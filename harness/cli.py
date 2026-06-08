@@ -913,9 +913,14 @@ async def synthesize_requirements(
 
 
 def _read_spec_file(spec_path: str) -> str:
-    """Read a specification file from disk."""
-    if not os.path.isfile(spec_path):
-        return ""
+    """Read a specification file from disk.
+
+    Relies on a single try/except instead of the previous isfile-then-open
+    pattern, which had a microsecond TOCTOU window (Bug 7). open() raises
+    FileNotFoundError (an OSError subclass) when the file doesn't exist,
+    which the existing handler already catches — same observable behavior,
+    no race.
+    """
     try:
         with open(spec_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()

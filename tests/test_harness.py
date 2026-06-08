@@ -2225,6 +2225,30 @@ class TestCLI:
         parser = build_parser()
         assert parser.prog == "harness"
 
+    def test_discovery_off_by_default(self):
+        # Regression: the exhaustive 8-sector discovery pipeline used to run
+        # on every invocation. It now requires explicit --discover.
+        from harness.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t"])
+        assert getattr(args, "discover", False) is False
+
+    def test_discover_flag_enables_discovery(self):
+        from harness.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t", "--discover"])
+        assert args.discover is True
+
+    def test_skip_discovery_flag_still_parses_for_backcompat(self):
+        # Old --skip-discovery flag is preserved as a no-op so existing scripts
+        # don't break. The new default already skips discovery anyway.
+        from harness.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t", "--skip-discovery"])
+        # The flag parses without error; it doesn't change the discovery decision
+        # (discover stays False; that's already the default).
+        assert getattr(args, "discover", False) is False
+
     def test_deep_merge(self):
         from harness.cli import _deep_merge
         base = {"a": 1, "b": {"x": 1}}

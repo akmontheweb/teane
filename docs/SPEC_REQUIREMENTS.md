@@ -101,7 +101,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Description:** Before code generation, the system MUST run a multi-phase discovery pipeline (requirements → architecture → deployment) where the LLM cross-examines the developer across structured sectors, with interactive question/answer loops and critical-unknown tracking.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `--skip-discovery` is NOT set, requirements discovery runs with an 8-sector cross-examination prompt.
+  - Given `--discover` IS set (opt-in), requirements discovery runs with an 8-sector cross-examination prompt. Discovery is skipped by default.
   - Given all discovery questions are answered, `discovery_complete` is set to true and the spec is written.
   - Given critical questions remain unanswered and the user types DONE, the loop refuses to exit.
 

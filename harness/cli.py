@@ -1208,6 +1208,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Budget:     $%.2f", budget_usd)
     logger.info("  Network:    %s", "enabled" if allow_network else "blocked")
     logger.info("  Prompt:     %s", args.prompt[:100] + ("..." if len(args.prompt) > 100 else ""))
+    logger.info("  Discovery:  %s", "enabled (--discover)" if getattr(args, "discover", False) else "skipped (pass --discover to enable)")
     if spec_override:
         logger.info("  Spec:       SPEC_REQUIREMENTS.md (%d chars)", len(spec_override))
     logger.info("=" * 60)
@@ -1223,7 +1224,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
             session_id=session_id,
             checkpointer=checkpointer,
             thread_id=thread_id,
-            skip_discovery=args.skip_discovery,
+            # Discovery runs only when --discover is explicitly passed.
+            # --skip-discovery (old flag) is a no-op now but kept for compat.
+            skip_discovery=not getattr(args, "discover", False),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -1520,11 +1523,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Enable debug-level logging.",
     )
+    # Discovery is OFF by default — most tasks are incremental patches on an
+    # existing codebase where the 20-minute exhaustive Q&A adds no value.
+    # Pass --discover to enable the full requirements/architecture interview.
+    run_parser.add_argument(
+        "--discover",
+        action="store_true",
+        default=False,
+        dest="discover",
+        help=(
+            "Run the full requirements/architecture/deployment discovery "
+            "pipeline before code generation. Recommended for greenfield "
+            "projects or when working from a blank workspace. Skipped by "
+            "default for incremental patching sessions."
+        ),
+    )
+    # Keep --skip-discovery as a no-op alias for backward compatibility
+    # (it was the old default=False flag; now discovery is already off).
     run_parser.add_argument(
         "--skip-discovery", "-s",
         action="store_true",
         default=False,
-        help="Skip requirements/architecture discovery phases and go directly to code generation.",
+        dest="skip_discovery_compat",
+        help=argparse.SUPPRESS,  # hidden; no longer needed but kept for scripts
     )
 
     # --- `harness resume` ---

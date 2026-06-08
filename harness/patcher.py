@@ -248,15 +248,50 @@ async def _aread(filepath: str) -> str:
 
 
 async def _awrite(filepath: str, content: str) -> None:
-    """Write a file asynchronously using aiofiles."""
+    """
+    Atomically write ``content`` to ``filepath``.
+
+    Strategy: write to a sibling temp file in the same directory, fsync, then
+    `os.replace` (atomic on POSIX and Windows). A crash or kill mid-write
+    leaves the original file unchanged; partial writes never become visible.
+    Previously this used a plain ``open(filepath, "w")`` which truncated the
+    file *before* writing — a crash between truncate and final flush left
+    the user's file empty.
+    """
+    import tempfile
+
+    directory = os.path.dirname(os.path.abspath(filepath)) or "."
+    # delete=False so we own cleanup; suffix keeps editor file-watchers happy.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".harness.tmp.",
+        suffix=os.path.basename(filepath),
+        dir=directory,
+    )
     try:
-        import aiofiles
-        async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
-            await f.write(content)
-    except ImportError:
-        logger.debug("[patcher] aiofiles not installed. Falling back to sync open().")
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        try:
+            import aiofiles
+            # Close the os-level fd we don't need; aiofiles will open by path.
+            os.close(fd)
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                await f.write(content)
+                await f.flush()
+        except ImportError:
+            logger.debug("[patcher] aiofiles not installed. Falling back to sync write.")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass  # fsync not supported on some filesystems
+        os.replace(tmp_path, filepath)
+    except Exception:
+        # Clean up the temp file on any failure so we don't leak it.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

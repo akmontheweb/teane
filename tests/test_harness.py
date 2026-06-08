@@ -168,6 +168,58 @@ class TestTextPatcher:
             with open(outside) as f:
                 assert f.read() == "original\n"
 
+    @pytest.mark.asyncio
+    async def test_awrite_is_atomic_on_failure(self, monkeypatch):
+        # Regression: writes used to truncate-then-write, so a crash mid-write
+        # left the file empty. Now we write to a temp + os.replace; a failure
+        # during write must leave the original content intact.
+        from harness import patcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "code.py")
+            with open(target, "w") as f:
+                f.write("ORIGINAL\n")
+
+            # Force the write call to raise mid-way
+            async def boom(self, content):
+                raise RuntimeError("disk full")
+
+            # Patch aiofiles open at the right level — easier to patch os.replace
+            # to simulate a crash AFTER the temp file is written but BEFORE
+            # the rename completes.
+            real_replace = patcher.os.replace
+
+            def failing_replace(src, dst):
+                raise OSError("simulated crash before atomic rename")
+
+            monkeypatch.setattr(patcher.os, "replace", failing_replace)
+            try:
+                with pytest.raises(OSError):
+                    await patcher._awrite(target, "NEW DANGEROUS CONTENT")
+            finally:
+                monkeypatch.setattr(patcher.os, "replace", real_replace)
+
+            # Original file content must be intact
+            with open(target) as f:
+                assert f.read() == "ORIGINAL\n"
+
+            # No leftover temp files in the dir
+            leftovers = [n for n in os.listdir(tmpdir) if n.startswith(".harness.tmp.")]
+            assert leftovers == [], f"temp files leaked: {leftovers}"
+
+    @pytest.mark.asyncio
+    async def test_awrite_succeeds_with_atomic_rename(self):
+        from harness import patcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "code.py")
+            with open(target, "w") as f:
+                f.write("OLD\n")
+            await patcher._awrite(target, "NEW\n")
+            with open(target) as f:
+                assert f.read() == "NEW\n"
+            # No temp leftovers
+            leftovers = [n for n in os.listdir(tmpdir) if n.startswith(".harness.tmp.")]
+            assert leftovers == []
+
     def test_safe_resolve_helper(self):
         from harness.patcher import _safe_resolve
         with tempfile.TemporaryDirectory() as tmpdir:

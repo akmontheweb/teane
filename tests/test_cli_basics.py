@@ -114,6 +114,30 @@ class TestValidateConfigKeys:
         # Should not raise
         _validate_config_keys(config, "test")
 
+    def test_validate_nested_typo_is_detected(self, caplog):
+        """Nested key typos (e.g. token_budget.hrad_cap_usd) should warn."""
+        bad = {"token_budget": {"hrad_cap_usd": 2.0}}
+        with caplog.at_level("WARNING"):
+            _validate_config_keys(bad, "test")
+        messages = " ".join(r.message for r in caplog.records)
+        assert "Unknown config key 'token_budget.hrad_cap_usd'" in messages
+        assert "hard_cap_usd" in messages  # suggested correction
+
+    def test_validate_nested_known_keys_dont_warn(self, caplog):
+        """All shipped defaults from cli.json should pass nested validation."""
+        config = _get_default_config()
+        with caplog.at_level("WARNING"):
+            _validate_config_keys(config, "test")
+        unknowns = [r.message for r in caplog.records if "Unknown config key" in r.message]
+        assert unknowns == []
+
+    def test_validate_nested_comment_keys_dont_warn(self, caplog):
+        """_comment keys inside nested sections must be ignored."""
+        config = {"sandbox": {"_comment": "doc", "backend": "auto"}}
+        with caplog.at_level("WARNING"):
+            _validate_config_keys(config, "test")
+        assert not any("Unknown" in r.message for r in caplog.records)
+
 
 class TestGenerateWorkspaceConfig:
     """Test workspace config generation."""

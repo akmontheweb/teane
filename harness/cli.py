@@ -5,6 +5,7 @@ Provides the following commands:
     harness run     — Primary execution entry point. Runs the full agent graph.
     harness resume  — Resume a crashed/interrupted session from its checkpoint.
     harness status  — Read-only inspection of a checkpointed session.
+    harness doctor  — Run first-run healthchecks (git, API keys, sandbox, DB, config).
     harness purge   — Manually wipe all checkpoint data.
 
 Use `harness -h` or `harness <command> -h` for detailed help on each subcommand.
@@ -193,18 +194,57 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "build_command", "allow_network", "sandbox", "token_budget",
     "node_throttle", "models", "model_routing", "persistence",
     "manifest_file", "redaction", "security", "skills", "deployment",
-    "speculative", "impact", "lintgate", "logging",
+    "speculative", "impact", "lintgate", "logging", "languages",
 })
+
+# Per-section known keys. Used to detect typos like
+# `token_budget.hrad_cap_usd` that silently no-op'd before — a typoed
+# budget cap meant agents ran without one. Keep these in sync with the
+# consumers grep'd by section (sandbox.py, deploy.py, lintgate.py, etc.).
+_KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
+    "sandbox": frozenset({
+        "backend", "docker_image", "docker_memory_limit", "docker_cpu_limit",
+        "docker_pids_limit", "readonly_cache_mounts", "timeout_seconds",
+        "pgid_kill_on_timeout", "log_buffer_max_mb",
+    }),
+    "token_budget": frozenset({
+        "hard_cap_usd", "context_window_threshold_pct",
+    }),
+    "node_throttle": frozenset({
+        "max_patch_repair_iterations",
+    }),
+    "persistence": frozenset({
+        "db_path", "ttl_days",
+    }),
+    "model_routing": frozenset({
+        "planning_primary", "planning_mode", "planning_fallback",
+        "patching_primary", "patching_mode",
+        "repair_primary", "repair_fallback", "repair_mode",
+        "ollama_local_model", "ollama_local_backup", "force_local_only",
+    }),
+    "deployment": frozenset({
+        "enabled", "compose_file",
+        "health_check_interval_seconds", "health_check_timeout_seconds",
+    }),
+    "lintgate": frozenset({
+        "format_modified_files",
+    }),
+    "logging": frozenset({
+        "level", "log_dir", "json_stderr", "langsmith",
+    }),
+}
 
 
 def _validate_config_keys(config: dict[str, Any], source_label: str) -> None:
     """
-    Warn on top-level config keys that aren't in the known set. Catches
-    typos like 'model_routin' silently no-op-ing. Heuristic-only: doesn't
-    block load, just logs an actionable warning with the closest match.
+    Warn on config keys that aren't in the known set. Catches typos like
+    'model_routin' or 'token_budget.hrad_cap_usd' silently no-op-ing.
+    Heuristic-only: doesn't block load, just logs an actionable warning
+    with the closest match. Recurses into known nested sections so a
+    typoed nested key still surfaces.
     """
     import difflib
-    for key in config.keys():
+    for key, value in config.items():
         if key.startswith("_"):
             continue  # comment keys
         if key not in _KNOWN_TOP_LEVEL_KEYS:
@@ -214,6 +254,23 @@ def _validate_config_keys(config: dict[str, Any], source_label: str) -> None:
                 "[cli] Unknown config key '%s' in %s%s — this entry will be ignored. "
                 "Known top-level keys: %s",
                 key, source_label, hint, ", ".join(sorted(_KNOWN_TOP_LEVEL_KEYS)),
+            )
+            continue
+        known_nested = _KNOWN_NESTED_KEYS.get(key)
+        if known_nested is None or not isinstance(value, dict):
+            continue
+        for nested_key in value.keys():
+            if nested_key.startswith("_"):
+                continue
+            if nested_key in known_nested:
+                continue
+            suggestion = difflib.get_close_matches(nested_key, known_nested, n=1, cutoff=0.6)
+            hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
+            logger.warning(
+                "[cli] Unknown config key '%s.%s' in %s%s — this entry will be ignored. "
+                "Known '%s' keys: %s",
+                key, nested_key, source_label, hint, key,
+                ", ".join(sorted(known_nested)),
             )
 
 
@@ -1446,6 +1503,235 @@ async def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 3b. `harness doctor` — first-run healthcheck
+# ---------------------------------------------------------------------------
+
+# ANSI color codes for the doctor report. Skipped when stdout is not a TTY
+# so log scrapers and CI captures see plain text. Treat the constants as
+# already-emitted-or-empty so callers don't have to branch on isatty.
+def _doctor_colors() -> tuple[str, str, str, str]:
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR", "") == "":
+        return ("\033[32m", "\033[33m", "\033[31m", "\033[0m")  # green, yellow, red, reset
+    return ("", "", "", "")
+
+
+def _format_doctor_line(status: str, label: str, detail: str) -> str:
+    green, yellow, red, reset = _doctor_colors()
+    if status == "pass":
+        marker = f"{green}[ OK ]{reset}"
+    elif status == "warn":
+        marker = f"{yellow}[WARN]{reset}"
+    else:
+        marker = f"{red}[FAIL]{reset}"
+    return f"  {marker} {label:<32} {detail}"
+
+
+def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
+    """Workspace is a git repo (rev-parse --git-dir)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "-C", workspace_path, "rev-parse", "--git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return "fail", "git binary not found on PATH"
+    except subprocess.TimeoutExpired:
+        return "fail", "git rev-parse timed out"
+    if result.returncode != 0:
+        return "fail", (
+            f"{workspace_path} is not a git repo (run 'git init' to initialize)"
+        )
+    return "pass", f"git repo detected at {workspace_path}"
+
+
+def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
+    """Every non-ollama model referenced in model_routing has its API key set."""
+    routing = config.get("model_routing", {}) or {}
+    routing_keys = (
+        "planning_primary", "planning_fallback",
+        "patching_primary",
+        "repair_primary", "repair_fallback",
+    )
+    needed_providers: dict[str, str] = {}  # provider -> first model that wants it
+    for routing_key in routing_keys:
+        model_key = routing.get(routing_key, "") or ""
+        if not model_key or ":" not in model_key:
+            continue
+        provider = model_key.split(":", 1)[0]
+        if provider == "ollama":
+            continue
+        needed_providers.setdefault(provider, model_key)
+
+    if not needed_providers:
+        return "warn", "no non-ollama models configured in model_routing"
+
+    missing: list[str] = []
+    present: list[str] = []
+    for provider, model_key in needed_providers.items():
+        env_var = f"{provider.upper()}_API_KEY"
+        if os.environ.get(env_var, ""):
+            present.append(env_var)
+        else:
+            missing.append(f"{env_var} (needed for {model_key})")
+
+    if missing:
+        return "fail", "missing: " + "; ".join(missing)
+    return "pass", "present: " + ", ".join(present)
+
+
+def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
+    """Sandbox backend is reachable (docker info / unshare echo)."""
+    import shutil
+    import subprocess
+    sandbox_cfg = config.get("sandbox", {}) or {}
+    backend = (sandbox_cfg.get("backend", "auto") or "auto").lower()
+
+    def _probe_docker() -> tuple[str, str]:
+        if shutil.which("docker") is None:
+            return "fail", "docker binary not found on PATH"
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return "fail", "docker info timed out (daemon unreachable?)"
+        if result.returncode != 0:
+            stderr = result.stderr.strip().splitlines()[-1] if result.stderr else "unknown error"
+            return "fail", f"docker info failed: {stderr}"
+        return "pass", "docker daemon reachable"
+
+    def _probe_unshare() -> tuple[str, str]:
+        if shutil.which("unshare") is None:
+            return "fail", "unshare binary not found on PATH"
+        try:
+            result = subprocess.run(
+                ["unshare", "--user", "echo", "ok"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return "fail", "unshare timed out"
+        if result.returncode != 0 or result.stdout.strip() != "ok":
+            return "fail", f"unshare --user failed (rc={result.returncode}); user namespaces may be disabled"
+        return "pass", "unshare --user works"
+
+    if backend == "docker":
+        return _probe_docker()
+    if backend == "unshare":
+        return _probe_unshare()
+    if backend == "bare":
+        return "warn", "backend=bare: no isolation (host-mode execution)"
+    # auto / unknown: prefer docker, fall back to unshare
+    docker_status, docker_detail = _probe_docker()
+    if docker_status == "pass":
+        return "pass", f"auto: {docker_detail}"
+    unshare_status, unshare_detail = _probe_unshare()
+    if unshare_status == "pass":
+        return "pass", f"auto: docker unavailable, fell back to unshare ({unshare_detail})"
+    return "fail", f"auto: docker ({docker_detail}) AND unshare ({unshare_detail}) both unavailable"
+
+
+def _doctor_check_checkpoint_db(config: dict[str, Any]) -> tuple[str, str]:
+    """Checkpoint DB path is writable (create parent dir, open with sqlite3)."""
+    import sqlite3
+    persistence_cfg = config.get("persistence", {}) or {}
+    db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
+    expanded = os.path.expanduser(db_path)
+    parent = os.path.dirname(expanded) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        return "fail", f"cannot create parent dir {parent}: {exc}"
+    try:
+        conn = sqlite3.connect(expanded, timeout=2)
+        conn.execute("PRAGMA user_version")
+        conn.close()
+    except sqlite3.Error as exc:
+        return "fail", f"sqlite3 open failed for {expanded}: {exc}"
+    return "pass", f"writable: {expanded}"
+
+
+def _doctor_check_config(workspace_path: str) -> tuple[str, str]:
+    """Config discovers and validates without errors. Captures _validate_config_keys warnings."""
+    import io
+    warning_handler = logging.StreamHandler(io.StringIO())
+    warning_handler.setLevel(logging.WARNING)
+    cli_logger = logging.getLogger("harness.cli")
+    cli_logger.addHandler(warning_handler)
+    try:
+        try:
+            config = discover_config(workspace_path)
+        except Exception as exc:  # noqa: BLE001
+            return "fail", f"discover_config raised: {exc}"
+    finally:
+        cli_logger.removeHandler(warning_handler)
+    captured = warning_handler.stream.getvalue()
+    typo_lines = [
+        line for line in captured.splitlines()
+        if "Unknown config key" in line
+    ]
+    if typo_lines:
+        first = typo_lines[0].split("Unknown config key", 1)[1].strip()
+        more = f" (+{len(typo_lines) - 1} more)" if len(typo_lines) > 1 else ""
+        return "warn", f"unknown key{more}: Unknown config key {first}"
+    section_count = sum(1 for k in config if not k.startswith("_"))
+    return "pass", f"config parsed cleanly ({section_count} top-level sections)"
+
+
+async def cmd_doctor(args: argparse.Namespace) -> int:
+    """
+    Execute the `harness doctor` subcommand.
+
+    Runs five healthchecks and prints a green/yellow/red summary.
+    Exits 0 if every check passes (warn included as non-blocking),
+    non-zero if any check fails.
+
+    Examples:
+        harness doctor
+        harness doctor -r /path/to/repo
+    """
+    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    # Silence the chatty INFO logging from discover_config; we surface
+    # parse warnings ourselves via the config check.
+    logging.getLogger("harness.cli").setLevel(logging.ERROR)
+
+    try:
+        config = discover_config(workspace_path)
+    except Exception:  # noqa: BLE001 — _doctor_check_config re-runs and reports
+        config = {}
+
+    checks: list[tuple[str, tuple[str, str]]] = [
+        ("git repo", _doctor_check_git(workspace_path)),
+        ("api keys", _doctor_check_api_keys(config)),
+        ("sandbox backend", _doctor_check_sandbox(config)),
+        ("checkpoint db", _doctor_check_checkpoint_db(config)),
+        ("config parse", _doctor_check_config(workspace_path)),
+    ]
+
+    print()
+    print("=" * 72)
+    print(f"harness doctor — workspace: {workspace_path}")
+    print("=" * 72)
+    for label, (status, detail) in checks:
+        print(_format_doctor_line(status, label, detail))
+    print("=" * 72)
+
+    failures = [label for label, (status, _) in checks if status == "fail"]
+    warnings = [label for label, (status, _) in checks if status == "warn"]
+    if failures:
+        print(f"FAIL: {len(failures)} check(s) failed: {', '.join(failures)}")
+        return 1
+    if warnings:
+        print(f"OK with warnings ({len(warnings)}): {', '.join(warnings)}")
+    else:
+        print("OK: all checks passed.")
+    return 0
+
+
 async def cmd_purge(args: argparse.Namespace) -> int:
     """
     Execute the `harness purge` subcommand.
@@ -1642,6 +1928,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness doctor` ---
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run first-run healthchecks (git, api keys, sandbox, db, config)",
+    )
+    doctor_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path to check (defaults to current directory).",
+    )
+    doctor_parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Enable debug-level logging.",
+    )
+
     # --- `harness purge` ---
     purge_parser = subparsers.add_parser("purge", help="Manually wipe checkpoint data")
     purge_parser.add_argument(
@@ -1694,6 +1997,8 @@ def main() -> int:
         return asyncio.run(cmd_resume(args))
     elif args.command == "status":
         return asyncio.run(cmd_status(args))
+    elif args.command == "doctor":
+        return asyncio.run(cmd_doctor(args))
     elif args.command == "purge":
         return asyncio.run(cmd_purge(args))
     else:

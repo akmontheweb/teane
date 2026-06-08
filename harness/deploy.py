@@ -36,88 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# LLM-output validators
+# LLM-output validators — delegated to harness/trust.py
 # ---------------------------------------------------------------------------
-#
-# The deployment pipeline interpolates LLM-supplied strings — service names,
-# image references, env var names, port mappings — directly into Dockerfile,
-# docker-compose.yml, and Caddyfile templates. Without validation, a confused
-# model or prompt-injected blueprint can inject newlines, semicolons, or
-# YAML structure that breaks out of the intended quoting and runs arbitrary
-# commands during `docker-compose up --build`. The preview gate catches the
-# worst cases but only if the user actually reads what it shows — these
-# validators add defense in depth by rejecting bad blueprints before the
-# files are even written.
-
-_VALID_DOCKER_IMAGE_RE = re.compile(
-    # Optional registry host:port/, then repository segments, optional :tag, optional @digest.
-    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*"
-    r"(?::\d+)?"                       # optional port on host
-    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"  # repository segments
-    r"(?::[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127})?"  # optional :tag
-    r"(?:@sha256:[a-f0-9]{64})?$"      # optional digest
+# Identifier validators and blueprint validation live in the central trust
+# module. Local aliases are kept so call sites in this file don't change.
+from harness.trust import (  # noqa: E402
+    is_valid_docker_image as _is_valid_docker_image,
+    is_valid_service_name as _is_valid_service_name,
+    is_valid_env_var_name as _is_valid_env_var_name,
+    is_valid_port_mapping as _is_valid_port_mapping,
+    validate_blueprint as _validate_blueprint,
 )
-_VALID_SERVICE_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,62}$")
-_VALID_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-_VALID_PORT_MAPPING_RE = re.compile(r"^(?:\d+:)?\d+(?:/(?:tcp|udp))?$")
-
-
-def _is_valid_docker_image(name: Any) -> bool:
-    return isinstance(name, str) and bool(_VALID_DOCKER_IMAGE_RE.match(name))
-
-
-def _is_valid_service_name(name: Any) -> bool:
-    return isinstance(name, str) and bool(_VALID_SERVICE_NAME_RE.match(name))
-
-
-def _is_valid_env_var_name(name: Any) -> bool:
-    return isinstance(name, str) and bool(_VALID_ENV_VAR_NAME_RE.match(name))
-
-
-def _is_valid_port_mapping(port: Any) -> bool:
-    if isinstance(port, int):
-        return 0 < port < 65536
-    return isinstance(port, str) and bool(_VALID_PORT_MAPPING_RE.match(port))
-
-
-def _validate_blueprint(blueprint: dict[str, Any]) -> list[str]:
-    """
-    Walk the blueprint and return a list of human-readable validation errors.
-    Empty list means safe to render into Dockerfile/compose/Caddyfile.
-
-    This runs *before* file generation so a bad LLM blueprint never produces
-    artifacts on disk in the first place.
-    """
-    errors: list[str] = []
-    services = blueprint.get("services", {})
-    if not isinstance(services, dict):
-        errors.append("services must be a dict")
-        return errors
-
-    for svc_name, svc_spec in services.items():
-        if not _is_valid_service_name(svc_name):
-            errors.append(f"invalid service name: {svc_name!r}")
-            continue
-        if not isinstance(svc_spec, dict):
-            errors.append(f"service {svc_name!r}: spec must be a dict")
-            continue
-
-        if svc_spec.get("base_image") and not _is_valid_docker_image(svc_spec["base_image"]):
-            errors.append(f"service {svc_name!r}: invalid base_image {svc_spec['base_image']!r}")
-
-        for port in svc_spec.get("ports", []) or []:
-            if not _is_valid_port_mapping(port):
-                errors.append(f"service {svc_name!r}: invalid port mapping {port!r}")
-
-        for env_key in svc_spec.get("environment_keys_needed", []) or []:
-            if not _is_valid_env_var_name(env_key):
-                errors.append(f"service {svc_name!r}: invalid env var name {env_key!r}")
-
-        for dep in svc_spec.get("depends_on_services", []) or []:
-            if not _is_valid_service_name(dep):
-                errors.append(f"service {svc_name!r}: invalid depends_on entry {dep!r}")
-
-    return errors
 
 
 # Files we always show in the deploy preview (in this order).

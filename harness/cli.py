@@ -903,9 +903,10 @@ async def synthesize_requirements(
     except Exception as exc:
         raise RuntimeError(f"LLM synthesis failed: {exc}") from exc
 
-    content = response.content.strip()
-    if not content:
-        raise RuntimeError("LLM returned empty content for specification synthesis.")
+    from harness.trust import validate_synthesized_spec
+    content, trust_errors = validate_synthesized_spec(response.content.strip())
+    if trust_errors:
+        raise RuntimeError(f"Synthesised spec failed trust validation: {trust_errors}")
 
     # Write the file
     os.makedirs(output_dir, exist_ok=True)

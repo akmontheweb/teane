@@ -32,29 +32,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
 
 
-# Environment variables stripped from the build process's inherited env
-# before subprocess launch. Builds running in the sandbox should never
-# need access to LLM provider API keys or VCS credentials — leaking
-# them lets a misbehaving build (or an LLM-generated test) exfiltrate
-# secrets out of the workspace. Users who legitimately need a secret
-# at build time can pass it explicitly via SandboxExecutor's extra_env
-# / readonly_cache_mounts mechanism, not through ambient inheritance.
-_SCRUBBED_BUILD_ENV_VARS: frozenset[str] = frozenset({
-    # LLM providers
-    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
-    "MISTRAL_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY",
-    "COHERE_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN",
-    "GROQ_API_KEY", "TOGETHER_API_KEY", "PERPLEXITY_API_KEY",
-    # Cloud provider creds
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "GCP_SERVICE_ACCOUNT_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
-    "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID",
-    # VCS
-    "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN",
-    # Other secret-bearing
-    "NPM_TOKEN", "PYPI_TOKEN", "STRIPE_SECRET_KEY", "SLACK_TOKEN",
-    "DATABASE_URL",  # may carry creds; users opt back in via extra_env if needed
-})
+# Credential scrubbing is centralised in harness/trust.py so every
+# subprocess-spawner uses the same allowlist.
+from harness.trust import SCRUBBED_BUILD_ENV_VARS as _SCRUBBED_BUILD_ENV_VARS  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

@@ -1163,13 +1163,17 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
             messages=list(messages), role=NodeRole.PLANNING,
             budget_remaining_usd=current_budget,
         )
-        content = response.content.strip()
-        # Strip code fences if present
-        if content.startswith("```"):
-            lines = content.splitlines()
-            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        discovery_data = json.loads(content)
+        from harness.trust import validate_discovery_json
+        discovery_data, trust_errors = validate_discovery_json(response.content)
+        if trust_errors:
+            logger.error("[reqs_disc] Discovery response failed trust validation: %s", trust_errors)
+            return {
+                "messages": messages,
+                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                "budget_remaining_usd": budget,
+            }
+
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
         total_questions = sum(len(m.get("questions", [])) for m in modules)
@@ -1269,12 +1273,17 @@ Output JSON with same schema as requirements discovery."""
             messages=list(messages), role=NodeRole.PLANNING,
             budget_remaining_usd=current_budget,
         )
-        content = response.content.strip()
-        if content.startswith("```"):
-            lines = content.splitlines()
-            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        discovery_data = json.loads(content)
+        from harness.trust import validate_discovery_json
+        discovery_data, trust_errors = validate_discovery_json(response.content)
+        if trust_errors:
+            logger.error("[arch_disc] Discovery response failed trust validation: %s", trust_errors)
+            return {
+                "messages": messages,
+                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                "budget_remaining_usd": budget,
+            }
+
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
         total_q = sum(len(m.get("questions", [])) for m in modules)
@@ -1365,12 +1374,17 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
             messages=list(messages), role=NodeRole.PLANNING,
             budget_remaining_usd=current_budget,
         )
-        content = response.content.strip()
-        if content.startswith("```"):
-            lines = content.splitlines()
-            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        discovery_data = json.loads(content)
+        from harness.trust import validate_discovery_json
+        discovery_data, trust_errors = validate_discovery_json(response.content)
+        if trust_errors:
+            logger.error("[deploy_disc] Discovery response failed trust validation: %s", trust_errors)
+            return {
+                "messages": messages,
+                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                "budget_remaining_usd": budget,
+            }
+
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
         total_q = sum(len(m.get("questions", [])) for m in modules)

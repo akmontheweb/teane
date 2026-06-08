@@ -298,38 +298,10 @@ async def _awrite(filepath: str, content: str) -> None:
 # 5. BasePatcher ABC
 # ---------------------------------------------------------------------------
 
-def _safe_resolve(workspace_root: str, filepath: str) -> str:
-    """
-    Resolve an LLM-supplied ``filepath`` against ``workspace_root`` and reject
-    anything that would land outside the workspace.
-
-    Guards against:
-      - empty / None paths
-      - absolute paths (``/etc/passwd``)
-      - parent-traversal (``../../etc/passwd``)
-      - symlinks pointing outside the workspace (via realpath)
-      - Windows mixed-drive joins
-
-    Returns the absolute, real (symlink-resolved) path on success.
-    Raises ``ValueError`` on any rejection.
-    """
-    if not filepath:
-        raise ValueError("filepath must be non-empty")
-    if os.path.isabs(filepath):
-        raise ValueError(f"absolute path rejected: {filepath!r}")
-
-    workspace_real = os.path.realpath(workspace_root)
-    candidate = os.path.realpath(os.path.join(workspace_real, filepath))
-
-    try:
-        common = os.path.commonpath([candidate, workspace_real])
-    except ValueError as e:
-        raise ValueError(f"unresolvable path: {filepath!r}") from e
-
-    if common != workspace_real:
-        raise ValueError(f"path escapes workspace: {filepath!r} -> {candidate}")
-
-    return candidate
+# Delegate path-traversal checking to the central trust boundary module.
+# The local name is preserved so that existing callers (tests, internal
+# code) continue to work without changes.
+from harness.trust import safe_resolve as _safe_resolve  # noqa: E402
 
 
 class BasePatcher(ABC):

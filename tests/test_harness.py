@@ -2226,6 +2226,58 @@ class TestImpactAnalyzer:
         result = ImpactResult(modified_files=["a.py"], total_impacted=3)
         assert result.has_impact()
 
+    def test_dependency_graph_marks_incomplete_when_scan_limit_hit(self):
+        # Regression: hitting max_scan_files used to silently mark the graph
+        # "built" with no incomplete flag — callers thought results were
+        # exhaustive when they were actually a partial view.
+        from harness.impact import DependencyGraph
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create 6 small Python files but set max_scan_files=2
+            for i in range(6):
+                with open(os.path.join(tmpdir, f"mod_{i}.py"), "w") as f:
+                    f.write(f"def f{i}(): pass\n")
+            graph = DependencyGraph(workspace_path=tmpdir, max_scan_files=2)
+            graph.build()
+            assert graph.incomplete is True
+            assert graph.files_scanned == 2
+
+    def test_dependency_graph_complete_when_under_limit(self):
+        from harness.impact import DependencyGraph
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                with open(os.path.join(tmpdir, f"mod_{i}.py"), "w") as f:
+                    f.write(f"def f{i}(): pass\n")
+            graph = DependencyGraph(workspace_path=tmpdir, max_scan_files=100)
+            graph.build()
+            assert graph.incomplete is False
+            assert graph.files_scanned == 3
+
+    def test_impact_result_propagates_incomplete_flag(self):
+        from harness.impact import ImpactAnalyzer
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(6):
+                with open(os.path.join(tmpdir, f"mod_{i}.py"), "w") as f:
+                    f.write(f"def f{i}(): pass\n")
+            analyzer = ImpactAnalyzer(workspace_path=tmpdir, max_scan_files=2)
+            result = analyzer.analyze(["mod_0.py"])
+            assert result.graph_incomplete is True
+            assert result.files_scanned == 2
+
+    def test_incomplete_scan_with_no_impact_still_warns(self):
+        # Regression-of-regression: when impacted_files is empty AND scan
+        # was incomplete, the user must still be told the result is unreliable.
+        from harness.impact import ImpactAnalyzer
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(6):
+                with open(os.path.join(tmpdir, f"mod_{i}.py"), "w") as f:
+                    f.write(f"def f{i}(): pass\n")
+            analyzer = ImpactAnalyzer(workspace_path=tmpdir, max_scan_files=2)
+            result = analyzer.analyze(["mod_0.py"])
+            # No imports between files = no impact, but graph is incomplete.
+            if not result.has_impact():
+                assert "INCOMPLETE" in result.warning
+                assert "lower bound" in result.warning or "missed" in result.warning
+
     def test_impact_result_no_impact(self):
         from harness.impact import ImpactResult
         result = ImpactResult(modified_files=["a.py"], total_impacted=0)
@@ -2297,6 +2349,68 @@ class TestParserRegistry:
 ZeroDivisionError: division by zero"""
         diags = detect_and_parse(output, build_command="python test.py")
         assert len(diags) >= 0
+
+    def test_generic_parser_captures_rust_span_context(self):
+        # Regression: Rust ` --> file:line | code | ^^^ ` annotation blocks
+        # under a primary error used to be silently dropped. semantic_context
+        # should now contain the full multi-line span so the repair node has
+        # the same view the developer would.
+        from harness.parser_registry import GenericParser
+        output = """src/main.rs:10:5: error: cannot find type `Foo` in this scope
+  --> src/main.rs:10:5
+   |
+10 |     let x: Foo = bar();
+   |            ^^^ not found in this scope
+   |
+   = help: consider importing this struct"""
+        diags = GenericParser.parse_diagnostics(output)
+        assert len(diags) == 1
+        ctx = diags[0].semantic_context
+        assert "let x: Foo" in ctx, f"missing source snippet in context: {ctx}"
+        assert "help:" in ctx, f"missing help hint in context: {ctx}"
+
+    def test_generic_parser_captures_gcc_note_followon(self):
+        from harness.parser_registry import GenericParser
+        output = """main.c:5:3: error: incompatible types when initializing
+   5 |   int x = "hello";
+     |   ^
+note: each undeclared identifier
+main.c:8:1: warning: unused variable"""
+        diags = GenericParser.parse_diagnostics(output)
+        # Two primary diagnostics; the first should have collected the note
+        # and caret as semantic_context.
+        assert len(diags) == 2
+        assert diags[0].semantic_context, "first diag context empty"
+        assert "note:" in diags[0].semantic_context
+        # The second diag (warning) should be parsed independently, not
+        # swallowed into the first one's context.
+        assert "unused variable" in diags[1].message
+
+    def test_go_parser_captures_indented_context(self):
+        # Go's `cannot use X as Y` errors emit a couple of tab-indented
+        # `have ... / want ...` lines under the primary.
+        from harness.parser_registry import GoParser
+        output = """cmd/main.go:42:10: cannot use x (type int) as type string in argument
+\thave int
+\twant string
+cmd/other.go:5:1: undefined: foo"""
+        diags = GoParser.parse_diagnostics(output)
+        assert len(diags) == 2
+        assert "have int" in diags[0].semantic_context
+        assert "want string" in diags[0].semantic_context
+        # Second diag must not have the first one's context.
+        assert "have int" not in diags[1].semantic_context
+
+    def test_context_collection_does_not_swallow_next_primary(self):
+        # Defense: two back-to-back primary diagnostics with no context
+        # between them must both be parsed cleanly, not merged.
+        from harness.parser_registry import GenericParser
+        output = """a.c:1:1: error: first
+b.c:2:2: error: second"""
+        diags = GenericParser.parse_diagnostics(output)
+        assert len(diags) == 2
+        assert diags[0].semantic_context == ""
+        assert diags[1].semantic_context == ""
 
     def test_list_registered_parsers(self):
         from harness.parser_registry import list_registered_parsers

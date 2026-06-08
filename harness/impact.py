@@ -45,6 +45,16 @@ class ImpactResult:
     symbol_impact: dict[str, list[str]] = field(default_factory=dict)
     warning: str = ""
     total_impacted: int = 0
+    # True when the underlying dependency graph hit max_scan_files and
+    # the workspace was only partially indexed. impacted_files only
+    # reflects dependents the scanner actually saw — there may be more
+    # downstream files that reference the modified files but lived
+    # beyond the scan cap. Callers should treat impact results as a
+    # *floor*, not a complete enumeration, when this is True.
+    graph_incomplete: bool = False
+    # Number of source files the graph builder actually scanned. Useful
+    # for surfacing "scanned 500 of ~2300 files" to the user.
+    files_scanned: int = 0
 
     def has_impact(self) -> bool:
         return self.total_impacted > 0
@@ -98,6 +108,11 @@ class DependencyGraph:
         self._exports: dict[str, set[str]] = {}
         self._dependents: dict[str, set[str]] = {}
         self._built = False
+        # True when build() bailed out at max_scan_files. Surfaced via
+        # ImpactResult.graph_incomplete so downstream warnings can say
+        # "this list is a lower bound" instead of treating it as complete.
+        self.incomplete: bool = False
+        self.files_scanned: int = 0
 
     def _is_ignored(self, filepath: str) -> bool:
         """Check if a file should be excluded from scanning."""
@@ -127,10 +142,17 @@ class DependencyGraph:
                     continue
                 if scanned >= self.max_scan_files:
                     logger.warning(
-                        "[impact] Maximum scan limit reached (%d files). Dependency graph may be incomplete.",
+                        "[impact] Maximum scan limit reached (%d files). Dependency graph is INCOMPLETE.",
                         self.max_scan_files,
                     )
+                    # Mark the result as incomplete so ImpactResult can warn
+                    # the caller that impacted_files is a lower bound.
+                    self.incomplete = True
+                    self.files_scanned = scanned
                     self._built = True
+                    # Still build the reverse index over the partial set so
+                    # impact lookups remain useful (just not exhaustive).
+                    self._build_reverse_index()
                     return scanned
                 try:
                     self._scan_file(filepath)
@@ -141,6 +163,7 @@ class DependencyGraph:
         # Build reverse index: for each symbol, find all files that reference it
         self._build_reverse_index()
 
+        self.files_scanned = scanned
         self._built = True
         logger.info("[impact] Dependency graph built: %d files, %d symbols.",
                      scanned, sum(len(syms) for syms in self._exports.values()))
@@ -456,6 +479,10 @@ class ImpactAnalyzer:
         result = ImpactResult(modified_files=modified_files)
         result.total_impacted = len(impacted)
         result.impacted_files = [f for f, _ in impacted]
+        # Propagate scan-completeness so callers know whether impacted_files
+        # is a complete enumeration or a lower bound.
+        result.graph_incomplete = graph.incomplete
+        result.files_scanned = graph.files_scanned
 
         # Build symbol impact map
         symbol_impact: dict[str, list[str]] = {}
@@ -478,11 +505,30 @@ class ImpactAnalyzer:
                 f"\n  You must now verify these {len(impacted)} file(s) to ensure no "
                 f"downstream breakage from the changes to {', '.join(os.path.basename(m) for m in modified_files)}."
             )
+            if result.graph_incomplete:
+                warning_parts.append(
+                    f"  ⚠ Note: dependency graph is INCOMPLETE (scanned {result.files_scanned} of "
+                    f"~{graph.max_scan_files}+ files). The list above is a *lower bound* — more "
+                    f"files may be affected. Raise `impact.max_scan_files` in config to widen the scan."
+                )
             result.warning = "\n".join(warning_parts)
 
             logger.warning(
-                "[impact] Modified %d file(s) → %d downstream file(s) potentially impacted.",
+                "[impact] Modified %d file(s) → %d downstream file(s) potentially impacted%s.",
                 len(modified_files), len(impacted),
+                " (graph incomplete — lower bound)" if result.graph_incomplete else "",
+            )
+        elif result.graph_incomplete:
+            # No matches found, but the scan was truncated — caller deserves to know.
+            result.warning = (
+                f"[Impact Analysis] No downstream impact detected, BUT the dependency "
+                f"graph is INCOMPLETE (scanned {result.files_scanned} of "
+                f"~{graph.max_scan_files}+ files). Some impacted files may have been "
+                f"missed. Raise `impact.max_scan_files` to widen the scan."
+            )
+            logger.warning(
+                "[impact] Scan incomplete (%d/%d files) — 'no impact' result is unreliable.",
+                result.files_scanned, graph.max_scan_files,
             )
         else:
             logger.info("[impact] No downstream impact detected for %d modified file(s).", len(modified_files))

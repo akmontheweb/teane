@@ -23,6 +23,74 @@ from harness.sandbox import BaseLanguageParser, DiagnosticObject
 logger = logging.getLogger(__name__)
 
 
+# Lines that look like "diagnostic context" attached to a previous error.
+# Matched after we've already located a primary diagnostic; whatever follows
+# until the next primary line / blank break / unrelated stanza is folded
+# into the primary's semantic_context field so downstream repair prompts
+# see e.g. "src/x.rs:10:5: cannot find type `Foo`" *plus* "  --> 10 |
+# let y: Foo = ...".
+#
+# Patterns covered:
+#   - Indented continuation lines (compilers emit leading whitespace for
+#     source-code carets, snippets, and tree-style hint output)
+#   - `note: ...`, `help: ...`, `info:`, `hint:` — GCC/clang/Rust sub-notes
+#   - Rust span markers: `-->`, ` = `, `   |`, `   ^`, `   ~`
+#   - GCC carets and "In file included from" lines
+_CONTEXT_LINE_RE = re.compile(
+    r"^("
+    r"\s+\S"                               # any indented continuation
+    r"|note:|help:|info:|hint:"            # named sub-notes (no leading ws)
+    r"|\s*(?:-->|\.\.\.|=|--|\|)\s"        # Rust span markers
+    r"|\s*\d+\s*\|"                        # Rust source-snippet line ("10 | ...")
+    r"|In file included from\b"            # GCC include chain
+    r"|\s*[\^~]+\s*$"                      # bare caret / tilde underline
+    r")"
+)
+
+
+def _collect_context_lines(
+    lines: list[str],
+    start_idx: int,
+    primary_re: re.Pattern[str],
+    max_context_lines: int = 12,
+) -> tuple[str, int]:
+    """
+    Walk forward from ``start_idx`` collecting attached context lines until
+    we hit either (a) the next primary-diagnostic line, (b) a fully blank
+    line followed by un-indented unrelated content, or (c) ``max_context_lines``
+    accumulated lines. Returns ``(joined_context, next_idx_to_resume_from)``.
+    """
+    collected: list[str] = []
+    i = start_idx
+    seen_blank = False
+    while i < len(lines) and len(collected) < max_context_lines:
+        raw = lines[i]
+        line = raw.rstrip()
+
+        # Another primary diagnostic terminates context — let the outer loop
+        # pick it up.
+        if primary_re.match(line.strip()):
+            break
+
+        if not line.strip():
+            # One blank line is fine (separates note: blocks from the
+            # caret), two in a row ends context.
+            if seen_blank:
+                break
+            seen_blank = True
+            i += 1
+            continue
+        seen_blank = False
+
+        if _CONTEXT_LINE_RE.match(line):
+            collected.append(line)
+            i += 1
+            continue
+        # Un-indented, non-matching line → end of this diagnostic's context.
+        break
+    return "\n".join(collected), i
+
+
 # CSI / SGR (color/style) and OSC escape sequences emitted by modern
 # compilers when stdout is a TTY (cargo, rustc, gcc, clang, go test).
 # Sandbox builds capture pipe output so these usually don't appear, but
@@ -125,18 +193,29 @@ class GoParser(BaseLanguageParser):
     @staticmethod
     def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
         diagnostics: list[DiagnosticObject] = []
-        for line in raw_output.splitlines():
-            match = GoParser._PATTERN.match(line.strip())
-            if match:
-                diagnostics.append(DiagnosticObject(
-                    file=match.group(1),
-                    line=int(match.group(2)),
-                    column=int(match.group(3)),
-                    severity="error",
-                    error_code="",
-                    message=match.group(4),
-                    semantic_context="",
-                ))
+        lines = raw_output.splitlines()
+        i = 0
+        while i < len(lines):
+            match = GoParser._PATTERN.match(lines[i].strip())
+            if not match:
+                i += 1
+                continue
+            # Found a primary; collect any indented context lines that follow
+            # (Go's `cannot use X (type Y) as ...` blocks often span several
+            # indented lines under the primary error).
+            context, next_i = _collect_context_lines(
+                lines, i + 1, GoParser._PATTERN,
+            )
+            diagnostics.append(DiagnosticObject(
+                file=match.group(1),
+                line=int(match.group(2)),
+                column=int(match.group(3)),
+                severity="error",
+                error_code="",
+                message=match.group(4),
+                semantic_context=context,
+            ))
+            i = next_i
         return diagnostics
 
 
@@ -234,19 +313,30 @@ class GenericParser(BaseLanguageParser):
     @staticmethod
     def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
         diagnostics: list[DiagnosticObject] = []
-        for line in raw_output.splitlines():
-            match = GenericParser._PATTERN.match(line.strip())
-            if match:
-                filepath = match.group(1)
-                diagnostics.append(DiagnosticObject(
-                    file=filepath,
-                    line=int(match.group(2)),
-                    column=int(match.group(3)),
-                    severity=match.group(4).lower(),
-                    error_code="",
-                    message=match.group(5),
-                    semantic_context="",
-                ))
+        lines = raw_output.splitlines()
+        i = 0
+        while i < len(lines):
+            match = GenericParser._PATTERN.match(lines[i].strip())
+            if not match:
+                i += 1
+                continue
+            # Collect attached context: GCC/clang `note:` follow-ons, Rust
+            # ` --> file:line | code | ^^^ ` span annotations, caret lines.
+            # Without this the LLM repair prompt only sees the headline
+            # error and misses what the compiler explained underneath.
+            context, next_i = _collect_context_lines(
+                lines, i + 1, GenericParser._PATTERN,
+            )
+            diagnostics.append(DiagnosticObject(
+                file=match.group(1),
+                line=int(match.group(2)),
+                column=int(match.group(3)),
+                severity=match.group(4).lower(),
+                error_code="",
+                message=match.group(5),
+                semantic_context=context,
+            ))
+            i = next_i
         return diagnostics
 
 

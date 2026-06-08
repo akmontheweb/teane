@@ -10,8 +10,35 @@ from harness.security import (
     GitGuardian,
     CommandValidator,
     CommandValidationResult,
+    HITLGate,
     create_command_validator_from_config,
 )
+
+
+class TestHITLGateCIBranch:
+    """Regression coverage for the CI auto-approve branch.
+
+    Locks in the corrected behaviour: ``auto_approve_in_ci=True`` means the
+    operation is approved (caller opted in); ``False`` means the operation
+    is blocked because there is no human present to confirm.
+    """
+
+    def test_auto_approve_true_in_ci_approves(self, monkeypatch):
+        monkeypatch.setenv("CI", "true")
+        gate = HITLGate(enabled=True, auto_approve_in_ci=True)
+        matches = [("git push", "sensitive push")]
+        assert gate.prompt_approval(matches) is True
+
+    def test_auto_approve_false_in_ci_blocks(self, monkeypatch):
+        monkeypatch.setenv("CI", "true")
+        gate = HITLGate(enabled=True, auto_approve_in_ci=False)
+        matches = [("git push", "sensitive push")]
+        assert gate.prompt_approval(matches) is False
+
+    def test_no_matches_always_approves(self, monkeypatch):
+        monkeypatch.setenv("CI", "true")
+        gate = HITLGate(enabled=True, auto_approve_in_ci=False)
+        assert gate.prompt_approval([]) is True
 
 
 class TestGitGuardian:

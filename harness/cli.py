@@ -1035,7 +1035,11 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
 
             print("[Refine] Updating specification with your feedback...")
             try:
-                updated = asyncio.get_event_loop().run_until_complete(
+                # ``interactive_review_loop`` is synchronous but is invoked
+                # from async ``cmd_run`` while a loop is already running.
+                # ``asyncio.run`` creates a fresh loop so we don't trip
+                # ``RuntimeError: This event loop is already running``.
+                updated = asyncio.run(
                     _refine_requirements(spec_path, notes, gateway)
                 )
                 print(f"[Refine] Specification updated ({len(updated):,} chars).")

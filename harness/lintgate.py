@@ -521,11 +521,38 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_path(filepath: str, workspace_path: str) -> Optional[str]:
-    """Resolve a filepath against the workspace."""
+    """
+    Resolve a filepath against the workspace with strict boundary enforcement.
+
+    Rejects absolute paths that escape the workspace and any relative path
+    that would traverse out via ``..`` or symlinks. Absolute paths that point
+    inside the workspace are accepted (converted to workspace-relative form
+    before delegating to ``trust.safe_resolve``).
+    """
+    from harness.trust import safe_resolve
+
+    if not filepath:
+        return None
+
     if os.path.isabs(filepath):
-        return filepath if os.path.exists(filepath) else None
-    full = os.path.join(workspace_path, filepath)
-    return full if os.path.exists(full) else None
+        # Convert an absolute path that lives inside the workspace into a
+        # workspace-relative form. Anything else is rejected as a boundary
+        # escape (previous behaviour silently accepted /etc/passwd).
+        try:
+            workspace_real = os.path.realpath(workspace_path)
+            filepath_real = os.path.realpath(filepath)
+            rel = os.path.relpath(filepath_real, workspace_real)
+        except (OSError, ValueError):
+            return None
+        if rel == ".." or rel.startswith(".." + os.sep):
+            return None
+        filepath = rel
+
+    try:
+        resolved = safe_resolve(workspace_path, filepath)
+    except ValueError:
+        return None
+    return resolved if os.path.exists(resolved) else None
 
 
 # ---------------------------------------------------------------------------

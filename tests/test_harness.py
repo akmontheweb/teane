@@ -1107,11 +1107,24 @@ class TestLintGate:
         assert is_tool_available("python") is True
         assert is_tool_available("nonexistent_tool_xyz") is False
 
-    def test_resolve_path_absolute(self):
+    def test_resolve_path_absolute_outside_workspace_rejected(self):
+        # Security: absolute paths that escape the workspace must be rejected,
+        # not silently returned. Previous behavior was an arbitrary-file-read
+        # vector.
         from harness.lintgate import _resolve_path
-        # Absolute existing path should return as-is
         result = _resolve_path("/tmp", "/workspace")
-        assert result == "/tmp"
+        assert result is None
+
+    def test_resolve_path_absolute_inside_workspace_resolves(self):
+        # Absolute path that lives inside the workspace is still accepted.
+        from harness.lintgate import _resolve_path
+        with tempfile.TemporaryDirectory() as ws:
+            target = os.path.join(ws, "file.py")
+            with open(target, "w") as f:
+                f.write("")
+            result = _resolve_path(target, ws)
+            assert result is not None
+            assert os.path.realpath(result) == os.path.realpath(target)
 
     def test_resolve_path_nonexistent(self):
         from harness.lintgate import _resolve_path

@@ -659,9 +659,12 @@ class HITLGate:
         Returns:
             True if the developer approves, False if denied.
 
-        In CI environments with auto_approve_in_ci=True, always returns False
-        (blocks by default in non-interactive mode) to prevent unattended
-        sensitive operations.
+        In CI environments (no interactive TTY available), the gate cannot
+        prompt a human. Behavior depends on ``auto_approve_in_ci``:
+          - ``True``: caller has explicitly opted into unattended CI runs;
+            sensitive operations are auto-approved with a warning.
+          - ``False`` (default): sensitive operations are blocked because
+            there is no human to confirm them.
         """
         if not matches:
             return True
@@ -669,14 +672,20 @@ class HITLGate:
         if self._is_ci_environment():
             if self.auto_approve_in_ci:
                 logger.warning(
-                    "[hitl_gate] CI environment detected. %d sensitive pattern(s) blocked: %s",
+                    "[hitl_gate] CI environment detected with auto_approve_in_ci=True. "
+                    "Auto-approving %d sensitive pattern(s): %s",
                     len(matches),
                     [warning for _, warning in matches],
                 )
-                return False  # Block in CI — no interactive prompt available
+                return True  # User opted into unattended CI approval
             else:
-                logger.info("[hitl_gate] CI detected but auto_approve_in_ci=False. Proceeding without prompt.")
-                return True
+                logger.warning(
+                    "[hitl_gate] CI environment detected with auto_approve_in_ci=False. "
+                    "Blocking %d sensitive pattern(s) (no interactive prompt available): %s",
+                    len(matches),
+                    [warning for _, warning in matches],
+                )
+                return False  # No human available to confirm — block
 
         # Interactive prompt
         print()

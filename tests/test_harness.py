@@ -1784,6 +1784,23 @@ class TestAgentState:
             assert "src/" in tree
             assert "main.py" in tree
 
+    def test_snapshot_directory_tree_unreadable_returns_descriptive_fallback(self, caplog):
+        # Regression for Bug 8: an unreadable workspace root used to return
+        # a bare "[Error reading directory: ...]" string with no warning,
+        # which silently poisoned the LLM system prompt.
+        import logging
+        from harness.graph import _snapshot_directory_tree
+
+        bogus_path = "/nonexistent_directory_xyz_for_bug8_test"
+        with caplog.at_level(logging.WARNING, logger="harness.graph"):
+            tree = _snapshot_directory_tree(bogus_path)
+
+        # Either the os.walk yields no results (empty lines → fallback string)
+        # or it raises and we log a warning. Both code paths should produce
+        # output that clearly identifies the bad path so the LLM context isn't
+        # silently poisoned.
+        assert bogus_path in tree or "Error reading directory" in tree
+
     def test_memory_cleanse(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)

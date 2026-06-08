@@ -300,7 +300,20 @@ def _snapshot_directory_tree(path: str, max_depth: int = 4, max_files_per_dir: i
             if len(files) > max_files_per_dir:
                 lines.append(f"{indent}... ({len(files) - max_files_per_dir} more files)")
     except (OSError, PermissionError) as exc:
+        # Surface as a WARNING so operators see the failure in logs — the
+        # previous silent return injected the error string straight into the
+        # LLM system prompt with no other signal, and the LLM would then
+        # hallucinate file paths against a workspace it cannot see.
+        logger.warning(
+            "[graph] Could not snapshot directory tree at %s: %s", path, exc,
+        )
         lines.append(f"[Error reading directory: {exc}]")
+    if not lines:
+        return (
+            f"[Unable to read directory structure at {path!s}. "
+            "The workspace appears empty or inaccessible — patches generated "
+            "against this snapshot will likely target non-existent files.]"
+        )
     return "\n".join(lines)
 
 

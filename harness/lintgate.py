@@ -307,8 +307,9 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                     format_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Format error for %s: %s", filepath, exc)
         else:
-            logger.debug(
-                "[lintgate_node] Skipping formatter '%s' for %s: tool not installed. %s",
+            logger.warning(
+                "[lintgate_node] Skipping formatter '%s' for %s extension: "
+                "tool not installed. Patches will not be auto-formatted. %s",
                 spec.command, ext, spec.install_hint,
             )
 

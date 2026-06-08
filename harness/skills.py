@@ -530,17 +530,29 @@ Use <<<CREATE_FILE>>> blocks to create the documentation file."""
             budget_remaining_usd=2.00,
         )
 
-        # Apply the generated document to disk
+        # Validate and write the generated document
         if response.content:
-            abs_output = _os.path.join(workspace_path, output_file) if not _os.path.isabs(output_file) else output_file
+            # Path validation: output_file must be workspace-relative and
+            # must not escape via absolute path or parent traversal.
+            from harness.trust import safe_resolve, validate_synthesized_spec
+            try:
+                abs_output = safe_resolve(workspace_path, output_file)
+            except ValueError as ve:
+                return {"success": False, "error": f"output_file path rejected: {ve}"}
+
+            # Validate the content before writing
+            content, trust_errors = validate_synthesized_spec(response.content)
+            if trust_errors:
+                return {"success": False, "error": f"docgen content failed trust validation: {trust_errors}"}
+
             _os.makedirs(_os.path.dirname(abs_output), exist_ok=True)
             with open(abs_output, "w", encoding="utf-8") as f:
-                f.write(response.content)
-            logger.info("[skills:docgen] Document written to %s (%d chars).", output_file, len(response.content))
+                f.write(content)
+            logger.info("[skills:docgen] Document written to %s (%d chars).", output_file, len(content))
             return {
                 "success": True,
                 "file": output_file,
-                "size_chars": len(response.content),
+                "size_chars": len(content),
                 "cost_usd": response.usage.cost_usd,
                 "message": f"Generated {doc_type} document at {output_file}.",
             }

@@ -1019,6 +1019,30 @@ class TestGateway:
         result = await check_context_window(messages, spec, threshold_pct=0.85)
         assert len(result) <= len(messages)
 
+    @pytest.mark.asyncio
+    async def test_check_context_window_continues_past_large_middle_message(self):
+        # Regression: the fill loop used `break` when a message was too big
+        # to fit. This caused all *older* (smaller) messages to be dropped
+        # even if they would have fit. `continue` is correct.
+        from harness.gateway import check_context_window, ModelSpec, estimate_token_count
+        # Small context: sys + last must fit, one middle too large, one tiny
+        spec = ModelSpec(provider="test", model_id="test", context_window=300,
+                        input_cost_per_1m=1.0, output_cost_per_1m=1.0)
+        messages = [
+            {"role": "system", "content": "sys"},          # ~1 token
+            {"role": "user", "content": "tiny"},            # ~1 token (oldest middle)
+            {"role": "assistant", "content": "x " * 200},  # huge — won't fit
+            {"role": "user", "content": "final question"},  # ~2 tokens (last, always kept)
+        ]
+        result = await check_context_window(messages, spec, threshold_pct=0.85)
+        # system and final must always be kept
+        assert result[0] == messages[0]
+        assert result[-1] == messages[-1]
+        # "tiny" (oldest middle) should survive because it fits, even though
+        # the message after it was too large.
+        contents = [m["content"] for m in result]
+        assert "tiny" in contents, f"Small old message was incorrectly dropped; result: {contents}"
+
     def test_gateway_aggregate_tokens(self):
         from harness.gateway import Gateway, GatewayConfig, TokenUsage
         gateway = Gateway(GatewayConfig())
@@ -1361,18 +1385,6 @@ class TestAgentState:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir, spec_override="# Custom Spec\n\nRequirements here")
             assert state["messages"][0]["content"] == "# Custom Spec\n\nRequirements here"
-
-    def test_route_after_planning(self):
-        from harness.graph import route_after_planning
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state = _make_state(tmpdir)
-            assert route_after_planning(state) == "patching_node"
-
-    def test_route_after_patching(self):
-        from harness.graph import route_after_patching
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state = _make_state(tmpdir)
-            assert route_after_patching(state) == "compiler_node"
 
     def test_route_after_compiler_success(self):
         from harness.graph import route_after_compiler

@@ -157,21 +157,43 @@ class PythonParser(BaseLanguageParser):
         re.MULTILINE,
     )
 
+    # Stdlib and virtual-env path fragments that should be deprioritised
+    # when searching for the most useful traceback frame.
+    _STDLIB_FRAGMENTS = (
+        os.sep + "lib" + os.sep + "python",
+        os.sep + "site-packages" + os.sep,
+        "<frozen",
+        "<string>",
+    )
+
+    @classmethod
+    def _is_user_frame(cls, filepath: str) -> bool:
+        """True when the traceback file looks like user/project code."""
+        return not any(frag in filepath for frag in cls._STDLIB_FRAGMENTS)
+
     @staticmethod
     def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
         diagnostics: list[DiagnosticObject] = []
         lines = raw_output.splitlines()
 
-        # Find the last traceback entry (closest to the actual error)
-        last_file = ""
-        last_line = 0
-        last_function = ""
+        # Collect all traceback frames (file, line, function).
+        # The "last user frame" — the deepest non-stdlib frame — is
+        # more useful than the absolute last frame, which may be inside
+        # the try/except handler or a stdlib wrapper.
+        frames: list[tuple[str, int, str]] = []
         for line in lines:
             match = PythonParser._TRACEBACK_PATTERN.match(line.strip())
             if match:
-                last_file = match.group(1)
-                last_line = int(match.group(2))
-                last_function = match.group(3) or ""
+                frames.append((match.group(1), int(match.group(2)), match.group(3) or ""))
+
+        # Prefer the innermost user-code frame; fall back to the last frame.
+        best_file, best_line, best_func = "", 0, ""
+        for filepath, lineno, func in reversed(frames):
+            if PythonParser._is_user_frame(filepath):
+                best_file, best_line, best_func = filepath, lineno, func
+                break
+        if not best_file and frames:
+            best_file, best_line, best_func = frames[-1]
 
         # Find the error message
         error_type = "Exception"
@@ -183,14 +205,14 @@ class PythonParser(BaseLanguageParser):
                 error_msg = match.group(2)
                 break
 
-        if last_file:
+        if best_file:
             diagnostics.append(DiagnosticObject(
-                file=last_file,
-                line=last_line,
+                file=best_file,
+                line=best_line,
                 column=0,
                 severity="error",
                 error_code=error_type,
-                message=error_msg or last_function,
+                message=error_msg or best_func,
                 semantic_context="",
             ))
 

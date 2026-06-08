@@ -1757,31 +1757,8 @@ def route_after_hitl(state: AgentState) -> Literal["compiler_node", "__end__"]:
 # 8. Route After Planning: Always to Patching
 # ---------------------------------------------------------------------------
 
-def route_after_planning(state: AgentState) -> Literal["patching_node"]:
-    """After planning completes, always proceed to the patching node."""
-    return "patching_node"
-
-
 # ---------------------------------------------------------------------------
-# 9. Route After Patching: Always to Compiler
-# ---------------------------------------------------------------------------
-
-def route_after_patching(state: AgentState) -> Literal["compiler_node"]:
-    """After patching completes, always proceed to the compiler node for verification."""
-    return "compiler_node"
-
-
-# ---------------------------------------------------------------------------
-# 10. Route After Repair: Always to Compiler
-# ---------------------------------------------------------------------------
-
-def route_after_repair(state: AgentState) -> Literal["compiler_node"]:
-    """After a repair patch is applied, always re-verify with the compiler."""
-    return "compiler_node"
-
-
-# ---------------------------------------------------------------------------
-# 11. Graph Builder — Assembles the Full StateGraph
+# 9. Graph Builder — Assembles the Full StateGraph
 # ---------------------------------------------------------------------------
 
 def build_graph() -> Any:

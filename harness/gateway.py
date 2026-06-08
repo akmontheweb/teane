@@ -778,8 +778,7 @@ async def check_context_window(
         if msg_estimate <= available_budget:
             truncated.insert(insertion_point, msg)
             available_budget -= msg_estimate
-        else:
-            break  # Can't fit more; oldest messages get dropped
+        # Don't break — a subsequent (older, smaller) message may still fit.
 
     truncated.append(messages[-1])
 

@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pytest-regression
+        name: pytest regression pack (480 tests)
+        entry: python -m pytest tests/ -q --tb=short
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

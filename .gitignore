@@ -29,3 +29,10 @@ Thumbs.db
 # Harness runtime
 *.db
 /tmp/.harness/
+
+# Test artifacts
+.coverage
+.pytest_cache/
+
+# Local agent metadata
+.claude/

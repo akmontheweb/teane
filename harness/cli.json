@@ -42,5 +42,12 @@
         "db_path": "~/.harness/checkpoints.db",
         "ttl_days": 30
     },
-    "manifest_file": "product_spec.txt"
+    "manifest_file": "product_spec.txt",
+    "logging": {
+        "_comment": "Structured logging configuration. Override in .harness_config.json.",
+        "level": "INFO",
+        "log_dir": "~/.harness/logs",
+        "json_stderr": false,
+        "langsmith": false
+    }
 }

@@ -1135,6 +1135,17 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     session_id = generate_session_id(args.session_id)
 
+    # Configure structured logging / per-session log file
+    from harness.observability import configure_logging
+    log_cfg = config.get("logging", {})
+    configure_logging(
+        session_id=session_id,
+        log_dir=log_cfg.get("log_dir", "~/.harness/logs"),
+        level=log_cfg.get("level", "INFO"),
+        langsmith_enabled=bool(log_cfg.get("langsmith", False)),
+        json_stderr=bool(log_cfg.get("json_stderr", False)),
+    )
+
     # Extract budget and sandbox settings
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)

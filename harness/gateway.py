@@ -1173,6 +1173,9 @@ class Gateway:
         # Execute with retry/backoff
         logger.info("[gateway] Dispatching to %s (role=%s, thinking=%s).", model_key, role.value, thinking)
 
+        import time as _time
+        _dispatch_start = _time.monotonic()
+
         async def _call() -> LLMResponse:
             return await provider.chat_completion(
                 messages=messages,
@@ -1189,6 +1192,7 @@ class Gateway:
         # Deduct cost from budget
         cost = response.usage.cost_usd
         new_budget = budget_remaining_usd - cost
+        elapsed_ms = round((_time.monotonic() - _dispatch_start) * 1000)
 
         logger.info(
             "[gateway] Response received. model=%s tokens_in=%d tokens_out=%d cache_hit=%d cost=$%.6f budget_left=$%.4f",
@@ -1199,6 +1203,24 @@ class Gateway:
             cost,
             new_budget,
         )
+
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "llm_call",
+                model=response.model,
+                role=role.value,
+                tokens_in=response.usage.input_tokens,
+                tokens_out=response.usage.output_tokens,
+                cached_tokens=response.usage.cached_tokens,
+                cache_creation_tokens=response.usage.cache_creation_tokens,
+                cost_usd=cost,
+                budget_remaining_usd=new_budget,
+                elapsed_ms=elapsed_ms,
+                finish_reason=response.finish_reason,
+            )
+        except Exception:  # noqa: BLE001 — observability must never break dispatch
+            pass
 
         return response, new_budget
 

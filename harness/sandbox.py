@@ -1254,6 +1254,12 @@ class SandboxExecutor:
             build_command,
         )
 
+        try:
+            from harness.observability import emit_event
+            emit_event("build_start", backend=self.backend.name, command=build_command)
+        except Exception:  # noqa: BLE001
+            pass
+
         exit_code, raw_output, timed_out, log_truncated = await self.backend.run(
             command=build_command,
             workspace_path=self.workspace_path,
@@ -1281,6 +1287,20 @@ class SandboxExecutor:
             "[sandbox] Build finished: backend=%s exit=%d elapsed=%.2fs timed_out=%s diagnostics=%d log_truncated=%s",
             self.backend.name, exit_code, elapsed, timed_out, len(diagnostics), log_truncated,
         )
+
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "build_end",
+                backend=self.backend.name,
+                exit_code=exit_code,
+                elapsed_seconds=round(elapsed, 3),
+                timed_out=timed_out,
+                log_truncated=log_truncated,
+                diagnostics=len(diagnostics),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         return BuildResult(
             exit_code=exit_code,

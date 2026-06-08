@@ -1038,14 +1038,25 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     total_repairs: int = loop_counter.get("total_repairs", 0)
     max_iterations: int = 3  # Spec: route to HITL after 3 failed repair attempts
 
+    def _transition(dest: str) -> str:
+        try:
+            from harness.observability import emit_event
+            emit_event("node_transition",
+                       from_node="compiler_node", to_node=dest,
+                       exit_code=exit_code, total_repairs=total_repairs,
+                       budget_remaining_usd=budget_remaining)
+        except Exception:  # noqa: BLE001
+            pass
+        return dest
+
     # Check budget first — financial guardrail takes priority
     if budget_remaining <= 0.0:
         logger.warning("[router] Budget exhausted ($%.4f remaining). Routing to HITL.", budget_remaining)
-        return "human_intervention_node"
+        return _transition("human_intervention_node")
 
     if exit_code == 0:
         logger.info("[router] Build succeeded (exit 0). Routing to security scan.")
-        return "security_scan_node"
+        return _transition("security_scan_node")
 
     if total_repairs >= max_iterations:
         logger.warning(
@@ -1053,10 +1064,10 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             total_repairs,
             max_iterations,
         )
-        return "human_intervention_node"
+        return _transition("human_intervention_node")
 
     logger.info("[router] Build failed (exit %d). Repair attempt %d/%d.", exit_code, total_repairs + 1, max_iterations)
-    return "repair_node"
+    return _transition("repair_node")
 
 
 # ---------------------------------------------------------------------------

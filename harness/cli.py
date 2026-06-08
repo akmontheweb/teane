@@ -1313,6 +1313,35 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     logger.info("[resume] Restoring session '%s' from checkpoint.", args.session_id)
 
+    # One-screen diagnostic: tell the user exactly what we're about to
+    # resume so they don't fly blind. Read-only — re-uses the same
+    # inspect_session() helper that powers `harness status`. Failures
+    # here must never block resume itself, so wrap in a broad except.
+    try:
+        from harness.storage import inspect_session as _inspect_session
+        summary = await _inspect_session(db_path, args.session_id)
+        if summary is not None:
+            file_preview = ""
+            if summary.modified_files:
+                shown = ", ".join(summary.modified_files[:5])
+                more = f", +{len(summary.modified_files) - 5} more" if len(summary.modified_files) > 5 else ""
+                file_preview = f" ({shown}{more})"
+            last_exit_label = (
+                "0 (clean)" if summary.exit_code == 0
+                else "-1 (not yet built)" if summary.exit_code == -1
+                else f"{summary.exit_code} (failed)"
+            )
+            logger.info("=" * 60)
+            logger.info("Resuming session %s", args.session_id)
+            logger.info("  Last node:        %s", summary.current_node or "(unknown)")
+            logger.info("  Modified files:   %d%s", len(summary.modified_files), file_preview)
+            logger.info("  Budget remaining: $%.4f", summary.budget_remaining_usd)
+            logger.info("  Last exit code:   %s", last_exit_label)
+            logger.info("  Loop counters:    %s", summary.loop_counters or "{}")
+            logger.info("=" * 60)
+    except Exception as _exc:  # noqa: BLE001 — diagnostic must never block resume
+        logger.debug("[resume] Could not build pre-resume summary: %s", _exc)
+
     try:
         final_state = await run_graph(
             workspace_path=workspace_path,

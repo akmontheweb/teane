@@ -337,7 +337,13 @@ class BasePatcher(ABC):
 
     @abstractmethod
     async def create_file(self, filepath: str, content: str) -> PatchResult:
-        """Create a new file with the given content. Fails if file already exists."""
+        """
+        Create a new file with the given content.
+
+        Idempotent: if the file already exists with byte-identical content,
+        returns success with a no-op message (resume-safe). If the file
+        exists with different content, returns an error.
+        """
         ...
 
     @abstractmethod
@@ -383,17 +389,48 @@ class TextPatcher(BasePatcher):
         full_path, _err = self._resolve_safe(filepath, OperationType.CREATE_FILE)
         if _err is not None:
             return _err
+
+        # Idempotency: if the file already exists with byte-identical content,
+        # treat as a successful no-op so a crash-then-resume of the same patch
+        # batch doesn't fail with "File already exists". Different content
+        # remains a hard error — that's genuinely unsafe to overwrite blindly.
+        expected = content + "\n"
         if os.path.exists(full_path):
+            try:
+                actual = await _aread(full_path)
+            except OSError as exc:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.CREATE_FILE,
+                    error=f"File exists but unreadable: {exc}",
+                )
+            if actual == expected:
+                logger.info(
+                    "[patcher:text] CREATE_FILE no-op: %s already at target state (resume-safe).",
+                    filepath,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.CREATE_FILE,
+                    message=f"already at target state (no-op on resume): {filepath}",
+                    lines_changed=0,
+                )
+            snippet = actual[:200].replace("\n", "\\n")
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.CREATE_FILE,
-                error=f"File already exists: {full_path}",
+                error=(
+                    f"File already exists with different content: {full_path}. "
+                    f"Existing first 200 chars: {snippet!r}"
+                ),
             )
 
         try:
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            await _awrite(full_path, content + "\n")
+            await _awrite(full_path, expected)
             lines_added = content.count("\n") + 1
             logger.info("[patcher:text] Created file: %s (%d lines)", filepath, lines_added)
             return PatchResult(
@@ -431,6 +468,25 @@ class TextPatcher(BasePatcher):
         # Exact match search — count occurrences
         count = original.count(search)
         if count == 0:
+            # Idempotency: if the replacement text is already present in
+            # the file (and the search text is gone), this REPLACE_BLOCK
+            # was already applied — likely by an earlier run of the same
+            # patch batch before the process crashed. Report success so
+            # the resume continues cleanly. We require the replacement
+            # to appear exactly once to avoid false positives where the
+            # text happens to appear elsewhere.
+            if replace and original.count(replace) == 1:
+                logger.info(
+                    "[patcher:text] REPLACE_BLOCK no-op: %s already at target state (resume-safe).",
+                    filepath,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.REPLACE_BLOCK,
+                    message=f"region already at target state (no-op on resume): {filepath}",
+                    lines_changed=0,
+                )
             # Try fuzzy matching to produce a helpful error
             suggestion = _find_closest_match(original, search)
             return PatchResult(
@@ -482,11 +538,20 @@ class TextPatcher(BasePatcher):
 
         count = original.count(search)
         if count == 0:
+            # Idempotency: DELETE_BLOCK's post-condition is exactly "this
+            # text is not in the file". If it's already gone, we are
+            # done — a resume of a partially-applied patch batch picks
+            # up cleanly instead of erroring.
+            logger.info(
+                "[patcher:text] DELETE_BLOCK no-op: %s already deleted (resume-safe).",
+                filepath,
+            )
             return PatchResult(
-                success=False,
+                success=True,
                 file=filepath,
                 operation=OperationType.DELETE_BLOCK,
-                error=f"Delete block not found in {filepath}.",
+                message=f"already deleted (no-op on resume): {filepath}",
+                lines_changed=0,
             )
         if count > 1:
             return PatchResult(
@@ -546,6 +611,22 @@ class TextPatcher(BasePatcher):
             line_start = original.rfind("\n", 0, anchor_idx) + 1
             insert_point = line_start
             content_with_newline = content.rstrip("\n") + "\n"
+            # Idempotency: if content_with_newline is already immediately
+            # before the anchor line, this INSERT_AT_BLOCK already ran.
+            # Re-running would duplicate. Detect and no-op.
+            existing_before = original[max(0, line_start - len(content_with_newline)):line_start]
+            if existing_before == content_with_newline:
+                logger.info(
+                    "[patcher:text] INSERT_AT_BLOCK no-op (BEFORE): %s already inserted (resume-safe).",
+                    filepath,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.INSERT_AT_BLOCK,
+                    message=f"already inserted (no-op on resume): {filepath}",
+                    lines_changed=0,
+                )
             modified = original[:insert_point] + content_with_newline + original[insert_point:]
         else:  # Placement.AFTER
             # Find the end of the line containing the anchor
@@ -554,6 +635,22 @@ class TextPatcher(BasePatcher):
                 line_end = len(original)
             insert_point = line_end + 1
             content_with_newline = "\n" + content.rstrip("\n")
+            # Idempotency: if content_with_newline is already at the insert
+            # point, this INSERT_AT_BLOCK already ran. Re-running would
+            # duplicate.
+            existing_after = original[insert_point:insert_point + len(content_with_newline)]
+            if existing_after == content_with_newline:
+                logger.info(
+                    "[patcher:text] INSERT_AT_BLOCK no-op (AFTER): %s already inserted (resume-safe).",
+                    filepath,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.INSERT_AT_BLOCK,
+                    message=f"already inserted (no-op on resume): {filepath}",
+                    lines_changed=0,
+                )
             modified = original[:insert_point] + content_with_newline + original[insert_point:]
 
         lines_changed = content.count("\n") + 1
@@ -663,31 +760,10 @@ class TreeSitterPatcher(BasePatcher):
         return results
 
     async def create_file(self, filepath: str, content: str) -> PatchResult:
-        # CREATE_FILE is purely text-based regardless — no AST parsing needed for new files
-        full_path, _err = self._resolve_safe(filepath, OperationType.CREATE_FILE)
-        if _err is not None:
-            return _err
-        if os.path.exists(full_path):
-            return PatchResult(
-                success=False,
-                file=filepath,
-                operation=OperationType.CREATE_FILE,
-                error=f"File already exists: {full_path}",
-            )
-        try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            await _awrite(full_path, content + "\n")
-            lines = content.count("\n") + 1
-            logger.info("[patcher:ast] Created file: %s (%d lines)", filepath, lines)
-            return PatchResult(
-                success=True,
-                file=filepath,
-                operation=OperationType.CREATE_FILE,
-                message=f"Created {filepath} ({lines} lines)",
-                lines_changed=lines,
-            )
-        except OSError as exc:
-            return PatchResult(success=False, file=filepath, operation=OperationType.CREATE_FILE, error=str(exc))
+        # CREATE_FILE is purely text-based regardless — delegate to TextPatcher
+        # so the idempotency logic lives in exactly one place.
+        text_patcher = TextPatcher(self.workspace_root)
+        return await text_patcher.create_file(filepath, content)
 
     async def replace_block(self, filepath: str, search: str, replace: str) -> PatchResult:
         """

@@ -299,6 +299,163 @@ class TestTextPatcher:
                 new_content = f.read()
                 assert "print('inserted')" in new_content
 
+    # ---- Resume-idempotency regressions ----
+
+    @pytest.mark.asyncio
+    async def test_create_file_idempotent_when_identical_content(self):
+        # Re-running a CREATE_FILE with identical content (e.g. after a
+        # crash-then-resume) must return success, not "File already exists".
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = TextPatcher(tmpdir)
+            r1 = await patcher.create_file("idem.py", "print('a')")
+            assert r1.success
+            r2 = await patcher.create_file("idem.py", "print('a')")
+            assert r2.success
+            assert "no-op" in r2.message.lower() or "already at target" in r2.message.lower()
+            assert r2.lines_changed == 0
+
+    @pytest.mark.asyncio
+    async def test_create_file_errors_when_content_differs(self):
+        # If the existing file has DIFFERENT content, refuse — overwriting
+        # would clobber whatever else put something there.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = TextPatcher(tmpdir)
+            await patcher.create_file("idem.py", "print('a')")
+            r2 = await patcher.create_file("idem.py", "print('different')")
+            assert not r2.success
+            assert "different content" in r2.error.lower()
+            # Original content untouched on disk
+            with open(os.path.join(tmpdir, "idem.py")) as f:
+                assert "print('a')" in f.read()
+
+    @pytest.mark.asyncio
+    async def test_replace_block_idempotent_when_already_replaced(self):
+        # Search text gone but replace text already present (uniquely) →
+        # the patch already ran. Report success on the re-run.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test.py")
+            with open(filepath, "w") as f:
+                f.write("def foo():\n    return 42\n")
+            patcher = TextPatcher(tmpdir)
+            # Try to "replace" something that's already at target state
+            result = await patcher.replace_block("test.py", "return 1", "return 42")
+            assert result.success
+            assert "already at target" in result.message.lower() or "no-op" in result.message.lower()
+            assert result.lines_changed == 0
+
+    @pytest.mark.asyncio
+    async def test_replace_block_still_fails_when_neither_present(self):
+        # When search and replace are BOTH absent the error path must remain.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test.py")
+            with open(filepath, "w") as f:
+                f.write("def foo():\n    return 1\n")
+            patcher = TextPatcher(tmpdir)
+            result = await patcher.replace_block("test.py", "missing", "also_missing")
+            assert not result.success
+            assert "not found" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_delete_block_idempotent_when_already_gone(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test.py")
+            with open(filepath, "w") as f:
+                f.write("line1\nline3\n")  # no "line2"
+            patcher = TextPatcher(tmpdir)
+            result = await patcher.delete_block("test.py", "line2\n")
+            assert result.success
+            assert "already deleted" in result.message.lower() or "no-op" in result.message.lower()
+            assert result.lines_changed == 0
+            # File untouched
+            with open(filepath) as f:
+                assert f.read() == "line1\nline3\n"
+
+    @pytest.mark.asyncio
+    async def test_insert_at_block_idempotent_when_already_inserted(self):
+        # Re-running INSERT_AT_BLOCK with the same anchor + content must
+        # not duplicate the insertion.
+        from harness.patcher import TextPatcher, Placement
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test.py")
+            with open(filepath, "w") as f:
+                f.write("line1\ndef target():\n    pass\nline3\n")
+            patcher = TextPatcher(tmpdir)
+            r1 = await patcher.insert_at_block(
+                "test.py", "target", Placement.AFTER, "    print('inserted')"
+            )
+            assert r1.success
+            r2 = await patcher.insert_at_block(
+                "test.py", "target", Placement.AFTER, "    print('inserted')"
+            )
+            assert r2.success
+            assert "already inserted" in r2.message.lower() or "no-op" in r2.message.lower()
+            assert r2.lines_changed == 0
+            # Content appears exactly once, not twice
+            with open(filepath) as f:
+                body = f.read()
+            assert body.count("print('inserted')") == 1
+
+    @pytest.mark.asyncio
+    async def test_insert_at_block_before_idempotent(self):
+        from harness.patcher import TextPatcher, Placement
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test.py")
+            with open(filepath, "w") as f:
+                f.write("def target():\n    pass\n")
+            patcher = TextPatcher(tmpdir)
+            r1 = await patcher.insert_at_block(
+                "test.py", "target", Placement.BEFORE, "# pragma: comment"
+            )
+            assert r1.success
+            r2 = await patcher.insert_at_block(
+                "test.py", "target", Placement.BEFORE, "# pragma: comment"
+            )
+            assert r2.success
+            assert r2.lines_changed == 0
+            with open(filepath) as f:
+                assert f.read().count("# pragma: comment") == 1
+
+    @pytest.mark.asyncio
+    async def test_patch_batch_partial_then_resume(self):
+        # End-to-end resume simulation: apply 2 of 3 CREATE_FILE patches,
+        # pretend the process crashed, then re-apply all 3. With
+        # idempotent CREATE_FILE the resume must succeed cleanly with
+        # the already-applied files reported as no-ops.
+        from harness.patcher import (
+            TextPatcher, HybridPatcher, PatchBlock, OperationType,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # First pass — partial: a.py and b.py created, c.py NOT yet.
+            patcher = TextPatcher(tmpdir)
+            r1 = await patcher.create_file("a.py", "x = 1")
+            r2 = await patcher.create_file("b.py", "y = 2")
+            assert r1.success and r2.success
+            # Simulate crash here: c.py was never created in the original run.
+
+            # Resume — full batch re-tried via HybridPatcher (the
+            # production path):
+            hybrid = HybridPatcher(tmpdir)
+            results = await hybrid.apply_all([
+                PatchBlock(operation=OperationType.CREATE_FILE, file="a.py", content="x = 1"),
+                PatchBlock(operation=OperationType.CREATE_FILE, file="b.py", content="y = 2"),
+                PatchBlock(operation=OperationType.CREATE_FILE, file="c.py", content="z = 3"),
+            ])
+            assert all(r.success for r in results), [
+                r.error for r in results if not r.success
+            ]
+            # Two were no-ops, one was a real creation
+            no_ops = [r for r in results if "no-op" in (r.message or "").lower()]
+            assert len(no_ops) == 2
+            # All three files exist with the expected content
+            for name, body in [("a.py", "x = 1"), ("b.py", "y = 2"), ("c.py", "z = 3")]:
+                with open(os.path.join(tmpdir, name)) as f:
+                    assert body in f.read()
+
 
 class TestHybridPatcher:
 

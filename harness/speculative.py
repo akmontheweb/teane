@@ -264,13 +264,46 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         logger.info("[speculative] Selected Variant %d (exit=%d, files=%d). Merging back.",
                      winner.index, winner.exit_code, len(winner.modified_files))
 
-        # Copy modified files from worktree back to main workspace
+        # Copy winning-variant files back to main workspace.
+        # Use temp files + atomic rename so a crash mid-copy doesn't leave
+        # the workspace in a half-merged state.
+        import tempfile as _tempfile
+        from harness.trust import safe_resolve as _safe_resolve
+        merge_errors: list[str] = []
         for filepath in winner.modified_files:
+            # Defense: the patcher already validates paths but the winner
+            # comes from a worktree — re-validate against workspace_path.
+            try:
+                _safe_resolve(workspace_path, filepath)
+            except ValueError:
+                logger.warning("[speculative] Skipping out-of-workspace path: %s", filepath)
+                continue
+
             src = os.path.join(winner.worktree_path, filepath)
             dst = os.path.join(workspace_path, filepath)
-            if os.path.isfile(src):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+            if not os.path.isfile(src):
+                continue
+            dst_dir = os.path.dirname(dst)
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+                fd, tmp = _tempfile.mkstemp(dir=dst_dir)
+                try:
+                    os.close(fd)
+                    shutil.copy2(src, tmp)
+                    os.replace(tmp, dst)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            except OSError as copy_err:
+                logger.error("[speculative] Failed to merge %s: %s", filepath, copy_err)
+                merge_errors.append(filepath)
+
+        if merge_errors:
+            logger.warning("[speculative] %d file(s) could not be merged: %s",
+                           len(merge_errors), merge_errors)
 
         # --- Step 7: Cleanup worktrees ---
         _cleanup_worktrees(workspace_path, worktree_base, variant_results)

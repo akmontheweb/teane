@@ -24,7 +24,7 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Union
 
 import httpx
 
@@ -197,10 +197,16 @@ class BaseLLM(ABC):
         - compute_cost(usage) → float
     """
 
-    def __init__(self, spec: ModelSpec, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        spec: ModelSpec,
+        api_key: Optional[str] = None,
+        ssl_verify: Union[bool, str] = True,
+    ):
         self.spec = spec
         # Resolution order: explicit arg → env var → config file → empty
         self.api_key = api_key or os.environ.get(f"{spec.provider.upper()}_API_KEY", "") or spec.api_key
+        self.ssl_verify = ssl_verify
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -218,6 +224,7 @@ class BaseLLM(ABC):
                 base_url=self.spec.api_base_url,
                 timeout=httpx.Timeout(120.0, connect=10.0),
                 headers=self._build_headers(),
+                verify=self.ssl_verify,
             )
         return self._client
 
@@ -260,6 +267,22 @@ class BaseLLM(ABC):
         ...
 
 
+def _parse_json_response(response: Any) -> dict[str, Any]:
+    """
+    Parse a JSON response body, converting JSONDecodeError into an
+    HTTPStatusError-like exception so retry_with_backoff treats it as
+    a retryable server error rather than letting it escape uncaught.
+    """
+    try:
+        return response.json()  # type: ignore[no-any-return]
+    except Exception as exc:
+        raise httpx.HTTPStatusError(
+            f"Malformed JSON in response body: {exc}",
+            request=response.request,
+            response=response,
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 3. DeepSeek Provider Implementation
 # ---------------------------------------------------------------------------
@@ -291,7 +314,7 @@ class DeepSeekProvider(BaseLLM):
 
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
-        data: dict[str, Any] = response.json()
+        data: dict[str, Any] = _parse_json_response(response)
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -376,6 +399,12 @@ class AnthropicProvider(BaseLLM):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
                             system_content.append(block.get("text", ""))
+                        elif isinstance(block, dict) and block.get("type") not in ("text", None):
+                            logger.warning(
+                                "[anthropic] Dropping non-text system block of type %r "
+                                "— Anthropic's top-level system field supports text only.",
+                                block.get("type"),
+                            )
             else:
                 # Map to Anthropic message format
                 anthropic_msg: dict[str, Any] = {"role": role, "content": msg.get("content", "")}
@@ -406,7 +435,7 @@ class AnthropicProvider(BaseLLM):
 
         response = await client.post("/messages", json=payload)
         response.raise_for_status()
-        data: dict[str, Any] = response.json()
+        data: dict[str, Any] = _parse_json_response(response)
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -491,7 +520,7 @@ class OpenAIProvider(BaseLLM):
 
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
-        data: dict[str, Any] = response.json()
+        data: dict[str, Any] = _parse_json_response(response)
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -564,7 +593,7 @@ class OllamaProvider(BaseLLM):
 
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
-        data: dict[str, Any] = response.json()
+        data: dict[str, Any] = _parse_json_response(response)
 
         usage = self.extract_usage(data)
         usage.cost_usd = 0.0  # Local inference is free
@@ -606,13 +635,20 @@ _provider_classes: dict[str, type[BaseLLM]] = {
 }
 
 
-def create_provider(model_key: str, api_key: Optional[str] = None) -> BaseLLM:
+def create_provider(
+    model_key: str,
+    api_key: Optional[str] = None,
+    ssl_verify: Union[bool, str] = True,
+) -> BaseLLM:
     """
     Factory: create the correct BaseLLM provider for a given model key.
 
     Args:
         model_key: Canonical model key (e.g., 'openai:gpt-4o').
         api_key: Optional API key override. Falls back to environment variable.
+        ssl_verify: TLS verification setting passed to httpx. Pass a CA bundle
+                    path (str) for corporate proxies, or False for air-gapped
+                    environments (not recommended for production).
 
     Returns:
         A configured BaseLLM provider instance.
@@ -633,7 +669,7 @@ def create_provider(model_key: str, api_key: Optional[str] = None) -> BaseLLM:
             f"Unknown provider '{provider_name}' for model '{model_key}'. "
             f"Supported providers: {list(_provider_classes.keys())}"
         )
-    return cls(spec, api_key=api_key or spec.api_key)
+    return cls(spec, api_key=api_key or spec.api_key, ssl_verify=ssl_verify)
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +975,9 @@ class GatewayConfig:
     context_window_threshold_pct: float = 0.85
     max_retries: int = 5
     base_delay: float = 1.0
+    # TLS: set to a CA bundle path (str) for corporate proxies, or False to
+    # disable verification in air-gapped envs (not recommended for production).
+    ssl_verify: Union[bool, str] = True
 
 
 class Gateway:
@@ -962,7 +1001,9 @@ class Gateway:
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
         if model_key not in self._providers:
-            self._providers[model_key] = create_provider(model_key)
+            self._providers[model_key] = create_provider(
+                model_key, ssl_verify=self.config.ssl_verify
+            )
         return self._providers[model_key]
 
     async def close(self) -> None:
@@ -1443,5 +1484,6 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         force_local_only=model_routing.get("force_local_only", False),
         hard_cap_usd=token_budget.get("hard_cap_usd", 2.00),
         context_window_threshold_pct=token_budget.get("context_window_threshold_pct", 0.85),
+        ssl_verify=config_dict.get("ssl_verify", True),
     )
     return Gateway(gateway_config)

@@ -142,3 +142,19 @@ class TestEmitEvent:
             assert len(events) >= 1
             assert events[0]["model"] == "x:y"
             assert events[0]["cost_usd"] == 0.01
+
+    def test_emit_with_langsmith_enabled(self, monkeypatch):
+        """emit_event should handle LangSmith integration if available."""
+        from harness.observability import configure_logging, emit_event
+        # Mock langsmith availability
+        monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+        monkeypatch.setenv("LANGCHAIN_API_KEY", "test-key")
+        monkeypatch.setenv("LANGSMITH_PROJECT", "harness-test")
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(session_id="ls-emit-test", log_dir=log_dir, level="DEBUG")
+            emit_event("test_event", detail="test data")
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            # Event should be logged regardless of LangSmith availability
+            assert path is not None

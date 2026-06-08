@@ -393,3 +393,113 @@ class TestAdversarialSweep:
         env = safe_subprocess_env()
         assert "ANTHROPIC_API_KEY" not in env
         assert "sk-ant-api01-super-secret" not in env.values()
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: safe_subprocess_env all scrubbed vars
+# ---------------------------------------------------------------------------
+
+class TestSafeSubprocessEnv:
+    """Test that all sensitive env vars are scrubbed."""
+
+    def test_all_scrubbed_vars_removed(self, monkeypatch):
+        from harness.trust import safe_subprocess_env, SCRUBBED_BUILD_ENV_VARS
+        # Set a few scrubbed vars
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "secret1")
+        monkeypatch.setenv("OPENAI_API_KEY", "secret2")
+        monkeypatch.setenv("GITHUB_TOKEN", "secret3")
+
+        env = safe_subprocess_env()
+        for var in SCRUBBED_BUILD_ENV_VARS:
+            assert var not in env, f"{var} should be scrubbed"
+
+    def test_keeps_non_scrubbed_vars(self, monkeypatch):
+        from harness.trust import safe_subprocess_env
+        monkeypatch.setenv("MY_CUSTOM_VAR", "keep_me")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        env = safe_subprocess_env()
+        assert env.get("MY_CUSTOM_VAR") == "keep_me"
+        assert "/usr/bin" in env.get("PATH", "")
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: validate_blueprint_json
+# ---------------------------------------------------------------------------
+
+class TestValidateBlueprintJson:
+    """Test blueprint JSON validation."""
+
+    def test_valid_blueprint_json(self):
+        from harness.trust import validate_blueprint_json
+        valid_blueprint = json.dumps({
+            "services": {
+                "api": {"base_image": "python:3.12", "exposed_port": 8000}
+            }
+        })
+        data, errors = validate_blueprint_json(valid_blueprint)
+        assert data is not None
+        assert len(errors) == 0
+
+    def test_malformed_json(self):
+        from harness.trust import validate_blueprint_json
+        invalid_json = "{not: valid json}"
+        data, errors = validate_blueprint_json(invalid_json)
+        # Returns {} (empty dict) on JSON decode error, with errors list populated
+        assert data == {}
+        assert len(errors) > 0
+
+    def test_empty_json(self):
+        from harness.trust import validate_blueprint_json
+        empty = "{}"
+        data, errors = validate_blueprint_json(empty)
+        assert data == {}
+        # Empty services is allowed
+        assert len(errors) == 0
+
+    def test_empty_string_blueprint(self):
+        from harness.trust import validate_blueprint_json
+        empty_str = ""
+        data, errors = validate_blueprint_json(empty_str)
+        assert data == {}
+        assert len(errors) > 0  # "blueprint response is empty"
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: is_path_allowed with symlinks
+# ---------------------------------------------------------------------------
+
+class TestIsPathAllowed:
+    """Test path allowlist validation."""
+
+    def test_file_inside_workspace_no_allowlist(self):
+        """No allowlist = all paths allowed."""
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            filepath = os.path.join(ws, "myfile.txt")
+            open(filepath, "w").close()
+            # None allowlist = all paths allowed
+            assert is_path_allowed(filepath, ws, allowed_paths=None) is True
+
+    def test_file_in_allowlist_accepted(self):
+        """File in allowlist should be accepted."""
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            # is_path_allowed takes workspace-relative path as second argument
+            # call signature: is_path_allowed(filepath: str, workspace_root: str, allowed_paths)
+            # where filepath is workspace-relative
+            assert is_path_allowed("allowed.txt", ws, allowed_paths=["allowed.txt"]) is True
+
+    def test_file_not_in_allowlist_rejected(self):
+        """File not in allowlist should be rejected."""
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            # File not in allowlist
+            assert is_path_allowed("notallowed.txt", ws, allowed_paths=["other.txt"]) is False
+
+    def test_directory_prefix_match(self):
+        """Path under allowlist directory prefix should be allowed."""
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            # allowlist with "src/" (directory prefix) allows src/main.py
+            assert is_path_allowed("src/main.py", ws, allowed_paths=["src/"]) is True

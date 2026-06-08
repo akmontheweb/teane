@@ -359,3 +359,53 @@ class TestHttpChannel:
     def test_is_interactive_true(self):
         ch = HttpChannel("http://127.0.0.1:9999")
         assert ch.is_interactive() is True
+
+    def test_connection_timeout_fallback(self):
+        """If the webhook server is unreachable, should fallback to default."""
+        ch = HttpChannel("http://127.0.0.1:1", max_retries=0)  # invalid port
+        # Should not raise, should return default
+        result = ch.prompt("Choose", ["a", "b"], default="a")
+        assert result == "a"
+
+    def test_non_200_status_with_valid_json(self):
+        """Non-200 status should fallback even if JSON is valid."""
+        server, url, _ = self._serve(b'{"answer": "should_ignore"}', status=400)
+        try:
+            ch = HttpChannel(url, max_retries=0)
+            result = ch.prompt("Choose", ["a", "b"], default="b")
+            assert result == "b"  # falls back to default, ignores answer
+        finally:
+            server.shutdown()
+
+
+class TestFileChannelEdgeCases:
+    """Additional coverage for FileChannel edge cases."""
+
+    def test_file_with_multiple_answers_consumed_sequentially(self):
+        """FileChannel should consume answers sequentially from file."""
+        with tempfile.TemporaryDirectory() as td:
+            response_file = os.path.join(td, "answers.json")
+            with open(response_file, "w") as f:
+                json.dump([
+                    {"prompt": "first", "answer": "a"},
+                    {"prompt": "second", "answer": "b"},
+                    {"prompt": "third", "answer": "c"},
+                ], f)
+            ch = FileChannel(response_file)
+            assert ch.notes("first prompt") == "a"
+            assert ch.notes("second prompt") == "b"
+            assert ch.notes("third prompt") == "c"
+
+    def test_file_channel_raises_on_unmatched_prompt_second_time(self):
+        """FileChannel should raise when same prompt is re-used (not pre-recorded twice)."""
+        with tempfile.TemporaryDirectory() as td:
+            response_file = os.path.join(td, "answers.json")
+            with open(response_file, "w") as f:
+                json.dump([
+                    {"prompt": "choose", "answer": "a"},
+                ], f)
+            ch = FileChannel(response_file)
+            assert ch.prompt("choose action", ["a", "b"]) == "a"
+            # Second call to same prompt should fail (not pre-recorded twice)
+            with pytest.raises(RuntimeError, match="No pre-recorded answer"):
+                ch.prompt("choose again", ["a", "b"])

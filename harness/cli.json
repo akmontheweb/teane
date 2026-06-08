@@ -24,6 +24,7 @@
     "node_throttle": {
         "max_patch_repair_iterations": 3
     },
+    "_models_comment": "Model specs are auto-loaded from harness/model_prices.json. List entries here only to override prices, add api_key, or register custom models. User entries are deep-merged over catalogue defaults.",
     "models": {},
     "model_routing": {
         "planning_primary": "",

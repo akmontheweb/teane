@@ -938,6 +938,69 @@ class TestFormatterSpec:
 # GATEWAY TESTS
 # ===========================================================================
 
+class TestModelPrices:
+
+    def test_catalogue_auto_loaded_at_import(self):
+        from harness.gateway import _MODEL_REGISTRY
+        # The shipped model_prices.json should have seeded the registry
+        assert len(_MODEL_REGISTRY) >= 10, "Expected at least 10 catalogue entries"
+
+    def test_known_models_in_catalogue(self):
+        from harness.gateway import get_model_spec
+        for key in ["anthropic:claude-sonnet-4-6", "openai:gpt-4o", "deepseek:deepseek-chat"]:
+            spec = get_model_spec(key)
+            assert spec is not None, f"{key} missing from catalogue"
+            assert spec.input_cost_per_1m >= 0
+            assert spec.output_cost_per_1m >= 0
+            assert spec.context_window > 0
+
+    def test_load_from_custom_file(self, tmp_path):
+        import json as _json
+        from harness.gateway import load_model_prices, get_model_spec
+        custom = tmp_path / "prices.json"
+        custom.write_text(_json.dumps({
+            "testprovider:test-model-x": {
+                "provider": "testprovider",
+                "model_id": "test-model-x",
+                "context_window": 4096,
+                "input_cost_per_1m": 9.99,
+                "output_cost_per_1m": 19.99,
+            }
+        }))
+        loaded = load_model_prices(str(custom), override=True)
+        assert loaded == 1
+        spec = get_model_spec("testprovider:test-model-x")
+        assert spec is not None
+        assert spec.input_cost_per_1m == 9.99
+
+    def test_user_config_overrides_catalogue(self):
+        from harness.gateway import register_models_from_config, get_model_spec
+        # User sets a higher input price for gpt-4o (e.g. after a price change)
+        config = {"models": {"openai:gpt-4o": {"input_cost_per_1m": 99.0}}}
+        register_models_from_config(config)
+        spec = get_model_spec("openai:gpt-4o")
+        assert spec is not None
+        assert spec.input_cost_per_1m == 99.0
+        # Other fields should still come from catalogue baseline
+        assert spec.context_window > 0
+
+    def test_load_ignores_comment_keys(self, tmp_path):
+        import json as _json
+        from harness.gateway import load_model_prices
+        custom = tmp_path / "prices.json"
+        custom.write_text(_json.dumps({
+            "_comment": "this is a comment",
+            "_version": "2025-01-01",
+        }))
+        loaded = load_model_prices(str(custom), override=True)
+        assert loaded == 0  # no real model entries
+
+    def test_load_nonexistent_file_returns_zero(self):
+        from harness.gateway import load_model_prices
+        count = load_model_prices("/nonexistent/path/prices.json")
+        assert count == 0
+
+
 class TestGateway:
 
     def test_register_model(self):

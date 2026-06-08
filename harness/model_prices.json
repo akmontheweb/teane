@@ -1,0 +1,158 @@
+{
+  "_comment": "Canonical model price catalogue — shipped with the harness.",
+  "_version": "2026-06-08",
+  "_update_guide": "Run `harness prices --refresh` (fetches from providers) or edit this file manually. Prices are USD per 1M tokens. User .harness_config.json 'models' entries always override these defaults.",
+
+  "anthropic:claude-opus-4-7": {
+    "provider": "anthropic",
+    "model_id": "claude-opus-4-7",
+    "context_window": 200000,
+    "input_cost_per_1m": 15.00,
+    "output_cost_per_1m": 75.00,
+    "cached_input_cost_per_1m": 1.50,
+    "cache_creation_cost_per_1m": 18.75,
+    "api_base_url": "https://api.anthropic.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true,
+    "anthropic_version": "2023-06-01",
+    "thinking_budget_tokens": 8000
+  },
+  "anthropic:claude-sonnet-4-6": {
+    "provider": "anthropic",
+    "model_id": "claude-sonnet-4-6",
+    "context_window": 200000,
+    "input_cost_per_1m": 3.00,
+    "output_cost_per_1m": 15.00,
+    "cached_input_cost_per_1m": 0.30,
+    "cache_creation_cost_per_1m": 3.75,
+    "api_base_url": "https://api.anthropic.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true,
+    "anthropic_version": "2023-06-01",
+    "thinking_budget_tokens": 8000
+  },
+  "anthropic:claude-haiku-4-5": {
+    "provider": "anthropic",
+    "model_id": "claude-haiku-4-5",
+    "context_window": 200000,
+    "input_cost_per_1m": 0.80,
+    "output_cost_per_1m": 4.00,
+    "cached_input_cost_per_1m": 0.08,
+    "cache_creation_cost_per_1m": 1.00,
+    "api_base_url": "https://api.anthropic.com/v1",
+    "supports_thinking": false,
+    "supports_cache": true,
+    "anthropic_version": "2023-06-01"
+  },
+  "anthropic:claude-3-5-sonnet-20241022": {
+    "provider": "anthropic",
+    "model_id": "claude-3-5-sonnet-20241022",
+    "context_window": 200000,
+    "input_cost_per_1m": 3.00,
+    "output_cost_per_1m": 15.00,
+    "cached_input_cost_per_1m": 0.30,
+    "cache_creation_cost_per_1m": 3.75,
+    "api_base_url": "https://api.anthropic.com/v1",
+    "supports_thinking": false,
+    "supports_cache": true,
+    "anthropic_version": "2023-06-01"
+  },
+  "anthropic:claude-3-5-haiku-20241022": {
+    "provider": "anthropic",
+    "model_id": "claude-3-5-haiku-20241022",
+    "context_window": 200000,
+    "input_cost_per_1m": 0.80,
+    "output_cost_per_1m": 4.00,
+    "cached_input_cost_per_1m": 0.08,
+    "cache_creation_cost_per_1m": 1.00,
+    "api_base_url": "https://api.anthropic.com/v1",
+    "supports_thinking": false,
+    "supports_cache": true,
+    "anthropic_version": "2023-06-01"
+  },
+  "openai:gpt-4o": {
+    "provider": "openai",
+    "model_id": "gpt-4o",
+    "context_window": 128000,
+    "input_cost_per_1m": 2.50,
+    "output_cost_per_1m": 10.00,
+    "cached_input_cost_per_1m": 1.25,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_cache": true
+  },
+  "openai:gpt-4o-mini": {
+    "provider": "openai",
+    "model_id": "gpt-4o-mini",
+    "context_window": 128000,
+    "input_cost_per_1m": 0.15,
+    "output_cost_per_1m": 0.60,
+    "cached_input_cost_per_1m": 0.075,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_cache": true
+  },
+  "openai:o1": {
+    "provider": "openai",
+    "model_id": "o1",
+    "context_window": 200000,
+    "input_cost_per_1m": 15.00,
+    "output_cost_per_1m": 60.00,
+    "cached_input_cost_per_1m": 7.50,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true
+  },
+  "openai:o3-mini": {
+    "provider": "openai",
+    "model_id": "o3-mini",
+    "context_window": 200000,
+    "input_cost_per_1m": 1.10,
+    "output_cost_per_1m": 4.40,
+    "cached_input_cost_per_1m": 0.55,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true
+  },
+  "deepseek:deepseek-chat": {
+    "provider": "deepseek",
+    "model_id": "deepseek-chat",
+    "context_window": 64000,
+    "input_cost_per_1m": 0.27,
+    "output_cost_per_1m": 1.10,
+    "cached_input_cost_per_1m": 0.07,
+    "api_base_url": "https://api.deepseek.com/v1"
+  },
+  "deepseek:deepseek-reasoner": {
+    "provider": "deepseek",
+    "model_id": "deepseek-reasoner",
+    "context_window": 64000,
+    "input_cost_per_1m": 0.55,
+    "output_cost_per_1m": 2.19,
+    "cached_input_cost_per_1m": 0.14,
+    "api_base_url": "https://api.deepseek.com/v1",
+    "supports_thinking": true
+  },
+  "ollama:llama3.2": {
+    "provider": "ollama",
+    "model_id": "llama3.2",
+    "context_window": 128000,
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "http://localhost:11434/v1"
+  },
+  "ollama:mistral": {
+    "provider": "ollama",
+    "model_id": "mistral",
+    "context_window": 32000,
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "http://localhost:11434/v1"
+  },
+  "ollama:codellama": {
+    "provider": "ollama",
+    "model_id": "codellama",
+    "context_window": 16000,
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "http://localhost:11434/v1"
+  }
+}

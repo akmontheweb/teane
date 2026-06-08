@@ -36,7 +36,7 @@ harness = "harness.cli:main"
 include = ["harness*"]
 
 [tool.setuptools.package-data]
-harness = ["cli.json"]
+harness = ["cli.json", "model_prices.json"]
 
 [tool.ruff]
 line-length = 120

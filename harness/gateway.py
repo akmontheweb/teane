@@ -103,17 +103,89 @@ class ModelSpec:
     thinking_budget_tokens: int = 8000
 
 
-# Model registry — user-populated via register_model() or .harness_config.json.
-# No default models are bundled. Every model must be explicitly registered.
+# Model registry — populated from model_prices.json at import time, then
+# overridden by user .harness_config.json 'models' entries, then by
+# explicit register_model() calls. This gives a sensible price catalogue
+# out-of-the-box while letting users override without editing source.
 _MODEL_REGISTRY: dict[str, ModelSpec] = {}
+
+# Path of the shipped price catalogue — installed alongside this module.
+_PRICES_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_prices.json")
+
+
+def load_model_prices(prices_path: Optional[str] = None, override: bool = False) -> int:
+    """
+    Load model specifications from a price-catalogue JSON file into the
+    model registry.
+
+    Called automatically at module import with the shipped
+    ``harness/model_prices.json``. Can be called again with a custom path
+    to load user-defined overrides or an updated price snapshot.
+
+    Args:
+        prices_path: Path to the JSON catalogue. Defaults to the shipped
+                     ``harness/model_prices.json``.
+        override:    If True, overwrite any existing registry entry for a
+                     model key. If False (default), existing entries win —
+                     this means a user's .harness_config.json entry always
+                     takes precedence over the shipped catalogue.
+
+    Returns:
+        Number of models successfully loaded.
+    """
+    path = prices_path or _PRICES_JSON_PATH
+    if not os.path.isfile(path):
+        logger.debug("[gateway] Model prices file not found at %s; skipping.", path)
+        return 0
+    try:
+        import json as _json
+        with open(path, "r", encoding="utf-8") as f:
+            raw: dict[str, Any] = _json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("[gateway] Could not load model prices from %s: %s", path, exc)
+        return 0
+
+    count = 0
+    for model_key, spec_dict in raw.items():
+        if model_key.startswith("_"):
+            continue  # skip comment/metadata keys
+        if not isinstance(spec_dict, dict):
+            continue
+        if not override and model_key in _MODEL_REGISTRY:
+            continue  # user config already registered this key — don't clobber
+        try:
+            spec = ModelSpec(
+                provider=spec_dict.get("provider", model_key.split(":")[0] if ":" in model_key else "unknown"),
+                model_id=spec_dict.get("model_id", model_key),
+                context_window=int(spec_dict.get("context_window", 131072)),
+                input_cost_per_1m=float(spec_dict.get("input_cost_per_1m", 0.0)),
+                output_cost_per_1m=float(spec_dict.get("output_cost_per_1m", 0.0)),
+                cached_input_cost_per_1m=float(spec_dict.get("cached_input_cost_per_1m", 0.0)),
+                cache_creation_cost_per_1m=float(spec_dict.get("cache_creation_cost_per_1m", 0.0)),
+                api_base_url=spec_dict.get("api_base_url", ""),
+                api_key=spec_dict.get("api_key", ""),
+                supports_thinking=bool(spec_dict.get("supports_thinking", False)),
+                supports_cache=bool(spec_dict.get("supports_cache", False)),
+                anthropic_version=spec_dict.get("anthropic_version", "2023-06-01"),
+                thinking_budget_tokens=int(spec_dict.get("thinking_budget_tokens", 8000)),
+            )
+            _MODEL_REGISTRY[model_key] = spec
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[gateway] Skipping malformed entry '%s' in %s: %s", model_key, path, exc)
+
+    if count:
+        logger.debug("[gateway] Loaded %d model(s) from %s.", count, path)
+    return count
 
 
 def get_model_spec(model_key: str) -> Optional[ModelSpec]:
     """
     Look up a model specification by its canonical key.
 
-    Returns None if the model is not registered. All models must be explicitly
-    registered via register_model() or .harness_config.json before use.
+    Returns None if the model is not registered. The registry is pre-seeded
+    with the shipped ``harness/model_prices.json`` catalogue; additional
+    models can be registered via .harness_config.json or register_model().
     """
     return _MODEL_REGISTRY.get(model_key)
 
@@ -128,6 +200,15 @@ def register_model(model_key: str, spec: ModelSpec) -> None:
     """
     _MODEL_REGISTRY[model_key] = spec
     logger.info("[gateway] Registered model '%s' (provider=%s, ctx=%d).", model_key, spec.provider, spec.context_window)
+
+
+# ---------------------------------------------------------------------------
+# Auto-seed the registry from the shipped price catalogue at import time.
+# This is a lightweight file read (~2ms). It runs before any user config
+# is loaded; register_models_from_config() called later will override these
+# defaults since it calls register_model() which always wins.
+# ---------------------------------------------------------------------------
+load_model_prices()
 
 
 def register_models_from_config(config_dict: dict[str, Any]) -> int:
@@ -162,17 +243,42 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
             logger.warning("[gateway] Skipping invalid model spec for '%s': not a dict.", model_key)
             continue
         try:
+            # Merge over the catalogue baseline if it exists, so users only
+            # need to specify the keys they want to override (e.g. api_key).
+            baseline = _MODEL_REGISTRY.get(model_key)
+            merged: dict[str, Any] = {}
+            if baseline is not None:
+                merged.update({
+                    "provider": baseline.provider,
+                    "model_id": baseline.model_id,
+                    "context_window": baseline.context_window,
+                    "input_cost_per_1m": baseline.input_cost_per_1m,
+                    "output_cost_per_1m": baseline.output_cost_per_1m,
+                    "cached_input_cost_per_1m": baseline.cached_input_cost_per_1m,
+                    "cache_creation_cost_per_1m": baseline.cache_creation_cost_per_1m,
+                    "api_base_url": baseline.api_base_url,
+                    "api_key": baseline.api_key,
+                    "supports_thinking": baseline.supports_thinking,
+                    "supports_cache": baseline.supports_cache,
+                    "anthropic_version": baseline.anthropic_version,
+                    "thinking_budget_tokens": baseline.thinking_budget_tokens,
+                })
+            merged.update(spec_dict)  # user config wins over catalogue baseline
+
             spec = ModelSpec(
-                provider=spec_dict.get("provider", model_key.split(":")[0] if ":" in model_key else "unknown"),
-                model_id=spec_dict.get("model_id", model_key),
-                context_window=spec_dict.get("context_window", 131072),
-                input_cost_per_1m=spec_dict.get("input_cost_per_1m", 0.0),
-                output_cost_per_1m=spec_dict.get("output_cost_per_1m", 0.0),
-                cached_input_cost_per_1m=spec_dict.get("cached_input_cost_per_1m", 0.0),
-                api_base_url=spec_dict.get("api_base_url", ""),
-                api_key=spec_dict.get("api_key", ""),
-                supports_thinking=spec_dict.get("supports_thinking", False),
-                supports_cache=spec_dict.get("supports_cache", False),
+                provider=merged.get("provider", model_key.split(":")[0] if ":" in model_key else "unknown"),
+                model_id=merged.get("model_id", model_key),
+                context_window=int(merged.get("context_window", 131072)),
+                input_cost_per_1m=float(merged.get("input_cost_per_1m", 0.0)),
+                output_cost_per_1m=float(merged.get("output_cost_per_1m", 0.0)),
+                cached_input_cost_per_1m=float(merged.get("cached_input_cost_per_1m", 0.0)),
+                cache_creation_cost_per_1m=float(merged.get("cache_creation_cost_per_1m", 0.0)),
+                api_base_url=merged.get("api_base_url", ""),
+                api_key=merged.get("api_key", ""),
+                supports_thinking=bool(merged.get("supports_thinking", False)),
+                supports_cache=bool(merged.get("supports_cache", False)),
+                anthropic_version=merged.get("anthropic_version", "2023-06-01"),
+                thinking_budget_tokens=int(merged.get("thinking_budget_tokens", 8000)),
             )
             register_model(model_key, spec)
             count += 1

@@ -885,6 +885,144 @@ class TestGateway:
         assert gateway.should_use_thinking(NodeRole.PATCHING) is False
         assert gateway.should_use_thinking(NodeRole.REPAIR) is True
 
+    def test_anthropic_compute_cost_doesnt_double_charge_cache(self):
+        # Regression: previously the provider summed cache_read +
+        # cache_creation into cached_tokens, then subtracted that sum
+        # from input_tokens (which Anthropic already reports excluding
+        # cache hits) — billing creation tokens at the read rate and
+        # zeroing out the regular input charge.
+        from harness.gateway import AnthropicProvider, ModelSpec, TokenUsage
+        spec = ModelSpec(
+            provider="anthropic", model_id="claude-test",
+            context_window=200_000,
+            input_cost_per_1m=3.00,
+            output_cost_per_1m=15.00,
+            cached_input_cost_per_1m=0.30,
+            cache_creation_cost_per_1m=3.75,
+            supports_cache=True,
+        )
+        provider = AnthropicProvider(spec)
+        usage = TokenUsage(
+            input_tokens=100_000,           # uncached, full rate
+            output_tokens=0,
+            cached_tokens=50_000,            # cache READS, discounted
+            cache_creation_tokens=20_000,    # cache WRITES, surcharge
+            model_name="claude-test",
+        )
+        # 100k * $3/M + 50k * $0.30/M + 20k * $3.75/M
+        # = 0.300 + 0.015 + 0.075 = $0.390
+        assert abs(provider.compute_cost(usage) - 0.390) < 1e-6
+
+    def test_anthropic_creation_rate_defaults_to_125pct(self):
+        # When the spec doesn't carry an explicit creation rate, the
+        # provider falls back to 1.25x input — matching Anthropic's docs.
+        from harness.gateway import AnthropicProvider, ModelSpec, TokenUsage
+        spec = ModelSpec(
+            provider="anthropic", model_id="claude-test",
+            context_window=200_000,
+            input_cost_per_1m=4.00,
+            output_cost_per_1m=20.00,
+            cached_input_cost_per_1m=0.40,
+            # cache_creation_cost_per_1m left as default 0 -> fallback
+        )
+        provider = AnthropicProvider(spec)
+        usage = TokenUsage(
+            input_tokens=0, output_tokens=0,
+            cached_tokens=0, cache_creation_tokens=1_000_000,
+            model_name="claude-test",
+        )
+        # 1M creation tokens * (4.00 * 1.25) = $5.00
+        assert abs(provider.compute_cost(usage) - 5.00) < 1e-6
+
+    def test_anthropic_extract_usage_separates_read_and_creation(self):
+        from harness.gateway import AnthropicProvider, ModelSpec
+        spec = ModelSpec(
+            provider="anthropic", model_id="claude-test",
+            context_window=200_000, input_cost_per_1m=3.0, output_cost_per_1m=15.0,
+        )
+        provider = AnthropicProvider(spec)
+        raw = {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_read_input_tokens": 5000,
+                "cache_creation_input_tokens": 800,
+            }
+        }
+        usage = provider.extract_usage(raw)
+        assert usage.input_tokens == 1000
+        assert usage.cached_tokens == 5000
+        assert usage.cache_creation_tokens == 800
+
+    def test_anthropic_thinking_added_to_payload_when_enabled(self):
+        # Regression: chat_completion accepted `thinking=True` but never
+        # passed it to the API. Verify the payload now carries the
+        # `thinking` block and forces temperature=1.0.
+        from harness.gateway import AnthropicProvider, ModelSpec
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        spec = ModelSpec(
+            provider="anthropic", model_id="claude-test",
+            context_window=200_000, input_cost_per_1m=3.0, output_cost_per_1m=15.0,
+            supports_thinking=True, thinking_budget_tokens=4000,
+        )
+        provider = AnthropicProvider(spec)
+
+        captured: dict = {}
+
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"content": [{"type": "text", "text": "hi"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        class FakeClient:
+            async def post(self, url, json):
+                captured["payload"] = json
+                return FakeResponse()
+
+        async def fake_get_client():
+            return FakeClient()
+
+        provider._get_client = fake_get_client  # type: ignore[assignment]
+        asyncio.run(provider.chat_completion(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=True, temperature=0.0, max_tokens=8000,
+        ))
+        assert "thinking" in captured["payload"]
+        assert captured["payload"]["thinking"]["type"] == "enabled"
+        assert captured["payload"]["thinking"]["budget_tokens"] == 4000
+        # Anthropic requires temperature=1.0 when thinking is on
+        assert captured["payload"]["temperature"] == 1.0
+
+    def test_anthropic_version_read_from_spec(self):
+        from harness.gateway import AnthropicProvider, ModelSpec
+        spec = ModelSpec(
+            provider="anthropic", model_id="claude-test",
+            context_window=200_000, input_cost_per_1m=3.0, output_cost_per_1m=15.0,
+            anthropic_version="2024-12-15",
+        )
+        provider = AnthropicProvider(spec)
+        provider.api_key = "test"
+        headers = provider._build_headers()
+        assert headers["anthropic-version"] == "2024-12-15"
+
+    def test_rate_limit_header_extraction(self):
+        from harness.gateway import _delay_from_rate_limit_headers
+        # Numeric Retry-After wins
+        assert _delay_from_rate_limit_headers({"Retry-After": "30"}, 1.0, 0) == 30.0
+        # Anthropic reset header is parsed
+        from datetime import datetime, timezone, timedelta
+        future = (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat().replace("+00:00", "Z")
+        delay = _delay_from_rate_limit_headers(
+            {"anthropic-ratelimit-tokens-reset": future}, 1.0, 0
+        )
+        assert 40 < delay < 50
+        # Fallback to exponential when no header
+        assert _delay_from_rate_limit_headers({}, 1.0, 3) == 8.0  # 1.0 * 2^3
+
     def test_openai_compute_cost_applies_cached_discount(self):
         # Regression: OpenAIProvider.compute_cost previously ignored
         # cached_tokens and billed all input_tokens at the full rate.

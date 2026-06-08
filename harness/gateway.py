@@ -45,10 +45,17 @@ class NodeRole(Enum):
 
 @dataclass
 class TokenUsage:
-    """Extracted token usage metadata from a single LLM response."""
+    """Extracted token usage metadata from a single LLM response.
+
+    ``cached_tokens`` counts cache *reads* (priced at the discounted
+    cached input rate). ``cache_creation_tokens`` counts tokens written
+    into the cache for the first time — Anthropic charges these at a
+    surcharge (~1.25× input), other providers leave it 0.
+    """
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    cache_creation_tokens: int = 0
     model_name: str = ""
     cost_usd: float = 0.0
 
@@ -57,6 +64,7 @@ class TokenUsage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
             "model_name": self.model_name,
             "cost_usd": self.cost_usd,
         }
@@ -80,11 +88,19 @@ class ModelSpec:
     context_window: int  # maximum tokens the model accepts
     input_cost_per_1m: float  # cost per 1M input tokens in USD
     output_cost_per_1m: float  # cost per 1M output tokens in USD
-    cached_input_cost_per_1m: float = 0.0  # cached/prompt-cache discount
+    cached_input_cost_per_1m: float = 0.0  # cache READ discount (Anthropic, OpenAI, DeepSeek)
+    cache_creation_cost_per_1m: float = 0.0  # cache WRITE surcharge (Anthropic only; ~1.25× input)
     api_base_url: str = ""
     api_key: str = ""  # Optional: API key stored in config (env var takes precedence)
     supports_thinking: bool = False
     supports_cache: bool = False
+    # Anthropic API version header. Default is the documented stable; users
+    # can override per-model via .harness_config.json when newer features
+    # need a different version.
+    anthropic_version: str = "2023-06-01"
+    # Default thinking budget in tokens when the role asks for thinking and
+    # the model supports it. Anthropic requires this to be < max_tokens.
+    thinking_budget_tokens: int = 8000
 
 
 # Model registry — user-populated via register_model() or .harness_config.json.
@@ -327,7 +343,10 @@ class AnthropicProvider(BaseLLM):
         headers = super()._build_headers()
         # Anthropic uses x-api-key header instead of Authorization Bearer
         headers["x-api-key"] = self.api_key
-        headers["anthropic-version"] = "2023-06-01"
+        # Version is per-model: newer models / features may require a newer
+        # date. Pulled from ModelSpec.anthropic_version so .harness_config.json
+        # can bump it without code changes.
+        headers["anthropic-version"] = self.spec.anthropic_version or "2023-06-01"
         # Remove the Bearer header since Anthropic doesn't use it
         headers.pop("Authorization", None)
         return headers
@@ -372,7 +391,18 @@ class AnthropicProvider(BaseLLM):
             # Anthropic expects a single string or list of text blocks for system
             payload["system"] = "\n\n".join(system_content)
 
-        logger.debug("[anthropic] Sending completion request. model=%s", self.spec.model_id)
+        # Extended thinking: must be opted in per request, and Anthropic requires
+        # temperature=1.0 with thinking enabled. budget_tokens must be < max_tokens.
+        if thinking and self.spec.supports_thinking:
+            budget = max(1024, min(self.spec.thinking_budget_tokens, max_tokens - 512))
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            payload["temperature"] = 1.0
+            # Ensure max_tokens accommodates the thinking budget + visible reply
+            if max_tokens <= budget:
+                payload["max_tokens"] = budget + 1024
+
+        logger.debug("[anthropic] Sending completion request. model=%s thinking=%s",
+                     self.spec.model_id, thinking and self.spec.supports_thinking)
 
         response = await client.post("/messages", json=payload)
         response.raise_for_status()
@@ -400,25 +430,36 @@ class AnthropicProvider(BaseLLM):
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
+        # Anthropic reports cache reads and cache creations separately from
+        # input_tokens — they are NOT included in input_tokens. Keep them
+        # distinct so compute_cost can price each correctly.
         usage_block = raw_response.get("usage", {})
         return TokenUsage(
             input_tokens=usage_block.get("input_tokens", 0),
             output_tokens=usage_block.get("output_tokens", 0),
-            cached_tokens=usage_block.get("cache_read_input_tokens", 0)
-            + usage_block.get("cache_creation_input_tokens", 0),
+            cached_tokens=usage_block.get("cache_read_input_tokens", 0),
+            cache_creation_tokens=usage_block.get("cache_creation_input_tokens", 0),
             model_name=self.spec.model_id,
         )
 
     def compute_cost(self, usage: TokenUsage) -> float:
+        # Anthropic billing tiers:
+        #   - input_tokens:          full input_cost_per_1m (already excludes cache hits)
+        #   - cache_read tokens:     cached_input_cost_per_1m (~10% of input)
+        #   - cache_creation tokens: cache_creation_cost_per_1m (~125% of input)
+        #     Falls back to 1.25x input rate when the spec doesn't carry an
+        #     explicit creation rate (matches Anthropic's published surcharge).
         spec = self.spec
-        cached = usage.cached_tokens
-        uncached_input = max(0, usage.input_tokens - cached)
-
-        input_cost = (uncached_input / 1_000_000) * spec.input_cost_per_1m
-        cached_cost = (cached / 1_000_000) * spec.cached_input_cost_per_1m
+        creation_rate = (
+            spec.cache_creation_cost_per_1m
+            if spec.cache_creation_cost_per_1m > 0
+            else spec.input_cost_per_1m * 1.25
+        )
+        input_cost = (usage.input_tokens / 1_000_000) * spec.input_cost_per_1m
+        cache_read_cost = (usage.cached_tokens / 1_000_000) * spec.cached_input_cost_per_1m
+        cache_creation_cost = (usage.cache_creation_tokens / 1_000_000) * creation_rate
         output_cost = (usage.output_tokens / 1_000_000) * spec.output_cost_per_1m
-
-        return input_cost + cached_cost + output_cost
+        return input_cost + cache_read_cost + cache_creation_cost + output_cost
 
 
 # ---------------------------------------------------------------------------
@@ -781,23 +822,16 @@ async def retry_with_backoff(
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 429:
-                # Respect Retry-After header if present; otherwise use our backoff
-                retry_after = exc.response.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        delay = float(retry_after)
-                    except ValueError:
-                        delay = base_delay * (2 ** attempt)
-                else:
-                    delay = base_delay * (2 ** attempt)
-                logger.warning("[gateway] Rate limited (429). Attempt %d/%d.", attempt + 1, max_retries + 1)
+                delay = _delay_from_rate_limit_headers(exc.response.headers, base_delay, attempt)
+                logger.warning("[gateway] Rate limited (429). Attempt %d/%d. Delay=%.2fs",
+                                attempt + 1, max_retries + 1, delay)
             elif status >= 500:
                 delay = base_delay * (2 ** attempt)
                 logger.warning("[gateway] Server error (%d). Attempt %d/%d.", status, attempt + 1, max_retries + 1)
             else:
                 raise  # Non-retryable HTTP error (4xx except 429)
             last_exception = exc
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
             delay = base_delay * (2 ** attempt)
             logger.warning("[gateway] Connection error. Attempt %d/%d. %s", attempt + 1, max_retries + 1, exc)
             last_exception = exc
@@ -810,6 +844,74 @@ async def retry_with_backoff(
             await asyncio.sleep(jittered)
 
     raise last_exception  # type: ignore[misc]
+
+
+def _delay_from_rate_limit_headers(
+    headers: Any, base_delay: float, attempt: int
+) -> float:
+    """
+    Compute the retry delay from common rate-limit response headers.
+
+    Recognized (in priority order):
+      - ``Retry-After``: seconds (numeric) or HTTP-date (RFC 7231)
+      - ``anthropic-ratelimit-tokens-reset`` / ``-requests-reset``: ISO 8601 datetime
+      - ``X-RateLimit-Reset``: epoch seconds (OpenAI-style)
+      - ``RateLimit-Reset``: seconds-from-now (RFC 9651)
+
+    Falls back to exponential backoff if no header is parseable.
+    """
+    from datetime import datetime, timezone
+
+    # 1. Retry-After (numeric seconds or HTTP-date)
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(retry_after)
+                delta = (dt - datetime.now(timezone.utc)).total_seconds()
+                if delta > 0:
+                    return delta
+            except (TypeError, ValueError):
+                pass
+
+    # 2. Anthropic-specific reset timestamps (ISO 8601 UTC)
+    for key in ("anthropic-ratelimit-tokens-reset", "anthropic-ratelimit-requests-reset"):
+        reset = headers.get(key)
+        if reset:
+            try:
+                dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+                delta = (dt - datetime.now(timezone.utc)).total_seconds()
+                if delta > 0:
+                    return delta
+            except (TypeError, ValueError):
+                pass
+
+    # 3. OpenAI X-RateLimit-Reset (epoch seconds)
+    x_reset = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset-requests")
+    if x_reset:
+        try:
+            target = float(x_reset)
+            now = datetime.now(timezone.utc).timestamp()
+            # Heuristic: if value > now, it's epoch; else seconds-from-now
+            delta = target - now if target > now else target
+            if delta > 0:
+                return delta
+        except ValueError:
+            pass
+
+    # 4. RFC 9651 RateLimit-Reset (seconds-from-now)
+    rl_reset = headers.get("RateLimit-Reset")
+    if rl_reset:
+        try:
+            return max(0.0, float(rl_reset))
+        except ValueError:
+            pass
+
+    # Fallback: exponential backoff
+    return base_delay * (2 ** attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1211,9 @@ class Gateway:
         tracker["total_input_tokens"] = tracker.get("total_input_tokens", 0) + usage.input_tokens
         tracker["total_output_tokens"] = tracker.get("total_output_tokens", 0) + usage.output_tokens
         tracker["total_cached_tokens"] = tracker.get("total_cached_tokens", 0) + usage.cached_tokens
+        tracker["total_cache_creation_tokens"] = (
+            tracker.get("total_cache_creation_tokens", 0) + usage.cache_creation_tokens
+        )
         tracker["total_cost_usd"] = tracker.get("total_cost_usd", 0.0) + usage.cost_usd
 
         # Per-model breakdown
@@ -1119,11 +1224,14 @@ class Gateway:
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cached_tokens": 0,
+                "cache_creation_tokens": 0,
                 "cost_usd": 0.0,
             }
         per_model[model_key]["input_tokens"] += usage.input_tokens
         per_model[model_key]["output_tokens"] += usage.output_tokens
         per_model[model_key]["cached_tokens"] += usage.cached_tokens
+        per_model[model_key].setdefault("cache_creation_tokens", 0)
+        per_model[model_key]["cache_creation_tokens"] += usage.cache_creation_tokens
         per_model[model_key]["cost_usd"] += usage.cost_usd
 
         return tracker

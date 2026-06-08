@@ -1052,7 +1052,11 @@ def _auto_detect_backend(**kwargs: Any) -> SandboxBackend:
     Priority (Docker-First strategy):
         1. docker   (container isolation, strongest sandbox boundary)
         2. unshare  (Linux kernel namespaces, zero deps)
-        3. bare     (no isolation, always available)
+        3. bare     (no isolation) — requires explicit opt-in via
+                    ``HARNESS_ALLOW_UNSAFE_SANDBOX=true`` env var.
+                    Without the opt-in, auto-detect raises RuntimeError
+                    rather than silently running LLM-generated build
+                    commands directly on the host.
 
     User-requested explicit backends (e.g., "unshare" or "bare") bypass this
     function entirely — see create_backend() for the override path.
@@ -1069,14 +1073,22 @@ def _auto_detect_backend(**kwargs: Any) -> SandboxBackend:
         logger.info("[sandbox] Auto-detected backend: unshare (Linux namespaces).")
         return unshare
 
-    # Tier 3: Bare fallback — always available, logs a diagnostic warning
-    logger.warning(
-        "[sandbox] No container or namespace isolation available. "
-        "Falling back to bare backend (NO isolation). "
-        "Builds will run directly on the host. "
-        "Install Docker or ensure unshare permissions for sandboxed execution."
+    # Tier 3: No safe backend. Bare runs LLM-supplied shell on the host with
+    # zero isolation — refuse unless the user opted in.
+    if os.environ.get("HARNESS_ALLOW_UNSAFE_SANDBOX", "").lower() == "true":
+        logger.warning(
+            "[sandbox] No container or namespace isolation available. "
+            "HARNESS_ALLOW_UNSAFE_SANDBOX=true is set; falling back to bare backend. "
+            "Builds will run directly on the host with no protection."
+        )
+        return BareBackend()
+
+    raise RuntimeError(
+        "Sandbox auto-detect failed: neither Docker nor unshare is available, "
+        "and bare-fallback is not opted-in. Install Docker, ensure `unshare` "
+        "has the required capabilities, or set HARNESS_ALLOW_UNSAFE_SANDBOX=true "
+        "to authorize zero-isolation execution."
     )
-    return BareBackend()
 
 
 # ---------------------------------------------------------------------------

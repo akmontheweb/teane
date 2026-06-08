@@ -302,6 +302,33 @@ class TestSandboxBackend:
         with pytest.raises(ValueError):
             create_backend("nonexistent")
 
+    def test_auto_detect_refuses_bare_without_optin(self, monkeypatch):
+        # Regression: silent fallback to bare (zero isolation) was a security
+        # hole. With Docker + unshare disabled and no env-var opt-in,
+        # auto-detect must raise rather than expose the host.
+        from harness.sandbox import _auto_detect_backend, DockerBackend, UnshareBackend
+        monkeypatch.setattr(DockerBackend, "is_available", lambda self: False)
+        monkeypatch.setattr(UnshareBackend, "is_available", lambda self: False)
+        monkeypatch.delenv("HARNESS_ALLOW_UNSAFE_SANDBOX", raising=False)
+        with pytest.raises(RuntimeError, match="HARNESS_ALLOW_UNSAFE_SANDBOX"):
+            _auto_detect_backend()
+
+    def test_auto_detect_uses_bare_with_explicit_optin(self, monkeypatch):
+        from harness.sandbox import _auto_detect_backend, DockerBackend, UnshareBackend, BareBackend
+        monkeypatch.setattr(DockerBackend, "is_available", lambda self: False)
+        monkeypatch.setattr(UnshareBackend, "is_available", lambda self: False)
+        monkeypatch.setenv("HARNESS_ALLOW_UNSAFE_SANDBOX", "true")
+        backend = _auto_detect_backend()
+        assert isinstance(backend, BareBackend)
+
+    def test_explicit_bare_backend_still_works(self):
+        # The opt-in gate only applies to auto-detection. Users who explicitly
+        # request "bare" via config get it without the env var — they typed
+        # the name themselves.
+        from harness.sandbox import create_backend, BareBackend
+        backend = create_backend("bare")
+        assert isinstance(backend, BareBackend)
+
 
 class TestDiagnosticParsing:
 

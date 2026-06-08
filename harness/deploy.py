@@ -26,11 +26,109 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time as time_module
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# Files we always show in the deploy preview (in this order).
+_PREVIEW_FILES = ("docker-compose.yml", "Dockerfile", "Caddyfile")
+# Max chars per file to display so the preview stays scannable.
+_PREVIEW_MAX_CHARS = 4000
+
+
+def _auto_approve_deploy() -> bool:
+    """
+    Return True if the user has explicitly authorized non-interactive
+    deploys via env var. We do NOT auto-approve on non-TTY alone: a
+    piped-in deploy must opt in, otherwise we fail closed.
+    """
+    return (
+        os.environ.get("CI", "").lower() == "true"
+        or os.environ.get("HARNESS_AUTO_APPROVE", "").lower() == "true"
+    )
+
+
+def _read_preview(workspace_path: str, generated_files: list[str]) -> str:
+    """
+    Build a human-readable preview of the LLM-generated deploy artifacts.
+    Reads docker-compose.yml, all Dockerfile(s), and Caddyfile if present.
+    """
+    seen: set[str] = set()
+    sections: list[str] = []
+
+    def _emit(rel: str) -> None:
+        if rel in seen:
+            return
+        seen.add(rel)
+        abs_path = os.path.join(workspace_path, rel)
+        if not os.path.isfile(abs_path):
+            return
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                body = f.read()
+        except OSError as e:
+            sections.append(f"--- {rel} (read failed: {e}) ---")
+            return
+        if len(body) > _PREVIEW_MAX_CHARS:
+            body = body[:_PREVIEW_MAX_CHARS] + f"\n... [truncated; full file is {len(body)} chars]"
+        sections.append(f"--- {rel} ---\n{body}")
+
+    # Predictable order first, then anything else generated.
+    for name in _PREVIEW_FILES:
+        _emit(name)
+    for path in generated_files:
+        rel = os.path.relpath(path, workspace_path) if os.path.isabs(path) else path
+        # Show any Dockerfile.* variants too
+        if rel not in seen and (rel.endswith(".yml") or rel.startswith("Dockerfile") or rel.endswith("Caddyfile")):
+            _emit(rel)
+
+    if not sections:
+        return "(no deploy artifacts found to preview)"
+    return "\n\n".join(sections)
+
+
+async def _prompt_deploy_approval(preview: str) -> bool:
+    """
+    Show the deploy preview and require explicit confirmation before any
+    `docker-compose up` runs. Returns True iff the user approved.
+
+    Auto-approves when CI=true or HARNESS_AUTO_APPROVE=true (the user has
+    opted in to non-interactive deploys). Fails closed on a non-TTY
+    without that opt-in — silently proceeding would let any piped input
+    bypass the gate.
+    """
+    if _auto_approve_deploy():
+        logger.warning(
+            "[deployment_node] Auto-approving deploy preview (CI/HARNESS_AUTO_APPROVE set)."
+        )
+        return True
+
+    if not sys.stdin.isatty():
+        logger.error(
+            "[deployment_node] Refusing deploy: no TTY for interactive approval and "
+            "HARNESS_AUTO_APPROVE is not set. Re-run interactively or set the env var."
+        )
+        return False
+
+    print("\n" + "=" * 72, file=sys.stderr)
+    print(" DEPLOY PREVIEW — LLM-generated containers about to be launched", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(preview, file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+
+    loop = asyncio.get_event_loop()
+    try:
+        answer = await loop.run_in_executor(
+            None, lambda: input("Proceed with `docker-compose up --build -d`? [y/N]: ").strip().lower()
+        )
+    except (EOFError, KeyboardInterrupt):
+        print("\n[deployment_node] Deploy declined (input interrupted).", file=sys.stderr)
+        return False
+    return answer in ("y", "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +1069,25 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "semantic_context": f"Generated files: {gen_result.get('generated', [])}",
             }],
             "loop_counter": {"deployment": 1},
+        }
+
+    # --- Phase 3.5: Preview gate ---
+    # The Dockerfile/compose/Caddyfile we're about to execute were synthesized
+    # from LLM JSON. A prompt-injected manifest or a confused model can put
+    # arbitrary `RUN curl … | sh` in them. Require explicit consent (with an
+    # env-var bypass for opted-in CI) before `docker-compose up`.
+    preview = _read_preview(workspace_path, gen_result.get("generated", []))
+    approved = await _prompt_deploy_approval(preview)
+    if not approved:
+        logger.info("[deployment_node] User declined deploy preview; aborting before docker-compose up.")
+        return {
+            "node_state": {
+                "deployment": {
+                    "skipped": True,
+                    "reason": "user_declined_preview",
+                    "phase": "preview_gate",
+                }
+            },
         }
 
     # Build

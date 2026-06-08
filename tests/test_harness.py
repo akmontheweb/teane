@@ -1388,6 +1388,67 @@ class TestDeployTelemetry:
             assert telemetry["existing_infrastructure"]["docker_compose"] is True
 
 
+class TestDeployPreviewGate:
+    """Regression: deployment_node used to docker-compose-up LLM-generated
+    containers with zero preview or confirmation."""
+
+    def test_auto_approve_when_env_set(self, monkeypatch):
+        from harness.deploy import _auto_approve_deploy
+        monkeypatch.setenv("HARNESS_AUTO_APPROVE", "true")
+        assert _auto_approve_deploy() is True
+
+    def test_auto_approve_when_ci_set(self, monkeypatch):
+        from harness.deploy import _auto_approve_deploy
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setenv("CI", "true")
+        assert _auto_approve_deploy() is True
+
+    def test_no_auto_approve_when_unset(self, monkeypatch):
+        from harness.deploy import _auto_approve_deploy
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.delenv("CI", raising=False)
+        assert _auto_approve_deploy() is False
+
+    def test_preview_contains_generated_artifacts(self):
+        from harness.deploy import _read_preview
+        with tempfile.TemporaryDirectory() as ws:
+            with open(os.path.join(ws, "docker-compose.yml"), "w") as f:
+                f.write("services:\n  app:\n    image: x\n")
+            with open(os.path.join(ws, "Dockerfile"), "w") as f:
+                f.write("FROM python:3.12\nRUN echo hi\n")
+            preview = _read_preview(ws, ["Dockerfile", "docker-compose.yml"])
+            assert "services:" in preview
+            assert "FROM python:3.12" in preview
+            assert "Dockerfile" in preview
+
+    def test_preview_truncates_huge_files(self):
+        from harness.deploy import _read_preview, _PREVIEW_MAX_CHARS
+        with tempfile.TemporaryDirectory() as ws:
+            huge = "X" * (_PREVIEW_MAX_CHARS + 5000)
+            with open(os.path.join(ws, "docker-compose.yml"), "w") as f:
+                f.write(huge)
+            preview = _read_preview(ws, [])
+            assert "truncated" in preview
+            assert len(preview) < len(huge)
+
+    @pytest.mark.asyncio
+    async def test_prompt_returns_true_with_auto_approve(self, monkeypatch):
+        from harness.deploy import _prompt_deploy_approval
+        monkeypatch.setenv("HARNESS_AUTO_APPROVE", "true")
+        assert await _prompt_deploy_approval("preview") is True
+
+    @pytest.mark.asyncio
+    async def test_prompt_fails_closed_on_non_tty_without_optin(self, monkeypatch):
+        # Non-TTY + no opt-in env var → fail closed (refuse deploy).
+        import io
+        from harness import deploy
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.delenv("CI", raising=False)
+        # Replace sys.stdin with a non-TTY stream
+        monkeypatch.setattr(deploy.sys, "stdin", io.StringIO("y\n"))
+        assert await deploy._prompt_deploy_approval("preview") is False
+
+
 class TestDeployBlueprint:
 
     def test_fallback_blueprint(self):

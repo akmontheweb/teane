@@ -414,6 +414,25 @@ class TestSandboxBackend:
         r2 = BuildResult(exit_code=1, raw_output="...", log_truncated=True)
         assert r2.log_truncated is True
 
+    @pytest.mark.asyncio
+    async def test_build_env_scrubs_api_keys(self, monkeypatch):
+        # Regression: variant builds (and any sandbox build) inherited
+        # OPENAI_API_KEY / GITHUB_TOKEN / etc. from the parent process,
+        # letting a malicious build exfiltrate them.
+        from harness.sandbox import _execute_subprocess_with_timeout
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-leaked-test")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_leaked-test")
+        monkeypatch.setenv("HARNESS_KEEPME", "value")  # not scrubbed
+        # Echo only the scrubbed vars + the kept one
+        cmd = ["sh", "-c", "echo OPENAI=$OPENAI_API_KEY GH=$GITHUB_TOKEN KEEP=$HARNESS_KEEPME"]
+        exit_code, output, _, _ = await _execute_subprocess_with_timeout(
+            cmd, timeout_seconds=10, log_buffer_mode="memory"
+        )
+        assert exit_code == 0
+        assert "sk-leaked-test" not in output
+        assert "ghp_leaked-test" not in output
+        assert "KEEP=value" in output  # unrelated vars survive
+
     def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
         # Regression: docker info failure used to just return False with no
         # signal whether the daemon was down or perms were wrong.
@@ -2076,6 +2095,26 @@ class TestParserRegistry:
     def test_get_parser_unknown(self):
         from harness.parser_registry import get_parser
         assert get_parser("nonexistent_compiler") is None
+
+    def test_strip_ansi_removes_color_codes(self):
+        from harness.parser_registry import _strip_ansi
+        # SGR (color) codes
+        assert _strip_ansi("\x1b[31merror\x1b[0m: undefined") == "error: undefined"
+        # Bold + color combined
+        assert _strip_ansi("\x1b[1;33mwarning\x1b[0m") == "warning"
+        # OSC (hyperlink) escapes used by modern terminals
+        assert _strip_ansi("\x1b]8;;file:///x\x07click\x1b]8;;\x07") == "click"
+
+    def test_detect_and_parse_strips_ansi_before_dispatching(self):
+        # Regression: cargo/rustc/etc emit \x1b[31m... when CARGO_TERM_COLOR=always
+        # is set in the env; the colorized diagnostic line never matched any
+        # regex and was silently dropped.
+        from harness.parser_registry import detect_and_parse
+        colored = "\x1b[1;31merror\x1b[0m: \x1b[1msrc/main.go:10:5: undefined: xyz\x1b[0m\n"
+        diags = detect_and_parse(colored, build_command="go build", workspace_path="/x")
+        # Must extract at least one diagnostic from the colorized output
+        assert len(diags) >= 1
+        assert any("xyz" in d.message or "main.go" in d.file for d in diags)
 
     def test_detect_and_parse_go(self):
         from harness.parser_registry import detect_and_parse

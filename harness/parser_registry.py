@@ -23,6 +23,21 @@ from harness.sandbox import BaseLanguageParser, DiagnosticObject
 logger = logging.getLogger(__name__)
 
 
+# CSI / SGR (color/style) and OSC escape sequences emitted by modern
+# compilers when stdout is a TTY (cargo, rustc, gcc, clang, go test).
+# Sandbox builds capture pipe output so these usually don't appear, but
+# some toolchains force-color via env vars (CARGO_TERM_COLOR=always,
+# CLICOLOR_FORCE=1) and break our diagnostic regexes if not stripped.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))"
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI color/style escape sequences from compiler output."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 # ---------------------------------------------------------------------------
 # Built-in Language Parsers
 # ---------------------------------------------------------------------------
@@ -335,6 +350,12 @@ def detect_and_parse(
     Returns:
         A list of DiagnosticObject instances.
     """
+    # Strip ANSI color escape sequences once at the entry point so every
+    # downstream regex sees clean text. Modern compilers emit \x1b[31m...
+    # when CARGO_TERM_COLOR=always or CLICOLOR_FORCE=1 is set, which
+    # would otherwise silently drop every diagnostic.
+    raw_output = _strip_ansi(raw_output)
+
     # Try compiler detection first
     if build_command:
         cmd_lower = build_command.lower()

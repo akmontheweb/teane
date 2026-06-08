@@ -2451,6 +2451,46 @@ class TestSpeculative:
         result = _fallback_result()
         assert result["node_state"]["speculative"]["fallback"] is True
 
+    def test_variant_cache_env_creates_isolated_dirs(self):
+        # Regression: parallel variants used to share host cache dirs
+        # (~/.cache/pip, ~/.cargo/registry etc.) and would race on writes.
+        # Each variant now gets its own .harness-cache/<tool>/ directory tree.
+        from harness.speculative import _build_variant_cache_env
+        with tempfile.TemporaryDirectory() as worktree:
+            env = _build_variant_cache_env(worktree)
+            # Cover the main package managers and incremental caches
+            required = {
+                "PIP_CACHE_DIR", "npm_config_cache", "YARN_CACHE_FOLDER",
+                "CARGO_HOME", "CARGO_TARGET_DIR", "GOCACHE", "GOMODCACHE",
+                "GRADLE_USER_HOME", "MYPY_CACHE_DIR", "RUFF_CACHE_DIR",
+                "XDG_CACHE_HOME",
+            }
+            assert required.issubset(env.keys()), f"missing: {required - env.keys()}"
+            # Every direct-path env var should point inside the worktree
+            for key in required:
+                assert env[key].startswith(worktree), f"{key} not in worktree"
+                assert os.path.isdir(env[key]), f"{key} dir not created: {env[key]}"
+
+    def test_variant_cache_env_dirs_isolated_per_variant(self):
+        # Two variants must get DIFFERENT cache paths.
+        from harness.speculative import _build_variant_cache_env
+        with tempfile.TemporaryDirectory() as outer:
+            v1 = os.path.join(outer, "variant-1")
+            v2 = os.path.join(outer, "variant-2")
+            os.makedirs(v1); os.makedirs(v2)
+            env1 = _build_variant_cache_env(v1)
+            env2 = _build_variant_cache_env(v2)
+            assert env1["PIP_CACHE_DIR"] != env2["PIP_CACHE_DIR"]
+            assert env1["CARGO_HOME"] != env2["CARGO_HOME"]
+            assert env1["GOCACHE"] != env2["GOCACHE"]
+
+    def test_variant_cache_env_pytest_addopts_format(self):
+        # PYTEST_ADDOPTS must be a valid pytest CLI flag string, not a dir path.
+        from harness.speculative import _build_variant_cache_env
+        with tempfile.TemporaryDirectory() as wt:
+            env = _build_variant_cache_env(wt)
+            assert env["PYTEST_ADDOPTS"].startswith("-o cache_dir=")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

@@ -1194,6 +1194,7 @@ class SandboxExecutor:
         pgid_kill_on_timeout: bool = True,
         backend: Optional[SandboxBackend] = None,
         command_validator: Optional[Any] = None,
+        extra_env: Optional[dict[str, str]] = None,
     ):
         self.workspace_path = os.path.abspath(workspace_path)
         self.allow_network = allow_network
@@ -1202,6 +1203,7 @@ class SandboxExecutor:
         self.pgid_kill_on_timeout = pgid_kill_on_timeout
         self.backend = backend or _auto_detect_backend()
         self.command_validator = command_validator  # Optional CommandValidator for security checks
+        self.extra_env = extra_env or {}
 
     async def run(self, build_command: str) -> BuildResult:
         """
@@ -1246,6 +1248,7 @@ class SandboxExecutor:
             timeout_seconds=self.timeout_seconds,
             allow_network=self.allow_network,
             readonly_cache_mounts=self.readonly_cache_mounts,
+            extra_env=self.extra_env or None,
         )
 
         elapsed = time.monotonic() - start_time

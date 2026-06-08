@@ -230,7 +230,19 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         if vr.error or not vr.worktree_path:
             return vr
         try:
-            executor = SandboxExecutor(workspace_path=vr.worktree_path)
+            # Give each variant a private writable cache directory tree.
+            # Multiple variants running in parallel would otherwise corrupt
+            # each other's pip / npm / cargo / go / mypy / pytest caches —
+            # those tools assume single-writer access to their cache dirs.
+            #
+            # Read-only host cache mounts (~/.cache/pip etc. via the unshare
+            # backend's --bind -o ro) still serve as warm sources; the env
+            # vars below redirect *writes* to per-variant locations.
+            variant_env = _build_variant_cache_env(vr.worktree_path)
+            executor = SandboxExecutor(
+                workspace_path=vr.worktree_path,
+                extra_env=variant_env,
+            )
             result = await executor.run(build_command)
             vr.exit_code = result.exit_code
             vr.raw_output = result.raw_output
@@ -403,6 +415,74 @@ def _select_winner(
 # ---------------------------------------------------------------------------
 # 4. Worktree Management
 # ---------------------------------------------------------------------------
+
+def _build_variant_cache_env(worktree_path: str) -> dict[str, str]:
+    """
+    Build environment variables that redirect every common build tool's
+    *writable* cache to a variant-local directory tree.
+
+    Without this, parallel variants run concurrent `pip install`,
+    `npm install`, `cargo build`, `go build`, `pytest`, `mypy`, etc.
+    against the same shared per-user cache directories — pip's lock file
+    races, cargo's registry index gets corrupted, mypy's incremental
+    cache gets mixed across branches, and pytest's `.pytest_cache`
+    becomes meaningless.
+
+    Each variant gets ``<worktree>/.harness-cache/<tool>/`` so writes are
+    isolated. The host-level read-only cache mounts (configured via
+    ``sandbox.readonly_cache_mounts``) still seed warm dependencies —
+    these env vars only affect where writes land.
+
+    Returned env-var keys (each pointing to a per-variant subdirectory):
+      - PIP_CACHE_DIR          (Python pip)
+      - npm_config_cache       (npm — lowercase is canonical)
+      - YARN_CACHE_FOLDER      (Yarn)
+      - CARGO_HOME             (Cargo registry + git + credentials)
+      - CARGO_TARGET_DIR       (Rust build artifacts)
+      - GOCACHE                (Go build cache)
+      - GOMODCACHE             (Go module download cache)
+      - GRADLE_USER_HOME       (Gradle)
+      - MAVEN_OPTS             (-Dmaven.repo.local override)
+      - PYTHONPYCACHEPREFIX    (Python __pycache__)
+      - MYPY_CACHE_DIR         (mypy incremental)
+      - RUFF_CACHE_DIR         (ruff)
+      - PYTEST_ADDOPTS         (forces -p no:cacheprovider OR --cache-dir)
+      - XDG_CACHE_HOME         (generic XDG fallback used by many tools)
+    """
+    base = os.path.join(worktree_path, ".harness-cache")
+    os.makedirs(base, exist_ok=True)
+
+    def _sub(name: str) -> str:
+        p = os.path.join(base, name)
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    maven_repo = _sub("maven-repo")
+
+    return {
+        # Python / pip / pytest / mypy / ruff
+        "PIP_CACHE_DIR": _sub("pip"),
+        "PYTHONPYCACHEPREFIX": _sub("pycache"),
+        "MYPY_CACHE_DIR": _sub("mypy"),
+        "RUFF_CACHE_DIR": _sub("ruff"),
+        # pytest uses XDG by default but PYTEST_ADDOPTS lets us override.
+        "PYTEST_ADDOPTS": f"-o cache_dir={_sub('pytest')}",
+        # JS / TS
+        "npm_config_cache": _sub("npm"),
+        "YARN_CACHE_FOLDER": _sub("yarn"),
+        # Rust
+        "CARGO_HOME": _sub("cargo-home"),
+        "CARGO_TARGET_DIR": _sub("cargo-target"),
+        # Go
+        "GOCACHE": _sub("go-build"),
+        "GOMODCACHE": _sub("go-mod"),
+        # JVM
+        "GRADLE_USER_HOME": _sub("gradle"),
+        "MAVEN_OPTS": f"-Dmaven.repo.local={maven_repo}",
+        # Generic XDG fallback caught by anything else
+        "XDG_CACHE_HOME": _sub("xdg"),
+    }
+
 
 def _create_worktree(repo_path: str, worktree_path: str) -> bool:
     """Create a git worktree at the given path."""

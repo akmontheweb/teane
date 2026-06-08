@@ -2030,6 +2030,42 @@ class TestCLI:
         assert base["b"]["y"] == 2
         assert base["c"] == 3
 
+    def test_deep_merge_lists_concatenate_with_dedupe(self):
+        # Regression: workspace overrides used to replace lists wholesale,
+        # silently nuking global cache mount defaults.
+        from harness.cli import _deep_merge
+        base = {"sandbox": {"readonly_cache_mounts": ["~/.cache/pip", "~/.npm"]}}
+        override = {"sandbox": {"readonly_cache_mounts": ["~/.npm", "./my-cache"]}}
+        _deep_merge(base, override)
+        # Global defaults preserved, workspace additions appended, dedupe applied
+        assert base["sandbox"]["readonly_cache_mounts"] == ["~/.cache/pip", "~/.npm", "./my-cache"]
+
+    def test_deep_merge_null_clears_value(self):
+        # Explicit null in override clears the base — the escape hatch for
+        # users who do want to nuke a default list.
+        from harness.cli import _deep_merge
+        base = {"sandbox": {"readonly_cache_mounts": ["~/.cache/pip"]}}
+        override = {"sandbox": {"readonly_cache_mounts": None}}
+        _deep_merge(base, override)
+        assert base["sandbox"]["readonly_cache_mounts"] is None
+
+    def test_validate_config_keys_warns_on_typo(self, caplog):
+        from harness.cli import _validate_config_keys
+        bad = {"model_routin": {"primary": "openai:gpt"}}  # missing 'g'
+        with caplog.at_level("WARNING"):
+            _validate_config_keys(bad, "/fake/path.json")
+        messages = " ".join(r.message for r in caplog.records)
+        assert "Unknown config key 'model_routin'" in messages
+        assert "model_routing" in messages  # suggested correction
+
+    def test_validate_config_keys_accepts_underscore_prefixed_keys(self, caplog):
+        # Keys starting with _ are comments and should NOT warn
+        from harness.cli import _validate_config_keys
+        config = {"_comment": "this is a comment", "build_command": "make"}
+        with caplog.at_level("WARNING"):
+            _validate_config_keys(config, "/fake/path.json")
+        assert not any("Unknown config key '_comment'" in r.message for r in caplog.records)
+
     def test_resolve_build_command_cli(self):
         from harness.cli import resolve_build_command
         result = resolve_build_command("custom build", {"build_command": "make build"})

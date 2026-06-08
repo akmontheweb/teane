@@ -52,6 +52,7 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
         try:
             with open(global_config_path, "r", encoding="utf-8") as f:
                 global_config = json.load(f)
+            _validate_config_keys(global_config, global_config_path)
             _deep_merge(config, global_config)
             logger.debug("[cli] Merged global config from %s", global_config_path)
         except (json.JSONDecodeError, OSError) as exc:
@@ -73,6 +74,7 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
         try:
             with open(workspace_config_path, "r", encoding="utf-8") as f:
                 workspace_config = json.load(f)
+            _validate_config_keys(workspace_config, workspace_config_path)
             _deep_merge(config, workspace_config)
             logger.debug("[cli] Merged workspace config from %s", workspace_config_path)
         except (json.JSONDecodeError, OSError) as exc:
@@ -150,12 +152,69 @@ def _get_default_config() -> dict[str, Any]:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> None:
-    """Recursively merge override dict into base dict in-place."""
+    """Recursively merge ``override`` into ``base`` in-place.
+
+    Merge rules:
+      - dict + dict  → recursive merge (existing behavior)
+      - list + list  → concatenate + dedupe (preserves base order, then
+        appends any new items from override). This means a partial
+        workspace override (e.g. one extra cache mount) doesn't wipe
+        the global defaults. To explicitly clear a base list, pass
+        ``null`` (None) in the override.
+      - any + None   → clears the base value (lets users opt out of
+        defaults without having to know their values).
+      - otherwise    → override wins.
+    """
     for key, value in override.items():
+        if value is None:
+            base[key] = None
+            continue
         if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _deep_merge(base[key], value)
+        elif key in base and isinstance(base[key], list) and isinstance(value, list):
+            # Concatenate + dedupe, preserving first-seen order.
+            seen: set[Any] = set()
+            merged: list[Any] = []
+            for item in list(base[key]) + list(value):
+                key_item = item if isinstance(item, (str, int, float, bool, tuple)) else repr(item)
+                if key_item in seen:
+                    continue
+                seen.add(key_item)
+                merged.append(item)
+            base[key] = merged
         else:
             base[key] = value
+
+
+# Top-level keys the harness knows about. Anything outside this set in a
+# user-provided config is almost certainly a typo (e.g. "model_routin").
+# Add new keys here when wiring new config sections.
+_KNOWN_TOP_LEVEL_KEYS = frozenset({
+    "build_command", "allow_network", "sandbox", "token_budget",
+    "node_throttle", "models", "model_routing", "persistence",
+    "manifest_file", "redaction", "security", "skills", "deployment",
+    "speculative", "impact", "lintgate", "logging",
+})
+
+
+def _validate_config_keys(config: dict[str, Any], source_label: str) -> None:
+    """
+    Warn on top-level config keys that aren't in the known set. Catches
+    typos like 'model_routin' silently no-op-ing. Heuristic-only: doesn't
+    block load, just logs an actionable warning with the closest match.
+    """
+    import difflib
+    for key in config.keys():
+        if key.startswith("_"):
+            continue  # comment keys
+        if key not in _KNOWN_TOP_LEVEL_KEYS:
+            suggestion = difflib.get_close_matches(key, _KNOWN_TOP_LEVEL_KEYS, n=1, cutoff=0.6)
+            hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
+            logger.warning(
+                "[cli] Unknown config key '%s' in %s%s — this entry will be ignored. "
+                "Known top-level keys: %s",
+                key, source_label, hint, ", ".join(sorted(_KNOWN_TOP_LEVEL_KEYS)),
+            )
 
 
 def _generate_workspace_config(

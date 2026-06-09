@@ -178,6 +178,10 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     "conftest.py", "manage.py", "__init__.py",
     "wsgi.py", "asgi.py", "main.py",
     "tox.ini", "pytest.ini", "MANIFEST.in", ".gitignore",
+    # Dependency manifests — must be in the static set so the LLM can
+    # CREATE them (e.g. add pytest after env_misconfig HITL), not just
+    # amend existing ones via the requirements*.txt scan below.
+    "requirements.txt",
 })
 
 

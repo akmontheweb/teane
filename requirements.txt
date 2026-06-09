@@ -11,10 +11,3 @@ httpx==0.28.1
 uuid7==0.1.0
 typing-extensions==4.15.0
 msgpack==1.1.2
-
-# Test dependencies — required because the harness's build_command is
-# `pip install -r requirements.txt && pytest`. The env_misconfig short-circuit
-# in compiler_node will otherwise route the run to HITL with
-# "Trigger: env_misconfig:pytest" before any LLM repair runs.
-pytest>=8.0.0
-pytest-asyncio>=0.24.0

@@ -114,6 +114,17 @@ class TestBuildPatcherAllowlist:
         assert "requirements.txt" in allowlist
         assert "requirements-dev.txt" in allowlist
 
+    def test_requirements_txt_allowed_even_when_absent(self, tmp_path):
+        # Greenfield workspaces won't have a requirements.txt yet — the LLM
+        # must still be allowed to CREATE one in response to env_misconfig.
+        # Pre-fix, the scan loop only included files already on disk, so a
+        # CREATE_FILE for `requirements.txt` was rejected with
+        # "path not in skill allowlist".
+        _seed_app_workspace(tmp_path)
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        assert "requirements.txt" in allowlist
+
 
 # ---------------------------------------------------------------------------
 # patching_node — out-of-root rejection

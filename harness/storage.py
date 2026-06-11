@@ -493,39 +493,63 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
     if blob is None:
         return {}
 
-    # msgpack binary path (LangGraph canonical format)
     if isinstance(blob, (bytes, bytearray)):
+        # LangGraph uses msgpack for the `checkpoint` column and plain JSON
+        # for the `metadata` column. Both pass through this helper, so we
+        # sniff the first non-whitespace byte and pick the right decoder
+        # first. The previous "msgpack-then-JSON" order spammed a noisy
+        # WARNING on every metadata blob (msgpack consumed the leading `{`
+        # as a fixmap header then raised "received extra data" on the
+        # remaining JSON bytes), confusing operators into thinking their
+        # checkpoint was corrupted when in fact the resume was succeeding
+        # via the silent JSON fallback.
         try:
             import msgpack
         except ImportError:
             msgpack = None  # type: ignore[assignment]
 
-        if msgpack is not None:
-            try:
-                return msgpack.unpackb(blob, raw=False)
-            except Exception as e:  # noqa: BLE001
-                # msgpack.exceptions.UnpackException or any decode failure.
-                # Promoted from DEBUG to WARNING so the operator sees the
-                # decode failure in default-level logs instead of silently
-                # falling through to a JSON attempt and then to {}.
-                logger.warning(
-                    "[storage] msgpack unpack failed (%s); trying JSON fallback.",
-                    e,
-                )
+        # First non-whitespace byte → format hint. JSON objects/arrays/strings
+        # always start with `{`, `[`, or `"` (0x7B / 0x5B / 0x22). Anything
+        # else (msgpack tag bytes 0x80-0xDF, etc.) is treated as msgpack.
+        sniff_idx = 0
+        while sniff_idx < len(blob) and blob[sniff_idx] in (0x20, 0x09, 0x0A, 0x0D):
+            sniff_idx += 1
+        first_byte = blob[sniff_idx] if sniff_idx < len(blob) else 0
+        looks_like_json = first_byte in (0x7B, 0x5B, 0x22)  # { [ "
 
-        # Fallback: try decoding as UTF-8 JSON text (legacy format)
-        try:
-            return json.loads(blob.decode("utf-8", errors="replace"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            logger.warning(
-                "[storage] JSON fallback also failed (%s). Blob is unreadable.",
-                exc,
+        def _try_msgpack() -> tuple[bool, Any, Optional[str]]:
+            if msgpack is None:
+                return False, None, "msgpack module unavailable"
+            try:
+                return True, msgpack.unpackb(blob, raw=False), None
+            except Exception as e:  # noqa: BLE001
+                return False, None, str(e)
+
+        def _try_json() -> tuple[bool, Any, Optional[str]]:
+            try:
+                return True, json.loads(blob.decode("utf-8", errors="replace")), None
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                return False, None, str(e)
+
+        attempts = (_try_json, _try_msgpack) if looks_like_json else (_try_msgpack, _try_json)
+        first_err: Optional[str] = None
+        for attempt in attempts:
+            ok, value, err = attempt()
+            if ok:
+                return value
+            first_err = first_err or err
+
+        # Both decoders failed → real corruption. Now the WARNING is meaningful.
+        logger.warning(
+            "[storage] Checkpoint blob decode failed (msgpack and JSON both "
+            "rejected it; first byte=0x%02x len=%d).",
+            first_byte, len(blob),
+        )
+        if strict:
+            raise CheckpointCorruptedError(
+                f"Checkpoint blob could not be decoded as msgpack or JSON: {first_err}"
             )
-            if strict:
-                raise CheckpointCorruptedError(
-                    "Checkpoint blob could not be decoded as msgpack or JSON."
-                ) from exc
-            return {}
+        return {}
 
     # Plain text JSON path (legacy / backwards-compat)
     if isinstance(blob, str):

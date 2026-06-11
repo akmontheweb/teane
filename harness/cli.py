@@ -267,7 +267,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "node_throttle", "models", "model_routing", "persistence",
     "manifest_file", "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
-    "test_generation", "metrics",
+    "test_generation", "metrics", "llm_dispatch",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -335,6 +335,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "num_variants", "temperature",
         "selection_strategy", "worktree_base_dir",
     }),
+    # LLM dispatch parameters consumed by harness/gateway.py.
+    # max_tokens_per_role is a free-form dict (role -> int) — the
+    # validator type-checks the wrapper but doesn't enumerate role
+    # names, so future NodeRole additions don't break this list.
+    "llm_dispatch": frozenset({
+        "max_tokens_default", "max_tokens_per_role",
+    }),
 }
 
 
@@ -398,6 +405,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.temperature": (int, float),
     "speculative.selection_strategy": (str,),
     "speculative.worktree_base_dir": (str,),
+    "llm_dispatch.max_tokens_default": (int,),
+    "llm_dispatch.max_tokens_per_role": (dict,),
     "metrics.burn_rate_window_minutes": (int,),
     "metrics.metrics_dir": (str,),
     "deployment.enabled": (bool,),
@@ -592,6 +601,46 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                     f"'speculative.num_variants' must be in [1, 10] "
                     f"(3 recommended), got {n_var}."
                 )
+
+    # LLM dispatch: clamp max_tokens to a range that makes sense across
+    # every supported provider. Below 256 → useless truncated replies;
+    # above 32768 → blows past per-request output caps on every supported
+    # model. Also validate that per-role values are positive ints (the
+    # role names themselves aren't enumerated here — unknown roles in
+    # max_tokens_per_role get silently ignored at dispatch time so adding
+    # a new NodeRole doesn't require a validator update).
+    dispatch_cfg = config.get("llm_dispatch", {})
+    if isinstance(dispatch_cfg, dict):
+        _MIN_MAX_TOKENS = 256
+        _MAX_MAX_TOKENS = 32768
+        default_mt = dispatch_cfg.get("max_tokens_default")
+        if isinstance(default_mt, int) and not isinstance(default_mt, bool):
+            if default_mt < _MIN_MAX_TOKENS or default_mt > _MAX_MAX_TOKENS:
+                errors.append(
+                    f"'llm_dispatch.max_tokens_default' must be in "
+                    f"[{_MIN_MAX_TOKENS}, {_MAX_MAX_TOKENS}], got {default_mt}."
+                )
+        per_role = dispatch_cfg.get("max_tokens_per_role", {})
+        if isinstance(per_role, dict):
+            for role_name, role_mt in per_role.items():
+                if not isinstance(role_name, str) or not role_name.strip():
+                    errors.append(
+                        f"'llm_dispatch.max_tokens_per_role' keys must be "
+                        f"non-empty role-name strings, got {role_name!r}."
+                    )
+                    continue
+                if not isinstance(role_mt, int) or isinstance(role_mt, bool):
+                    errors.append(
+                        f"'llm_dispatch.max_tokens_per_role.{role_name}' "
+                        f"must be an int, got {type(role_mt).__name__}."
+                    )
+                    continue
+                if role_mt < _MIN_MAX_TOKENS or role_mt > _MAX_MAX_TOKENS:
+                    errors.append(
+                        f"'llm_dispatch.max_tokens_per_role.{role_name}' "
+                        f"must be in [{_MIN_MAX_TOKENS}, {_MAX_MAX_TOKENS}], "
+                        f"got {role_mt}."
+                    )
 
     # --- 5. Env var presence for every model referenced by routing ---
     referenced_models: set[str] = set()

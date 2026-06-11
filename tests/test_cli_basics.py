@@ -213,6 +213,58 @@ class TestValidateConfigStrict:
         assert "/some/path.json" in msg
         assert "Fix the config file before re-running" in msg
 
+    # --- llm_dispatch section (max_tokens per role) ---
+
+    def test_llm_dispatch_valid_passes(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "max_tokens_default": 4096,
+            "max_tokens_per_role": {
+                "planning": 4096, "patching": 4096, "repair": 8192,
+                "doc_reviewer": 2048, "code_reviewer": 4096,
+            },
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_default_below_floor_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {"max_tokens_default": 100}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "max_tokens_default" in str(exc.value)
+        assert "[256, 32768]" in str(exc.value)
+
+    def test_llm_dispatch_per_role_above_ceiling_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {"max_tokens_per_role": {"repair": 99999}}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        msg = str(exc.value)
+        assert "max_tokens_per_role.repair" in msg
+        assert "32768" in msg
+
+    def test_llm_dispatch_per_role_wrong_type_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {"max_tokens_per_role": {"repair": "eight"}}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "must be an int" in str(exc.value)
+
+    def test_llm_dispatch_section_optional(self, openai_key):
+        # Section is opt-in — absence falls back to GatewayConfig defaults.
+        cfg = _min_valid_config()
+        assert "llm_dispatch" not in cfg
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_unknown_nested_key_rejected(self, openai_key):
+        # Typos in the llm_dispatch section must surface, not silently no-op.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {"max_tokens_defalt": 4096}  # typo
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "max_tokens_defalt" in str(exc.value)
+        assert "max_tokens_default" in str(exc.value)  # difflib suggestion
+
 
 # ---------------------------------------------------------------------------
 # discover_config — single-source loader

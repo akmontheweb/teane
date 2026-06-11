@@ -2309,6 +2309,227 @@ class TestGateway:
         # Config must remain untouched
         assert gateway.config.repair_primary == config_before
 
+    # --- llm_dispatch / max_tokens externalization ---
+
+    def test_max_tokens_for_per_role_overrides_default(self):
+        from harness.gateway import Gateway, GatewayConfig, NodeRole
+        gw = Gateway(GatewayConfig(
+            max_tokens_default=4096,
+            max_tokens_per_role={"repair": 8192, "doc_reviewer": 2048},
+        ))
+        assert gw._max_tokens_for(NodeRole.REPAIR) == 8192
+        assert gw._max_tokens_for(NodeRole.DOC_REVIEWER) == 2048
+
+    def test_max_tokens_for_falls_back_to_default(self):
+        # Roles not in the per-role map inherit the default.
+        from harness.gateway import Gateway, GatewayConfig, NodeRole
+        gw = Gateway(GatewayConfig(
+            max_tokens_default=4096,
+            max_tokens_per_role={"repair": 8192},
+        ))
+        assert gw._max_tokens_for(NodeRole.PLANNING) == 4096
+        assert gw._max_tokens_for(NodeRole.PATCHING) == 4096
+        assert gw._max_tokens_for(NodeRole.CODE_REVIEWER) == 4096
+
+    def test_max_tokens_for_ignores_non_positive_value(self):
+        # If a config writer manages to slip a zero/negative through (e.g.
+        # via the programmatic GatewayConfig path that bypasses
+        # validate_config_strict), _max_tokens_for must NOT pass it to the
+        # provider — fall back to the default instead.
+        from harness.gateway import Gateway, GatewayConfig, NodeRole
+        gw = Gateway(GatewayConfig(
+            max_tokens_default=4096,
+            max_tokens_per_role={"repair": 0, "doc_reviewer": -1},
+        ))
+        assert gw._max_tokens_for(NodeRole.REPAIR) == 4096
+        assert gw._max_tokens_for(NodeRole.DOC_REVIEWER) == 4096
+
+    def test_create_gateway_from_config_loads_llm_dispatch(self):
+        # End-to-end: the JSON-shaped llm_dispatch section ends up on the
+        # GatewayConfig dataclass after create_gateway_from_config.
+        from harness.gateway import create_gateway_from_config
+        cfg = {
+            "models": {
+                "openai:gpt-4o-mini": {
+                    "provider": "openai", "model_id": "gpt-4o-mini",
+                    "context_window": 128000,
+                    "input_cost_per_1m": 0.15, "output_cost_per_1m": 0.60,
+                    "api_base_url": "https://api.openai.com/v1",
+                    "supports_thinking": False, "api_key": "",
+                },
+            },
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "openai:gpt-4o-mini",
+                "repair_primary": "openai:gpt-4o-mini",
+            },
+            "llm_dispatch": {
+                "max_tokens_default": 4096,
+                "max_tokens_per_role": {"repair": 8192, "doc_reviewer": 2048},
+            },
+        }
+        gw = create_gateway_from_config(cfg)
+        assert gw.config.max_tokens_default == 4096
+        assert gw.config.max_tokens_per_role == {"repair": 8192, "doc_reviewer": 2048}
+
+    def test_create_gateway_from_config_clamps_out_of_range(self):
+        # Defense-in-depth: even if a programmatic caller hands us a value
+        # outside [256, 32768] (bypassing validate_config_strict), the
+        # factory must clamp it instead of trusting it blindly.
+        from harness.gateway import create_gateway_from_config
+        cfg = {
+            "models": {
+                "openai:gpt-4o-mini": {
+                    "provider": "openai", "model_id": "gpt-4o-mini",
+                    "context_window": 128000,
+                    "input_cost_per_1m": 0.15, "output_cost_per_1m": 0.60,
+                    "api_base_url": "https://api.openai.com/v1",
+                    "supports_thinking": False, "api_key": "",
+                },
+            },
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "openai:gpt-4o-mini",
+                "repair_primary": "openai:gpt-4o-mini",
+            },
+            "llm_dispatch": {
+                "max_tokens_default": 100,                  # below floor
+                "max_tokens_per_role": {"repair": 99999},   # above ceiling
+            },
+        }
+        gw = create_gateway_from_config(cfg)
+        assert gw.config.max_tokens_default == 256
+        assert gw.config.max_tokens_per_role["repair"] == 32768
+
+    def test_create_gateway_from_config_defaults_when_section_absent(self):
+        # No llm_dispatch in config → GatewayConfig defaults (4096 / empty map).
+        from harness.gateway import create_gateway_from_config
+        cfg = {
+            "models": {
+                "openai:gpt-4o-mini": {
+                    "provider": "openai", "model_id": "gpt-4o-mini",
+                    "context_window": 128000,
+                    "input_cost_per_1m": 0.15, "output_cost_per_1m": 0.60,
+                    "api_base_url": "https://api.openai.com/v1",
+                    "supports_thinking": False, "api_key": "",
+                },
+            },
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "openai:gpt-4o-mini",
+                "repair_primary": "openai:gpt-4o-mini",
+            },
+        }
+        gw = create_gateway_from_config(cfg)
+        assert gw.config.max_tokens_default == 4096
+        assert gw.config.max_tokens_per_role == {}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_injects_per_role_max_tokens(self):
+        # Verify dispatch() passes the per-role max_tokens into the
+        # provider.chat_completion kwargs. Spy on chat_completion to
+        # capture what it received without making a real API call.
+        # The redactor must be intact (gateway fails-closed if it's not),
+        # so we install a real one via the factory.
+        from harness.gateway import (
+            Gateway, GatewayConfig, NodeRole, ModelSpec, register_model,
+        )
+        from harness.redactor import create_redactor_from_config
+        create_redactor_from_config({})
+
+        register_model(
+            "ollama:dispatch-mt-test",
+            ModelSpec(provider="ollama", model_id="mt-test",
+                      context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+
+        gateway = Gateway(GatewayConfig(
+            repair_primary="ollama:dispatch-mt-test",
+            max_tokens_default=4096,
+            max_tokens_per_role={"repair": 8192},
+        ))
+
+        seen_kwargs: dict = {}
+        original = gateway._get_provider
+
+        async def spy_get_provider(model_key):
+            provider = await original(model_key)
+
+            async def spy_chat(**kwargs):
+                seen_kwargs.update(kwargs)
+                raise RuntimeError("stop before network call")
+
+            provider.chat_completion = spy_chat  # type: ignore[assignment]
+            return provider
+
+        gateway._get_provider = spy_get_provider  # type: ignore[assignment]
+
+        try:
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "x"}],
+                role=NodeRole.REPAIR,
+                budget_remaining_usd=1.0,
+            )
+        except RuntimeError:
+            pass  # expected — spy raises before network
+
+        assert seen_kwargs.get("max_tokens") == 8192, (
+            f"REPAIR role should have received max_tokens=8192, "
+            f"got {seen_kwargs.get('max_tokens')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_respects_caller_max_tokens_override(self):
+        # When the caller passes max_tokens explicitly via **llm_kwargs,
+        # the gateway must NOT overwrite it — per-role config is only the
+        # default, not a hard ceiling.
+        from harness.gateway import (
+            Gateway, GatewayConfig, NodeRole, ModelSpec, register_model,
+        )
+        from harness.redactor import create_redactor_from_config
+        create_redactor_from_config({})
+
+        register_model(
+            "ollama:dispatch-mt-override-test",
+            ModelSpec(provider="ollama", model_id="override-test",
+                      context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+
+        gateway = Gateway(GatewayConfig(
+            repair_primary="ollama:dispatch-mt-override-test",
+            max_tokens_default=4096,
+            max_tokens_per_role={"repair": 8192},
+        ))
+
+        seen_kwargs: dict = {}
+        original = gateway._get_provider
+
+        async def spy_get_provider(model_key):
+            provider = await original(model_key)
+
+            async def spy_chat(**kwargs):
+                seen_kwargs.update(kwargs)
+                raise RuntimeError("stop")
+
+            provider.chat_completion = spy_chat  # type: ignore[assignment]
+            return provider
+
+        gateway._get_provider = spy_get_provider  # type: ignore[assignment]
+
+        try:
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "x"}],
+                role=NodeRole.REPAIR,
+                budget_remaining_usd=1.0,
+                max_tokens=1024,  # explicit caller override
+            )
+        except RuntimeError:
+            pass
+
+        assert seen_kwargs.get("max_tokens") == 1024
+
 
 class TestGatekeeperAutoApprove:
     """Regression: human_gatekeeper_node ignored HARNESS_AUTO_APPROVE and CI."""

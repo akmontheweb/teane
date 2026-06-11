@@ -1120,6 +1120,16 @@ class GatewayConfig:
     # TLS: set to a CA bundle path (str) for corporate proxies, or False to
     # disable verification in air-gapped envs (not recommended for production).
     ssl_verify: Union[bool, str] = True
+    # Per-call max_tokens ceiling. Used by Gateway._max_tokens_for(role).
+    # max_tokens_default is the fallback when a role isn't listed in
+    # max_tokens_per_role. Both are clamped to [256, 32768] in
+    # validate_config_strict so the gateway can trust the values here.
+    # For reasoning-mode models (deepseek-v4-pro) the ceiling is shared
+    # between the hidden thinking trace and the visible content — bumping
+    # repair to 8192 is the recommended baseline so the thinking trace +
+    # patch blocks both fit.
+    max_tokens_default: int = 4096
+    max_tokens_per_role: dict[str, int] = field(default_factory=dict)
 
 
 class Gateway:
@@ -1235,6 +1245,22 @@ class Gateway:
         elif role == NodeRole.CODE_REVIEWER:
             return self.config.code_reviewer_mode.lower() in ("thinking", "thinking_max")
         return False
+
+    def _max_tokens_for(self, role: NodeRole) -> int:
+        """Resolve the per-call max_tokens ceiling for ``role``.
+
+        Looks up ``llm_dispatch.max_tokens_per_role.<role>`` from config;
+        falls back to ``llm_dispatch.max_tokens_default``. Roles absent
+        from the map (e.g. a future NodeRole addition shipped before the
+        operator updates config) inherit the default — they don't crash.
+        validate_config_strict already clamped both values into
+        [256, 32768], so the result is always usable.
+        """
+        per_role = self.config.max_tokens_per_role or {}
+        value = per_role.get(role.value)
+        if isinstance(value, int) and value > 0:
+            return value
+        return self.config.max_tokens_default
 
     def _get_models_with_keys(self) -> list[tuple[str, ModelSpec]]:
         """Return all registered non-Ollama models that have a resolvable API key."""
@@ -1464,8 +1490,20 @@ class Gateway:
         except Exception as exc:  # noqa: BLE001 — estimate must never block valid calls
             logger.debug("[gateway] Pre-flight cost estimate failed: %s", exc)
 
+        # Per-role max_tokens ceiling. Inject only when the caller hasn't
+        # passed one explicitly, so one-shot call sites can still override
+        # (e.g. summarizer prompts that want a hard 1024 cap regardless of
+        # global config). The default per-role values come from
+        # llm_dispatch.max_tokens_per_role in config.json; see
+        # Gateway._max_tokens_for for resolution order.
+        if "max_tokens" not in llm_kwargs:
+            llm_kwargs["max_tokens"] = self._max_tokens_for(role)
+
         # Execute with retry/backoff
-        logger.info("[gateway] Dispatching to %s (role=%s, thinking=%s).", model_key, role.value, thinking)
+        logger.info(
+            "[gateway] Dispatching to %s (role=%s, thinking=%s, max_tokens=%d).",
+            model_key, role.value, thinking, llm_kwargs["max_tokens"],
+        )
 
         import time as _time
         _dispatch_start = _time.monotonic()
@@ -1848,6 +1886,40 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 30
         return value
 
+    def _clamp_max_tokens(raw: Any, fallback: int) -> int:
+        """Clamp llm_dispatch.max_tokens_* into [256, 32768].
+
+        validate_config_strict already enforces this range when the
+        section is present in config.json, but this clamp is the second
+        line of defense for programmatic callers that hand-build a
+        config dict (tests, embed-in-pipeline use cases).
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return fallback
+        if value < 256:
+            logger.warning("max_tokens %d < 256; clamping to 256.", value)
+            return 256
+        if value > 32768:
+            logger.warning("max_tokens %d > 32768; clamping to 32768.", value)
+            return 32768
+        return value
+
+    llm_dispatch = config_dict.get("llm_dispatch", {}) or {}
+    max_tokens_default = _clamp_max_tokens(
+        llm_dispatch.get("max_tokens_default", 4096), 4096
+    )
+    raw_per_role = llm_dispatch.get("max_tokens_per_role", {}) or {}
+    max_tokens_per_role: dict[str, int] = {}
+    if isinstance(raw_per_role, dict):
+        for role_name, role_mt in raw_per_role.items():
+            if not isinstance(role_name, str) or not role_name.strip():
+                continue
+            max_tokens_per_role[role_name] = _clamp_max_tokens(
+                role_mt, max_tokens_default
+            )
+
     gateway_config = GatewayConfig(
         planning_primary=model_routing.get("planning_primary", ""),
         planning_mode=model_routing.get("planning_mode", "thinking_max"),
@@ -1877,5 +1949,7 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         hard_cap_usd=token_budget.get("hard_cap_usd", 2.00),
         context_window_threshold_pct=token_budget.get("context_window_threshold_pct", 0.85),
         ssl_verify=config_dict.get("ssl_verify", True),
+        max_tokens_default=max_tokens_default,
+        max_tokens_per_role=max_tokens_per_role,
     )
     return Gateway(gateway_config)

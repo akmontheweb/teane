@@ -1186,6 +1186,122 @@ class TestSandboxBackend:
         assert isinstance(executor.backend, DockerBackend)
         assert executor.backend.restore_workspace_ownership is False
 
+    # ------------------------------------------------------------------
+    # Windows compatibility — three regression nets for the POSIX-only
+    # paths in sandbox.py. Each test simulates Windows via monkeypatch
+    # so the suite still runs entirely on Linux/macOS hosts. The same
+    # functions on the POSIX side are exercised by every OTHER test in
+    # this class, so the unchanged-on-Linux contract is verified by
+    # those tests staying green without modification.
+    # ------------------------------------------------------------------
+
+    def test_kill_process_group_falls_back_to_proc_kill_on_windows(self, monkeypatch):
+        # On Windows os.killpg and os.getpgid don't exist; the old guard
+        # only caught ProcessLookupError/OSError, so an unguarded killpg
+        # call would crash the entire harness with an AttributeError when
+        # a build timed out. Now the hasattr() check routes through the
+        # cross-platform proc.kill() fallback.
+        from harness.sandbox import _kill_process_group
+
+        # Simulate Windows: remove killpg from the os module the function
+        # sees. monkeypatch restores it after the test.
+        monkeypatch.delattr(os, "killpg", raising=False)
+
+        class _FakeProc:
+            def __init__(self):
+                self.killed = False
+            def kill(self):
+                self.killed = True
+
+        fake = _FakeProc()
+        # Must not raise — and must invoke the proc.kill() fallback.
+        _kill_process_group(pgid=4242, proc=fake)  # type: ignore[arg-type]
+        assert fake.killed, (
+            "Windows fallback didn't call proc.kill() — the timeout path "
+            "would crash with AttributeError instead of cleaning up."
+        )
+
+    def test_docker_mount_path_returns_unchanged_on_linux(self, monkeypatch):
+        # On Linux/macOS the helper must be a pure pass-through so the
+        # existing docker-argv assertions in this test class stay valid.
+        from harness.sandbox import _docker_mount_path
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        assert _docker_mount_path("/work") == "/work"
+        assert _docker_mount_path("/home/akhila/mywork/projects/foo") == "/home/akhila/mywork/projects/foo"
+
+    def test_docker_mount_path_converts_windows_drive_letter(self, monkeypatch):
+        # Windows path C:\Users\foo\ws must become /c/Users/foo/ws so
+        # Docker Desktop's CLI doesn't choke on the ":" in "C:" being
+        # mistaken for the host/container mount separator.
+        from harness.sandbox import _docker_mount_path
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Windows")
+        assert _docker_mount_path("C:\\Users\\foo\\ws") == "/c/Users/foo/ws"
+        assert _docker_mount_path("D:\\src\\app") == "/d/src/app"
+        # Lower-case drive letter regardless of input case.
+        assert _docker_mount_path("c:\\users\\foo") == "/c/users/foo"
+        # Already-POSIX path (Git Bash / WSL) passes through with slash flip.
+        assert _docker_mount_path("/mnt/c/foo") == "/mnt/c/foo"
+
+    def test_bare_backend_uses_cmd_c_on_windows(self, monkeypatch):
+        # BareBackend defaults to ["sh", "-c", ...] on POSIX; on Windows
+        # there's no sh on PATH, so we use cmd /c with cd /d (the /d
+        # switch crosses drive letters). Verify the constructed argv.
+        from harness.sandbox import BareBackend
+
+        # Capture the argv without actually spawning a subprocess. The
+        # real run() awaits a subprocess; we just need to know what cmd
+        # would be passed to _execute_subprocess_with_timeout.
+        captured: dict[str, list[str]] = {}
+        async def _fake_exec(cmd, timeout_seconds, extra_env=None):
+            captured["cmd"] = cmd
+            return (0, "", False, False)
+
+        monkeypatch.setattr(
+            "harness.sandbox._execute_subprocess_with_timeout", _fake_exec,
+        )
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Windows")
+
+        import asyncio
+        backend = BareBackend()
+        asyncio.run(backend.run(
+            command="echo hello",
+            workspace_path="C:\\work",
+            timeout_seconds=60,
+        ))
+        assert captured["cmd"][:2] == ["cmd", "/c"], (
+            f"Expected cmd /c on Windows, got {captured['cmd'][:2]!r}"
+        )
+        assert 'cd /d "C:\\work"' in captured["cmd"][2]
+        assert "echo hello" in captured["cmd"][2]
+
+    def test_bare_backend_uses_sh_on_linux(self, monkeypatch):
+        # Regression-net partner for the test above: on Linux the
+        # constructed argv MUST still be ["sh", "-c", ...] so the
+        # existing POSIX behaviour is unchanged byte-for-byte.
+        from harness.sandbox import BareBackend
+
+        captured: dict[str, list[str]] = {}
+        async def _fake_exec(cmd, timeout_seconds, extra_env=None):
+            captured["cmd"] = cmd
+            return (0, "", False, False)
+
+        monkeypatch.setattr(
+            "harness.sandbox._execute_subprocess_with_timeout", _fake_exec,
+        )
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+
+        import asyncio
+        backend = BareBackend()
+        asyncio.run(backend.run(
+            command="echo hello",
+            workspace_path="/tmp/work",
+            timeout_seconds=60,
+        ))
+        assert captured["cmd"][:2] == ["sh", "-c"], (
+            f"Linux MUST still use ['sh', '-c', ...]; got {captured['cmd'][:2]!r}"
+        )
+        assert captured["cmd"][2] == "cd '/tmp/work' && echo hello"
+
     def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
         # Regression: docker info failure used to just return False with no
         # signal whether the daemon was down or perms were wrong.

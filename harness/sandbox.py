@@ -266,6 +266,38 @@ class UnshareBackend(SandboxBackend):
 # 4. DockerBackend — Docker Container Isolation
 # ---------------------------------------------------------------------------
 
+def _docker_mount_path(p: str) -> str:
+    """Normalise a filesystem path for use as a Docker ``-v`` / ``-w`` argument.
+
+    Docker on Linux and macOS accepts the native path verbatim — this helper
+    is a pure pass-through there, returning ``p`` byte-identical to its
+    input so the existing Linux/macOS test argv-assertions continue to
+    match unchanged.
+
+    On Windows, ``docker run -v C:\\Users\\foo:C:\\Users\\foo:rw`` is
+    ambiguous (the ``:`` in ``C:`` is also the host/container separator),
+    so Docker Desktop's CLI rejects it. The canonical fix is to express
+    the path in POSIX form (``/c/Users/foo``) and let Docker Desktop's
+    bind-mount layer translate back. This helper does that conversion:
+    lower-case the drive letter, strip the colon, prepend ``/``, and
+    flip backslashes to forward slashes. ``C:\\Users\\foo`` becomes
+    ``/c/Users/foo``; ``D:\\src\\app`` becomes ``/d/src/app``.
+
+    Uses ``ntpath.splitdrive`` (not ``os.path.splitdrive``) so the
+    Windows-style drive-letter split works even when this code is
+    cross-tested from a Linux host — ``os.path.splitdrive`` dispatches
+    based on the running platform and would return ``("", path)`` on a
+    Linux test harness, missing the drive letter.
+    """
+    if platform.system() != "Windows":
+        return p
+    import ntpath
+    drive, rest = ntpath.splitdrive(p)
+    if drive.endswith(":"):
+        return f"/{drive[:-1].lower()}{rest}".replace("\\", "/")
+    return p.replace("\\", "/")
+
+
 class DockerBackend(SandboxBackend):
     """
     Executes builds inside an ephemeral Docker container with resource limits.
@@ -457,17 +489,22 @@ class DockerBackend(SandboxBackend):
         else:
             cmd.extend(["--network", "none"])     # Complete network isolation
 
-        # Mount workspace read-write
-        cmd.extend(["-v", f"{workspace_path}:{workspace_path}:rw"])
+        # Mount workspace read-write. _docker_mount_path is a pass-through
+        # on Linux/macOS (string returned byte-identical) and converts the
+        # path to POSIX form on Windows so Docker Desktop's CLI parser
+        # doesn't choke on the ``:`` in ``C:\``.
+        ws_mount = _docker_mount_path(workspace_path)
+        cmd.extend(["-v", f"{ws_mount}:{ws_mount}:rw"])
 
         # Mount cache directories read-only
         for cache_path in cache_mounts:
             expanded = os.path.expanduser(cache_path)
             if os.path.isdir(expanded):
-                cmd.extend(["-v", f"{expanded}:{expanded}:ro"])
+                expanded_mount = _docker_mount_path(expanded)
+                cmd.extend(["-v", f"{expanded_mount}:{expanded_mount}:ro"])
 
-        # Set working directory
-        cmd.extend(["-w", workspace_path])
+        # Set working directory (same Windows path conversion as the mount).
+        cmd.extend(["-w", _docker_mount_path(workspace_path)])
 
         # Environment variables. Default suppression of pyc emission into the
         # bind-mounted workspace — pytest otherwise leaves root-owned
@@ -680,7 +717,15 @@ class BareBackend(SandboxBackend):
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
     ) -> tuple[int, str, bool, bool]:
-        cmd = ["sh", "-c", f"cd '{workspace_path}' && {command}"]
+        # On Windows there is no ``sh`` on PATH by default. Use ``cmd /c`` with
+        # ``cd /d`` (the ``/d`` switch lets cmd.exe cross drive letters, e.g.
+        # ``C:`` → ``D:``). The ``&&`` separator works in both shells. On
+        # Linux/macOS the ``else`` branch keeps the exact existing line so
+        # the constructed argv is byte-identical to today.
+        if platform.system() == "Windows":
+            cmd = ["cmd", "/c", f'cd /d "{workspace_path}" && {command}']
+        else:
+            cmd = ["sh", "-c", f"cd '{workspace_path}' && {command}"]
         logger.info("[sandbox:bare] Running without isolation (bare subprocess).")
         return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=extra_env)
 
@@ -754,12 +799,16 @@ async def _execute_subprocess_with_timeout(
             env=env,
         )
 
-        # Capture the process group ID for clean tree termination
+        # Capture the process group ID for clean tree termination.
+        # On Windows ``os.getpgid`` doesn't exist; leave ``pgid`` as ``None``
+        # so the timeout-watchdog falls through to the cross-platform
+        # ``proc.kill()`` path inside ``_kill_process_group``.
         pgid: Optional[int] = None
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
-            pgid = proc.pid
+        if hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                pgid = proc.pid
 
         async def _read_stdout() -> None:
             assert proc.stdout is not None
@@ -1121,8 +1170,17 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
     """
     Kill an entire process group. Sends SIGTERM first, waits 3s,
     then escalates to SIGKILL if the group still exists.
+
+    On Windows ``os.killpg`` does not exist; the existing
+    ``except (ProcessLookupError, OSError)`` clauses would NOT catch the
+    resulting ``AttributeError`` and the harness would crash the moment a
+    build timed out. Gate the POSIX path on ``hasattr(os, "killpg")`` and
+    fall through to ``proc.kill()`` (asyncio's cross-platform terminator,
+    which maps to ``TerminateProcess`` on Win32) when the syscall family
+    is unavailable.
     """
-    if pgid is not None:
+    if pgid is not None and hasattr(os, "killpg"):
+        # POSIX path — IDENTICAL to the pre-Windows behaviour.
         try:
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
@@ -1133,12 +1191,12 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
-    else:
-        # Fallback: just kill the parent process
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        return
+    # Windows OR pgid-unavailable fallback: kill the parent process.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 # ---------------------------------------------------------------------------

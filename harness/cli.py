@@ -2171,6 +2171,26 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     except Exception as _exc:  # noqa: BLE001 — diagnostic must never block resume
         logger.debug("[resume] Could not build pre-resume summary: %s", _exc)
 
+    # Re-attach the GitGuardian to the same agent/patch-<id> branch that
+    # the original cmd_run created. Without this, a resumed session that
+    # ends in success (exit_code=0) leaves its fixes as uncommitted dirty
+    # working-tree files — `git log` shows nothing, `git checkout main`
+    # loses them, and the operator has to `git add . && git commit`
+    # manually. A resumed session that ends in failure leaves the LLM's
+    # bad patches in the workspace with no rollback. Mirroring cmd_run's
+    # git lifecycle around the resumed graph fixes both.
+    #
+    # create_patch_branch is idempotent: it sees the existing
+    # agent/patch-<id> branch (created by the original cmd_run that wrote
+    # the checkpoint) and just checks it out — same primitive on both
+    # paths. If the operator deleted the branch between suspend ↔ resume
+    # we recreate it; if they switched to a different branch we re-attach
+    # to the agent one.
+    from harness.security import GitGuardian
+    git_guardian = GitGuardian(workspace_path)
+    git_guardian.stash_if_dirty()
+    git_guardian.create_patch_branch(args.session_id)
+
     try:
         final_state = await run_graph(
             workspace_path=workspace_path,
@@ -2193,10 +2213,40 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         )
     except Exception:
         logger.exception("Resume execution failed.")
+        git_guardian.rollback()
+        git_guardian.pop_stash()
         await checkpointer.conn.close()
         return 1
 
     exit_code = final_state.get("exit_code", -1)
+    modified_files = final_state.get("modified_files", [])
+
+    # Mirror cmd_run's post-graph dispatch — same branches, same flags,
+    # same order. Keeps the two paths symmetric so behaviour after a
+    # resume is identical to behaviour after a fresh run.
+    node_state = final_state.get("node_state", {}) or {}
+    hitl_suspend = bool(node_state.get("hitl_suspend"))
+    hitl_abandon = bool(node_state.get("hitl_abandon"))
+
+    if hitl_suspend:
+        agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
+        logger.info(
+            "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
+            "'%s'. Resume with `harness resume --session-id %s` to continue "
+            "from the same workspace state.",
+            len(modified_files), agent_branch, args.session_id,
+        )
+    elif hitl_abandon:
+        git_guardian.rollback(modified_files)
+        git_guardian.pop_stash()
+    elif exit_code == 0:
+        git_guardian.commit_all_changes(args.session_id, modified_files, exit_code)
+        git_guardian.restore_original_branch()
+        git_guardian.pop_stash()
+    else:
+        git_guardian.rollback(modified_files)
+        git_guardian.pop_stash()
+
     logger.info("[resume] Session '%s' completed with exit code %d.", args.session_id, exit_code)
 
     await checkpointer.conn.close()

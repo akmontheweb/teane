@@ -2617,8 +2617,24 @@ async def architecture_discovery_node(state: AgentState) -> dict[str, Any]:
     if is_followup:
         prompt = f"""You are a Principal Infrastructure Architect. FOLLOW-UP round #{question_count + 1}.
 Review the conversation above. Cross-reference answers. Find remaining gaps.
-If all 8 sectors fully resolved, output {{"complete": true}}.
-Same JSON schema as before."""
+If all 8 architectural sectors are fully resolved, output {{"complete": true}} and nothing else.
+
+Otherwise, output the EXACT JSON shape below — top-level key MUST be
+literally "modules". The harness parses this shape strictly; any other
+top-level key yields zero questions and the operator sees an empty
+interview screen.
+
+{{
+  "modules": [
+    {{"name": "STORAGE TOPOLOGY", "questions": [
+      {{"id": "A1.1", "text": "...", "critical": true}}
+    ]}}
+  ],
+  "complete": false,
+  "summary": "Brief status of what's resolved vs remaining"
+}}
+
+Return ONLY valid JSON. No markdown, no explanation, no code fences."""
 
     else:
         prompt = """You are a Principal Infrastructure Architect. Perform EXHAUSTIVE architecture discovery across ALL 8 sectors.
@@ -2744,8 +2760,23 @@ async def deployment_discovery_node(state: AgentState) -> dict[str, Any]:
     if is_followup:
         prompt = f"""You are a Principal DevSecOps Engineer. FOLLOW-UP round #{question_count + 1}.
 Review the conversation above. Cross-reference deployment answers. Find remaining gaps.
-If all 4 deployment sectors fully resolved, output {{"complete": true}}.
-Same JSON schema as before."""
+If all 4 deployment sectors are fully resolved, output {{"complete": true}} and nothing else.
+
+Otherwise, output the EXACT JSON shape below — top-level key MUST be
+literally "modules". Any other key yields zero questions on the
+interview screen.
+
+{{
+  "modules": [
+    {{"name": "NETWORK TOPOLOGY", "questions": [
+      {{"id": "D1.1", "text": "...", "critical": true}}
+    ]}}
+  ],
+  "complete": false,
+  "summary": "Brief status of what's resolved vs remaining"
+}}
+
+Return ONLY valid JSON. No markdown, no explanation, no code fences."""
 
     else:
         prompt = """You are a Principal DevSecOps Systems Engineer and Lead SRE. Perform EXHAUSTIVE deployment infrastructure discovery across ALL 4 sectors below.
@@ -3358,6 +3389,22 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         findings = critique.get("findings", []) if isinstance(critique, dict) else []
         if not isinstance(findings, list):
             findings = []
+        # Schema-drift sentinel: response parsed cleanly, but the canonical
+        # "findings" key is missing AND the LLM produced something else at
+        # the top level (e.g. "issues" / "comments"). The previous behaviour
+        # silently treated this as "code is clean" and skipped the security
+        # gate — same silent-drift shape as the discovery 0-modules bug.
+        if isinstance(critique, dict) and "findings" not in critique:
+            other_keys = sorted(k for k in critique.keys() if not k.startswith("_"))
+            if other_keys:
+                logger.warning(
+                    "[code_review] Response parsed cleanly but the canonical "
+                    "'findings' key is missing — the LLM used non-canonical "
+                    "top-level keys=%s. Treating as no-findings (code passes "
+                    "review) BUT the security gate would skip; verify the "
+                    "review JSON in docs/CODE_REVIEW.md before trusting the "
+                    "result.", other_keys,
+                )
     except (ValueError, json.JSONDecodeError) as exc:
         logger.warning("[code_review] Critique was not valid JSON (%s) — passing through.", exc)
         findings = []
@@ -3545,10 +3592,12 @@ async def generate_deployment_spec_node(state: AgentState) -> dict[str, Any]:
 6. Scaling & Resource Limits
 7. Deployment Sequence (order of container startup)
 
-Output as clean Markdown."""
+Output as clean Markdown. Do NOT wrap the document in an outer
+```markdown … ``` fence — emit the body directly, starting with the
+first heading. Fences are reserved for code blocks INSIDE the document."""
 
             messages = [
-                {"role": "system", "content": "You are a DevOps architect. Output clean Markdown."},
+                {"role": "system", "content": "You are a DevOps architect. Output clean Markdown — no outer code fences around the document."},
                 {"role": "user", "content": prompt},
             ]
             current_budget = state.get("budget_remaining_usd", 0.0)

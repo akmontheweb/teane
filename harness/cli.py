@@ -1242,7 +1242,10 @@ SPEC_REQUIREMENTS.md document.
 
 ## Formatting
 Output as clean, well-structured Markdown. Use proper headings, bullet points,
-and code blocks where appropriate. Do not include any text outside the document."""
+and code blocks where appropriate. Do not include any text outside the document.
+Do NOT wrap the whole document in an outer ```markdown … ``` fence — emit the
+Markdown body directly, starting with the first heading. Fences are reserved
+for code blocks INSIDE the document."""
 
 
 async def synthesize_requirements(
@@ -1392,7 +1395,10 @@ For each module the implementation will contain:
 Output clean, well-structured Markdown. Use proper headings, bullet points,
 and fenced code blocks for file paths / endpoints / schemas. Do not include
 prose outside the document. Do not restate the requirements verbatim —
-reference them by FR-id when justifying a design decision."""
+reference them by FR-id when justifying a design decision.
+Do NOT wrap the whole document in an outer ```markdown … ``` fence — emit
+the Markdown body directly, starting with the first heading. Fences are
+reserved for code blocks INSIDE the document."""
 
 
 async def synthesize_architecture(

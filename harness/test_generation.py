@@ -102,10 +102,123 @@ _TEST_FILE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+_PYTEST_IMPORTLIB_INI = (
+    "[pytest]\n"
+    "# Auto-written by harness.test_generation. Uses importlib import mode so\n"
+    "# same-named test files in different packages (e.g. tests/models/test_job.py\n"
+    "# and tests/schemas/test_job.py) coexist as distinct dotted names instead\n"
+    "# of colliding with 'import file mismatch' under the default prepend mode.\n"
+    "addopts = --import-mode=importlib\n"
+)
+
+
+def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
+    """Write a minimal ``pytest.ini`` with ``--import-mode=importlib`` if the
+    workspace has no pytest configuration of any kind.
+
+    Recognises every shape pytest itself looks at:
+      - ``pytest.ini``
+      - ``pyproject.toml`` with a ``[tool.pytest.ini_options]`` table
+      - ``setup.cfg`` with a ``[tool:pytest]`` section
+      - ``tox.ini`` with a ``[pytest]`` section
+
+    Returns the workspace-relative path of the newly-written file, or
+    ``None`` if any existing config was found (no-op).
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+
+    # Hard signals — file existence wins. pyproject.toml / setup.cfg / tox.ini
+    # only count if they actually contain a pytest section.
+    if os.path.isfile(os.path.join(workspace_path, "pytest.ini")):
+        return None
+
+    section_signals: tuple[tuple[str, str], ...] = (
+        ("pyproject.toml", "[tool.pytest.ini_options]"),
+        ("setup.cfg", "[tool:pytest]"),
+        ("tox.ini", "[pytest]"),
+    )
+    for fname, marker in section_signals:
+        path = os.path.join(workspace_path, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                # Manifests are small; cap reads at 256 KB.
+                content = f.read(256 * 1024)
+        except OSError:
+            continue
+        if marker in content:
+            return None
+
+    target = os.path.join(workspace_path, "pytest.ini")
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(_PYTEST_IMPORTLIB_INI)
+    except OSError as exc:
+        logger.warning(
+            "[test_generation_node] Failed to write pytest.ini: %s. "
+            "Same-basename test collisions may still occur.", exc,
+        )
+        return None
+    logger.info(
+        "[test_generation_node] Wrote default pytest.ini with "
+        "--import-mode=importlib so duplicate test basenames coexist."
+    )
+    return "pytest.ini"
+
+
 def _is_test_file(rel_path: str) -> bool:
     """True when ``rel_path`` looks like an existing test file."""
     norm = rel_path.replace("\\", "/")
     return any(p.search(norm) for p in _TEST_FILE_PATTERNS)
+
+
+# Directory names that should never be walked for test_generation candidates.
+# Mirrors harness.impact._NEVER_SOURCE_DIRS but kept local to avoid an import
+# cycle (impact also imports test-related state types in some configurations).
+_SCAN_SKIP_DIRS: frozenset[str] = frozenset({
+    "__pycache__", "node_modules", "vendor", "target", "build", "dist",
+    "out", ".venv", "venv", "env", ".git", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "docs", "doc", "migrations", "fixtures",
+    "tests", "test", "__tests__",
+})
+
+
+def _scan_workspace_for_source(workspace_path: str, limit: int = 200) -> list[str]:
+    """Return workspace-relative paths of testable source files anywhere
+    under ``workspace_path``.
+
+    Used by the no_tests_collected fallback path: when the router sent us
+    here because pytest had no tests to run but `state["modified_files"]`
+    happened to be test/manifest-only, we still need to know which source
+    files exist on disk so we can write tests for them.
+    """
+    found: list[str] = []
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return found
+    workspace_path = os.path.abspath(workspace_path)
+    try:
+        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _SCAN_SKIP_DIRS
+            ]
+            for fname in sub_files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in _SOURCE_EXTENSIONS:
+                    continue
+                abspath = os.path.join(sub_root, fname)
+                relpath = os.path.relpath(abspath, workspace_path)
+                if _is_test_file(relpath):
+                    continue
+                found.append(relpath)
+                if len(found) >= limit:
+                    return found
+    except OSError:
+        return found
+    return found
 
 
 def _pick_primary_stack(tags: set[str]) -> Optional[str]:
@@ -254,9 +367,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
 
     workspace_path: str = state.get("workspace_path", os.getcwd())
     modified_files: list[str] = list(state.get("modified_files", []) or [])
+    no_tests_collected: bool = bool(
+        state.get("node_state", {}).get("no_tests_collected")
+    )
 
     # --- Skip when nothing testable ---
-    if not modified_files:
+    if not modified_files and not no_tests_collected:
         logger.info("[test_generation_node] No modified files. Skipping.")
         return {}
 
@@ -265,6 +381,41 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         if not _is_test_file(rel)
         and os.path.splitext(rel)[1].lower() in _SOURCE_EXTENSIONS
     ]
+
+    # When the compiler routed us here because pytest exit=5 (no tests
+    # collected), modified_files may legitimately contain only test scaffolds
+    # or manifest files — yet the workspace has source code that needs tests.
+    # Fall back to a workspace scan for testable source so we don't return
+    # empty and bounce back through compiler→test_gen→repair forever.
+    if not source_files and no_tests_collected:
+        scanned = _scan_workspace_for_source(workspace_path)
+        if scanned:
+            logger.info(
+                "[test_generation_node] no_tests_collected: modified_files had "
+                "no testable source, scanned workspace and found %d source "
+                "file(s): %s",
+                len(scanned), scanned[:10],
+            )
+            source_files = scanned
+        else:
+            logger.warning(
+                "[test_generation_node] no_tests_collected but workspace scan "
+                "found no source files either. Routing to HITL."
+            )
+            loop_counter = dict(state.get("loop_counter", {}))
+            return {
+                "loop_counter": loop_counter,
+                "node_state": {
+                    "current_node": "test_generation",
+                    "env_misconfig": True,
+                    "env_misconfig_symbol": "no_source_files",
+                    "test_generation": {
+                        "status": "skipped",
+                        "reason": "no_source_in_workspace",
+                    },
+                },
+            }
+
     if not source_files:
         logger.info(
             "[test_generation_node] No testable source files in the %d modified file(s). Skipping.",
@@ -496,6 +647,21 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    # When the stack is Python, ensure pytest has a config that uses the
+    # importlib import mode. Without this, two same-named test files in
+    # different directories (e.g. `tests/app/models/test_job.py` and
+    # `tests/app/schemas/test_job.py`, both arising from a `job.py` source
+    # in each package) collide on collection with the well-known
+    # "import file mismatch: imported module 'test_job' has this __file__
+    # attribute" error. importlib mode uses Python's package resolution
+    # so the two coexist as distinct dotted names. Idempotent — leaves any
+    # existing pytest config (pytest.ini / pyproject.toml / setup.cfg)
+    # alone.
+    if primary == "python":
+        ensured = _ensure_pytest_importlib_config(workspace_path)
+        if ensured:
+            new_modified.append(ensured)
+
     from harness.sandbox import SandboxExecutor
     sandbox_cfg = dict(state.get("sandbox_config", {}) or {})
     allow_network = bool(state.get("allow_network", False))
@@ -505,6 +671,32 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # also lift it explicitly here so the SandboxExecutor sees it.
     if any(tok in test_cmd for tok in ("pip install", "npm install", "go get", "cargo")):
         allow_network = True
+
+    # Adapt the sandbox image and root-FS writability to match the test
+    # command's toolchain. Without this, `pip install pytest && pytest -q`
+    # runs in the default ubuntu:22.04 base image, which has no pip
+    # installed → exit 127 in 0.2s, and the LLM gets routed to a wasted
+    # repair iteration with a spurious "test failure". compiler_node does
+    # the same adaptation via _toolchain_image_for; reuse it here.
+    from harness.graph import _toolchain_image_for, _build_command_needs_network
+    desired_image = _toolchain_image_for(test_cmd)
+    if desired_image and sandbox_cfg.get("docker_image") != desired_image:
+        logger.info(
+            "[test_generation_node] Adapting sandbox docker_image to '%s' "
+            "to match toolchain implied by test command: %s",
+            desired_image, test_cmd,
+        )
+        sandbox_cfg["docker_image"] = desired_image
+    # Pip / npm / cargo / go install steps write into system locations the
+    # read-only root FS would block; flip the flag when the test command
+    # has an install step.
+    if _build_command_needs_network(test_cmd) and sandbox_cfg.get("read_only_root", True):
+        logger.info(
+            "[test_generation_node] Adapting sandbox.read_only_root to False "
+            "because test command installs packages into system locations: %s",
+            test_cmd,
+        )
+        sandbox_cfg["read_only_root"] = False
 
     executor = SandboxExecutor(
         workspace_path=workspace_path,

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -113,8 +114,63 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     workspace_path = state.get("workspace_path", os.getcwd())
     build_command = state.get("build_command", "make build")
+    sandbox_config = dict(state.get("sandbox_config", {}) or {})
+    allow_network = state.get("allow_network", False)
     messages = state.get("messages", [])
     budget = state.get("budget_remaining_usd", 2.00)
+
+    # Late-bind the build command + toolchain image the same way
+    # ``compiler_node`` does. Without this, speculative variants run with
+    # the historical ``make build`` default in ``ubuntu:22.04`` against
+    # workspaces the LLM just populated (e.g. Python sources with no
+    # Makefile), every variant exits 127, and the whole speculative round
+    # is guaranteed budget waste. Keeping this inline rather than
+    # importing ``compiler_node``'s block verbatim because we don't need
+    # the loop-counter / token-tracker plumbing — just the resolved
+    # build_command + sandbox_config + allow_network.
+    adapted_build_cmd: Optional[str] = None
+    if build_command.strip() == "make build" and not any(
+        os.path.exists(os.path.join(workspace_path, name))
+        for name in ("Makefile", "makefile", "GNUmakefile")
+    ):
+        try:
+            from harness.cli import _detect_default_build_command
+            late = _detect_default_build_command(workspace_path)
+            if late and late != "make build":
+                logger.info(
+                    "[speculative] Workspace has no Makefile; adapting build command "
+                    "from default 'make build' to detected: %s", late,
+                )
+                adapted_build_cmd = late
+                build_command = late
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[speculative] build-command late-bind failed: %s", exc)
+    try:
+        from harness.graph import _apply_toolchain_adaptation
+        (
+            sandbox_config,
+            allow_network,
+            image_was_adapted,
+            network_was_adapted,
+            _ro_was_adapted,
+        ) = _apply_toolchain_adaptation(
+            build_command,
+            sandbox_config,
+            allow_network,
+            command_is_adapter_synthesised=adapted_build_cmd is not None,
+        )
+        if image_was_adapted:
+            logger.info(
+                "[speculative] Adapting sandbox docker_image to %r to match toolchain implied by: %s",
+                sandbox_config.get("docker_image"), build_command,
+            )
+        if network_was_adapted:
+            logger.info(
+                "[speculative] Auto-enabling network for adapter-synthesised install step: %s",
+                build_command,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[speculative] toolchain adaptation failed: %s", exc)
 
     start_time = time_module.monotonic()
 
@@ -254,6 +310,8 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             executor = SandboxExecutor(
                 workspace_path=vr.worktree_path,
                 extra_env=variant_env,
+                sandbox_config=sandbox_config,
+                allow_network=allow_network,
             )
             result = await executor.run(build_command)
             vr.exit_code = result.exit_code
@@ -367,6 +425,82 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # --- Fallback: all variants failed ---
+    # Before throwing away every variant's work, try to salvage the best
+    # failing one and merge its patches back to the real workspace. Variants
+    # often fail their compile not because their generated code is wrong
+    # but because the sandbox is missing a pip dep or pytest had no tests
+    # to collect — both of which the repair loop can resolve once the code
+    # actually lives on disk. Without salvage, the repair loop starts from
+    # an empty workspace and spins out on "no source to fix".
+    salvage = _pick_salvage_variant(variant_results)
+    if salvage is not None:
+        logger.warning(
+            "[speculative] All %d variants failed, but Variant %d applied "
+            "%d patch(es) with a recoverable failure (exit=%d). Salvaging "
+            "its patches to the workspace so the repair loop has real code "
+            "to work with.",
+            len(variant_results), salvage.index,
+            sum(1 for r in salvage.patch_results if r.success),
+            salvage.exit_code,
+        )
+        merge_errors = _merge_variant_into_workspace(salvage, workspace_path)
+        _cleanup_worktrees(workspace_path, worktree_base, variant_results)
+
+        # Merge salvaged files into the accumulated modified_files list rather
+        # than replacing it — the downstream nodes (lintgate, test_generation,
+        # repair) all read modified_files as the source of truth for "what
+        # changed this session." If we replaced instead of merged we'd drop
+        # any files an earlier patching pass produced.
+        prior_modified: list[str] = list(state.get("modified_files", []) or [])
+        merged_modified = list(prior_modified)
+        for f in salvage.modified_files:
+            if f not in merged_modified:
+                merged_modified.append(f)
+
+        logger.info(
+            "[speculative:salvage] Merged Variant %d → workspace: %d new file(s) "
+            "(prior modified=%d, merge_errors=%d). modified_files now=%d.",
+            salvage.index, len(salvage.modified_files),
+            len(prior_modified), len(merge_errors), len(merged_modified),
+        )
+
+        messages_out = list(state.get("messages", []))
+        status_parts = [
+            f"[Speculative] All {len(variant_results)} variants failed.",
+            (
+                f"  Salvaged Variant {salvage.index}: "
+                f"{len(salvage.modified_files)} file(s) merged back. "
+                f"Build failure (exit={salvage.exit_code}) appears recoverable; "
+                f"routing to repair_node for follow-up fix."
+            ),
+        ]
+        for vr in variant_results:
+            if vr is not salvage:
+                status_parts.append(f"  Variant {vr.index}: {vr.error or f'exit={vr.exit_code}'}")
+        if merge_errors:
+            status_parts.append(
+                f"  Note: {len(merge_errors)} file(s) could not be merged back: {merge_errors}"
+            )
+        messages_out.append({"role": "system", "content": "\n".join(status_parts)})
+
+        token_tracker = state.get("token_tracker", {})
+        if salvage.llm_response is not None:
+            token_tracker = gateway.aggregate_tokens(token_tracker, salvage.llm_response.usage)
+
+        return {
+            "modified_files": merged_modified,
+            "messages": messages_out,
+            "token_tracker": token_tracker,
+            "node_state": {
+                "speculative": {
+                    "all_failed": True,
+                    "salvaged_index": salvage.index,
+                    "salvaged_files": len(salvage.modified_files),
+                    "total_variants": spec_result.total_variants,
+                },
+            },
+        }
+
     _cleanup_worktrees(workspace_path, worktree_base, variant_results)
 
     logger.warning("[speculative] All %d variants failed. Falling back to sequential repair.",
@@ -387,6 +521,123 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 2b. Salvage helpers (rescue the best failing variant on full-fleet failure)
+# ---------------------------------------------------------------------------
+
+# Exit codes / output patterns that signal a recoverable build failure —
+# the variant's patches are likely fine, but the sandbox couldn't run them
+# end to end. The repair loop on the real workspace can resolve these.
+_RECOVERABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # pip-installable test runner missing
+    re.compile(r"ModuleNotFoundError: No module named ['\"](?:pytest|pytest_\w+|ruff|mypy|black|isort|coverage)['\"]"),
+    re.compile(r"^/[^:\s]+/python3?: No module named (pytest|pytest_\w+|ruff|mypy|black|isort)\s*$", re.MULTILINE),
+    # pytest exit-5: no tests collected — handled downstream by test_generation
+    re.compile(r"(?m)^=*\s*no tests ran in [\d.]+s\s*=*$"),
+    re.compile(r"(?m)^no tests ran in [\d.]+s\s*$"),
+    # Missing application dep (e.g. fastapi, uvicorn, sqlalchemy)
+    re.compile(r"ModuleNotFoundError: No module named ['\"][^'\"]+['\"]"),
+)
+
+_SALVAGE_PYTEST_EXIT_CODES: frozenset[int] = frozenset({1, 2, 4, 5})
+
+
+def _is_recoverable_failure(vr: "VariantResult") -> bool:
+    """True when the variant's compile failure looks like something the
+    sequential repair loop can fix once the patches live on the real
+    workspace (missing deps, no tests collected, generic test failures).
+
+    Excludes timeouts, sandbox errors, and exit codes that suggest the
+    container itself is misconfigured (which the repair loop can't help with).
+    """
+    if vr.timed_out:
+        return False
+    if vr.error and not vr.patch_results:
+        return False
+    # Hard NO when no patches actually landed on the worktree — there's
+    # nothing to merge back.
+    if not any(r.success for r in vr.patch_results):
+        return False
+    # Permissive: any non-zero pytest-shaped exit code can be salvaged if
+    # the tail of the output contains a recoverable signature.
+    if vr.exit_code in _SALVAGE_PYTEST_EXIT_CODES:
+        tail = (vr.raw_output or "")[-4000:]
+        if any(p.search(tail) for p in _RECOVERABLE_PATTERNS):
+            return True
+        # Even without a signature, exit codes 1-5 from a test runner are
+        # fixable by the repair LLM in most cases (assertion failures,
+        # import errors in the user's own code).
+        return True
+    return False
+
+
+def _pick_salvage_variant(variant_results: list["VariantResult"]) -> Optional["VariantResult"]:
+    """Among the failed variants, pick the most-promising one to merge back.
+
+    Ranking: most successful patches first, then fewest lines changed
+    (Occam-ish — smaller diffs are less likely to drag in hallucinated code).
+    Returns None when no variant qualifies for salvage.
+    """
+    candidates = [vr for vr in variant_results if _is_recoverable_failure(vr)]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda vr: (
+            -sum(1 for r in vr.patch_results if r.success),
+            vr.total_lines_changed,
+        )
+    )
+    return candidates[0]
+
+
+def _merge_variant_into_workspace(
+    vr: "VariantResult", workspace_path: str,
+) -> list[str]:
+    """Copy a variant's successful patch files back into the workspace.
+
+    Mirrors the merge step used for the winner path, but operates on a
+    failing-but-salvageable variant. Returns the list of files that could
+    not be merged (empty on full success).
+    """
+    import tempfile as _tempfile
+    from harness.trust import safe_resolve as _safe_resolve
+
+    merge_errors: list[str] = []
+    for filepath in vr.modified_files:
+        try:
+            _safe_resolve(workspace_path, filepath)
+        except ValueError:
+            logger.warning(
+                "[speculative:salvage] Skipping out-of-workspace path: %s", filepath
+            )
+            continue
+
+        src = os.path.join(vr.worktree_path, filepath)
+        dst = os.path.join(workspace_path, filepath)
+        if not os.path.isfile(src):
+            continue
+        dst_dir = os.path.dirname(dst)
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            fd, tmp = _tempfile.mkstemp(dir=dst_dir)
+            try:
+                os.close(fd)
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as copy_err:
+            logger.error(
+                "[speculative:salvage] Failed to merge %s: %s", filepath, copy_err
+            )
+            merge_errors.append(filepath)
+    return merge_errors
 
 
 # ---------------------------------------------------------------------------
@@ -565,17 +816,21 @@ def _cleanup_worktrees(
     worktree_base: str,
     variant_results: list[VariantResult],
 ) -> None:
-    """Clean up all temporary worktrees."""
+    """Remove all temporary worktrees.
+
+    Do NOT clear ``vr.modified_files`` / ``vr.patch_results`` here. Both the
+    winner-merge path and the salvage path read those fields after cleanup
+    (to populate the LangGraph state return) — clearing them dropped the
+    list of merged files on the floor, so downstream nodes saw
+    ``modified_files=[]`` even though files HAD been copied to the
+    workspace. Only ``worktree_path`` is reset so callers don't try to
+    touch a directory that's no longer there.
+    """
     for vr in variant_results:
         if vr.worktree_path and os.path.isdir(vr.worktree_path):
             _remove_worktree(repo_path, vr.worktree_path)
             logger.debug("[speculative] Removed worktree %s", vr.worktree_path)
-
-    # Clean up the base dir if empty
-    for vr in variant_results:
         vr.worktree_path = ""
-        vr.modified_files = []
-        vr.patch_results = []
 
 
 # ---------------------------------------------------------------------------

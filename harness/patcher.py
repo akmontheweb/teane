@@ -235,6 +235,40 @@ def get_language_for_file(filepath: str) -> Optional[str]:
 # 4. Async File I/O Helpers (aiofiles)
 # ---------------------------------------------------------------------------
 
+def _is_reparse_or_symlink(filepath: str) -> bool:
+    """True when ``filepath`` exists and is a symlink (POSIX or Windows) OR
+    a Windows reparse point (directory junction / mount point).
+
+    ``os.path.islink`` returns False for Windows directory junctions created
+    with ``mklink /J`` — they're reparse points but not symlinks. An LLM
+    that staged a junction inside the workspace pointing at, e.g.,
+    ``C:\\Users\\<user>\\AppData`` would be able to write outside the
+    workspace through it, since the patcher uses ``os.replace`` which
+    follows reparse points. Checking the file-attribute reparse-point bit
+    via ``stat.FILE_ATTRIBUTE_REPARSE_POINT`` (0x0400) closes that gap.
+    """
+    try:
+        if not os.path.lexists(filepath):
+            return False
+    except OSError:
+        return False
+    if os.path.islink(filepath):
+        return True
+    if os.name == "nt":
+        try:
+            st = os.lstat(filepath)
+        except OSError:
+            return False
+        # FILE_ATTRIBUTE_REPARSE_POINT = 0x0400. Present on the stat result
+        # as st_file_attributes on Windows (Python 3.5+). Anything with the
+        # reparse-point bit set — junction, mount point, symlink — is
+        # blocked. Standard files / dirs have the bit clear.
+        attrs = getattr(st, "st_file_attributes", 0)
+        if attrs & 0x0400:
+            return True
+    return False
+
+
 async def _aread(filepath: str) -> str:
     """Read a file asynchronously using aiofiles."""
     try:
@@ -263,23 +297,23 @@ async def _awrite(filepath: str, content: str) -> None:
     but an attacker could pre-stage a symlink ``pyproject.toml ->
     ~/.ssh/authorized_keys`` (or any in-workspace dotfile) and ride the
     LLM's first patch onto a sensitive target. ``lstat`` + ``O_NOFOLLOW``
-    closes that path before the atomic rename takes effect. Windows path
-    symlinks are not protected (no portable O_NOFOLLOW); logged as a
-    debug message so operators on Windows aren't surprised.
+    closes that path before the atomic rename takes effect. On Windows
+    we additionally check for directory junctions (``mklink /J``) via
+    the reparse-tag bit — ``os.path.islink`` only flags true symlinks
+    and would miss junctions, leaving a workspace-escape primitive open.
     """
     import tempfile
 
-    # P1.2: reject symlinks at the destination BEFORE we set up the temp
-    # file. os.path.islink uses lstat under the hood — the same primitive
-    # O_NOFOLLOW relies on, with the advantage that we can issue a useful
-    # error before any disk write happens. On Linux/macOS we also try to
-    # open the file with O_NOFOLLOW as a belt-and-braces check that
-    # catches races between this check and the os.replace below.
-    if os.path.lexists(filepath) and os.path.islink(filepath):
+    # P1.2: reject symlinks AND Windows reparse points (junctions, mount
+    # points) at the destination BEFORE we set up the temp file. On
+    # Linux/macOS the islink + O_NOFOLLOW pair is enough. On Windows
+    # os.path.islink returns False for directory junctions; check the
+    # reparse-point bit explicitly so we don't traverse them.
+    if _is_reparse_or_symlink(filepath):
         raise PermissionError(
-            f"[patcher] Refusing to write through symlink: {filepath!r}. "
-            f"This usually indicates a path-traversal attempt or a "
-            f"stale dev symlink — delete the symlink and retry."
+            f"[patcher] Refusing to write through symlink / reparse point: "
+            f"{filepath!r}. This usually indicates a path-traversal attempt "
+            f"or a stale dev symlink/junction — delete it and retry."
         )
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is not None and os.path.lexists(filepath):
@@ -1269,16 +1303,49 @@ async def process_llm_patch_output(
         patcher = HybridPatcher(workspace_root)
         results.extend(await patcher.apply_all(blocks_to_apply))
 
-    # Track modified files (only successful ones)
+    # Track modified files (only successful ones). Keep this-call's new
+    # modifications separate from the accumulated list passed in by the
+    # caller so the log line below describes what THIS call did, not what
+    # any earlier call had already done.
     modified_files = list(existing_modified_files or [])
+    newly_modified: list[str] = []
     for result in results:
         if result.success and result.file not in modified_files:
             modified_files.append(result.file)
+            newly_modified.append(result.file)
 
     success_count = sum(1 for r in results if r.success)
-    logger.info(
-        "[patcher] Applied %d/%d patches successfully. Modified files: %s",
-        success_count, len(results), modified_files,
-    )
+    total = len(results)
+
+    if total == 0:
+        logger.info("[patcher] No patch blocks to apply.")
+    elif success_count == total:
+        logger.info(
+            "[patcher] Applied %d/%d patches. Files: %s",
+            success_count, total, newly_modified,
+        )
+    else:
+        # Partial- or full-failure path: surface what the LLM tried and why
+        # each block was rejected so the log isn't just "0/N modified=[]".
+        rejected_paths = sorted({
+            r.file for r in results
+            if not r.success and isinstance(r.error, str)
+            and "not in skill allowlist" in r.error
+        })
+        other_failures = sorted({
+            r.file for r in results
+            if not r.success and (
+                not isinstance(r.error, str)
+                or "not in skill allowlist" not in r.error
+            )
+        })
+        parts = [f"[patcher] Applied {success_count}/{total} patches."]
+        if newly_modified:
+            parts.append(f"Succeeded on: {newly_modified}.")
+        if rejected_paths:
+            parts.append(f"Rejected by allowlist: {rejected_paths}.")
+        if other_failures:
+            parts.append(f"Other failures: {other_failures}.")
+        logger.info(" ".join(parts))
 
     return results, modified_files

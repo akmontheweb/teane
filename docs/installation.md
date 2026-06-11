@@ -155,6 +155,17 @@ pip install .
 harness --version
 ```
 
+For a **pilot install where you need bit-exact reproducibility**, use the
+shipped constraints file:
+
+```bash
+pip install -e . --constraint requirements-prod.txt
+```
+
+This pins every direct and transitive dependency to a known-good version.
+Regenerate after a deliberate dependency bump with
+`pip freeze | grep -v '^-e ' | sort > requirements-prod.txt`.
+
 ### Windows native (PowerShell)
 
 ```powershell
@@ -278,9 +289,28 @@ A minimal user-global config:
 }
 ```
 
-Every key in `model_routing` references a model registered under `models` (or one of the catalogue entries shipped in `harness/model_prices.json`). The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation` — is documented in [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md).
+Every key in `model_routing` references a model registered under `models` (or one of the catalogue entries shipped in `harness/model_prices.json`). The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics` — is documented in [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md).
+
+**API key resolution.** Each provider key is resolved at runtime in this order: (1) explicit constructor argument, (2) `{PROVIDER}_API_KEY` env var, (3) `models["<provider>:<model>"].api_key` field in any config layer. `harness doctor` checks the same two locations (env first, then config field) and reports the source per model in its `api keys` line, so an `[ OK ]` row reading `... (config)` confirms a config-only key would be picked up. Set the key in `~/.harness/config.json` for global use or per-workspace in `.harness_config.json`.
+
+**Recent config additions worth knowing**:
+- `persistence.redact_messages` (default `true`) — checkpoint message redaction. Flip to `false` to keep verbatim transcripts at rest.
+- `sandbox.auto_enable_network_for_install` (default `false`) — opt in to auto-enabling network on detected pip / npm install commands. Without this, the heuristic only logs a WARNING.
+- `node_throttle.max_discovery_iterations` (default `10`, clamped `[1, 30]`) — hard cap on the discovery question loop.
+- `logging.max_bytes` / `logging.backup_count` (default `10_000_000` / `5`) — rotation knobs for the per-session JSONL file. Set `max_bytes: 0` to opt out of rotation.
+- `metrics.metrics_dir` (default `~/.harness/metrics`) and `metrics.burn_rate_window_minutes` (default `10`) — output destination and trailing window for `harness metrics`.
 
 **WSL2 only**: put your workspaces and the config under the WSL filesystem (`~/...`), **not** under `/mnt/c/...`. Windows-mount paths have order-of-magnitude slower I/O.
+
+### Workspace single-writer lock
+
+Every `harness run` acquires an `fcntl` lock on `<workspace>/.harness_session.lock` (Linux/macOS/WSL2). A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
+
+```bash
+harness run -r <workspace> -p "<prompt>" --force-lock
+```
+
+Windows native skips locking entirely (no portable `fcntl`); single-writer is the operator's responsibility there. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
 
 ## 8.5 Test generation (new)
 
@@ -330,15 +360,29 @@ After every patching round, the harness writes stack-canonical unit tests for th
 harness doctor
 ```
 
-Expected output: five check lines, all green.
+Expected output: six check lines, all green.
 
 | Check | What it verifies | Failure means |
 |-------|------------------|---------------|
 | `git repo` | Workspace is a git repo with at least one commit | `git init` and make a commit |
-| `api keys` | Every provider referenced in `model_routing` has its `*_API_KEY` env var set | Re-do §6 for the missing provider |
+| `global config` | `~/.harness/config.json` exists and is valid JSON | Run the setup script or create it manually |
+| `api keys` | Every provider referenced in `model_routing` has a key in EITHER its `*_API_KEY` env var OR its `models["<key>"].api_key` config field, AND each provider passes a one-token "hello" request that confirms the key actually authenticates | Set the missing key, fix an `HTTP 401 — API key rejected`, or set `HARNESS_DOCTOR_SKIP_LIVE=true` to disable the live ping (CI / headless) |
 | `sandbox backend` | Docker or `unshare` is reachable | Re-do §4 for your platform |
-| `checkpoint db` | `~/.harness/checkpoints.db` is writable | Adjust `persistence.db_path` or fix HOME |
+| `checkpoint db` | `~/.harness/checkpoints.db` is writable AND the 5 most recent checkpoints deserialize cleanly | Adjust `persistence.db_path`, or `harness purge --session-id <id>` for a corrupted session |
 | `config parse` | The merged config is valid JSON with known keys | Fix the typo it suggests |
+
+The `api keys` PASS message includes the source per model — `... (env)` or `... (config)` — so you can confirm at a glance whether the runtime will resolve from your env vars or your config file. The check also makes a 1-token chat call per provider (in parallel) to confirm the key actually authenticates against the configured model. Cost is well under a tenth of a cent across all providers combined. To skip the live ping (e.g. in CI where outbound network is blocked), set `HARNESS_DOCTOR_SKIP_LIVE=true`; the doctor then reports the source per model and notes `(live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)`.
+
+Common failure modes the live ping surfaces:
+
+| Detail line | Likely cause |
+|---|---|
+| `HTTP 401 — API key rejected` | Key is invalid, revoked, or has a typo |
+| `HTTP 403 — key is valid but has no access to model '<id>'` | Key works for other models but not this one; pick another model or upgrade the account tier |
+| `HTTP 404 — model '<id>' not found at provider` | Model id misspelt in `model_routing` |
+| `HTTP 429 — rate limited` | Key works but quota is exhausted right now; try again later or use a different account |
+| `timeout — provider unreachable or network blocked` | Local firewall / proxy issue, or provider is down |
+| `connection failed (...)` | DNS or connectivity issue at this host |
 
 Exit code `0` means you are ready to run.
 
@@ -356,12 +400,13 @@ harness run -r ./sample -p "list the top-level files"
 The harness will:
 
 1. Auto-generate `./sample/.harness_config.json`.
-2. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.log`.
-3. Run planning → patching → compile loop, checkpointing each step.
+2. Acquire an `fcntl` lock on `./sample/.harness_session.lock` (Linux/macOS/WSL2).
+3. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.jsonl` (rotated at 10 MB × 5 backups by default).
+4. Run planning → patching → compile loop, checkpointing each step.
 
-A successful smoke test exits 0. Inspect the run with `harness status --session-id <id>` or by tailing the log file.
+A successful smoke test exits 0. Inspect the run with `harness status --session-id <id>` or by tailing the JSONL log file. After the run, `harness metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.
 
-See the [README command reference](../README.md#command-reference) for the full flag list.
+See the [README command reference](../README.md#command-reference) for the full flag list. For diagnostics on a stuck or failed run, start with [`docs/RUNBOOK.md`](RUNBOOK.md).
 
 ## 11. Headless / Server Deployment
 
@@ -371,6 +416,9 @@ For unattended runs (CI, scheduled jobs, services):
 - Set `HARNESS_HITL_WEBHOOK_URL` (and `HARNESS_HITL_WEBHOOK_SECRET`) if you want sensitive operations to require approval via a webhook instead of stdin.
 - Ensure NTP is running — clock skew breaks API auth on fresh VMs.
 - With test_generation on (the default — see [§8.5](#85-test-generation-new)), each session spends additional LLM tokens for test authorship and may hit the default `token_budget.hard_cap_usd = 2.00` on larger changes. Raise the cap in your config, or set `test_generation.enabled: false` under CI when budget pressure matters.
+- Track aggregate cost with a cron job: `harness metrics --all --prometheus --output /var/lib/node_exporter/textfile/harness.prom`. The atomic-write contract means a scraper never sees a half-written file.
+- For long-running services, leave `logging.max_bytes` / `logging.backup_count` at defaults (10 MB × 5) — that's ~50 MB max per session, dropped oldest-first.
+- If a scheduled job dies hard and leaves the workspace lock stale, the next run will refuse to start. Wrap with a retry that adds `--force-lock` on second attempt only.
 
 ### Linux (systemd)
 
@@ -417,7 +465,7 @@ On Windows native: `pip uninstall ai-agent-harness` then `Remove-Item -Recurse $
 
 ## 13. Troubleshooting
 
-The canonical runtime-failure table lives in the [README → Troubleshooting](../README.md#troubleshooting) section. This list adds install-specific gotchas the README doesn't cover.
+The canonical runtime-failure table lives in the [README → Troubleshooting](../README.md#troubleshooting) section. For the top-five mid-session failure modes (checkpoint corrupted, budget exhausted, sandbox dead, workspace lock refused, persistent LLM silence), see [`docs/RUNBOOK.md`](RUNBOOK.md). This list adds install-specific gotchas neither of those covers.
 
 ### All platforms
 
@@ -437,7 +485,10 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 |---------|---------|-----|
 | `env_misconfig:<symbol>` (e.g. `env_misconfig:pytest`) | Sandbox build exited with "No module named X" / "command not found" / Docker `exec: "X": executable file not found`. The runtime is missing inside the container. | Either prepend an install step to `build_command` (e.g. `pip install <symbol> && <original-cmd>`) or set `sandbox.docker_image` to one that ships `<symbol>`. |
 | `env_misconfig:llm_api_key` | test_generation cannot run because no LLM gateway is configured. | Set the matching `*_API_KEY` env var (see §6), or set `test_generation.enabled: false` in `.harness_config.json`. |
+| `llm_silent` (HITL fires immediately) | Three consecutive empty responses from the LLM provider (`EmptyLLMResponseError`). | Check the provider's status page; retry, or route the affected node to a different model via `model_routing`. |
 | `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — fix by adjusting `build_command` or pinning `sandbox.docker_image` explicitly. |
+| `[FAIL] api keys` despite a key being set | Doctor used to only check env vars. The current build checks env AND `models["<key>"].api_key` config field — if doctor still reports FAIL, neither location has the key. The FAIL message names both. | Set the key in either `{PROVIDER}_API_KEY` env var or `models."<key>".api_key` in `~/.harness/config.json`. |
+| `lock held by PID <n>` at startup | A prior `harness run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `harness run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
 
 ### Linux
 

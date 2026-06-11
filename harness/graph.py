@@ -219,7 +219,11 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     Mirrors the language used in the system prompt's "Workspace Layout"
     section, so the LLM sees the same rules as the patcher applies.
     """
-    from harness.impact import _detect_source_root
+    from harness.impact import (
+        _detect_source_root,
+        _is_greenfield_workspace,
+        _workspace_basename_variants,
+    )
     root = _detect_source_root(workspace_path)
 
     if root:
@@ -228,20 +232,50 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
             "tests/", "test/", "__tests__/",
             *_ROOT_ALLOWLIST_FILES,
         ]
-    else:
-        # Conservative fallback when no source root is detected. Covers the
-        # 95% case (src/, lib/, app/, pkg/, cmd/) without resorting to the
-        # old "anything goes" permissive default.
-        logger.warning(
-            "[allowlist] No source root detected for %s — falling back to "
-            "conservative allowlist (src/, lib/, app/, pkg/, cmd/, tests/). "
-            "If the LLM needs to write elsewhere, fix detection in "
-            "harness.impact._detect_source_root or extend _ROOT_ALLOWLIST_FILES.",
+    elif _is_greenfield_workspace(workspace_path):
+        # Greenfield project (no source files yet) — the LLM IS the one
+        # defining the layout, so constraining its package directory name
+        # to "must match the workspace basename" is the wrong rule. The
+        # LLM often picks a descriptive name (e.g. `job_queue/` for a
+        # workspace called `TaskDispatcher`) — a reasonable engineering
+        # choice that the basename-only allowlist used to reject.
+        #
+        # Return ``None`` so the patcher skips the prefix check entirely.
+        # The patcher's :func:`harness.trust.safe_resolve` still blocks
+        # path traversal (``../``) and absolute paths, which is the only
+        # real safety concern for a fresh workspace. Subsequent runs will
+        # detect the source root the LLM picked and lock the allowlist
+        # to it (regular ``if root:`` branch above).
+        logger.info(
+            "[allowlist] Greenfield workspace %s — no allowlist; the LLM "
+            "defines the layout. Path-traversal still blocked by the "
+            "patcher's safe_resolve guard.",
             workspace_path,
         )
+        return None
+    else:
+        # Conservative fallback when no source root is detected but the
+        # workspace also isn't truly greenfield (e.g. leftover files from a
+        # previous abandoned session). Still include the workspace's
+        # basename variants — without them, the LLM's natural choice of a
+        # package directory matching the project name (e.g. task_dispatcher/
+        # for a workspace called TaskDispatcher) gets rejected on every
+        # patch attempt and the repair loop burns through to HITL.
+        basename_dirs = [
+            f"{name}/" for name in _workspace_basename_variants(workspace_path)
+        ]
+        logger.warning(
+            "[allowlist] No source root detected for %s — falling back to "
+            "permissive allowlist (src/, lib/, app/, pkg/, cmd/, tests/ + "
+            "basename variants %s). Workspace not greenfield, so this "
+            "likely contains stale files; the LLM still needs a place to "
+            "put new code matching the project name.",
+            workspace_path, basename_dirs,
+        )
         allowlist = [
-            "src/", "lib/", "app/", "pkg/", "cmd/",
+            "src/", "lib/", "app/", "pkg/", "cmd/", "internal/",
             "tests/", "test/", "__tests__/",
+            *basename_dirs,
             *_ROOT_ALLOWLIST_FILES,
         ]
 
@@ -589,9 +623,19 @@ def set_gateway(gateway: Any) -> None:
     """
     Inject the LLM Gateway instance for use by graph nodes.
     Called by the CLI layer before running the graph.
+
+    Also stashes ``gateway.config`` via :func:`set_gateway_config` so the
+    reviewer nodes (``spec_review_node``, ``code_review_node``) and the
+    pre-flight reviewer block in ``cmd_run`` see a non-None config. Prior
+    to this, ``set_gateway_config`` had no caller anywhere — every
+    ``get_gateway_config()`` consumer read None and silently skipped,
+    which made every configured reviewer LLM effectively dead code.
     """
     global _gateway
     _gateway = gateway
+    config = getattr(gateway, "config", None)
+    if config is not None:
+        set_gateway_config(config)
     logger.info("[graph] Gateway instance injected.")
 
 
@@ -879,6 +923,15 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # Report patch application results
         success_count = sum(1 for r in patch_results if r.success)
         fail_count = len(patch_results) - success_count
+        # Carve out allowlist rejections from generic failures so the next
+        # repair iteration sees the exact paths and reason — without this,
+        # the LLM keeps re-proposing the same blocked paths.
+        allowlist_rejections = [
+            {"file": r.file, "operation": r.operation, "reason": r.error}
+            for r in patch_results
+            if not r.success and isinstance(r.error, str)
+            and "not in skill allowlist" in r.error
+        ]
         if success_count > 0:
             status_msg = f"[System]: Applied {success_count}/{len(patch_results)} patches successfully."
             if fail_count > 0:
@@ -886,6 +939,12 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 status_msg += f" Failed on: {', '.join(failed_files)}."
         else:
             status_msg = f"[System]: Failed to apply {fail_count} patch(es)."
+        if allowlist_rejections:
+            rejected_paths = ", ".join(sorted({r["file"] for r in allowlist_rejections}))
+            status_msg += (
+                f"\n[Allowlist] Rejected paths outside the configured layout: "
+                f"{rejected_paths}. Allowed roots: {allowed_paths}."
+            )
         messages.append(MessageDict(role="system", content=status_msg))
 
         logger.info(
@@ -909,6 +968,8 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 "patch_complete": True,
                 "patch_success": success_count,
                 "patch_fail": fail_count,
+                "allowlist_rejections": allowlist_rejections,
+                "allowed_paths": allowed_paths,
             },
         }
     except RuntimeError as exc:
@@ -957,7 +1018,19 @@ def _build_command_needs_network(build_command: str) -> bool:
 # one of these fires we route to HITL immediately instead of burning the
 # whole 3-iteration repair budget on a problem the LLM cannot fix from
 # inside the sandbox.
-_ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
+#
+# Split by source kind because the repairability heuristic differs:
+#   - Python ModuleNotFoundError → ALWAYS repairable. The fix is "add the
+#     missing distribution to requirements.txt / pyproject deps", which
+#     the autofix / repair LLM can handle for any single-segment module
+#     name (httpx, fastapi, pydantic, sqlalchemy — every regular pip
+#     package). The earlier whitelist-only policy meant any framework
+#     dep outside the test/lint tool set short-circuited to HITL.
+#   - Shell `command not found` → repairable only when the command is a
+#     known pip-installable Python tool (pytest, ruff, mypy, ...). For
+#     anything else (npm, cargo, go, docker) the container needs a
+#     different base image, which only the operator can change.
+_PYTHON_MODULE_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Python: "/usr/local/bin/python3: No module named pytest"
     # Dotted names (e.g. 'api.database') are excluded — those signal a
     # local-import bug in the user's code, which the repair loop can fix.
@@ -965,6 +1038,9 @@ _ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Python: "ModuleNotFoundError: No module named 'pytest'"
     # Same dotted-name exclusion as above.
     re.compile(r"ModuleNotFoundError: No module named ['\"](?P<sym>[^'\".]+)['\"]"),
+)
+
+_SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Shell-style "<cmd>: command not found" (covers npm, cargo, go, etc.)
     re.compile(r"(?m)^(?:/bin/sh: \d+: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
     re.compile(r"(?m)^(?:bash: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
@@ -978,27 +1054,313 @@ _ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?m)^(?P<sym>node|npm|yarn|pnpm): not found\s*$"),
 )
 
+# Composite — preserved for callers that don't care about the source kind.
+_ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *_PYTHON_MODULE_MISS_PATTERNS,
+    *_SHELL_COMMAND_MISS_PATTERNS,
+)
 
-def _is_env_misconfig(raw_output: str) -> Optional[str]:
-    """Return the missing module / binary name when the build output looks
-    like an environment misconfiguration, otherwise None.
 
-    Catches the "container doesn't ship the toolchain the build_command
-    invokes" class of failure (e.g. ``pytest`` not in ``python:3.12-slim``,
-    ``npm: command not found`` in a base image). Used by compiler_node to
-    short-circuit the repair loop — no amount of LLM patching will fix a
-    missing system binary.
+def _is_env_misconfig(
+    raw_output: str,
+    workspace_path: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Return ``(symbol, kind)`` where ``kind`` is ``"python"`` for a
+    Python ``ModuleNotFoundError`` or ``"shell"`` for a shell
+    ``command not found`` — or ``None`` if the build output doesn't
+    look like an environment miss.
+
+    The caller uses ``kind`` to decide repairability:
+      - ``"python"`` → always repairable as MISSING_DEP. Any single-segment
+        Python module name is a pip-installable distribution; autofix R4
+        (``_try_missing_dep``) lands the requirements.txt edit without an
+        LLM call. The earlier whitelist-only policy meant common app
+        deps like ``httpx`` / ``fastapi`` / ``pydantic`` short-circuited
+        to HITL for no good reason — they're as fixable as ``pytest``.
+      - ``"shell"`` → repairable only when the symbol matches
+        ``_PIP_INSTALLABLE_SYMBOLS`` (pytest, ruff, ...). Everything else
+        (npm, cargo, go, docker) needs a different base image and the
+        repair LLM can't fix it from inside the sandbox.
+
+    When ``workspace_path`` is supplied and the matched symbol corresponds
+    to a directory or top-level Python module in the workspace (e.g.
+    ``task_dispatcher`` is the project's own package under ``src/``), we
+    return ``None`` — the import error is a layout / sys.path bug in the
+    user's own code, which the repair LLM can fix differently
+    (conftest.py, pyproject src-layout, etc.).
     """
     if not raw_output:
         return None
     # Scan only the tail — these errors land at the end of the log when
     # the missing-binary line is the last thing the container prints.
     tail = raw_output[-4000:]
-    for pattern in _ENV_MISCONFIG_PATTERNS:
+    for pattern in _PYTHON_MODULE_MISS_PATTERNS:
         match = pattern.search(tail)
         if match:
-            return match.group("sym").strip("'\"")
+            sym = match.group("sym").strip("'\"")
+            if workspace_path and _symbol_exists_in_workspace(sym, workspace_path):
+                logger.info(
+                    "[env_misconfig] '%s' looks like a missing module but a "
+                    "directory or file by that name exists in %s — treating "
+                    "as a user-code import bug, not env misconfig.",
+                    sym, workspace_path,
+                )
+                return None
+            return (sym, "python")
+    for pattern in _SHELL_COMMAND_MISS_PATTERNS:
+        match = pattern.search(tail)
+        if match:
+            sym = match.group("sym").strip("'\"")
+            if workspace_path and _symbol_exists_in_workspace(sym, workspace_path):
+                logger.info(
+                    "[env_misconfig] '%s' looks like a missing command but a "
+                    "directory or file by that name exists in %s — treating "
+                    "as a user-code import bug, not env misconfig.",
+                    sym, workspace_path,
+                )
+                return None
+            return (sym, "shell")
     return None
+
+
+def _symbol_exists_in_workspace(symbol: str, workspace_path: str) -> bool:
+    """True when ``symbol`` matches a directory or Python module file in the
+    workspace tree (anywhere under root, excluding never-source dirs).
+
+    Used by :func:`_is_env_misconfig` to distinguish a missing-system-binary
+    failure (``pytest`` not installed → genuine env misconfig) from a
+    missing-own-package failure (``task_dispatcher`` not on sys.path → fixable
+    user-code bug).
+    """
+    if not symbol or not workspace_path or not os.path.isdir(workspace_path):
+        return False
+    from harness.impact import _NEVER_SOURCE_DIRS
+    sym = symbol.strip().strip("'\"")
+    if not sym or "/" in sym or os.sep in sym:
+        return False
+    try:
+        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+            ]
+            if sym in sub_dirs:
+                return True
+            if f"{sym}.py" in sub_files:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+# pytest's exit code 5 means "no tests collected" — distinct from a genuine
+# compile/test failure. Confirm via the literal "no tests ran" line so we
+# don't misclassify a config error that happens to produce exit 5.
+_NO_TESTS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?m)^=+\s*no tests ran in [\d.]+s\s*=*$"),
+    re.compile(r"(?m)^no tests ran in [\d.]+s\s*$"),
+)
+
+
+# pip's resolver emits one of these lines when version pins in the build's
+# requirements file (or its transitive deps) can't be satisfied together.
+# The error message rarely names BOTH sides of the conflict, so the repair
+# LLM is forced to guess — autofix strips the pins entirely instead.
+_PIP_RESOLUTION_CONFLICT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?m)^ERROR: ResolutionImpossible\b"),
+    re.compile(
+        r"(?m)^ERROR: Cannot install .+ because these package versions have "
+        r"conflicting dependencies"
+    ),
+    re.compile(
+        r"(?m)^ERROR: pip's dependency resolver does not currently take into "
+        r"account all the packages that are installed"
+    ),
+)
+
+
+def _is_pip_resolution_conflict(raw_output: str, build_command: str) -> bool:
+    """True when the build failed because pip's resolver couldn't satisfy
+    the requested version pins together.
+
+    Used by compiler_node to emit a distinct ``DEP_RESOLUTION_CONFLICT``
+    diagnostic. Autofix R5 then drops every version specifier from
+    ``requirements.txt`` — for greenfield runs where every pin is a
+    fresh LLM guess, that resolves the conflict 95% of the time without
+    spending a repair iteration.
+    """
+    if not raw_output:
+        return False
+    if "pip" not in build_command.lower():
+        return False
+    tail = raw_output[-4000:]
+    return any(p.search(tail) for p in _PIP_RESOLUTION_CONFLICT_PATTERNS)
+
+
+def _is_no_tests_collected(exit_code: int, raw_output: str, build_command: str) -> bool:
+    """True when the build's failure is pytest's exit-5 'no tests collected'
+    rather than an actual test/compile failure.
+
+    Detected by matching the literal 'no tests ran' line in the output AND
+    requiring the build to actually exercise pytest. Treating this as a
+    generic build failure burns repair iterations on a problem the repair
+    LLM cannot fix (there's nothing to repair — the test runner found
+    nothing). The router uses this to route to test_generation_node or
+    HITL with a precise message instead.
+    """
+    if exit_code != 5 or not raw_output:
+        return False
+    if "pytest" not in build_command.lower():
+        return False
+    tail = raw_output[-4000:]
+    return any(p.search(tail) for p in _NO_TESTS_PATTERNS)
+
+
+def _slice_build_output_for_repair(
+    raw_output: str,
+    head_chars: int = 1500,
+    tail_chars: int = 2000,
+) -> str:
+    """Return a head+tail slice of ``raw_output`` for the repair LLM.
+
+    Long build logs (C++ template explosions, Java dependency stacks, Cargo
+    compilation walls) tend to put the root-cause error near the START and
+    cascading downstream errors near the END. A pure tail slice (the old
+    behaviour) shows the repair LLM only the cascade, hiding the underlying
+    cause. Slicing both ends gives the model both the original failure and
+    the final state, separated by an explicit truncation marker so it knows
+    chars were dropped.
+
+    For outputs shorter than ``head_chars + tail_chars + 200`` we return
+    the whole thing unchanged — the split adds noise without saving space.
+    """
+    if not raw_output:
+        return ""
+    total = len(raw_output)
+    if total <= head_chars + tail_chars + 200:
+        return raw_output
+    head = raw_output[:head_chars]
+    tail = raw_output[-tail_chars:]
+    dropped = total - head_chars - tail_chars
+    return (
+        f"{head}\n"
+        f"... [truncated {dropped} chars from the middle of {total}-char build log] ...\n"
+        f"{tail}"
+    )
+
+
+_DEP_MANIFEST_CANDIDATES: tuple[str, ...] = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements/base.txt",
+    "requirements/dev.txt",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "Pipfile",
+)
+
+
+def _collect_manifest_snippets_for_repair(
+    errors: list[Any], workspace_path: str,
+) -> str:
+    """Build a Markdown block embedding the current contents of any dep
+    manifest the build command references.
+
+    Fires only when at least one diagnostic is shaped as a MISSING_DEP.
+    Without the actual file contents in the repair prompt, the LLM resorts
+    to ``CREATE_FILE`` (fails when the file exists) or ``REPLACE_BLOCK``
+    with a search string it guessed (fails when the guess doesn't match).
+    Returns the empty string when no MISSING_DEP diagnostic is present or
+    no manifest is found, so callers can string-append unconditionally.
+    """
+    if not errors or not workspace_path:
+        return ""
+    missing_deps = [
+        e for e in errors
+        if str(e.get("error_code", "")) in ("MISSING_DEP", "DEP_RESOLUTION_CONFLICT")
+    ]
+    if not missing_deps:
+        return ""
+    if not os.path.isdir(workspace_path):
+        return ""
+
+    # Pick the manifests the build command actually references when we can
+    # tell — otherwise fall back to whatever exists at workspace root.
+    build_cmd = str(missing_deps[0].get("build_command", "") or "").lower()
+    preferred: list[str] = []
+    if "pyproject" in build_cmd or "pip install -e" in build_cmd:
+        preferred = ["pyproject.toml", "setup.py", "setup.cfg"]
+    elif "requirements" in build_cmd:
+        preferred = ["requirements.txt", "requirements-dev.txt"]
+    elif "npm install" in build_cmd or "yarn" in build_cmd or "pnpm" in build_cmd:
+        preferred = ["package.json"]
+    candidates = preferred or list(_DEP_MANIFEST_CANDIDATES)
+
+    found: list[tuple[str, str]] = []
+    for rel in candidates:
+        abs_path = os.path.join(workspace_path, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                # Cap at 8KB per manifest — anything bigger is almost
+                # certainly the wrong file.
+                content = f.read(8192)
+        except OSError:
+            continue
+        found.append((rel, content))
+        if len(found) >= 3:
+            break
+
+    if not found:
+        return ""
+    missing = sorted({
+        str(e.get("missing_symbol", "") or "")
+        for e in missing_deps if e.get("missing_symbol")
+    })
+    lines = [
+        "\n## Dependency Manifests (current workspace contents)",
+        (
+            f"The build is missing {missing!r}. Use REPLACE_BLOCK / "
+            f"INSERT_AT_BLOCK against the exact bytes below — do NOT "
+            f"emit CREATE_FILE for a path that already exists, and do "
+            f"NOT invent search strings that aren't in the file."
+        ),
+    ]
+    for rel, content in found:
+        lang = "toml" if rel.endswith(".toml") else (
+            "json" if rel.endswith(".json") else "text"
+        )
+        lines.append(f"\n### `{rel}`\n```{lang}\n{content.rstrip()}\n```")
+    return "\n".join(lines) + "\n"
+
+
+def _workspace_has_source_files(workspace_path: str) -> bool:
+    """True when the workspace contains at least one source file under a
+    non-ignored directory. Used by the router to decide whether 'no tests
+    collected' should route to test_generation_node (source exists, needs
+    tests) or HITL (truly empty workspace — the LLM failed to scaffold)."""
+    from harness.impact import (
+        _SOURCE_FILE_EXTENSIONS,
+        _NEVER_SOURCE_DIRS,
+    )
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return False
+    try:
+        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+                and d not in {"tests", "test", "__tests__"}
+            ]
+            for fname in sub_files:
+                if os.path.splitext(fname)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 # Pip-installable test / lint tools. When `_is_env_misconfig` flags one
@@ -1029,10 +1391,12 @@ def _repairable_dep_hint(symbol: str, build_command: str) -> str:
         f"dependency manifest, so pip never installs it.\n\n"
         f"Fix in ONE place:\n"
         f"  - If the install step is `pip install -r requirements.txt`: "
-        f"add `{symbol}` to `requirements.txt`.\n"
+        f"add `{symbol}` to `requirements.txt`. If the file does not "
+        f"exist yet, CREATE it with one dependency per line "
+        f"(including `{symbol}`).\n"
         f"  - If the install step is `pip install -e '.[dev]'`: add "
         f"`{symbol}` to `[project.optional-dependencies].dev` in "
-        f"`pyproject.toml`.\n"
+        f"`pyproject.toml`. If the section does not exist, CREATE it.\n"
         f"Do not change the build_command or docker_image — the package "
         f"is pip-installable and the current image is correct."
     )
@@ -1083,6 +1447,8 @@ def _apply_toolchain_adaptation(
     build_command: str,
     sandbox_config: Optional[dict[str, Any]],
     allow_network: bool,
+    *,
+    command_is_adapter_synthesised: bool = False,
 ) -> tuple[dict[str, Any], bool, bool, bool, bool]:
     """Idempotently adapt sandbox_config/allow_network to match the build
     command's implied toolchain.
@@ -1099,9 +1465,20 @@ def _apply_toolchain_adaptation(
 
     P1.3: the network auto-enable on a pip/npm install heuristic is gated
     by ``sandbox.auto_enable_network_for_install`` (default ``false``).
-    When the heuristic would fire but the opt-in is off, the function
-    declines to flip ``allow_network`` and logs a warning so the operator
-    sees the divergence instead of silently widening the blast radius.
+    When the heuristic would fire on a user-typed build command but the
+    opt-in is off, the function declines to flip ``allow_network`` and
+    logs a warning so the operator sees the divergence.
+
+    ``command_is_adapter_synthesised`` (default False) marks the case
+    where the install step was introduced by the harness's own late-bind
+    detection (``_detect_default_build_command`` fell through to a
+    bootstrapping branch), NOT by the operator. The user's opt-in
+    governs auto-flips on commands the OPERATOR wrote; it doesn't make
+    sense to apply it to commands the harness invented to make a
+    greenfield build work at all. When ``True``, network is auto-enabled
+    for the install step regardless of the opt-in (the operator can
+    still hard-pin ``allow_network=False`` at the workspace config level
+    if they really want it).
     """
     cfg = dict(sandbox_config or {})
     image_was_adapted = False
@@ -1121,9 +1498,16 @@ def _apply_toolchain_adaptation(
     new_allow_network = allow_network
     needs_install = _build_command_needs_network(build_command)
     if not allow_network and needs_install:
-        # Explicit opt-in required (default False). Without this gate, the
-        # heuristic cracks the network-isolation contract automatically.
-        if cfg.get("auto_enable_network_for_install", False):
+        # When the harness itself produced the install step, the opt-in
+        # doesn't apply — the operator never typed `pip install`, the
+        # adapter inserted it to bootstrap a greenfield workspace. The
+        # user's network policy still applies at the workspace config
+        # level (sandbox config) but the opt-in flag is about user-typed
+        # commands, not adapter-synthesised ones.
+        if command_is_adapter_synthesised:
+            new_allow_network = True
+            network_was_adapted = True
+        elif cfg.get("auto_enable_network_for_install", False):
             new_allow_network = True
             network_was_adapted = True
         else:
@@ -1206,6 +1590,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # resume from a pre-fix checkpoint whose sandbox_config wasn't yet
     # adapted. The helper is idempotent: if the image already matches the
     # toolchain, image_was_adapted is False and no extra log line appears.
+    # When the build_command was just adapter-synthesised, tell the
+    # toolchain adapter so it can bypass the user-opt-in network gate —
+    # the operator never typed this command, the harness invented it.
     prev_image = sandbox_cfg.get("docker_image", "ubuntu:22.04")
     (
         sandbox_cfg,
@@ -1213,7 +1600,12 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         image_was_adapted,
         network_was_adapted,
         ro_root_was_adapted,
-    ) = _apply_toolchain_adaptation(build_cmd, sandbox_cfg, allow_network)
+    ) = _apply_toolchain_adaptation(
+        build_cmd,
+        sandbox_cfg,
+        allow_network,
+        command_is_adapter_synthesised=adapted_build_cmd is not None,
+    )
     if image_was_adapted:
         logger.info(
             "[compiler_node] Adapting sandbox docker_image from %r to %r "
@@ -1263,27 +1655,71 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     #   - Everything else (npm/node/cargo/go/docker, single-segment local
     #     modules): the image itself is wrong / the LLM cannot help from
     #     inside the sandbox. Short-circuit to HITL as before.
+    # pip ResolutionImpossible — emit a distinct diagnostic so autofix R5
+    # (`_try_dep_resolution_conflict`) can strip the version pins from
+    # requirements.txt instead of forcing the repair LLM to guess which
+    # side of the conflict to relax. Without this we burn the entire
+    # 3-iteration repair budget on conflicts the LLM doesn't have enough
+    # information to resolve (pip's error doesn't name both sides).
+    if (
+        exit_code != 0
+        and not compiler_errors
+        and _is_pip_resolution_conflict(raw_log, build_cmd)
+    ):
+        logger.warning(
+            "[compiler_node] pip resolution conflict detected — routing "
+            "through repair loop so autofix can strip pins from requirements."
+        )
+        compiler_errors = [{
+            "file": "<sandbox>",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "error_code": "DEP_RESOLUTION_CONFLICT",
+            "message": (
+                "pip's resolver couldn't satisfy the version pins in the "
+                "dependency manifest together. The repair-loop fix is to "
+                "loosen or drop the version specifiers (>=, ==, ~=, <, !=) "
+                "from the manifest so pip can pick a self-consistent set."
+            ),
+            "semantic_context": f"Build command: {build_cmd}.",
+            "missing_symbol": "",
+            "build_command": build_cmd,
+            "miss_kind": "resolution",
+        }]
+
     env_misconfig_symbol: Optional[str] = None
     env_misconfig_is_repairable: bool = False
     if exit_code != 0 and not compiler_errors:
-        env_misconfig_symbol = _is_env_misconfig(raw_log)
-        if env_misconfig_symbol:
+        env_match = _is_env_misconfig(raw_log, workspace)
+        if env_match:
+            env_misconfig_symbol, miss_kind = env_match
+            # Python ModuleNotFoundError is ALWAYS repairable — any
+            # single-segment module name is a pip-installable distribution,
+            # and the autofix R4 (`_try_missing_dep`) + the repair LLM can
+            # land the requirements.txt edit. Shell `command not found` is
+            # only repairable when the symbol is a pip-installable Python
+            # tool listed in `_PIP_INSTALLABLE_SYMBOLS`; everything else
+            # (npm, cargo, go, docker) needs an operator-side image swap.
             env_misconfig_is_repairable = (
-                env_misconfig_symbol.lower() in _PIP_INSTALLABLE_SYMBOLS
+                miss_kind == "python"
+                or env_misconfig_symbol.lower() in _PIP_INSTALLABLE_SYMBOLS
             )
             if env_misconfig_is_repairable:
                 logger.info(
-                    "[compiler_node] Missing '%s' is pip-installable. Routing "
-                    "through repair loop so the LLM can amend the dep manifest.",
-                    env_misconfig_symbol,
+                    "[compiler_node] Missing '%s' (kind=%s) is pip-installable. "
+                    "Routing through repair loop so autofix / LLM can amend the "
+                    "dep manifest.",
+                    env_misconfig_symbol, miss_kind,
                 )
                 msg = _repairable_dep_hint(env_misconfig_symbol, build_cmd)
                 code = "MISSING_DEP"
             else:
                 logger.warning(
-                    "[compiler_node] Environment misconfig detected: missing '%s'. "
-                    "Short-circuiting repair loop — this needs a config fix, not an LLM patch.",
-                    env_misconfig_symbol,
+                    "[compiler_node] Environment misconfig detected: missing '%s' "
+                    "(kind=%s). Short-circuiting repair loop — this needs a config "
+                    "fix, not an LLM patch.",
+                    env_misconfig_symbol, miss_kind,
                 )
                 msg = _env_misconfig_hint(env_misconfig_symbol, build_cmd)
                 code = "ENV_MISCONFIG"
@@ -1299,6 +1735,11 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                     f"Build command: {build_cmd}. "
                     f"docker_image: {sandbox_cfg.get('docker_image', 'ubuntu:22.04')}."
                 ),
+                # Structured fields the autofix + repair-prompt builders read
+                # without re-parsing the human-readable message.
+                "missing_symbol": env_misconfig_symbol,
+                "build_command": build_cmd,
+                "miss_kind": miss_kind,
             }]
 
     # Build the return dictionary
@@ -1311,6 +1752,29 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     if env_misconfig_symbol and not env_misconfig_is_repairable:
         node_state["env_misconfig"] = True
         node_state["env_misconfig_symbol"] = env_misconfig_symbol
+
+    # Pytest exit-5 (no tests collected) is NOT a build failure — the test
+    # runner just had nothing to run. Surface as a distinct condition so the
+    # router can fan out to test_generation (when source exists) or HITL
+    # (when the workspace is empty), instead of burning the repair budget
+    # on a problem the repair LLM cannot fix from inside the loop.
+    #
+    # Deliberately do NOT populate `compiler_errors` here. If we did, the
+    # downstream `route_after_test_generation` would see a non-empty errors
+    # list (even after test_generation_node skips or finishes cleanly) and
+    # spin into a repair loop trying to "fix" a non-error.
+    if exit_code != 0 and not compiler_errors and _is_no_tests_collected(
+        exit_code, raw_log, build_cmd,
+    ):
+        has_source = _workspace_has_source_files(workspace)
+        node_state["no_tests_collected"] = True
+        node_state["no_tests_has_source"] = has_source
+        logger.warning(
+            "[compiler_node] pytest exit=5: no tests collected. "
+            "Source files present: %s. Router will %s.",
+            has_source,
+            "route to test_generation" if has_source else "route to HITL",
+        )
 
     return_dict: dict[str, Any] = {
         "exit_code": exit_code,
@@ -1445,11 +1909,44 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         lint_summary = "\n## Lint Gate Errors\n" + "\n".join(f"  - {e}" for e in lint_errors_list)
         error_summary += lint_summary
 
+    # If the previous patching/repair attempt had any allowlist rejections,
+    # surface them so the LLM stops re-proposing the same blocked paths. The
+    # repair LLM otherwise has no way to know its patches keep being thrown
+    # away by the path filter.
+    prior_rejections = state.get("node_state", {}).get("allowlist_rejections") or []
+    if prior_rejections:
+        prior_allowed = state.get("node_state", {}).get("allowed_paths") or []
+        rejected_paths = sorted({r.get("file", "") for r in prior_rejections if r.get("file")})
+        rejection_block = (
+            "\n## Allowlist Rejections (PREVIOUS attempt)\n"
+            "Your last attempt produced patches targeting paths the patcher's "
+            "skill allowlist rejected. These patches did NOT land on disk. "
+            "Do NOT re-propose the same paths verbatim — relocate the file or "
+            "use one of the allowed roots.\n"
+            f"Rejected: {rejected_paths}\n"
+            f"Allowed roots: {prior_allowed}\n"
+        )
+        error_summary += rejection_block
+
     # If no structured diagnostics, include the raw build output so the LLM can see the actual error
     if not errors:
         raw_output = state.get("node_state", {}).get("last_build_output", "")
         if raw_output:
-            error_summary += f"\n## Raw Build Output (last 2000 chars)\n```\n{raw_output[-2000:]}\n```"
+            error_summary += f"\n## Raw Build Output\n```\n{_slice_build_output_for_repair(raw_output)}\n```"
+
+    # When any diagnostic is MISSING_DEP, attach the current contents of the
+    # dependency manifest the build command references. Without this the LLM
+    # tries CREATE_FILE (which fails — "already exists with different content")
+    # then REPLACE_BLOCK with a guessed search string that doesn't match.
+    # Autofix R4 (`_try_missing_dep`) handles requirements.txt automatically;
+    # this block covers the pyproject / package.json fallback path where
+    # autofix deliberately defers to the LLM.
+    workspace_for_manifest = state.get("workspace_path", os.getcwd())
+    manifest_attachments = _collect_manifest_snippets_for_repair(
+        errors, workspace_for_manifest,
+    )
+    if manifest_attachments:
+        error_summary += manifest_attachments
 
     try:
         from harness.gateway import NodeRole
@@ -1598,10 +2095,25 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # Report results
         success_count = sum(1 for r in patch_results if r.success)
         fail_count = len(patch_results) - success_count
+        # Track allowlist rejections so the *next* repair iteration sees the
+        # exact paths and reason and stops re-proposing them. Without this,
+        # the LLM has no signal that its patches keep vanishing.
+        allowlist_rejections = [
+            {"file": r.file, "operation": r.operation, "reason": r.error}
+            for r in patch_results
+            if not r.success and isinstance(r.error, str)
+            and "not in skill allowlist" in r.error
+        ]
         status_msg = f"[System]: Repair attempt {loop_counter['total_repairs']}: applied {success_count}/{len(patch_results)} patches."
         if fail_count > 0:
             failed_files = [r.file for r in patch_results if not r.success]
             status_msg += f" Failed: {', '.join(failed_files)}."
+        if allowlist_rejections:
+            rejected_paths = ", ".join(sorted({r["file"] for r in allowlist_rejections}))
+            status_msg += (
+                f"\n[Allowlist] Rejected paths outside the configured layout: "
+                f"{rejected_paths}. Allowed roots: {allowed_paths}."
+            )
         messages.append(MessageDict(role="system", content=status_msg))
 
         logger.info(
@@ -1626,6 +2138,8 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 "repair_context": error_summary,
                 "repair_success": success_count,
                 "repair_fail": fail_count,
+                "allowlist_rejections": allowlist_rejections,
+                "allowed_paths": allowed_paths,
             },
         }
     except RuntimeError as exc:
@@ -1751,7 +2265,7 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
 # 6. Conditional Edge: Compiler → Next Node
 # ---------------------------------------------------------------------------
 
-def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node"]:
+def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node"]:
     """
     Conditional edge router executed after compiler_node completes.
 
@@ -1760,6 +2274,8 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         exit_code != 0 AND repairs < 3     → repair_node
         exit_code != 0 AND repairs >= 3    → human_intervention_node
         budget_remaining <= 0              → human_intervention_node
+        no_tests_collected AND has_source  → test_generation_node
+        no_tests_collected AND empty repo  → human_intervention_node
     """
     exit_code: int = state.get("exit_code", -1)
     loop_counter: dict[str, int] = state.get("loop_counter", {})
@@ -1803,6 +2319,27 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # instead of the generic repair-limit message.
     if state.get("node_state", {}).get("llm_silent"):
         logger.warning("[router] LLM returned empty content. Routing to HITL immediately.")
+        return _transition("human_intervention_node")
+
+    # Pytest exit=5 (no tests collected) is not a build failure.
+    #   * Source files exist → route to test_generation_node, which will
+    #     generate unit tests targeting them. Don't spend a repair on a
+    #     non-error.
+    #   * No source files either → the prior patching pass produced nothing
+    #     usable (e.g. allowlist rejected every patch). Route to HITL with
+    #     the precise diagnostic so the operator can fix the layout/config
+    #     instead of letting the repair loop spin.
+    if state.get("node_state", {}).get("no_tests_collected"):
+        if state.get("node_state", {}).get("no_tests_has_source"):
+            logger.info(
+                "[router] No tests collected but source files exist. "
+                "Routing to test_generation_node."
+            )
+            return _transition("test_generation_node")
+        logger.warning(
+            "[router] No tests collected and no source files in workspace. "
+            "Routing to HITL — the patching pass did not produce code."
+        )
         return _transition("human_intervention_node")
 
     if total_repairs >= max_iterations:
@@ -2323,6 +2860,138 @@ def _review_followups_to_discovery_shape(critique: dict[str, Any], gate: str) ->
     return [{"name": module_name, "questions": questions}]
 
 
+async def review_and_revise_spec(
+    spec_path: str,
+    gate: str,
+    *,
+    gateway: Any,
+    budget_remaining_usd: float,
+    user_goal: str,
+) -> dict[str, Any]:
+    """Run the independent doc-reviewer critique + revise pass on a spec
+    file. Writes ``SPEC_{REQUIREMENTS,ARCHITECTURE}_REVIEW.md`` alongside
+    the spec and overwrites ``spec_path`` with the revised version.
+
+    Used by:
+      - ``spec_review_node`` (graph path, after discovery).
+      - ``harness.cli.cmd_run`` (pre-flight path, after
+        ``synthesize_requirements``) — the reviewer fires whenever
+        ``doc_reviewer_primary`` is configured, independent of
+        ``--discover``.
+
+    Returns a dict with: ``review_path``, ``critique`` (parsed dict),
+    ``new_budget_usd``, ``token_usage_list`` (list of provider Usage
+    objects for the caller to aggregate), ``ok`` (bool). On any
+    non-fatal failure ``ok=False`` and the caller falls through.
+    """
+    from harness.gateway import NodeRole
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "review_path": None,
+        "critique": None,
+        "new_budget_usd": budget_remaining_usd,
+        "token_usage_list": [],
+    }
+
+    if gate == "REQUIREMENTS":
+        review_filename = "SPEC_REQUIREMENTS_REVIEW.md"
+    elif gate == "ARCHITECTURE":
+        review_filename = "SPEC_ARCHITECTURE_REVIEW.md"
+    else:
+        return result
+
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            original_spec = f.read()
+    except OSError as exc:
+        logger.warning("[spec_review] Cannot read %s: %s", spec_path, exc)
+        return result
+
+    critique_user_prompt = (
+        f"## User Goal\n{user_goal}\n\n"
+        f"## Specification Under Review ({gate})\n{original_spec}\n\n"
+        "Produce the JSON critique now."
+    )
+    critique_messages = [
+        {"role": "system", "content": _SPEC_REVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": critique_user_prompt},
+    ]
+
+    try:
+        critique_response, new_budget = await gateway.dispatch(
+            messages=critique_messages,
+            role=NodeRole.DOC_REVIEWER,
+            budget_remaining_usd=budget_remaining_usd,
+        )
+    except Exception as exc:
+        logger.warning("[spec_review] Reviewer dispatch failed: %s — passing through.", exc)
+        return result
+    result["new_budget_usd"] = new_budget
+    result["token_usage_list"].append(critique_response.usage)
+
+    try:
+        from harness.trust import _strip_code_fences  # type: ignore
+        critique_text = _strip_code_fences(critique_response.content)
+    except Exception:
+        critique_text = critique_response.content.strip()
+
+    try:
+        critique = json.loads(critique_text)
+        if not isinstance(critique, dict):
+            raise ValueError("critique JSON must be an object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("[spec_review] Critique was not valid JSON (%s) — passing through.", exc)
+        return result
+    result["critique"] = critique
+
+    review_path = os.path.join(os.path.dirname(spec_path), review_filename)
+    try:
+        with open(review_path, "w", encoding="utf-8") as f:
+            f.write(f"# {gate.capitalize()} Spec Review\n\n")
+            f.write("*Generated by the independent doc-reviewer LLM.*\n\n")
+            f.write("```json\n")
+            f.write(json.dumps(critique, indent=2))
+            f.write("\n```\n")
+        result["review_path"] = review_path
+    except OSError as exc:
+        logger.warning("[spec_review] Failed to write %s: %s", review_path, exc)
+
+    revise_prompt = _SPEC_REVISE_INSTRUCTION_TEMPLATE.format(
+        gate=gate,
+        original_spec=original_spec,
+        critique_json=json.dumps(critique, indent=2),
+    )
+    revise_messages = [
+        {"role": "system", "content": "You are a senior specification author. Output clean Markdown only."},
+        {"role": "user", "content": revise_prompt},
+    ]
+    try:
+        revised_response, new_budget = await gateway.dispatch(
+            messages=revise_messages,
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=new_budget,
+        )
+        result["new_budget_usd"] = new_budget
+        result["token_usage_list"].append(revised_response.usage)
+    except Exception as exc:
+        logger.warning("[spec_review] Revise dispatch failed: %s — leaving original spec.", exc)
+        revised_response = None
+
+    if revised_response is not None:
+        revised_text = revised_response.content.strip()
+        if revised_text:
+            try:
+                with open(spec_path, "w", encoding="utf-8") as f:
+                    f.write(revised_text)
+                logger.info("[spec_review] Revised spec written to %s.", spec_path)
+            except OSError as exc:
+                logger.warning("[spec_review] Failed to overwrite %s: %s", spec_path, exc)
+
+    result["ok"] = True
+    return result
+
+
 async def spec_review_node(state: AgentState) -> dict[str, Any]:
     """
     Independent LLM critiques the freshly written spec, then the primary
@@ -2349,10 +3018,8 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
     # Determine which spec path to operate on.
     if gate == "REQUIREMENTS":
         path_key = "spec_requirements_path"
-        review_filename = "SPEC_REQUIREMENTS_REVIEW.md"
     elif gate == "ARCHITECTURE":
         path_key = "spec_architecture_path"
-        review_filename = "SPEC_ARCHITECTURE_REVIEW.md"
     else:
         logger.info("[spec_review] gate=%s — out of reviewer scope, passing through.", gate)
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
@@ -2376,13 +3043,6 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
         logger.info("[spec_review] spec file missing (%s) — skipping.", spec_path)
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
 
-    try:
-        with open(spec_path, "r", encoding="utf-8") as f:
-            original_spec = f.read()
-    except OSError as exc:
-        logger.warning("[spec_review] Cannot read %s: %s", spec_path, exc)
-        return {"node_state": {"current_node": "spec_review", "skipped": True}}
-
     # Short user-goal summary — keeps the reviewer prompt cheap and prevents
     # it from re-litigating the discovery process.
     messages = state.get("messages", [])
@@ -2390,94 +3050,26 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
     if len(messages) >= 2:
         user_goal = str(messages[1].get("content", ""))[:1000]
 
-    from harness.gateway import NodeRole
-
-    critique_user_prompt = (
-        f"## User Goal\n{user_goal}\n\n"
-        f"## Specification Under Review ({gate})\n{original_spec}\n\n"
-        "Produce the JSON critique now."
+    # Run the shared critique + revise pass.
+    review_result = await review_and_revise_spec(
+        spec_path,
+        gate,
+        gateway=gateway,
+        budget_remaining_usd=budget,
+        user_goal=user_goal,
     )
-    critique_messages = [
-        {"role": "system", "content": _SPEC_REVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": critique_user_prompt},
-    ]
-
-    try:
-        critique_response, new_budget = await gateway.dispatch(
-            messages=critique_messages,
-            role=NodeRole.DOC_REVIEWER,
-            budget_remaining_usd=budget,
-        )
-    except Exception as exc:
-        logger.warning("[spec_review] Reviewer dispatch failed: %s — passing through.", exc)
+    if not review_result["ok"]:
+        # Helper logged the reason; pass through.
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
 
-    token_tracker = gateway.aggregate_tokens(state.get("token_tracker", {}), critique_response.usage)
+    new_budget = review_result["new_budget_usd"]
+    review_path = review_result["review_path"]
+    critique = review_result["critique"] or {}
 
-    # Parse the critique JSON; tolerate code fences.
-    try:
-        from harness.trust import _strip_code_fences  # type: ignore
-        critique_text = _strip_code_fences(critique_response.content)
-    except Exception:
-        critique_text = critique_response.content.strip()
-
-    try:
-        critique = json.loads(critique_text)
-        if not isinstance(critique, dict):
-            raise ValueError("critique JSON must be an object")
-    except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("[spec_review] Critique was not valid JSON (%s) — passing through.", exc)
-        return {
-            "messages": list(messages) + [
-                MessageDict(role="assistant", content=critique_response.content)
-            ],
-            "token_tracker": token_tracker,
-            "budget_remaining_usd": new_budget,
-            "node_state": {"current_node": "spec_review", "skipped": True},
-        }
-
-    # Persist the critique to a separate review document for the user.
-    review_path = os.path.join(os.path.dirname(spec_path), review_filename)
-    try:
-        with open(review_path, "w", encoding="utf-8") as f:
-            f.write(f"# {gate.capitalize()} Spec Review\n\n")
-            f.write("*Generated by the independent doc-reviewer LLM.*\n\n")
-            f.write("```json\n")
-            f.write(json.dumps(critique, indent=2))
-            f.write("\n```\n")
-    except OSError as exc:
-        logger.warning("[spec_review] Failed to write %s: %s", review_path, exc)
-
-    # Re-spec call: ask the planning model to produce a revised spec.
-    revise_prompt = _SPEC_REVISE_INSTRUCTION_TEMPLATE.format(
-        gate=gate,
-        original_spec=original_spec,
-        critique_json=json.dumps(critique, indent=2),
-    )
-    revise_messages = [
-        {"role": "system", "content": "You are a senior specification author. Output clean Markdown only."},
-        {"role": "user", "content": revise_prompt},
-    ]
-    try:
-        revised_response, new_budget = await gateway.dispatch(
-            messages=revise_messages,
-            role=NodeRole.PLANNING,
-            budget_remaining_usd=new_budget,
-        )
-    except Exception as exc:
-        logger.warning("[spec_review] Revise dispatch failed: %s — leaving original spec.", exc)
-        revised_response = None
-
-    if revised_response is not None:
-        token_tracker = gateway.aggregate_tokens(token_tracker, revised_response.usage)
-        revised_text = revised_response.content.strip()
-        if revised_text:
-            try:
-                with open(spec_path, "w", encoding="utf-8") as f:
-                    f.write(revised_text)
-                logger.info("[spec_review] Revised spec written to %s.", spec_path)
-            except OSError as exc:
-                logger.warning("[spec_review] Failed to overwrite %s: %s", spec_path, exc)
+    # Aggregate token tracker across whichever dispatches actually fired.
+    token_tracker = state.get("token_tracker", {})
+    for usage in review_result["token_usage_list"]:
+        token_tracker = gateway.aggregate_tokens(token_tracker, usage)
 
     loop_counter["review_spec"] = counter + 1
 
@@ -3284,6 +3876,9 @@ def build_graph() -> Any:
             "security_scan_node": "code_review_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
+            # pytest exit=5 with source present → generate tests instead of
+            # burning a repair iteration on a non-error.
+            "test_generation_node": "test_generation_node",
         },
     )
 
@@ -3354,6 +3949,7 @@ def build_graph() -> Any:
             "security_scan_node": "security_scan_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
+            "test_generation_node": "test_generation_node",
         },
     )
 

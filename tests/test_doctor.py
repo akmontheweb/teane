@@ -1,9 +1,12 @@
 """Tests for harness/cli.py — `harness doctor` first-run healthcheck."""
 
+import asyncio
 import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 
 from harness.cli import (
@@ -14,6 +17,24 @@ from harness.cli import (
     _doctor_check_sandbox,
     _format_doctor_line,
 )
+
+
+@pytest.fixture(autouse=True)
+def _skip_live_ping(monkeypatch):
+    """Default: every doctor api-keys test skips the live HTTP ping.
+
+    The live ping was added after the original tests landed; without
+    this fixture every key-resolution assertion would also need to mock
+    httpx. The handful of tests that exercise the live-ping path opt
+    back in by clearing the env var explicitly and patching httpx.
+    """
+    monkeypatch.setenv("HARNESS_DOCTOR_SKIP_LIVE", "true")
+
+
+def _run_api_keys_check(config):
+    """Sync wrapper — the check is async, but most tests assert on the
+    returned (status, detail) tuple, not concurrency."""
+    return asyncio.run(_doctor_check_api_keys(config))
 
 
 class TestDoctorGitCheck:
@@ -55,19 +76,19 @@ class TestDoctorGitCheck:
 class TestDoctorApiKeysCheck:
     def test_warns_when_no_routing_models_configured(self):
         config = {"model_routing": {}}
-        status, detail = _doctor_check_api_keys(config)
+        status, detail = _run_api_keys_check(config)
         assert status == "warn"
         assert "no non-ollama models" in detail
 
     def test_warns_when_only_ollama_configured(self):
         config = {"model_routing": {"planning_primary": "ollama:llama3"}}
-        status, detail = _doctor_check_api_keys(config)
+        status, detail = _run_api_keys_check(config)
         assert status == "warn"
 
     def test_fails_when_provider_key_missing(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = {"model_routing": {"planning_primary": "openai:gpt-4o"}}
-        status, detail = _doctor_check_api_keys(config)
+        status, detail = _run_api_keys_check(config)
         assert status == "fail"
         assert "OPENAI_API_KEY" in detail
 
@@ -80,10 +101,253 @@ class TestDoctorApiKeysCheck:
                 "patching_primary": "deepseek:deepseek-coder",
             },
         }
-        status, detail = _doctor_check_api_keys(config)
+        status, detail = _run_api_keys_check(config)
         assert status == "pass"
-        assert "ANTHROPIC_API_KEY" in detail
-        assert "DEEPSEEK_API_KEY" in detail
+        # New format reports model_key and source — env vs config — so
+        # the operator can spot which keys came from where at a glance.
+        assert "anthropic:claude-opus-4-5 (env)" in detail
+        assert "deepseek:deepseek-coder (env)" in detail
+
+    def test_passes_when_key_only_in_config_field(self, monkeypatch):
+        """Regression for the doctor-vs-runtime mismatch: gateway.py:331
+        accepts a key from ``models[<key>].api_key`` when the env var is
+        empty, but the doctor used to only probe env. Now it matches."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = {
+            "model_routing": {"planning_primary": "openai:gpt-4o-mini"},
+            "models": {"openai:gpt-4o-mini": {"api_key": "sk-from-config"}},
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "openai:gpt-4o-mini (config)" in detail
+
+    def test_env_takes_precedence_over_config(self, monkeypatch):
+        """Mirrors gateway.py:331 — env wins. Doctor must report the same
+        source the runtime would actually use so it doesn't lie about
+        which key is in play."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+        config = {
+            "model_routing": {"planning_primary": "openai:gpt-4o-mini"},
+            "models": {"openai:gpt-4o-mini": {"api_key": "sk-from-config"}},
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "openai:gpt-4o-mini (env)" in detail
+        assert "(config)" not in detail
+
+    def test_fails_when_neither_env_nor_config_have_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = {
+            "model_routing": {"planning_primary": "openai:gpt-4o-mini"},
+            "models": {"openai:gpt-4o-mini": {}},  # explicit empty entry
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        # The recovery path must show both options so the operator
+        # doesn't think env var is the only place to set it.
+        assert "OPENAI_API_KEY" in detail
+        assert "models.\"openai:gpt-4o-mini\".api_key" in detail
+
+    def test_config_field_with_whitespace_only_treated_as_missing(self, monkeypatch):
+        """An accidental ``"api_key": "   "`` shouldn't count as set —
+        the runtime would treat it the same way (empty after strip)."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = {
+            "model_routing": {"planning_primary": "openai:gpt-4o-mini"},
+            "models": {"openai:gpt-4o-mini": {"api_key": "   "}},
+        }
+        status, _ = _run_api_keys_check(config)
+        assert status == "fail"
+
+
+class _FakeResponse:
+    """Minimal stand-in for httpx.Response used by the live-ping tests."""
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeAsyncClient:
+    """In-place stand-in for httpx.AsyncClient. ``script`` is a callable
+    that maps (url, headers, json_body) → (status_code, text). Lets a
+    single test stub multiple provider endpoints with different responses.
+    """
+    def __init__(self, *_args, **_kwargs):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *_exc):
+        return False
+
+    # Replaced by individual tests via monkeypatch on the class.
+    async def post(self, url, *, headers=None, json=None):
+        raise NotImplementedError
+
+
+def _install_fake_async_client(monkeypatch, post_handler):
+    """Patch httpx.AsyncClient so doctor's live ping calls ``post_handler``.
+    ``post_handler(url, headers, body)`` returns ``_FakeResponse``."""
+    import httpx
+
+    class _Client(_FakeAsyncClient):
+        async def post(self, url, *, headers=None, json=None):
+            return post_handler(url, headers or {}, json or {})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+
+class TestDoctorApiKeysLivePing:
+    """Live ping: with HARNESS_DOCTOR_SKIP_LIVE unset, the doctor makes
+    a 1-token chat call per provider to confirm the key actually
+    authenticates against the model. These tests opt out of the
+    autouse skip fixture and patch httpx.AsyncClient.
+    """
+
+    def test_live_ping_pass_returns_pass(self, monkeypatch):
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+
+        def handler(url, headers, body):
+            assert "api.openai.com" in url
+            assert headers["Authorization"] == "Bearer sk-real"
+            assert body["max_tokens"] == 1
+            return _FakeResponse(200, '{"id":"chatcmpl-x"}')
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {"model_routing": {"planning_primary": "openai:gpt-4o-mini"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "live" in detail
+        assert "openai:gpt-4o-mini" in detail
+
+    def test_live_ping_401_returns_fail_with_clear_message(self, monkeypatch):
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-bad")
+
+        def handler(_url, _headers, _body):
+            return _FakeResponse(401, '{"error":"invalid_api_key"}')
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {"model_routing": {"planning_primary": "openai:gpt-4o-mini"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        assert "401" in detail
+        assert "API key rejected" in detail or "rejected" in detail
+
+    def test_live_ping_429_distinguished_from_auth_failure(self, monkeypatch):
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-real")
+
+        def handler(_url, _headers, _body):
+            return _FakeResponse(429, '{"error":"rate_limit"}')
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {"model_routing": {"planning_primary": "deepseek:deepseek-v4-pro"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        assert "429" in detail
+        assert "rate" in detail.lower() or "quota" in detail.lower()
+
+    def test_live_ping_connect_error_fails_with_network_hint(self, monkeypatch):
+        import httpx
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real")
+
+        class _ExplodingClient(_FakeAsyncClient):
+            async def post(self, *_a, **_kw):
+                raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(httpx, "AsyncClient", _ExplodingClient)
+        config = {"model_routing": {"planning_primary": "anthropic:claude-sonnet-4"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        assert "connection failed" in detail.lower() or "connect" in detail.lower()
+
+    def test_live_ping_timeout_fails_with_timeout_hint(self, monkeypatch):
+        import httpx
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+
+        class _TimeoutClient(_FakeAsyncClient):
+            async def post(self, *_a, **_kw):
+                raise httpx.ConnectTimeout("timed out")
+
+        monkeypatch.setattr(httpx, "AsyncClient", _TimeoutClient)
+        config = {"model_routing": {"planning_primary": "openai:gpt-4o-mini"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        assert "timeout" in detail.lower() or "unreachable" in detail.lower()
+
+    def test_live_ping_uses_correct_anthropic_headers(self, monkeypatch):
+        """Anthropic uses x-api-key + anthropic-version, NOT Bearer.
+        If the doctor sends the wrong header the live ping reports 401
+        against a real provider — same diagnostic failure as a bad key.
+        """
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real")
+        captured: dict = {}
+
+        def handler(url, headers, body):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = body
+            return _FakeResponse(200, '{"id":"msg_x"}')
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {"model_routing": {"planning_primary": "anthropic:claude-sonnet-4"}}
+        status, _detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "api.anthropic.com" in captured["url"]
+        assert captured["headers"]["x-api-key"] == "sk-real"
+        assert "anthropic-version" in captured["headers"]
+        assert "Authorization" not in captured["headers"]
+        assert captured["body"]["model"] == "claude-sonnet-4"
+        assert captured["body"]["max_tokens"] == 1
+
+    def test_skip_live_env_var_short_circuits(self, monkeypatch):
+        """With HARNESS_DOCTOR_SKIP_LIVE=true (the autouse default), no
+        network request fires even with a key set. Confirms the opt-out
+        works for CI / headless and proves the rest of the suite's
+        autouse fixture is doing its job."""
+        # The autouse fixture already sets the env var; assert the live
+        # ping is NEVER invoked by patching httpx.AsyncClient to explode.
+        import httpx
+
+        class _ExplodingClient(_FakeAsyncClient):
+            async def post(self, *_a, **_kw):
+                raise AssertionError("live ping must not fire when SKIP_LIVE=true")
+
+        monkeypatch.setattr(httpx, "AsyncClient", _ExplodingClient)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+        config = {"model_routing": {"planning_primary": "openai:gpt-4o-mini"}}
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "live ping skipped" in detail
+
+    def test_live_ping_parallel_across_providers(self, monkeypatch):
+        """Two providers configured → two parallel pings. Assertion is
+        weak (both must be hit) since asyncio gather scheduling order
+        isn't deterministic — just confirm both were dispatched."""
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-1")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-2")
+        urls_hit: list[str] = []
+
+        def handler(url, _headers, _body):
+            urls_hit.append(url)
+            return _FakeResponse(200, "{}")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "anthropic:claude-sonnet-4",
+            },
+        }
+        status, _detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert any("openai.com" in u for u in urls_hit)
+        assert any("anthropic.com" in u for u in urls_hit)
 
 
 class TestDoctorSandboxCheck:
@@ -114,20 +378,41 @@ class TestDoctorCheckpointDbCheck:
 
 
 class TestDoctorConfigCheck:
-    def test_clean_config_passes(self):
+    def test_clean_canonical_config_passes(self, monkeypatch):
+        # Under the single-source contract the doctor's "config" check
+        # delegates entirely to discover_config + validate_config_strict.
+        # When the canonical config is valid AND every routed model has
+        # its env var set, the check passes.
+        monkeypatch.setenv("OPENAI_API_KEY", "stub")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "stub")
         with tempfile.TemporaryDirectory() as tmpdir:
             status, detail = _doctor_check_config(tmpdir)
+            assert status == "pass", detail
+
+    def test_legacy_workspace_config_is_ignored(self, monkeypatch):
+        # Legacy .harness_config.json files in the workspace are NOT
+        # parsed; they're logged-and-ignored. Doctor returns pass when
+        # the CANONICAL config is valid regardless of what the legacy
+        # workspace file contains.
+        monkeypatch.setenv("OPENAI_API_KEY", "stub")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "stub")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy = Path(tmpdir) / ".harness_config.json"
+            legacy.write_text('{"token_budget": {"hrad_cap_usd": 1.0}}')
+            status, _ = _doctor_check_config(tmpdir)
             assert status == "pass"
 
-    def test_typo_in_workspace_config_warns(self):
+    def test_missing_env_var_fails(self, monkeypatch):
+        # Strict validation now refuses to load when a model referenced
+        # by routing has no API key env var set. Doctor reports a clean
+        # fail with the env var name in the message.
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with tempfile.TemporaryDirectory() as tmpdir:
-            cfg_path = Path(tmpdir) / ".harness_config.json"
-            cfg_path.write_text(
-                '{"token_budget": {"hrad_cap_usd": 1.0}}'
-            )
             status, detail = _doctor_check_config(tmpdir)
-            assert status == "warn"
-            assert "hrad_cap_usd" in detail
+            assert status == "fail"
+            assert "API key environment variable" in detail
 
 
 class TestDoctorLineFormatting:

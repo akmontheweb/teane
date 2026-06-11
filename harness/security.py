@@ -1057,12 +1057,17 @@ def _fallback_secret_scan(workspace_path: str) -> list[SecurityFinding]:
 
     findings: list[SecurityFinding] = []
     ignore_dirs = {".git", "__pycache__", "node_modules", "vendor", "target", "build", "dist", ".tox", ".venv", "venv"}
+    # Files we never scan: .env-style secret files (these intentionally
+    # carry secrets; flagging them creates noise) AND the harness's own
+    # operational files (managed by _is_harness_owned_path so both the
+    # fallback and real-gitleaks code paths share one definition).
+    env_basenames = {".env", ".env.local", ".env.production"}
 
     try:
         for root, dirs, files in os.walk(workspace_path):
             dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
             for filename in files[:100]:
-                if filename in (".env", ".env.local", ".env.production"):
+                if filename in env_basenames or _is_harness_owned_path(filename):
                     continue
                 filepath = os.path.join(root, filename)
                 try:
@@ -1139,6 +1144,7 @@ async def run_gitleaks_scan(
         )
 
     findings = _parse_gitleaks_json(stdout)
+    findings = [f for f in findings if not _is_harness_owned_path(f.file)]
     if findings:
         logger.warning("[security_scan] gitleaks found %d secret(s).", len(findings))
     else:
@@ -1148,6 +1154,26 @@ async def run_gitleaks_scan(
         status=ScannerStatus.FOUND if findings else ScannerStatus.OK,
         findings=findings,
     )
+
+
+# Files the harness owns / writes into the workspace that legitimately
+# carry API keys and similar operator-side state. Centralised here so the
+# fallback scanner (above) and the real-gitleaks post-filter (below) both
+# use the same list. Match on basename so any directory the harness writes
+# them into is covered.
+_HARNESS_OWNED_BASENAMES: frozenset[str] = frozenset({
+    ".harness_config.json",
+    ".harness_session.lock",
+})
+
+
+def _is_harness_owned_path(rel_path: str) -> bool:
+    """True when ``rel_path`` is one of the harness's own operational
+    files inside the workspace and should NOT be reported by the
+    security scan."""
+    if not rel_path:
+        return False
+    return os.path.basename(rel_path) in _HARNESS_OWNED_BASENAMES
 
 
 def _scan_workspace_languages(workspace_path: str) -> tuple[bool, bool, bool]:

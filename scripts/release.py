@@ -181,8 +181,8 @@ def main() -> int:
     run(["git", "tag", "-a", f"v{new_str}", "-m", f"Release v{new_str}"])
 
     if args.no_push:
-        print(f"[release] Local commit + tag created. Skipping push (--no-push).")
-        print(f"[release] To finish: git push && git push --tags")
+        print("[release] Local commit + tag created. Skipping push (--no-push).")
+        print("[release] To finish: git push && git push --tags")
         return 0
 
     run(["git", "push"])

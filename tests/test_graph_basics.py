@@ -264,3 +264,56 @@ class TestErrorHandling:
             "exit_code": -1,
         }
         assert state["timed_out"] is True
+
+
+class TestGatewayConfigPropagation:
+    """Regression: ``set_gateway`` used to inject only the Gateway instance,
+    not its config. Every ``get_gateway_config()`` consumer
+    (``spec_review_node``, ``code_review_node``, the pre-flight reviewer
+    in ``cmd_run``) read None and silently skipped — making the
+    ``doc_reviewer_primary`` / ``code_reviewer_primary`` config keys
+    effectively dead code. The fix makes ``set_gateway`` atomic: setting
+    the gateway also stashes ``gateway.config`` for downstream readers.
+    """
+
+    def test_set_gateway_also_stashes_config(self):
+        from harness.graph import set_gateway, get_gateway_config, get_gateway
+
+        class _FakeConfig:
+            doc_reviewer_primary = "openai:gpt-4o"
+            code_reviewer_primary = "anthropic:claude-sonnet"
+
+        class _FakeGateway:
+            def __init__(self):
+                self.config = _FakeConfig()
+
+        gw = _FakeGateway()
+        try:
+            set_gateway(gw)
+            assert get_gateway() is gw
+            cfg = get_gateway_config()
+            assert cfg is gw.config
+            assert cfg.doc_reviewer_primary == "openai:gpt-4o"
+        finally:
+            # Reset the module-level slot so other tests aren't polluted.
+            set_gateway.__globals__["_gateway"] = None
+            set_gateway.__globals__["_gateway_config"] = None
+
+    def test_set_gateway_without_config_is_safe(self):
+        """A test double that doesn't expose ``.config`` still works —
+        the gateway gets injected and the config slot stays whatever it
+        was before (no AttributeError)."""
+        from harness.graph import set_gateway, get_gateway_config
+
+        class _Bare:
+            pass
+
+        # Capture whatever the slot was before to assert we don't crash.
+        prior = get_gateway_config()
+        try:
+            set_gateway(_Bare())
+            # No assertion on cfg value — just that the call returned cleanly.
+            _ = get_gateway_config()
+        finally:
+            set_gateway.__globals__["_gateway"] = None
+            set_gateway.__globals__["_gateway_config"] = prior

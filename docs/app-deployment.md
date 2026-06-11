@@ -7,6 +7,7 @@ How the harness deploys the app it just built — what artefacts you get, what c
 - **You don't write the `docker-compose.yml`.** The harness's `deployment_node` does it for you after the security scan returns clean, deriving services / volumes / networks from a deterministic workspace telemetry scan + one LLM call.
 - **You don't run `docker-compose up`** either — the harness runs `docker-compose up --build -d` itself and polls the declared health endpoints. If health checks fail, it routes back to the LLM repair loop.
 - **The dev-env deployment is gated.** A Phase 3.5 preview gate shows you the proposed Dockerfile / compose / Caddyfile before they execute. Approve interactively, or bypass under CI with `HARNESS_AUTO_APPROVE=true` (or `CI=true`).
+- **Checkpoint message redaction is on by default.** Any `messages`-channel content that gets checkpointed during the deployment phase is scrubbed through `harness.redactor` before SQLite. Set `persistence.redact_messages: false` only if you need verbatim transcripts at rest (e.g. audit replay).
 - Config switch: `deployment.enabled` (default `true`). Set `false` to skip the whole phase and own deployment yourself.
 - **Limitation**: the bring-up runs on the local Docker daemon the harness has access to. There is no SSH-driven remote-deploy subcommand yet — for remote dev, copy the generated artefacts and run the same `docker-compose up` there.
 
@@ -84,7 +85,7 @@ docker-compose down
 docker-compose down -v
 ```
 
-If a service won't come up after a code change, re-run `harness run --resume <session-id>` — the repair loop will iterate on the compose/Dockerfile or the code until it lands.
+If a service won't come up after a code change, re-run `harness resume --session-id <id>` — the repair loop will iterate on the compose/Dockerfile or the code until it lands. Resume pre-flights the latest checkpoint with strict deserialization and a schema-version check; if either fails you'll get an operator-readable message naming the recovery options (`docs/RUNBOOK.md` § 1). Track cost as you iterate with `harness metrics --session-id <id>` — it reports total spend, the trailing 10-minute burn rate, and projected minutes-to-exhaustion at the current rate against `token_budget.hard_cap_usd`.
 
 ## The Phase 3.5 preview gate
 
@@ -136,4 +137,5 @@ Future work directions: a stack-aware `install_generation_node` mirroring `harne
 - `harness/deploy.py:scan_workspace_telemetry` (line 278), `synthesize_architecture` (line 407), `generate_assets_from_blueprint` (line 849), `health_check_loop` (line 1014) — phase entry points.
 - `harness/graph.py:route_after_security_scan` (line 2226) — where the deployment phase joins the graph.
 - [docs/installation.md](installation.md) — how to install the harness itself.
-- [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md) — graph topology and module map.
+- [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md) — graph topology and module map (§5.21–§5.30 cover the recent reliability + security primitives that wrap deployment).
+- [docs/RUNBOOK.md](RUNBOOK.md) — top-five operator failure modes with diagnostic + fix recipes.

@@ -195,3 +195,47 @@ class TestSelectWinner:
         # Should select v1 (first)
         assert winner is not None
         assert winner.variant_id == "v1"
+
+
+class TestSpeculativeBuildCommandAdaptation:
+    """Fix 3 regression: speculative_node used to invoke the sandbox
+    with raw state['build_command'] / state['sandbox_config'] without
+    running the same late-bind detection compiler_node already had. On
+    a greenfield Python workspace with the default `make build`, every
+    variant compiled against ubuntu:22.04 and exited 127 — the entire
+    speculative round was guaranteed budget waste.
+
+    The fix runs ``_detect_default_build_command`` plus
+    ``_apply_toolchain_adaptation`` once up-front and threads the
+    resolved values through to each variant executor. This test
+    exercises just the late-bind path — full speculative_node is too
+    heavy for a unit test, so we verify the building blocks behave
+    correctly on the same shape of input.
+    """
+
+    def test_detect_and_adapt_for_greenfield_python_workspace(self, tmp_path):
+        """Greenfield Python workspace + ``make build`` default should
+        end up with: install+pytest command, python:3.12-slim image,
+        network auto-enabled (adapter-synthesised install bypasses the
+        user opt-in)."""
+        from harness.cli import _detect_default_build_command
+        from harness.graph import _apply_toolchain_adaptation
+
+        # Mirror the run-log scenario: app/ package, no Makefile, no
+        # pyproject yet, no requirements.txt.
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None and "pip install pytest" in detected
+
+        cfg, allow_net, img_adapted, net_adapted, _ro = _apply_toolchain_adaptation(
+            detected,
+            {"docker_image": "ubuntu:22.04"},
+            allow_network=False,
+            command_is_adapter_synthesised=True,
+        )
+        assert img_adapted
+        assert cfg["docker_image"] == "python:3.12-slim"
+        assert net_adapted
+        assert allow_net is True

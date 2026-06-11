@@ -23,6 +23,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -278,6 +279,9 @@ class DockerBackend(SandboxBackend):
         - Automatic container cleanup (--rm)
         - Workspace volume mount (read-write)
         - Cache volume mounts (read-only)
+        - Workspace ownership restoration on exit (chown root-owned bind-mount
+          files back to the host user, so __pycache__/ and friends don't end
+          up needing sudo to delete on the host).
     """
 
     def __init__(
@@ -288,6 +292,7 @@ class DockerBackend(SandboxBackend):
         pids_limit: int = 100,
         docker_path: str = "docker",
         read_only_root: bool = True,
+        restore_workspace_ownership: bool = True,
     ):
         self.image = image
         self.memory_limit = memory_limit
@@ -301,6 +306,13 @@ class DockerBackend(SandboxBackend):
         # to /root/.local which is *also* on the read-only root FS. The
         # container is --rm so dropping read-only does not leak state.
         self.read_only_root = read_only_root
+        # When True (default on Linux when the host user is non-root) we
+        # append a `find -uid 0 -exec chown <uid>:<gid>` trailer to the shell
+        # entrypoint so any files the in-container build wrote as root
+        # (notably pytest's __pycache__/) land owned by the host user via the
+        # bind-mount. Set to False to opt out — useful with rootless docker /
+        # podman where the user-namespace remapping already handles ownership.
+        self.restore_workspace_ownership = restore_workspace_ownership
 
     @property
     def name(self) -> str:
@@ -376,7 +388,21 @@ class DockerBackend(SandboxBackend):
         )
         logger.info("[sandbox:docker] Running in Docker container (image=%s, mem=%s).", self.image, self.memory_limit)
         logger.debug("[sandbox:docker] Command: %s", " ".join(docker_cmd))
-        return await _execute_subprocess_with_timeout(docker_cmd, timeout_seconds)
+        try:
+            return await _execute_subprocess_with_timeout(docker_cmd, timeout_seconds)
+        finally:
+            # Belt-and-suspenders: if the in-container ownership-restore
+            # trailer was skipped (container OOM-killed, SIGKILLed by the
+            # outer timeout, or `restore_workspace_ownership=False`), sweep
+            # the bind-mount on the host. Best-effort: silently exits if the
+            # host user lacks CAP_CHOWN.
+            self._host_side_ownership_sweep(workspace_path)
+
+    # In-container HOME used when --user passes a non-root UID. /tmp is the
+    # writable tmpfs already provisioned at line 414, so the host user's HOME
+    # lives there without a separate mount. Stable name so test assertions
+    # and operators tailing logs can grep for it.
+    _BUILDER_HOME = "/tmp/builder-home"
 
     def _build_docker_command(
         self,
@@ -398,13 +424,32 @@ class DockerBackend(SandboxBackend):
             "--stop-timeout", str(max(5, timeout_seconds // 10)),  # Graceful stop
         ]
 
+        # Run as the host user when possible. The container's processes
+        # otherwise default to UID 0 (root), which (a) makes pip emit the
+        # well-known "Running pip as the 'root' user can result in broken
+        # permissions" warning and (b) is conceptually wrong — the harness
+        # is meant to act on the user's behalf, not as root. We gate on
+        # Linux + non-root host (macOS/Windows Docker Desktop already remap
+        # ownership via the FUSE layer; root on root is a no-op).
+        run_as_host_user = self._should_run_as_host_user()
+        host_uid: Optional[int] = None
+        host_gid: Optional[int] = None
+        if run_as_host_user:
+            host_uid = os.getuid()
+            host_gid = os.getgid()
+            cmd.extend(["--user", f"{host_uid}:{host_gid}"])
+
         if self.read_only_root:
             cmd.append("--read-only")
-            # When the root FS is RO, pip / npm / cargo will try the per-user
-            # fallback (~/.local, ~/.cache, ~/.npm). Without a writable HOME
-            # those installs fail with "Read-only file system: '/root/...'"
-            # *after* downloading every wheel. Give them a tmpfs to land in.
-            cmd.extend(["--tmpfs", "/root:exec"])
+            if not run_as_host_user:
+                # When the root FS is RO, pip / npm / cargo will try the
+                # per-user fallback (~/.local, ~/.cache, ~/.npm). Without a
+                # writable HOME those installs fail with "Read-only file
+                # system: '/root/...'" *after* downloading every wheel. Give
+                # them a tmpfs to land in. When running as the host user we
+                # set HOME to the existing /tmp tmpfs (see env vars below),
+                # so /root never gets written to.
+                cmd.extend(["--tmpfs", "/root:exec"])
 
         # Network isolation
         if allow_network:
@@ -424,15 +469,190 @@ class DockerBackend(SandboxBackend):
         # Set working directory
         cmd.extend(["-w", workspace_path])
 
-        # Environment variables
-        for key, value in extra_env.items():
+        # Environment variables. Default suppression of pyc emission into the
+        # bind-mounted workspace — pytest otherwise leaves root-owned
+        # __pycache__/ trees the host user can't rm without sudo. Defaults
+        # are merged UNDER extra_env so the speculative path's per-variant
+        # PYTHONPYCACHEPREFIX (see speculative._build_variant_cache_env) still
+        # takes precedence. When running as the host user we also need to
+        # redirect HOME (the container's /etc/passwd usually only has root
+        # set, so a non-root UID has no resolvable HOME) and pre-route pip
+        # into per-user mode so the existing build command `pip install X`
+        # works without further command rewriting.
+        defaults = self._default_pyc_env()
+        if run_as_host_user:
+            defaults.update(self._default_user_mode_env())
+        merged_env = {**defaults, **extra_env}
+        for key, value in merged_env.items():
             cmd.extend(["-e", f"{key}={value}"])
 
-        # Image and entrypoint
+        # Image and entrypoint. When running as a non-root UID we have to
+        # ensure ``$HOME`` exists before the build command runs, because
+        # pip's per-user install path is computed from HOME and pip will
+        # crash with "Could not find an activated virtualenv (required)" or
+        # similar if HOME doesn't exist on disk. ``mkdir -p`` is cheap and
+        # idempotent.
+        wrapped_cmd = shell_cmd
+        if run_as_host_user:
+            wrapped_cmd = f'mkdir -p "$HOME" && ( {wrapped_cmd} )'
+
+        # When the container runs as root we additionally wrap with an
+        # ownership-restoring trailer so any files the in-container root
+        # process wrote into the bind-mount land owned by the host user.
+        # When we already passed --user to docker every write is host-owned
+        # from the start and the trailer becomes a redundant find walk;
+        # skip it to save the (typically small but non-zero) scan time.
+        if not run_as_host_user:
+            wrapped_cmd = self._wrap_shell_cmd_with_ownership_restore(
+                wrapped_cmd, workspace_path,
+            )
+
         cmd.append(self.image)
-        cmd.extend(["sh", "-c", shell_cmd])
+        cmd.extend(["sh", "-c", wrapped_cmd])
 
         return cmd
+
+    def _should_run_as_host_user(self) -> bool:
+        """True when the container should be launched with
+        ``--user $UID:$GID`` instead of the image's default UID 0.
+
+        Gated on:
+          - the operator hasn't opted out via the same
+            ``restore_workspace_ownership=False`` switch (single config knob
+            for "behave like the host user");
+          - the host is Linux (Docker Desktop on macOS / Windows already
+            remaps ownership via FUSE, no benefit to switching UIDs);
+          - the host user is non-root (root → root in container is the
+            current behaviour and avoids surprising permission failures
+            for operators running the harness in CI containers).
+        """
+        if not self.restore_workspace_ownership:
+            return False
+        if platform.system() != "Linux":
+            return False
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is None or getgid is None:
+            return False
+        return getuid() != 0
+
+    def _default_user_mode_env(self) -> dict[str, str]:
+        """Env vars needed when the container runs as a non-root UID with
+        no matching entry in the image's /etc/passwd.
+
+        - ``HOME`` points at the writable /tmp tmpfs so pip / cargo / npm
+          have somewhere to write per-user caches and installed packages.
+        - ``PIP_USER=1`` flips ``pip install`` to per-user install mode
+          (writes to ``$HOME/.local/lib/...`` instead of
+          ``/usr/local/lib/python*/site-packages`` which would EACCES).
+        - ``PIP_ROOT_USER_ACTION=ignore`` silences pip's noisy
+          "running as the 'root' user" warning when the build does
+          occasionally land back on root (e.g. via sudo).
+        - ``PATH`` is prefixed with ``$HOME/.local/bin`` so the entry-point
+          scripts pip installs there (``pytest``, ``ruff``, ``mypy``) are
+          found by subsequent steps in the same build command.
+        """
+        home = self._BUILDER_HOME
+        return {
+            "HOME": home,
+            "PIP_USER": "1",
+            "PIP_ROOT_USER_ACTION": "ignore",
+            "PATH": f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+
+    def _host_side_ownership_sweep(self, workspace_path: str) -> None:
+        """Best-effort host-side fallback for the in-container chown trailer.
+
+        The in-container trailer (see :meth:`_wrap_shell_cmd_with_ownership_restore`)
+        catches the common path. This sweep covers the rest: container OOM
+        kills, SIGKILL from the outer timeout, or operators who explicitly
+        disabled ``restore_workspace_ownership``. Run as a subprocess so we
+        don't block the asyncio loop; swallow every failure path because the
+        host user often *can't* chown root-owned files (would need
+        ``CAP_CHOWN``), and that's the expected case — the in-container
+        trailer is the real defence.
+        """
+        if platform.system() != "Linux":
+            return
+        if not workspace_path or not os.path.isdir(workspace_path):
+            return
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is None or getgid is None:
+            return
+        uid = getuid()
+        gid = getgid()
+        if uid == 0:
+            return
+        try:
+            subprocess.run(
+                ["find", workspace_path, "-uid", "0", "-exec",
+                 "chown", f"{uid}:{gid}", "{}", "+"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    @staticmethod
+    def _default_pyc_env() -> dict[str, str]:
+        """Default env vars that prevent pytest / Python from writing
+        ``__pycache__/*.pyc`` next to source files inside the bind-mounted
+        workspace. Both vars are belt-and-braces:
+          - ``PYTHONDONTWRITEBYTECODE=1`` suppresses pyc emission entirely.
+          - ``PYTHONPYCACHEPREFIX=/tmp/pycache`` redirects any pyc that does
+            get emitted (e.g. by a sub-interpreter that ignores the first var)
+            into the container's writable tmpfs.
+        Callers can override either by passing the same key in ``extra_env``;
+        the merge in :meth:`_build_docker_command` makes ``extra_env`` win.
+        """
+        return {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "/tmp/pycache",
+        }
+
+    def _wrap_shell_cmd_with_ownership_restore(
+        self, shell_cmd: str, workspace_path: str,
+    ) -> str:
+        """Wrap ``shell_cmd`` so that on exit (success OR failure), any files
+        owned by uid 0 inside the bind-mounted workspace are chowned back to
+        the host user's uid:gid.
+
+        Only fires on Linux when the host user is non-root and the backend was
+        constructed with ``restore_workspace_ownership=True``. On macOS /
+        Windows the Docker bind-mount FUSE layer already remaps ownership; on
+        a host running as root no remap is needed. In all those cases the
+        original ``shell_cmd`` is returned unchanged.
+        """
+        if not self.restore_workspace_ownership:
+            return shell_cmd
+        if platform.system() != "Linux":
+            return shell_cmd
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is None or getgid is None:
+            return shell_cmd
+        uid = getuid()
+        gid = getgid()
+        if uid == 0:
+            # Host is root — chown to 0:0 is a no-op, skip the find walk.
+            return shell_cmd
+
+        quoted_ws = shlex.quote(workspace_path)
+        # `find -uid 0 -exec chown +` only touches files the container
+        # actually wrote as root, leaving legitimately differently-owned
+        # files (e.g. a vendored .git/objects tree) alone. The trailing
+        # `|| true` keeps the build's exit code even if chown trips on a
+        # transient file (race with the build's own cleanup).
+        trailer = (
+            f"; __rc=$?; "
+            f"find {quoted_ws} -uid 0 -exec chown {uid}:{gid} {{}} + "
+            f"2>/dev/null || true; "
+            f"exit $__rc"
+        )
+        return f"( {shell_cmd} ){trailer}"
 
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1532,10 @@ class SandboxExecutor:
                 docker_kwargs["pids_limit"] = cfg["docker_pids_limit"]
             if "read_only_root" in cfg:
                 docker_kwargs["read_only_root"] = bool(cfg["read_only_root"])
+            if "restore_workspace_ownership" in cfg:
+                docker_kwargs["restore_workspace_ownership"] = bool(
+                    cfg["restore_workspace_ownership"]
+                )
             requested_backend = (cfg.get("backend", "auto") or "auto").lower()
             if requested_backend in ("auto", ""):
                 # auto-detect: forward docker kwargs (auto-detect itself

@@ -24,6 +24,36 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+_CLEANSED_CONTENT_PLACEHOLDER = (
+    "[ERROR: Redaction Failure — Content Cleansed before checkpoint persistence "
+    "to prevent secret leakage. See harness logs for the underlying redactor "
+    "error.]"
+)
+
+
+def _cleansed_messages(messages: Any) -> list[Any]:
+    """Return a copy of ``messages`` with every entry's ``content`` field
+    replaced by a fixed placeholder.
+
+    Used by the storage layer's fail-safe path when the redactor crashes:
+    the checkpoint still gets written (LangGraph needs it to resume) but
+    no raw message content reaches disk. Preserves message role and any
+    structural metadata so resume logic can still walk the message list.
+    """
+    if not isinstance(messages, list):
+        return messages
+    cleansed: list[Any] = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            scrubbed = dict(msg)
+            if "content" in scrubbed:
+                scrubbed["content"] = _CLEANSED_CONTENT_PLACEHOLDER
+            cleansed.append(scrubbed)
+        else:
+            cleansed.append(_CLEANSED_CONTENT_PLACEHOLDER)
+    return cleansed
+
+
 # ---------------------------------------------------------------------------
 # 1. Types
 # ---------------------------------------------------------------------------
@@ -198,8 +228,16 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
 
     def _redact_messages_list(self, messages: Any) -> Any:
         """Redact a messages-channel value in place. Returns the (possibly
-        modified) value. Falls back to the original on any error so a
-        redactor crash never blocks the checkpoint write."""
+        modified) value.
+
+        Fail-SAFE policy: a redactor crash MUST NOT cause raw, unredacted
+        message content to land on disk. Earlier versions of this method
+        fell back to ``return messages`` on exception, which silently
+        persisted plaintext secrets to the SQLite checkpoint. Instead, on
+        any redactor failure we replace every message's ``content`` with a
+        cleansed placeholder so the checkpoint still gets written (so
+        LangGraph can resume) but secrets never reach disk.
+        """
         if not getattr(self, "_redact_messages_on_checkpoint", True):
             return messages
         if not isinstance(messages, list):
@@ -207,14 +245,24 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         try:
             from harness.redactor import redact_messages
         except Exception:  # noqa: BLE001
-            return messages
+            # Redactor module itself failed to import — cleanse rather than
+            # persisting raw content. Same fail-safe behavior as a runtime
+            # crash inside redact_messages().
+            logger.warning(
+                "[storage] redactor module unavailable; cleansing message "
+                "content before persistence to avoid secret leakage."
+            )
+            return _cleansed_messages(messages)
         try:
             # redact_messages tolerates non-dict items and is a no-op if the
             # global scanner hasn't been configured.
             return redact_messages(messages)  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001 — fail open on redactor errors
-            logger.warning("[storage] message redaction failed; persisting raw: %s", exc)
-            return messages
+        except Exception as exc:  # noqa: BLE001 — fail SAFE on redactor crashes
+            logger.warning(
+                "[storage] message redaction failed (%s); cleansing content "
+                "before persistence to avoid secret leakage.", exc,
+            )
+            return _cleansed_messages(messages)
 
     async def aput(self, config, checkpoint, metadata, new_versions):  # type: ignore[override]
         # Redact the `messages` channel inside the full state snapshot before

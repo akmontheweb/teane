@@ -733,27 +733,32 @@ class TestSandboxBackend:
         assert "ghp_leaked-test" not in output
         assert "KEEP=value" in output  # unrelated vars survive
 
-    def test_docker_cmd_default_is_read_only_with_writable_home(self):
-        # Default DockerBackend keeps --read-only for defense in depth, but
-        # always supplies a tmpfs at /root so pip's --user fallback can land
-        # without [Errno 30].
+    def test_docker_cmd_default_is_read_only_with_writable_home(self, monkeypatch):
+        # Default DockerBackend keeps --read-only for defense in depth, and
+        # supplies a tmpfs at /root so pip's --user fallback can land without
+        # [Errno 30] WHEN the container runs as root (i.e. no --user passed).
+        # When --user is passed (host-user mode), HOME is redirected to /tmp
+        # so no /root tmpfs is needed; covered by the host-user tests below.
         from harness.sandbox import DockerBackend
+        # Pin to root-in-container mode for this test.
+        monkeypatch.setattr(os, "getuid", lambda: 0)
         backend = DockerBackend(image="python:3.12-slim")
         cmd = backend._build_docker_command(
             "pytest -q", "/work", allow_network=False,
             cache_mounts=[], extra_env={}, timeout_seconds=60,
         )
         assert "--read-only" in cmd
-        # /tmp tmpfs is always present; /root tmpfs comes with --read-only
+        # /tmp tmpfs is always present; /root tmpfs comes with --read-only.
         tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
         assert "/tmp:exec" in tmpfs_targets
         assert "/root:exec" in tmpfs_targets
 
-    def test_docker_cmd_drops_read_only_when_root_writable_requested(self):
+    def test_docker_cmd_drops_read_only_when_root_writable_requested(self, monkeypatch):
         # When the toolchain adapter detects an install command it flips
         # read_only_root=False. The docker command must then drop both
         # --read-only AND the /root tmpfs (root FS is writable now).
         from harness.sandbox import DockerBackend
+        monkeypatch.setattr(os, "getuid", lambda: 0)
         backend = DockerBackend(image="python:3.12-slim", read_only_root=False)
         cmd = backend._build_docker_command(
             "pip install -e .", "/work", allow_network=True,
@@ -780,6 +785,296 @@ class TestSandboxBackend:
         )
         assert isinstance(executor.backend, DockerBackend)
         assert executor.backend.read_only_root is False
+
+    def test_docker_cmd_suppresses_pyc_by_default(self, monkeypatch):
+        # The Docker container runs as UID 0 and bind-mounts the workspace
+        # rw, so pytest's __pycache__ writes would land root-owned on the
+        # host. Default env strips bytecode emission AND redirects whatever
+        # slips through to the container's /tmp tmpfs.
+        from harness.sandbox import DockerBackend
+        # Force Linux + non-root host so the trailer is active.
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        env_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e"]
+        assert "PYTHONDONTWRITEBYTECODE=1" in env_pairs
+        assert "PYTHONPYCACHEPREFIX=/tmp/pycache" in env_pairs
+
+    def test_docker_cmd_extra_env_overrides_pyc_defaults(self, monkeypatch):
+        # Speculative's _build_variant_cache_env sets its own
+        # PYTHONPYCACHEPREFIX per-variant. The default must NOT clobber it.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[],
+            extra_env={"PYTHONPYCACHEPREFIX": "/tmp/spec/v0/pycache"},
+            timeout_seconds=60,
+        )
+        env_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e"]
+        # Speculative override wins
+        assert "PYTHONPYCACHEPREFIX=/tmp/spec/v0/pycache" in env_pairs
+        assert "PYTHONPYCACHEPREFIX=/tmp/pycache" not in env_pairs
+        # The non-overridden default still applies
+        assert "PYTHONDONTWRITEBYTECODE=1" in env_pairs
+
+    def test_docker_cmd_wraps_shell_with_ownership_restore(self, monkeypatch):
+        # When the container falls back to running as root (e.g. on macOS
+        # Docker Desktop where Linux UID mapping isn't useful, or when the
+        # host is itself root), the shell entrypoint must be wrapped with a
+        # `find -uid 0 -exec chown` trailer so files the in-container root
+        # process wrote into the bind-mount land owned by the host user.
+        # When the container runs as a non-root host UID via --user, every
+        # write is host-owned from the start and the trailer is skipped
+        # (covered by test_docker_cmd_host_user_mode_*).
+        from harness.sandbox import DockerBackend
+        # Force the root-in-container path by reporting the host as macOS,
+        # which gates run_as_host_user off (Docker Desktop FUSE already
+        # remaps ownership). Then assert the chown safety net is wired.
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Darwin")
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        # macOS path doesn't add the chown trailer, so we'd skip the
+        # assertion. Instead pin Linux host = root to confirm the
+        # trailer fires when the container is launched as root.
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(os, "getgid", lambda: 0)
+        # ...but the host-user mode logic also bails when host uid==0
+        # (chowning to 0:0 is a no-op), so to actually see the trailer we
+        # need a non-root host and explicit opt-out of the --user path.
+        # The simplest construction: disable restore_workspace_ownership=False
+        # would skip BOTH, so we monkeypatch _should_run_as_host_user
+        # directly to simulate "couldn't determine host UID" → falls back
+        # to root-in-container with the chown trailer enabled.
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        monkeypatch.setattr(
+            DockerBackend, "_should_run_as_host_user", lambda self: False,
+        )
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        assert cmd[-3:-1] == ["sh", "-c"]
+        payload = cmd[-1]
+        assert "pytest -q" in payload
+        assert "find /work -uid 0 -exec chown 1000:1000" in payload
+        assert "exit $__rc" in payload
+
+    def test_docker_cmd_no_trailer_when_restore_disabled(self, monkeypatch):
+        # Operators on rootless docker / podman where the user-namespace
+        # remapping already handles ownership can opt out via
+        # restore_workspace_ownership=False.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(
+            image="python:3.12-slim", restore_workspace_ownership=False,
+        )
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert "chown" not in payload
+        assert payload == "pytest -q"
+
+    def test_docker_cmd_no_trailer_on_non_linux_host(self, monkeypatch):
+        # On macOS / Windows, Docker Desktop's FUSE layer already remaps
+        # ownership; the trailer is unnecessary and would slow builds.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Darwin")
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert "chown" not in payload
+
+    def test_docker_cmd_no_trailer_when_host_is_root(self, monkeypatch):
+        # When the host user is already root, chowning to 0:0 is a no-op.
+        # Skip the find walk entirely.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        monkeypatch.setattr(os, "getgid", lambda: 0)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert "chown" not in payload
+
+    def test_docker_cmd_trailer_preserves_user_exit_code(self, monkeypatch):
+        # The trailer must capture $? BEFORE chown and re-exit with it, so
+        # a build failure isn't masked by the chown succeeding. Asserted on
+        # the root-in-container path; the host-user path doesn't use a
+        # trailer at all.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        monkeypatch.setattr(
+            DockerBackend, "_should_run_as_host_user", lambda self: False,
+        )
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "exit 1", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        # Sequence: ( user_cmd ); __rc=$?; chown ...; exit $__rc
+        assert payload.index("__rc=$?") < payload.index("chown")
+        assert payload.endswith("exit $__rc")
+
+    def test_docker_cmd_workspace_path_is_shell_quoted(self, monkeypatch):
+        # A workspace path with spaces / special chars must survive the
+        # sh -c expansion without the trailer breaking. Asserted on the
+        # root-in-container path because that's where the workspace path
+        # is interpolated into the chown trailer.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        monkeypatch.setattr(
+            DockerBackend, "_should_run_as_host_user", lambda self: False,
+        )
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/path with spaces/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        # shlex.quote wraps in single quotes
+        assert "'/path with spaces/work'" in payload
+
+    def test_docker_cmd_host_user_mode_passes_user_flag(self, monkeypatch):
+        # When the host is Linux + non-root, the container must launch with
+        # --user $UID:$GID so the build runs as the host user (no more
+        # root-owned __pycache__ on the bind-mount, no more pip "running as
+        # root" warning).
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        # --user flag with the host UID:GID
+        assert "--user" in cmd
+        assert cmd[cmd.index("--user") + 1] == "1000:1000"
+
+    def test_docker_cmd_host_user_mode_sets_pip_user_env(self, monkeypatch):
+        # In host-user mode the container's pip must default to per-user
+        # install mode so `pip install pkg` doesn't EACCES on
+        # /usr/local/lib/.../site-packages. HOME points at the writable /tmp
+        # tmpfs so the per-user dir is creatable; PATH is rewritten so the
+        # entry-point scripts pip lands in $HOME/.local/bin (pytest, ruff,
+        # mypy) are findable in later steps of the same build command.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        env_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e"]
+        assert "PIP_USER=1" in env_pairs
+        assert "PIP_ROOT_USER_ACTION=ignore" in env_pairs
+        assert "HOME=/tmp/builder-home" in env_pairs
+        # PATH must include the host-user's local bin dir BEFORE the
+        # standard locations so pytest from `pip install --user pytest` wins.
+        path_entries = [v for v in env_pairs if v.startswith("PATH=")]
+        assert len(path_entries) == 1
+        assert path_entries[0].startswith("PATH=/tmp/builder-home/.local/bin:")
+
+    def test_docker_cmd_host_user_mode_ensures_home_exists(self, monkeypatch):
+        # The wrapped shell command must `mkdir -p $HOME` before the user
+        # command so pip's per-user install doesn't fail trying to create
+        # /tmp/builder-home/.local/lib/... inside a missing parent.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pip install pytest && pytest -q", "/work", allow_network=True,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert payload.startswith('mkdir -p "$HOME" && ')
+        assert "pip install pytest && pytest -q" in payload
+
+    def test_docker_cmd_host_user_mode_skips_chown_trailer(self, monkeypatch):
+        # With --user passing the host UID, every write is host-owned from
+        # the start. The `find -uid 0 -exec chown` trailer becomes a
+        # redundant find-walk over the entire workspace; skip it.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert "chown" not in payload
+        assert "find /work -uid 0" not in payload
+
+    def test_docker_cmd_host_user_mode_skips_root_tmpfs(self, monkeypatch):
+        # When --user is passed, HOME points at /tmp/builder-home (already
+        # covered by the existing /tmp:exec tmpfs). The container never
+        # writes to /root so the separate /root:exec tmpfs that's added in
+        # root-in-container mode is no longer needed and would just consume
+        # memory.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        assert "/tmp:exec" in tmpfs_targets
+        assert "/root:exec" not in tmpfs_targets
+
+    def test_sandbox_executor_threads_restore_workspace_ownership(self):
+        # SandboxExecutor must forward sandbox_config["restore_workspace_ownership"]
+        # to DockerBackend so operators can opt out via config.
+        from harness.sandbox import SandboxExecutor, DockerBackend
+        executor = SandboxExecutor(
+            workspace_path="/work",
+            sandbox_config={
+                "backend": "docker",
+                "docker_image": "python:3.12-slim",
+                "restore_workspace_ownership": False,
+            },
+        )
+        assert isinstance(executor.backend, DockerBackend)
+        assert executor.backend.restore_workspace_ownership is False
 
     def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
         # Regression: docker info failure used to just return False with no
@@ -2101,6 +2396,101 @@ class TestToolchainAdaptation:
         assert not ro2, "second call should not re-flag ro_root adaptation"
         assert cfg2["read_only_root"] is False
 
+    def test_adapter_synthesised_install_bypasses_user_optin(self):
+        """Fix 2b regression: when the harness's own late-bind detection
+        produced the install step (operator never typed `pip install`),
+        the user's auto_enable_network_for_install opt-in does not apply
+        — the harness invented the command to make a greenfield build
+        possible. Otherwise the LLM repair loop wedges because pip can't
+        reach the index and the user can't see why.
+        """
+        from harness.graph import _apply_toolchain_adaptation
+        # Operator's config explicitly keeps the opt-in OFF.
+        _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+            "python3 -m pip install pytest && python3 -m pytest -q",
+            {"docker_image": "ubuntu:22.04"},  # no opt-in
+            False,
+            command_is_adapter_synthesised=True,
+        )
+        assert net_adapted, "adapter-synthesised install must auto-enable network"
+        assert allow_net is True
+
+    def test_adapter_synthesised_does_not_help_user_typed_command(self):
+        """Default path (command_is_adapter_synthesised=False) still
+        respects the opt-in — we don't want a user-typed install to
+        silently bypass the network gate."""
+        from harness.graph import _apply_toolchain_adaptation
+        _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+            "pip install -r requirements.txt && pytest",
+            {"docker_image": "ubuntu:22.04"},
+            False,
+            # default command_is_adapter_synthesised=False
+        )
+        assert not net_adapted
+        assert allow_net is False
+
+
+class TestDetectDefaultBuildCommandPyFallback:
+    """Fix 2a regression: the bare-`.py`-fallback branch used to return
+    `python3 -m pytest -q` with no install step. Real LLM-scaffolded
+    workspaces hit pytest-not-installed and the repair loop wedged
+    because adding pytest to a manifest doesn't trigger an install.
+    """
+
+    def test_top_level_py_file_bootstraps_pytest(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "app.py").write_text("print('hi')\n")
+        cmd = _detect_default_build_command(str(tmp_path))
+        assert cmd is not None
+        assert "pip install pytest" in cmd
+        assert "pytest" in cmd
+
+    def test_nested_py_file_also_triggers_fallback(self, tmp_path):
+        """Real run hit this: LLM created app/__init__.py + app/models.py
+        but no top-level .py file. The original walk only checked the
+        top level and returned None, falling back to the historical
+        `make build` default and exit 127."""
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+        cmd = _detect_default_build_command(str(tmp_path))
+        assert cmd is not None
+        assert "pip install pytest" in cmd
+
+    def test_pyproject_still_wins_over_py_fallback(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+        cmd = _detect_default_build_command(str(tmp_path))
+        # pyproject.toml branch fires first → editable install + pytest
+        assert "pip install -e ." in cmd
+
+    def test_no_python_returns_none(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "README.md").write_text("# hi\n")
+        assert _detect_default_build_command(str(tmp_path)) is None
+
+
+class TestRepairableDepHint:
+    """Fix 2c regression: the hint must tell the LLM to CREATE the
+    manifest file if it doesn't exist. The original phrasing assumed
+    the file was already there.
+    """
+
+    def test_hint_mentions_create_for_requirements_txt(self):
+        from harness.graph import _repairable_dep_hint
+        hint = _repairable_dep_hint("pytest", "python3 -m pytest -q")
+        assert "CREATE" in hint, "hint must mention creating the file"
+        assert "requirements.txt" in hint
+        assert "pytest" in hint
+
+    def test_hint_mentions_create_for_pyproject(self):
+        from harness.graph import _repairable_dep_hint
+        hint = _repairable_dep_hint("ruff", "ruff check .")
+        assert "CREATE" in hint
+        assert "pyproject.toml" in hint
+
 
 class TestDiscoveryNodes:
     """Regression: discovery nodes used to hardcode budget=2.00 and write_spec
@@ -2961,51 +3351,34 @@ class TestCLI:
         # (discover stays False; that's already the default).
         assert getattr(args, "discover", False) is False
 
-    def test_deep_merge(self):
-        from harness.cli import _deep_merge
-        base = {"a": 1, "b": {"x": 1}}
-        override = {"b": {"y": 2}, "c": 3}
-        _deep_merge(base, override)
-        assert base["a"] == 1
-        assert base["b"]["x"] == 1
-        assert base["b"]["y"] == 2
-        assert base["c"] == 3
+    def test_validate_config_strict_raises_on_typo(self):
+        # The harness consolidated to a single canonical config file
+        # (config/config.json) and validation became strict: typos must
+        # raise ConfigError instead of just logging a warning. The
+        # comprehensive tests live in tests/test_cli_basics.py — this
+        # one is just a regression check that the API is still wired up
+        # at the same import path expected by older callers.
+        import pytest
+        from harness.cli import validate_config_strict, ConfigError
+        bad = {"model_routin": {"planning_primary": "x"}}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(bad, source="/fake/path.json")
+        assert "Unknown top-level key 'model_routin'" in str(exc.value)
+        assert "model_routing" in str(exc.value)  # difflib suggestion
 
-    def test_deep_merge_lists_concatenate_with_dedupe(self):
-        # Regression: workspace overrides used to replace lists wholesale,
-        # silently nuking global cache mount defaults.
-        from harness.cli import _deep_merge
-        base = {"sandbox": {"readonly_cache_mounts": ["~/.cache/pip", "~/.npm"]}}
-        override = {"sandbox": {"readonly_cache_mounts": ["~/.npm", "./my-cache"]}}
-        _deep_merge(base, override)
-        # Global defaults preserved, workspace additions appended, dedupe applied
-        assert base["sandbox"]["readonly_cache_mounts"] == ["~/.cache/pip", "~/.npm", "./my-cache"]
-
-    def test_deep_merge_null_clears_value(self):
-        # Explicit null in override clears the base — the escape hatch for
-        # users who do want to nuke a default list.
-        from harness.cli import _deep_merge
-        base = {"sandbox": {"readonly_cache_mounts": ["~/.cache/pip"]}}
-        override = {"sandbox": {"readonly_cache_mounts": None}}
-        _deep_merge(base, override)
-        assert base["sandbox"]["readonly_cache_mounts"] is None
-
-    def test_validate_config_keys_warns_on_typo(self, caplog):
-        from harness.cli import _validate_config_keys
-        bad = {"model_routin": {"primary": "openai:gpt"}}  # missing 'g'
-        with caplog.at_level("WARNING"):
-            _validate_config_keys(bad, "/fake/path.json")
-        messages = " ".join(r.message for r in caplog.records)
-        assert "Unknown config key 'model_routin'" in messages
-        assert "model_routing" in messages  # suggested correction
-
-    def test_validate_config_keys_accepts_underscore_prefixed_keys(self, caplog):
-        # Keys starting with _ are comments and should NOT warn
-        from harness.cli import _validate_config_keys
-        config = {"_comment": "this is a comment", "build_command": "make"}
-        with caplog.at_level("WARNING"):
-            _validate_config_keys(config, "/fake/path.json")
-        assert not any("Unknown config key '_comment'" in r.message for r in caplog.records)
+    def test_strip_comments_removes_underscore_keys(self):
+        # _comment keys are stripped from the loaded config so strict
+        # validation never sees them.
+        from harness.cli import _strip_comments
+        out = _strip_comments({
+            "_comment": "doc",
+            "build_command": "make",
+            "sandbox": {"_comment": "doc", "backend": "auto"},
+        })
+        assert "_comment" not in out
+        assert "_comment" not in out["sandbox"]
+        assert out["build_command"] == "make"
+        assert out["sandbox"]["backend"] == "auto"
 
     def test_resolve_build_command_cli(self):
         from harness.cli import resolve_build_command
@@ -3054,10 +3427,17 @@ class TestCLI:
             assert _detect_default_build_command(tmpdir) == "npm install && npm test"
 
     def test_detect_build_command_loose_python_files(self):
+        # Fix 2a: the bare-.py fallback must prepend a pip install step.
+        # Before this change the branch returned bare ``python3 -m pytest -q``,
+        # which trips pytest-not-installed on every greenfield workspace
+        # and wedges the repair loop (the LLM keeps editing manifests
+        # the build_command never consults).
         from harness.cli import _detect_default_build_command
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "main.py").write_text("print('hi')\n")
-            assert _detect_default_build_command(tmpdir) == "python3 -m pytest -q"
+            assert _detect_default_build_command(tmpdir) == (
+                "python3 -m pip install pytest && python3 -m pytest -q"
+            )
 
     def test_detect_build_command_no_hints_returns_none(self):
         from harness.cli import _detect_default_build_command

@@ -131,180 +131,132 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# 1. Configuration Discovery
+# 1. Configuration Discovery — single canonical source
 # ---------------------------------------------------------------------------
+#
+# The harness reads ONE config file and only one: <myharness_root>/config/config.json.
+# There are no fallbacks, no per-workspace overrides, no auto-generated files.
+# Per-project differences (build command, docker image, network) are handled
+# by the harness's existing auto-detection (graph._toolchain_image_for,
+# graph._build_command_needs_network, cli._detect_default_build_command) plus
+# the existing CLI flags (--build-cmd, --budget, --allow-network).
+#
+# Validation is STRICT — see validate_config_strict() below. Unknown keys,
+# missing required fields, wrong types, or cross-reference errors raise
+# ConfigError. Every CLI subcommand catches ConfigError at the outermost
+# layer, prints the message to stderr, and exits with code 2 BEFORE any
+# other initialization (logging setup, storage init, lock acquisition,
+# gateway construction). No LLM call ever happens with bad config.
+#
+# API keys live in env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# DEEPSEEK_API_KEY) and are resolved at dispatch time by gateway.py:331.
+# Operators may NOT put live keys in this file; the schema slot is kept as
+# empty string for documentation only.
+
+
+class ConfigError(Exception):
+    """Raised when the canonical config file is missing, malformed, has
+    unknown keys, has wrong types, or fails cross-reference validation.
+
+    Every CLI subcommand entry catches this at the outermost layer and
+    exits 2 with the message printed to stderr — by design, the harness
+    refuses to run with bad config rather than silently picking defaults.
+    """
+
 
 def _get_global_config_path() -> str:
-    """Resolve the repo-root global config path: <myharness_root>/config/config.json.
+    """Resolve the repo-root canonical config path:
+    ``<myharness_root>/config/config.json``.
 
-    The harness package lives at <root>/harness/, so the parent of this
-    module's directory is the repo root.
+    The harness package lives at ``<root>/harness/``, so the parent of
+    this module's directory is the repo root.
     """
     package_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(package_dir)
     return os.path.join(repo_root, "config", "config.json")
 
 
-def discover_config(workspace_path: str) -> dict[str, Any]:
+def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
+    """Load and strictly validate the canonical config.
+
+    This MUST be the first deterministic check at every CLI entry. It
+    performs no LLM calls, no network, no file writes — pure read +
+    validate. On any error it raises :class:`ConfigError` with an
+    actionable message and the harness exits before doing anything else.
+
+    The ``workspace_path`` argument is accepted for call-site
+    backwards-compatibility but is unused for config purposes — the
+    harness no longer reads per-workspace ``.harness_config.json``
+    files. If one is present we log a one-shot INFO line noting it
+    will be ignored.
+
+    Returns a fully-validated, comment-stripped config dictionary.
     """
-    Hierarchical configuration discovery.
+    path = _get_global_config_path()
+    if not os.path.isfile(path):
+        raise ConfigError(
+            f"Canonical config not found at {path}. "
+            f"The harness reads exactly one config file and it must exist. "
+            f"Create it (see <myharness_root>/config/config.json in the repo "
+            f"for the documented schema) before re-running the harness."
+        )
 
-    Priority order:
-        1. .harness_config.json in the workspace root (if it exists)
-        2. <myharness_root>/config/config.json (in-repo global defaults)
-        3. harness/cli.json (shipped fallback defaults)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"Invalid JSON in {path}: {exc}. "
+            f"Fix the JSON syntax before re-running the harness."
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(
+            f"Cannot read {path}: {exc}. "
+            f"Fix the file permissions or path before re-running the harness."
+        ) from exc
 
-    Returns a merged configuration dictionary.
-    """
-    config: dict[str, Any] = _get_default_config()
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{path} must contain a JSON object at the top level, got {type(raw).__name__}."
+        )
 
-    # Layer 2: In-repo global config (models, API keys, default routing)
-    global_config_path = _get_global_config_path()
-    if os.path.isfile(global_config_path):
-        try:
-            with open(global_config_path, "r", encoding="utf-8") as f:
-                global_config = json.load(f)
-            _validate_config_keys(global_config, global_config_path)
-            _deep_merge(config, global_config)
-            logger.debug("[cli] Merged global config from %s", global_config_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.error(
-                "[cli] Failed to parse global config at %s: %s\n"
-                "  This file must contain valid JSON. The harness cannot proceed without it.\n"
-                "  Fix the JSON syntax in this file and re-run.",
-                global_config_path, exc,
-            )
+    cfg = _strip_comments(raw)
+    validate_config_strict(cfg, source=path)
 
-    # Layer 1: Workspace-local config (highest priority)
-    workspace_config_path = os.path.join(workspace_path, ".harness_config.json")
-    if not os.path.isfile(workspace_config_path):
-        # Auto-generate from global config + fallback defaults.
-        fallback = _get_default_config()
-        _generate_workspace_config(workspace_config_path, config, fallback)
+    # Legacy detection: notify but do not act.
+    if workspace_path:
+        _warn_if_legacy_workspace_config(workspace_path)
 
-    if os.path.isfile(workspace_config_path):
-        try:
-            with open(workspace_config_path, "r", encoding="utf-8") as f:
-                workspace_config = json.load(f)
-            _validate_config_keys(workspace_config, workspace_config_path)
-            _deep_merge(config, workspace_config)
-            logger.debug("[cli] Merged workspace config from %s", workspace_config_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("[cli] Failed to read workspace config: %s", exc)
-
-    return config
+    return cfg
 
 
-def _get_default_config() -> dict[str, Any]:
-    """Return fallback configuration loaded from harness/cli.json.
-
-    Models are defined in <myharness_root>/config/config.json (global, shared across projects).
-    Per-project model routing lives in .harness_config.json.
-    Fallback defaults live in harness/cli.json (shipped with the package).
-    Users can edit cli.json instead of modifying Python source code.
-    """
-    cli_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cli.json")
-    if os.path.isfile(cli_json_path):
-        try:
-            with open(cli_json_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            logger.debug("[cli] Loaded fallback defaults from %s", cli_json_path)
-            # Remove comment keys (keys starting with _)
-            return {k: v for k, v in config.items() if not k.startswith("_")}
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("[cli] Failed to read cli.json fallback defaults: %s. Using hardcoded defaults.", exc)
-    else:
-        logger.warning("[cli] cli.json not found at %s. Using hardcoded defaults.", cli_json_path)
-
-    # Absolute fallback (should never be reached if cli.json is shipped correctly)
-    return {
-        "build_command": "make build",
-        "allow_network": False,
-        "sandbox": {
-            "backend": "auto",
-            "docker_image": "ubuntu:22.04",
-            "docker_memory_limit": "512m",
-            "docker_cpu_limit": "1.0",
-            "docker_pids_limit": 100,
-            "readonly_cache_mounts": [
-                "~/.cache/pip",
-                "~/.npm",
-                "~/.cache/go-build",
-                "~/.cargo/registry",
-            ],
-            "timeout_seconds": 300,
-            "pgid_kill_on_timeout": True,
-        },
-        "token_budget": {
-            "hard_cap_usd": 2.00,
-            "context_window_threshold_pct": 0.85,
-        },
-        "node_throttle": {
-            "max_patch_repair_iterations": 3,
-            "max_doc_review_cycles": 1,
-            "max_code_review_cycles": 1,
-            "max_discovery_iterations": 10,
-        },
-        "models": {},
-        "model_routing": {
-            "planning_primary": "",
-            "planning_mode": "thinking_max",
-            "planning_fallback": "",
-            "patching_primary": "",
-            "patching_mode": "non_thinking",
-            "repair_primary": "",
-            "repair_fallback": "",
-            "repair_mode": "thinking",
-            "doc_reviewer_primary": "",
-            "doc_reviewer_mode": "thinking",
-            "doc_reviewer_fallback": "",
-            "code_reviewer_primary": "",
-            "code_reviewer_mode": "thinking",
-            "code_reviewer_fallback": "",
-            "ollama_local_model": "",
-            "ollama_local_backup": "",
-            "force_local_only": False,
-        },
-        "persistence": {
-            "db_path": "~/.harness/checkpoints.db",
-            "ttl_days": 30,
-        },
-    }
-
-
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> None:
-    """Recursively merge ``override`` into ``base`` in-place.
-
-    Merge rules:
-      - dict + dict  → recursive merge (existing behavior)
-      - list + list  → concatenate + dedupe (preserves base order, then
-        appends any new items from override). This means a partial
-        workspace override (e.g. one extra cache mount) doesn't wipe
-        the global defaults. To explicitly clear a base list, pass
-        ``null`` (None) in the override.
-      - any + None   → clears the base value (lets users opt out of
-        defaults without having to know their values).
-      - otherwise    → override wins.
-    """
-    for key, value in override.items():
-        if value is None:
-            base[key] = None
+def _strip_comments(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Recursively drop keys starting with ``_`` (used for inline JSON
+    documentation that JSON-the-format doesn't support natively)."""
+    out: dict[str, Any] = {}
+    for key, value in cfg.items():
+        if isinstance(key, str) and key.startswith("_"):
             continue
-        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-            _deep_merge(base[key], value)
-        elif key in base and isinstance(base[key], list) and isinstance(value, list):
-            # Concatenate + dedupe, preserving first-seen order.
-            seen: set[Any] = set()
-            merged: list[Any] = []
-            for item in list(base[key]) + list(value):
-                key_item = item if isinstance(item, (str, int, float, bool, tuple)) else repr(item)
-                if key_item in seen:
-                    continue
-                seen.add(key_item)
-                merged.append(item)
-            base[key] = merged
+        if isinstance(value, dict):
+            out[key] = _strip_comments(value)
         else:
-            base[key] = value
+            out[key] = value
+    return out
+
+
+def _warn_if_legacy_workspace_config(workspace_path: str) -> None:
+    """Log one INFO line when a workspace still has a ``.harness_config.json``
+    from the pre-consolidation era. The file is ignored; the operator can
+    delete it (or leave it — we don't touch it)."""
+    legacy = os.path.join(workspace_path, ".harness_config.json")
+    if os.path.isfile(legacy):
+        logger.info(
+            "[cli] Legacy .harness_config.json detected at %s — ignored. "
+            "The canonical config is %s; per-workspace overrides are no "
+            "longer supported. You can delete the legacy file at your "
+            "convenience.",
+            legacy, _get_global_config_path(),
+        )
 
 
 # Top-level keys the harness knows about. Anything outside this set in a
@@ -315,7 +267,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "node_throttle", "models", "model_routing", "persistence",
     "manifest_file", "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
-    "test_generation",
+    "test_generation", "metrics",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -329,6 +281,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "pgid_kill_on_timeout", "log_buffer_max_mb",
         # P1.3: opt-in for auto-enabling network on detected pip/npm install.
         "auto_enable_network_for_install",
+        # Chown bind-mounted files back to the host user on docker container
+        # exit — prevents root-owned __pycache__/ littering the workspace.
+        "restore_workspace_ownership",
+        # Toggled by compiler_node when the build command writes to system
+        # locations the read-only root FS would block.
+        "read_only_root",
     }),
     "token_budget": frozenset({
         "hard_cap_usd", "context_window_threshold_pct",
@@ -365,100 +323,292 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_generation": frozenset({
         "enabled", "max_iterations",
     }),
+    # P2.7: cost-metrics aggregation (harness metrics subcommand).
+    "metrics": frozenset({
+        "burn_rate_window_minutes", "metrics_dir",
+    }),
 }
 
 
-def _validate_config_keys(config: dict[str, Any], source_label: str) -> None:
-    """
-    Warn on config keys that aren't in the known set. Catches typos like
-    'model_routin' or 'token_budget.hrad_cap_usd' silently no-op-ing.
-    Heuristic-only: doesn't block load, just logs an actionable warning
-    with the closest match. Recurses into known nested sections so a
-    typoed nested key still surfaces.
+# Per-field type schema used by validate_config_strict. Keys are dotted paths
+# matching the structure in config.json. A value's runtime type must be in
+# the listed tuple; bool is excluded from int matches via an explicit check
+# because Python's bool is a subclass of int.
+_TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
+    "build_command": (str,),
+    "allow_network": (bool,),
+    "manifest_file": (str,),
+    "sandbox.backend": (str,),
+    "sandbox.docker_image": (str,),
+    "sandbox.docker_memory_limit": (str,),
+    "sandbox.docker_cpu_limit": (str,),
+    "sandbox.docker_pids_limit": (int,),
+    "sandbox.readonly_cache_mounts": (list,),
+    "sandbox.timeout_seconds": (int,),
+    "sandbox.pgid_kill_on_timeout": (bool,),
+    "sandbox.log_buffer_max_mb": (int,),
+    "sandbox.auto_enable_network_for_install": (bool,),
+    "sandbox.restore_workspace_ownership": (bool,),
+    "sandbox.read_only_root": (bool,),
+    "token_budget.hard_cap_usd": (int, float),
+    "token_budget.context_window_threshold_pct": (int, float),
+    "node_throttle.max_patch_repair_iterations": (int,),
+    "node_throttle.max_doc_review_cycles": (int,),
+    "node_throttle.max_code_review_cycles": (int,),
+    "node_throttle.max_discovery_iterations": (int,),
+    "persistence.db_path": (str,),
+    "persistence.ttl_days": (int,),
+    "persistence.redact_messages": (bool,),
+    "model_routing.planning_primary": (str,),
+    "model_routing.planning_mode": (str,),
+    "model_routing.planning_fallback": (str,),
+    "model_routing.patching_primary": (str,),
+    "model_routing.patching_mode": (str,),
+    "model_routing.repair_primary": (str,),
+    "model_routing.repair_fallback": (str,),
+    "model_routing.repair_mode": (str,),
+    "model_routing.doc_reviewer_primary": (str,),
+    "model_routing.doc_reviewer_mode": (str,),
+    "model_routing.doc_reviewer_fallback": (str,),
+    "model_routing.code_reviewer_primary": (str,),
+    "model_routing.code_reviewer_mode": (str,),
+    "model_routing.code_reviewer_fallback": (str,),
+    "model_routing.ollama_local_model": (str,),
+    "model_routing.ollama_local_backup": (str,),
+    "model_routing.force_local_only": (bool,),
+    "lintgate.format_modified_files": (bool,),
+    "logging.level": (str,),
+    "logging.log_dir": (str,),
+    "logging.json_stderr": (bool,),
+    "logging.langsmith": (bool,),
+    "logging.max_bytes": (int,),
+    "logging.backup_count": (int,),
+    "test_generation.enabled": (bool,),
+    "test_generation.max_iterations": (int,),
+    "metrics.burn_rate_window_minutes": (int,),
+    "metrics.metrics_dir": (str,),
+    "deployment.enabled": (bool,),
+    "deployment.compose_file": (str,),
+    "deployment.health_check_interval_seconds": (int,),
+    "deployment.health_check_timeout_seconds": (int,),
+}
+
+# model_routing fields that must reference an entry in `models` when
+# non-empty. doc_reviewer_*, code_reviewer_*, ollama_local_* are opt-in
+# (empty disables that role). planning/patching/repair are REQUIRED.
+_REQUIRED_ROUTING_FIELDS: tuple[str, ...] = (
+    "planning_primary", "patching_primary", "repair_primary",
+)
+_OPTIONAL_ROUTING_FIELDS: tuple[str, ...] = (
+    "planning_fallback", "patching_fallback", "repair_fallback",
+    "doc_reviewer_primary", "doc_reviewer_fallback",
+    "code_reviewer_primary", "code_reviewer_fallback",
+    "ollama_local_model", "ollama_local_backup",
+)
+
+# Sandbox backend whitelist — outside this set the SandboxExecutor doesn't
+# know how to construct anything.
+_VALID_SANDBOX_BACKENDS: frozenset[str] = frozenset({
+    "auto", "docker", "unshare", "bare",
+})
+
+# Providers that DON'T need an API key env var (run locally / on-host).
+# Anything else is treated as remote and gated on {PROVIDER}_API_KEY.
+_LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
+
+
+def validate_config_strict(config: dict[str, Any], source: str) -> None:
+    """Validate ``config`` strictly. Raise :class:`ConfigError` with a
+    consolidated message listing EVERY problem found in one pass.
+
+    Caller (cli entry points) catches ConfigError and exits 2 before any
+    further initialization. The harness never runs with bad config.
+
+    Checks performed (collect all, fail once):
+      1. Unknown top-level keys (with difflib suggestions).
+      2. Unknown nested keys inside known sections (with suggestions).
+      3. Wrong types per :data:`_TYPE_SCHEMA`.
+      4. Required fields present and non-empty:
+         - ``models`` is a non-empty dict.
+         - ``model_routing.planning_primary``, ``patching_primary``,
+           ``repair_primary`` non-empty AND reference keys in ``models``.
+         - Optional routing fields, if non-empty, reference keys in ``models``.
+         - ``persistence.db_path`` non-empty.
+         - ``token_budget.hard_cap_usd`` positive.
+         - ``sandbox.backend`` in the valid set.
+      5. Every model that will actually be used (i.e. referenced in
+         ``model_routing``) whose provider is NOT in ``_LOCAL_PROVIDERS``
+         has its ``{PROVIDER}_API_KEY`` env var set. Without this the
+         harness would crash mid-run when the gateway tries to dispatch.
     """
     import difflib
+
+    errors: list[str] = []
+
+    # --- 1 + 2. Key validation ---
     for key, value in config.items():
-        if key.startswith("_"):
-            continue  # comment keys
         if key not in _KNOWN_TOP_LEVEL_KEYS:
             suggestion = difflib.get_close_matches(key, _KNOWN_TOP_LEVEL_KEYS, n=1, cutoff=0.6)
             hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
-            logger.warning(
-                "[cli] Unknown config key '%s' in %s%s — this entry will be ignored. "
-                "Known top-level keys: %s",
-                key, source_label, hint, ", ".join(sorted(_KNOWN_TOP_LEVEL_KEYS)),
-            )
+            errors.append(f"Unknown top-level key '{key}'{hint}")
             continue
         known_nested = _KNOWN_NESTED_KEYS.get(key)
         if known_nested is None or not isinstance(value, dict):
             continue
         for nested_key in value.keys():
-            if nested_key.startswith("_"):
-                continue
             if nested_key in known_nested:
                 continue
             suggestion = difflib.get_close_matches(nested_key, known_nested, n=1, cutoff=0.6)
             hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
-            logger.warning(
-                "[cli] Unknown config key '%s.%s' in %s%s — this entry will be ignored. "
-                "Known '%s' keys: %s",
-                key, nested_key, source_label, hint, key,
-                ", ".join(sorted(known_nested)),
+            errors.append(f"Unknown nested key '{key}.{nested_key}'{hint}")
+
+    # --- 3. Type validation ---
+    for dotted_path, expected_types in _TYPE_SCHEMA.items():
+        present, actual_value = _walk_dotted(config, dotted_path)
+        if not present:
+            continue
+        # bool is a subclass of int in Python — exclude bool from int matches
+        # unless bool is itself in the expected set.
+        if isinstance(actual_value, bool) and bool not in expected_types:
+            errors.append(
+                f"'{dotted_path}' must be of type "
+                f"{'/'.join(t.__name__ for t in expected_types)}, "
+                f"got bool ({actual_value!r})"
+            )
+            continue
+        if not isinstance(actual_value, expected_types):
+            errors.append(
+                f"'{dotted_path}' must be of type "
+                f"{'/'.join(t.__name__ for t in expected_types)}, "
+                f"got {type(actual_value).__name__} ({actual_value!r})"
             )
 
-
-def _generate_workspace_config(
-    workspace_config_path: str,
-    global_config: dict[str, Any],
-    fallback_config: dict[str, Any],
-) -> None:
-    """
-    Auto-generate a .harness_config.json in the workspace when one is missing.
-
-    Builds the workspace config by extracting relevant fields from the
-    global config (<myharness_root>/config/config.json) and filling in
-    remaining fields from the built-in fallback defaults (harness/cli.json).
-    """
-    # Fields to pull from global config
-    workspace_config: dict[str, Any] = {
-        "_comment": (
-            "Auto-generated .harness_config.json. Generated because no per-project "
-            "configuration was found in this workspace. Values sourced from "
-            "<myharness_root>/config/config.json (global) and harness/cli.json "
-            "(built-in defaults). Modify this file to customize per-project settings."
-        ),
-        "build_command": fallback_config.get("build_command", "make build"),
-        "allow_network": fallback_config.get("allow_network", False),
-        "sandbox": fallback_config.get("sandbox", {}),
-        "token_budget": global_config.get("token_budget", fallback_config.get("token_budget", {})),
-        "node_throttle": fallback_config.get("node_throttle", {}),
-        "models": global_config.get("models", fallback_config.get("models", {})),
-        "model_routing": global_config.get("model_routing", fallback_config.get("model_routing", {})),
-        "persistence": global_config.get("persistence", fallback_config.get("persistence", {})),
-        "languages": fallback_config.get("languages", {}),
-    }
-
-    # Strip _comment keys from nested dicts inherited from global config.
-    for key in ("token_budget", "models", "model_routing", "persistence"):
-        if isinstance(workspace_config.get(key), dict):
-            workspace_config[key] = {
-                k: v for k, v in workspace_config[key].items() if not k.startswith("_")
-            }
-
-    try:
-        with open(workspace_config_path, "w", encoding="utf-8") as f:
-            json.dump(workspace_config, f, indent=4)
-        logger.warning(
-            "[cli] .harness_config.json not found in workspace. "
-            "Auto-generated one from global configuration + defaults. "
-            "Written to: %s",
-            workspace_config_path,
+    # --- 4. Required fields ---
+    models = config.get("models")
+    if not isinstance(models, dict) or not models:
+        errors.append(
+            "'models' must contain at least one entry. Declare every model "
+            "the harness should know about (provider, model_id, costs, etc.)."
         )
-    except OSError as exc:
-        logger.error(
-            "[cli] Failed to auto-generate .harness_config.json at %s: %s",
-            workspace_config_path, exc,
+        models = {}
+
+    routing = config.get("model_routing")
+    if not isinstance(routing, dict):
+        errors.append("'model_routing' must be an object with role → model mappings.")
+        routing = {}
+
+    for field in _REQUIRED_ROUTING_FIELDS:
+        val = routing.get(field, "")
+        if not isinstance(val, str) or not val.strip():
+            errors.append(
+                f"'model_routing.{field}' is required and must reference "
+                f"a key in 'models' (e.g. 'openai:gpt-4o')."
+            )
+            continue
+        if val not in models:
+            errors.append(
+                f"'model_routing.{field}' references unknown model "
+                f"'{val}'. Declare it under 'models' or pick one of: "
+                f"{sorted(models.keys())}"
+            )
+
+    for field in _OPTIONAL_ROUTING_FIELDS:
+        val = routing.get(field, "")
+        if isinstance(val, str) and val.strip() and val not in models:
+            errors.append(
+                f"'model_routing.{field}' is set to '{val}' but no model "
+                f"by that key exists in 'models'. Either declare it or "
+                f"set the field to an empty string to disable."
+            )
+
+    persistence = config.get("persistence", {})
+    if isinstance(persistence, dict):
+        db_path = persistence.get("db_path", "")
+        if not isinstance(db_path, str) or not db_path.strip():
+            errors.append(
+                "'persistence.db_path' is required and must be a non-empty path."
+            )
+
+    token_budget = config.get("token_budget", {})
+    if isinstance(token_budget, dict):
+        hard_cap = token_budget.get("hard_cap_usd")
+        if isinstance(hard_cap, bool) or not isinstance(hard_cap, (int, float)) or hard_cap <= 0:
+            errors.append(
+                "'token_budget.hard_cap_usd' is required and must be a "
+                "positive number (USD budget cap per session)."
+            )
+
+    sandbox = config.get("sandbox", {})
+    if isinstance(sandbox, dict):
+        backend = sandbox.get("backend", "")
+        if not isinstance(backend, str) or backend not in _VALID_SANDBOX_BACKENDS:
+            errors.append(
+                f"'sandbox.backend' must be one of "
+                f"{sorted(_VALID_SANDBOX_BACKENDS)}, got {backend!r}."
+            )
+
+    # --- 5. Env var presence for every model referenced by routing ---
+    referenced_models: set[str] = set()
+    for field in (*_REQUIRED_ROUTING_FIELDS, *_OPTIONAL_ROUTING_FIELDS):
+        val = routing.get(field, "")
+        if isinstance(val, str) and val.strip() and val in models:
+            referenced_models.add(val)
+
+    missing_env: dict[str, list[str]] = {}  # env_var → [model_keys needing it]
+    for model_key in sorted(referenced_models):
+        spec = models.get(model_key)
+        if not isinstance(spec, dict):
+            continue
+        provider = spec.get("provider", "")
+        if not isinstance(provider, str) or not provider.strip():
+            errors.append(
+                f"'models.{model_key}.provider' is missing or empty. Set "
+                f"it to one of: openai, anthropic, deepseek, ollama, …"
+            )
+            continue
+        if provider.lower() in _LOCAL_PROVIDERS:
+            continue
+        env_var = f"{provider.upper()}_API_KEY"
+        if not os.environ.get(env_var, "").strip():
+            missing_env.setdefault(env_var, []).append(model_key)
+
+    if missing_env:
+        details = "; ".join(
+            f"{env_var} (required by model{'s' if len(keys) > 1 else ''}: "
+            f"{', '.join(keys)})"
+            for env_var, keys in sorted(missing_env.items())
         )
+        errors.append(
+            f"Missing API key environment variable(s): {details}. "
+            f"Export the env var(s) before re-running the harness — "
+            f"the harness reads keys from the environment, never from "
+            f"the config file. Example: `export {sorted(missing_env)[0]}=\"sk-...\"`."
+        )
+
+    # --- Raise if any error collected ---
+    if errors:
+        bullet = "\n  - "
+        raise ConfigError(
+            f"Configuration error{'s' if len(errors) > 1 else ''} in {source}:"
+            f"{bullet}{bullet.join(errors)}\n\n"
+            f"Fix the config file before re-running the harness. "
+            f"The harness will not proceed with invalid configuration."
+        )
+
+
+def _walk_dotted(config: dict[str, Any], dotted_path: str) -> tuple[bool, Any]:
+    """Return ``(present, value)`` for a dotted path inside ``config``.
+
+    ``present=False`` means the path was absent (caller should skip type
+    check — type schema only flags WRONG types, not missing optional
+    fields; required-presence is enforced separately).
+    """
+    cur: Any = config
+    for part in dotted_path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
 
 
 def _detect_default_build_command(workspace_path: str) -> Optional[str]:
@@ -486,11 +636,24 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
         return "cargo build && cargo test"
     if has("go.mod"):
         return "go build ./... && go test ./..."
-    # Last-chance heuristic: any .py file at top level → assume pytest
+    # Last-chance heuristic: any .py file (top level OR one level deep,
+    # e.g. ``app/__init__.py`` after LLM scaffolds a package) → bootstrap
+    # pytest. The branch previously returned a bare ``python3 -m pytest -q``
+    # with no install step, so freshly-scaffolded workspaces hit exit 1
+    # ("pytest not installed") and the repair LLM kept editing manifests
+    # that the build_command never honoured. Install pytest explicitly so
+    # the first build can actually succeed.
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):
-                return "python3 -m pytest -q"
+                return "python3 -m pip install pytest && python3 -m pytest -q"
+            full = os.path.join(workspace_path, entry)
+            if os.path.isdir(full) and not entry.startswith("."):
+                try:
+                    if any(child.endswith(".py") for child in os.listdir(full)):
+                        return "python3 -m pip install pytest && python3 -m pytest -q"
+                except OSError:
+                    continue
     except OSError:
         pass
     return None
@@ -1174,6 +1337,149 @@ def _read_spec_file(spec_path: str) -> str:
         return ""
 
 
+_ARCHITECTURE_SYNTHESIS_PROMPT = """You are a Principal Software Architect.
+Read the approved SPEC_REQUIREMENTS.md below and produce a focused
+SPEC_ARCHITECTURE.md that lays out the technical design the coding agent
+will follow.
+
+## Output Sections
+
+### 1. Architecture Overview
+- One paragraph naming the architectural style (monolith / modular monolith /
+  layered / hex / event-driven / microservices) and the rationale tied to
+  the requirements.
+
+### 2. Component / Module Inventory
+For each module the implementation will contain:
+- **Module name** (use the file-system path the agent should create, e.g.
+  `task_dispatcher/api.py`).
+- Purpose (one sentence).
+- Public surface — functions / classes / endpoints exposed.
+- Dependencies on other modules (forward refs only — no cycles).
+
+### 3. Data Model
+- Entities, fields, types, relationships.
+- Persistence mechanism (SQLite / Postgres / in-memory / file).
+- Migration / schema-init strategy.
+
+### 4. External Interfaces
+- HTTP/gRPC endpoints with method, path, request/response shape.
+- CLI commands / arguments.
+- Message-queue topics / event payloads (where applicable).
+- Third-party services consumed (with auth model).
+
+### 5. Cross-Cutting Concerns
+- Configuration (env vars, defaults, validation).
+- Logging / observability hooks.
+- Error handling strategy (where exceptions are raised vs. handled).
+- Concurrency model (sync / async / threads / processes).
+- Security boundaries (authn/authz placement).
+
+### 6. Test Strategy
+- Unit-test layout (directory, naming convention).
+- Integration / E2E coverage targets.
+- Fixtures / fakes / mocks the test suite will rely on.
+
+### 7. Build & Run
+- Dependency manifest file(s) — list every runtime AND dev dependency.
+- Build command the harness will execute (matches the workspace setup).
+- Run command for local development.
+
+## Approved Requirements Specification
+{requirements}
+
+## Formatting
+Output clean, well-structured Markdown. Use proper headings, bullet points,
+and fenced code blocks for file paths / endpoints / schemas. Do not include
+prose outside the document. Do not restate the requirements verbatim —
+reference them by FR-id when justifying a design decision."""
+
+
+async def synthesize_architecture(
+    requirements_path: str,
+    output_dir: str,
+    gateway: Any,
+) -> str:
+    """
+    Read the approved SPEC_REQUIREMENTS.md and synthesize SPEC_ARCHITECTURE.md.
+
+    Mirrors :func:`synthesize_requirements` but targets the architecture
+    phase: takes a locked requirements spec and produces a technical-design
+    document that the patching LLM will use as its blueprint. Without this,
+    the harness skips straight from requirements to code generation with no
+    explicit module/data-model/test-strategy guidance, and the LLM picks
+    layouts ad-hoc — which is what produced the allowlist-rejected
+    `task_dispatcher/...` patches in the TaskDispatcher run.
+
+    Args:
+        requirements_path: Absolute path to SPEC_REQUIREMENTS.md.
+        output_dir: Directory to write SPEC_ARCHITECTURE.md.
+        gateway: Initialized LLM Gateway instance.
+
+    Returns:
+        Absolute path to the generated SPEC_ARCHITECTURE.md file.
+
+    Raises:
+        FileNotFoundError: If requirements_path does not exist.
+        RuntimeError: If LLM synthesis fails or produces empty content.
+    """
+    if not os.path.isfile(requirements_path):
+        raise FileNotFoundError(f"Requirements spec not found: {requirements_path}")
+
+    try:
+        import aiofiles
+        async with aiofiles.open(requirements_path, "r", encoding="utf-8", errors="replace") as f:
+            requirements = await f.read()
+    except ImportError:
+        with open(requirements_path, "r", encoding="utf-8", errors="replace") as f:
+            requirements = f.read()
+
+    if not requirements.strip():
+        raise RuntimeError("Requirements spec is empty.")
+
+    logger.info(
+        "[architecture] Synthesizing SPEC_ARCHITECTURE.md from %d chars of requirements...",
+        len(requirements),
+    )
+
+    from harness.gateway import NodeRole
+    prompt = _ARCHITECTURE_SYNTHESIS_PROMPT.format(requirements=requirements)
+    messages = [
+        {"role": "system", "content": "You are a technical architecture expert. Output clean, structured Markdown."},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        response, _ = await gateway.dispatch(
+            messages=messages,
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=2.00,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"LLM architecture synthesis failed: {exc}") from exc
+
+    from harness.trust import validate_synthesized_spec
+    content, trust_errors = validate_synthesized_spec(response.content.strip())
+    if trust_errors:
+        raise RuntimeError(f"Synthesised architecture spec failed trust validation: {trust_errors}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    spec_path = os.path.join(output_dir, "SPEC_ARCHITECTURE.md")
+    try:
+        import aiofiles
+        async with aiofiles.open(spec_path, "w", encoding="utf-8") as f:
+            await f.write(content)
+    except ImportError:
+        with open(spec_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    logger.info(
+        "[architecture] SPEC_ARCHITECTURE.md written to %s (%d chars, cost=$%.6f).",
+        spec_path, len(content), response.usage.cost_usd,
+    )
+    return spec_path
+
+
 async def _refine_requirements(
     spec_path: str,
     additional_notes: str,
@@ -1231,7 +1537,7 @@ updated SPEC_REQUIREMENTS.md document."""
     return content
 
 
-def interactive_review_loop(spec_path: str, gateway: Any) -> str:
+async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
     """
     Interactive terminal review loop for SPEC_REQUIREMENTS.md.
 
@@ -1239,6 +1545,12 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
         [A] Approve — Accept the specification as-is and proceed.
         [B] Refine — Provide additional notes to improve the spec (loops).
         [C] Manual — Open the file in your IDE, edit, press Enter to continue.
+
+    Async because the refine branch awaits ``_refine_requirements``; the
+    caller is already inside ``asyncio.run(cmd_run(...))`` so there's no
+    new loop to start. Prior to this change the refine branch called
+    ``asyncio.run`` inside the running loop and raised — the gate was
+    effectively unusable.
 
     Args:
         spec_path: Absolute path to the SPEC_REQUIREMENTS.md file.
@@ -1286,13 +1598,10 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
 
             print("[Refine] Updating specification with your feedback...")
             try:
-                # ``interactive_review_loop`` is synchronous but is invoked
-                # from async ``cmd_run`` while a loop is already running.
-                # ``asyncio.run`` creates a fresh loop so we don't trip
-                # ``RuntimeError: This event loop is already running``.
-                updated = asyncio.run(
-                    _refine_requirements(spec_path, notes, gateway)
-                )
+                # Async path: the surrounding cmd_run loop owns the event
+                # loop, so we await directly. Earlier code wrapped this in
+                # asyncio.run() and tripped "loop already running".
+                updated = await _refine_requirements(spec_path, notes, gateway)
                 print(f"[Refine] Specification updated ({len(updated):,} chars).")
             except Exception as exc:
                 print(f"[Refine] Error: {exc}")
@@ -1361,6 +1670,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
         logger.error("Workspace path does not exist: %s", workspace_path)
         return 1
 
+    # FIRST: deterministic config check. Reads + validates the canonical
+    # config file with no side effects. Raises ConfigError (caught by
+    # main()) on any problem — missing file, JSON syntax error, unknown
+    # keys, missing required fields, wrong types, or missing API key env
+    # vars for routed models. By running this before _acquire_workspace_lock
+    # we avoid leaving a stale lock file when the operator's config is bad.
+    config = discover_config(workspace_path)
+
     # P1.7: workspace-level advisory lock. Without this, two concurrent
     # `harness run -r <same workspace>` invocations both read and write
     # source files in interleaved order — silently corrupting each other's
@@ -1375,7 +1692,6 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # opt into --force-lock. Refuse to proceed.
         return 1
 
-    config = discover_config(workspace_path)
     build_command = resolve_build_command(args.build_cmd, config, workspace_path)
 
     # Extract persistence settings
@@ -1484,9 +1800,110 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
                 gateway=gateway,
             )
+            # Pre-flight spec review: fire whenever doc_reviewer_primary is
+            # configured, regardless of whether --discover was passed.
+            # Previously the reviewer only ran inside the discovery flow
+            # (write_spec_node → spec_review_node), so any run started from
+            # a manifest skipped it silently.
+            from harness.graph import get_gateway_config as _get_gateway_config
+            gw_cfg = _get_gateway_config()
+            doc_reviewer_primary = (
+                getattr(gw_cfg, "doc_reviewer_primary", "") or ""
+                if gw_cfg is not None else ""
+            )
+            if doc_reviewer_primary:
+                logger.info(
+                    "[requirements] doc_reviewer_primary=%s configured — running pre-flight spec review.",
+                    doc_reviewer_primary,
+                )
+                from harness.graph import review_and_revise_spec
+                review_result = await review_and_revise_spec(
+                    spec_path,
+                    "REQUIREMENTS",
+                    gateway=gateway,
+                    budget_remaining_usd=budget_usd,
+                    user_goal=args.prompt or "",
+                )
+                if review_result["ok"] and review_result.get("review_path"):
+                    logger.info(
+                        "[requirements] Review written to %s; spec revised in place.",
+                        review_result["review_path"],
+                    )
+                    budget_usd = review_result["new_budget_usd"]
+            else:
+                logger.info(
+                    "[requirements] doc_reviewer_primary not configured — skipping pre-flight spec review."
+                )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
-            spec_override = interactive_review_loop(spec_path, gateway)
+            spec_override = await interactive_review_loop(spec_path, gateway)
             logger.info("[requirements] Specification locked. %d characters approved.", len(spec_override))
+
+            # Architecture synthesis runs whenever the architecture stage is not
+            # explicitly disabled. The previous flow jumped straight from
+            # locked requirements into code generation, leaving the patching
+            # LLM with no explicit module-layout / data-model / test-strategy
+            # guidance — which is what produced the allowlist-rejected
+            # task_dispatcher/ patches in the TaskDispatcher run. The
+            # synthesized SPEC_ARCHITECTURE.md is appended to the system
+            # prompt so the patching LLM sees both documents.
+            architecture_cfg = config.get("architecture", {}) or {}
+            if architecture_cfg.get("enabled", True):
+                try:
+                    arch_path = await synthesize_architecture(
+                        requirements_path=spec_path,
+                        output_dir=output_dir,
+                        gateway=gateway,
+                    )
+                    # Same adversarial doc-reviewer pass we run on
+                    # requirements — the architecture spec drives every
+                    # downstream patch, so skipping the critique was the
+                    # difference between a layout the patching LLM follows
+                    # and one it works around.
+                    if doc_reviewer_primary:
+                        logger.info(
+                            "[architecture] doc_reviewer_primary=%s configured — running architecture spec review.",
+                            doc_reviewer_primary,
+                        )
+                        arch_review_result = await review_and_revise_spec(
+                            arch_path,
+                            "ARCHITECTURE",
+                            gateway=gateway,
+                            budget_remaining_usd=budget_usd,
+                            user_goal=args.prompt or "",
+                        )
+                        if arch_review_result["ok"] and arch_review_result.get("review_path"):
+                            logger.info(
+                                "[architecture] Review written to %s; spec revised in place.",
+                                arch_review_result["review_path"],
+                            )
+                            budget_usd = arch_review_result["new_budget_usd"]
+                    else:
+                        logger.info(
+                            "[architecture] doc_reviewer_primary not configured — skipping architecture spec review."
+                        )
+                    arch_content = _read_spec_file(arch_path)
+                    if arch_content:
+                        spec_override = (
+                            f"{spec_override}\n\n"
+                            f"# Architecture Specification\n"
+                            f"_(synthesized from approved requirements)_\n\n"
+                            f"{arch_content}"
+                        )
+                        logger.info(
+                            "[architecture] SPEC_ARCHITECTURE.md (%d chars) appended to system prompt.",
+                            len(arch_content),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[architecture] Architecture synthesis failed: %s. "
+                        "Continuing without SPEC_ARCHITECTURE.md.",
+                        exc,
+                    )
+            else:
+                logger.info(
+                    "[architecture] Disabled in config (architecture.enabled=false). "
+                    "Skipping SPEC_ARCHITECTURE.md synthesis."
+                )
         except Exception as exc:
             logger.error("[requirements] Requirement refinement failed: %s", exc)
             return 1
@@ -1507,7 +1924,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Prompt:     %s", args.prompt[:100] + ("..." if len(args.prompt) > 100 else ""))
     logger.info("  Discovery:  %s", "enabled (--discover)" if getattr(args, "discover", False) else "skipped (pass --discover to enable)")
     if spec_override:
-        logger.info("  Spec:       SPEC_REQUIREMENTS.md (%d chars)", len(spec_override))
+        logger.info("  Spec:       SPEC_REQUIREMENTS.md (+SPEC_ARCHITECTURE.md) (%d chars)", len(spec_override))
     logger.info("=" * 60)
 
     try:
@@ -1833,6 +2250,8 @@ def _format_doctor_line(status: str, label: str, detail: str) -> str:
         marker = f"{green}[ OK ]{reset}"
     elif status == "warn":
         marker = f"{yellow}[WARN]{reset}"
+    elif status == "skip":
+        marker = f"{yellow}[SKIP]{reset}"
     else:
         marker = f"{red}[FAIL]{reset}"
     return f"  {marker} {label:<32} {detail}"
@@ -1875,9 +2294,115 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
     return "pass", f"git repo detected at {workspace_path}"
 
 
-def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
-    """Every non-ollama model referenced in model_routing has its API key set."""
+# Per-provider HTTP probe targets for the live api-keys check. Endpoint
+# is the smallest possible chat call that exercises auth + the model id
+# — we cap output to a single token so the cost-per-doctor-run stays
+# well under a tenth of a cent across all providers combined.
+_LIVE_PING_TIMEOUT_SECONDS = 8.0
+
+
+async def _ping_provider_live(
+    provider: str, model_id: str, api_key: str,
+    *,
+    timeout: float = _LIVE_PING_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Make the smallest possible chat call to confirm the key authenticates.
+
+    Returns ``(ok, message)``. ``ok=True`` means the provider accepted
+    the key for this model (HTTP 200). Anything else is a FAIL with a
+    specific operator-actionable reason — 401 names the key as invalid,
+    403 distinguishes "key valid but no access to model", 429 calls out
+    that the key works but quota is exhausted, network errors point at
+    reachability.
+    """
+    import httpx
+    if not api_key:
+        return False, "no API key resolved"
+
+    try:
+        if provider == "anthropic":
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            body: dict[str, Any] = {
+                "model": model_id,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+        elif provider in {"openai", "deepseek"}:
+            base = (
+                "https://api.deepseek.com" if provider == "deepseek"
+                else "https://api.openai.com"
+            )
+            url = f"{base}/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": model_id,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+        else:
+            return False, f"unknown provider '{provider}' (no live-ping probe registered)"
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, headers=headers, json=body)
+    except httpx.TimeoutException:
+        return False, (
+            f"timeout after {timeout:.0f}s — provider unreachable or network blocked"
+        )
+    except httpx.ConnectError as exc:
+        return False, f"connection failed ({exc})"
+    except Exception as exc:  # noqa: BLE001 — surface anything unexpected
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if response.status_code == 200:
+        return True, "live"
+    if response.status_code == 401:
+        return False, "HTTP 401 — API key rejected (verify the key is correct and active)"
+    if response.status_code == 403:
+        return False, (
+            f"HTTP 403 — key is valid but has no access to model '{model_id}'"
+        )
+    if response.status_code == 404:
+        return False, (
+            f"HTTP 404 — model '{model_id}' not found at provider; check spelling"
+        )
+    if response.status_code == 429:
+        return False, (
+            "HTTP 429 — rate limited (key works but quota exhausted right now)"
+        )
+    if 500 <= response.status_code < 600:
+        return False, f"HTTP {response.status_code} — provider error"
+    # Anything else: surface the status + truncated body so the operator
+    # can paste it into a search engine.
+    snippet = response.text[:200].replace("\n", " ").strip()
+    return False, f"HTTP {response.status_code}: {snippet}"
+
+
+async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
+    """Every non-ollama model referenced in model_routing has a working API key.
+
+    Two-phase check:
+      1. Key resolution — same as before: env var OR per-model
+         ``api_key`` config field, matching ``BaseProviderClient.__init__``.
+      2. Live ping — for each provider that resolved a key, make the
+         smallest possible chat call. Pings run in parallel via
+         ``asyncio.gather`` so the doctor stays fast even with 3-4
+         providers configured.
+
+    Set ``HARNESS_DOCTOR_SKIP_LIVE=true`` to skip the live ping (key
+    presence only). Useful in headless CI where outbound network may be
+    blocked or where the per-check latency matters more than the
+    correctness signal.
+    """
     routing = config.get("model_routing", {}) or {}
+    models_cfg = config.get("models", {}) or {}
     routing_keys = (
         "planning_primary", "planning_fallback",
         "patching_primary",
@@ -1898,18 +2423,62 @@ def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     if not needed_providers:
         return "warn", "no non-ollama models configured in model_routing"
 
+    # Phase 1: resolve keys.
+    resolved: list[tuple[str, str, str, str]] = []  # (provider, model_key, source, key)
     missing: list[str] = []
-    present: list[str] = []
     for provider, model_key in needed_providers.items():
         env_var = f"{provider.upper()}_API_KEY"
-        if os.environ.get(env_var, ""):
-            present.append(env_var)
+        env_value = (os.environ.get(env_var, "") or "").strip()
+        cfg_entry = models_cfg.get(model_key, {}) or {}
+        cfg_value = (cfg_entry.get("api_key", "") or "").strip() if isinstance(cfg_entry, dict) else ""
+        if env_value:
+            resolved.append((provider, model_key, "env", env_value))
+        elif cfg_value:
+            resolved.append((provider, model_key, "config", cfg_value))
         else:
-            missing.append(f"{env_var} (needed for {model_key})")
+            missing.append(
+                f"{model_key} (set {env_var} env var, or "
+                f"models.\"{model_key}\".api_key in ~/.harness/config.json)"
+            )
 
     if missing:
         return "fail", "missing: " + "; ".join(missing)
-    return "pass", "present: " + ", ".join(present)
+
+    skip_live = (os.environ.get("HARNESS_DOCTOR_SKIP_LIVE", "") or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if skip_live:
+        return (
+            "pass",
+            "present: " + ", ".join(f"{m} ({s})" for _p, m, s, _k in resolved)
+            + " (live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)",
+        )
+
+    # Phase 2: live ping in parallel.
+    import asyncio as _asyncio
+    ping_results = await _asyncio.gather(
+        *[
+            _ping_provider_live(provider, model_key.split(":", 1)[1], key)
+            for provider, model_key, _src, key in resolved
+        ],
+        return_exceptions=True,
+    )
+
+    live_failures: list[str] = []
+    live_present: list[str] = []
+    for (provider, model_key, source, _key), result in zip(resolved, ping_results):
+        if isinstance(result, BaseException):
+            live_failures.append(f"{model_key} ({source}): unexpected {type(result).__name__}: {result}")
+            continue
+        ok, detail = result
+        if ok:
+            live_present.append(f"{model_key} ({source}, live)")
+        else:
+            live_failures.append(f"{model_key} ({source}): {detail}")
+
+    if live_failures:
+        return "fail", "live ping failed — " + "; ".join(live_failures)
+    return "pass", "live: " + ", ".join(live_present)
 
 
 def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
@@ -2044,28 +2613,19 @@ def _doctor_check_global_config() -> tuple[str, str]:
 
 
 def _doctor_check_config(workspace_path: str) -> tuple[str, str]:
-    """Config discovers and validates without errors. Captures _validate_config_keys warnings."""
-    import io
-    warning_handler = logging.StreamHandler(io.StringIO())
-    warning_handler.setLevel(logging.WARNING)
-    cli_logger = logging.getLogger("harness.cli")
-    cli_logger.addHandler(warning_handler)
+    """Canonical config loads and strictly validates without errors.
+
+    Under the single-source-config contract there is no "warn" outcome:
+    discover_config either passes or raises ConfigError. The doctor
+    surfaces the full multi-line error message so the operator can
+    correct every problem in one pass.
+    """
     try:
-        try:
-            config = discover_config(workspace_path)
-        except Exception as exc:  # noqa: BLE001
-            return "fail", f"discover_config raised: {exc}"
-    finally:
-        cli_logger.removeHandler(warning_handler)
-    captured = warning_handler.stream.getvalue()
-    typo_lines = [
-        line for line in captured.splitlines()
-        if "Unknown config key" in line
-    ]
-    if typo_lines:
-        first = typo_lines[0].split("Unknown config key", 1)[1].strip()
-        more = f" (+{len(typo_lines) - 1} more)" if len(typo_lines) > 1 else ""
-        return "warn", f"unknown key{more}: Unknown config key {first}"
+        config = discover_config(workspace_path)
+    except ConfigError as exc:
+        return "fail", f"strict validation failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return "fail", f"discover_config raised: {exc}"
     section_count = sum(1 for k in config if not k.startswith("_"))
     return "pass", f"config parsed cleanly ({section_count} top-level sections)"
 
@@ -2074,9 +2634,16 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     """
     Execute the `harness doctor` subcommand.
 
-    Runs five healthchecks and prints a green/yellow/red summary.
-    Exits 0 if every check passes (warn included as non-blocking),
-    non-zero if any check fails.
+    Runs healthchecks and prints a green/yellow/red summary. Under the
+    single-source-config contract the very first check is "config" —
+    if it fails, the harness can't load anything else, so every
+    downstream check is marked "skipped" and the doctor returns
+    non-zero. When the config is valid we proceed to git, sandbox,
+    checkpoint DB, and the live API-key ping.
+
+    Exits 0 if every executed check passes (warn is non-blocking),
+    non-zero on any failure or when config validation prevents the
+    rest of the checks from running.
 
     Examples:
         harness doctor
@@ -2084,26 +2651,45 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     # Silence the chatty INFO logging from discover_config; we surface
-    # parse warnings ourselves via the config check.
+    # the result via the explicit "config" check.
     logging.getLogger("harness.cli").setLevel(logging.ERROR)
 
-    try:
-        config = discover_config(workspace_path)
-    except Exception:  # noqa: BLE001 — _doctor_check_config re-runs and reports
-        config = {}
+    # --- Step 1: deterministic config check. EVERYTHING else depends on
+    # this passing — if the canonical config doesn't load and validate,
+    # there's nothing meaningful to check downstream. We still run the
+    # workspace-independent git check (operators may be debugging a
+    # config-broken setup from a non-git directory).
+    config_status, config_detail = _doctor_check_config(workspace_path)
 
     checks: list[tuple[str, tuple[str, str]]] = [
+        ("config", (config_status, config_detail)),
         ("git repo", _doctor_check_git(workspace_path)),
-        ("global config", _doctor_check_global_config()),
-        ("api keys", _doctor_check_api_keys(config)),
-        ("sandbox backend", _doctor_check_sandbox(config)),
-        ("checkpoint db", _doctor_check_checkpoint_db(config)),
-        ("config parse", _doctor_check_config(workspace_path)),
     ]
+
+    if config_status == "pass":
+        # Config is valid; load it for downstream checks and run them.
+        # discover_config can't raise here because the check just passed.
+        config = discover_config(workspace_path)
+        api_keys_result = await _doctor_check_api_keys(config)
+        checks.extend([
+            ("api keys (live)", api_keys_result),
+            ("sandbox backend", _doctor_check_sandbox(config)),
+            ("checkpoint db", _doctor_check_checkpoint_db(config)),
+        ])
+    else:
+        # Config invalid → mark downstream checks as skipped so the
+        # operator sees they exist but understands they can't run yet.
+        skipped_detail = "skipped — fix the config check above first"
+        checks.extend([
+            ("api keys (live)", ("skip", skipped_detail)),
+            ("sandbox backend", ("skip", skipped_detail)),
+            ("checkpoint db", ("skip", skipped_detail)),
+        ])
 
     print()
     print("=" * 72)
     print(f"harness doctor — workspace: {workspace_path}")
+    print(f"canonical config: {_get_global_config_path()}")
     print("=" * 72)
     for label, (status, detail) in checks:
         print(_format_doctor_line(status, label, detail))
@@ -2111,11 +2697,22 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 
     failures = [label for label, (status, _) in checks if status == "fail"]
     warnings = [label for label, (status, _) in checks if status == "warn"]
+    skipped = [label for label, (status, _) in checks if status == "skip"]
     if failures:
         print(f"FAIL: {len(failures)} check(s) failed: {', '.join(failures)}")
+        if "config" in failures:
+            print(
+                "Fix the config file at the path shown above and re-run "
+                "`harness doctor` — the harness will not proceed with "
+                "invalid configuration."
+            )
         return 1
     if warnings:
         print(f"OK with warnings ({len(warnings)}): {', '.join(warnings)}")
+    elif skipped:
+        # Defensive — shouldn't be reached because skipped requires a fail.
+        print(f"PARTIAL: {len(skipped)} check(s) skipped.")
+        return 1
     else:
         print("OK: all checks passed.")
     return 0
@@ -2180,6 +2777,145 @@ async def cmd_purge(args: argparse.Namespace) -> int:
         return 1
 
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 3b. Metrics Subcommand (P2.7)
+# ---------------------------------------------------------------------------
+
+# Default destination for machine-readable metrics outputs. Overridable
+# via the metrics.metrics_dir config key at any layer (shipped defaults
+# in cli.json, user-global ~/.harness/config.json, per-workspace
+# .harness_config.json).
+_DEFAULT_METRICS_DIR = "~/.harness/metrics"
+
+
+async def cmd_metrics(args: argparse.Namespace) -> int:
+    """Execute the `harness metrics` subcommand (P2.7).
+
+    Aggregates per-session cost/usage from the JSONL logs and renders it
+    as a human report (stdout), JSON dump, Prometheus exposition text,
+    or roll-up table across every session in the log directory.
+
+    Examples:
+        harness metrics --session-id abc123
+        harness metrics --all
+        harness metrics --session-id abc123 --prometheus
+        harness metrics --all --json --output -
+    """
+    from harness.metrics import (
+        aggregate_session,
+        format_human,
+        format_prometheus,
+        format_table,
+        list_sessions,
+        write_atomic,
+    )
+
+    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    config = discover_config(workspace_path)
+    log_cfg = config.get("logging", {})
+    metrics_cfg = config.get("metrics", {})
+    token_budget_cfg = config.get("token_budget", {})
+
+    log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
+    metrics_dir = os.path.expanduser(
+        metrics_cfg.get("metrics_dir", _DEFAULT_METRICS_DIR)
+    )
+    window_minutes = int(
+        args.window_minutes
+        if args.window_minutes is not None
+        else metrics_cfg.get("burn_rate_window_minutes", 10)
+    )
+    window_minutes = max(1, min(1440, window_minutes))
+    hard_cap_usd = float(token_budget_cfg.get("hard_cap_usd", 2.00))
+
+    if args.all and args.session_id:
+        logger.error("Pass --session-id OR --all, not both.")
+        return 1
+    if not args.all and not args.session_id:
+        logger.error("Please specify --session-id <id> or --all.")
+        return 1
+
+    if args.session_id:
+        target_sessions = [args.session_id]
+    else:
+        target_sessions = list_sessions(log_dir)
+        if not target_sessions:
+            logger.error(
+                "No session logs found in %s. Run a session first, or set "
+                "logging.log_dir if your logs live elsewhere.",
+                log_dir,
+            )
+            return 1
+
+    metrics_list = [
+        aggregate_session(sid, log_dir, window_minutes=window_minutes)
+        for sid in target_sessions
+    ]
+
+    # If we asked for a specific session and nothing was found on disk,
+    # surface that as a non-zero exit so cron/automation catches it.
+    if args.session_id and metrics_list[0].llm_call_count == 0 and not metrics_list[0].log_files:
+        logger.error(
+            "No log files found for session '%s' in %s.",
+            args.session_id, log_dir,
+        )
+        return 1
+
+    # Output routing. Human (default) → stdout. JSON / Prometheus go to
+    # the configured metrics_dir unless --output overrides.
+    if args.json:
+        if args.session_id:
+            body = json.dumps(metrics_list[0].to_jsonable(), indent=2) + "\n"
+            default_name = f"{args.session_id}.json"
+        else:
+            body = json.dumps(
+                {"sessions": [m.to_jsonable() for m in metrics_list]},
+                indent=2,
+            ) + "\n"
+            default_name = "sessions.json"
+        _emit_output(body, default_name, metrics_dir, args.output, write_atomic)
+    elif args.prometheus:
+        body = format_prometheus(metrics_list, hard_cap_usd=hard_cap_usd)
+        default_name = (
+            f"{args.session_id}.prom" if args.session_id else "all.prom"
+        )
+        _emit_output(body, default_name, metrics_dir, args.output, write_atomic)
+    else:
+        # Human-readable: always to stdout.
+        if args.session_id:
+            print(format_human(metrics_list[0], hard_cap_usd=hard_cap_usd))
+        else:
+            print(format_table(metrics_list, hard_cap_usd=hard_cap_usd))
+
+    return 0
+
+
+def _emit_output(
+    body: str,
+    default_name: str,
+    metrics_dir: str,
+    output_override: Optional[str],
+    writer: Any,
+) -> None:
+    """Route a machine-readable payload to stdout or an atomic file.
+
+    `output_override` semantics:
+      - None: write to ``<metrics_dir>/<default_name>`` (the configured
+        per-session/per-rollup file the operator can hand to a scraper).
+      - "-": stream to stdout, no file written.
+      - anything else: treat as an explicit absolute or relative file
+        path and write there atomically.
+    """
+    if output_override == "-":
+        sys.stdout.write(body)
+        if not body.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    dest = output_override or os.path.join(metrics_dir, default_name)
+    writer(dest, body)
+    print(f"Wrote {dest}")
 
 
 # ---------------------------------------------------------------------------
@@ -2421,6 +3157,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness metrics` ---
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Per-session cost / burn-rate / Prometheus aggregation from logs",
+    )
+    metrics_parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Report on a single session.",
+    )
+    metrics_parser.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="Roll-up table across every session in the log dir.",
+    )
+    metrics_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Write machine-readable JSON to <metrics_dir>/ (or stdout with --output -).",
+    )
+    metrics_parser.add_argument(
+        "--prometheus",
+        action="store_true",
+        default=False,
+        help="Write Prometheus text-exposition output to <metrics_dir>/ (or stdout with --output -).",
+    )
+    metrics_parser.add_argument(
+        "--output",
+        default=None,
+        help="Override the destination path. Use '-' to emit to stdout.",
+    )
+    metrics_parser.add_argument(
+        "--window-minutes",
+        type=int,
+        default=None,
+        help="Burn-rate trailing window in minutes (default 10; clamped to [1, 1440]).",
+    )
+    metrics_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+
     return parser
 
 
@@ -2432,8 +3213,16 @@ def main() -> int:
     """
     Primary CLI entry point. Dispatches to the correct subcommand handler.
 
+    Catches :class:`ConfigError` at the outermost layer — any subcommand
+    whose first step calls :func:`discover_config` and finds a bad config
+    propagates the error up here. We print the consolidated message to
+    stderr and return exit code 2 *before* any further side effects (no
+    LLM call, no checkpointer init, no workspace lock leftover). This
+    keeps the user's contract: the harness either runs with valid config
+    or refuses to run at all.
+
     Returns:
-        0 on success, non-zero on failure.
+        0 on success, 1 on subcommand-level failure, 2 on config failure.
     """
     parser = build_parser()
     args = parser.parse_args()
@@ -2447,20 +3236,29 @@ def main() -> int:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("harness").setLevel(logging.DEBUG)
 
-    # Dispatch to subcommand
-    if args.command == "run":
-        return asyncio.run(cmd_run(args))
-    elif args.command == "resume":
-        return asyncio.run(cmd_resume(args))
-    elif args.command == "status":
-        return asyncio.run(cmd_status(args))
-    elif args.command == "doctor":
-        return asyncio.run(cmd_doctor(args))
-    elif args.command == "purge":
-        return asyncio.run(cmd_purge(args))
-    else:
-        parser.print_help()
-        return 1
+    try:
+        if args.command == "run":
+            return asyncio.run(cmd_run(args))
+        elif args.command == "resume":
+            return asyncio.run(cmd_resume(args))
+        elif args.command == "status":
+            return asyncio.run(cmd_status(args))
+        elif args.command == "doctor":
+            return asyncio.run(cmd_doctor(args))
+        elif args.command == "purge":
+            return asyncio.run(cmd_purge(args))
+        elif args.command == "metrics":
+            return asyncio.run(cmd_metrics(args))
+        else:
+            parser.print_help()
+            return 1
+    except ConfigError as exc:
+        # Deterministic config-time failure. Print directly to stderr —
+        # the logging subsystem may not even be configured yet (config-
+        # check runs before any other init), so going through the
+        # logger would swallow the message in early-startup contexts.
+        print(f"\n[harness] {exc}\n", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@
 
 ## Verdict
 
-**P0 + P1 + P2 cleared (2026-06-10).** All three P0 gaps, all ten P1 gaps, and all eight open P2 polish items are closed; only P2.7 (metrics endpoint) remains intentionally deferred to post-pilot. Regression suite is at **845 tests passing**, **ruff clean** end-to-end, and the CI quality job (lint + format-check + mypy) is wired with ruff as the blocking gate. CI matrix now covers Linux (blocking) plus macOS and Windows (advisory).
+**P0 + P1 + P2 cleared (2026-06-10).** All three P0 gaps, all ten P1 gaps, and all nine P2 polish items — including P2.7 (metrics endpoint), originally deferred but pulled forward — are closed. Regression suite is at **868 tests passing**, **ruff clean** end-to-end, and the CI quality job (lint + format-check + mypy) is wired with ruff as the blocking gate. CI matrix now covers Linux (blocking) plus macOS and Windows (advisory).
 
 The harness is ready to charge a customer subject to the standard pilot caveats (Linux primary, single-tenant, hands-on hotfix availability).
 
@@ -35,10 +35,10 @@ Every finding includes file:line so it's a punch-list item, not a discussion top
 | Reliability — checkpoint & concurrency | 0 | 0 | 0 | fixed |
 | Reliability — repair / HITL | 0 | 0 | 0 | fixed |
 | Operations — CI & packaging | 0 | 0 | 0 | fixed |
-| Operations — logging & lifecycle | 0 | 0 | 1 | deferred |
+| Operations — logging & lifecycle | 0 | 0 | 0 | fixed |
 | Operations — license & versioning | 0 | 0 | 0 | fixed |
 | Operations — defense-in-depth wiring | 0 | 0 | 0 | fixed |
-| **Total** | **0** | **0** | **1 (deferred)** | |
+| **Total** | **0** | **0** | **0** | |
 
 **P0 closeout summary (2026-06-10):**
 - P0.1 — checkpoint message redaction wired in `harness/storage.py` (`HarnessAsyncSqliteSaver.aput` / `aput_writes`); opt-out via `persistence.redact_messages: false`. Regression tests: `tests/test_storage_basic.py::TestCheckpointMessageRedaction`.
@@ -52,7 +52,7 @@ Every finding includes file:line so it's a punch-list item, not a discussion top
 - P2.4 — checkpoint metadata stamped with `_harness_schema_version` (current `CHECKPOINT_SCHEMA_VERSION = 1`); `validate_checkpoint_schema` + `CheckpointSchemaMismatchError` enforced by `cmd_resume`. Tests: `tests/test_storage_basic.py::TestCheckpointSchemaVersion`.
 - P2.5 — real `--version` / `-V` action wired in `build_parser`; reads `importlib.metadata.version("ai-agent-harness")`. README command table updated.
 - P2.6 — CI matrix extended with `macos-latest` + `windows-latest`, advisory via `continue-on-error`.
-- P2.7 — **deferred to post-pilot** by design (metrics endpoint / burn-rate forecast). Workaround documented in the doc.
+- P2.7 — `harness/metrics.py` aggregates `<id>.jsonl*` for per-session cost, tokens, error counts, burn rate, projected exhaustion; new `harness metrics` subcommand (`--session-id` / `--all` / `--json` / `--prometheus` / `--output` / `--window-minutes`). Atomic writes into `~/.harness/metrics/` (override globally via `metrics.metrics_dir`). Tests: `tests/test_metrics.py` (23 cases).
 - P2.8 — `docs/RUNBOOK.md` covering checkpoint corruption / budget exhaustion / sandbox / lock / LLM silence. Linked from README.
 - P2.9 — `cmd_purge --session-id` now also removes the live JSONL log file and rotated backups; failures logged but don't abort.
 
@@ -132,7 +132,7 @@ Every finding includes file:line so it's a punch-list item, not a discussion top
 
 ---
 
-## P2 — Polish  *(all open items fixed 2026-06-10; P2.7 deferred by design)*
+## P2 — Polish  *(all items fixed 2026-06-10)*
 
 ### P2.1  Dependencies are range-pinned, not exact-pinned
 **Where (was):** `pyproject.toml:14-28` — every dep is `>=` only (`langgraph>=0.4.0`, `httpx>=0.28.0`, etc.).
@@ -168,10 +168,10 @@ Every finding includes file:line so it's a punch-list item, not a discussion top
 **Status:** Fixed
 
 ### P2.7  No metrics endpoint / budget burn-rate forecast
-**Where:** `harness/observability.py` emits structured events but offers no `/metrics` Prometheus surface and no "at current burn, budget exhausted in X minutes" projection.
-**Why it matters:** Operators running multiple sessions can't see aggregate cost in real time.
-**Recommended fix:** Defer to post-pilot. For pilot, document `grep '"event": "llm_call"' ~/.harness/logs/*.jsonl | jq …` as the cost-tracking recipe.
-**Status:** Deferred
+**Where (was):** `harness/observability.py` emitted structured events but offered no aggregation surface — operators couldn't see cumulative cost without a hand-rolled jq pipeline, and there was no "at current burn, budget exhausted in X minutes" projection.
+**Fix landed:** New `harness/metrics.py` reads `<id>.jsonl` + `<id>.jsonl.*` rotated backups, sums `llm_call` cost/tokens, counts failure events (`llm_empty_response`, `llm_circuit_open`, `token_budget_exhausted`, `sandbox_start_failed`, `hitl_gate_blocked`), computes a sliding-window burn rate, and projects exhaustion against `token_budget.hard_cap_usd`. New `harness metrics` subcommand wires it through the CLI (`--session-id`, `--all`, `--json`, `--prometheus`, `--output`, `--window-minutes`). Machine-readable outputs land in `~/.harness/metrics/` by default (configurable globally via `metrics.metrics_dir` in `~/.harness/config.json`) and are written atomically (`<dest>.tmp` → `os.replace`) so node_exporter textfile collectors never see a half-written file. No HTTP daemon — a cron job emitting `--prometheus` is enough for pilot scale.
+**Regression tests:** `tests/test_metrics.py` — 23 cases covering aggregation across rotated backups, malformed-line tolerance, burn-rate window math, projection edge cases (zero burn, already exhausted), human/table/Prometheus formatting, atomic write guarantees, config-override resolution, and CLI smoke (stdout, file write, `--output -`, no-logs exit code).
+**Status:** Fixed
 
 ### P2.8  No runbook for common operator failures
 **Where (was):** `docs/` had installation, architecture, and spec docs but no `docs/RUNBOOK.md`.

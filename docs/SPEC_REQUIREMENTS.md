@@ -13,11 +13,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 ## 2. Functional Requirements (FR)
 
 ### FR-001: CLI Subcommand Routing
-- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, `doctor`, and `purge`, each with their own argument parsers and help text.
+- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, `doctor`, `purge`, and `metrics`, each with their own argument parsers and help text. The root parser MUST also accept a `--version` / `-V` flag that prints the installed package version (resolved via `importlib.metadata.version("ai-agent-harness")`) and exits.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `harness -h`, the system displays help with all five subcommands listed.
+  - Given `harness -h`, the system displays help with all six subcommands listed.
   - Given `harness run -h`, the system displays run-specific help with all flags documented.
+  - Given `harness --version`, the system prints `harness <X.Y.Z>` and exits 0; the version falls back to `(unknown)` for uninstalled in-tree runs.
 
 ### FR-002: Workspace-Bound Execution
 - **Description:** The system MUST accept a `--workspace` / `-r` flag pointing to an existing directory. All generated code, specs, and deployment artifacts MUST land inside this workspace.
@@ -130,12 +131,15 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `product_spec.txt` exists in the workspace root, it is used as the manifest without explicit `--manifest` flag.
 
 ### FR-016: Checkpoint Persistence and Crash Recovery
-- **Description:** The system MUST persist graph state to a SQLite database (WAL mode) at every node transition. `harness resume --session-id` MUST restore and continue from the last checkpoint.
+- **Description:** The system MUST persist graph state to a SQLite database (WAL mode) at every node transition. `harness resume --session-id` MUST restore and continue from the last checkpoint. Each checkpoint's metadata MUST carry a `_harness_schema_version` stamp (current `CHECKPOINT_SCHEMA_VERSION = 1`); `cmd_resume` MUST pre-flight the most recent blob with strict deserialization and refuse to load on `CheckpointCorruptedError` or `CheckpointSchemaMismatchError`. The `messages` channel MUST be redacted through `harness.redactor` before serialization (opt-out via `persistence.redact_messages: false`, default `true`).
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given a running graph, checkpoints are written to `~/.harness/checkpoints.db`.
-  - Given `harness resume --session-id <id>`, the graph resumes from the checkpointed state.
+  - Given a running graph, checkpoints are written to `~/.harness/checkpoints.db` with the schema version stamped in metadata.
+  - Given `harness resume --session-id <id>`, the graph resumes from the checkpointed state after the pre-flight check passes.
+  - Given a corrupted checkpoint blob, `cmd_resume` exits with an operator-readable message offering fresh-start / restore-backup / purge-session options.
+  - Given a checkpoint stamped with a future schema version, `cmd_resume` refuses with an upgrade-or-purge message.
   - Given a non-existent session ID, resume exits with error code 1.
+  - Given a prompt containing an API-key-shaped secret, the byte sequence is absent from the on-disk SQLite checkpoint blob.
 
 ### FR-017: Read-Only Status Inspection
 - **Description:** `harness status --all` MUST list all checkpointed sessions with session ID, created time, updated time, and workspace path. `harness status --session-id <id>` MUST display a full state snapshot.
@@ -146,11 +150,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a non-existent session ID, a "not found" message is printed.
 
 ### FR-018: Session Data Purging
-- **Description:** `harness purge --all` MUST delete all checkpoint data after confirmation. `harness purge --session-id <id>` MUST delete a specific session's checkpoints.
+- **Description:** `harness purge --all` MUST delete all checkpoint data after confirmation. `harness purge --session-id <id>` MUST delete that session's checkpoints AND its per-session JSONL log file (`<id>.jsonl`) plus any rotated backups (`<id>.jsonl.*`). Log-file removal is best-effort: a single OS error MUST log a WARNING and continue rather than abort the purge.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given `harness purge --all` and user confirms "yes", all rows in the checkpoints DB are deleted.
-  - Given `harness purge --session-id <id>`, only that thread's checkpoints are deleted.
+  - Given `harness purge --session-id <id>`, only that thread's checkpoints are deleted and the count of removed log files is printed.
+  - Given a session whose log file cannot be removed (permissions, race), the checkpoint deletion still completes and the failure is logged at WARNING.
 
 ### FR-019: Lint Gate (Deterministic Format Verification)
 - **Description:** Before each build, modified files MUST be auto-formatted and linted using language-specific tools. Lintgate ships specs for `.py` / `.pyi` (ruff), `.go` (gofmt), `.rs` (rustfmt + clippy), `.ts` / `.tsx` / `.js` / `.jsx` / `.css` / `.html` / `.json` / `.yaml` / `.yml` / `.md` (prettier), `.c` / `.h` / `.cpp` / `.cc` / `.cxx` / `.hpp` (clang-format), `.java` (google-java-format), `.dart` (`dart format`), `.sh` / `.bash` (shfmt), and `.sql` (sqlfluff). Lint errors are surfaced in the build output. By default, formatting only runs on files actually patched this session (`lintgate.format_modified_files=false`); linters run on all modified files.
@@ -198,11 +203,16 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a patch to a file with 3 downstream dependents, those dependents are listed in the impact result.
 
 ### FR-025: First-Run Healthcheck (`harness doctor`)
-- **Description:** The CLI MUST expose `harness doctor`, which runs five healthchecks and reports each as PASS / WARN / FAIL with a colored marker (suppressed when stdout is not a TTY or `NO_COLOR` is set): git repo presence, API keys per configured `model_routing` provider, sandbox backend reachability, checkpoint DB writability, and config parse cleanliness (re-running `discover_config` + `_validate_config_keys`).
+- **Description:** The CLI MUST expose `harness doctor`, which runs six healthchecks and reports each as PASS / WARN / FAIL with a colored marker (suppressed when stdout is not a TTY or `NO_COLOR` is set): git repo presence, global config presence, API keys per configured `model_routing` provider, sandbox backend reachability, checkpoint DB writability and corruption scan over the 5 most recent rows, and config parse cleanliness (re-running `discover_config` + `_validate_config_keys`). The api-keys check MUST consider a provider satisfied when EITHER the `{PROVIDER}_API_KEY` env var OR the `models["<provider>:<model>"].api_key` config field is set (matching the runtime resolution in `gateway.BaseProviderClient.__init__`); the PASS message MUST report the source (`(env)` vs `(config)`) per model so operators see which key the runtime would actually use. The api-keys check MUST also issue a one-token chat call against each provider in parallel to confirm the resolved key actually authenticates against the configured model; HTTP-status-specific FAIL messages distinguish key-rejected (401), no-model-access (403), model-not-found (404), rate-limited (429), provider error (5xx), and network failures. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / headless / outbound-network-blocked environments) — the doctor then reports presence and source only.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given a healthy install, `harness doctor` exits 0.
-  - Given a missing API key for a routed non-Ollama provider, the `api keys` check reports FAIL listing the missing `{PROVIDER}_API_KEY` env vars and the command exits non-zero.
+  - Given an API key only in the `models["<key>"].api_key` config field (no env var), the `api keys` check reports PASS with `(config)` next to the model id (after a successful live ping).
+  - Given an env var AND a config field both set, the PASS message reports `(env)` (env wins precedence, matching the runtime).
+  - Given neither env var nor config field set for a routed non-Ollama provider, the `api keys` check reports FAIL with a message naming BOTH the env var to set AND the `models."<key>".api_key` path; the command exits non-zero.
+  - Given a configured key that returns HTTP 401, the live ping reports FAIL with `HTTP 401 — API key rejected` and the command exits non-zero.
+  - Given `HARNESS_DOCTOR_SKIP_LIVE=true`, no outbound HTTP request fires and the PASS detail notes `(live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)`.
+  - Given a corrupted checkpoint blob among the 5 most recent rows, the `checkpoint db` check reports FAIL with the row identifier.
   - Given a typoed nested config key, the `config parse` check reports WARN with the fuzzy-match suggestion.
 
 ### FR-026: Multi-Stack Tree-Sitter Coverage
@@ -241,18 +251,111 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a clean config, no `Unknown config key` warnings are emitted.
 
 ### FR-031: Continuous Integration Gate
-- **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.11 / 3.12 / 3.13. The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing job MUST block merge.
+- **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.11 / 3.12 / 3.13 on `ubuntu-latest` (blocking) plus `macos-latest` and `windows-latest` on Python 3.12 (advisory via `continue-on-error: true`). A separate `quality` job MUST run `ruff check` (blocking gate) plus `ruff format --check` and `mypy harness/` (advisory until typing/format backlog clears). The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing blocking job MUST block merge; advisory failures MUST NOT.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given a PR that breaks any test, the `pytest (py3.11)` / `(py3.12)` / `(py3.13)` job(s) fail.
-  - Given a green pytest run on all three Python versions, the workflow reports `success`.
+  - Given a PR that breaks any test, the `pytest (py3.11, ubuntu-latest)` / `(py3.12, ubuntu-latest)` / `(py3.13, ubuntu-latest)` job(s) fail and block merge.
+  - Given a ruff-check violation in `harness/` or `tests/`, the `quality` job fails and blocks merge.
+  - Given a Linux-only regression that breaks the macOS or Windows run, the `pytest` job for that OS reports failure but merge is NOT blocked (advisory).
+  - Given a green pytest + ruff-check run on all blocking targets, the workflow reports `success`.
+
+### FR-032: Cost-Metrics Aggregation (`harness metrics`)
+- **Description:** The CLI MUST expose `harness metrics`, which reads `<id>.jsonl` plus rotated backups (`<id>.jsonl.*`) under `logging.log_dir`, aggregates `llm_call` cost / tokens, counts tracked failure events (`token_budget_exhausted`, `llm_empty_response`, `llm_circuit_open`, `sandbox_start_failed`, `hitl_gate_blocked`), computes a trailing-window burn-rate in USD/min, and projects exhaustion against `token_budget.hard_cap_usd`. Flags: `--session-id`, `--all`, `--json`, `--prometheus`, `--output` (path or `-` for stdout), `--window-minutes`. Human-readable output goes to stdout; machine-readable outputs (`--json` / `--prometheus`) write atomically (`<dest>.tmp` → `os.replace`) into `metrics.metrics_dir` (default `~/.harness/metrics/`).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a session log with three `llm_call` records (cost $0.10, $0.20, $0.05), `harness metrics --session-id <id>` prints `Total cost: $0.3500` and a non-zero burn rate.
+  - Given `--prometheus` and no `--output`, the file `~/.harness/metrics/<id>.prom` is written atomically with `# HELP` / `# TYPE` headers for every documented metric.
+  - Given `--output -`, the payload is streamed to stdout and no file is written.
+  - Given an empty log directory, `--all` exits with code 1.
+
+### FR-033: Checkpoint Message Redaction
+- **Description:** `HarnessAsyncSqliteSaver.aput` and `aput_writes` MUST scrub the `messages` channel through `harness.redactor.redact_messages` before delegating to LangGraph's serializer. Opt-out via `persistence.redact_messages: false` (default `true`). Redactor crashes MUST fail open (log a WARNING and persist the original value) so the checkpoint write itself can never be blocked by a redactor bug.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a prompt containing an `sk-…`-shaped API key and `redact_messages: true`, the raw key bytes are absent from the SQLite blob.
+  - Given `redact_messages: false`, the raw bytes ARE present (opt-out is honoured).
+  - Given a forced redactor exception, the WARNING is logged and the checkpoint write succeeds.
+
+### FR-034: Process-Wide Command Validator
+- **Description:** `cmd_run` and `cmd_resume` MUST instantiate a `CommandValidator` via `create_command_validator_from_config(config)` and register it process-wide using `set_command_validator()`. `SandboxExecutor.__init__` MUST fall back to the global default when `command_validator=None` is passed. Explicit constructor arguments override the global.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a session whose sandbox executor is created without an explicit validator, the global instance is used.
+  - Given an explicit validator argument, it overrides the global.
+  - Given no global and no explicit value, the executor's `command_validator` is `None`.
+
+### FR-035: Pre-Flight Budget Refusal
+- **Description:** Before issuing any LLM call, the gateway MUST estimate cost as `(input_chars / 4) × input_rate + (4000 × output_rate)`. If the estimate exceeds `budget_remaining_usd`, the gateway MUST raise `BudgetTooLowError` without contacting the provider. A WARNING MUST be emitted when a call lands within 20% of the cap.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a 100k-character prompt against a $0.01 remaining budget, `BudgetTooLowError` is raised and no HTTP request is made.
+  - Given a call estimated at 85% of remaining budget, a WARNING is logged before dispatch.
+
+### FR-036: Empty-LLM-Response Handling
+- **Description:** When a provider returns an empty content body, the gateway MUST retry up to two additional times after the existing transport-retry loop. If still empty, the gateway MUST raise `EmptyLLMResponseError` and `emit_event("llm_empty_response", ...)`. `repair_node` MUST set `node_state["llm_silent"] = True` on this exception; `route_after_compiler` MUST short-circuit to HITL immediately on `llm_silent=True` rather than waiting for the 3-cycle repair cap.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given three consecutive empty responses, `EmptyLLMResponseError` is raised and the `llm_empty_response` event is recorded.
+  - Given an empty-then-successful sequence, the call returns the second content without raising.
+
+### FR-037: Rate-Limit Circuit Breaker
+- **Description:** The gateway MUST track HTTP 429 / 5xx failures in a 5-minute sliding window. When the count reaches 3, `_circuit_is_open()` MUST return True and the next `dispatch()` MUST force `force_local=True` (Ollama). A WARNING with the cooldown duration MUST be logged when the breaker opens.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given 3 rate-limit failures within 5 minutes, the next call is routed to the local Ollama backend.
+  - Given the window expiring, subsequent failures restart the count.
+
+### FR-038: Workspace Single-Writer Lock
+- **Description:** `cmd_run` MUST acquire an `fcntl.flock(LOCK_EX | LOCK_NB)` on `<workspace>/.harness_session.lock` at startup. On `BlockingIOError` (another session holds the lock), the CLI MUST exit 1 unless `--force-lock` is passed; with `--force-lock`, a WARNING MUST be logged and the lock acquired. The handle MUST be pinned in a module-level slot so the OS holds the lock for the process lifetime. Platforms without `fcntl` (native Windows) MUST log a DEBUG message and skip locking.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given two `harness run` invocations against the same workspace, the second exits with a clear "lock held by PID X" message.
+  - Given `--force-lock`, the second invocation proceeds after logging a WARNING.
+  - Given a Windows native run, lock acquisition is skipped without error.
+
+### FR-039: Discovery JSON Trust Guards
+- **Description:** `trust.validate_discovery_json` MUST reject responses larger than 1 MB (UTF-8 byte length) before invoking `json.loads`, and MUST reject parsed trees deeper than 10 levels (cycle-safe depth walk). The existing per-question text cap (10,000 chars) and module-count cap (50) MUST remain in effect.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a 2 MB payload, the validator returns an error containing `"exceeds 1000000 bytes"` without attempting to parse.
+  - Given a depth-15 nested object, the validator returns an error containing `"nesting depth"`.
+  - Given a normal depth-4 discovery response, no depth or size error is reported.
+
+### FR-040: Log Rotation
+- **Description:** `configure_logging` MUST install a `RotatingFileHandler` for the per-session JSONL by default (max 10 MB, 5 backups), configurable via `logging.max_bytes` and `logging.backup_count`. Setting `max_bytes: 0` MUST opt out and fall back to a plain `FileHandler` for operators pinning a single non-rotating file (e.g. for an external log shipper).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given default config, the live JSONL is a `RotatingFileHandler` with `maxBytes=10_000_000`, `backupCount=5`.
+  - Given enough writes to exceed `maxBytes`, the live file plus `.1` backup co-exist.
+  - Given `max_bytes: 0`, the handler is a plain `FileHandler` (no rotation).
+
+### FR-041: Patcher Symlink Guard and Conservative Allowlist
+- **Description:** The async writer in `harness/patcher.py` MUST refuse to write through any path where `os.path.islink(target)` is true and MUST use `O_NOFOLLOW` on Linux/macOS to catch races. When the source-root heuristic in `harness/graph.py::_build_patcher_allowlist` cannot decide on a project layout, the function MUST fall back to a conservative allowlist (`src/`, `lib/`, `app/`, `pkg/`, `cmd/`, `tests/`, `test/`, `__tests__/`, `_ROOT_ALLOWLIST_FILES`, and any `requirements*.txt`) and log a WARNING so the operator can fix detection. Windows native has no portable `O_NOFOLLOW`; the `islink` check still applies.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a write target that is a symlink, the patcher logs a WARNING and refuses, leaving the symlink target intact.
+  - Given a flat workspace with no recognised source root, only paths under the conservative allowlist are writable; writes to the workspace root are refused.
+
+### FR-042: Sandbox Network Auto-Enable Opt-In
+- **Description:** The harness MUST NOT automatically enable `allow_network=True` on detected pip/npm install commands unless `sandbox.auto_enable_network_for_install: true` is set. When detection fires with the opt-in off, the function MUST log a WARNING pointing the operator at the config key. The opt-in MUST be whitelisted in the `sandbox` section of `_KNOWN_NESTED_KEYS`.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `build_command: "pip install -e ."` and `auto_enable_network_for_install: false` (default), the sandbox does NOT auto-enable network.
+  - Given the same build command and the opt-in `true`, network IS auto-enabled.
+
+### FR-043: Hard Cap on Discovery Loop
+- **Description:** `node_throttle.max_discovery_iterations` (default 10, clamped to `[1, 30]` at config load) MUST hard-cap the number of discovery loop iterations. `route_after_discovery` MUST short-circuit to `write_spec_node` with a WARNING when `discovery_question_count >= max_discovery_iterations`. The key MUST appear in every config layer (cli.json, config.json, .harness_config.json, templates) and in the `node_throttle` whitelist.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `max_discovery_iterations: 3` and a fourth discovery question, the graph routes to `write_spec_node` instead of issuing the LLM call.
+  - Given a value outside `[1, 30]`, it is clamped at load and logged.
 
 ---
 
 ## 3. System Scope
 
 ### In-Scope
-- CLI interface with 5 subcommands (run, resume, status, doctor, purge)
+- CLI interface with 6 subcommands (run, resume, status, doctor, purge, metrics) plus `--version`
 - LangGraph-based agent graph with 20+ nodes
 - Multi-provider LLM gateway (DeepSeek, Anthropic, OpenAI, Ollama)
 - Hierarchical JSON configuration with deep merge + recursive typo detection
@@ -265,9 +368,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Git branch lifecycle management (stash, patch branch, commit, rollback)
 - Exhaustive 3-phase discovery pipeline with structured Q&A loops (opt-in via `--discover`)
 - Pre-flight manifest → spec synthesis with interactive review
-- SQLite checkpoint persistence with WAL mode and 30-day TTL GC
+- SQLite checkpoint persistence with WAL mode, 30-day TTL GC, schema-version stamping, strict-deserialize pre-flight on resume, and message redaction on every aput / aput_writes
 - Read-only session status inspector with timestamp and workspace display
-- First-run healthcheck (`harness doctor`) covering five environment preconditions
+- First-run healthcheck (`harness doctor`) covering six environment preconditions, with the api-keys check matching the runtime resolution policy (env var OR `models["<key>"].api_key`)
+- Cost-metrics aggregation (`harness metrics`) with human / JSON / Prometheus output, sliding-window burn rate, and projected exhaustion against `token_budget.hard_cap_usd`
+- Per-session JSONL log file with `RotatingFileHandler` (10 MB × 5 backups by default), configurable via `logging.max_bytes` / `logging.backup_count`
+- fcntl-based workspace lock (`.harness_session.lock`) preventing concurrent sessions on the same workspace; `--force-lock` for stale-lock recovery
+- Pre-flight LLM-budget refusal (`BudgetTooLowError`), empty-response retry with `EmptyLLMResponseError` route-to-HITL short-circuit, and a rate-limit circuit breaker that diverts to local Ollama after 3 hits in 5 min
 - Structured failure-event catalogue (`log_failure(name, **fields)`)
 - Lint gate with auto-detected formatters per language (Python, Java, JS/TS, Dart, Go, Rust, C/C++, shell, SQL, markdown, YAML, JSON, HTML, CSS)
 - Multi-variant speculative compilation in parallel git worktrees
@@ -276,7 +383,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Conversation memory cleanse for prefix-cache optimization
 - Dependency graph impact analysis backed by tree-sitter grammars for Python, Java, JS/TS, Dart, Rust, Go, and C/C++
 - Two-tier skills system (harness-level + project-level markdown conventions) with stack-aware filtering via `applies_to:` frontmatter
-- GitHub Actions CI matrix on Python 3.11 / 3.12 / 3.13
+- Patcher symlink guard (`O_NOFOLLOW` + `os.path.islink`) and a conservative fallback allowlist when the source root cannot be auto-detected
+- Discovery JSON trust guards: 1 MB byte-size cap + depth-10 recursion guard in `trust.validate_discovery_json`
+- Sandbox network auto-enable gated by `sandbox.auto_enable_network_for_install` opt-in (default false)
+- Hard cap on the discovery interview loop via `node_throttle.max_discovery_iterations` (default 10)
+- GitHub Actions CI: pytest pack on Linux (Python 3.11 / 3.12 / 3.13, blocking) plus macOS + Windows (Python 3.12, advisory `continue-on-error`); separate `quality` job with `ruff check` blocking
+- MIT `LICENSE` at repo root; `requirements-prod.txt` with exact transitive pins for reproducible pilot installs
 
 ### Out-of-Scope
 - Interactive IDE plugin or VS Code extension
@@ -284,7 +396,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Multi-user concurrent session management
 - Cloud-hosted SaaS offering
 - Non-Git version control systems (Mercurial, SVN)
-- Native Windows support (Windows + WSL2 is best-effort untested; the `unshare` backend is Linux-only)
+- Guaranteed native Windows support (Windows + WSL2 is best-effort; the `unshare` backend and `fcntl` workspace lock are Linux-only). Windows is covered in CI as advisory (`continue-on-error`) to surface regressions but is not a blocking platform.
 - Real-time streaming collaboration
 - Built-in code review or PR management
 - Training or fine-tuning of LLMs
@@ -323,9 +435,9 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 | msgpack | 1.0.0 | Required by the storage GC regression test (not a runtime dep — runtime code falls back to JSON if absent). |
 
 ### Platform Requirements
-- **OS:** Linux is the only platform covered by the CI matrix. macOS and Windows + WSL2 are best-effort via the Docker backend (untested). See the platform support matrix in `README.md`.
+- **OS:** Linux is the blocking CI target (Python 3.11 / 3.12 / 3.13). macOS and Windows (both Python 3.12) are covered as advisory `continue-on-error` jobs in the matrix — regressions surface but do not block merge. The `unshare` backend and fcntl-based workspace lock are Linux-only.
 - **Sandbox backend:** Docker daemon, or Linux user-namespace support (`unshare --user`), or `HARNESS_ALLOW_UNSAFE_SANDBOX=true` opt-in for the bare backend.
-- **Disk:** ~10MB for checkpoint database per 30-day window.
+- **Disk:** ~10MB for checkpoint database per 30-day window; up to ~50MB per session for rotated JSONL logs (10 MB live × 5 backups, default).
 - **Network:** Outbound HTTPS required for LLM API calls (unless `force_local_only` + Ollama).
 
 ### Performance Targets
@@ -337,10 +449,15 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 
 ### Security Requirements
 - No secrets in outbound API calls (pre-transmission redaction)
-- No secrets in checkpoints database (values are in LangGraph state, not separately encrypted)
-- Sandbox network isolation by default (no outbound network unless `--allow-network`)
+- No secrets in checkpoints database — the `messages` channel is scrubbed through `harness.redactor` on every `aput` / `aput_writes` (opt-out via `persistence.redact_messages: false`)
+- Sandbox network isolation by default (no outbound network unless `--allow-network`); auto-enable on detected pip/npm install is gated behind `sandbox.auto_enable_network_for_install` opt-in (default false)
+- Process-wide `CommandValidator` enforced by every `SandboxExecutor` (set in `cmd_run` / `cmd_resume`)
+- Patcher refuses writes to symlinks (`O_NOFOLLOW` + `os.path.islink`); falls back to a conservative allowlist when the source root cannot be auto-detected
+- Discovery JSON parser refuses payloads > 1 MB or depth > 10 to bound trust-boundary input
 - PGID-based process group termination on timeout (no orphaned child processes)
+- Single-writer workspace lock prevents concurrent sessions from clobbering each other
 - Git rollback on session abandonment (no unrecoverable workspace corruption)
+- `harness purge --session-id` removes both checkpoint rows AND the per-session JSONL transcripts for GDPR-style deletion requests
 
 ---
 
@@ -356,17 +473,39 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Build command not found:** Sandbox returns exit code 127; parsed as a generic diagnostic.
 - **Sandbox auto-detect fails entirely:** Raises `RuntimeError` and emits `sandbox_start_failed` event; falls back to bare only when `HARNESS_ALLOW_UNSAFE_SANDBOX=true` is set.
 - **Token budget exhausted:** Gateway raises `RuntimeError` and emits `token_budget_exhausted` event.
+- **Pre-flight budget too low for next call:** Gateway raises `BudgetTooLowError` without contacting the provider; emits a WARNING.
+- **LLM returns empty content:** Gateway retries up to 2x; on exhaustion raises `EmptyLLMResponseError` and emits `llm_empty_response`. `repair_node` sets `llm_silent=True`; the graph short-circuits to HITL.
+- **Rate-limit circuit opens:** After 3 HTTP 429/5xx failures in 5 minutes, gateway diverts the next call to `force_local=True` (Ollama) and logs a WARNING.
+- **Workspace lock held by another session:** `cmd_run` exits 1 with a "lock held by PID X" message unless `--force-lock` is passed.
+- **Checkpoint corrupted:** `cmd_resume` raises `CheckpointCorruptedError`; the operator is offered fresh-start / restore-backup / purge-session options.
+- **Checkpoint schema mismatch:** `cmd_resume` raises `CheckpointSchemaMismatchError` and refuses to load if the stamped `_harness_schema_version` is higher than `CHECKPOINT_SCHEMA_VERSION`. Legacy (unstamped, pre-P2.4) checkpoints warn-and-allow.
+- **Patcher write target is a symlink:** Refused with a WARNING; symlink target is left intact.
+- **Discovery JSON > 1 MB or depth > 10:** `validate_discovery_json` returns an error without parsing or after a depth walk; the response is rejected.
+- **Discovery loop hits `max_discovery_iterations`:** Route short-circuits to `write_spec_node` with a WARNING; no further questions are issued.
+- **Auto-network detection fires but opt-in is off:** Sandbox does NOT enable network; logs a WARNING pointing at `sandbox.auto_enable_network_for_install`.
+- **Log file grows past `logging.max_bytes`:** `RotatingFileHandler` rolls the live file to `.1`, shifting older backups; oldest is dropped at `logging.backup_count`.
 - **HITL abandon chosen:** `_attempt_git_rollback()` runs and `hitl_gate_blocked` event is emitted.
 - **gitleaks not installed:** Security scan falls back to Python regex-based secret scanner.
 - **msgpack module missing:** `_deserialize_checkpoint_blob()` falls back to JSON text decoding for legacy rows.
 - **`harness doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
+- **`harness metrics` with no logs:** `--all` exits 1; `--session-id <id>` against a missing session exits 1 so cron detects regression.
 
 ### Boundary Conditions
 - **Max repair iterations:** 3 (hardcoded in `route_after_compiler`)
 - **Max security fix attempts:** 2 (hardcoded in `route_after_security_scan`)
+- **Max discovery iterations:** 10 (default; `node_throttle.max_discovery_iterations`, clamped to `[1, 30]`)
 - **Default budget cap:** $2.00 USD
 - **Sandbox timeout:** 300 seconds (configurable via `sandbox.timeout_seconds`)
 - **Checkpoint TTL:** 30 days (configurable via `persistence.ttl_days`)
+- **Checkpoint schema version:** `CHECKPOINT_SCHEMA_VERSION = 1` (current); minimum resumable: 1
+- **Log file rotation:** 10 MB live size, 5 backups (default; `logging.max_bytes` / `logging.backup_count`; `0` disables rotation)
+- **Discovery JSON byte cap:** 1 MB (`_MAX_DISCOVERY_BYTES`)
+- **Discovery JSON depth cap:** 10 (`_MAX_DISCOVERY_DEPTH`)
+- **Rate-limit circuit breaker threshold:** 3 failures in 5-minute sliding window
+- **Empty-LLM-response retry budget:** 2 extra retries after the transport-retry loop
+- **Pre-flight budget approach WARNING threshold:** within 20% of remaining cap
+- **Burn-rate window for `harness metrics`:** 10 minutes (default; `metrics.burn_rate_window_minutes`, clamped to `[1, 1440]`)
+- **Default metrics output dir:** `~/.harness/metrics/` (`metrics.metrics_dir`)
 - **Max files per directory in tree snapshot:** 50
 - **Max directory depth in tree snapshot:** 4
 - **Max skills file chars:** 4000 (harness) / 3000 (project)
@@ -377,10 +516,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 
 ### Recovery Scenarios
 - **Process killed mid-graph:** Next `harness run` loads from latest checkpoint; LangGraph replays from the boundary.
-- **Network timeout during LLM call:** Gateway retries with exponential backoff + jitter (up to 3 attempts).
+- **Network timeout during LLM call:** Gateway retries with exponential backoff + jitter (up to 3 attempts), then the rate-limit circuit breaker may divert to Ollama if the failure pattern persists.
 - **Build timeout in sandbox:** PGID-based `kill(-pgid, SIGKILL)` → `SIGTERM` escalation after 5s.
-- **Corrupted checkpoint DB:** `harness purge --all` wipes and recreates; sessions are lost but workspace is untouched.
+- **Single corrupted session:** `harness purge --session-id <id>` removes only that thread's checkpoints AND its JSONL log + rotated backups; other sessions are unaffected.
+- **Corrupted checkpoint DB across the board:** `harness purge --all` wipes and recreates; sessions are lost but the workspace is untouched.
+- **Stale workspace lock from a crashed prior session:** `harness run -r <ws> -p '...' --force-lock` releases the stale lock and acquires a fresh one (operator confirms the prior PID is gone). See `docs/RUNBOOK.md` § 4.
 - **Git stash conflict:** `git stash pop` may fail if stash conflicts; harness logs warning and continues (working tree is in the patch branch state).
+- **Self-serve recovery playbooks:** `docs/RUNBOOK.md` covers the top-five operator failure modes (checkpoint corrupted, budget exhausted mid-session, sandbox can't start, workspace lock refused, persistent LLM silence) with symptom / diagnostic / fix recipes.
 
 ---
 
@@ -405,7 +547,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Build output captured in full (stdout + stderr) via disk log streamer
 
 ### Maintainability
-- TypedDict + Pydantic dual schema for compile-time and runtime type safety
+- TypedDict schemas for compile-time type safety across nodes (Pydantic was evaluated and removed — see `SPEC_ARCHITECTURE.md` §5.8)
 - All nodes are isolated async functions with explicit state → state contracts
 - Gateway providers implement a common interface for easy addition of new providers
 - Diagnostic parsers are registered via a plugin registry (parser_registry.py)

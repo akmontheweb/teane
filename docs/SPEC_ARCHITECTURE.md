@@ -109,23 +109,32 @@ The harness is a single-process Python application with these deployable/service
 harness/
 ├── __init__.py           # Package init, version, __all__
 ├── cli.json              # Fallback defaults (shipped config)
-├── cli.py                # CLI entry, subcommand routing (run / resume / status / doctor / purge),
-│                         # HITL menus, config discovery, doctor healthchecks
+├── cli.py                # CLI entry, subcommand routing (run / resume / status / doctor /
+│                         # purge / metrics), HITL menus, config discovery, doctor healthchecks
+│   ├── _get_harness_version()   # importlib.metadata lookup feeding --version / -V
+│   ├── _acquire_workspace_lock()# fcntl single-writer lock (FR-038); --force-lock override
 │   ├── discover_config()        # Hierarchical merge: workspace → home → cli.json
 │   ├── _validate_config_keys()  # Recursive top-level + nested typo detection (FR-030)
-│   ├── cmd_run / cmd_resume / cmd_status / cmd_purge
-│   ├── cmd_doctor()             # 5-check healthcheck (FR-025)
-│   ├── _doctor_check_git / api_keys / sandbox / checkpoint_db / config
+│   ├── cmd_run / cmd_resume / cmd_status / cmd_purge / cmd_metrics
+│   ├── cmd_doctor()             # 6-check healthcheck (FR-025)
+│   ├── _doctor_check_git / global_config / api_keys / sandbox / checkpoint_db / config
+│   ├── _ping_provider_live()    # 1-token chat call per provider (PASS only after auth confirmed)
 │   ├── human_gatekeeper_node()  # Three-phase HITL gatekeeper
 │   ├── hitl_menu_loop()         # 7-action HITL menu: [v/r/e/m/b/s/q]
+│   ├── _emit_output()           # Routes machine-readable metrics to file / stdout
 │   └── interactive_review_loop()# Pre-flight manifest review
 ├── gateway.py            # Model-agnostic LLM Gateway
-│   ├── GatewayConfig     # Runtime config dataclass
-│   ├── Gateway           # Orchestrator: dispatch + budget + retry
+│   ├── GatewayConfig     # Runtime config dataclass (incl. max_discovery_iterations)
+│   ├── Gateway           # Orchestrator: dispatch + budget + retry + circuit breaker
+│   │   ├── _preflight_budget_check() # Raises BudgetTooLowError before any HTTP call (FR-035)
+│   │   ├── _circuit_is_open()        # 3-in-5min rate-limit breaker → divert to Ollama (FR-037)
+│   │   └── _retry_empty_response()   # Up to 2 retries on empty content (FR-036)
+│   ├── BudgetTooLowError / EmptyLLMResponseError  # Pre-flight + empty-content exceptions
 │   ├── DeepSeekProvider  # OpenAI-compatible /v1/chat/completions
 │   ├── AnthropicProvider # Claude /v1/messages with system prompt extraction
 │   ├── OpenAIProvider    # Standard /v1/chat/completions
 │   ├── OllamaProvider    # Local inference, free
+│   ├── BaseProviderClient# api_key resolution: explicit arg → env var → spec.api_key
 │   ├── retry_with_backoff()  # Exponential backoff + jitter
 │   └── check_context_window() # 85% threshold truncation
 ├── graph.py              # LangGraph StateGraph topology
@@ -140,11 +149,13 @@ harness/
 │   ├── deployment_discovery_node()   # LLM: 4-sector deployment discovery
 │   ├── write_spec_node() # Serialize discovery to .md files
 │   ├── generate_deployment_spec_node() # Produce DEPLOYMENT_BLUEPRINT.md
-│   ├── route_after_compiler()    # Conditional: repair / HITL / security_scan
-│   ├── route_after_discovery()   # Conditional: write_spec / discovery loop
+│   ├── route_after_compiler()    # Conditional: repair / HITL (short-circuits on llm_silent) / security_scan
+│   ├── route_after_discovery()   # Conditional: write_spec / discovery loop (capped at max_discovery_iterations, FR-043)
 │   ├── route_after_gatekeeper()  # Conditional: next phase / refinement loop
 │   ├── route_after_security_scan() # Conditional: patch / HITL / deployment
 │   ├── route_after_hitl()        # Conditional: compiler / END
+│   ├── _build_patcher_allowlist()# Conservative fallback when source root unclear (FR-041)
+│   ├── _apply_toolchain_adaptation() # pip/npm network auto-enable gated by config opt-in (FR-042)
 │   ├── apply_memory_cleanse()    # Compress verbose repair messages
 │   ├── build_graph()             # Assemble full StateGraph
 │   └── run_graph()               # Async entry point
@@ -165,15 +176,23 @@ harness/
 │   ├── TextPatcher       # Exact-match SEARCH/REPLACE
 │   ├── TreeSitterPatcher # AST-aware rewriting
 │   ├── HybridPatcher     # Auto-selects best strategy
+│   ├── _awrite()         # Symlink guard: refuses os.path.islink targets + O_NOFOLLOW (FR-041)
 │   ├── parse_patch_blocks() # Extract blocks from LLM text
 │   └── process_llm_patch_output() # Primary integration point
 ├── security.py           # Lifecycle & security
 │   ├── GitGuardian       # Branch creation, commit, rollback
 │   ├── CommandValidator  # Whitelist/blocklist command scanner
+│   ├── set_command_validator / get_command_validator # Process-wide singleton (FR-034)
+│   ├── create_command_validator_from_config()  # Built once in cmd_run / cmd_resume
 │   ├── HITLGate          # Pre-execution sensitive operation confirmation
 │   └── security_scan_node() # SAST + secret scanning gatekeeper
 ├── storage.py            # Checkpoint persistence
-│   ├── AsyncSqliteSaver  # Disk-backed LangGraph checkpointer
+│   ├── HarnessAsyncSqliteSaver # LangGraph checkpointer with message redaction +
+│   │                            # schema-version stamping on every aput / aput_writes
+│   ├── CHECKPOINT_SCHEMA_VERSION / SCHEMA_VERSION_METADATA_KEY  # Version stamp (FR-016, FR-033)
+│   ├── CheckpointCorruptedError / CheckpointSchemaMismatchError # Surfaced by cmd_resume pre-flight
+│   ├── validate_checkpoint_schema() # Refuses future versions; warns on legacy unstamped blobs
+│   ├── _deserialize_checkpoint_blob(strict=) # Strict mode raises instead of returning {}
 │   ├── CheckpointSummary # Read-only state snapshot
 │   ├── generate_session_id()
 │   ├── inspect_session() # Read-only status inspector
@@ -223,20 +242,30 @@ harness/
 │   └── _auto_approve()   # CI / HARNESS_AUTO_APPROVE / non-TTY auto-approve
 ├── observability.py      # Structured logging + JSONL session events
 │   ├── JSONFormatter     # One JSON object per log line, with `extra=` merge
-│   ├── configure_logging()  # Stderr + per-session JSONL + optional LangSmith
+│   ├── configure_logging()  # Stderr + per-session JSONL (RotatingFileHandler,
+│   │                          10 MB × 5 backups default; max_bytes=0 disables) + LangSmith (FR-040)
 │   ├── emit_event()      # INFO-level structured event (successful / observational)
 │   └── log_failure()     # ERROR-level structured failure event (FR-029)
 │                         # Catalogue: sandbox_start_failed, token_budget_exhausted,
-│                         #            hitl_gate_blocked.
+│                         #            hitl_gate_blocked, llm_empty_response, llm_circuit_open.
 ├── trust.py              # Workspace boundary enforcement + structured-output trust
 │   ├── safe_resolve()           # Block path traversal outside workspace_root
 │   ├── is_path_allowed()
 │   ├── is_valid_docker_image / service_name / env_var_name / port_mapping
 │   ├── validate_blueprint()     # Deploy blueprint schema check
-│   ├── validate_discovery_json()# Discovery-LLM output trust gate
+│   ├── validate_discovery_json()# Discovery-LLM trust gate: 1 MB byte cap + depth-10 walk (FR-039)
 │   ├── validate_blueprint_json()# Deploy-LLM output trust gate
 │   ├── validate_synthesized_spec()  # Manifest-synthesis trust gate (Bug 7 closure)
 │   └── safe_subprocess_env()    # Scrub envrionment passed to sandbox subprocess
+├── metrics.py            # Cost-metrics aggregation for `harness metrics` (FR-032)
+│   ├── SessionMetrics    # @dataclass: per-session cost / tokens / errors / burn rate
+│   ├── parse_jsonl_file()        # Tolerant line-by-line JSONL reader
+│   ├── _sorted_session_log_files()  # Live <id>.jsonl + rotated .N backups in chronological order
+│   ├── aggregate_session()       # Sum cost/tokens, count failures, compute window burn rate
+│   ├── list_sessions()           # Distinct session IDs from filenames (dedups rotation suffix)
+│   ├── project_exhaustion()      # Minutes until hard_cap_usd at current burn rate
+│   ├── format_human / format_table / format_prometheus
+│   └── write_atomic()    # <dest>.tmp → fsync → os.replace, atomic from a scraper's POV
 └── parser_registry.py    # Diagnostic parser plugins (FR-026)
     ├── RustParser        # --error-format=json
     ├── GccClangParser    # -fdiagnostics-format=json
@@ -398,10 +427,12 @@ AgentState fields and which nodes write to them:
 | **HTTP Client** | httpx ≥ 0.28 | Async HTTP/2 with connection pooling and timeout management |
 | **Config** | JSON (discovered hierarchically) | Workspace `.harness_config.json` → `~/.harness/config.json` → `cli.json` |
 | **Testing** | pytest + pytest-asyncio | Async test support, fixture injection, coverage |
-| **CI** | GitHub Actions matrix | `pytest tests/ -q --tb=short` on push to `main` and PRs across Python 3.11 / 3.12 / 3.13 |
-| **Pre-commit** | pre-commit + local pytest hook | Same suite runs locally as in CI; bypassable with `--no-verify` for emergencies only |
-| **Linting** | ruff ≥ 0.8 | Fast Python linter + formatter |
-| **Type Checking** | mypy ≥ 1.13 (strict mode) | TypedDict validation |
+| **CI** | GitHub Actions matrix | `pytest tests/ -q --tb=short` across Python 3.11 / 3.12 / 3.13 on `ubuntu-latest` (blocking) + Python 3.12 on `macos-latest` and `windows-latest` (advisory `continue-on-error`); separate `quality` job runs `ruff check` (blocking) plus `ruff format` and `mypy` (advisory). |
+| **Pre-commit** | pre-commit + local pytest hook + ruff | Same suite + lint gate runs locally as in CI; bypassable with `--no-verify` for emergencies only |
+| **Linting** | ruff ≥ 0.8 | Fast Python linter + formatter; `ruff check harness/ tests/` is the blocking CI gate |
+| **Type Checking** | mypy ≥ 1.13 (strict mode) | TypedDict validation; advisory in CI pending typing backlog |
+| **Pinned install (pilot)** | `requirements-prod.txt` | Exact transitive pins for reproducible installs: `pip install -e . --constraint requirements-prod.txt` |
+| **License** | MIT (`LICENSE` at repo root) | `pyproject.toml` references the file so the wheel ships it and GitHub auto-detects |
 | **Sandbox (primary)** | Docker CLI | Strongest isolation, built-in resource limits; preferred by `backend: "auto"` |
 | **Sandbox (fallback)** | Linux unshare(2) | Kernel namespace isolation without Docker dependency |
 | **Sandbox (opt-in)** | bare subprocess | Zero isolation; opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true` for environments where neither Docker nor user-namespaces are available |
@@ -571,11 +602,94 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.20 Structured Failure-Event Catalogue
 
-**Decision**: Failure sites emit structured events via `harness.observability.log_failure(name, **fields)` — an ERROR-level mirror of the existing `emit_event` helper. Each event carries a snake_case `event` field, so failures are grep-able from the per-session JSONL log by event name instead of by string fragment. The initial catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`.
+**Decision**: Failure sites emit structured events via `harness.observability.log_failure(name, **fields)` — an ERROR-level mirror of the existing `emit_event` helper. Each event carries a snake_case `event` field, so failures are grep-able from the per-session JSONL log by event name instead of by string fragment. The catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`, `llm_empty_response`, `llm_circuit_open`.
 
-**Rationale**: Logging was already comprehensive but inconsistent — every module invented its own `logger.error("...")` format, so an operator scanning a failure across modules had to grep multiple substrings. A named event catalogue makes the failure modes a first-class queryable shape: `jq 'select(.event == "token_budget_exhausted")'`.
+**Rationale**: Logging was already comprehensive but inconsistent — every module invented its own `logger.error("...")` format, so an operator scanning a failure across modules had to grep multiple substrings. A named event catalogue makes the failure modes a first-class queryable shape: `jq 'select(.event == "token_budget_exhausted")'`. The catalogue also feeds `harness metrics`, which counts each event per session.
 
 **Trade-off**: New failure sites need a name. The `log_failure` docstring lists naming conventions (`_failed`, `_exhausted`, `_blocked`) and the canonical catalogue, so authors can extend it without inventing new patterns.
+
+### 5.21 Checkpoint Message Redaction (P0.1)
+
+**Decision**: `HarnessAsyncSqliteSaver.aput` / `aput_writes` scrub the `messages` channel through `harness.redactor.redact_messages` before letting LangGraph's serializer touch it. Opt-out via `persistence.redact_messages: false`. Redactor crashes fail open (log a WARNING, persist the original) so a redactor bug can never block the checkpoint write itself.
+
+**Rationale**: Pre-transmission redaction (5.5) already kept secrets out of outbound API calls, but the *checkpoint* was unguarded. A pasted API key landed at rest in `~/.harness/checkpoints.db` (msgpack blob) — a privacy/exposure hole if backups left the host. Scrubbing on the write path closes the hole without touching the in-memory state the running graph holds.
+
+**Trade-off**: Operators who want verbatim transcripts (audit, replay) need to flip the opt-out explicitly. That's the safer default — silent loss-of-fidelity is preferred to silent loss-of-secrecy.
+
+### 5.22 Patcher Symlink Guard + Conservative Allowlist (P1.1, P1.2)
+
+**Decision**: The async writer in `harness/patcher.py` refuses to write through any path where `os.path.islink(target)` is true and uses `O_NOFOLLOW` on Linux/macOS to catch races. When the source-root heuristic can't decide on a project layout, `_build_patcher_allowlist` returns a conservative set (`src/`, `lib/`, `app/`, `pkg/`, `cmd/`, `tests/`, `test/`, `__tests__/`, plus `_ROOT_ALLOWLIST_FILES` and any `requirements*.txt`) and logs a WARNING so the operator can fix detection.
+
+**Rationale**: A malicious LLM output (or a confused one) shouldn't be able to walk an attacker-controlled symlink out of the workspace, and a flat / unfamiliar workspace shouldn't open the harness up to whole-tree rewrites. Both are defence-in-depth — neither is the primary boundary, but together they collapse the blast radius of an LLM hallucination from "anywhere on disk" to "the part of the workspace that looks like source."
+
+**Trade-off**: Windows native has no portable `O_NOFOLLOW`; the `islink` check is the only guard there (TOCTOU window, but small). The conservative allowlist may refuse a legitimate write in an exotic layout — that surfaces as a clear WARNING the operator can act on.
+
+### 5.23 Network Auto-Enable Opt-In (P1.3)
+
+**Decision**: `_apply_toolchain_adaptation` no longer auto-flips `allow_network=True` on detected pip/npm install commands unless `sandbox.auto_enable_network_for_install: true` is set. When the heuristic fires with the opt-in off, the function logs a WARNING pointing the operator at the config key.
+
+**Rationale**: Auto-enabling network on heuristic match is a least-surprise *footgun* — it silently relaxes the sandbox boundary because the build command looks plausible-installish. The opt-in keeps the heuristic available for operators who know they want it while making the default match the principle of least privilege.
+
+**Trade-off**: Operators who *do* rely on the heuristic must remember one config flag. The WARNING in the log makes the missing flag discoverable on the first session that hits it.
+
+### 5.24 Pre-Flight Budget Refusal + Empty-LLM Handling + Circuit Breaker (P1.4 / P1.5 / P1.9)
+
+**Decision**: Three reliability primitives on the gateway path, working together:
+- **Pre-flight budget** (`BudgetTooLowError`): estimate `(input_chars/4) × input_rate + 4000 × output_rate`; refuse before any HTTP call if the estimate exceeds `budget_remaining_usd`. WARNING when a call lands within 20% of the cap.
+- **Empty-response retry** (`EmptyLLMResponseError`): retry up to two extra times on empty content; on exhaustion, `repair_node` sets `llm_silent=True` and `route_after_compiler` short-circuits to HITL instead of waiting for the 3-cycle repair cap.
+- **Rate-limit circuit breaker**: 3 HTTP 429/5xx failures in a 5-minute sliding window opens the breaker; the next `dispatch` diverts to `force_local=True` (Ollama).
+
+**Rationale**: Each closes a specific failure mode the pilot can hit in the first hour — runaway prompt overflowing the cap, a stuck provider returning empty bodies, persistent throttling. Doing all three on the same surface (the gateway) keeps the policy in one place and the routing simple.
+
+**Trade-off**: The budget pre-flight is conservative (assumes worst-case 4000-token output); a few legitimate calls will be refused that *would* have fit. Operators can raise the cap. Empty-response detection treats `""` as the signal — a real LLM that legitimately returns an empty string (rare) gets retried twice unnecessarily.
+
+### 5.25 Strict Checkpoint Deserialize + Schema Versioning (P1.6 / P2.4)
+
+**Decision**: `_deserialize_checkpoint_blob(strict=True)` raises `CheckpointCorruptedError` instead of returning `{}`. `cmd_resume` pre-flights the most recent blob with `strict=True` and surfaces a clear operator message on corruption. `doctor` scans the 5 most recent rows. Every checkpoint metadata blob now carries `_harness_schema_version` (current `CHECKPOINT_SCHEMA_VERSION = 1`); `validate_checkpoint_schema` refuses futures (`CheckpointSchemaMismatchError`) and warns-then-allows legacy unstamped blobs.
+
+**Rationale**: The previous "silently restore empty state" path was the worst possible failure shape — the graph appeared to resume but actually restarted from scratch, often clobbering the workspace with a fresh first patch. Strict mode + a clear operator message ("fresh start / restore backup / purge session") makes the recovery path explicit. Schema versioning future-proofs the on-disk format against the first MAJOR bump that adds a required AgentState field.
+
+**Trade-off**: Operators with corrupted checkpoints now see a hard refusal instead of an opaque fresh-start. That's the desired outcome — see `docs/RUNBOOK.md` § 1 for the recovery recipe.
+
+### 5.26 Single-Writer Workspace Lock (P1.7)
+
+**Decision**: `cmd_run` acquires an `fcntl.flock(LOCK_EX | LOCK_NB)` on `<workspace>/.harness_session.lock` at startup. The handle is pinned in a module-level slot so the OS holds it for the process lifetime. `--force-lock` releases a stale lock and acquires fresh, logging a WARNING. Platforms without `fcntl` (Windows native) skip locking with a DEBUG log.
+
+**Rationale**: Two `harness run` sessions on the same workspace were a real footgun — race on patch branches, fight over the build command, write to the same files. An advisory file lock is the cheap correct fix, and `--force-lock` gives the operator an escape hatch for the crashed-prior-session case (see `docs/RUNBOOK.md` § 4).
+
+**Trade-off**: Windows native gets no enforcement — single-writer is the operator's responsibility there. We accept this rather than pull in `msvcrt.locking` (different semantics, more surprises).
+
+### 5.27 Discovery JSON Trust Guards (P2.2)
+
+**Decision**: `trust.validate_discovery_json` rejects payloads larger than 1 MB (UTF-8 byte length) before invoking `json.loads`, and rejects parsed trees deeper than 10 levels via a cycle-safe `_json_depth` walker. The existing per-question (10,000 chars) and module-count (50) caps remain.
+
+**Rationale**: A malicious or runaway LLM could synthesize a 50 MB JSON or a billion-laughs-style nested object that hits Python's default 1000-frame recursion limit and crashes the process. The byte cap kills the obvious pathological input before parsing; the depth walk catches the rest.
+
+**Trade-off**: A pathological-but-legitimate response above either cap is rejected. A normal discovery is depth ~4 and a few KB, so the margin is two orders of magnitude.
+
+### 5.28 Log Rotation (P2.3)
+
+**Decision**: `configure_logging` installs a `RotatingFileHandler` for the per-session JSONL by default (`maxBytes=10_000_000`, `backupCount=5`). Configurable via `logging.max_bytes` and `logging.backup_count`. Setting `max_bytes=0` falls back to plain `FileHandler` for operators pinning a single non-rotating file.
+
+**Rationale**: The plain `FileHandler` had no upper bound — a long pilot session could silently fill the customer's disk over weeks. 10 MB × 5 backups gives ~50 MB per session for post-mortem coverage without unbounded growth.
+
+**Trade-off**: A rotation in the middle of a session means the most-recent file is the *live* one, with older content in `.1`, `.2`, …; tools that read the JSONL (notably `harness metrics`) sort the rotated suffixes chronologically before iterating.
+
+### 5.29 Process-Wide CommandValidator (P0.2)
+
+**Decision**: `cmd_run` and `cmd_resume` build a `CommandValidator` via `create_command_validator_from_config(config)` and register it process-wide with `set_command_validator()`. `SandboxExecutor.__init__` falls back to the global default when no explicit validator is passed. Mirrors the redactor's global-scanner pattern.
+
+**Rationale**: The validator existed but every `SandboxExecutor(...)` call site defaulted `command_validator=None`, and the inner guard short-circuited validation entirely on None. The runtime quietly ran without the defence layer that the codebase already shipped. A process-wide registration ensures every executor — including ones added in the future — picks it up without modification.
+
+**Trade-off**: Tests that previously instantiated `SandboxExecutor` directly with `command_validator=None` and expected no validation now inherit the global if one is set; tests explicitly assert behaviour with and without the global. Explicit constructor argument still wins, so test isolation is unaffected.
+
+### 5.30 Cost-Metrics Aggregation (P2.7)
+
+**Decision**: `harness metrics` (CLI surface) plus `harness/metrics.py` (pure aggregation) reconstruct per-session cost, token, and error metrics by reading `<id>.jsonl` + `<id>.jsonl.*` rotated backups. Outputs: human (stdout), `--json`, `--prometheus`. Machine-readable outputs default to `~/.harness/metrics/` (configurable via `metrics.metrics_dir`) and are written atomically (`<dest>.tmp` → `os.replace`). Burn rate is computed over a trailing window (default 10 minutes); exhaustion is projected against `token_budget.hard_cap_usd`.
+
+**Rationale**: Operators running multiple sessions had no way to see aggregate cost or "when will I hit the cap at this rate" without a hand-rolled jq pipeline. Doing it as a read-only CLI (instead of an HTTP daemon) matches the single-tenant pilot scope — a cron job emitting `--prometheus` is enough for node_exporter textfile-collector scrape, with no auth/network surface to harden.
+
+**Trade-off**: Metrics live entirely on disk (the JSONL logs are the source of truth). Purging logs deletes the metrics record too — by design, since `harness purge --session-id` is the GDPR-deletion path. For longer-term retention, operators redirect `logging.log_dir` and `metrics.metrics_dir` to a managed location.
 
 ---
 
@@ -629,8 +743,8 @@ Table: checkpoints
 ├── checkpoint_id: TEXT (PK composite)
 ├── parent_checkpoint_id: TEXT
 ├── type: TEXT
-├── checkpoint: BLOB (JSON serialized state)
-├── metadata: BLOB (JSON)
+├── checkpoint: BLOB (msgpack — channel_values with `messages` redacted via harness.redactor)
+├── metadata: BLOB (msgpack — includes `_harness_schema_version` stamp, current = 1)
 ├── created_at: TEXT
 └── updated_at: TEXT
 
@@ -714,9 +828,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 ## 8. Deployment & Environment
 
 ### 8.1 Runtime Requirements
-- Python 3.11+ (3.11 / 3.12 / 3.13 covered by CI)
-- Linux is the only platform actively tested. macOS and Windows + WSL2 are
-  best-effort via the Docker backend — see the platform matrix in `README.md`.
+- Python 3.11+ (3.11 / 3.12 / 3.13 covered by CI; macOS + Windows on 3.12 as advisory `continue-on-error` matrix entries)
+- Linux is the blocking CI target. macOS and Windows + WSL2 are best-effort via the Docker backend; the `unshare` backend and fcntl workspace lock are Linux-only.
 - Git 2.x+ (for branch lifecycle management)
 - Sandbox: Docker daemon (preferred), OR Linux user-namespace support
   (`unshare --user`), OR opt-in bare via `HARNESS_ALLOW_UNSAFE_SANDBOX=true`.
@@ -729,19 +842,33 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 | `cli.json` | Shipped with package | Absolute fallback defaults |
 | `~/.harness/config.json` | User home | Global default models and settings |
 | `.harness_config.json` | Workspace root | Per-project override (highest priority) |
+| `requirements-prod.txt` | Repo root | Exact transitive pins for reproducible pilot installs (`pip install -e . --constraint requirements-prod.txt`) |
+| `LICENSE` | Repo root | MIT license; referenced from `pyproject.toml` so wheels ship it |
+
+**Top-level config sections**: `build_command`, `allow_network`, `sandbox`, `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`.
+
+**Key recent additions**:
+- `persistence.redact_messages` (default `true`) — opt out of checkpoint message redaction.
+- `sandbox.auto_enable_network_for_install` (default `false`) — opt in to auto-enabling network on detected pip/npm install.
+- `node_throttle.max_discovery_iterations` (default `10`, clamped `[1, 30]`) — hard cap on discovery loop.
+- `logging.max_bytes`, `logging.backup_count` — rotation knobs for the per-session JSONL file (default 10 MB × 5).
+- `metrics.metrics_dir` (default `~/.harness/metrics`) and `metrics.burn_rate_window_minutes` (default `10`) — `harness metrics` output and window.
 
 ### 8.3 Environment Variables
 | Variable | Purpose |
 |----------|---------|
-| `DEEPSEEK_API_KEY` | DeepSeek API authentication |
+| `DEEPSEEK_API_KEY` | DeepSeek API authentication (env wins precedence over `models["<key>"].api_key` config field) |
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) API authentication |
 | `OPENAI_API_KEY` | OpenAI API authentication |
 | `CI` | Detect CI environment (auto-approve HITL gate behavior) |
 | `HARNESS_AUTO_APPROVE` | Force auto-approve for non-interactive runs |
 | `HARNESS_ALLOW_UNSAFE_SANDBOX` | Opt in to the `bare` (zero-isolation) sandbox backend when neither Docker nor `unshare` is available. Never set this outside a disposable VM. |
 | `NO_COLOR` | Suppress ANSI colour markers in `harness doctor` output. |
+| `HARNESS_DOCTOR_SKIP_LIVE` | Truthy value (`1` / `true` / `yes`) skips the live 1-token chat ping the `api keys` check makes against each configured provider. Falls back to key-presence-only validation. Useful for CI runs where outbound HTTPS is blocked. |
 | `LANGCHAIN_API_KEY` | Required when `logging.langsmith=true` to forward traces to LangSmith. |
 | `LANGCHAIN_TRACING_V2`, `LANGSMITH_PROJECT` | Additional LangSmith trace routing knobs honoured by `configure_logging`. |
+
+API keys can also live in `models["<provider>:<model>"].api_key` inside any config layer — the gateway's resolution order is explicit arg → env var → config field, and `harness doctor` reflects the same policy.
 
 ### 8.4 Generated Files (during execution)
 - `docs/SPEC_REQUIREMENTS.md` — Requirements specification
@@ -750,5 +877,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 - `Dockerfile` / `Dockerfile.<service>` — Per-service container images
 - `docker-compose.yml` — Multi-service orchestration
 - `Caddyfile` — Reverse proxy routing rules
-- `~/.harness/checkpoints.db` — Session checkpoint database
+- `~/.harness/checkpoints.db` — Session checkpoint database (WAL mode; metadata includes `_harness_schema_version`)
+- `~/.harness/logs/<session-id>.jsonl[.N]` — Per-session structured JSONL log (rotated)
+- `~/.harness/metrics/<session-id>.{json,prom}` — `harness metrics` outputs (configurable via `metrics.metrics_dir`)
+- `<workspace>/.harness_session.lock` — fcntl single-writer lock; auto-released when the process exits
 - `/tmp/.harness/` — Temporary sandbox build logs (auto-cleaned)

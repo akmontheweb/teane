@@ -1,5 +1,53 @@
 {
-    "_comment": "Example global config for AI Agent Harness. Copy to config.json and fill in your own model registry, API keys, and routing. The real config.json is .gitignored because it carries secrets — never commit it.",
+    "_comment": "Example canonical configuration for the AI Agent Harness. Copy this file to config.json (same directory) and adjust to taste. The real config.json is .gitignored. The harness reads ONLY this file — there are no fallback defaults, no per-workspace overrides, no auto-generated workspace configs. Validation is strict: unknown keys, typos, wrong types, missing required fields, or missing API key env vars all cause the harness to exit (code 2) BEFORE any LLM call. API keys are NEVER stored in this file — set them as env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY) before running. Keys for models that are declared here but NOT referenced in model_routing below are not required. Ollama (local) models need no env var.",
+
+    "_build_command_comment": "Default shell command the sandbox runs to compile / test the workspace. The compiler_node auto-adapts this per-workspace (e.g. 'make build' → 'python3 -m pytest -q' when no Makefile is present and pyproject.toml exists). Override per-run via the --build-cmd CLI flag.",
+    "build_command": "make build",
+
+    "_allow_network_comment": "Default for whether the build sandbox is allowed network access. compiler_node auto-flips to true when the build command contains 'pip install', 'npm install', etc. Override per-run via --allow-network.",
+    "allow_network": true,
+
+    "_manifest_file_comment": "Filename the harness looks for in the workspace root when synthesizing SPEC_REQUIREMENTS.md from raw product notes. Override per-run via --manifest.",
+    "manifest_file": "product_spec.txt",
+
+    "_sandbox_comment": "Build-sandbox isolation. 'backend' is the isolation strategy: 'auto' picks docker if installed else unshare(8) else bare-subprocess. 'docker_image' is the base container image (compiler_node auto-swaps to python:3.12-slim / node:20-slim / etc. based on the toolchain implied by build_command). Memory / CPU / PID limits cap container resource use. readonly_cache_mounts are host directories bind-mounted read-only into the container so package managers find their warm caches. timeout_seconds is the hard cap on a single build run. pgid_kill_on_timeout=true sends SIGKILL to the process group on timeout. restore_workspace_ownership=true causes the harness to either pass --user $UID:$GID to docker (Linux non-root host) or run a chown trailer so the bind-mounted workspace doesn't end up root-owned.",
+    "sandbox": {
+        "backend": "auto",
+        "docker_image": "ubuntu:22.04",
+        "docker_memory_limit": "512m",
+        "docker_cpu_limit": "1.0",
+        "docker_pids_limit": 100,
+        "readonly_cache_mounts": [
+            "~/.cache/pip",
+            "~/.npm",
+            "~/.cache/yarn",
+            "~/.pnpm-store",
+            "~/.cache/go-build",
+            "~/.cargo/registry",
+            "~/.m2",
+            "~/.gradle",
+            "~/.pub-cache"
+        ],
+        "timeout_seconds": 300,
+        "pgid_kill_on_timeout": true,
+        "restore_workspace_ownership": true
+    },
+
+    "_token_budget_comment": "Spend caps. hard_cap_usd is the per-session dollar ceiling — the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window.",
+    "token_budget": {
+        "hard_cap_usd": 2.00,
+        "context_window_threshold_pct": 0.85
+    },
+
+    "_node_throttle_comment": "Per-loop iteration ceilings. max_patch_repair_iterations caps build-repair retries before HITL. max_doc_review_cycles / max_code_review_cycles cap the adversarial reviewer revisions. max_discovery_iterations caps the requirements/architecture interview loop.",
+    "node_throttle": {
+        "max_patch_repair_iterations": 3,
+        "max_doc_review_cycles": 1,
+        "max_code_review_cycles": 1,
+        "max_discovery_iterations": 10
+    },
+
+    "_models_comment": "Model registry. Every LLM the harness can dispatch to must be declared here. The key (e.g. 'openai:gpt-4o-mini') is the routing handle used in model_routing below. Required fields: provider (openai/anthropic/deepseek/ollama), model_id (vendor's name), context_window. Cost fields drive the budget tracker. supports_thinking=true allows extended-thinking when a role's *_mode is 'thinking' or 'thinking_max'. supports_cache=true enables prefix-caching. api_key MUST stay empty here — set keys as env vars ({PROVIDER}_API_KEY). The gateway reads env vars at dispatch time; the api_key field is informational only.",
     "models": {
         "openai:gpt-4o": {
             "provider": "openai",
@@ -10,8 +58,8 @@
             "cached_input_cost_per_1m": 1.25,
             "api_base_url": "https://api.openai.com/v1",
             "supports_thinking": false,
-            "supports_cache": true,
-            "_api_key_hint": "Prefer setting OPENAI_API_KEY in your shell. Inline 'api_key' here works too but be careful — this file holds secrets."
+            "api_key": "",
+            "supports_cache": true
         },
         "openai:gpt-4o-mini": {
             "provider": "openai",
@@ -22,6 +70,7 @@
             "cached_input_cost_per_1m": 0.075,
             "api_base_url": "https://api.openai.com/v1",
             "supports_thinking": false,
+            "api_key": "",
             "supports_cache": true
         },
         "anthropic:claude-sonnet-4": {
@@ -33,8 +82,8 @@
             "cached_input_cost_per_1m": 0.30,
             "api_base_url": "https://api.anthropic.com/v1",
             "supports_thinking": false,
-            "supports_cache": true,
-            "_api_key_hint": "Set ANTHROPIC_API_KEY in your shell."
+            "api_key": "",
+            "supports_cache": true
         },
         "deepseek:deepseek-v4-pro": {
             "provider": "deepseek",
@@ -44,8 +93,8 @@
             "output_cost_per_1m": 0.28,
             "cached_input_cost_per_1m": 0.014,
             "api_base_url": "https://api.deepseek.com/v1",
-            "supports_thinking": false,
-            "api_key": "REPLACE_WITH_YOUR_DEEPSEEK_KEY",
+            "supports_thinking": true,
+            "api_key": "",
             "supports_cache": true
         },
         "deepseek:deepseek-v4-flash": {
@@ -57,7 +106,7 @@
             "cached_input_cost_per_1m": 0.014,
             "api_base_url": "https://api.deepseek.com/v1",
             "supports_thinking": false,
-            "api_key": "REPLACE_WITH_YOUR_DEEPSEEK_KEY",
+            "api_key": "",
             "supports_cache": true
         },
         "ollama:qwen2.5-coder:14b": {
@@ -68,38 +117,60 @@
             "output_cost_per_1m": 0.0,
             "api_base_url": "http://localhost:11434/v1",
             "supports_thinking": false,
+            "api_key": "",
             "supports_cache": false
         }
     },
+
+    "_model_routing_comment": "Maps the harness's internal roles to model keys from the registry above. Only models referenced here are 'active' — declared-but-unrouted models don't require a {PROVIDER}_API_KEY env var. *_primary fields are REQUIRED (planning, patching, repair) — the harness exits at startup if any is empty or references a missing model. *_fallback fires when the primary returns empty / errors. *_mode controls extended-thinking: 'thinking_max' (largest budget), 'thinking' (conservative), 'non_thinking' (off). doc_reviewer_* and code_reviewer_* are optional — empty primary disables that role. ollama_local_model + force_local_only let operators route everything to a local Ollama model for offline / cost-control use.",
     "model_routing": {
-        "_comment": "Default routing for all projects. Override per-project in .harness_config.json. Point each role to a model_key registered above.",
         "planning_primary": "deepseek:deepseek-v4-flash",
-        "planning_fallback": "deepseek:deepseek-v4-flash",
+        "planning_mode": "thinking_max",
+        "planning_fallback": "deepseek:deepseek-v4-pro",
         "patching_primary": "deepseek:deepseek-v4-pro",
+        "patching_mode": "thinking",
         "repair_primary": "deepseek:deepseek-v4-pro",
-        "_doc_reviewer_comment": "Doc reviewer LLM — independent of code reviewer. Setting doc_reviewer_primary IS the opt-in; leave empty to skip doc review entirely.",
-        "doc_reviewer_primary": "",
+        "repair_mode": "thinking",
+        "repair_fallback": "deepseek:deepseek-v4-pro",
+        "doc_reviewer_primary": "openai:gpt-4o-mini",
         "doc_reviewer_mode": "thinking",
-        "doc_reviewer_fallback": "",
-        "_code_reviewer_comment": "Code reviewer LLM — independent of doc reviewer. Setting code_reviewer_primary IS the opt-in; leave empty to skip code review entirely.",
-        "code_reviewer_primary": "",
+        "doc_reviewer_fallback": "openai:gpt-4o",
+        "code_reviewer_primary": "openai:gpt-4o-mini",
         "code_reviewer_mode": "thinking",
-        "code_reviewer_fallback": "",
-        "ollama_local_model": "ollama:qwen2.5-coder:14b"
+        "code_reviewer_fallback": "openai:gpt-4o",
+        "ollama_local_model": "ollama:qwen2.5-coder:14b",
+        "ollama_local_backup": "",
+        "force_local_only": false
     },
-    "node_throttle": {
-        "_comment": "Per-loop hard ceilings. Review cycles clamp [0,5]; discovery clamp [1,30]; 0 suspends a review loop without clearing the model slot.",
-        "max_patch_repair_iterations": 3,
-        "max_doc_review_cycles": 1,
-        "max_code_review_cycles": 1,
-        "max_discovery_iterations": 10
-    },
-    "token_budget": {
-        "hard_cap_usd": 2.00,
-        "context_window_threshold_pct": 0.85
-    },
+
+    "_persistence_comment": "Where LangGraph stores session checkpoints. db_path is the SQLite file path (default: per-user). ttl_days expires checkpoints older than this on every harness run — set to 0 to disable GC.",
     "persistence": {
         "db_path": "~/.harness/checkpoints.db",
         "ttl_days": 30
+    },
+
+    "_logging_comment": "Structured logging. level is the root logger level (DEBUG/INFO/WARNING/ERROR). log_dir is where per-session JSONL log files land. json_stderr=true emits each log record as one JSON line to stderr (good for log aggregators). langsmith=true enables LangSmith tracing if LANGCHAIN_API_KEY is set.",
+    "logging": {
+        "level": "INFO",
+        "log_dir": "~/.harness/logs",
+        "json_stderr": false,
+        "langsmith": false
+    },
+
+    "_lintgate_comment": "Lintgate behaviour after patches land. format_modified_files=false (default) skips the auto-formatter on pre-existing files so the harness doesn't clobber user style. Linters still run on every modified file.",
+    "lintgate": {
+        "format_modified_files": false
+    },
+
+    "_test_generation_comment": "Auto-generate stack-specific unit tests for modified source files after patching. enabled=false disables the test_generation_node entirely. max_iterations caps retries.",
+    "test_generation": {
+        "enabled": true,
+        "max_iterations": 2
+    },
+
+    "_metrics_comment": "Cost-metrics aggregation for the `harness metrics` subcommand. burn_rate_window_minutes is the rolling window for the live burn-rate gauge (clamped to [1, 1440]). metrics_dir is where --json / --prometheus outputs land.",
+    "metrics": {
+        "burn_rate_window_minutes": 10,
+        "metrics_dir": "~/.harness/metrics"
     }
 }

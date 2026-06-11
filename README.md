@@ -82,6 +82,7 @@ the preview gate, and how to bring the same setup up on a different host.
 | `harness status` | Read-only inspection of a checkpointed session. |
 | `harness doctor` | Run first-run healthchecks (git, API keys, sandbox, DB, config). |
 | `harness purge` | Wipe checkpoint data. |
+| `harness metrics` | Per-session cost / burn-rate / Prometheus aggregation from logs. |
 | `harness --version` | Print the installed harness version and exit. |
 
 ### `harness run`
@@ -136,6 +137,24 @@ config parse), prints a colored summary, and exits 0 if all pass.
 | `--session-id` | Purge a specific session only. |
 | `-r`, `--workspace` | Workspace path (for config discovery). |
 
+### `harness metrics`
+
+| Flag | Purpose |
+|------|---------|
+| `--session-id` | Aggregate one session into a human report (stdout). |
+| `--all` | Roll-up table across every session in the log dir (stdout). |
+| `--json` | Emit JSON to `<metrics_dir>/<id>.json` (or `sessions.json` with `--all`). |
+| `--prometheus` | Emit Prometheus exposition to `<metrics_dir>/<id>.prom` (or `all.prom`). |
+| `--output <path>` | Override destination. Use `-` to write to stdout. |
+| `--window-minutes <n>` | Burn-rate trailing window (default 10; `metrics.burn_rate_window_minutes`). |
+| `-r`, `--workspace` | Workspace path (for config discovery). |
+
+Default `metrics_dir` is `~/.harness/metrics/`; override globally via
+`metrics.metrics_dir` in `~/.harness/config.json` (point it at e.g. a
+node_exporter textfile collector directory). Writes are atomic
+(`<dest>.tmp` → `os.replace`) so scrapers never see a half-written
+file.
+
 ## Configuration
 
 Configuration is layered, with later layers overriding earlier ones:
@@ -147,9 +166,10 @@ Configuration is layered, with later layers overriding earlier ones:
 
 Top-level sections: `build_command`, `allow_network`, `sandbox`,
 `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`,
-`logging`, `lintgate`, `deployment`. Unknown top-level *and* nested keys are
-warned about at load time with fuzzy-match suggestions — see
-[`docs/SPEC_REQUIREMENTS.md`](docs/SPEC_REQUIREMENTS.md) for the full schema.
+`logging`, `lintgate`, `deployment`, `metrics`. Unknown top-level *and*
+nested keys are warned about at load time with fuzzy-match suggestions —
+see [`docs/SPEC_REQUIREMENTS.md`](docs/SPEC_REQUIREMENTS.md) for the full
+schema.
 
 ## Troubleshooting
 

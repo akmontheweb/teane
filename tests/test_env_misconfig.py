@@ -28,7 +28,7 @@ class TestIsEnvMisconfig:
     def test_python_no_module_named_pytest(self):
         # The exact wording from the user's incident.
         raw = "/usr/local/bin/python3: No module named pytest\n"
-        assert _is_env_misconfig(raw) == "pytest"
+        assert _is_env_misconfig(raw) == ("pytest", "python")
 
     def test_modulenotfounderror(self):
         raw = (
@@ -36,22 +36,22 @@ class TestIsEnvMisconfig:
             "  File \"<stdin>\", line 1, in <module>\n"
             "ModuleNotFoundError: No module named 'requests'\n"
         )
-        assert _is_env_misconfig(raw) == "requests"
+        assert _is_env_misconfig(raw) == ("requests", "python")
 
     def test_command_not_found_npm(self):
         raw = "/bin/sh: 1: npm: not found\n"
-        assert _is_env_misconfig(raw) == "npm"
+        assert _is_env_misconfig(raw) == ("npm", "shell")
 
     def test_command_not_found_bash(self):
         raw = "bash: cargo: command not found\n"
-        assert _is_env_misconfig(raw) == "cargo"
+        assert _is_env_misconfig(raw) == ("cargo", "shell")
 
     def test_docker_executable_not_found(self):
         raw = (
             'docker: Error response from daemon: failed to create task '
             'for container: exec: "go": executable file not found in $PATH.\n'
         )
-        assert _is_env_misconfig(raw) == "go"
+        assert _is_env_misconfig(raw) == ("go", "shell")
 
     def test_empty_returns_none(self):
         assert _is_env_misconfig("") is None
@@ -96,7 +96,18 @@ class TestIsEnvMisconfig:
         # Even with a huge log, the helper finds the trailing
         # pytest-missing line.
         raw = ("filler line\n" * 5000) + "/usr/local/bin/python3: No module named pytest\n"
-        assert _is_env_misconfig(raw) == "pytest"
+        assert _is_env_misconfig(raw) == ("pytest", "python")
+
+    def test_python_app_dep_returns_python_kind(self):
+        # Regression: httpx and other application deps (fastapi, pydantic,
+        # sqlalchemy, …) used to be misclassified as ENV_MISCONFIG because
+        # they weren't in the pip-installable-test-tools whitelist. The
+        # `python` kind tag is now what the compiler_node keys on, and
+        # MISSING_DEP applies to every Python ModuleNotFoundError.
+        raw = "ModuleNotFoundError: No module named 'httpx'\n"
+        assert _is_env_misconfig(raw) == ("httpx", "python")
+        raw = "ModuleNotFoundError: No module named 'fastapi'\n"
+        assert _is_env_misconfig(raw) == ("fastapi", "python")
 
 
 # ---------------------------------------------------------------------------

@@ -930,7 +930,12 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
       4. Otherwise pick the directory with the most source files,
          provided it dominates (≥ 80% of all non-root source files OR
          > 3 files vs. 0 in every other candidate).
-      5. Return ``None`` when the workspace is flat (all source at
+      5. A top-level directory containing ``__init__.py`` is treated
+         as a Python package and qualifies as a source root in its own
+         right (even with no other .py files yet) — this catches the
+         standard "package_name/" layout that LLMs produce for greenfield
+         projects.
+      6. Return ``None`` when the workspace is flat (all source at
          root), empty (no source files anywhere), or genuinely
          ambiguous (no clear leader).
 
@@ -946,6 +951,7 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
         return None
 
     counts: dict[str, int] = {}
+    package_dirs: set[str] = set()
     files_scanned = 0
     root_source_count = 0
 
@@ -962,6 +968,11 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
             continue
         if entry.startswith(".") or entry in _NEVER_SOURCE_DIRS:
             continue
+
+        # Python-package signal: a directory carrying __init__.py is a
+        # source root candidate even before it contains user code.
+        if os.path.isfile(os.path.join(full, "__init__.py")):
+            package_dirs.add(entry)
 
         dir_count = 0
         for sub_root, sub_dirs, sub_files in os.walk(full):
@@ -982,11 +993,6 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
         if files_scanned >= _MAX_FILES_PER_SCAN:
             break
 
-    # No source files at all → no opinion.
-    total_non_root = sum(counts.values())
-    if total_non_root == 0 and root_source_count == 0:
-        return None
-
     # Preferred-name bias: if any preferred name has ≥1 source file, it wins
     # over any non-preferred candidate. Among preferred names, the one with
     # the most files wins.
@@ -997,6 +1003,23 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
     if preferred_candidates:
         best_preferred = max(preferred_candidates.items(), key=lambda kv: kv[1])
         return best_preferred[0]
+
+    # Python-package signal — if exactly one top-level dir has __init__.py,
+    # that's the source root even if it currently has zero scanned source
+    # files (e.g. a freshly created package with only sub-packages so far).
+    # When multiple top-level packages exist, pick the one with the most
+    # source files so we don't lock onto a tests/ shim or a scratch dir.
+    if package_dirs:
+        if len(package_dirs) == 1:
+            return next(iter(package_dirs))
+        best_pkg = max(package_dirs, key=lambda name: counts.get(name, 0))
+        if counts.get(best_pkg, 0) > 0:
+            return best_pkg
+
+    # No source files at all → no opinion.
+    total_non_root = sum(counts.values())
+    if total_non_root == 0 and root_source_count == 0:
+        return None
 
     # No preferred-name match. Fall back to "the dominant non-preferred dir,
     # if it dominates clearly." Used for workspaces with stack-specific
@@ -1016,6 +1039,69 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
     if not dominates:
         return None
     return best_name
+
+
+def _is_greenfield_workspace(workspace_path: str) -> bool:
+    """True when the workspace has no source files anywhere — a true
+    greenfield project where the LLM is about to scaffold from scratch.
+
+    Used by the patcher allowlist builder to widen the allowed write set:
+    on greenfield, we let the LLM pick any reasonable top-level layout
+    (e.g. ``task_dispatcher/`` for a project named TaskDispatcher) rather
+    than forcing it into the conservative ``src/``/``lib/``/``app/`` set
+    that would reject the standard Python package-at-root layout.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return False
+    files_seen = 0
+    try:
+        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+            ]
+            for fname in sub_files:
+                if os.path.splitext(fname)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                    return False
+                files_seen += 1
+                if files_seen >= _MAX_FILES_PER_SCAN:
+                    return True
+    except OSError:
+        return False
+    return True
+
+
+def _workspace_basename_variants(workspace_path: str) -> list[str]:
+    """Return plausible package-directory names derived from the workspace
+    folder basename.
+
+    For ``/path/to/TaskDispatcher`` returns
+    ``["TaskDispatcher", "taskdispatcher", "task_dispatcher"]`` — the
+    natural Python-package and JS-module shapes an LLM is likely to pick
+    when scaffolding code into a project named TaskDispatcher.
+
+    Used by the patcher allowlist builder so a greenfield run doesn't
+    fail closed when the LLM picks the obvious snake_case name.
+    """
+    if not workspace_path:
+        return []
+    base = os.path.basename(os.path.abspath(workspace_path))
+    if not base or base in {"/", "."}:
+        return []
+    variants: list[str] = [base]
+    lowered = base.lower()
+    if lowered != base:
+        variants.append(lowered)
+    # CamelCase → snake_case
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", base).lower()
+    if snake not in variants:
+        variants.append(snake)
+    # Dash to underscore (e.g. "task-dispatcher" → "task_dispatcher")
+    if "-" in base:
+        dashless = base.replace("-", "_").lower()
+        if dashless not in variants:
+            variants.append(dashless)
+    return variants
 
 
 # ---------------------------------------------------------------------------

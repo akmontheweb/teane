@@ -84,15 +84,23 @@ ERROR  BudgetTooLowError: pre-flight estimate ($0.0123) exceeds remaining ($0.00
 **Diagnose**
 
 ```bash
-# See exactly what was spent and where:
+# Headline: total cost, burn rate, projected exhaustion at current rate.
+harness metrics --session-id <id>
+
+# Roll-up across every session in the log dir:
+harness metrics --all
+
+# Legacy fallback (when the harness binary itself is the problem):
 grep '"event": "llm_call"' ~/.harness/logs/<session-id>.jsonl | \
   jq -s 'map({model, cost_usd, tokens_in, tokens_out}) |
          group_by(.model) |
          map({model: .[0].model, total_cost: (map(.cost_usd) | add), calls: length})'
 ```
 
-The output shows cost per model — you'll see whether one provider is
-dominating spend.
+The `harness metrics` output shows total cost, per-window burn rate,
+and an estimated minutes-until-exhaustion at the current rate. The
+legacy jq recipe still works and is useful when the CLI itself is the
+thing that's broken.
 
 **Fix**
 
@@ -233,8 +241,20 @@ grep llm_circuit_open ~/.harness/logs/<session-id>.jsonl
   #   "model_routing": { "planning_primary": "anthropic:claude-sonnet-4-6" }
   harness resume --session-id <id>
   ```
-- **API key revoked or out of credit** — `harness doctor` will flag this.
-  Update `~/.harness/config.json` with a fresh key.
+- **API key revoked, out of credit, or wrong model id** — `harness doctor`
+  now makes a 1-token chat call per configured provider and reports the
+  specific HTTP code:
+  - `HTTP 401 — API key rejected` → key is bad, update it.
+  - `HTTP 403 — key valid but no access to model '<id>'` → either pick
+    a different model in `model_routing` or upgrade the account tier.
+  - `HTTP 404 — model not found` → fix the model id spelling.
+  - `HTTP 429 — rate limited` → quota exhausted right now; retry later
+    or rotate to a different account.
+  - `timeout / connection failed` → outbound network blocked at this
+    host; check firewall / proxy.
+  In CI or any environment where outbound HTTPS is blocked, set
+  `HARNESS_DOCTOR_SKIP_LIVE=true` to fall back to a key-presence-only
+  check.
 - **Rate-limited** — the gateway's circuit breaker (3 failures / 5 min
   window) auto-diverts to local Ollama. Confirm Ollama is running:
   ```bash

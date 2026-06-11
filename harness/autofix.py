@@ -133,6 +133,14 @@ async def apply_autofixes(
             candidate = _try_security_autofix(diag, workspace_path)
             if candidate is not None:
                 fix_kind = "security"
+        if candidate is None:
+            candidate = _try_missing_dep(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "dep"
+        if candidate is None:
+            candidate = _try_dep_resolution_conflict(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "dep"
 
         if candidate is None:
             unhandled.append(diag)
@@ -652,6 +660,217 @@ def _first_meaningful_line(source: str) -> str:
             continue
         return raw
     return ""
+
+
+# ---------------------------------------------------------------------------
+# R4 — Missing pip-installable dep autofix
+# ---------------------------------------------------------------------------
+
+# Symbols whose package name on PyPI differs from the import name. The
+# compiler_node sets `missing_symbol` to whatever pytest / python printed —
+# usually the import name — but we have to write the *install* name into
+# the manifest. Only list symbols whose distribution name truly differs;
+# the common case (`pytest` → `pytest`, `pydantic` → `pydantic`) needs no entry.
+_DEP_INSTALL_NAMES: dict[str, str] = {
+    "yaml": "PyYAML",
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "bs4": "beautifulsoup4",
+}
+
+
+def _try_missing_dep(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Append a missing pip-installable dep to the workspace's requirements
+    manifest. Triggered by compiler_node's MISSING_DEP diagnostic.
+
+    The compiler_node already validated that the missing symbol is in
+    ``_PIP_INSTALLABLE_SYMBOLS`` (pytest, ruff, mypy, etc.), so we don't
+    need to second-guess the package name. We only handle the
+    ``requirements.txt`` path here — pyproject.toml `[project.optional-
+    dependencies].dev` needs structural TOML edits that the LLM can do
+    more accurately than a regex. If the manifest doesn't exist yet, we
+    CREATE_FILE it with the single line.
+
+    Idempotent: if the symbol is already present anywhere in the manifest
+    (with or without a version pin), we return None so the LLM gets the
+    diagnostic and can investigate further.
+    """
+    if str(diag.get("error_code", "")) != "MISSING_DEP":
+        return None
+    symbol = str(diag.get("missing_symbol", "") or "").strip()
+    if not symbol:
+        return None
+    install_name = _DEP_INSTALL_NAMES.get(symbol, symbol)
+    build_cmd = str(diag.get("build_command", "") or "").lower()
+
+    # Only handle the requirements.txt install path. If the build command
+    # references pyproject (`pip install -e .` etc.), let the LLM handle
+    # the TOML structural edit — autofixing TOML is too error-prone.
+    if "requirements" not in build_cmd:
+        return None
+
+    manifest_rel = "requirements.txt"
+    manifest_abs = os.path.join(workspace_path, manifest_rel)
+
+    # If the manifest doesn't exist yet, create it with just this dep.
+    if not os.path.isfile(manifest_abs):
+        return PatchBlock(
+            operation=OperationType.CREATE_FILE,
+            file=manifest_rel,
+            content=f"{install_name}\n",
+        )
+
+    # Read existing content. Treat any line that starts with the install
+    # name (case-insensitive, ignoring extras like `package[extra]>=1.0`)
+    # as "already present" → idempotent no-op.
+    try:
+        with open(manifest_abs, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    except OSError:
+        return None
+
+    pin_pattern = re.compile(
+        rf"^\s*{re.escape(install_name)}(?:\[|[<>=!~]|\s|$)",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if pin_pattern.search(existing):
+        return None
+
+    # Append the dep on a new line. Use INSERT_AT_BLOCK with no anchor
+    # would require the AST patcher; instead emit a REPLACE_BLOCK that
+    # rewrites the last existing line into "<last_line>\n<dep>", which the
+    # TextPatcher applies as a straight substring swap.
+    stripped = existing.rstrip("\n")
+    if not stripped:
+        # File exists but is empty / whitespace — CREATE_FILE will fail
+        # ("already exists"), so emit a REPLACE_BLOCK that rewrites the
+        # whitespace into the single dep line.
+        return PatchBlock(
+            operation=OperationType.REPLACE_BLOCK,
+            file=manifest_rel,
+            search=existing,
+            replace=f"{install_name}\n",
+        )
+    last_line = stripped.split("\n")[-1]
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=manifest_rel,
+        search=last_line,
+        replace=f"{last_line}\n{install_name}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# R5 — pip ResolutionImpossible autofix
+# ---------------------------------------------------------------------------
+
+# Matches a requirement-spec line and captures the package name + optional
+# extras (e.g. "uvicorn[standard]"). Anything trailing — the version
+# specifier — is dropped. Line shapes covered:
+#   fastapi
+#   fastapi>=0.100.0
+#   fastapi >= 0.100.0, < 0.120
+#   uvicorn[standard]>=0.23.0
+#   pydantic~=2.0
+#   pkg-name==1.2.3 ; python_version >= "3.10"
+# We deliberately do NOT touch:
+#   - URLs / VCS refs (anything starting with git+, http://, etc.)
+#   - editable installs (-e .)
+#   - local paths (./, /path/to)
+#   - constraint / index flags (-c, -r, --index-url)
+#   - comments and blanks
+_REQ_LINE_RE = re.compile(
+    r"^(?P<pkg>[A-Za-z0-9][A-Za-z0-9_.\-]*(?:\[[A-Za-z0-9_,\-]+\])?)"
+    r"\s*(?:[<>=!~][^;]*)?(?P<marker>\s*;[^\n]*)?$"
+)
+
+
+def _try_dep_resolution_conflict(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Drop every version specifier from ``requirements.txt`` so pip's
+    resolver can pick a self-consistent set on its own.
+
+    The repair LLM is otherwise forced to guess which pin to relax —
+    pip's "ResolutionImpossible" message rarely names both sides of the
+    conflict, so guesses make conflicts worse and burn the repair budget.
+
+    Stripping pins is the right move on greenfield runs where every pin
+    is itself an LLM guess. Lines that aren't simple version specs
+    (editable installs, VCS refs, URLs, comments, blanks, pip flags) are
+    preserved verbatim.
+
+    Returns None when:
+      - the diagnostic isn't a DEP_RESOLUTION_CONFLICT,
+      - requirements.txt doesn't exist,
+      - the file already has no pins anywhere (so stripping would be a no-op).
+    """
+    if str(diag.get("error_code", "")) != "DEP_RESOLUTION_CONFLICT":
+        return None
+
+    manifest_rel = "requirements.txt"
+    manifest_abs = os.path.join(workspace_path, manifest_rel)
+    if not os.path.isfile(manifest_abs):
+        return None
+
+    try:
+        with open(manifest_abs, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    except OSError:
+        return None
+
+    if not existing.strip():
+        return None
+
+    stripped_lines: list[str] = []
+    changed = False
+    for raw_line in existing.splitlines():
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+        # Preserve blanks, comments, and pip flags verbatim.
+        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+            stripped_lines.append(line)
+            continue
+        # Preserve URLs / VCS refs / local paths.
+        if any(stripped.startswith(prefix) for prefix in (
+            "git+", "hg+", "svn+", "bzr+",
+            "http://", "https://", "file://",
+            "./", "../", "/",
+        )):
+            stripped_lines.append(line)
+            continue
+        m = _REQ_LINE_RE.match(stripped)
+        if m is None:
+            # Unrecognised shape — leave it untouched.
+            stripped_lines.append(line)
+            continue
+        pkg = m.group("pkg")
+        marker = (m.group("marker") or "").strip()
+        new_line = pkg if not marker else f"{pkg} {marker}"
+        if new_line != stripped:
+            changed = True
+        stripped_lines.append(new_line)
+
+    if not changed:
+        return None
+
+    # Preserve trailing newline if the original had one.
+    new_content = "\n".join(stripped_lines)
+    if existing.endswith("\n"):
+        new_content += "\n"
+
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=manifest_rel,
+        search=existing,
+        replace=new_content,
+    )
 
 
 # ---------------------------------------------------------------------------

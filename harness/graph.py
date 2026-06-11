@@ -1644,6 +1644,35 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             adapted_build_cmd = late
             build_cmd = late
 
+    # Mid-session upgrade: when the build_cmd is the bare "pip install <tool>
+    # && pytest -q" fallback (chosen earlier because the workspace had no
+    # manifest yet) AND a manifest has since appeared on disk — typically
+    # because autofix R4 just wrote requirements.txt to install a missing
+    # pip-installable dep — re-detect now so the next compile uses
+    # `pip install -r requirements.txt`. Without this upgrade the bare
+    # pytest install never sees the new dep and the same MISSING_DEP loops
+    # forever.
+    if (
+        adapted_build_cmd is None
+        and "pip install" in build_cmd
+        and "-r" not in build_cmd
+        and (
+            os.path.isfile(os.path.join(workspace, "requirements.txt"))
+            or os.path.isfile(os.path.join(workspace, "pyproject.toml"))
+        )
+    ):
+        from harness.cli import _detect_default_build_command
+        re_detected = _detect_default_build_command(workspace)
+        if re_detected and re_detected != build_cmd and re_detected != "make build":
+            logger.info(
+                "[compiler_node] Workspace gained a dependency manifest mid-session; "
+                "upgrading build command from %r to detected %r so installed deps "
+                "are honored.",
+                build_cmd, re_detected,
+            )
+            adapted_build_cmd = re_detected
+            build_cmd = re_detected
+
     # Late-bound sandbox image / network adaptation. With the pre-flight
     # adaptation in run_graph this is now a safety net — it only fires when
     # the build_command was just adapted above (greenfield rescue), or on

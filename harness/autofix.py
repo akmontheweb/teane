@@ -708,10 +708,13 @@ def _try_missing_dep(
     install_name = _DEP_INSTALL_NAMES.get(symbol, symbol)
     build_cmd = str(diag.get("build_command", "") or "").lower()
 
-    # Only handle the requirements.txt install path. If the build command
-    # references pyproject (`pip install -e .` etc.), let the LLM handle
-    # the TOML structural edit — autofixing TOML is too error-prone.
-    if "requirements" not in build_cmd:
+    # Defer to the LLM only when the build command points at pyproject
+    # (`pip install -e .`) — autofixing TOML structure is too error-prone.
+    # Everything else (bare `pip install pytest && pytest -q`,
+    # `pip install -r requirements.txt && pytest`, any pip-prefixed flow)
+    # gets a requirements.txt edit; the compiler_node's adapter will
+    # upgrade the build command to consume it on the next compile cycle.
+    if "pip install -e" in build_cmd or "pyproject" in build_cmd:
         return None
 
     manifest_rel = "requirements.txt"

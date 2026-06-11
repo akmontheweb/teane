@@ -632,6 +632,116 @@ x = 1
 
 
 # ===========================================================================
+# TREE-SITTER PATCHER TESTS
+# ===========================================================================
+# The TestHybridPatcher class above only exercises text-mode operations. These
+# tests lock in the AST path: confirm HybridPatcher routes known languages to
+# the tree-sitter overlay (not the text fallback), that the init log fires,
+# and that unknown extensions / CREATE_FILE correctly bypass the AST path.
+# Without these, a future regression that broke tree-sitter would silently
+# drop every patch to the regex text path and every other test would pass.
+
+class TestTreeSitterPatcher:
+
+    def test_hybrid_patcher_init_loads_ast_overlay(self, tmp_path, caplog):
+        # The "[patcher:hybrid] Tree-sitter AST patcher initialized" line is
+        # the operator's only signal that the AST overlay loaded. Lock it
+        # in so a silent ImportError regression (leaving _ast_patcher=None)
+        # cannot pass review.
+        import logging
+        from harness.patcher import HybridPatcher
+        with caplog.at_level(logging.INFO, logger="harness.patcher"):
+            patcher = HybridPatcher(str(tmp_path))
+        assert patcher._ast_patcher is not None, (
+            "Tree-sitter overlay failed to load. Reinstall "
+            "tree-sitter-language-pack (declared in pyproject.toml)."
+        )
+        messages = " ".join(r.message for r in caplog.records)
+        assert "Tree-sitter AST patcher initialized" in messages
+
+    def test_ast_path_selected_for_python(self, tmp_path):
+        # _select_patcher must return the AST overlay (not the text
+        # fallback) for files whose extension is registered in
+        # patcher.LANGUAGE_MAP. Identity comparison — the AST patcher is
+        # a distinct object from the text patcher.
+        from harness.patcher import HybridPatcher
+        patcher = HybridPatcher(str(tmp_path))
+        if patcher._ast_patcher is None:
+            import pytest
+            pytest.skip("tree-sitter not loaded; covered by init test")
+        selected = patcher._select_patcher("module.py")
+        assert selected is patcher._ast_patcher
+
+    def test_ast_path_selected_for_rust(self, tmp_path):
+        from harness.patcher import HybridPatcher
+        patcher = HybridPatcher(str(tmp_path))
+        if patcher._ast_patcher is None:
+            import pytest
+            pytest.skip("tree-sitter not loaded; covered by init test")
+        selected = patcher._select_patcher("lib.rs")
+        assert selected is patcher._ast_patcher
+
+    def test_ast_path_selected_for_typescript(self, tmp_path):
+        from harness.patcher import HybridPatcher
+        patcher = HybridPatcher(str(tmp_path))
+        if patcher._ast_patcher is None:
+            import pytest
+            pytest.skip("tree-sitter not loaded; covered by init test")
+        selected = patcher._select_patcher("app.ts")
+        assert selected is patcher._ast_patcher
+
+    def test_unknown_extension_falls_back_to_text(self, tmp_path):
+        # Unregistered extensions must route to the text patcher even
+        # when the AST overlay is loaded — the AST path has no parser
+        # for them.
+        from harness.patcher import HybridPatcher
+        patcher = HybridPatcher(str(tmp_path))
+        selected = patcher._select_patcher("config.unknownext")
+        assert selected is patcher._text_patcher
+
+    def test_create_file_uses_text_path_via_apply(self, tmp_path):
+        # CREATE_FILE doesn't benefit from AST awareness — there's no
+        # existing structure to parse. Regression check: the file lands
+        # on disk regardless of which patcher executes it.
+        import asyncio
+        from harness.patcher import HybridPatcher, PatchBlock, OperationType
+        patcher = HybridPatcher(str(tmp_path))
+        block = PatchBlock(
+            operation=OperationType.CREATE_FILE,
+            file="new.py",
+            content="x = 1\n",
+        )
+        result = asyncio.run(patcher.apply_patch(block))
+        assert result.success
+        assert os.path.isfile(os.path.join(str(tmp_path), "new.py"))
+
+    @pytest.mark.asyncio
+    async def test_replace_block_lands_through_ast_path(self, tmp_path):
+        # End-to-end: write a real Python file, REPLACE_BLOCK against it,
+        # confirm the replacement landed AND that _select_patcher routes
+        # this file to the AST overlay (so we know we're testing the AST
+        # path, not the text fallback under the same API).
+        from harness.patcher import HybridPatcher, PatchBlock, OperationType
+        src_path = tmp_path / "mod.py"
+        src_path.write_text("def foo():\n    return 1\n", encoding="utf-8")
+        patcher = HybridPatcher(str(tmp_path))
+        if patcher._ast_patcher is None:
+            import pytest
+            pytest.skip("tree-sitter not loaded; covered by init test")
+        # Sanity: this file's extension is AST-registered.
+        assert patcher._select_patcher("mod.py") is patcher._ast_patcher
+        block = PatchBlock(
+            operation=OperationType.REPLACE_BLOCK,
+            file="mod.py",
+            search="def foo():\n    return 1",
+            replace="def foo():\n    return 42",
+        )
+        result = await patcher.apply_patch(block)
+        assert result.success, result.error
+        assert "return 42" in src_path.read_text(encoding="utf-8")
+
+
+# ===========================================================================
 # SANDBOX TESTS
 # ===========================================================================
 

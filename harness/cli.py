@@ -2630,6 +2630,96 @@ def _doctor_check_config(workspace_path: str) -> tuple[str, str]:
     return "pass", f"config parsed cleanly ({section_count} top-level sections)"
 
 
+def _doctor_check_tree_sitter() -> tuple[str, str]:
+    """Tree-sitter and the language-pack catalogue are importable and at
+    least one grammar loads + parses.
+
+    The harness uses tree-sitter in two places — :class:`HybridPatcher`
+    for AST-aware code modifications (``harness/patcher.py``) and
+    :class:`DependencyGraph` for cross-file symbol extraction
+    (``harness/impact.py``). When the pip package
+    ``tree-sitter-language-pack`` is missing or its bundled grammars stop
+    loading on a new Python ABI, both subsystems silently fall back to
+    regex extraction — every harness run continues to work but loses
+    structural awareness, and no operator-facing signal warns about it.
+    This check surfaces that degradation BEFORE the next harness run.
+
+    Returns:
+      - ``"pass"`` when every supported grammar loads and parses a tiny
+        snippet.
+      - ``"warn"`` when between 1 and 2 grammars are unhealthy (the rest
+        still provide AST; only the degraded languages drop to regex).
+      - ``"fail"`` when ImportError fires on either package, or when
+        every grammar is unhealthy.
+    """
+    try:
+        import tree_sitter  # noqa: F401
+        from tree_sitter_language_pack import get_language
+    except ImportError as exc:
+        return "fail", (
+            f"import failed: {exc}. Run `pip install -e .` from the repo "
+            f"root (tree-sitter + tree-sitter-language-pack are declared "
+            f"in pyproject.toml)."
+        )
+
+    # Iterate the same grammar map the harness's tree-sitter consumers
+    # use (DependencyGraph._GRAMMAR_NAMES). Keeps this check in sync
+    # with the actual supported-language set without duplicating the list.
+    from harness.impact import DependencyGraph
+    grammar_names_map = DependencyGraph._GRAMMAR_NAMES
+    from tree_sitter import Parser
+
+    # Minimal syntactically-valid snippet per language. The body doesn't
+    # matter — we only need the parser to construct a tree without
+    # raising. Anything more elaborate would risk false negatives on
+    # grammar dialects.
+    snippets: dict[str, str] = {
+        "python": "x = 1\n",
+        "javascript": "var x = 1;\n",
+        "tsx": "const x: number = 1;\n",
+        "typescript": "const x: number = 1;\n",
+        "java": "class X { }\n",
+        "go": "package main\n",
+        "rust": "fn main() {}\n",
+        "dart": "void main() {}\n",
+    }
+
+    healthy: list[str] = []
+    degraded: list[str] = []
+    # _GRAMMAR_NAMES maps harness language tags → grammar names; multiple
+    # tags can share a grammar (jsx and javascript both → "javascript"),
+    # so dedupe via set() to avoid double-probing.
+    for grammar_name in sorted(set(grammar_names_map.values())):
+        try:
+            language = get_language(grammar_name)  # type: ignore[arg-type]
+            parser = Parser()
+            parser.language = language
+            sample = snippets.get(grammar_name, "x\n")
+            parser.parse(sample.encode("utf-8"))
+            healthy.append(grammar_name)
+        except Exception:  # noqa: BLE001
+            degraded.append(grammar_name)
+
+    if not healthy:
+        return "fail", (
+            f"no grammars loadable. Degraded: {degraded}. The harness "
+            f"will fall back to regex extraction across the board; "
+            f"reinstall tree-sitter-language-pack."
+        )
+    if degraded:
+        if len(degraded) <= 2:
+            return "warn", (
+                f"AST available for {len(healthy)} grammar(s); degraded: "
+                f"{degraded} fall back to regex extraction."
+            )
+        return "fail", (
+            f"AST degraded for {len(degraded)} grammar(s): {degraded}. "
+            f"Only {healthy} remain healthy; reinstall "
+            f"tree-sitter-language-pack."
+        )
+    return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
+
+
 async def cmd_doctor(args: argparse.Namespace) -> int:
     """
     Execute the `harness doctor` subcommand.
@@ -2673,6 +2763,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         api_keys_result = await _doctor_check_api_keys(config)
         checks.extend([
             ("api keys (live)", api_keys_result),
+            ("tree-sitter", _doctor_check_tree_sitter()),
             ("sandbox backend", _doctor_check_sandbox(config)),
             ("checkpoint db", _doctor_check_checkpoint_db(config)),
         ])
@@ -2682,6 +2773,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         skipped_detail = "skipped — fix the config check above first"
         checks.extend([
             ("api keys (live)", ("skip", skipped_detail)),
+            ("tree-sitter", ("skip", skipped_detail)),
             ("sandbox backend", ("skip", skipped_detail)),
             ("checkpoint db", ("skip", skipped_detail)),
         ])

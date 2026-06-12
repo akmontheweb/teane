@@ -121,6 +121,18 @@ class AgentState(TypedDict, total=False):
     # Discovery-shaped follow-up questions the doc reviewer wants the user to
     # answer in a second pass of the interview loop.
     reviewer_followups: list[dict[str, Any]]
+    # Per-node config sections plumbed through state so the graph nodes can
+    # read them without round-tripping through cli.py's config loader. Each
+    # is loaded from the corresponding section of config/config.json and
+    # written into initial_state by run_graph. MUST be declared here — any
+    # key the run_graph initializer sets that isn't in this TypedDict is
+    # silently dropped by LangGraph's state channel layer, falling back to
+    # in-node defaults (e.g. compiler_node defaulting docker_image to
+    # ubuntu:22.04 and "adapting" the configured python:3.12-slim away).
+    sandbox_config: dict[str, Any]
+    lintgate_config: dict[str, Any]
+    deployment_config: dict[str, Any]
+    run_prod_import_smoke_check: bool
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -6171,18 +6183,18 @@ async def run_graph(
     # respectively. These are free-form dicts on the state; nodes consult
     # them via state.get("lintgate_config", {}) etc.
     if lintgate_config is not None:
-        initial_state["lintgate_config"] = lintgate_config  # type: ignore[typeddict-unknown-key]
+        initial_state["lintgate_config"] = lintgate_config
     if deployment_config is not None:
-        initial_state["deployment_config"] = deployment_config  # type: ignore[typeddict-unknown-key]
+        initial_state["deployment_config"] = deployment_config
     if test_generation_config is not None:
-        initial_state["test_generation_config"] = test_generation_config  # type: ignore[typeddict-unknown-key]
+        initial_state["test_generation_config"] = test_generation_config
     if speculative_config is not None:
-        initial_state["speculative_config"] = speculative_config  # type: ignore[typeddict-unknown-key]
+        initial_state["speculative_config"] = speculative_config
     # Plumb the smoke-check flag into state so compiler_node can read it
     # without reaching out to config (which the graph module doesn't
     # touch directly today).
     if compiler_config is not None:
-        initial_state["run_prod_import_smoke_check"] = bool(  # type: ignore[typeddict-unknown-key]
+        initial_state["run_prod_import_smoke_check"] = bool(
             compiler_config.get("run_prod_import_smoke_check", True)
         )
 
@@ -6217,7 +6229,7 @@ async def run_graph(
             "command installs packages into system locations: %s", build_command,
         )
     if sandbox_config is not None or image_was_adapted or ro_root_was_adapted:
-        initial_state["sandbox_config"] = adapted_cfg  # type: ignore[typeddict-unknown-key]
+        initial_state["sandbox_config"] = adapted_cfg
 
     # Compile graph with checkpointer
     compiled_graph = compile_graph(checkpointer=checkpointer)

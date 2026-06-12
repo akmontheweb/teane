@@ -143,12 +143,26 @@ def create_initial_state(
 
     If spec_override is provided (from the product_spec_dir requirement
     refinement that ran in cmd_run before graph build), the
-    SPEC_REQUIREMENTS.md content becomes the system prompt, replacing
-    the default snapshot-based prompt. This makes the approved
-    specification the immutable root context for all downstream nodes.
+    SPEC_REQUIREMENTS.md + SPEC_ARCHITECTURE.md content is **prepended**
+    to the default patch-DSL system prompt. Without this concatenation
+    the carefully-tuned patcher contract (DSL syntax, Edit Invariants,
+    CREATE_FILE-vs-REPLACE_BLOCK rules, imports placement, Makefile
+    requirements) would be silently replaced by the project spec, leaving
+    the patching LLM with no instructions on how to emit edits. Empirical
+    grep across pre-fix debug dumps for "Edit Invariants" / "EXACT-BYTE
+    matching" returned zero matches — the section was never reaching the
+    LLM in any product_spec/-driven run.
     """
     if spec_override:
-        system_prompt = spec_override
+        # Spec first (project context), then the patcher's operating
+        # contract (DSL + Edit Invariants + workspace conventions). The
+        # spec anchors prefix-cache and the LLM's framing of WHAT we're
+        # building; the patcher contract governs HOW to express edits.
+        system_prompt = (
+            spec_override
+            + "\n\n---\n\n"
+            + _build_system_prompt(workspace_path, build_command)
+        )
         # When a user-approved spec already exists (from the pre-flight
         # product_spec_dir refinement), skip the graph's discovery
         # pipeline completely. Otherwise write_spec_node would overwrite

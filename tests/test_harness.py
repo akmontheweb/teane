@@ -2824,9 +2824,36 @@ class TestAgentState:
             assert state["budget_remaining_usd"] == 2.00
 
     def test_create_initial_state_with_spec(self):
+        # When spec_override is provided, the project spec is anchored at
+        # messages[0] AHEAD of (not instead of) the built-in patcher
+        # contract. The spec frames "what we're building"; the built-in
+        # prompt's Edit Invariants / DSL syntax / workspace conventions
+        # frame "how to express edits". Both must reach every downstream
+        # LLM call — see plans/review-the-last-session-zesty-octopus.md.
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir, spec_override="# Custom Spec\n\nRequirements here")
-            assert state["messages"][0]["content"] == "# Custom Spec\n\nRequirements here"
+            content = state["messages"][0]["content"]
+            assert "# Custom Spec" in content
+            assert "Requirements here" in content
+            # Spec must lead — its prefix-cache anchor lives at the top.
+            assert content.startswith("# Custom Spec")
+
+    def test_create_initial_state_with_spec_keeps_edit_invariants(self):
+        # Regression: a prior version replaced the entire system prompt
+        # with spec_override, silently dropping the Phase B4 Edit
+        # Invariants section. The patching LLM then operated without
+        # exact-byte / strip-N|-prefix / indentation / read-before-edit
+        # guidance in any product_spec/-driven run. Assert the section
+        # survives.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir, spec_override="# Custom Spec\n")
+            content = state["messages"][0]["content"]
+            assert "## Edit Invariants" in content
+            assert "EXACT-BYTE matching" in content
+            # READ_FILE doc and count: modifier doc (Phase B2/B3) also
+            # live in the built-in prompt; they must also reach the LLM.
+            assert "READ_FILE" in content
+            assert "count: unique" in content or "count:" in content
 
     def test_route_after_compiler_success(self):
         from harness.graph import route_after_compiler

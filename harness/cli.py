@@ -2507,6 +2507,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
 
     session_id = generate_session_id(args.session_id)
+    # Bind the active session_id NOW so every LLM dispatch that happens
+    # before the LangGraph runner is entered (spec synthesis,
+    # architecture synthesis, doc review cycles) sees the real session
+    # in Gateway._dump_llm_call_to_disk filenames instead of the default
+    # "unknown" prefix. Without this the pre-graph dumps land at
+    # ~/.harness/debug/unknown_NNNN_planning_*.txt and can't be grouped
+    # with the in-graph dumps. ContextVar lasts until the process exits;
+    # no explicit reset needed for a CLI command.
+    from harness.observability import set_active_session_id
+    set_active_session_id(session_id)
 
     # Configure structured logging / per-session log file
     from harness.observability import configure_logging
@@ -3022,6 +3032,14 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         logger.error("No checkpoint found for session '%s'.", args.session_id)
         await checkpointer.conn.close()
         return 1
+
+    # Bind the active session_id immediately so any pre-graph dispatches
+    # (e.g. checkpoint health-check helpers, future hooks) and the in-graph
+    # dispatches that follow all stamp the correct session into
+    # ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt filenames. See the
+    # matching call in cmd_run.
+    from harness.observability import set_active_session_id
+    set_active_session_id(args.session_id)
 
     build_command = resolve_build_command(args.build_cmd, config, workspace_path)
     token_budget = config.get("token_budget", {})

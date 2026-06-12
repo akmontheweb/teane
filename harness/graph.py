@@ -3026,6 +3026,40 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "miss_kind": miss_kind,
             }]
 
+    # Track consecutive repeats of the same MISSING_DEP symbol across
+    # iterations. The router's "deterministic autofixable" bypass at the
+    # repair limit (see route_after_compiler) keeps re-entering repair_node
+    # forever when the missing symbol is something the manifest fix cannot
+    # actually install — e.g. `pip` itself missing from a docker image like
+    # buildpack-deps. Each LLM patch ostensibly "lands" but the very next
+    # build emits the same MISSING_DEP. Without a tripwire here the session
+    # spins past the configured max_iterations indefinitely (observed in
+    # session 083770ac: 21+ attempts on missing 'pip', $0.02 of budget
+    # burnt before being killed externally). The router consumes this
+    # counter and escalates to HITL with a "fix the image, not the
+    # manifest" message when it crosses the threshold.
+    primary_missing_dep_symbol = ""
+    for err in compiler_errors:
+        if str(err.get("error_code", "")).upper() == "MISSING_DEP":
+            sym = str(err.get("missing_symbol", "") or "").strip().lower()
+            if sym:
+                primary_missing_dep_symbol = sym
+                break
+    prior_symbol = str(loop_counter.get("missing_dep_last_symbol", "") or "")
+    if primary_missing_dep_symbol:
+        if primary_missing_dep_symbol == prior_symbol:
+            loop_counter["missing_dep_consecutive_same"] = (
+                int(loop_counter.get("missing_dep_consecutive_same", 0) or 0) + 1
+            )
+        else:
+            loop_counter["missing_dep_consecutive_same"] = 1
+            loop_counter["missing_dep_last_symbol"] = primary_missing_dep_symbol
+    else:
+        # No MISSING_DEP this round (either build succeeded or different
+        # error shape) — reset so a future MISSING_DEP starts fresh.
+        loop_counter["missing_dep_consecutive_same"] = 0
+        loop_counter["missing_dep_last_symbol"] = ""
+
     # Build the return dictionary by MERGING into the existing node_state,
     # not replacing it. Cross-iteration signals like patch_failures (the
     # patcher's "Current file content around closest match" window),
@@ -4177,6 +4211,38 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "[router] Repair limit reached (%d/%d). Routing to HITL.",
             total_repairs,
             max_iterations,
+        )
+        return _transition("human_intervention_node")
+
+    # Same-MISSING_DEP-symbol tripwire (bug #1 from the latest log
+    # review). When the SAME missing_symbol recurs N times consecutively,
+    # the deterministic autofix has demonstrably failed to resolve it —
+    # typically because the missing tool is something the manifest cannot
+    # install (`pip` itself, `make`, a system package). Continuing to
+    # bypass the iteration limit just burns budget on patches that can't
+    # land the fix; escalate to HITL with a message that points at the
+    # sandbox image, not the manifest. Session 083770ac demonstrates the
+    # unguarded loop: 21+ attempts on missing 'pip' against
+    # buildpack-deps:bookworm before being killed externally.
+    SAME_MISSING_DEP_LIMIT = 3
+    consecutive_same_dep = int(
+        loop_counter.get("missing_dep_consecutive_same", 0) or 0
+    )
+    if (
+        has_autofixable
+        and consecutive_same_dep >= SAME_MISSING_DEP_LIMIT
+    ):
+        last_symbol = str(
+            loop_counter.get("missing_dep_last_symbol", "") or "?"
+        )
+        logger.warning(
+            "[router] Missing dependency '%s' has recurred %d times in a "
+            "row despite landed patches. The deterministic-autofix bypass "
+            "cannot resolve it from inside the loop — the sandbox image "
+            "almost certainly does not ship the bootstrap tool (`%s`). "
+            "Routing to HITL: fix the docker_image (sandbox.docker_image "
+            "in config.json or your project's build_command), then resume.",
+            last_symbol, consecutive_same_dep, last_symbol,
         )
         return _transition("human_intervention_node")
 

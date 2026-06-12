@@ -2863,6 +2863,116 @@ class TestAgentState:
             state["budget_remaining_usd"] = 0.0
             assert route_after_compiler(state) == "human_intervention_node"
 
+    def test_route_after_compiler_missing_dep_recurrence_escalates_to_hitl(self):
+        # Bug #1 fix: the deterministic-autofix bypass should NOT keep
+        # re-entering repair_node when the same missing_symbol recurs
+        # repeatedly — the manifest can't install something like `pip`
+        # itself, and looping forever just burns budget (session 083770ac
+        # reached 21+ attempts on missing 'pip' against
+        # buildpack-deps:bookworm). Past the SAME_MISSING_DEP_LIMIT of 3,
+        # route to HITL with a "fix the image" message.
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 2
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = [{
+                "file": "<sandbox>",
+                "error_code": "MISSING_DEP",
+                "missing_symbol": "pip",
+                "message": "Missing 'pip'",
+            }]
+            # Even with iterations still available, the recurrence counter
+            # at the threshold MUST escalate to HITL.
+            state["loop_counter"] = {
+                "total_repairs": 5,
+                "missing_dep_consecutive_same": 3,
+                "missing_dep_last_symbol": "pip",
+            }
+            assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_route_after_compiler_missing_dep_first_time_still_bypasses(self):
+        # The same-symbol tripwire must NOT fire on the FIRST recurrence
+        # — the deterministic autofix legitimately needs one or two
+        # rounds to land the manifest edit. Pin at 1 (first occurrence
+        # after compiler_node bumped the counter).
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 2
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = [{
+                "file": "<sandbox>",
+                "error_code": "MISSING_DEP",
+                "missing_symbol": "fastapi",
+                "message": "Missing 'fastapi'",
+            }]
+            state["loop_counter"] = {
+                "total_repairs": 5,
+                "missing_dep_consecutive_same": 1,
+                "missing_dep_last_symbol": "fastapi",
+            }
+            # Past the iteration cap but recurrence < threshold ⇒ bypass
+            # is still in effect (route to repair_node so autofix lands).
+            assert route_after_compiler(state) == "repair_node"
+
+    def test_route_after_compiler_missing_dep_different_symbols_does_not_escalate(self):
+        # When the missing symbol changes between iterations, that's
+        # progress (the prior dep was added, a new one surfaced).
+        # consecutive_same should have been reset to 1 by compiler_node;
+        # router must not escalate.
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 2
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = [{
+                "file": "<sandbox>",
+                "error_code": "MISSING_DEP",
+                "missing_symbol": "sqlalchemy",
+                "message": "Missing 'sqlalchemy'",
+            }]
+            state["loop_counter"] = {
+                "total_repairs": 5,
+                "missing_dep_consecutive_same": 1,
+                "missing_dep_last_symbol": "sqlalchemy",
+            }
+            assert route_after_compiler(state) == "repair_node"
+
+    def test_cmd_run_binds_active_session_id_for_pre_graph_dispatch(self, monkeypatch):
+        # Bug #2 fix: ensure the active_session_id ContextVar is set
+        # BEFORE any spec-synthesis dispatch happens. We don't run cmd_run
+        # end-to-end here — that needs a config + workspace + gateway. We
+        # exercise the contract directly: after calling
+        # set_active_session_id, get_active_session_id returns that value
+        # to any nested asyncio context (modelling how
+        # Gateway._dump_llm_call_to_disk reads it).
+        import asyncio
+        from harness.observability import (
+            set_active_session_id, get_active_session_id,
+            _active_session_id,
+        )
+
+        # Reset to default in case prior tests left a value behind.
+        try:
+            _active_session_id.set("unknown")
+        except Exception:
+            pass
+
+        async def _inner():
+            return get_active_session_id()
+
+        async def _scenario():
+            assert get_active_session_id() == "unknown"
+            set_active_session_id("abc12345-deadbeef")
+            # Nested awaits inherit the ContextVar value.
+            inner = await _inner()
+            assert inner == "abc12345-deadbeef"
+            return inner
+
+        result = asyncio.run(_scenario())
+        assert result == "abc12345-deadbeef"
+
     def test_route_after_hitl_resume(self):
         from harness.graph import route_after_hitl
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -3526,6 +3526,26 @@ class TestToolchainAdaptation:
         assert not img_adapted
         assert cfg["docker_image"] == "my-org/custom-builder:1.0"
 
+    def test_make_build_swaps_python_slim_to_buildpack_deps(self):
+        # Session b8475cf0 regression: when the user's global config has
+        # `docker_image: python:3.12-slim` (a common default for python
+        # projects) and the resolved build_command is `make build`, the
+        # python-slim image doesn't ship make. The in-container apt-get
+        # bootstrap can't recover either — restore_workspace_ownership
+        # passes --user $UID:$GID and apt-get refuses without privileges,
+        # so the build exits 127 with "make: not found" in ~200ms and
+        # short-circuits straight to HITL. Adaptation must catch this by
+        # treating the harness's own auto-selected toolchain images
+        # (python-slim, node-slim, etc.) as default-ish — swappable when
+        # the build implies a different toolchain.
+        from harness.graph import _apply_toolchain_adaptation
+        for slim in ("python:3.12-slim", "node:20-slim", "rust:1.79-slim", "golang:1.22"):
+            cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
+                "make build", {"docker_image": slim}, True,
+            )
+            assert img_adapted, f"{slim} should swap for make build"
+            assert cfg["docker_image"] == "buildpack-deps:bookworm"
+
     def test_adapts_network_for_pip_install(self):
         # P1.3 closeout: auto-network on pip-install detection now requires
         # explicit opt-in via sandbox.auto_enable_network_for_install. Pass
@@ -3648,6 +3668,128 @@ class TestToolchainAdaptation:
             {"docker_image": "ubuntu:22.04"},
             False,
             # default command_is_adapter_synthesised=False
+        )
+        assert not net_adapted
+        assert allow_net is False
+
+    def test_build_command_needs_network_make_variants(self):
+        """Session 993c32ad regression: `make build` ran with --network=none
+        because the install-token heuristic didn't recognize `make`. Any
+        `make <target>` is now treated as install-needing (the Makefile
+        recipe per the LLM skill conventionally invokes pip/npm/apt).
+        Use a stripped-startswith form so substring traps (cmake,
+        make-something, makefile, echo make build) don't false-match.
+        """
+        from harness.graph import _build_command_needs_network
+        # True: any bare/leading-make form
+        assert _build_command_needs_network("make build")
+        assert _build_command_needs_network("make")
+        assert _build_command_needs_network("make test")
+        assert _build_command_needs_network("make install")
+        assert _build_command_needs_network("  make build  ")
+        assert _build_command_needs_network("MAKE BUILD")
+        # False: substring traps that must not match
+        assert not _build_command_needs_network("cmake build")
+        assert not _build_command_needs_network("make-something")
+        assert not _build_command_needs_network("makefile")
+        assert not _build_command_needs_network("echo make build")
+
+    def test_apply_toolchain_adaptation_make_bypasses_opt_in(self, caplog):
+        """Session 993c32ad fix: `make <target>` must bypass the
+        `auto_enable_network_for_install` opt-in, because the operator
+        types `make build` but the install step that needs network is
+        inside the LLM-written Makefile recipe — semantically the same
+        situation as an adapter-synthesised command. The warn-and-fail
+        branch at the bottom of `_apply_toolchain_adaptation` must NOT
+        fire on this path.
+        """
+        import logging
+        from harness.graph import _apply_toolchain_adaptation
+        with caplog.at_level(logging.WARNING, logger="harness.graph"):
+            _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+                "make build",
+                {"docker_image": "ubuntu:22.04"},  # no opt-in
+                False,
+                # command_is_adapter_synthesised defaults to False
+            )
+        assert net_adapted, "make must auto-enable network even without opt-in"
+        assert allow_net is True
+        # The warn-and-fail branch must not have fired.
+        warns = [
+            r.message for r in caplog.records
+            if "auto_enable_network_for_install is false" in r.message
+        ]
+        assert warns == [], (
+            "make commands must bypass the opt-in silently, not warn-and-fail "
+            "(that was the old behaviour that produced session 993c32ad's HITL)"
+        )
+
+    def test_apply_toolchain_adaptation_make_respects_workspace_pin(self):
+        """Airgap escape hatch: when the operator hard-pinned
+        `allow_network=False` at the workspace level (passed in as the
+        positional `allow_network=False`) AND ALSO no opt-in, the
+        precondition at the top of the install branch keeps the bypass
+        from firing — but only if the workspace pin is genuine. We
+        model the pin by passing allow_network=False; the actual
+        workspace-config wins because `_apply_toolchain_adaptation` only
+        ever flips False → True, never the reverse. After the make
+        bypass, allow_net flips on; the precondition `if not
+        allow_network` is by design met whenever the caller passed
+        False, so the only way to keep allow_net=False for `make` is
+        the workspace-config layer ABOVE this function (run_graph
+        passes the already-resolved `allow_network`). This test
+        documents the no-regression case: with allow_network already
+        True, the bypass is a no-op (network was already on).
+        """
+        from harness.graph import _apply_toolchain_adaptation
+        _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+            "make build",
+            {"docker_image": "ubuntu:22.04"},
+            True,  # already on, simulating a `harness run --allow-network` or workspace pin to True
+        )
+        # Idempotency: network already on, so we don't re-flag adaptation.
+        assert allow_net is True
+        assert not net_adapted, (
+            "allow_network was already True; bypass must not re-flag adaptation"
+        )
+
+    def test_apply_toolchain_adaptation_make_image_network_readonly_compose(self):
+        """Single call with cur_image=ubuntu:22.04 and `make build`:
+        image swaps to buildpack-deps:bookworm, network flips on (via
+        the new make bypass), and read_only_root flips to False (the
+        install-branch at the bottom of `_apply_toolchain_adaptation`
+        now covers `make` because `needs_install` returns True). All
+        three adapters must compose without one stepping on another.
+        """
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
+            _apply_toolchain_adaptation(
+                "make build",
+                {"docker_image": "ubuntu:22.04"},  # no opt-in
+                False,
+            )
+        )
+        assert img_adapted
+        assert cfg["docker_image"] == "buildpack-deps:bookworm"
+        assert net_adapted
+        assert allow_net is True
+        assert ro_adapted
+        assert cfg["read_only_root"] is False
+
+    def test_apply_toolchain_adaptation_cmake_not_bypassed(self):
+        """Substring-trap regression: `cmake build` must NOT trigger the
+        make bypass (cmake is a different tool, doesn't follow the
+        same recipe-writes-pip-install convention). The opt-in gate
+        applies, and with no opt-in the warn-and-fail branch fires.
+        """
+        from harness.graph import _apply_toolchain_adaptation, _build_command_needs_network
+        # cmake doesn't even register as install-needing (no make
+        # bypass, no pip/npm token). The branch never enters.
+        assert not _build_command_needs_network("cmake build")
+        _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+            "cmake build",
+            {"docker_image": "ubuntu:22.04"},
+            False,
         )
         assert not net_adapted
         assert allow_net is False

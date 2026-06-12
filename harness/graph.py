@@ -1374,10 +1374,34 @@ def _toolchain_image_for(build_command: str) -> Optional[str]:
     return None
 
 
+def _command_is_make(build_command: str) -> bool:
+    """True when ``build_command`` invokes ``make`` (``make``, ``make build``,
+    ``make test``, ...). Prefix-match on the stripped command, NOT substring
+    search, so we don't false-match ``cmake build``, ``make-something``,
+    ``makefile``, or ``echo make build``. Mirrors the safer form used by
+    :func:`_toolchain_image_for`.
+    """
+    stripped = build_command.strip().lower()
+    return stripped == "make" or stripped.startswith("make ")
+
+
 def _build_command_needs_network(build_command: str) -> bool:
     """True when the build command performs a package install that needs
-    to reach a registry (pip/npm/yarn/pnpm/cargo/go)."""
+    to reach a registry (pip/npm/yarn/pnpm/cargo/go) — OR invokes ``make``.
+
+    The ``make`` clause exists because the LLM-generated ``Makefile`` (per
+    ``harness/skills/makefile_python.md``) conventionally puts
+    ``pip install -r requirements.txt`` (or ``npm install``, etc.) INSIDE
+    the target's recipe lines. The command string the harness invokes is
+    just ``"make build"`` — the ``pip install`` substring lives in the
+    Makefile, not in the outer command, so the install-token heuristic
+    can't see it. Parsing recipe text is the alternative, but it's brittle
+    against sub-makes, includes, and ``$(MAKE) -C subdir`` patterns. The
+    cleaner rule: any ``make <target>`` is treated as install-needing.
+    """
     cmd = build_command.lower()
+    if _command_is_make(build_command):
+        return True
     return any(token in cmd for token in (
         "pip install", "pip3 install", "npm install", "yarn install",
         "pnpm install", "cargo build", "cargo test", "go mod",
@@ -2666,12 +2690,27 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     )
 
 
-# Bare base images that ship none of the language toolchains. When the
-# resolved build_command implies a specific toolchain, swap one of these
-# out for a matching toolchain image so the very first build doesn't
-# exit 127 with "python3: not found" / "node: not found".
+# Images we treat as "default-ish" — safe to swap when the build command
+# implies a different toolchain. Two groups:
+#
+#   1. Truly bare bases (ubuntu/debian) that ship no language runtime.
+#   2. Slim language images — these are exactly the values `_toolchain_image_for`
+#      itself emits for non-make commands. Including them here means a user
+#      who set `docker_image: python:3.12-slim` as their global default and
+#      runs a `make build` gets auto-promoted to `buildpack-deps:bookworm`
+#      (which has make + python3 + gcc). Without this the slim image lacks
+#      make and the bootstrap probe in DockerBackend can't apt-get install
+#      it either: when --user $UID:$GID is on (restore_workspace_ownership
+#      default), apt-get fails with "permission denied" in ~200ms and the
+#      build crashes with exit 127 "make: not found" — observed in session
+#      b8475cf0 burning straight through to HITL without any LLM repair.
+#
+# Same-image case (python:3.12-slim and the resolved toolchain is also
+# python:3.12-slim) is a no-op — _apply_toolchain_adaptation guards with
+# `cur_image != toolchain_image` before writing.
 _BARE_IMAGE_DEFAULTS = frozenset({
     "ubuntu:22.04", "ubuntu:latest", "debian:12", "debian:latest",
+    "python:3.12-slim", "node:20-slim", "rust:1.79-slim", "golang:1.22",
 })
 
 
@@ -2711,6 +2750,17 @@ def _apply_toolchain_adaptation(
     for the install step regardless of the opt-in (the operator can
     still hard-pin ``allow_network=False`` at the workspace config level
     if they really want it).
+
+    ``make <target>`` commands receive the same bypass. The operator
+    types ``make build`` (or accepts the CLI default), but the recipe
+    that actually runs — including any ``pip install -r requirements.txt``
+    — is authored by the LLM per the Makefile skill
+    (``harness/skills/makefile_python.md``). Treating it like an operator-
+    typed install would silently route to the warn-and-fail branch and
+    burn the ``make`` bootstrap's apt-get probe (which itself needs
+    network) at the same time. Bypassing the opt-in keeps the
+    deterministic-build promise; the workspace-config ``allow_network``
+    hard-pin still wins for genuine airgap operators.
     """
     cfg = dict(sandbox_config or {})
     image_was_adapted = False
@@ -2736,7 +2786,13 @@ def _apply_toolchain_adaptation(
         # user's network policy still applies at the workspace config
         # level (sandbox config) but the opt-in flag is about user-typed
         # commands, not adapter-synthesised ones.
-        if command_is_adapter_synthesised:
+        #
+        # ``make <target>`` rides the same bypass: the operator may have
+        # typed `make build`, but the install step that needs network is
+        # inside the LLM-written Makefile recipe — semantically the same
+        # situation as an adapter-synthesised command, just expressed via
+        # a different file. See the docstring for the full rationale.
+        if command_is_adapter_synthesised or _command_is_make(build_command):
             new_allow_network = True
             network_was_adapted = True
         elif cfg.get("auto_enable_network_for_install", False):

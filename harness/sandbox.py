@@ -744,11 +744,17 @@ class DockerBackend(SandboxBackend):
         #   already ship make (buildpack-deps:bookworm, full python:3.12).
         # - apt-get → apk → yum dispatch covers debian/ubuntu/slim,
         #   alpine, and rhel-derivative images.
-        # - `2>/dev/null || true` makes the whole probe a no-op when the
-        #   container can't reach a mirror (allow_network=False) or
-        #   doesn't have root (Linux non-root host UID). The build
-        #   continues; if it actually needs make, the residual failure
-        #   surfaces through _is_env_misconfig and routes to HITL.
+        # - The probe is EXPECTED to succeed for `make <target>` commands
+        #   because `_build_command_needs_network` enables network (and
+        #   `_apply_toolchain_adaptation` already swaps ubuntu:22.04 →
+        #   buildpack-deps:bookworm). The `|| true` shoulder is the final
+        #   guardrail for the residual cases: non-root container mode
+        #   (apt-get refuses without privileges), a workspace-config
+        #   `allow_network=False` hard-pin that survived adaptation, or
+        #   an exotic image where neither apt-get/apk/yum is the package
+        #   manager. In those cases the build continues; if make is
+        #   actually missing, the residual failure surfaces through
+        #   `_is_env_misconfig` and routes to HITL.
         # - `;` (not `&&`) so the build command runs even if the probe
         #   exits non-zero in an unexpected way.
         make_bootstrap = (

@@ -294,11 +294,14 @@ class TestSpeculativeBuildCommandAdaptation:
         (worktree / "pyproject.toml").write_text("[project]\nname='x'\n")
 
         # Workspace-time pass: nothing to detect (greenfield workspace),
-        # so build_command stays "make build". Under Fix 2 the toolchain
-        # adapter now swaps `ubuntu:22.04` → `buildpack-deps:bookworm`
-        # for `make ...` commands (the base ubuntu image doesn't ship
-        # `make` and would otherwise crash with exit 127). Previously
-        # this was a no-op.
+        # so build_command stays "make build". Under the toolchain-adapter
+        # behavior the workspace-time pass on `make build`:
+        #   - swaps ubuntu:22.04 → buildpack-deps:bookworm (make-bearing image)
+        #   - flips allow_network → True via the make bypass (the operator
+        #     types `make build` but the install step that needs network
+        #     is inside the LLM-written Makefile recipe, semantically the
+        #     same as an adapter-synthesised command)
+        # Both fire in the same call.
         ws_build = "make build"
         ws_late = _detect_default_build_command(str(workspace))
         assert ws_late is None
@@ -306,17 +309,18 @@ class TestSpeculativeBuildCommandAdaptation:
             ws_build, {"docker_image": "ubuntu:22.04"}, allow_network=False,
         )
         assert ws_img_adapted is True
-        assert ws_net_adapted is False
+        assert ws_net_adapted is True
+        assert ws_net is True
         assert ws_cfg["docker_image"] == "buildpack-deps:bookworm"
 
-        # Per-variant pass: detects the worktree's pyproject, adapts to
-        # python:3.12-slim. The make-image swap from workspace-time
-        # is now overwritten by the python toolchain swap because
-        # `buildpack-deps:bookworm` is also in _BARE_IMAGE_DEFAULTS-equivalent
-        # treatment for the swap — wait, actually it's NOT in
-        # _BARE_IMAGE_DEFAULTS, so the swap doesn't fire and the image
-        # stays at `buildpack-deps:bookworm`. That's fine: buildpack-deps
-        # ships Python too, so pyproject-based builds still work.
+        # Per-variant pass: detects the worktree's pyproject. The
+        # buildpack-deps:bookworm image carried over from the workspace
+        # pass isn't in _BARE_IMAGE_DEFAULTS, so the swap doesn't fire
+        # and the image stays at buildpack-deps:bookworm (which ships
+        # Python too, so pyproject-based builds still work). Network was
+        # already flipped on by the workspace pass, so the per-variant
+        # bypass is a no-op for the network bit — this is the chained
+        # idempotency the test is pinning.
         pv_build = _detect_default_build_command(str(worktree))
         assert pv_build is not None
         pv_cfg, pv_net, pv_img_adapted, pv_net_adapted, _ = _apply_toolchain_adaptation(
@@ -327,7 +331,8 @@ class TestSpeculativeBuildCommandAdaptation:
         # isn't a bare default; the existing image is preserved.
         assert pv_img_adapted is False
         assert pv_cfg["docker_image"] == "buildpack-deps:bookworm"
-        assert pv_net_adapted is True
+        # Network already on from the workspace pass → no re-flag.
+        assert pv_net_adapted is False
         assert pv_net is True
 
         # Idempotency: calling again with the per-variant inputs is a no-op.

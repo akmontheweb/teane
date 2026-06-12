@@ -1416,9 +1416,14 @@ _SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Shell-style "<cmd>: command not found" (covers npm, cargo, go, etc.)
     re.compile(r"(?m)^(?:/bin/sh: \d+: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
     re.compile(r"(?m)^(?:bash: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
-    # Dash / busybox shells say "X: not found" (no "command"). Often
-    # prefixed with "/bin/sh: 1: " in the alpine/slim images.
-    re.compile(r"(?m)^/bin/sh: \d+: (?P<sym>\S+): not found\s*$"),
+    # Dash / busybox shells say "X: not found" (no "command"). The
+    # prefix may be "/bin/sh: 1: " (most debian-based) or "sh: 1: " (some
+    # slim images that don't symlink /bin/sh into PATH the same way).
+    # Session 51ecb569 hit the latter form with `sh: 1: make: not found`
+    # in python:3.12-slim and the original /bin/-only pattern missed it,
+    # so compiler_node never tagged env_misconfig and the repair loop
+    # burned 5 LLM iterations on a problem no patch could fix.
+    re.compile(r"(?m)^(?:/bin/)?sh: \d+: (?P<sym>\S+): not found\s*$"),
     # Docker entrypoint missing (exec format / OCI runtime error)
     re.compile(r"executable file not found in \$?PATH: (?P<sym>\S+)"),
     re.compile(r'exec: "(?P<sym>[^"]+)": executable file not found'),

@@ -1161,7 +1161,12 @@ class TestSandboxBackend:
         )
         payload = cmd[-1]
         assert "chown" not in payload
-        assert payload == "pytest -q"
+        # The make bootstrap prelude is prepended unconditionally (see
+        # sandbox.py:_build_docker_command); the operator command runs
+        # after it. The contract this test is enforcing is "no chown
+        # trailer when restore_workspace_ownership=False" — the bootstrap
+        # is orthogonal.
+        assert payload.endswith(" pytest -q")
 
     def test_docker_cmd_no_trailer_on_non_linux_host(self, monkeypatch):
         # On macOS / Windows, Docker Desktop's FUSE layer already remaps
@@ -1292,7 +1297,12 @@ class TestSandboxBackend:
             cache_mounts=[], extra_env={}, timeout_seconds=60,
         )
         payload = cmd[-1]
-        assert payload.startswith('mkdir -p "$HOME" && ')
+        # The make bootstrap prelude is prepended unconditionally and is
+        # separated from the user-mode HOME wrap by a `;`. What this test
+        # cares about is that `mkdir -p "$HOME"` happens before the user's
+        # command — assert on the relative ordering instead of position 0.
+        assert 'mkdir -p "$HOME" && ' in payload
+        assert payload.index('mkdir -p "$HOME"') < payload.index("pip install pytest")
         assert "pip install pytest && pytest -q" in payload
 
     def test_docker_cmd_host_user_mode_skips_chown_trailer(self, monkeypatch):
@@ -1345,6 +1355,68 @@ class TestSandboxBackend:
         )
         assert isinstance(executor.backend, DockerBackend)
         assert executor.backend.restore_workspace_ownership is False
+
+    def test_docker_cmd_includes_make_bootstrap(self, monkeypatch):
+        # Layer 1 of the make-not-found fix (see session 51ecb569 logs):
+        # every container we spin up gets a `command -v make ||
+        # apt-get/apk/yum install make` prelude so the build can never
+        # fail with "sh: 1: make: not found" in a make-less image. The
+        # prelude is the fast path on images that already ship make
+        # (command -v exits 0 in <1ms) and a one-time apt/apk install on
+        # slim/alpine images.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "make build", "/work", allow_network=True,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        # The probe + each package-manager branch must be present.
+        assert "command -v make" in payload
+        assert "apt-get install -y -qq --no-install-recommends make" in payload
+        assert "apk add --no-cache make" in payload
+        assert "yum install -y -q make" in payload
+        # Failures from the probe must NOT block the build (`|| true` +
+        # `;` separator).
+        assert "|| true" in payload
+        # The operator's command still runs after the prelude.
+        assert "make build" in payload
+
+    def test_docker_cmd_make_bootstrap_runs_before_user_command(self, monkeypatch):
+        # The prelude MUST appear before the operator-typed command in
+        # the wrapped shell payload. Otherwise the build would fire first
+        # and the install would happen too late to help.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "make build", "/work", allow_network=True,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert payload.index("command -v make") < payload.index("make build")
+
+    def test_docker_cmd_make_bootstrap_also_present_in_host_user_mode(self, monkeypatch):
+        # Linux non-root host mode passes --user $UID:$GID, so apt-get
+        # inside the container will fail with EPERM. The prelude is
+        # still emitted unconditionally — the `|| true` swallows the
+        # failure cleanly and the residual `sh: 1: make: not found` is
+        # caught by Layer 2 (graph._is_env_misconfig). Test asserts the
+        # prelude is present in this mode so a future refactor doesn't
+        # accidentally gate it on root.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(os, "getgid", lambda: 1000)
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "make build", "/work", allow_network=True,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        payload = cmd[-1]
+        assert "command -v make" in payload
+        assert "|| true" in payload
 
     # ------------------------------------------------------------------
     # Windows compatibility — three regression nets for the POSIX-only

@@ -728,6 +728,42 @@ class DockerBackend(SandboxBackend):
                 wrapped_cmd, workspace_path,
             )
 
+        # Deterministic toolchain bootstrap: make sure `make` is on PATH
+        # before the operator's command runs. The default build command is
+        # `make build` and the toolchain-image adapter sometimes lands us
+        # on a slim image (python:3.12-slim, node:20-slim) that doesn't
+        # ship `make` — session 51ecb569 burned 5 LLM repair iterations
+        # on `sh: 1: make: not found` because no patch can fix a missing
+        # system binary. Prepending the install probe makes the failure
+        # mode impossible in the common (root-container) case and keeps
+        # the existing graph-level env_misconfig short-circuit as the
+        # safety net for the rest.
+        #
+        # Design notes:
+        # - `command -v make` is the fast path: ~0ms on images that
+        #   already ship make (buildpack-deps:bookworm, full python:3.12).
+        # - apt-get → apk → yum dispatch covers debian/ubuntu/slim,
+        #   alpine, and rhel-derivative images.
+        # - `2>/dev/null || true` makes the whole probe a no-op when the
+        #   container can't reach a mirror (allow_network=False) or
+        #   doesn't have root (Linux non-root host UID). The build
+        #   continues; if it actually needs make, the residual failure
+        #   surfaces through _is_env_misconfig and routes to HITL.
+        # - `;` (not `&&`) so the build command runs even if the probe
+        #   exits non-zero in an unexpected way.
+        make_bootstrap = (
+            "( command -v make >/dev/null 2>&1 "
+            "|| ( command -v apt-get >/dev/null 2>&1 "
+            "    && apt-get update -qq "
+            "    && apt-get install -y -qq --no-install-recommends make ) "
+            "|| ( command -v apk >/dev/null 2>&1 "
+            "    && apk add --no-cache make ) "
+            "|| ( command -v yum >/dev/null 2>&1 "
+            "    && yum install -y -q make ) "
+            "|| true ) 2>/dev/null ;"
+        )
+        wrapped_cmd = f"{make_bootstrap} {wrapped_cmd}"
+
         cmd.append(self.image)
         cmd.extend(["sh", "-c", wrapped_cmd])
 

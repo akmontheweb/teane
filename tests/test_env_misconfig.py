@@ -42,6 +42,17 @@ class TestIsEnvMisconfig:
         raw = "/bin/sh: 1: npm: not found\n"
         assert _is_env_misconfig(raw) == ("npm", "shell")
 
+    def test_command_not_found_sh_no_bin_prefix(self):
+        # python:3.12-slim's dash emits "sh: 1: <cmd>: not found" with no
+        # leading /bin/ prefix. Session 51ecb569 hit this with
+        # `sh: 1: make: not found` and the pre-fix regex missed it, so
+        # the loop wasted 5 LLM repair iterations on a sandbox config
+        # issue no patch could fix. The relaxed regex must match both
+        # forms; the /bin/ prefix variant is still covered by the npm
+        # test above.
+        raw = "sh: 1: make: not found\n"
+        assert _is_env_misconfig(raw) == ("make", "shell")
+
     def test_command_not_found_bash(self):
         raw = "bash: cargo: command not found\n"
         assert _is_env_misconfig(raw) == ("cargo", "shell")

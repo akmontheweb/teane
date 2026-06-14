@@ -491,6 +491,8 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "debug", "compiler",
     # Patcher behaviour knobs (B5: enforce_read_before_edit).
     "patcher",
+    # Change-request behaviour knobs (reverse_engineer_budget_usd etc.).
+    "change_requests",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -595,6 +597,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
     "compiler": frozenset({"run_prod_import_smoke_check"}),
+    # Change-request mode knobs. reverse_engineer_budget_usd caps the
+    # one-shot LLM walk in reverse_engineer_architecture_node so a large
+    # codebase doesn't blow the session budget on first contact.
+    "change_requests": frozenset({"reverse_engineer_budget_usd"}),
 }
 
 
@@ -613,6 +619,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "patcher.enforce_read_before_edit": (bool,),
     "patcher.use_structured_tools": (bool,),
     "compiler.run_prod_import_smoke_check": (bool,),
+    "change_requests.reverse_engineer_budget_usd": (int, float),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -3674,6 +3681,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             change_request_mode=change_request_mode,
             change_requests_dir_abs=cr_dir_abs if change_request_mode else "",
             archive_target_dir=archive_target_dir,
+            change_requests_config=config.get("change_requests", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")

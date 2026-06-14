@@ -27,12 +27,15 @@ from harness.deploy import (
     _generate_caddyfile,
     _generate_compose_file,
     _generate_dockerfile,
+    generate_assets_from_blueprint,
 )
 from harness.graph import (
     _assign_change_request_ids,
     _build_change_request_preamble,
+    _sample_workspace_for_reverse_engineer,
     _scan_archived_cr_ids,
     ingest_change_requests_node,
+    reverse_engineer_architecture_node,
     route_after_start,
     write_spec_node,
 )
@@ -619,3 +622,244 @@ class TestDeployCrAttribution:
         )
         # Marker on the very first line so it survives multi-stage builds.
         assert out.startswith("# CR-11: install postgres client libs\n")
+
+
+# ===========================================================================
+# PR-3: reverse-engineer architecture node + cr_attribution flow-through
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# File sampler
+# ---------------------------------------------------------------------------
+
+class TestReverseEngineerSampler:
+
+    def test_sampler_returns_empty_for_empty_workspace(self, tmp_path):
+        assert _sample_workspace_for_reverse_engineer(str(tmp_path), None) == []
+
+    def test_sampler_prioritises_entry_points(self, tmp_path):
+        # main.py and pyproject.toml should rank ahead of arbitrary .py
+        # files when both are present.
+        (tmp_path / "main.py").write_text("print('hi')\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "obscure.py").write_text("# obscure\n")
+        sampled = _sample_workspace_for_reverse_engineer(str(tmp_path), None)
+        rels = [rel for rel, _ in sampled]
+        assert "main.py" in rels and "pyproject.toml" in rels
+        # main.py is index 0 in the priority list, pyproject.toml is later
+        # but still before obscure.py.
+        assert rels.index("main.py") < rels.index("lib/obscure.py")
+
+    def test_sampler_skips_noise_directories(self, tmp_path):
+        (tmp_path / "main.py").write_text("x\n")
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "junk.js").write_text("noise\n")
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "config").write_text("noise\n")
+        sampled = _sample_workspace_for_reverse_engineer(str(tmp_path), None)
+        rels = [rel for rel, _ in sampled]
+        assert not any("node_modules" in r for r in rels)
+        assert not any(r.startswith(".git") for r in rels)
+
+
+# ---------------------------------------------------------------------------
+# reverse_engineer_architecture_node
+# ---------------------------------------------------------------------------
+
+class _StubResponse:
+    def __init__(self, content: str):
+        self.content = content
+        class _Usage:
+            input_tokens = 50
+            output_tokens = 40
+            cached_tokens = 0
+            cost_usd = 0.001
+            model = "stub"
+        self.usage = _Usage()
+
+
+class _StubGateway:
+    """Records dispatch calls and returns a canned architecture spec."""
+
+    class config:
+        repair_fallback = ""
+        planning_fallback = ""
+
+    def __init__(self, content: str):
+        self._content = content
+        self.dispatched: list[dict] = []
+
+    async def dispatch(self, *, messages, role, budget_remaining_usd, **kwargs):
+        self.dispatched.append({"messages": list(messages), "role": role})
+        return _StubResponse(self._content), budget_remaining_usd - 0.10
+
+    def aggregate_tokens(self, tracker, usage, role=None):
+        out = dict(tracker or {})
+        out["total_cost_usd"] = out.get("total_cost_usd", 0.0) + 0.001
+        return out
+
+
+@pytest.fixture
+def stub_gateway():
+    from harness import graph as graph_mod
+    installed: list[_StubGateway] = []
+
+    def _set(content: str) -> _StubGateway:
+        gw = _StubGateway(content)
+        graph_mod.set_gateway(gw)
+        installed.append(gw)
+        return gw
+
+    yield _set
+    from harness import graph as graph_mod  # noqa: F811
+    graph_mod.set_gateway(None)
+
+
+class TestReverseEngineerArchitectureNode:
+
+    def _seeded_workspace(self, tmp_path) -> str:
+        (tmp_path / "main.py").write_text("def run():\n    pass\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        return str(tmp_path)
+
+    def _state(self, workspace: str, *, budget: float = 2.00) -> dict:
+        return {
+            "workspace_path": workspace,
+            "change_request_mode": True,
+            "change_request_files": [
+                {"cr_id": 1, "original_name": "x.txt"},
+            ],
+            "budget_remaining_usd": budget,
+            "change_requests_config": {"reverse_engineer_budget_usd": 0.50},
+        }
+
+    def test_no_op_when_not_in_change_request_mode(self, tmp_path):
+        state = {
+            "workspace_path": str(tmp_path),
+            "change_request_mode": False,
+            "budget_remaining_usd": 2.00,
+        }
+        # No gateway needed — the node bails before dispatching.
+        result = asyncio.run(reverse_engineer_architecture_node(state))
+        assert result == {}
+        assert not (tmp_path / "docs" / "SPEC_ARCHITECTURE.md").exists()
+
+    def test_skipped_when_spec_already_exists(self, tmp_path, stub_gateway):
+        # Pre-seed an existing SPEC_ARCHITECTURE.md so the node short-
+        # circuits to the file-stat skip without paying the LLM cost.
+        ws = self._seeded_workspace(tmp_path)
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "SPEC_ARCHITECTURE.md").write_text("# Pre-existing spec\n")
+        gw = stub_gateway("# Should NOT be written")
+        result = asyncio.run(reverse_engineer_architecture_node(self._state(ws)))
+        # The spec path is returned but the LLM was NOT called.
+        assert result["spec_architecture_path"].endswith("SPEC_ARCHITECTURE.md")
+        assert gw.dispatched == []
+        assert (docs / "SPEC_ARCHITECTURE.md").read_text() == "# Pre-existing spec\n"
+
+    def test_synthesizes_spec_when_missing(self, tmp_path, stub_gateway):
+        ws = self._seeded_workspace(tmp_path)
+        gw = stub_gateway("# Synthesized Architecture\n\nDescribes the system.\n")
+        result = asyncio.run(reverse_engineer_architecture_node(self._state(ws)))
+        assert result["spec_architecture_path"] == str(tmp_path / "docs" / "SPEC_ARCHITECTURE.md")
+        # Spec landed on disk with the LLM content.
+        written = (tmp_path / "docs" / "SPEC_ARCHITECTURE.md").read_text()
+        assert "Synthesized Architecture" in written
+        # Single dispatch — the node is a one-shot, not a discovery loop.
+        assert len(gw.dispatched) == 1
+        # Budget reduced by the canned dispatch delta.
+        assert result["budget_remaining_usd"] == pytest.approx(1.90, rel=0.01)
+
+    def test_budget_gate_skips_when_remaining_below_cap(self, tmp_path, stub_gateway):
+        ws = self._seeded_workspace(tmp_path)
+        gw = stub_gateway("# Should NOT be written")
+        state = self._state(ws, budget=0.10)  # below the $0.50 default
+        result = asyncio.run(reverse_engineer_architecture_node(state))
+        assert result == {}
+        assert gw.dispatched == []
+        assert not (tmp_path / "docs" / "SPEC_ARCHITECTURE.md").exists()
+
+    def test_empty_workspace_skips(self, tmp_path, stub_gateway):
+        # No source files → nothing to sample → bail before dispatching.
+        gw = stub_gateway("ignored")
+        result = asyncio.run(
+            reverse_engineer_architecture_node(self._state(str(tmp_path)))
+        )
+        assert result == {}
+        assert gw.dispatched == []
+
+
+# ---------------------------------------------------------------------------
+# generate_assets_from_blueprint flow-through
+# ---------------------------------------------------------------------------
+
+class TestGenerateAssetsCrAttributionFlow:
+
+    def _blueprint(self) -> dict:
+        return {
+            "services": {
+                "auth": {
+                    "build_context": "auth",
+                    "ports": ["8080:8080"],
+                },
+                "redis": {
+                    "base_image": "redis:7-alpine",
+                    "ports": ["6379:6379"],
+                },
+            },
+            "volumes": {},
+            "networks": {"app-net": {"driver": "bridge"}},
+            "proxy_service": "caddy",
+        }
+
+    def _telemetry(self) -> dict:
+        return {"languages": ["python"], "databases_detected": [], "frameworks_detected": []}
+
+    def test_byte_identical_when_no_attribution(self, tmp_path):
+        bp = self._blueprint()
+        plain = generate_assets_from_blueprint(bp, self._telemetry(), str(tmp_path))
+        assert plain["success"] is True
+        compose = (tmp_path / "docker-compose.yml").read_text()
+        caddy = (tmp_path / "Caddyfile").read_text()
+        assert "CR-" not in compose
+        assert "CR-" not in caddy
+
+    def test_attribution_propagates_via_explicit_kwarg(self, tmp_path):
+        attribution = {"redis": "CR-7: added redis service for sessions"}
+        generate_assets_from_blueprint(
+            self._blueprint(), self._telemetry(), str(tmp_path),
+            cr_attribution=attribution,
+        )
+        compose = (tmp_path / "docker-compose.yml").read_text()
+        assert "# CR-7: added redis service for sessions" in compose
+
+    def test_attribution_propagates_via_blueprint_field(self, tmp_path):
+        # When the kwarg is omitted, the function falls back to
+        # blueprint['cr_attribution'] — so the deployment synthesizer can
+        # carry the attribution data inline with the blueprint.
+        bp = self._blueprint()
+        bp["cr_attribution"] = {"auth": "CR-9: rate-limited /login"}
+        generate_assets_from_blueprint(bp, self._telemetry(), str(tmp_path))
+        compose = (tmp_path / "docker-compose.yml").read_text()
+        caddy = (tmp_path / "Caddyfile").read_text()
+        assert "# CR-9: rate-limited /login" in compose
+        assert "# CR-9: rate-limited /login" in caddy
+        # Dockerfile for auth carries the marker on its first line.
+        dockerfile_path = tmp_path / "Dockerfile"
+        assert dockerfile_path.exists()
+        assert dockerfile_path.read_text().startswith(
+            "# CR-9: rate-limited /login\n"
+        )
+
+    def test_invalid_attribution_type_logged_and_ignored(self, tmp_path):
+        bp = self._blueprint()
+        bp["cr_attribution"] = ["not-a-dict"]   # operator error
+        result = generate_assets_from_blueprint(
+            bp, self._telemetry(), str(tmp_path),
+        )
+        assert result["success"] is True
+        compose = (tmp_path / "docker-compose.yml").read_text()
+        # The malformed input is ignored, not crashed on.
+        assert "CR-" not in compose

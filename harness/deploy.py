@@ -887,6 +887,8 @@ def generate_assets_from_blueprint(
     blueprint: dict[str, Any],
     telemetry: dict[str, Any],
     workspace_path: str,
+    *,
+    cr_attribution: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """
     Programmatically construct Dockerfiles, docker-compose.yml, and Caddyfile
@@ -896,10 +898,31 @@ def generate_assets_from_blueprint(
         blueprint: The architecture blueprint from synthesize_architecture().
         telemetry: The telemetry dict from scan_workspace_telemetry().
         workspace_path: Path to write generated files.
+        cr_attribution: Optional mapping of service name -> ``"CR-N: <reason>"``
+            summary used in change-request mode. When supplied, the
+            generated Dockerfile, compose, and Caddyfile blocks for each
+            annotated service carry a ``# CR-N: <reason>`` comment so a
+            reader can ``grep CR-N`` and trace deployment artifacts to
+            the originating request. When ``None`` (or when not in
+            change-request mode), the call site falls back to
+            ``blueprint.get("cr_attribution")`` so the deployment
+            synthesizer can carry attribution data inline with the
+            blueprint instead of plumbing a separate channel. Output is
+            byte-identical to pre-change-request behaviour when neither
+            source is set.
 
     Returns:
         Dict with list of generated file paths.
     """
+    if cr_attribution is None:
+        cr_attribution = blueprint.get("cr_attribution")
+    if cr_attribution is not None and not isinstance(cr_attribution, dict):
+        logger.warning(
+            "[deploy:generate] Ignoring non-dict cr_attribution=%r — "
+            "expected {service_name: 'CR-N: <reason>'}.",
+            type(cr_attribution).__name__,
+        )
+        cr_attribution = None
     # Validate before generating anything — refuse to write files for a
     # blueprint that would inject newlines/semicolons into Dockerfile or
     # YAML. The preview gate downstream is the user's last defense; this
@@ -931,7 +954,10 @@ def generate_assets_from_blueprint(
         if build_ctx == ".":
             svc_lang = primary_lang
 
-        dockerfile_content = _generate_dockerfile(svc_name, svc_spec, svc_lang, workspace_path)
+        dockerfile_content = _generate_dockerfile(
+            svc_name, svc_spec, svc_lang, workspace_path,
+            cr_attribution=cr_attribution,
+        )
         dockerfile_name = _dockerfile_name_for(svc_name, services)
         dockerfile_path = workspace / dockerfile_name
         dockerfile_path.write_text(dockerfile_content, encoding="utf-8")
@@ -939,7 +965,9 @@ def generate_assets_from_blueprint(
         logger.info("[deploy:generate] Generated %s", dockerfile_name)
 
     # Generate docker-compose.yml
-    compose_content = _generate_compose_file(blueprint)
+    compose_content = _generate_compose_file(
+        blueprint, cr_attribution=cr_attribution,
+    )
     compose_path = workspace / "docker-compose.yml"
     compose_path.write_text(compose_content, encoding="utf-8")
     generated.append("docker-compose.yml")
@@ -948,7 +976,9 @@ def generate_assets_from_blueprint(
     # Generate Caddyfile if proxy service specified
     if blueprint.get("proxy_service") == "caddy" or "caddy" in services:
         caddy_path = workspace / "Caddyfile"
-        caddy_content = _generate_caddyfile(blueprint)
+        caddy_content = _generate_caddyfile(
+            blueprint, cr_attribution=cr_attribution,
+        )
         caddy_path.write_text(caddy_content, encoding="utf-8")
         generated.append("Caddyfile")
         logger.info("[deploy:generate] Generated Caddyfile")
@@ -1190,7 +1220,22 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     logger.info("[deployment_node] Phase 2 complete: %d service(s) in blueprint.", len(blueprint.get("services", {})))
 
     # --- Phase 3: Generate ---
-    gen_result = generate_assets_from_blueprint(blueprint, telemetry, workspace_path)
+    # In change-request mode, source per-service CR attribution from
+    # either the blueprint (the deployment synthesizer can populate it
+    # inline as part of its delta-aware output) or from a state-level
+    # override the deployment_discovery_node may set. ``None`` (the
+    # default, and the greenfield case) yields byte-identical infra
+    # files to pre-change-request behaviour.
+    cr_attribution: Optional[dict[str, str]] = None
+    if state.get("change_request_mode", False):
+        ns = state.get("node_state", {}) or {}
+        cr_attribution = (
+            ns.get("deployment_cr_attribution")
+            or blueprint.get("cr_attribution")
+        )
+    gen_result = generate_assets_from_blueprint(
+        blueprint, telemetry, workspace_path, cr_attribution=cr_attribution,
+    )
     if not gen_result.get("success"):
         return {
             "compiler_errors": [{

@@ -162,6 +162,9 @@ class AgentState(TypedDict, total=False):
     # prompts (PR-2+) for CR-N marker injection.
     change_request_files: list[dict[str, Any]]
     archive_target_dir: str
+    # Loaded from the "change_requests" section of config.json by run_graph.
+    # Read by reverse_engineer_architecture_node for the budget cap.
+    change_requests_config: dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -180,6 +183,7 @@ def create_initial_state(
     change_request_mode: bool = False,
     change_requests_dir_abs: str = "",
     archive_target_dir: str = "",
+    change_requests_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -245,6 +249,7 @@ def create_initial_state(
         change_requests_dir_abs=change_requests_dir_abs,
         change_request_files=[],
         archive_target_dir=archive_target_dir,
+        change_requests_config=dict(change_requests_config or {}),
     )
 
 
@@ -4500,6 +4505,261 @@ def _assign_change_request_ids(
     return records
 
 
+_REVERSE_ENGINEER_DEFAULT_BUDGET_USD: float = 0.50
+_REVERSE_ENGINEER_MAX_FILES: int = 30
+_REVERSE_ENGINEER_MAX_BYTES: int = 100_000
+
+# Priority order when sampling files for the reverse-engineer walk. Lower
+# index = higher priority. Files outside this list are still considered
+# but sorted last (alphabetically). The list captures "entry points first"
+# (main.py, app.py, index.ts) → "framework configs" (pyproject.toml,
+# package.json) → "module roots" — exactly what an architect would skim
+# to map a codebase in 5 minutes.
+_REVERSE_ENGINEER_PRIORITY_BASENAMES: tuple[str, ...] = (
+    "main.py", "app.py", "wsgi.py", "asgi.py", "manage.py",
+    "index.ts", "index.js", "server.ts", "server.js",
+    "main.go", "main.rs", "Main.java", "lib.rs",
+    "pyproject.toml", "package.json", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
+    "Makefile", "README.md",
+)
+_REVERSE_ENGINEER_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt",
+    ".rb", ".dart", ".cs", ".cpp", ".c", ".h", ".hpp", ".swift",
+    ".sql", ".proto", ".yaml", ".yml", ".toml",
+})
+
+
+def _sample_workspace_for_reverse_engineer(
+    workspace_path: str,
+    source_root: Optional[str],
+) -> list[tuple[str, str]]:
+    """Return up to ``_REVERSE_ENGINEER_MAX_FILES`` files from the
+    workspace, capped at ``_REVERSE_ENGINEER_MAX_BYTES`` cumulative bytes,
+    biased toward priority entry-point filenames. Each tuple is
+    ``(workspace-relative path, content)``. Pure I/O — no LLM call.
+
+    Walk skips dot-directories, ``node_modules``, ``__pycache__``,
+    ``.git``, ``venv``, etc. so we don't hand the LLM lockfiles or
+    vendored dependencies.
+    """
+    skip_dirs = {
+        ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv",
+        "venv", "env", "dist", "build", ".pytest_cache", ".tox",
+        "target", ".idea", ".vscode", ".mypy_cache", ".ruff_cache",
+        "applied",  # change_requests/applied/
+    }
+
+    candidates: list[tuple[int, str]] = []
+    root_for_walk = (
+        os.path.join(workspace_path, source_root) if source_root else workspace_path
+    )
+    if not os.path.isdir(root_for_walk):
+        root_for_walk = workspace_path
+
+    for dirpath, dirnames, filenames in os.walk(root_for_walk):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for fname in filenames:
+            ext = os.path.splitext(fname)[1].lower()
+            if (
+                fname not in _REVERSE_ENGINEER_PRIORITY_BASENAMES
+                and ext not in _REVERSE_ENGINEER_SOURCE_EXTENSIONS
+            ):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fname), workspace_path)
+            if fname in _REVERSE_ENGINEER_PRIORITY_BASENAMES:
+                priority = _REVERSE_ENGINEER_PRIORITY_BASENAMES.index(fname)
+            else:
+                priority = len(_REVERSE_ENGINEER_PRIORITY_BASENAMES) + 1
+            candidates.append((priority, rel))
+
+    candidates.sort(key=lambda kv: (kv[0], kv[1]))
+
+    sampled: list[tuple[str, str]] = []
+    total_bytes = 0
+    for _priority, rel in candidates:
+        if len(sampled) >= _REVERSE_ENGINEER_MAX_FILES:
+            break
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(_REVERSE_ENGINEER_MAX_BYTES)
+        except OSError:
+            continue
+        if total_bytes + len(content) > _REVERSE_ENGINEER_MAX_BYTES:
+            # Truncate the last file to fit under the cap rather than
+            # silently dropping it — the LLM gets *some* signal from
+            # whatever fits, which is usually the file's imports + module
+            # docstring + first class/function, exactly what architecture
+            # synthesis needs.
+            remaining = max(0, _REVERSE_ENGINEER_MAX_BYTES - total_bytes)
+            if remaining < 200:
+                break
+            content = content[:remaining] + "\n... (truncated)\n"
+        sampled.append((rel, content))
+        total_bytes += len(content)
+    return sampled
+
+
+async def reverse_engineer_architecture_node(state: AgentState) -> dict[str, Any]:
+    """Synthesize ``SPEC_ARCHITECTURE.md`` for an existing codebase that
+    lacks one, on first contact in change-request mode.
+
+    Pre-conditions: ``change_request_mode=True`` AND no
+    ``SPEC_ARCHITECTURE.md`` exists at the conventional output path
+    (``<workspace>/docs/``). On a workspace that already has the spec
+    this node is a fast no-op (file-stat only). Subsequent change-request
+    sessions on the same repo therefore never re-pay the LLM cost.
+
+    Budget-gated by ``change_requests.reverse_engineer_budget_usd``
+    (defaults to ``$0.50``): when the remaining session budget is below
+    the cap the node logs and short-circuits — the architecture review
+    cycle that follows will still run, just without the synthesized
+    baseline, which mirrors how the discovery pipeline handles a missing
+    SPEC_ARCHITECTURE.md elsewhere.
+    """
+    if not state.get("change_request_mode", False):
+        return {}
+
+    workspace = state.get("workspace_path", os.getcwd())
+    output_dir = os.path.join(workspace, "docs")
+    arch_path = os.path.join(output_dir, "SPEC_ARCHITECTURE.md")
+
+    if os.path.isfile(arch_path):
+        logger.info(
+            "[reverse_engineer] %s already exists — skipping the one-shot "
+            "LLM walk. Subsequent CR sessions reuse this baseline.",
+            arch_path,
+        )
+        return {"spec_architecture_path": arch_path}
+
+    # Budget gate. Read the change_requests config section if it's
+    # plumbed through state (CR-3 PR ships it in cmd_run); otherwise use
+    # the conservative default.
+    cr_cfg = state.get("change_requests_config", {}) or {}
+    budget_cap = float(
+        cr_cfg.get(
+            "reverse_engineer_budget_usd",
+            _REVERSE_ENGINEER_DEFAULT_BUDGET_USD,
+        )
+    )
+    current_budget = float(state.get("budget_remaining_usd", 0.0))
+    if current_budget < budget_cap:
+        logger.warning(
+            "[reverse_engineer] Remaining budget $%.4f is below the "
+            "reverse_engineer cap $%.2f. Skipping the one-shot synthesis "
+            "and falling through to the discovery pipeline without a "
+            "baseline architecture spec.",
+            current_budget, budget_cap,
+        )
+        return {}
+
+    gateway = get_gateway()
+    if gateway is None:
+        logger.error(
+            "[reverse_engineer] No gateway configured — cannot synthesize "
+            "SPEC_ARCHITECTURE.md. Falling through to discovery."
+        )
+        return {}
+
+    # Cheap structural context: stack tags + source root. The discovery
+    # pipeline already uses these helpers for its own prompts.
+    from harness.impact import (
+        _detect_source_root,
+        _detect_workspace_stack,
+    )
+    stack_tags = sorted(_detect_workspace_stack(workspace))
+    source_root = _detect_source_root(workspace)
+
+    sampled = _sample_workspace_for_reverse_engineer(workspace, source_root)
+    if not sampled:
+        logger.warning(
+            "[reverse_engineer] No representative source files found in %s "
+            "— skipping the one-shot synthesis.", workspace,
+        )
+        return {}
+
+    cr_records = state.get("change_request_files", []) or []
+    cr_summary_lines = "\n".join(
+        f"  - CR-{r['cr_id']}: {r.get('original_name', '?')}" for r in cr_records
+    ) or "  (no active CRs)"
+
+    sample_blocks: list[str] = []
+    for rel, content in sampled:
+        sample_blocks.append(f"### `{rel}`\n```\n{content}\n```")
+    sample_body = "\n\n".join(sample_blocks)
+
+    system_prompt = (
+        "You are a Principal Software Architect performing a one-shot "
+        "reverse-engineering pass on an existing codebase. Your job is to "
+        "produce SPEC_ARCHITECTURE.md — a concise, accurate snapshot of the "
+        "system AS IT EXISTS TODAY. Subsequent sessions will amend this "
+        "document with `## Revision: CR-N — …` headers when change requests "
+        "modify the architecture. Be specific. Cite filenames you saw. "
+        "Do NOT invent components that aren't in the sampled files."
+    )
+    user_prompt = (
+        f"# Workspace fingerprint\n\n"
+        f"- Workspace path: `{workspace}`\n"
+        f"- Detected stack tags: {', '.join(stack_tags) or '(none detected)'}\n"
+        f"- Detected source root: `{source_root or '(flat layout)'}`\n"
+        f"- Pending change requests driving this session:\n"
+        f"{cr_summary_lines}\n\n"
+        f"# Representative source files ({len(sampled)} sampled)\n\n"
+        f"{sample_body}\n\n"
+        "---\n\n"
+        "# Task\n\n"
+        "Produce SPEC_ARCHITECTURE.md describing this system. Required sections:\n\n"
+        "1. **Module map** — top-level components and what each is responsible "
+        "for. Cite the directory and 1-2 representative files.\n"
+        "2. **Data model** — entities, stores, schemas. State unknowns explicitly.\n"
+        "3. **Integration surface** — external services, APIs called or exposed.\n"
+        "4. **Build & runtime** — toolchain, entry point, deploy unit.\n"
+        "5. **Known unknowns** — areas where the sample didn't give you enough "
+        "signal, framed as concrete questions for the operator.\n\n"
+        "Output ONLY the markdown document — no preamble, no fences."
+    )
+
+    from harness.gateway import NodeRole
+    try:
+        response, new_budget = await gateway.dispatch(
+            messages=[
+                MessageDict(role="system", content=system_prompt),
+                MessageDict(role="user", content=user_prompt),
+            ],
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=current_budget,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[reverse_engineer] LLM dispatch failed: %s — continuing "
+            "without baseline architecture.", exc,
+        )
+        return {}
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(arch_path, "w", encoding="utf-8") as f:
+            f.write(response.content)
+    except OSError as exc:
+        logger.error(
+            "[reverse_engineer] Could not write %s: %s. Continuing without "
+            "baseline architecture.", arch_path, exc,
+        )
+        return {"budget_remaining_usd": new_budget}
+
+    logger.info(
+        "[reverse_engineer] Synthesized %s (%d chars) from %d source files. "
+        "Subsequent CR sessions on this repo will skip this step. "
+        "Budget: $%.4f → $%.4f.",
+        arch_path, len(response.content), len(sampled),
+        current_budget, new_budget,
+    )
+    return {
+        "spec_architecture_path": arch_path,
+        "budget_remaining_usd": new_budget,
+    }
+
+
 async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
     """Consume the change_requests/ folder and inject the requests as the
     LLM's task description.
@@ -6330,8 +6590,14 @@ def build_graph() -> Any:
     )
     graph.add_node("test_generation_node", _test_generation_node)
 
-    # Register change-request ingest entry point
+    # Register change-request ingest entry point and the one-shot
+    # reverse-engineer architecture synthesis node that runs once on
+    # first contact with a repo that lacks SPEC_ARCHITECTURE.md.
     graph.add_node("ingest_change_requests_node", ingest_change_requests_node)
+    graph.add_node(
+        "reverse_engineer_architecture_node",
+        reverse_engineer_architecture_node,
+    )
 
     # Register exhaustive discovery nodes
     graph.add_node("requirements_discovery_node", requirements_discovery_node)
@@ -6383,12 +6649,19 @@ def build_graph() -> Any:
         },
     )
 
-    # ingest_change_requests_node hands off to the discovery pipeline so
-    # change requests flow through requirements → interview → spec →
-    # gatekeeper → patching. The ingest node sets ``skip_discovery=False``
-    # in its returned state so the downstream nodes don't short-circuit
-    # to gatekeeper-only.
-    graph.add_edge("ingest_change_requests_node", "requirements_discovery_node")
+    # ingest_change_requests_node hands off to the one-shot reverse-
+    # engineer pass (no-op when SPEC_ARCHITECTURE.md already exists),
+    # which then hands off to the discovery pipeline so change requests
+    # flow through requirements → interview → spec → gatekeeper →
+    # patching. The ingest node sets ``skip_discovery=False`` in its
+    # returned state so the downstream nodes don't short-circuit to
+    # gatekeeper-only.
+    graph.add_edge(
+        "ingest_change_requests_node", "reverse_engineer_architecture_node",
+    )
+    graph.add_edge(
+        "reverse_engineer_architecture_node", "requirements_discovery_node",
+    )
 
     # Requirements discovery loop
     graph.add_edge("requirements_discovery_node", "discovery_interview_loop")
@@ -6774,6 +7047,7 @@ async def run_graph(
     change_request_mode: bool = False,
     change_requests_dir_abs: str = "",
     archive_target_dir: str = "",
+    change_requests_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -6814,6 +7088,7 @@ async def run_graph(
         change_request_mode=change_request_mode,
         change_requests_dir_abs=change_requests_dir_abs,
         archive_target_dir=archive_target_dir,
+        change_requests_config=change_requests_config,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node
@@ -6829,6 +7104,8 @@ async def run_graph(
         initial_state["test_generation_config"] = test_generation_config
     if speculative_config is not None:
         initial_state["speculative_config"] = speculative_config
+    if change_requests_config is not None:
+        initial_state["change_requests_config"] = change_requests_config
     # Plumb the smoke-check flag into state so compiler_node can read it
     # without reaching out to config (which the graph module doesn't
     # touch directly today).

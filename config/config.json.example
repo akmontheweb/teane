@@ -178,12 +178,23 @@
         "format_modified_files": false
     },
 
-    "_speculative_comment": "Multi-variant speculative compilation. When enabled=true, the speculative_node forks num_variants parallel LLM dispatches (each at the configured temperature), applies each variant's patches in an isolated git worktree, and compiles each in parallel. The first variant that compiles cleanly wins and gets merged back. When all variants fail, the salvage path optionally merges the best-of-failing back (subject to a quality gate in _pick_salvage_variant). Default off because in practice the winner case rarely fires on greenfield Python-ish projects — variants converge on the same wrong solution at temperature=0.3, salvage merges incoherent partial work, and the repair loop can't recover. Flip enabled=true for workloads where parallel exploration earns its 3× LLM cost (e.g. steady-state codebases with bounded micro-fixes). selection_strategy ∈ {first_success, fewest_changes, all_pass}; num_variants ∈ [1, 10]; temperature ∈ [0.0, 1.5].",
+    "_speculative_comment": "Configuration-driven speculative compilation (#12 rebuild). Six independent strategy axes; the shipped defaults aim for positive ROI on typical workloads. (1) trigger decides WHEN speculative engages: 'always' fires every patching pass (high cost); 'first_attempt_only' is the legacy default; 'after_n_repair_failures' (DEFAULT) holds back until sequential repair has stalled — the high-value moment; 'manual' fires only when state.force_speculative is set. n_repair_failures_threshold (default 2) is the gate for the after_n_repair_failures trigger. (2) diversity_mode decides HOW variants differ: 'temperature' spreads temps over one model (legacy); 'prompt' fixes the model but varies a per-variant system-prompt style; 'model' (DEFAULT) routes each variant through a different model from variant_models — real architectural independence beats temperature noise; 'mixed' combines models and styles. (3) cost_strategy decides the COST shape: 'equal_cost' (legacy 3x cost); 'cheap_first_sequential' (DEFAULT) dispatches the cheap_model first, then expensive_model only if needed — expected cost ~1.1x; 'cheap_parallel_then_expensive' fires all-but-one cheap and one expensive in parallel; 'all_cheap' uses cheap_model for every variant. (4) selection_strategy: 'first_pass' (DEFAULT, alias 'first_success'); 'fewest_changes'; 'voted' dispatches voting.n_judges adversarial reviewers per passing variant (reuses fanout #11) and picks the highest-vote-rate; 'all_pass' requires every variant to pass. (5) salvage_strategy: 'none' (DEFAULT — fall back to sequential repair against the untouched workspace, strictly safer than the legacy merge); 'fewest_errors'; 'voted_partial'; 'merge' (legacy behaviour; documented failure mode of incoherent workspaces). (6) num_variants ∈ [1, 10]; max_concurrency ∈ [1, 10] caps parallelism; temperature ∈ [0.0, 1.5]. variant_models is a list of model keys used by diversity_mode ∈ {model, mixed}. variant_prompt_styles is a list of styles (e.g. 'minimal-diff', 'balanced', 'thorough') or names from the built-in style library used by diversity_mode ∈ {prompt, mixed}. expensive_model + cheap_model are referenced by the cost_strategy axes. Legacy configs without the new keys auto-upgrade to {trigger: first_attempt_only, diversity_mode: temperature, cost_strategy: equal_cost, salvage_strategy: merge} with a one-time warning so existing operators see exactly today's behaviour.",
     "speculative": {
         "enabled": false,
+        "trigger": "after_n_repair_failures",
+        "n_repair_failures_threshold": 2,
+        "diversity_mode": "model",
+        "cost_strategy": "cheap_first_sequential",
+        "selection_strategy": "first_pass",
+        "salvage_strategy": "none",
         "num_variants": 3,
+        "max_concurrency": 3,
         "temperature": 0.3,
-        "selection_strategy": "first_success",
+        "variant_models": [],
+        "variant_prompt_styles": [],
+        "expensive_model": "",
+        "cheap_model": "",
+        "voting": {"n_judges": 3, "judge_role": "code_reviewer"},
         "worktree_base_dir": "/tmp/.harness/speculative"
     },
 

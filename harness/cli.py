@@ -592,8 +592,14 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # the fork count; temperature controls per-variant diversity (sweet spot
     # 0.2-0.4 for code); selection_strategy is the winner-pick rule.
     "speculative": frozenset({
+        # Original keys (legacy schema — preserved for backwards compat).
         "enabled", "num_variants", "temperature",
         "selection_strategy", "worktree_base_dir",
+        # Rebuild keys (#12) — strategy axes and per-strategy parameters.
+        "trigger", "n_repair_failures_threshold",
+        "diversity_mode", "cost_strategy", "salvage_strategy",
+        "max_concurrency", "variant_models", "variant_prompt_styles",
+        "expensive_model", "cheap_model", "voting",
     }),
     # LLM dispatch parameters consumed by harness/gateway.py.
     # max_tokens_per_role is a free-form dict (role -> int) — the
@@ -755,6 +761,17 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.temperature": (int, float),
     "speculative.selection_strategy": (str,),
     "speculative.worktree_base_dir": (str,),
+    "speculative.trigger": (str,),
+    "speculative.n_repair_failures_threshold": (int,),
+    "speculative.diversity_mode": (str,),
+    "speculative.cost_strategy": (str,),
+    "speculative.salvage_strategy": (str,),
+    "speculative.max_concurrency": (int,),
+    "speculative.variant_models": (list,),
+    "speculative.variant_prompt_styles": (list,),
+    "speculative.expensive_model": (str,),
+    "speculative.cheap_model": (str,),
+    "speculative.voting": (dict,),
     "llm_dispatch.max_tokens_default": (int,),
     "llm_dispatch.max_tokens_per_role": (dict,),
     "llm_dispatch.prompt_cache_enabled": (bool,),

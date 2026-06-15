@@ -68,12 +68,416 @@ class SpeculativeResult:
     passed_variants: int = 0
     winner_index: int = -1
     variant_results: list[VariantResult] = field(default_factory=list)
-    strategy: str = "first_success"
+    strategy: str = "first_pass"
     elapsed_seconds: float = 0.0
 
 
 # ---------------------------------------------------------------------------
-# 2. Speculative Node
+# 2. Strategy enums + config (rebuild, #12)
+# ---------------------------------------------------------------------------
+
+# Enums-as-string-constants. We use plain strings (not Enum subclasses) so
+# they round-trip through JSON / state-dict serialisation without
+# additional type adapters; the validation in :func:`SpeculativeConfig.
+# normalize` covers typos.
+
+DIVERSITY_TEMPERATURE = "temperature"   # all variants same model, varied temp
+DIVERSITY_PROMPT      = "prompt"        # all variants same model, varied system prompt
+DIVERSITY_MODEL       = "model"         # different models per variant
+DIVERSITY_MIXED       = "mixed"         # different models AND different prompt styles
+DIVERSITY_MODES = frozenset({
+    DIVERSITY_TEMPERATURE, DIVERSITY_PROMPT, DIVERSITY_MODEL, DIVERSITY_MIXED,
+})
+
+COST_EQUAL = "equal_cost"                          # current behaviour
+COST_CHEAP_FIRST_SEQUENTIAL = "cheap_first_sequential"  # cheap one-by-one, expensive last
+COST_CHEAP_PARALLEL_THEN_EXPENSIVE = "cheap_parallel_then_expensive"
+COST_ALL_CHEAP = "all_cheap"
+COST_STRATEGIES = frozenset({
+    COST_EQUAL,
+    COST_CHEAP_FIRST_SEQUENTIAL,
+    COST_CHEAP_PARALLEL_THEN_EXPENSIVE,
+    COST_ALL_CHEAP,
+})
+
+SELECT_FIRST_PASS = "first_pass"          # canonical name
+SELECT_FIRST_SUCCESS = "first_success"    # legacy alias for first_pass
+SELECT_FEWEST_CHANGES = "fewest_changes"
+SELECT_VOTED = "voted"                    # adversarial judges (uses fanout #11)
+SELECT_ALL_PASS = "all_pass"
+SELECTION_STRATEGIES = frozenset({
+    SELECT_FIRST_PASS, SELECT_FIRST_SUCCESS, SELECT_FEWEST_CHANGES,
+    SELECT_VOTED, SELECT_ALL_PASS,
+})
+
+SALVAGE_NONE = "none"      # fall back to sequential repair against untouched workspace
+SALVAGE_FEWEST_ERRORS = "fewest_errors"
+SALVAGE_VOTED_PARTIAL = "voted_partial"
+SALVAGE_MERGE = "merge"    # legacy behaviour (often produces incoherent workspaces)
+SALVAGE_STRATEGIES = frozenset({
+    SALVAGE_NONE, SALVAGE_FEWEST_ERRORS, SALVAGE_VOTED_PARTIAL, SALVAGE_MERGE,
+})
+
+TRIGGER_ALWAYS = "always"
+TRIGGER_FIRST_ATTEMPT_ONLY = "first_attempt_only"
+TRIGGER_AFTER_N_REPAIR_FAILURES = "after_n_repair_failures"
+TRIGGER_MANUAL = "manual"  # only when state["force_speculative"] is truthy
+TRIGGERS = frozenset({
+    TRIGGER_ALWAYS, TRIGGER_FIRST_ATTEMPT_ONLY,
+    TRIGGER_AFTER_N_REPAIR_FAILURES, TRIGGER_MANUAL,
+})
+
+
+@dataclass
+class VotingConfig:
+    """Settings for ``selection_strategy=voted`` (adversarial judges)."""
+
+    n_judges: int = 3
+    judge_role: str = "code_reviewer"  # one of the NodeRole values
+
+
+@dataclass
+class SpeculativeConfig:
+    """Full strategy surface for speculative execution (#12 rebuild).
+
+    Each axis (``diversity_mode``, ``cost_strategy``,
+    ``selection_strategy``, ``salvage_strategy``, ``trigger``) is
+    independently selectable from config. The defaults below were chosen
+    to deliver positive ROI for typical workloads:
+
+    - ``trigger=after_n_repair_failures`` (threshold 2): sequential is
+      cheaper and more focused on the happy path. Speculative is held
+      back for the moment when sequential repair is stuck — that's when
+      diversity actually buys recovery.
+    - ``cost_strategy=cheap_first_sequential``: try a cheap model first;
+      only spawn the expensive baseline when cheap fails. Expected cost
+      is ~1.1× sequential rather than the old 3×.
+    - ``diversity_mode=model``: use *different* models for variants when
+      we do fan out. Different architectures genuinely fail differently;
+      temperature noise on one model does not.
+    - ``selection_strategy=first_pass``: take the first variant that
+      compiles cleanly. Cheap and effective.
+    - ``salvage_strategy=none``: when all variants fail, throw the
+      worktrees away and fall back to sequential repair against the
+      untouched workspace. Pareto-better than the legacy ``merge`` path
+      which often produced incoherent workspaces.
+    """
+
+    enabled: bool = False  # opt-in; legacy default preserved
+    trigger: str = TRIGGER_AFTER_N_REPAIR_FAILURES
+    n_repair_failures_threshold: int = 2
+    diversity_mode: str = DIVERSITY_MODEL
+    cost_strategy: str = COST_CHEAP_FIRST_SEQUENTIAL
+    selection_strategy: str = SELECT_FIRST_PASS
+    salvage_strategy: str = SALVAGE_NONE
+    num_variants: int = 3
+    max_concurrency: int = 3
+    temperature: float = 0.3
+    # Diversity vectors — used when the mode references them.
+    variant_models: list[str] = field(default_factory=list)
+    variant_prompt_styles: list[str] = field(default_factory=list)
+    expensive_model: str = ""  # primary model for cheap_first / cheap_parallel
+    cheap_model: str = ""      # fallback / cheap variants
+    voting: VotingConfig = field(default_factory=VotingConfig)
+    worktree_base_dir: str = "/tmp/.harness/speculative"
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "SpeculativeConfig":
+        raw = dict(state.get("speculative_config") or {})
+        raw = _upgrade_legacy_config(raw)
+        return cls.normalize(raw)
+
+    @classmethod
+    def normalize(cls, raw: dict[str, Any]) -> "SpeculativeConfig":
+        """Build a :class:`SpeculativeConfig` from a raw dict, clamping
+        out-of-range values and replacing unknown enum values with the
+        documented defaults (with a warning).
+        """
+        def _pick(value: Any, allowed: frozenset[str], default: str) -> str:
+            if not isinstance(value, str) or value not in allowed:
+                if value not in (None, ""):
+                    logger.warning(
+                        "[speculative] unknown value %r; using %r.",
+                        value, default,
+                    )
+                return default
+            return value
+
+        def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
+            try:
+                v = int(value) if value is not None else default
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _clamp_float(value: Any, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(value) if value is not None else default
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        voting_raw = raw.get("voting") or {}
+        voting = VotingConfig(
+            n_judges=_clamp_int(voting_raw.get("n_judges"), 3, 1, 7),
+            judge_role=str(voting_raw.get("judge_role", "code_reviewer") or "code_reviewer"),
+        )
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            trigger=_pick(raw.get("trigger"), TRIGGERS, TRIGGER_AFTER_N_REPAIR_FAILURES),
+            n_repair_failures_threshold=_clamp_int(
+                raw.get("n_repair_failures_threshold"), 2, 1, 10,
+            ),
+            diversity_mode=_pick(raw.get("diversity_mode"), DIVERSITY_MODES, DIVERSITY_MODEL),
+            cost_strategy=_pick(raw.get("cost_strategy"), COST_STRATEGIES, COST_CHEAP_FIRST_SEQUENTIAL),
+            selection_strategy=_pick(
+                raw.get("selection_strategy"), SELECTION_STRATEGIES, SELECT_FIRST_PASS,
+            ),
+            salvage_strategy=_pick(raw.get("salvage_strategy"), SALVAGE_STRATEGIES, SALVAGE_NONE),
+            num_variants=_clamp_int(raw.get("num_variants"), 3, 1, 10),
+            max_concurrency=_clamp_int(
+                raw.get("max_concurrency", raw.get("num_variants")), 3, 1, 10,
+            ),
+            temperature=_clamp_float(raw.get("temperature"), 0.3, 0.0, 1.5),
+            variant_models=[
+                str(m) for m in (raw.get("variant_models") or [])
+                if isinstance(m, str) and m
+            ],
+            variant_prompt_styles=[
+                str(s) for s in (raw.get("variant_prompt_styles") or [])
+                if isinstance(s, str) and s
+            ],
+            expensive_model=str(raw.get("expensive_model") or ""),
+            cheap_model=str(raw.get("cheap_model") or ""),
+            voting=voting,
+            worktree_base_dir=str(raw.get("worktree_base_dir") or "/tmp/.harness/speculative"),
+        )
+
+
+_LEGACY_KEY_ALIASES = {
+    "first_success": SELECT_FIRST_PASS,  # selection_strategy alias
+}
+
+
+def _upgrade_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map old-shape speculative config to the new schema.
+
+    The legacy shape was::
+
+        {"enabled": bool, "num_variants": int, "temperature": float,
+         "selection_strategy": "first_success" | "fewest_changes" |
+                                "all_pass",
+         "worktree_base_dir": str}
+
+    When the operator hasn't migrated to the new keys, we infer the
+    backwards-compatible defaults so their flow keeps working:
+
+      - ``diversity_mode=temperature``  (matches old "all variants, vary
+        temp" behaviour)
+      - ``cost_strategy=equal_cost``    (all variants used same model)
+      - ``salvage_strategy=merge``      (legacy merge-on-fail path)
+      - ``trigger=first_attempt_only``  (engages on the first patching
+        call, mirroring the old wiring)
+
+    Logs a one-time deprecation warning when any legacy-only key is
+    detected so operators see they should migrate.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    has_legacy_only = (
+        "trigger" not in raw
+        and "diversity_mode" not in raw
+        and "cost_strategy" not in raw
+        and "salvage_strategy" not in raw
+        and raw.get("enabled", False)
+    )
+    if "selection_strategy" in out and out["selection_strategy"] in _LEGACY_KEY_ALIASES:
+        out["selection_strategy"] = _LEGACY_KEY_ALIASES[out["selection_strategy"]]
+    if has_legacy_only:
+        out.setdefault("diversity_mode", DIVERSITY_TEMPERATURE)
+        out.setdefault("cost_strategy", COST_EQUAL)
+        out.setdefault("salvage_strategy", SALVAGE_MERGE)
+        out.setdefault("trigger", TRIGGER_FIRST_ATTEMPT_ONLY)
+        logger.warning(
+            "[speculative] legacy config detected; mapping to "
+            "diversity_mode=%r cost_strategy=%r salvage_strategy=%r "
+            "trigger=%r. Migrate to the new keys to silence this "
+            "warning — see config/config.json.example.",
+            DIVERSITY_TEMPERATURE, COST_EQUAL, SALVAGE_MERGE,
+            TRIGGER_FIRST_ATTEMPT_ONLY,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 3. Trigger evaluation
+# ---------------------------------------------------------------------------
+
+def _trigger_met(cfg: "SpeculativeConfig", state: dict[str, Any]) -> tuple[bool, str]:
+    """Return ``(engage, reason)``.
+
+    The reason is a human-readable string used in the no-op log so the
+    operator can tell why a speculative round was skipped.
+    """
+    loop = state.get("loop_counter") or {}
+    if cfg.trigger == TRIGGER_ALWAYS:
+        return True, "trigger=always"
+    if cfg.trigger == TRIGGER_FIRST_ATTEMPT_ONLY:
+        patching_count = int(loop.get("patching", 0) or 0)
+        if patching_count <= 1:
+            return True, "first patching attempt"
+        return False, f"patching_count={patching_count} > 1"
+    if cfg.trigger == TRIGGER_AFTER_N_REPAIR_FAILURES:
+        repair_count = int(loop.get("repair", 0) or 0)
+        if repair_count >= cfg.n_repair_failures_threshold:
+            return True, f"repair_count={repair_count} >= {cfg.n_repair_failures_threshold}"
+        return False, (
+            f"repair_count={repair_count} < threshold "
+            f"{cfg.n_repair_failures_threshold}"
+        )
+    if cfg.trigger == TRIGGER_MANUAL:
+        if state.get("force_speculative"):
+            return True, "state.force_speculative=true"
+        return False, "manual trigger; state.force_speculative not set"
+    # Defensive fallback (should not happen — normalize() catches typos).
+    return False, f"unknown trigger {cfg.trigger!r}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Variant spec builder
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _VariantSpec:
+    """Per-variant LLM dispatch spec — internal, fed to fanout or
+    serially executed depending on the cost strategy."""
+
+    index: int
+    model_override: Optional[str]
+    temperature: float
+    system_prompt_suffix: str  # extra style hint appended to messages[0]
+    is_expensive: bool = False  # used by cheap_first / cheap_parallel strategies
+
+
+_PROMPT_STYLE_LIBRARY = {
+    "minimal-diff": (
+        "Style override: produce the smallest possible diff that solves the "
+        "task. Avoid speculative refactors, comment churn, or imports you "
+        "don't need."
+    ),
+    "balanced": (
+        "Style override: balance correctness and minimal change. Refactor "
+        "only what's required by the task."
+    ),
+    "thorough": (
+        "Style override: prefer thorough, defensive code with explicit error "
+        "handling and tests where appropriate."
+    ),
+    "conservative": (
+        "Style override: prefer adding small wrappers over modifying existing "
+        "behaviour. When in doubt, leave existing code untouched."
+    ),
+    "bold": (
+        "Style override: don't hesitate to refactor when the current "
+        "structure is the root cause of the problem."
+    ),
+}
+
+
+def _build_variant_specs(cfg: "SpeculativeConfig") -> list[_VariantSpec]:
+    """Build the per-variant dispatch specs based on diversity_mode +
+    cost_strategy. Returns a list of length ``cfg.num_variants``.
+    """
+    specs: list[_VariantSpec] = []
+
+    # Resolve the model lists used by each strategy.
+    cheap = cfg.cheap_model or ""
+    expensive = cfg.expensive_model or ""
+    models_pool = list(cfg.variant_models)
+    prompts_pool = list(cfg.variant_prompt_styles) or list(_PROMPT_STYLE_LIBRARY.keys())
+
+    for i in range(cfg.num_variants):
+        # --- Diversity axis ---
+        if cfg.diversity_mode == DIVERSITY_TEMPERATURE:
+            # Same model (gateway default), spread temperatures.
+            temp = max(0.0, min(1.5, cfg.temperature + i * 0.15))
+            model = None
+            style = ""
+        elif cfg.diversity_mode == DIVERSITY_PROMPT:
+            model = None
+            temp = cfg.temperature
+            style = prompts_pool[i % len(prompts_pool)] if prompts_pool else ""
+        elif cfg.diversity_mode == DIVERSITY_MODEL:
+            model = models_pool[i % len(models_pool)] if models_pool else None
+            temp = cfg.temperature
+            style = ""
+        else:  # DIVERSITY_MIXED
+            model = models_pool[i % len(models_pool)] if models_pool else None
+            temp = max(0.0, min(1.5, cfg.temperature + (i // max(1, len(models_pool))) * 0.15))
+            style = prompts_pool[i % len(prompts_pool)] if prompts_pool else ""
+
+        # --- Cost axis: override model assignment when strategy demands ---
+        is_expensive = False
+        if cfg.cost_strategy == COST_EQUAL:
+            pass  # diversity already chose the model
+        elif cfg.cost_strategy == COST_ALL_CHEAP and cheap:
+            model = cheap
+        elif cfg.cost_strategy == COST_CHEAP_FIRST_SEQUENTIAL:
+            # First N-1 cheap; last expensive. Sequential execution
+            # below short-circuits as soon as one passes.
+            if i < cfg.num_variants - 1 and cheap:
+                model = cheap
+            elif expensive:
+                model = expensive
+                is_expensive = True
+        elif cfg.cost_strategy == COST_CHEAP_PARALLEL_THEN_EXPENSIVE:
+            # All-but-one cheap, one expensive. Parallel; expensive marked
+            # so the runner can prioritise / report cost.
+            if i == 0 and expensive:
+                model = expensive
+                is_expensive = True
+            elif cheap:
+                model = cheap
+
+        # --- Resolve style suffix from the library when name is a key ---
+        style_suffix = _PROMPT_STYLE_LIBRARY.get(style, style)
+
+        specs.append(_VariantSpec(
+            index=i,
+            model_override=model,
+            temperature=temp,
+            system_prompt_suffix=style_suffix,
+            is_expensive=is_expensive,
+        ))
+    return specs
+
+
+def _seed_messages_with_style(
+    messages: list[dict[str, Any]], spec: "_VariantSpec",
+) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with the variant's style suffix
+    appended to the first system message. Used by diversity_mode=prompt
+    / mixed to actually steer the LLM through a *different* angle than
+    its peers — without this the spec's prompt_style does nothing.
+    """
+    if not spec.system_prompt_suffix:
+        return list(messages)
+    out = [dict(m) for m in messages]
+    inserted = False
+    for m in out:
+        if m.get("role") == "system":
+            base = str(m.get("content") or "")
+            m["content"] = (base + "\n\n" + spec.system_prompt_suffix).strip()
+            inserted = True
+            break
+    if not inserted:
+        out.insert(0, {"role": "system", "content": spec.system_prompt_suffix})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 5. Speculative Node (entry point — preserved name + state contract)
 # ---------------------------------------------------------------------------
 
 async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -110,27 +514,29 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     import time as time_module
 
-    # --- Config ---
-    spec_cfg = state.get("speculative_config", {}) or {}
-    # Honour the `enabled` flag. Default is False: across the recent log set
-    # (sessions ae01ec25, c498b865, dd47480a, 8b7f7d52) the winner case
-    # never fired — every speculative round fell through to salvage, the
-    # salvage merge created workspace coherence problems (incoherent
-    # directory layouts, missing entry points), and the downstream repair
-    # loop couldn't recover. The 3× LLM cost bought negative ROI. Operators
-    # who want speculative on a workload where it earns its cost (e.g.
-    # steady-state repos with bounded micro-fixes) flip the flag in
-    # config.json. See speculative.md (when documented) for details.
-    if not spec_cfg.get("enabled", False):
+    # --- Config (#12 rebuild) ---
+    cfg = SpeculativeConfig.from_state(state)
+    if not cfg.enabled:
         logger.info(
             "[speculative] Disabled (speculative.enabled is false). "
             "Passing through to standard patching flow."
         )
         return _fallback_result()
-    num_variants = spec_cfg.get("num_variants", 3)
-    temperature = spec_cfg.get("temperature", 0.3)
-    strategy = spec_cfg.get("selection_strategy", "first_success")
-    worktree_base = spec_cfg.get("worktree_base_dir", "/tmp/.harness/speculative")
+    # Trigger gate. Even when enabled, we only engage on the workloads the
+    # operator opted into (e.g. trigger=after_n_repair_failures means we
+    # stay out of the way until sequential repair has stalled).
+    engage, reason = _trigger_met(cfg, state)
+    if not engage:
+        logger.info(
+            "[speculative] Trigger %r not met (%s). Passing through.",
+            cfg.trigger, reason,
+        )
+        return _fallback_result()
+    num_variants = cfg.num_variants
+    temperature = cfg.temperature
+    strategy = cfg.selection_strategy
+    worktree_base = cfg.worktree_base_dir
+    variant_specs = _build_variant_specs(cfg)
 
     workspace_path = state.get("workspace_path", os.getcwd())
     build_command = state.get("build_command", "make build")
@@ -204,33 +610,76 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         logger.error("[speculative] No gateway configured. Falling back to single patch.")
         return _fallback_result()
 
-    # --- Step 1: Generate N variants in parallel ---
+    # --- Step 1: Generate N variants ---
+    # The cost strategy decides parallel vs sequential. cheap_first_sequential
+    # dispatches one variant at a time so that, downstream, we can short-circuit
+    # the remaining LLM calls once a cheap variant proves it can compile.
     variant_responses: list[Any] = []
-    try:
-        tasks = [
-            gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.PATCHING,
-                budget_remaining_usd=budget,
-                temperature=temperature,
-            )
-            for _ in range(num_variants)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                logger.warning("[speculative] Variant %d LLM call failed: %s", i, result)
-                variant_responses.append(None)
-            else:
-                response, new_budget = result  # (LLMResponse, new_budget)
+    if cfg.cost_strategy == COST_CHEAP_FIRST_SEQUENTIAL:
+        for spec in variant_specs:
+            try:
+                seeded_messages = _seed_messages_with_style(messages, spec)
+                response, _ = await gateway.dispatch(
+                    messages=seeded_messages,
+                    role=NodeRole.PATCHING,
+                    budget_remaining_usd=budget,
+                    temperature=spec.temperature,
+                    model_override=spec.model_override,
+                )
                 variant_responses.append(response)
-                logger.info("[speculative] Variant %d: %d tokens (in=%d out=%d)",
-                             i, response.usage.input_tokens + response.usage.output_tokens,
-                             response.usage.input_tokens, response.usage.output_tokens)
-    except Exception as exc:
-        logger.exception("[speculative] Variant generation failed: %s", exc)
-        return _fallback_result()
+                logger.info(
+                    "[speculative] Variant %d (seq, model=%s, temp=%.2f): "
+                    "%d tokens (in=%d out=%d)",
+                    spec.index,
+                    spec.model_override or "(routed)",
+                    spec.temperature,
+                    response.usage.input_tokens + response.usage.output_tokens,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[speculative] Variant %d sequential dispatch failed: %s",
+                    spec.index, exc,
+                )
+                variant_responses.append(None)
+    else:
+        try:
+            tasks = [
+                gateway.dispatch(
+                    messages=_seed_messages_with_style(messages, spec),
+                    role=NodeRole.PATCHING,
+                    budget_remaining_usd=budget,
+                    temperature=spec.temperature,
+                    model_override=spec.model_override,
+                )
+                for spec in variant_specs
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for spec, result in zip(variant_specs, results):
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "[speculative] Variant %d LLM call failed: %s",
+                        spec.index, result,
+                    )
+                    variant_responses.append(None)
+                else:
+                    response, new_budget = result  # (LLMResponse, new_budget)
+                    variant_responses.append(response)
+                    logger.info(
+                        "[speculative] Variant %d (parallel, model=%s, temp=%.2f): "
+                        "%d tokens (in=%d out=%d)",
+                        spec.index,
+                        spec.model_override or "(routed)",
+                        spec.temperature,
+                        response.usage.input_tokens + response.usage.output_tokens,
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                    )
+        except Exception as exc:
+            logger.exception("[speculative] Variant generation failed: %s", exc)
+            return _fallback_result()
 
     # Count successful LLM calls
     valid_variants = [r for r in variant_responses if r is not None]
@@ -482,7 +931,13 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
     ]))
 
     # --- Step 5: Select the winning variant ---
-    winner = _select_winner(variant_results, strategy)
+    winner = await _select_winner_async(
+        variant_results,
+        strategy,
+        cfg=cfg,
+        gateway=gateway,
+        budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
+    )
     elapsed = time_module.monotonic() - start_time
 
     spec_result = SpeculativeResult(
@@ -588,7 +1043,13 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
     # to collect — both of which the repair loop can resolve once the code
     # actually lives on disk. Without salvage, the repair loop starts from
     # an empty workspace and spins out on "no source to fix".
-    salvage = _pick_salvage_variant(variant_results)
+    # Gate salvage on the strategy. Default is SALVAGE_NONE — fall back
+    # to sequential repair against the untouched workspace rather than
+    # risk an incoherent merge.
+    if cfg.salvage_strategy == SALVAGE_NONE:
+        salvage = None
+    else:
+        salvage = _pick_salvage_variant(variant_results)
     if salvage is not None:
         logger.warning(
             "[speculative] All %d variants failed, but Variant %d applied "
@@ -833,33 +1294,117 @@ def _merge_variant_into_workspace(
 
 def _select_winner(
     variant_results: list[VariantResult],
-    strategy: str = "first_success",
+    strategy: str = SELECT_FIRST_PASS,
 ) -> Optional[VariantResult]:
     """
     Select the winning variant based on the configured strategy.
 
-    Strategies:
-        - "first_success": First variant with exit_code 0
-        - "fewest_changes": Passing variant with fewest lines changed
-        - "all_pass": Only return winner if ALL variants pass (strictest)
+    Strategies (string constants exported at module top):
+        - first_pass / first_success: first variant with exit_code 0
+        - fewest_changes: passing variant with the smallest diff
+        - all_pass: only return a winner when every variant passes
+        - voted: see :func:`_select_winner_async` (requires gateway)
     """
     passing = [vr for vr in variant_results if vr.passed]
 
     if not passing:
         return None
 
-    if strategy == "all_pass":
+    if strategy == SELECT_ALL_PASS:
         if len(passing) == len(variant_results):
             return passing[0]
         logger.warning("[speculative] all_pass strategy: %d/%d passed. No winner selected.",
                         len(passing), len(variant_results))
         return None
 
-    if strategy == "fewest_changes":
+    if strategy == SELECT_FEWEST_CHANGES:
         return min(passing, key=lambda vr: vr.total_lines_changed)
 
-    # Default: first_success
+    # voted falls back here when the async selector wasn't used —
+    # treat as first_pass so callers always get a deterministic answer.
     return passing[0]
+
+
+async def _select_winner_async(
+    variant_results: list[VariantResult],
+    strategy: str,
+    *,
+    cfg: "SpeculativeConfig",
+    gateway: Any,
+    budget_remaining_usd: float,
+) -> Optional[VariantResult]:
+    """Async wrapper that adds the ``voted`` strategy on top of the
+    synchronous :func:`_select_winner`.
+
+    For non-voted strategies, returns the same answer as the sync path.
+    For ``voted``: keeps the passing variants, dispatches
+    ``cfg.voting.n_judges`` adversarial reviewers per candidate to
+    score them, then returns the variant with the highest accept-rate
+    (ties broken by fewest_changes — Occam keeps the smaller diff).
+    """
+    passing = [vr for vr in variant_results if vr.passed]
+    if strategy != SELECT_VOTED or len(passing) <= 1 or gateway is None:
+        return _select_winner(variant_results, strategy)
+    try:
+        from harness.fanout import AgentSpec, run_parallel_agents
+        from harness.gateway import NodeRole as _NR
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[speculative] voted fallback to first_pass (%s)", exc)
+        return passing[0]
+    role_map = {
+        "code_reviewer": _NR.CODE_REVIEWER,
+        "doc_reviewer": _NR.DOC_REVIEWER,
+        "planning": _NR.PLANNING,
+    }
+    judge_role = role_map.get(cfg.voting.judge_role, _NR.CODE_REVIEWER)
+
+    scores: dict[int, int] = {}
+    for vr in passing:
+        snippet = (vr.raw_output or "")[-1500:] if vr.raw_output else ""
+        files = ", ".join(vr.modified_files[:6])
+        prompt = (
+            "You are scoring a candidate code patch variant. The variant "
+            "compiled cleanly. Decide whether you would accept this "
+            "variant as the winner among several passing candidates. "
+            "Respond with a one-line JSON object with keys "
+            "`accept` (bool) and `reason` (short string).\n\n"
+            f"Variant index: {vr.index}\n"
+            f"Files modified: {files}\n"
+            f"Build output tail:\n{snippet}\n"
+        )
+        judge_specs = [
+            AgentSpec(
+                name=f"judge-v{vr.index}-{i}",
+                system_prompt=(
+                    "You are an adversarial code reviewer. Be skeptical; "
+                    "default to accept=false when uncertain."
+                ),
+                user_prompt=prompt,
+                role=judge_role,
+            )
+            for i in range(max(1, cfg.voting.n_judges))
+        ]
+        votes, budget_remaining_usd = await run_parallel_agents(
+            judge_specs, gateway,
+            budget_remaining_usd=budget_remaining_usd,
+            max_concurrency=cfg.max_concurrency,
+        )
+        accept = 0
+        for v in votes:
+            if not v.success:
+                continue
+            from harness.fanout import _parse_first_json
+            verdict = _parse_first_json(v.content) or {}
+            if bool(verdict.get("accept", False)):
+                accept += 1
+        scores[vr.index] = accept
+
+    # Pick max accept; ties broken by fewest lines changed.
+    ranked = sorted(
+        passing,
+        key=lambda vr: (-scores.get(vr.index, 0), vr.total_lines_changed),
+    )
+    return ranked[0]
 
 
 # ---------------------------------------------------------------------------

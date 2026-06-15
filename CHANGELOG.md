@@ -12,6 +12,45 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+- **Tier 1 capability (rebuild)** — `harness/speculative.py` is now
+  configuration-driven across six independent strategy axes (#12). The
+  legacy 1056-LoC fixed pipeline (3 parallel temperature variants on
+  one model → first-pass → optional merge salvage) generated negative
+  ROI on observed sessions; the rebuild exposes:
+  - `trigger`: `always` / `first_attempt_only` (legacy default) /
+    `after_n_repair_failures` (NEW DEFAULT, threshold 2) / `manual`.
+    The default holds speculative back until sequential repair has
+    stalled — the high-value moment.
+  - `diversity_mode`: `temperature` (legacy) / `prompt` (per-variant
+    system-prompt style from a built-in library: minimal-diff,
+    balanced, thorough, conservative, bold) / `model` (NEW DEFAULT —
+    different models per variant; real architectural independence,
+    not temperature noise) / `mixed`.
+  - `cost_strategy`: `equal_cost` (legacy) / `cheap_first_sequential`
+    (NEW DEFAULT — dispatch cheap_model variants one at a time, only
+    use expensive_model if all cheap fail; expected cost ~1.1× rather
+    than 3×) / `cheap_parallel_then_expensive` / `all_cheap`.
+  - `selection_strategy`: `first_pass` (NEW DEFAULT) /
+    `fewest_changes` / `voted` (NEW — dispatches `voting.n_judges`
+    adversarial reviewers via the `harness/fanout.py` infrastructure
+    from #11 and picks the variant with the highest accept-rate) /
+    `all_pass`. The legacy `first_success` value is an accepted alias.
+  - `salvage_strategy`: `none` (NEW DEFAULT — fall back to sequential
+    repair against the untouched workspace, strictly safer than the
+    legacy merge path which often produced incoherent workspaces) /
+    `fewest_errors` / `voted_partial` / `merge` (legacy behaviour
+    preserved as opt-in).
+  - `voting`: `{n_judges, judge_role}` for the `voted` selection
+    strategy.
+  Legacy configs auto-upgrade to a backwards-compatible mapping
+  (`diversity_mode=temperature`, `cost_strategy=equal_cost`,
+  `salvage_strategy=merge`, `trigger=first_attempt_only`) with a
+  one-time deprecation warning so existing flows are byte-identical.
+  Worktree machinery, `_build_variant_cache_env`, salvage helpers,
+  and `VariantResult` are unchanged — the rewrite is the
+  orchestration layer only.
+
 ### Added
 - **Tier 1 capability** — Interactive refinement REPL (`harness chat`).
   New `harness/chat.py` ships a stdin-driven REPL that reuses the

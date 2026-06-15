@@ -6,7 +6,7 @@
 
 ## 1. Executive Summary
 
-AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks, generates precise code patches via LLMs, verifies them through sandboxed builds, and deploys containerized applications — all under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment), human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Dart / Flutter.
+AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--dev-deployment`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment.json` policy, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Go / Rust / Dart / Flutter — all built on a single kitchen-sink builder image so polyglot workspaces share one container.
 
 ---
 
@@ -174,12 +174,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given all variants fail, the system falls back to the original patching flow.
 
 ### FR-021: Container Deployment
-- **Description:** After successful build and security scan, the system MUST scan workspace telemetry, synthesize a deployment architecture blueprint, generate Dockerfiles + docker-compose.yml + Caddyfile, build containers, and run health checks.
+- **Description:** After a successful build and clean security scan AND when the operator has opted in via `--dev-deployment` (see FR-044), the system MUST scan workspace telemetry, synthesize a deployment architecture blueprint, generate Dockerfiles + docker-compose.yml + Caddyfile, build containers, and run health checks. Without `--dev-deployment` the graph ends at the clean-scan boundary and the workspace is handed back with the generated code in place but no Docker artifacts.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a Python workspace with `requirements.txt`, a Python Dockerfile is generated.
+  - Given `--dev-deployment` and a Python workspace with `requirements.txt`, a Python Dockerfile is generated.
   - Given the deployment blueprint, `docker compose up --build -d` is executed (Compose V2 syntax, no hyphen).
   - Given containers are running, health check polling confirms readiness within 30s.
+  - Given `--dev-deployment` is NOT set, no Dockerfile / compose / `docker compose up` is produced and the graph routes to END after the security scan.
 
 ### FR-022: Security Scanning Gate
 - **Description:** After successful build, the system MUST run gitleaks (secret detection) and bandit/semgrep (SAST) on the workspace. Findings route to patching for fix, with a limit of 2 security fix attempts.
@@ -350,6 +351,64 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `max_discovery_iterations: 3` and a fourth discovery question, the graph routes to `write_spec_node` instead of issuing the LLM call.
   - Given a value outside `[1, 30]`, it is clamped at load and logged.
 
+### FR-044: Opt-In Deployment Phase (`--dev-deployment`)
+- **Description:** The deployment phase (deployment discovery → `DEPLOYMENT_BLUEPRINT.md` → gatekeeper approval → `docker compose up`) MUST be off by default. `harness run` MUST accept `--dev-deployment` / `--dev_deployment` (`action="store_true"`) on `run_parser` and thread it through `run_graph(dev_deployment=...)` into `AgentState["dev_deployment"]`. `route_after_security_scan` MUST consult the flag: with a clean scan and `dev_deployment=False`, the router MUST return `"__end__"`; with `dev_deployment=True` it MUST return `"deployment_discovery_node"`. The Flutter short-circuit (FR-028) MUST run before the flag check so mobile builds end regardless of the flag. The existing `deployment.enabled` config switch is a NARROWER gate that only short-circuits the docker step inside `deployment_node` once the phase is already running.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `harness run` with no `--dev-deployment`, after a clean security scan the run ends with no Dockerfile / compose / containers produced and `[cli] Code generated at <path>. Deployment phase skipped.` is logged.
+  - Given `harness run --dev-deployment` and a clean security scan, the router enters `deployment_discovery_node`.
+  - Given a Flutter project with `--dev-deployment`, the run still ends at the Flutter short-circuit (mobile build, no docker-compose).
+  - Given `--dev-deployment` AND `deployment.enabled: false` in config, the phase enters discovery and writes `DEPLOYMENT_BLUEPRINT.md`, but `deployment_node` skips the docker step with `{"skipped": True, "reason": "disabled"}`.
+
+### FR-045: Change-Request Folder Mode
+- **Description:** The harness MUST support a `change_requests/` folder at the workspace root containing one or more `.txt` files, each a self-contained ask. `cmd_run` MUST detect the folder (or be told via the wizard) and route through `ingest_change_requests_node` instead of the bare-prompt path. The ingest node MUST (1) walk only the top-level `.txt` files, skipping `applied/`; (2) assign monotonic `CR-N` IDs starting at `max(applied/**/CR-*.txt) + 1`; (3) respect operator-supplied IDs in filenames matching `CR-<N>-<rest>.txt`, aborting on collisions with archived IDs; (4) concatenate file contents under `# === CR-N: <relative-path> ===` separators and inject the result as the first user message. At session end, consumed files MUST be moved into `change_requests/applied/<session-id>/` with a `manifest.json` recording the status (`success` / `cancelled` / `failed-build`). When both `-p "..."` and a populated folder are supplied, the folder wins and the prompt is dropped with a WARNING.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given an empty `change_requests/` folder under `--new_build=false`, the CLI exits with a clear error directing the operator to add at least one `.txt` file.
+  - Given files `feature-x.txt` + `CR-12-bugfix.txt` and prior archive `applied/abcd/CR-3-old.txt`, the new IDs are CR-4 (feature-x) and CR-12 (bugfix); a collision with CR-3 aborts.
+  - Given a successful run, the consumed `.txt` files land under `change_requests/applied/<session-id>/` with `manifest.json` recording `status: "success"`.
+  - Given `CR-7` is assigned, the LLM's first user message references it inside a `# === CR-7: feature-x.txt ===` block; downstream specs, source comments, tests, and the commit trailer carry the `CR-7` marker so `grep -rn "CR-7" .` returns all linked artifacts.
+
+### FR-046: Reverse-Engineer Architecture on First Contact
+- **Description:** When a change-request session opens against a repo with NO `docs/SPEC_ARCHITECTURE.md`, `reverse_engineer_architecture_node` MUST run once to synthesize a baseline architecture spec from a representative file sample (≤30 files / ≤100 KB cumulative), biased toward entry-point basenames (`main.py`, `app.py`, `pyproject.toml`, `package.json`, `index.ts`, `go.mod`) and skipping noise dirs (`.git`, `node_modules`, `__pycache__`, `dist`, `build`, `.venv`). The node MUST be gated by `change_requests.reverse_engineer_budget_usd` (default `$0.50`) and skip with an INFO log when the remaining session budget is below the cap (downstream delta-mode discovery still runs). On subsequent change-request sessions the file already exists and the node is a no-op.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given no prior `docs/SPEC_ARCHITECTURE.md` and `budget_remaining_usd > 0.50`, the node fires one planning-role LLM call and writes the file.
+  - Given the file already exists, the node skips with a log line and no LLM call is made.
+  - Given `budget_remaining_usd < change_requests.reverse_engineer_budget_usd`, the node skips with a budget-gate log line; the delta-mode discovery that follows still runs.
+
+### FR-047: Setup Wizard for Bare `harness run`
+- **Description:** When `harness run` is invoked with no `-r` / `-p` flags, the CLI MUST drop the operator into an interactive setup wizard (`harness/wizard.py:run_setup_wizard`). The wizard MUST first ask "new session or resume?". For a new session it MUST collect workspace path, prompt (or change-requests folder confirmation), `--new_build true|false` (default `false` for existing code so the harness does not clobber files), and `--git enable|disable`. Resume MUST jump straight to `harness resume` with the chosen session. The wizard's behaviour MUST be skippable via direct flag passing; passing any one of `-r`, `-p`, or `--manifest` MUST bypass the wizard entirely.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `harness run` with no flags, the wizard prompts: new vs resume → workspace → prompt-source → `--new_build` → `--git`.
+  - Given resume is chosen, the wizard lists checkpointed sessions newest-first and hands off to `harness resume --session-id <chosen>`.
+  - Given `harness run -r /tmp/x -p "fix bug"`, the wizard is skipped.
+
+### FR-048: Per-Question Discovery Defaults + Optional Org-Wide `deployment.json`
+- **Description:** Each discovery question MUST accept a bare Enter (empty input) as "use the default value baked into the prompt." The harness MUST also load an optional org-wide policy file from `config/deployment.json` (or `~/.harness/deployment.json`); when present, its already-resolved fields MUST be injected into the deployment-discovery LLM prompt as known answers so the planner does not re-ask. The file is OPTIONAL — absence preserves the full questionnaire. A `config/deployment.json.example` MUST ship with the repo as a template.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a discovery question with a documented default and the operator hits Enter, the default is recorded as the answer and a CONFIRM line is logged.
+  - Given `~/.harness/deployment.json` declares `target_environment: "compose-dev"`, the deployment-discovery LLM is told that field is resolved and asks no question about it.
+  - Given no `deployment.json` file is present, the full questionnaire runs as before.
+
+### FR-049: Workspace Git-Awareness Toggle (`--git enable|disable`)
+- **Description:** `harness run` MUST accept `--git enable|disable` (default `enable`). When `enable`, `GitGuardian` performs stash → patch-branch → commit/rollback as today and requires the workspace to be a git repo. When `disable`, every git-aware step MUST be skipped (`_make_git_guardian` returns a no-op stub with the same interface) so operators whose target repo isn't under git can still run the harness. File-scanning security tools (gitleaks, bandit, semgrep) MUST still run in either mode — they scan files, not history.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `--git enable` and a non-git workspace, the CLI exits 1 with a "not a git repo" message.
+  - Given `--git disable` and a non-git workspace, the run proceeds and security scanners still execute against the file tree.
+  - Given `--git disable` and a HITL abandon, no rollback is attempted and the workspace is left as the LLM left it.
+
+### FR-050: Kitchen-Sink Builder Sandbox Image
+- **Description:** The harness MUST ship a single multi-stack Docker image (`harness/vendor/Dockerfile.builder`) that contains Python, Node.js, Go, Java, Rust, Dart, and Make toolchains plus a slim base. The graph MUST stop dispatching a per-command Docker image (the old "per-build-command" lookup is retired); compiler/lintgate/test-generation nodes all run inside the same builder image. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, etc.) MUST still be honoured as swappable bases when the operator pins one in `sandbox.docker_image`, but `make`-based builds MUST always have `make` available (bootstrap-installed by the sandbox layer if missing).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given the default config and a polyglot workspace (Python + Node), both stacks build inside the same container without per-command image dispatch.
+  - Given `sandbox.docker_image: "python:3.12-slim"` and a `make build` command, the sandbox layer ensures `make` is available before invoking the build.
+  - Given a `sh: 1: <cmd>: not found` error in build output, the parser surfaces the missing tool without the `/bin/` prefix mismatch.
+
 ---
 
 ## 3. System Scope
@@ -378,7 +437,14 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Structured failure-event catalogue (`log_failure(name, **fields)`)
 - Lint gate with auto-detected formatters per language (Python, Java, JS/TS, Dart, Go, Rust, C/C++, shell, SQL, markdown, YAML, JSON, HTML, CSS)
 - Multi-variant speculative compilation in parallel git worktrees
-- Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); short-circuits to END for Flutter / mobile projects
+- Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); **opt-in via `--dev-deployment`** (off by default — clean security scan ends the run otherwise); short-circuits to END for Flutter / mobile projects regardless of the flag
+- Change-request folder mode (`change_requests/*.txt` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
+- One-shot reverse-engineer of `SPEC_ARCHITECTURE.md` on first contact with a brownfield repo, gated by `change_requests.reverse_engineer_budget_usd` ($0.50 default)
+- Interactive setup wizard on bare `harness run` (new-vs-resume → workspace → prompt-source → `--new_build` → `--git`)
+- Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment.json` policy file (template at `config/deployment.json.example`) that pre-resolves deployment-discovery answers
+- Workspace git-awareness toggle (`--git enable|disable`); `disable` runs every git-aware step as a no-op so non-git workspaces still work
+- Single kitchen-sink builder image (`harness/vendor/Dockerfile.builder`, Python + Node + Go + Java + Rust + Dart + Make) shared by compiler / lintgate / test-generation nodes; per-command image dispatch retired
+- Per-stack Makefile skills (`harness/skills/makefile_python.md`, `makefile_node.md`, `makefile_go.md`, `makefile_java.md`, `makefile_rust.md`, `makefile_dart.md`) so the LLM emits a real `Makefile` for each stack
 - Post-build security scanning (gitleaks + bandit/semgrep)
 - Conversation memory cleanse for prefix-cache optimization
 - Dependency graph impact analysis backed by tree-sitter grammars for Python, Java, JS/TS, Dart, Rust, Go, and C/C++
@@ -489,6 +555,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **msgpack module missing:** `_deserialize_checkpoint_blob()` falls back to JSON text decoding for legacy rows.
 - **`harness doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
 - **`harness metrics` with no logs:** `--all` exits 1; `--session-id <id>` against a missing session exits 1 so cron detects regression.
+- **`change_requests/` folder empty under `--new_build=false`:** CLI exits 1 with a clear error telling the operator to add at least one `.txt` file; there is no implicit "use the prior product_spec" fallback.
+- **Change-request ID collision with archive:** A filename `CR-<N>-<rest>.txt` whose `N` clashes with an existing `change_requests/applied/**/CR-<N>-*.txt` aborts the session so the operator can rename and retry.
+- **Both `-p "..."` and a populated `change_requests/` folder supplied:** The folder wins and the seed prompt is dropped with a WARNING log line; the folder is the single source of truth.
+- **Bare `harness run` with no flags:** Drops the operator into the setup wizard; supplying any of `-r`, `-p`, or `--manifest` bypasses the wizard.
+- **`--dev-deployment` not set + clean security scan:** Graph ends at the security-scan boundary; no Dockerfile / compose / `docker compose up` is produced. A `[cli] Code generated at <path>. Deployment phase skipped.` line is logged.
+- **`--git disable` + HITL abandon:** No git rollback is attempted; the workspace is left as the LLM left it (matches the operator's stated intent of running outside git).
 
 ### Boundary Conditions
 - **Max repair iterations:** 3 (hardcoded in `route_after_compiler`)
@@ -513,6 +585,9 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Repair prompt raw output fallback:** Last 2000 characters
 - **Token budget context window threshold:** 85% (truncation trigger)
 - **Disk log buffer max size:** 500MB
+- **Default `--dev-deployment`:** off (deployment phase opt-in)
+- **Reverse-engineer architecture budget cap:** $0.50 USD (`change_requests.reverse_engineer_budget_usd`)
+- **Change-request file scan:** `change_requests/` top-level `.txt` files only; `applied/` archive subdirectory is skipped
 
 ### Recovery Scenarios
 - **Process killed mid-graph:** Next `harness run` loads from latest checkpoint; LangGraph replays from the boundary.

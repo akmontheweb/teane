@@ -1,49 +1,99 @@
 {
-    "_comment": "AI Agent Harness — OPTIONAL org-wide deployment policy. Copy this file to config/deployment.json and edit. When config/deployment.json is absent the deployment-phase questionnaire runs in its current full mode. When present, the planning LLM is told to treat every populated field below as RESOLVED — it skips emitting an interview question for that field. Sections and individual fields are independently optional: leave a section out (or set its keys to null) and the LLM will still emit questions for it. Stack-specific values (Postgres port, Redis volume path, etc.) deliberately are NOT in this file — those are still derived from workspace telemetry and asked per-project. Keys starting with '_' are documentation comments stripped at load time (same convention as config.json).",
+    "_comment": "AI Agent Harness — OPTIONAL org-wide deployment policy. Copy this file to config/deployment.json and edit. When config/deployment.json is absent the deployment-phase questionnaire runs in its current full mode. When present, the planning LLM is told to treat every populated field below as RESOLVED — it skips emitting an interview question for that field. Sections and individual fields are independently optional: leave a section out (or set its keys to null) and the LLM will still emit questions for it. Stack-specific values (Postgres port, Redis volume path, etc.) deliberately are NOT in this file — those are still derived from workspace telemetry and asked per-project. Keys starting with '_' are documentation comments stripped at load time (same convention as config.json). The 'Possible values' lists below are conventions, not enforcement — the harness does NOT validate against an enum, so any string you set is passed verbatim to the planning LLM. Stick to the listed values unless you know your toolchain.",
 
     "_schema_version_comment": "Pin the schema this file is written against. Only schema_version 1 is recognised today. The harness exits with code 2 if it sees a higher number, so future loaders know when to migrate.",
     "schema_version": 1,
 
     "_network_comment": "Sector 1: NETWORK TOPOLOGY. Org-wide answers for reverse proxy, TLS, public ports, host-side port allocation, Docker networking, and DNS. Leave individual fields out (or set to null) to let the LLM ask anyway.",
     "network": {
+        "_reverse_proxy_comment": "Reverse proxy that fronts the app and terminates TLS. Possible values: caddy | nginx | traefik | envoy | haproxy | none.",
         "reverse_proxy": "caddy",
+
+        "_tls_strategy_comment": "How TLS certificates are obtained and renewed. Possible values: letsencrypt | self-signed | manual | none.",
         "tls_strategy": "letsencrypt",
+
+        "_tls_contact_email_comment": "Email handed to the ACME provider for expiry notices. Free text; REQUIRED when tls_strategy=letsencrypt, ignored otherwise.",
         "tls_contact_email": "ops@example.com",
+
+        "_public_http_port_comment": "Host port that serves plain HTTP (used by ACME HTTP-01 challenges and HTTP→HTTPS redirects). Integer 1–65535; typically 80, sometimes 8080 on rootless hosts.",
         "public_http_port": 80,
+
+        "_public_https_port_comment": "Host port that serves HTTPS. Integer 1–65535; typically 443, sometimes 8443 on rootless hosts.",
         "public_https_port": 443,
+
+        "_host_port_range_comment": "Range [min, max] (two integers, 1–65535, min<max) of ephemeral host ports the harness may auto-allocate when publishing per-service containers. Pick a band that does not collide with other tenants on the host.",
         "host_port_range": [8000, 8999],
+
+        "_docker_network_mode_comment": "Docker network driver applied to the project compose stack. Possible values: bridge | host | overlay | macvlan | none.",
         "docker_network_mode": "bridge",
+
+        "_primary_domain_comment": "Fully-qualified domain name where the deployed app is reachable from the public internet. Free text (FQDN); used as the SAN in the issued certificate and as the default vhost on the reverse proxy.",
         "primary_domain": "app.example.com",
+
+        "_dns_provider_comment": "DNS provider whose API the harness may call for DNS-01 challenges and record management. Possible values: cloudflare | route53 | gcp | azure | manual | none.",
         "dns_provider": "cloudflare"
     },
 
     "_storage_comment": "Sector 2: DATA & STORAGE PERSISTENCE. Org-wide answers for volume layout, container UID/GID convention, backup destination, and multi-host storage. Stack-specific volume paths (e.g. /var/lib/postgresql/data) are still derived from telemetry — this section captures the policy decisions that wrap them.",
     "storage": {
+        "_volume_root_comment": "Absolute host path under which the harness lays out per-service data directories (e.g. <volume_root>/postgres, <volume_root>/redis). Free text; must be an absolute filesystem path the harness has write access to.",
         "volume_root": "/var/lib/app",
+
+        "_persistence_mode_comment": "How container data is persisted on the host. Possible values: bind (host directory bind-mount) | volume (named Docker volume) | tmpfs (ephemeral RAM, data lost on restart) | none.",
         "persistence_mode": "bind",
+
+        "_container_uid_comment": "Numeric UID the harness asks containers to run as (and chowns bind-mounts to). Integer ≥ 0; 1000 is the typical first non-root user on Linux. Set to match the host operator account that owns volume_root.",
         "container_uid": 1000,
+
+        "_container_gid_comment": "Numeric GID counterpart of container_uid. Integer ≥ 0; usually identical to container_uid on single-user hosts.",
         "container_gid": 1000,
+
+        "_backup_destination_comment": "Where the backup driver writes service snapshots. Possible values: s3 | gcs | azure_blob | local | none.",
         "backup_destination": "s3",
+
+        "_backup_path_comment": "Destination URI matching backup_destination. Examples: 's3://acme-backups/' for s3, 'gs://acme-backups/' for gcs, 'https://<account>.blob.core.windows.net/<container>/' for azure_blob, '/srv/backups/' for local. Ignored when backup_destination=none.",
         "backup_path": "s3://acme-backups/",
+
+        "_multi_host_storage_comment": "Shared storage layer for multi-host deployments. Possible values: none (single-host) | nfs | ceph | glusterfs | longhorn.",
         "multi_host_storage": "none"
     },
 
     "_secrets_comment": "Sector 3: SECRETS & IDENTITY MANAGEMENT. Org-wide answers for secret manager choice, CI injection method, rotation policy, and log masking. Specific secret values are NEVER stored here — only the policy describing where and how the harness fetches them.",
     "secrets": {
+        "_manager_comment": "Backend the harness reads secrets from at deploy time. Possible values: vault (HashiCorp Vault) | aws_secrets_manager | gcp_secret_manager | azure_key_vault | sops (encrypted files in git) | env_file (plain .env) | none.",
         "manager": "vault",
+
+        "_manager_endpoint_comment": "URL of the secret-manager API. Required for vault / aws_secrets_manager / gcp_secret_manager / azure_key_vault; leave empty for sops, env_file, or none.",
         "manager_endpoint": "https://vault.internal",
+
+        "_env_file_path_comment": "Path to the .env file the harness loads when manager=env_file, relative to the workspace root. Ignored for all other managers. Free text path.",
         "env_file_path": ".env",
+
+        "_ci_secret_injection_comment": "How secrets are injected into the CI pipeline that builds the app. Possible values: github_actions | gitlab_ci | jenkins | circleci | none.",
         "ci_secret_injection": "github_actions",
+
+        "_rotation_policy_days_comment": "Maximum age in days before a secret must be rotated. Integer ≥ 0; 0 disables the policy (secrets never expire).",
         "rotation_policy_days": 90,
+
+        "_mask_in_logs_comment": "Whether the harness's log-redaction layer must scrub matched secret strings before writing them to disk or stdout. Boolean: true | false.",
         "mask_in_logs": true
     },
 
     "_infra_sync_comment": "Sector 4: PARTIAL INFRASTRUCTURE SYNC. Org-wide policy for handling pre-existing containers, reserved ports, protected volumes, and legacy compatibility. reserved_ports lists host ports the harness must NEVER bind. protect_containers / protect_volumes name resources the harness must NEVER destroy or recreate. conflict_policy ∈ {skip, overwrite, rename, abort} — default 'abort' is the safest (refuses to touch anything contested).",
     "infra_sync": {
+        "_conflict_policy_comment": "What the harness does when a container/volume/port it wants to create already exists. Possible values: skip (leave the existing resource alone, do not deploy that piece) | overwrite (destroy and recreate) | rename (deploy alongside under a new name) | abort (refuse to proceed; safest default).",
         "conflict_policy": "abort",
+
+        "_reserved_ports_comment": "Host ports the harness must NEVER bind, even if free. List of integers 1–65535. Use this to fence off ports owned by SSH, the host DB, monitoring agents, etc.",
         "reserved_ports": [22, 5432, 6379],
+
+        "_protect_containers_comment": "Container names the harness must NEVER destroy or recreate, even on conflict. List of strings (Docker container names). Use for legacy containers managed outside the harness.",
         "protect_containers": ["legacy-db"],
+
+        "_protect_volumes_comment": "Volume names the harness must NEVER destroy or recreate. List of strings (Docker named-volume identifiers, or absolute bind-mount paths).",
         "protect_volumes": ["legacy-data"],
+
+        "_legacy_compat_mode_comment": "Relaxes shape and naming checks so the harness can co-exist with a pre-existing legacy compose stack. Boolean: true | false. Default false; flip to true only when adopting the harness on an already-running deployment.",
         "legacy_compat_mode": false
     }
 }

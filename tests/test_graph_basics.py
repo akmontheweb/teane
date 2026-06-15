@@ -5,6 +5,7 @@
 from harness.graph import (
     apply_memory_cleanse,
     _format_diagnostics_for_repair,
+    route_after_security_scan,
 )
 
 
@@ -317,3 +318,63 @@ class TestGatewayConfigPropagation:
         finally:
             set_gateway.__globals__["_gateway"] = None
             set_gateway.__globals__["_gateway_config"] = prior
+
+
+class TestRouteAfterSecurityScan:
+    """Routing decisions after security_scan_node.
+
+    Covers the --dev-deployment opt-in gate that controls whether a clean
+    security scan rolls forward into deployment_discovery_node or stops at
+    END. route_after_security_scan imports ``_is_flutter_project`` inside
+    the function body, so we monkeypatch the attribute on
+    ``harness.impact`` rather than on ``harness.graph``.
+    """
+
+    def _clean_state(self, **overrides):
+        state = {
+            "compiler_errors": [],
+            "budget_remaining_usd": 1.0,
+            "workspace_path": "/tmp/ws",
+            "loop_counter": {"security": 0},
+            "dev_deployment": False,
+        }
+        state.update(overrides)
+        return state
+
+    def test_clean_scan_ends_when_dev_deployment_false(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        assert route_after_security_scan(self._clean_state()) == "__end__"
+
+    def test_clean_scan_enters_deployment_when_dev_deployment_true(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        state = self._clean_state(dev_deployment=True)
+        assert route_after_security_scan(state) == "deployment_discovery_node"
+
+    def test_flutter_short_circuits_regardless_of_dev_deployment(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: True)
+        # With dev_deployment=True the Flutter early-return must still win;
+        # Flutter and the opt-in flag are independent skip reasons.
+        state = self._clean_state(dev_deployment=True)
+        assert route_after_security_scan(state) == "__end__"
+
+    def test_security_findings_route_to_repair(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        state = self._clean_state(
+            compiler_errors=[
+                {
+                    "file": "x.py",
+                    "line": 1,
+                    "column": 0,
+                    "severity": "error",
+                    "error_code": "GITLEAKS-X",
+                    "message": "secret detected",
+                    "semantic_context": "",
+                }
+            ],
+        )
+        # Findings exist + low attempts → repair_node regardless of flag.
+        assert route_after_security_scan(state) == "repair_node"

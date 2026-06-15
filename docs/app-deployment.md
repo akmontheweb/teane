@@ -4,11 +4,12 @@ How the harness deploys the app it just built — what artefacts you get, what c
 
 ## TL;DR
 
-- **You don't write the `docker-compose.yml`.** The harness's `deployment_node` does it for you after the security scan returns clean, deriving services / volumes / networks from a deterministic workspace telemetry scan + one LLM call.
+- **The deployment phase is opt-in.** Pass `--dev-deployment` to `harness run`. Without it, the harness stops after a clean security scan with the source + tests + spec in the workspace, and no Dockerfile / compose / containers are produced.
+- **You don't write the `docker-compose.yml`.** When `--dev-deployment` is set, the harness's `deployment_node` does it for you after the security scan returns clean, deriving services / volumes / networks from a deterministic workspace telemetry scan + one LLM call.
 - **You don't run `docker-compose up`** either — the harness runs `docker-compose up --build -d` itself and polls the declared health endpoints. If health checks fail, it routes back to the LLM repair loop.
 - **The dev-env deployment is gated.** A Phase 3.5 preview gate shows you the proposed Dockerfile / compose / Caddyfile before they execute. Approve interactively, or bypass under CI with `HARNESS_AUTO_APPROVE=true` (or `CI=true`).
 - **Checkpoint message redaction is on by default.** Any `messages`-channel content that gets checkpointed during the deployment phase is scrubbed through `harness.redactor` before SQLite. Set `persistence.redact_messages: false` only if you need verbatim transcripts at rest (e.g. audit replay).
-- Config switch: `deployment.enabled` (default `true`). Set `false` to skip the whole phase and own deployment yourself.
+- Config switch: `deployment.enabled` (default `true`) is a narrower gate that only short-circuits the docker step inside `deployment_node` once the phase is already running. It does not bring the phase back on its own — `--dev-deployment` is still required to enter the phase.
 - **Limitation**: the bring-up runs on the local Docker daemon the harness has access to. There is no SSH-driven remote-deploy subcommand yet — for remote dev, copy the generated artefacts and run the same `docker-compose up` there.
 
 ## The four phases of `deployment_node`
@@ -32,12 +33,13 @@ The deployment phase is reached only after several other gates pass:
 1. `patching_node` lands code.
 2. `lintgate_node` is clean.
 3. `compiler_node` exits 0.
-4. `security_scan_node` is clean (see `route_after_security_scan`, `harness/graph.py:2226`).
-5. `deployment_discovery_node` collects any unknowns (or skips when none).
-6. The human gatekeeper approves the `DEPLOYMENT` gate (or `HARNESS_AUTO_APPROVE=true` / `CI=true` bypasses).
-7. Then `deployment_node` runs.
+4. `security_scan_node` is clean (see `route_after_security_scan` in `harness/graph.py`).
+5. `harness run` was invoked with `--dev-deployment`. Without the flag the router ends the run here and the workspace is handed back with code + tests + spec in place.
+6. `deployment_discovery_node` collects any unknowns (or skips when none).
+7. The human gatekeeper approves the `DEPLOYMENT` gate (or `HARNESS_AUTO_APPROVE=true` / `CI=true` bypasses).
+8. Then `deployment_node` runs.
 
-So a green build that doesn't have a deployment-discovery loop still reaches the deployment phase quickly; greenfield projects spend more time in steps 5–6 collecting infra unknowns.
+So a green build invoked with `--dev-deployment` and no discovery loop reaches the deployment phase quickly; greenfield projects with `--dev-deployment` spend more time in steps 6–7 collecting infra unknowns.
 
 ## Configuration
 
@@ -52,7 +54,7 @@ Defaults are baked into `harness/deploy.py` (lines 1122–1130) and can be overr
 }
 ```
 
-To skip the deployment phase entirely (when you want to own deployment yourself), set `"deployment": { "enabled": false }`. The graph ends after the security scan, with the source + tests + Dockerfile/compose **not** generated.
+To skip the deployment phase entirely (when you want to own deployment yourself), just omit `--dev-deployment` from `harness run` — that is the default. The graph ends after the security scan with source + tests + spec in the workspace and **no** Dockerfile / compose / containers produced. The narrower `"deployment": { "enabled": false }` config switch still exists for the case where you do want discovery and DEPLOYMENT_BLUEPRINT.md generated but want to skip just the final `docker compose up`.
 
 ## What lands in the workspace
 

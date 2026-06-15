@@ -115,6 +115,7 @@ harness/
 │   ├── _acquire_workspace_lock()# fcntl single-writer lock (FR-038); --force-lock override
 │   ├── discover_config()        # Hierarchical merge: workspace → home → cli.json
 │   ├── _validate_config_keys()  # Recursive top-level + nested typo detection (FR-030)
+│   ├── load_deployment_defaults()  # Optional org-wide deployment.json policy (FR-048)
 │   ├── cmd_run / cmd_resume / cmd_status / cmd_purge / cmd_metrics
 │   ├── cmd_doctor()             # 6-check healthcheck (FR-025)
 │   ├── _doctor_check_git / global_config / api_keys / sandbox / checkpoint_db / config
@@ -122,7 +123,14 @@ harness/
 │   ├── human_gatekeeper_node()  # Three-phase HITL gatekeeper
 │   ├── hitl_menu_loop()         # 7-action HITL menu: [v/r/e/m/b/s/q]
 │   ├── _emit_output()           # Routes machine-readable metrics to file / stdout
+│   ├── _archive_consumed_change_requests()  # Move consumed CR-*.txt into applied/<sid>/ + manifest.json (FR-045)
+│   ├── _make_git_guardian()     # Returns no-op stub when --git=disable (FR-049)
 │   └── interactive_review_loop()# Pre-flight manifest review
+├── wizard.py             # Interactive setup wizard for bare `harness run` (FR-047)
+│   ├── run_setup_wizard()       # Top-level: new vs resume → workspace → prompt-source → --new_build → --git
+│   ├── _prompt_new_or_resume()  # First fork: greenfield/brownfield or `harness resume <id>`
+│   ├── _choose_session()        # Lists checkpointed sessions newest-first for resume
+│   └── _confirm_change_requests_folder()  # Detects change_requests/ and offers brownfield mode
 ├── gateway.py            # Model-agnostic LLM Gateway
 │   ├── GatewayConfig     # Runtime config dataclass (incl. max_discovery_iterations)
 │   ├── Gateway           # Orchestrator: dispatch + budget + retry + circuit breaker
@@ -140,25 +148,28 @@ harness/
 ├── graph.py              # LangGraph StateGraph topology
 │   ├── AgentState        # TypedDict state schema
 │   ├── planning_node()   # LLM: generate implementation blueprint
-│   ├── patching_node()   # LLM: generate SEARCH/REPLACE patches
+│   ├── patching_node()   # LLM: generate SEARCH/REPLACE patches (CR-N markers in change-request mode)
 │   ├── compiler_node()   # Deterministic: run build in sandbox
 │   ├── repair_node()     # LLM: analyze errors, fix, escalate to fallback model
 │   ├── human_intervention_node() # Set HITL flags
-│   ├── requirements_discovery_node() # LLM: 8-sector requirements discovery
-│   ├── architecture_discovery_node() # LLM: 8-sector architecture discovery
-│   ├── deployment_discovery_node()   # LLM: 4-sector deployment discovery
-│   ├── write_spec_node() # Serialize discovery to .md files
-│   ├── generate_deployment_spec_node() # Produce DEPLOYMENT_BLUEPRINT.md
+│   ├── requirements_discovery_node() # LLM: 8-sector requirements discovery (delta-mode in CR sessions)
+│   ├── architecture_discovery_node() # LLM: 8-sector architecture discovery (delta-mode in CR sessions)
+│   ├── deployment_discovery_node()   # LLM: 4-sector deployment discovery (deployment.json defaults injected)
+│   ├── ingest_change_requests_node() # Parse change_requests/*.txt, assign CR-N IDs (FR-045)
+│   ├── reverse_engineer_architecture_node() # One-shot SPEC_ARCHITECTURE.md synthesis on first contact (FR-046)
+│   ├── write_spec_node() # Serialize discovery to .md files (delta-merge in CR sessions)
+│   ├── generate_deployment_spec_node() # Produce DEPLOYMENT_BLUEPRINT.md + cr_attribution
+│   ├── route_after_start()       # Conditional: ingest_change_requests / patching / requirements_discovery
 │   ├── route_after_compiler()    # Conditional: repair / HITL (short-circuits on llm_silent) / security_scan
 │   ├── route_after_discovery()   # Conditional: write_spec / discovery loop (capped at max_discovery_iterations, FR-043)
 │   ├── route_after_gatekeeper()  # Conditional: next phase / refinement loop
-│   ├── route_after_security_scan() # Conditional: patch / HITL / deployment
+│   ├── route_after_security_scan() # Conditional: repair / HITL / END (Flutter, FR-028) / END (no --dev-deployment, FR-044) / deployment_discovery
 │   ├── route_after_hitl()        # Conditional: compiler / END
-│   ├── _build_patcher_allowlist()# Conservative fallback when source root unclear (FR-041)
+│   ├── _build_patcher_allowlist()# Conservative fallback when source root unclear (FR-041); includes Node-JS allowlist
 │   ├── _apply_toolchain_adaptation() # pip/npm network auto-enable gated by config opt-in (FR-042)
 │   ├── apply_memory_cleanse()    # Compress verbose repair messages
 │   ├── build_graph()             # Assemble full StateGraph
-│   └── run_graph()               # Async entry point
+│   └── run_graph()               # Async entry point (now threads dev_deployment, change_request_mode, …)
 ├── sandbox.py            # Sandbox execution engine
 │   ├── SandboxBackend    # ABC for isolation backends
 │   ├── UnshareBackend    # Linux namespace isolation
@@ -301,6 +312,14 @@ harness/
 6. run_graph() → create_initial_state()
                               │
                               ▼
+        route_after_start (FR-045):
+          - change_request_mode=True → ingest_change_requests_node →
+              reverse_engineer_architecture_node (if first contact, FR-046) →
+              discovery pipeline runs in DELTA MODE
+          - skip_discovery=True                → patching_node
+          - else                                → requirements_discovery_node
+                              │
+                              ▼
         ┌─────────────────────────────────────────────────┐
         │         EXHAUSTIVE DISCOVERY PIPELINE           │
         │                                                 │
@@ -359,6 +378,9 @@ harness/
 14. Flutter detected? ─yes─▶ [END]  (FR-028 — mobile builds bypass docker compose)
     │ no                       │
     ▼                          │
+14b. --dev-deployment set? ─no─▶ [END]  (FR-044 — deployment phase is opt-in)
+    │ yes                      │
+    ▼                          │
 15. deployment_discovery_node │
     │                          │
     ▼                          │
@@ -408,8 +430,18 @@ AgentState fields and which nodes write to them:
 │ current_gate             │ requirements_discovery, architecture_discovery│
 │                          │   deployment_discovery, generate_deployment   │
 │ spec_requirements_path   │ write_spec_node                               │
-│ spec_architecture_path   │ write_spec_node                               │
+│ spec_architecture_path   │ write_spec_node, reverse_engineer_architecture│
 │ deployment_blueprint_path│ generate_deployment_spec_node                 │
+│ dev_deployment           │ run_graph (from --dev-deployment CLI flag)    │
+│ change_request_mode      │ run_graph (from CLI / wizard)                 │
+│ change_requests_dir_abs  │ run_graph (resolved folder path)              │
+│ change_request_files     │ ingest_change_requests_node                   │
+│ archive_target_dir       │ run_graph (applied/<sid>/ destination)        │
+│ change_requests_config   │ run_graph (from config["change_requests"])    │
+│ deployment_defaults      │ run_graph (from config/deployment.json)       │
+│ sandbox_config           │ run_graph (from config["sandbox"])            │
+│ lintgate_config          │ run_graph (from config["lintgate"])           │
+│ deployment_config        │ run_graph (from config["deployment"])         │
 └──────────────────────────┴──────────────────────────────────────────────┘
 ```
 
@@ -691,6 +723,46 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: Metrics live entirely on disk (the JSONL logs are the source of truth). Purging logs deletes the metrics record too — by design, since `harness purge --session-id` is the GDPR-deletion path. For longer-term retention, operators redirect `logging.log_dir` and `metrics.metrics_dir` to a managed location.
 
+### 5.31 Opt-In Deployment Phase (`--dev-deployment`)
+
+**Decision**: The deployment phase is gated by a new CLI flag `--dev-deployment` (default `False`). The flag is threaded into `AgentState["dev_deployment"]` via `run_graph(dev_deployment=...)` and `create_initial_state(dev_deployment=...)`. `route_after_security_scan` reads `state.get("dev_deployment", False)` after a clean scan; without it the router returns `"__end__"`. The narrower `deployment.enabled` config switch still exists and gates only the docker step inside `deployment_node` (so a user can opt into the phase but still skip `docker compose up`).
+
+**Rationale**: Users split cleanly into two camps — "generate code and ship via my own pipeline" and "bring it up locally." The old auto-deploy default surprised the first camp by mutating the workspace with Dockerfiles and starting containers. Making the phase opt-in respects both intents, and keeping `deployment.enabled` as an independent narrower gate avoids forcing the operator to choose between "no phase at all" and "phase including docker run."
+
+**Trade-off**: Default behaviour changed — previously a clean security scan auto-rolled into deployment; now the run ends and the operator must re-run with `--dev-deployment`. CI scripts and demo recordings that relied on auto-deploy need to add the flag. The `[cli] Code generated at <path>. Deployment phase skipped.` log line makes the new default visible on the first post-upgrade run.
+
+### 5.32 Change-Request Folder Mode (FR-045 / FR-046)
+
+**Decision**: Existing-project runs are file-driven via a `change_requests/` folder at the workspace root. `ingest_change_requests_node` walks the top-level `.txt` files (skipping `applied/`), assigns monotonic `CR-N` IDs that respect operator-supplied filename prefixes, concatenates the file contents under `# === CR-N: <path> ===` headers, and injects the result as the LLM's first user message. The CR IDs propagate through specs, source comments, test names / docstrings, deployment-blueprint `cr_attribution`, and the commit trailer. At session end `_archive_consumed_change_requests` moves the consumed files into `change_requests/applied/<session-id>/` with a `manifest.json` recording status (`success` / `cancelled` / `failed-build`). When the workspace has no prior `docs/SPEC_ARCHITECTURE.md`, `reverse_engineer_architecture_node` runs once (budget-gated by `change_requests.reverse_engineer_budget_usd`, default $0.50) to synthesize a baseline before discovery enters delta mode.
+
+**Rationale**: Brownfield work is the dominant use case — the harness was created for greenfield scaffolding but operators kept reaching for it on existing repos. A file-driven, CR-N-tagged workflow gives the operator (and reviewers) a single artifact ID that links every spec line, source comment, test, and infra change back to one ask. `grep -rn "CR-7" .` after the session shows the entire footprint of a single change request, which is what code-review and audit need.
+
+**Trade-off**: The change-request flow runs through the same HITL gates as greenfield, so users do not get to skip discovery just because the repo "already exists." Delta-mode discovery and gatekeeper short-circuits keep the friction proportional to the size of the change. The `applied/<session-id>/` archive accumulates over time; operators rotate or prune it manually.
+
+### 5.33 Optional Org-Wide `deployment.json` Policy + Enter-to-Accept Discovery (FR-048)
+
+**Decision**: Discovery prompts now bake a default value into each question, and a bare Enter records the default as the answer. An optional `~/.harness/deployment.json` (or `config/deployment.json`; template at `config/deployment.json.example`) declares pre-resolved deployment-discovery fields (`target_environment`, `container_runtime`, `reverse_proxy`, `secret_store`, …). `load_deployment_defaults()` loads it at startup and `deployment_discovery_node` injects the resolved fields into the planner prompt so no question fires for them. Absent file = full questionnaire as before.
+
+**Rationale**: Most teams have a fixed deployment story (same target env, same reverse proxy, same secret store across all projects). Re-answering the same questions on every project was friction with no signal. An org-wide policy file with per-question defaults captures the team's standard once and lets the discovery loop focus on the project-specific unknowns.
+
+**Trade-off**: Defaults baked into discovery prompts can drift from policy if both are edited independently; the org-wide file wins because it is loaded at startup and treated as already-resolved by the planner. The `_KNOWN_NESTED_KEYS` whitelist is the authoritative schema for `deployment.json` — typos there get the same WARN-and-ignore treatment as the main config.
+
+### 5.34 Setup Wizard for Bare `harness run` (FR-047)
+
+**Decision**: When `harness run` is invoked without `-r`, `-p`, or `--manifest`, the CLI hands off to `harness/wizard.py:run_setup_wizard`. The wizard first asks new-vs-resume; for new it walks workspace → prompt-source → `--new_build` (defaults `false` so the harness does not clobber files in an existing repo) → `--git`. Resume lists checkpointed sessions newest-first and re-enters `cmd_resume`. Any direct flag bypasses the wizard.
+
+**Rationale**: The harness used to fail with an argparse error when invoked bare. Operators ran `harness run --help`, hand-built a command, and often missed `--git` or `--new_build`. A wizard turns first-run discovery into a guided dialog without changing the contract for power users — flags still work.
+
+**Trade-off**: Two paths to invoke the same `cmd_run` (wizard vs flags). Tests exercise both; the wizard is kept thin (it just resolves into the same `args` namespace `argparse` would have produced).
+
+### 5.35 Single Kitchen-Sink Builder Image (FR-050)
+
+**Decision**: `harness/vendor/Dockerfile.builder` ships a multi-stack base image (Python + Node + Go + Java + Rust + Dart + Make). The old per-build-command image dispatch in `harness/graph.py` is retired — compiler, lintgate, and test-generation nodes all run inside the same container. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, …) are still honoured as swappable bases when pinned in `sandbox.docker_image`; the sandbox layer bootstrap-installs `make` if the chosen image doesn't ship it.
+
+**Rationale**: Per-command image dispatch was a constant source of cache thrash — a polyglot workspace (Python service + React frontend) needed two images, each with its own pip / npm cache, and the dispatch logic in graph.py grew an exception for every new stack. A single kitchen-sink image collapses the matrix, lets the prefix cache stay hot across compile / lint / test, and removes the dispatch code path entirely.
+
+**Trade-off**: The builder image is ~3-4 GB on first pull. Once pulled, every subsequent build reuses the layer cache and per-build sandbox startup time drops by ~1.5s vs the dispatch path. Operators who want a smaller surface can still pin a slim image via `sandbox.docker_image` and accept the missing toolchains.
+
 ---
 
 ## 6. Data Model Overview
@@ -731,7 +803,17 @@ AgentState
 ├── current_gate: str                # "REQUIREMENTS"|"ARCHITECTURE"|"DEPLOYMENT"|""
 ├── spec_requirements_path: str
 ├── spec_architecture_path: str
-└── deployment_blueprint_path: str
+├── deployment_blueprint_path: str
+├── dev_deployment: bool             # Opt-in deployment phase gate (FR-044)
+├── change_request_mode: bool        # True when change_requests/ folder was found / chosen (FR-045)
+├── change_requests_dir_abs: str     # Resolved abs path of change_requests/
+├── change_request_files: list[dict] # [{cr_id: int, original_name: str, abs_path: str}]
+├── archive_target_dir: str          # change_requests/applied/<session-id>/ (set in run_graph)
+├── change_requests_config: dict[str, Any]  # config["change_requests"] (e.g. reverse_engineer_budget_usd)
+├── deployment_defaults: dict[str, Any]     # Org-wide deployment.json policy (FR-048); empty when absent
+├── sandbox_config: dict[str, Any]          # config["sandbox"] threaded into state (P0)
+├── lintgate_config: dict[str, Any]         # config["lintgate"] threaded into state
+└── deployment_config: dict[str, Any]       # config["deployment"] threaded into state
 ```
 
 ### 6.2 Checkpoint Schema (SQLite)
@@ -842,10 +924,18 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 | `cli.json` | Shipped with package | Absolute fallback defaults |
 | `~/.harness/config.json` | User home | Global default models and settings |
 | `.harness_config.json` | Workspace root | Per-project override (highest priority) |
+| `~/.harness/deployment.json` (optional) | User home | Org-wide deployment-discovery defaults (FR-048); absent = full questionnaire |
+| `config/deployment.json.example` | Repo root | Template for the optional org-wide deployment policy |
 | `requirements-prod.txt` | Repo root | Exact transitive pins for reproducible pilot installs (`pip install -e . --constraint requirements-prod.txt`) |
 | `LICENSE` | Repo root | MIT license; referenced from `pyproject.toml` so wheels ship it |
 
-**Top-level config sections**: `build_command`, `allow_network`, `sandbox`, `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`.
+**Top-level config sections**: `build_command`, `allow_network`, `sandbox`, `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`, `change_requests`, `speculative`, `compiler`.
+
+**Key recent additions** (since the prior spec snapshot):
+- `change_requests.reverse_engineer_budget_usd` (default `$0.50`) — budget cap for the first-contact architecture reverse-engineer LLM call (FR-046).
+- `speculative.temperature` / `num_variants` / `strategy` — externalised speculative tuning knobs (previously hard-coded).
+- `compiler.run_prod_import_smoke_check` (default `true`) — toggle the post-build production-import smoke check.
+- Per-role `max_tokens` overrides in `model_routing` (e.g., `planning_max_tokens`) — externalised gateway dispatch caps.
 
 **Key recent additions**:
 - `persistence.redact_messages` (default `true`) — opt out of checkpoint message redaction.
@@ -881,4 +971,7 @@ API keys can also live in `models["<provider>:<model>"].api_key` inside any conf
 - `~/.harness/logs/<session-id>.jsonl[.N]` — Per-session structured JSONL log (rotated)
 - `~/.harness/metrics/<session-id>.{json,prom}` — `harness metrics` outputs (configurable via `metrics.metrics_dir`)
 - `<workspace>/.harness_session.lock` — fcntl single-writer lock; auto-released when the process exits
+- `<workspace>/change_requests/` — Operator-authored `CR-N-<name>.txt` files; consumed change-request inputs (FR-045)
+- `<workspace>/change_requests/applied/<session-id>/` — Archive of consumed `.txt` files + `manifest.json` recording `status` (`success` / `cancelled` / `failed-build`) and the linked modified files
+- `<workspace>/Dockerfile` / `docker-compose.yml` / `Caddyfile` — Only produced when `--dev-deployment` is passed (FR-044)
 - `/tmp/.harness/` — Temporary sandbox build logs (auto-cleaned)

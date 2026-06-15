@@ -30,6 +30,15 @@ Three dispatchers, dispatched per-diagnostic by apply_autofixes():
               manifest file (requirements.txt / package.json / go.mod /
               Cargo.toml)
 
+    R6 (web asset) — _try_asset_reference_fix
+        Fires when error_code == "WEB_ASSET_REF" (produced by the
+        web-asset reference scanner in lintgate). Rewrites the broken
+        local reference to the suggested path if (a) a suggestion exists
+        and (b) the raw reference appears exactly once in the referring
+        file. Otherwise returns None — the diagnostic escalates to the
+        LLM, which has full context to choose between fixing the path
+        and creating the missing asset.
+
 Each dispatcher returns Optional[PatchBlock]. apply_autofixes() funnels every
 emitted PatchBlock through the existing HybridPatcher so AST safety,
 allowlist gating, and idempotency-on-resume are all inherited unchanged.
@@ -141,6 +150,10 @@ async def apply_autofixes(
             candidate = _try_dep_resolution_conflict(diag, workspace_path)
             if candidate is not None:
                 fix_kind = "dep"
+        if candidate is None:
+            candidate = _try_asset_reference_fix(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "web_asset"
 
         if candidate is None:
             unhandled.append(diag)
@@ -1155,3 +1168,98 @@ _SECURITY_FIX_TABLE: dict[str, Any] = {
     "GITLEAKS-FALLBACK": _fix_gitleaks,
     "TRIVY": _fix_trivy,
 }
+
+
+# ---------------------------------------------------------------------------
+# R6 — Web asset reference fix dispatcher
+# ---------------------------------------------------------------------------
+
+WEB_ASSET_ERROR_CODE = "WEB_ASSET_REF"
+
+
+def _try_asset_reference_fix(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Rewrite a broken local asset reference to its suggested path.
+
+    Triggered by lintgate's web-asset scanner via error_code WEB_ASSET_REF.
+    Two-step safety:
+      1. A suggested_path must exist (the scanner only attaches one when
+         the basename match is unique in the workspace).
+      2. The raw_reference must appear exactly once in the referring file,
+         so REPLACE_BLOCK has an unambiguous anchor.
+
+    Returns None when either condition fails — the LLM repair loop then
+    gets the diagnostic with full file context and can choose between
+    fixing the path or creating the missing asset.
+    """
+    if str(diag.get("error_code", "")) != WEB_ASSET_ERROR_CODE:
+        return None
+
+    raw_ref = diag.get("raw_reference") or ""
+    suggested = diag.get("suggested_path") or ""
+    if not raw_ref or not suggested:
+        return None
+    if raw_ref == suggested:
+        # Scanner shouldn't suggest itself, but guard against pathological
+        # inputs that would produce a no-op patch.
+        return None
+
+    file = str(diag.get("file") or "")
+    if not file:
+        return None
+    rel_file = _relative_to_workspace(file, workspace_path)
+    if rel_file is None:
+        return None
+    file_path = os.path.join(workspace_path, rel_file)
+    if not os.path.isfile(file_path):
+        return None
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except OSError:
+        return None
+
+    # Demand a unique occurrence of raw_ref so the rewrite is unambiguous.
+    # If the string appears multiple times (e.g. one HTML referencing the
+    # same broken path in two <link> tags) we punt to the LLM rather than
+    # risk rewriting the wrong one.
+    if source.count(raw_ref) != 1:
+        return None
+
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=rel_file,
+        search=raw_ref,
+        replace=suggested,
+    )
+
+
+def web_asset_diagnostics_to_standard(
+    web_asset_errors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert lintgate's web_asset_errors dicts to the standard diagnostic
+    shape consumed by apply_autofixes.
+
+    Called from the bridge in repair_node so R6 sees these alongside compiler
+    diagnostics in the same dispatcher loop.
+    """
+    out: list[dict[str, Any]] = []
+    for err in web_asset_errors or []:
+        out.append({
+            "file": err.get("referring_file", ""),
+            "line": err.get("line", 0),
+            "column": err.get("column", 0),
+            "error_code": WEB_ASSET_ERROR_CODE,
+            "message": (
+                f"unresolved asset reference '{err.get('raw_reference', '')}'"
+                + (f" (did you mean '{err['suggested_path']}'?)"
+                   if err.get("suggested_path") else "")
+            ),
+            "severity": "error",
+            "raw_reference": err.get("raw_reference", ""),
+            "suggested_path": err.get("suggested_path"),
+        })
+    return out

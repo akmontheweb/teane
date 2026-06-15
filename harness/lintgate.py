@@ -465,18 +465,33 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
         if ext in _DEFAULT_FORMATTERS:
             lint_only_grouped.setdefault(ext, []).append(filepath)
 
+    # Run the web-asset scan AND the architecture inventory post-patch check
+    # early so their diagnostics surface even when there are no formatters to
+    # apply (e.g. a pure-HTML static site with no formatter installed).
+    web_asset_diagnostics = await _run_web_asset_scan(
+        workspace_path, modified_files
+    )
+    inventory_diagnostics = await _run_inventory_post_patch_check(
+        workspace_path, state
+    )
+
     if not grouped:
         logger.info("[lintgate_node] No registered formatters for modified file types.")
-        return {
-            "node_state": {
-                "lintgate": {
-                    "checked": len(modified_files),
-                    "formatted": 0,
-                    "linted": 0,
-                    "errors": 0,
+        if not web_asset_diagnostics and not inventory_diagnostics:
+            return {
+                "node_state": {
+                    "lintgate": {
+                        "checked": len(modified_files),
+                        "formatted": 0,
+                        "linted": 0,
+                        "errors": 0,
+                        "web_asset_errors": [],
+                        "lint_errors": [],
+                    }
                 }
             }
-        }
+        # Fall through with empty format/lint lists so the asset diagnostics
+        # surface through the normal return path below.
 
     files_formatted: list[str] = []
     files_linted: list[str] = []
@@ -608,6 +623,21 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
             except Exception as exc:
                 lint_errors.append(f"{filepath}: {exc}")
 
+    # Web-asset diagnostics from the early scan flow into lint_errors so
+    # autofix R6 + the existing repair loop pick them up. Catches the class
+    # of bug where the LLM emits `<link href="src/styles.css">` but never
+    # writes the CSS file.
+    for diag in web_asset_diagnostics:
+        lint_errors.append(diag.format_compiler_style())
+
+    # Layer 1 follow-on: post-patch existence check against the manifest
+    # declared in SPEC_ARCHITECTURE.md. Catches "plan said style.css,
+    # patcher didn't write it" without any new graph node. The diagnostics
+    # were collected by the early-pass; flatten them into lint_errors here
+    # so the existing repair loop picks them up.
+    for diag in inventory_diagnostics:
+        lint_errors.append(diag.format_compiler_style())
+
     total_checked = len(modified_files)
     total_formatted = len(files_formatted)
     total_linted = len(files_linted)
@@ -633,6 +663,16 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
             status_parts.append(f"    {err}")
         if len(format_errors) > 3:
             status_parts.append(f"    ... and {len(format_errors) - 3} more")
+    if web_asset_diagnostics:
+        status_parts.append(
+            f"  - Unresolved asset references ({len(web_asset_diagnostics)}):"
+        )
+        for diag in web_asset_diagnostics[:5]:
+            status_parts.append(f"    {diag.format_compiler_style()}")
+        if len(web_asset_diagnostics) > 5:
+            status_parts.append(
+                f"    ... and {len(web_asset_diagnostics) - 5} more"
+            )
     if total_formatted == 0 and total_linted == 0:
         status_parts.append("  No formatters triggered (tools not installed or no matching file types).")
     messages.append({"role": "system", "content": "\n".join(status_parts)})
@@ -648,9 +688,113 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                 "files_formatted": files_formatted,
                 "files_linted": files_linted,
                 "format_errors": format_errors,
+                "lint_errors": lint_errors,
+                "web_asset_errors": [
+                    {
+                        "referring_file": d.referring_file,
+                        "line": d.line,
+                        "column": d.column,
+                        "raw_reference": d.raw_reference,
+                        "resolved_path": d.resolved_path,
+                        "suggested_path": d.suggested_path,
+                    }
+                    for d in web_asset_diagnostics
+                ],
             }
         }
     }
+
+
+async def _run_inventory_post_patch_check(
+    workspace_path: str,
+    state: dict[str, Any],
+) -> list[Any]:
+    """Post-patch existence check: every file in the architecture inventory
+    must exist on disk.
+
+    Reads the fenced JSON inventory block from ``docs/SPEC_ARCHITECTURE.md``
+    (or wherever ``state["spec_architecture_path"]`` points) and asserts
+    every listed path was actually written. Catches the upstream class of
+    bug where planning forgot to generate a file declared in the
+    architecture — e.g. ticktaktoe's missing style.css.
+
+    Silently no-ops when:
+      * No architecture spec exists yet (first-pass project).
+      * The spec contains no JSON inventory block (legacy spec format).
+      * Workspace is backend-only (no html tag).
+
+    Returns a list of InventoryDiagnostic (MISSING_FROM_DISK).
+    """
+    try:
+        from harness.architecture_inventory import (
+            check_files_on_disk,
+            parse_inventory,
+        )
+        from harness.impact import _detect_workspace_stack
+    except ImportError as exc:
+        logger.debug("[lintgate_node] inventory check unavailable: %s", exc)
+        return []
+
+    try:
+        tags = _detect_workspace_stack(workspace_path) or set()
+    except Exception:
+        return []
+    if "html" not in tags:
+        return []
+
+    arch_path = state.get("spec_architecture_path") or os.path.join(
+        workspace_path, "docs", "SPEC_ARCHITECTURE.md"
+    )
+    if not arch_path or not os.path.isfile(arch_path):
+        return []
+    try:
+        with open(arch_path, "r", encoding="utf-8") as fh:
+            spec_md = fh.read()
+    except OSError as exc:
+        logger.debug("[lintgate_node] inventory read failed: %s", exc)
+        return []
+
+    parsed = parse_inventory(spec_md)
+    if not parsed.ok:
+        logger.debug(
+            "[lintgate_node] inventory block absent or malformed: %s",
+            parsed.error,
+        )
+        return []
+    return check_files_on_disk(parsed.files, workspace_path)
+
+
+async def _run_web_asset_scan(
+    workspace_path: str,
+    modified_files: list[str],
+) -> list[Any]:
+    """Run the static asset reference scanner if the workspace ships HTML.
+
+    Returns a list of AssetRefDiagnostic. Empty for non-web workspaces or
+    when no asset references are broken. Gated on the same `html` workspace
+    tag the skill loader uses, so backend-only projects pay nothing.
+    """
+    try:
+        from harness.impact import _detect_workspace_stack
+        from harness.web_asset_scan import scan_web_asset_references
+    except ImportError as exc:
+        logger.debug("[lintgate_node] web asset scan unavailable: %s", exc)
+        return []
+
+    try:
+        tags = _detect_workspace_stack(workspace_path) or set()
+    except Exception as exc:
+        logger.debug("[lintgate_node] workspace stack detection failed: %s", exc)
+        return []
+
+    if "html" not in tags:
+        return []
+
+    try:
+        return scan_web_asset_references(workspace_path, modified_files)
+    except Exception as exc:
+        logger.warning("[lintgate_node] web asset scan errored: %s", exc)
+        return []
 
 
 def _resolve_path(filepath: str, workspace_path: str) -> Optional[str]:

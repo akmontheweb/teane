@@ -67,11 +67,18 @@ For a full deployment walkthrough — prerequisites, sandbox setup, API keys,
 and platform-specific notes for Linux / macOS / Windows (WSL2 + native) —
 see [docs/installation.md](docs/installation.md).
 
-Once a `harness run` finishes a green build it has already produced your
-`Dockerfile`, `docker-compose.yml`, and (when needed) `Caddyfile`, then
-brought the dev env up with health checks. See
-[docs/app-deployment.md](docs/app-deployment.md) for the artefact contract,
-the preview gate, and how to bring the same setup up on a different host.
+A `harness run` stops after a clean security scan by default — the
+workspace holds the generated code and you can take it to whatever
+deployment pipeline you already use. Pass `--dev-deployment` to opt into
+the local docker-compose dev environment: the harness then walks
+deployment discovery, generates `Dockerfile` / `docker-compose.yml` /
+`Caddyfile` (and a `DEPLOYMENT_BLUEPRINT.md`), and brings the stack up
+with health checks. The separate `deployment.enabled` config flag is a
+narrower switch: it only gates the final `docker compose up` step once
+the deployment phase is already running. See
+[docs/app-deployment.md](docs/app-deployment.md) for the artefact
+contract, the preview gate, and how to bring the same setup up on a
+different host.
 
 ## Command reference
 
@@ -98,6 +105,7 @@ the preview gate, and how to bring the same setup up on a different host.
 | `--thread-id` | LangGraph thread ID for checkpoint lookups (defaults to session). |
 | `--allow-network` | Permit outbound network traffic in the sandbox. |
 | `--discover` | Run the full requirements / architecture / deployment interview. |
+| `--dev-deployment` | After a clean security scan, continue into deployment discovery, `DEPLOYMENT_BLUEPRINT.md`, gatekeeper approval, and `docker compose up`. Off by default — without this flag the run ends after code generation. |
 | `-v`, `--verbose` | Debug-level logging. |
 
 ### `harness resume`

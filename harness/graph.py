@@ -141,6 +141,14 @@ class AgentState(TypedDict, total=False):
     sandbox_config: dict[str, Any]
     lintgate_config: dict[str, Any]
     deployment_config: dict[str, Any]
+    # Operator-controlled toggle for the entire deployment phase (discovery
+    # → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose up). Set by the
+    # `--dev-deployment` CLI flag on `harness run`; default False. When False,
+    # route_after_security_scan short-circuits to END after a clean scan
+    # instead of routing into deployment_discovery_node. Distinct from
+    # `deployment_config["enabled"]`, which only gates the docker step
+    # inside deployment_node once the phase is already running.
+    dev_deployment: bool
     # Optional org-wide deployment policy loaded from config/deployment.json.
     # When populated, deployment_discovery_node injects it into the planning
     # LLM's prompt so already-resolved fields don't produce questions. Empty
@@ -184,6 +192,7 @@ def create_initial_state(
     change_requests_dir_abs: str = "",
     archive_target_dir: str = "",
     change_requests_config: Optional[dict[str, Any]] = None,
+    dev_deployment: bool = False,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -250,6 +259,7 @@ def create_initial_state(
         change_request_files=[],
         archive_target_dir=archive_target_dir,
         change_requests_config=dict(change_requests_config or {}),
+        dev_deployment=bool(dev_deployment),
     )
 
 
@@ -492,6 +502,17 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
             f"rejected by the patcher.\n"
         )
 
+    # Web-app file manifest contract: only injected when this is a web
+    # workspace. Tells the LLM to emit a structured JSON manifest the
+    # harness can cross-check against the architecture inventory.
+    inventory_block = ""
+    if workspace_tags and ("html" in workspace_tags):
+        from harness.architecture_inventory import PLANNING_INVENTORY_INSTRUCTION
+        inventory_block = (
+            f"## File Manifest Contract (web apps)\n"
+            f"{PLANNING_INVENTORY_INSTRUCTION}\n"
+        )
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
 ## Repository Root
@@ -499,7 +520,7 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
 
 ## Directory Structure (snapshot at invocation)
 {tree}
-{layout_block}{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}{style_guides if style_guides else ""}
+{layout_block}{inventory_block}{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}{style_guides if style_guides else ""}
 ## Build Command
 {build_command}
 
@@ -3324,14 +3345,34 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             len(raw_errors) - len(errors), len(errors),
         )
 
-    # --- Deterministic autofix pass (R1+R2+R3) ---
+    # --- Deterministic autofix pass (R1+R2+R3+R4+R5+R6) ---
     # Try to resolve diagnostics with compiler-suggested fixes,
-    # missing-import insertion, or known-safe security autofixes BEFORE
-    # spending an LLM call. Anything still unhandled falls through to
-    # the LLM exactly as before.
-    from harness.autofix import apply_autofixes, autofix_system_message
+    # missing-import insertion, known-safe security autofixes, or
+    # web-asset reference rewrites BEFORE spending an LLM call. Anything
+    # still unhandled falls through to the LLM exactly as before.
+    from harness.autofix import (
+        apply_autofixes,
+        autofix_system_message,
+        web_asset_diagnostics_to_standard,
+    )
     workspace_path = state.get("workspace_path", os.getcwd())
-    unhandled, applied_fixes = await apply_autofixes(list(errors), workspace_path)
+
+    # Bridge: lintgate writes web_asset_errors as dicts in node_state. R6
+    # consumes them through the same standardized diagnostic shape as every
+    # other dispatcher. Convert and merge here so the autofix pass sees the
+    # full pool in one loop.
+    lintgate_state = state.get("node_state", {}).get("lintgate", {}) or {}
+    web_asset_diags = web_asset_diagnostics_to_standard(
+        lintgate_state.get("web_asset_errors", [])
+    )
+    combined_input = list(errors) + web_asset_diags
+    unhandled, applied_fixes = await apply_autofixes(combined_input, workspace_path)
+    # Strip any web-asset diagnostics that the LLM should NOT see in the
+    # compiler-errors framing — they're already surfaced via the lint_errors
+    # channel further up. Only compiler errors should fall through to the
+    # LLM's compiler-style repair prompt.
+    unhandled = [d for d in unhandled
+                 if d.get("error_code") != "WEB_ASSET_REF"]
     autofix_modified_files = list(state.get("modified_files", []))
     autofix_messages = list(state.get("messages", []))
     if applied_fixes:
@@ -4697,6 +4738,7 @@ async def reverse_engineer_architecture_node(state: AgentState) -> dict[str, Any
         "modify the architecture. Be specific. Cite filenames you saw. "
         "Do NOT invent components that aren't in the sampled files."
     )
+    from harness.architecture_inventory import ARCHITECTURE_INVENTORY_INSTRUCTION
     user_prompt = (
         f"# Workspace fingerprint\n\n"
         f"- Workspace path: `{workspace}`\n"
@@ -4716,7 +4758,10 @@ async def reverse_engineer_architecture_node(state: AgentState) -> dict[str, Any
         "4. **Build & runtime** — toolchain, entry point, deploy unit.\n"
         "5. **Known unknowns** — areas where the sample didn't give you enough "
         "signal, framed as concrete questions for the operator.\n\n"
-        "Output ONLY the markdown document — no preamble, no fences."
+        f"{ARCHITECTURE_INVENTORY_INSTRUCTION}\n"
+        "Output ONLY the markdown document — no preamble, no fences. The "
+        "fenced ```json inventory block IS part of the markdown body and "
+        "must be included verbatim."
     )
 
     from harness.gateway import NodeRole
@@ -6474,6 +6519,16 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         if workspace_path and _is_flutter_project(workspace_path):
             logger.info("[router] Flutter project detected. Skipping deploy pipeline (M-1). Routing to END.")
             return "__end__"
+        # Operator opt-in gate (--dev-deployment). When the flag is absent
+        # the harness stops after a clean security scan; the operator can
+        # inspect the generated code, then re-run with --dev-deployment to
+        # enter discovery → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose.
+        if not state.get("dev_deployment", False):
+            logger.info(
+                "[router] Security scan clean. --dev-deployment not set; "
+                "skipping deployment phase. Routing to END."
+            )
+            return "__end__"
         logger.info("[router] Security scan clean. Routing to deployment discovery.")
         return "deployment_discovery_node"
 
@@ -7048,6 +7103,7 @@ async def run_graph(
     change_requests_dir_abs: str = "",
     archive_target_dir: str = "",
     change_requests_config: Optional[dict[str, Any]] = None,
+    dev_deployment: bool = False,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -7089,6 +7145,7 @@ async def run_graph(
         change_requests_dir_abs=change_requests_dir_abs,
         archive_target_dir=archive_target_dir,
         change_requests_config=change_requests_config,
+        dev_deployment=dev_deployment,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node

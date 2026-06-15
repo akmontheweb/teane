@@ -173,3 +173,31 @@ class TestBuildSystemPromptIntegration:
             assert "Python — FastAPI" not in prompt
             assert "Mobile — Flutter" not in prompt
             assert "Frontend — React" not in prompt
+
+    def test_static_web_workspace_loads_web_skills(self):
+        """Regression: the ticktaktoe shape (index.html + jest tests, no
+        package.json or framework) must pull in both the web-app asset
+        contract and the static-web Makefile skill. The empty Makefile +
+        missing CSS bug came from neither of these skills being loaded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.html"), "w") as f:
+                f.write(
+                    '<!DOCTYPE html><html><head>'
+                    '<link rel="stylesheet" href="style.css">'
+                    '</head><body></body></html>'
+                )
+            os.makedirs(os.path.join(tmp, "tests"))
+            with open(os.path.join(tmp, "tests", "x.test.js"), "w") as f:
+                f.write("test('x', () => expect(1).toBe(1));\n")
+
+            prompt = _build_system_prompt(tmp, "make test")
+            # Both Layer 2 (preventive contract) and Layer 3 (Makefile)
+            # skills must load for this shape — the upstream root cause of
+            # the empty `build: @echo` Makefile was that neither did.
+            assert "Web App — Asset Reference Contract" in prompt
+            assert "Build — Static Web App Makefile" in prompt
+            # Should NOT load framework-specific skills.
+            assert "Frontend — React" not in prompt
+            assert "Frontend — Vue" not in prompt
+            # Should NOT load the node Makefile skill (no package.json).
+            assert "Build — Node.js / TypeScript Makefile" not in prompt

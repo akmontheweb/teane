@@ -5110,12 +5110,27 @@ class TestGitGuardianLifecycle:
 class TestSecurityScanRouting:
 
     def test_route_after_security_scan_clean(self):
+        # A clean security scan now routes into deployment only when the
+        # operator opted in via --dev-deployment (state["dev_deployment"]
+        # = True). Without the flag the router ends the run and the
+        # workspace is handed back with the generated code in place.
+        from harness.graph import route_after_security_scan
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir, dev_deployment=True)
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = []
+            assert route_after_security_scan(state) == "deployment_discovery_node"
+
+    def test_route_after_security_scan_clean_without_dev_deployment(self):
+        # New default: clean scan + no --dev-deployment → END. The whole
+        # deployment phase (discovery, blueprint, gatekeeper, docker
+        # compose up) is skipped.
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
-            assert route_after_security_scan(state) == "deployment_discovery_node"
+            assert route_after_security_scan(state) == "__end__"
 
     def test_route_after_security_scan_findings(self):
         # Security findings route to repair_node (not patching_node) so

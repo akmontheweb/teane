@@ -492,6 +492,81 @@ def test_last_run_for_job_returns_none_when_no_history(tmp_path):
     assert last_run_for_job(cfg, "anything") is None
 
 
+@pytest.mark.asyncio
+async def test_daemon_tick_fires_due_web_oneshot_jobs(tmp_path):
+    """Tier-C integration smoke: the schedule daemon picks up rows
+    enqueued in web.db's ``web_oneshot_jobs`` whose ``fire_at_utc``
+    has elapsed, fires them via the same execute_job_once path, and
+    marks them consumed afterwards."""
+    from datetime import datetime as _dt, timedelta as _td
+    from harness.web_state import (
+        add_oneshot_job, list_all_oneshot_jobs,
+    )
+
+    web_db = str(tmp_path / "web.db")
+    cfg = ScheduleConfig(
+        history_db=str(tmp_path / "h.db"),
+        log_dir=str(tmp_path / "logs"),
+        harness_binary=sys.executable,
+        web_db_path=web_db,
+    )
+    add_oneshot_job(
+        db_path=web_db,
+        name="urgent-fix",
+        fire_at_utc=_dt.now(UTC) - _td(seconds=10),  # already due
+        workspace=str(tmp_path),
+        prompt="fix the regression",
+    )
+    add_oneshot_job(
+        db_path=web_db,
+        name="much-later",
+        fire_at_utc=_dt.now(UTC) + _td(hours=2),  # not due
+        workspace=str(tmp_path),
+    )
+
+    daemon = ScheduleDaemon(cfg)
+
+    import harness.schedule as sched_mod
+    original = sched_mod.build_run_command
+
+    def _fast_argv(_cfg, _job):
+        return [sys.executable, "-c", "import sys; sys.exit(0)"]
+
+    sched_mod.build_run_command = _fast_argv
+    try:
+        results = await daemon.tick_once()
+    finally:
+        sched_mod.build_run_command = original
+
+    assert len(results) == 1
+    assert results[0]["job_name"].startswith("web-oneshot-")
+    assert "oneshot_id" in results[0]
+
+    all_jobs = list_all_oneshot_jobs(db_path=web_db)
+    # Both rows still present; only the due one is consumed.
+    consumed = [j for j in all_jobs if j["consumed_at"] is not None]
+    pending = [j for j in all_jobs if j["consumed_at"] is None]
+    assert len(consumed) == 1
+    assert consumed[0]["name"] == "urgent-fix"
+    assert len(pending) == 1
+    assert pending[0]["name"] == "much-later"
+
+
+@pytest.mark.asyncio
+async def test_daemon_tick_skips_oneshots_when_web_db_path_empty(tmp_path):
+    """Headless deployments that disable the web.db integration
+    shouldn't try to read it."""
+    cfg = ScheduleConfig(
+        history_db=str(tmp_path / "h.db"),
+        log_dir=str(tmp_path / "logs"),
+        harness_binary=sys.executable,
+        web_db_path="",  # disabled
+    )
+    daemon = ScheduleDaemon(cfg)
+    results = await daemon.tick_once()
+    assert results == []
+
+
 def test_history_for_job_respects_limit(tmp_path):
     cfg = ScheduleConfig(history_db=str(tmp_path / "h.db"))
     # Manually insert 5 rows; verify limit=2 returns 2 newest.

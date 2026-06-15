@@ -13,6 +13,53 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- **Tier B + C dashboard** — Interactive web app for non-CLI
+  operators. Extends `harness dashboard` from a read-only viewer into
+  a full graphical control plane while preserving the existing
+  read-only routes byte-identically when `--writes-enabled` is off.
+  New surfaces:
+  - **Tier A enriched views**: `/live` (currently-running + recently-
+    terminated runs), `/config` + `/config/<section>` (read-only
+    config tree).
+  - **Tier B write paths** (require `--writes-enabled`):
+    `POST /config/<section>` form-based section editor backed by the
+    strict validator (form schema derived from
+    `_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA`, no hand-curation);
+    `POST /memory/<name>` memory-file editor;
+    `POST /schedule/jobs` schedule-job CRUD. Atomic config writes
+    (tempfile + `os.replace`) gated by a CSRF double-submit cookie
+    + `X-CSRF-Token` header.
+  - **Tier C control plane**: `/run/new` form, `POST /run/now`
+    spawns a `harness run` subprocess (registered in an in-memory
+    `ProcessRegistry`; `HARNESS_HITL_WEBHOOK_URL` exported so the
+    harness POSTs HITL prompts back to the dashboard);
+    `POST /run/schedule` enqueues a row in
+    `web.db:web_oneshot_jobs` which the existing schedule daemon
+    (#13) picks up alongside its config-driven jobs;
+    `GET /api/sessions/<id>/events` Server-Sent Events stream
+    tailing the per-session JSONL log; `POST /hitl/webhook` is the
+    blocking endpoint the harness's `HttpChannel` POSTs to and the
+    UI's `POST /sessions/<id>/hitl/answer` signals;
+    `POST /sessions/<id>/note` queues chat notes that prepend onto
+    the next HITL gate's `extra_notes`; `POST /sessions/<id>/cancel`
+    SIGTERMs the registered process group.
+  - **New modules**: `harness/web_state.py` (process registry +
+    HITL queue + web.db SQLite schema with `audit_log`,
+    `run_presets`, `web_oneshot_jobs`, `chat_notes` tables);
+    `harness/web_forms.py` (form schemas derived from the live
+    validator; a round-trip test guards against drift between the
+    schema and the validator).
+  - **Schedule daemon extension** (#13 + #14): `ScheduleDaemon.
+    tick_once` now also fires due rows from `web.db:web_oneshot_jobs`
+    in addition to config-driven jobs.
+  - **Auth**: localhost-only default bind + bearer token (unchanged)
+    + new CSRF double-submit cookie on every write. CSRF token
+    auto-generated per server boot unless
+    `dashboard.csrf_token_env` names a persistent env var.
+    Server refuses to start when `token_env` or
+    `csrf_token_env` references an empty env var (fail-closed).
+  - **Frontend**: server-rendered HTML + small vanilla-JS
+    EventSource. Zero new Python deps, zero npm, zero build step.
 - **Tier 1 capability** — Cron-driven scheduled-job daemon (#13).
   New `harness/schedule.py` + `harness schedule {run,list,validate,
   once,history}` subcommands. Hand-rolled cron syntax subset

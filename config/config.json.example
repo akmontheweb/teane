@@ -266,13 +266,18 @@
         "gh_path": ""
     },
 
+    "_dashboard_writes_comment": "When writes_enabled=true the dashboard adds form-based config editing, memory editing, schedule-job CRUD, and 'Run now / Schedule it' from the browser (Tier B + C). On the harness side, dashboard-spawned runs export HARNESS_HITL_WEBHOOK_URL pointing at the dashboard's /hitl/webhook endpoint so HITL gates surface in the UI instead of the terminal. CSRF: token cookie + X-CSRF-Token header required on every write request; the token is generated per server boot unless csrf_token_env names an env var with a persistent value. hitl_webhook_secret (optional) is the shared secret the harness's HttpChannel includes when POSTing HITL prompts. web_db_path is the SQLite store for audit log, saved run presets, queued chat notes, and one-shot scheduled jobs. config_path overrides the canonical config.json location (defaults to the global config). All writes are atomic (tempfile + os.replace) and re-validated through the strict validator before landing.",
     "_dashboard_comment": "Read-only web UI (#14) over the harness's on-disk state — sessions, cost burn-down (Chart.js), scheduled jobs, repo index status, per-repo memory. Start with `harness dashboard`. Default bind 127.0.0.1:8729 — accidental public exposure is impossible without flipping `host`. For remote access set `token_env` to the name of an env var holding a bearer token; every request must then carry `Authorization: Bearer <token>` and tokens are constant-time compared. When `token_env` is set but the env var is empty the server refuses to start — fail-closed. log_dir / metrics_dir / memory_dir / repo_index_dir / schedule_db default to the live harness paths so most operators don't need to set them. sessions_max caps how many session log files the sessions list scans (default 200). chart_js_url is the CDN script tag; air-gapped operators drop a local chart.js into static_dir and the dashboard prefers it.",
     "dashboard": {
         "enabled": false,
         "host": "127.0.0.1",
         "port": 8729,
         "token_env": "",
-        "sessions_max": 200
+        "sessions_max": 200,
+        "writes_enabled": false,
+        "csrf_token_env": "",
+        "hitl_webhook_secret": "",
+        "web_db_path": "~/.harness/web.db"
     },
 
     "_schedule_comment": "Cron-driven background daemon (#13) that fires recurring `harness run` jobs. Started with `harness schedule run`. Each job has a name, a schedule string, a workspace, an optional prompt, and optional on_success / on_failure shell hooks. Schedule syntax (hand-rolled subset; case-insensitive; all times UTC): 'every 15m' / 'every 6h' / 'every 3d' / 'hourly :MM' / 'daily HH:MM' / 'weekly DAY HH:MM' (DAY ∈ mon,tue,wed,thu,fri,sat,sun). Hooks run via /bin/sh -c with these env vars exported: HARNESS_JOB_NAME, HARNESS_JOB_EXIT_CODE, HARNESS_JOB_DURATION_SEC, HARNESS_JOB_LOG_PATH — wire any service (Slack/Discord/PagerDuty/email) in one curl line. tick_seconds is the daemon's polling interval (default 60s). history_db is where job execution history persists (SQLite next to checkpoints). harness_binary is the path the daemon shells out to (set to the venv's bin when not on PATH). Default off. Drop sample jobs into 'jobs' to enable.",

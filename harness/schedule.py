@@ -254,6 +254,13 @@ class ScheduleConfig:
     log_dir: str = _DEFAULT_LOG_DIR
     tick_seconds: int = _DEFAULT_TICK_SECONDS
     harness_binary: str = "harness"  # operators using a venv set "/path/to/venv/bin/harness"
+    # Path to the dashboard's web.db. When set (default
+    # ``~/.harness/web.db``), the daemon polls ``web_oneshot_jobs`` for
+    # one-shot runs the dashboard enqueued via ``POST /run/schedule`` and
+    # fires + marks them consumed alongside the config-driven jobs.
+    # Empty string disables this integration (useful for headless CI
+    # daemons that never run the dashboard).
+    web_db_path: str = "~/.harness/web.db"
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "ScheduleConfig":
@@ -280,6 +287,7 @@ class ScheduleConfig:
             log_dir=str(section.get("log_dir", _DEFAULT_LOG_DIR)),
             tick_seconds=tick_seconds,
             harness_binary=str(section.get("harness_binary", "harness")),
+            web_db_path=str(section.get("web_db_path", "~/.harness/web.db")),
         )
 
     @staticmethod
@@ -604,16 +612,71 @@ class ScheduleDaemon:
             self._in_flight.discard(job.name)
 
     async def tick_once(self) -> list[dict[str, Any]]:
-        """Run one tick of the daemon loop: fire all due jobs
-        concurrently, return their summaries. Public so unit tests can
-        drive the daemon without sleeping."""
+        """Run one tick of the daemon loop: fire all due config-driven
+        jobs *and* any web one-shot jobs the dashboard enqueued whose
+        ``fire_at_utc`` has elapsed. Returns the union of summaries.
+        Public so unit tests can drive the daemon without sleeping."""
         due = self.jobs_due()
-        if not due:
+        oneshots = self._due_oneshots() if self.cfg.web_db_path else []
+        coroutines: list[Any] = []
+        for j in due:
+            coroutines.append(self.fire_job(j))
+        for row in oneshots:
+            coroutines.append(self._fire_oneshot(row))
+        if not coroutines:
             return []
-        results = await asyncio.gather(
-            *(self.fire_job(j) for j in due), return_exceptions=False,
-        )
+        results = await asyncio.gather(*coroutines, return_exceptions=False)
         return list(results)
+
+    def _due_oneshots(self) -> list[dict[str, Any]]:
+        """Read all pending web one-shot jobs whose fire time has
+        elapsed. Best-effort: failures (missing DB, schema mismatch)
+        log and return ``[]`` so the daemon's main loop continues."""
+        try:
+            from harness.web_state import list_pending_oneshot_jobs
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[schedule] web_state import failed: %s", exc)
+            return []
+        try:
+            return list_pending_oneshot_jobs(db_path=self.cfg.web_db_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[schedule] web_oneshot poll failed for %s: %s",
+                self.cfg.web_db_path, exc,
+            )
+            return []
+
+    async def _fire_oneshot(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Build a transient :class:`Job` from a web one-shot row and
+        run it through :func:`execute_job_once`. Mark consumed
+        regardless of exit code so a failed run doesn't re-fire next
+        tick (operators re-enqueue from the UI if they want a retry)."""
+        # The schedule field is required by Job but only used by
+        # next_run; execute_job_once ignores it. Pick a no-op shape.
+        try:
+            sched = parse_schedule("daily 00:00")
+        except ValueError:
+            sched = Schedule(raw="daily 00:00", kind=SCHEDULE_KIND_DAILY)
+        job = Job(
+            name=f"web-oneshot-{row['id']}-{row['name']}",
+            schedule=sched,
+            workspace=str(row["workspace"]),
+            prompt=str(row.get("prompt") or ""),
+            harness_args=list(row.get("harness_args") or []),
+        )
+        try:
+            result = await execute_job_once(self.cfg, job)
+        finally:
+            try:
+                from harness.web_state import mark_oneshot_consumed
+                mark_oneshot_consumed(db_path=self.cfg.web_db_path, job_id=int(row["id"]))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[schedule] failed to mark oneshot %s consumed: %s",
+                    row.get("id"), exc,
+                )
+        result["oneshot_id"] = row["id"]
+        return result
 
     async def run_forever(self) -> int:
         """Main loop. Returns when the asyncio task is cancelled

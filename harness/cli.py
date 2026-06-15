@@ -690,6 +690,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "host", "port", "token_env",
         "log_dir", "metrics_dir", "memory_dir", "repo_index_dir",
         "schedule_db", "static_dir", "chart_js_url", "sessions_max",
+        # Tier B/C extensions (web app).
+        "writes_enabled", "csrf_token_env", "hitl_webhook_secret",
+        "web_db_path", "config_path",
     }),
     # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
     "github": frozenset({"gh_path"}),
@@ -834,6 +837,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "dashboard.static_dir": (str,),
     "dashboard.chart_js_url": (str,),
     "dashboard.sessions_max": (int,),
+    "dashboard.writes_enabled": (bool,),
+    "dashboard.csrf_token_env": (str,),
+    "dashboard.hitl_webhook_secret": (str,),
+    "dashboard.web_db_path": (str,),
+    "dashboard.config_path": (str,),
     "github.gh_path": (str,),
     "repo_index.enabled": (bool,),
     "repo_index.backend": (str,),
@@ -5214,6 +5222,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         dash_cfg.host = str(args.host)
     if getattr(args, "port", None):
         dash_cfg.port = int(args.port)
+    if getattr(args, "writes_enabled", False):
+        dash_cfg.writes_enabled = True
     try:
         start_server(dash_cfg, blocking=True)
     except RuntimeError as exc:
@@ -6466,6 +6476,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--workspace", "-w", "-r",
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+    dashboard_parser.add_argument(
+        "--writes-enabled",
+        action="store_true",
+        default=False,
+        help="Enable the editing UI + Run-from-web. Required to render form fields, save config, "
+             "start runs, and intercept HITL gates. Default off (read-only).",
     )
 
     # --- `harness schedule` (#13) ---

@@ -12,6 +12,41 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+- **Tier 1 capability** — Cron-driven scheduled-job daemon (#13).
+  New `harness/schedule.py` + `harness schedule {run,list,validate,
+  once,history}` subcommands. Hand-rolled cron syntax subset
+  (`every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM`)
+  covers >90% of real use cases without depending on `croniter`. Each
+  job runs as `harness run` in its own subprocess; SQLite history at
+  `~/.harness/schedule.db` carries started/ended/exit_code/duration/
+  log_path per fire. Notifications via generic shell hooks
+  (`on_success` / `on_failure`) with `HARNESS_JOB_NAME` /
+  `HARNESS_JOB_EXIT_CODE` / `HARNESS_JOB_DURATION_SEC` /
+  `HARNESS_JOB_LOG_PATH` exported — operators wire Slack/Discord/
+  PagerDuty/email in one curl line. Default off.
+- **Tier 1 capability** — Read-only web dashboard (#14). New
+  `harness/dashboard.py` + `harness dashboard` subcommand. Surfaces
+  the harness's existing on-disk state: sessions list + per-session
+  detail (from `~/.harness/logs/*.jsonl`), cost burn-down chart
+  (Chart.js via CDN; air-gapped operators drop a local file into
+  `dashboard.static_dir`), scheduled-job runs (from the #13 SQLite
+  store), repo-index status (from #6 SQLite store), per-repo memory
+  files (from #7). Default bind `127.0.0.1` so accidental public
+  exposure isn't possible without an explicit config change.
+  Optional bearer-token auth via `dashboard.token_env` —
+  `hmac.compare_digest` constant-time match; tokens never logged.
+  When `token_env` is set but the env var is empty the server
+  refuses to start (fail-closed). Zero new Python dependencies —
+  uses stdlib `http.server.ThreadingHTTPServer`.
+- **Tier 4** — `make coverage` target backed by `pytest-cov`. Emits
+  terminal summary + HTML report under `htmlcov/` + XML at
+  `coverage.xml`. No CI gate on the coverage number — the metric is
+  for visibility; we'll set a defensible floor only after the rapid
+  feature-shipping phase settles. README's "545-test regression
+  pack" claim retired in favour of the live `make coverage`
+  output (#9).
+
 ### Changed
 - **Tier 1 capability (rebuild)** — `harness/speculative.py` is now
   configuration-driven across six independent strategy axes (#12). The

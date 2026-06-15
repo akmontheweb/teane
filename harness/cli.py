@@ -519,6 +519,9 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Cron-driven scheduled job daemon. Started with `harness schedule
     # run`. Default off. See harness/schedule.py.
     "schedule",
+    # Read-only web dashboard. Started with `harness dashboard`. Default
+    # bind 127.0.0.1; optional bearer-token auth. See harness/dashboard.py.
+    "dashboard",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -681,6 +684,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "jobs", "history_db", "log_dir",
         "tick_seconds", "harness_binary",
     }),
+    # Read-only web dashboard. Default bind 127.0.0.1; optional
+    # bearer-token auth via the named env var. See harness/dashboard.py.
+    "dashboard": frozenset({
+        "enabled", "host", "port", "token_env",
+        "log_dir", "metrics_dir", "memory_dir", "repo_index_dir",
+        "schedule_db", "static_dir", "chart_js_url", "sessions_max",
+    }),
     # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
     "github": frozenset({"gh_path"}),
     # Semantic retrieval index. enabled gates planner injection +
@@ -812,6 +822,18 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "schedule.log_dir": (str,),
     "schedule.tick_seconds": (int,),
     "schedule.harness_binary": (str,),
+    "dashboard.enabled": (bool,),
+    "dashboard.host": (str,),
+    "dashboard.port": (int,),
+    "dashboard.token_env": (str,),
+    "dashboard.log_dir": (str,),
+    "dashboard.metrics_dir": (str,),
+    "dashboard.memory_dir": (str,),
+    "dashboard.repo_index_dir": (str,),
+    "dashboard.schedule_db": (str,),
+    "dashboard.static_dir": (str,),
+    "dashboard.chart_js_url": (str,),
+    "dashboard.sessions_max": (int,),
     "github.gh_path": (str,),
     "repo_index.enabled": (bool,),
     "repo_index.backend": (str,),
@@ -5168,6 +5190,41 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """``harness dashboard`` — start the read-only web UI."""
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError:
+        config = {}
+    from harness.dashboard import DashboardConfig, start_server
+    dash_cfg = DashboardConfig.from_config(config)
+    if not dash_cfg.enabled:
+        # The subcommand still works without enabled=true — the operator
+        # is the one running it; the flag matters when the dashboard is
+        # surfaced through a process supervisor.
+        logger.warning(
+            "[dashboard] dashboard.enabled is false; running anyway because "
+            "the operator launched the subcommand directly."
+        )
+    if getattr(args, "host", None):
+        dash_cfg.host = str(args.host)
+    if getattr(args, "port", None):
+        dash_cfg.port = int(args.port)
+    try:
+        start_server(dash_cfg, blocking=True)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: cannot bind {dash_cfg.host}:{dash_cfg.port}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _resolve_schedule_config(args: argparse.Namespace) -> "Any":
     """Load the schedule section from the canonical config. Returns a
     ScheduleConfig; raises ConfigError to the outer handler when the
@@ -6392,6 +6449,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness dashboard` (#14) ---
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Read-only web UI over the harness's on-disk state (sessions, cost, schedule, repo index, memory).",
+    )
+    dashboard_parser.add_argument(
+        "--host", default=None,
+        help="Bind host. Overrides dashboard.host (default 127.0.0.1).",
+    )
+    dashboard_parser.add_argument(
+        "--port", type=int, default=None,
+        help="Bind port. Overrides dashboard.port (default 8729).",
+    )
+    dashboard_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+
     # --- `harness schedule` (#13) ---
     schedule_parser = subparsers.add_parser(
         "schedule",
@@ -6631,6 +6707,8 @@ def main() -> int:
             return 1
         elif args.command == "chat":
             return asyncio.run(cmd_chat(args))
+        elif args.command == "dashboard":
+            return cmd_dashboard(args)
         elif args.command == "schedule":
             action = getattr(args, "schedule_action", None)
             if action == "run":

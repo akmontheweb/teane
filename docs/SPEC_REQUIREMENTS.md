@@ -409,12 +409,124 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `sandbox.docker_image: "python:3.12-slim"` and a `make build` command, the sandbox layer ensures `make` is available before invoking the build.
   - Given a `sh: 1: <cmd>: not found` error in build output, the parser surfaces the missing tool without the `/bin/` prefix mismatch.
 
+### FR-051: MCP (Model Context Protocol) Client
+- **Description:** The harness MUST support connecting to one or more MCP servers declared in `config.mcp.servers` and exposing each server's advertised tools as `mcp__<server>__<tool>` skills in the `SkillRegistry`. The MCP client MUST implement JSON-RPC 2.0 over stdio (newline-delimited frames) without depending on the upstream `mcp` SDK so the core install stays dependency-clean. Server commands MUST be validated through `harness.trust.validate_mcp_server_command` (allowlist of `npx`/`node`/`python*`/`uvx`/`docker`; hard-deny on shells / `sudo` / `rm`; shell-metacharacter scan; `/etc /root /proc /sys` path rejection). Filesystem MCP servers MUST be gated behind `mcp.allow_local_filesystem_servers=true`.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `mcp.enabled=true` and a valid stdio server, `harness doctor` lists the server with the count of advertised tools.
+  - Given the planner emits a `<<<MCP_CALL server="x" tool="y" args='{...}'>>>` block, the graph's `_run_tool_loop` intercepts it, dispatches via the MCP client, and feeds the result back as a user message.
+  - Given a server command that fails the allowlist, the pool refuses to start and logs the rejection reason; one bad server never blocks the rest of the pool.
+
+### FR-052: Provider Prompt Caching
+- **Description:** The gateway MUST emit Anthropic `cache_control: {"type": "ephemeral"}` markers on the system block (and on the first user message when ≥ 4 KB) for cache-capable models when `llm_dispatch.prompt_cache_enabled=true` (default). For OpenAI / DeepSeek the gateway already deducts `cache_read_input_tokens` at the discounted rate; the gateway MUST also run a **prefix-stability drift detector** that hashes the first two messages per `(session, role)` and emits a `cache_prefix_drift` observability event when the hash changes between consecutive calls — surfacing silent cache misses on auto-cache providers.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given an Anthropic dispatch with `supports_cache=true`, the request payload's `system` field is a list-of-blocks with `cache_control: {"type": "ephemeral"}`.
+  - Given two consecutive dispatches for the same session+role with a mutated immutable preamble, a `cache_prefix_drift` event is emitted.
+  - Given `llm_dispatch.prompt_cache_enabled=false`, Anthropic requests fall back to the legacy string-form `system` payload.
+
+### FR-053: Web Research Tools (`WebFetchSkill`, `WebSearchSkill`)
+- **Description:** The harness MUST expose `web_fetch` and `web_search` to the planner via text-DSL blocks (`<<<WEB_FETCH url="...">>>`, `<<<WEB_SEARCH query="...">>>`) when `web_tools.enabled=true`. Default backend: `duckduckgo_lite` (no API key). Outbound URLs MUST be validated through `harness.trust.validate_outbound_url` which rejects `file://`/`javascript:` schemes, loopback / link-local / RFC-1918 hosts (SSRF guard) unless `web_tools.allow_private_ips=true`. Response size MUST be capped at `web_tools.max_bytes` and content-type MUST be on the allowlist (`text/html`, `text/plain`, `text/markdown`, `application/json`, `application/xml`).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given the planner emits a `<<<WEB_FETCH url="https://docs.python.org/">>>` block, the graph intercepts, fetches the URL, and feeds the readable text back as a user message.
+  - Given an LLM-supplied URL targeting `169.254.169.254`, `validate_outbound_url` rejects it before the HTTP call.
+  - Given `web_tools.enabled=false`, the skills are not registered and any tool block is left in the response with a "tool not registered" notice.
+
+### FR-054: GitHub Integration (`harness gh`)
+- **Description:** The harness MUST ship a `harness gh` subcommand family wrapping the `gh` CLI (no new Python dep). `harness gh issue --repo X --number Y` MUST pull an issue body and write it to the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow processes it. `harness gh pr-create` MUST open a PR from the workspace's current branch; `harness gh pr-comment` MUST post a comment on an existing PR. Authentication MUST defer to whatever `gh auth status` reports.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `gh` is on PATH and authenticated, `harness gh issue --repo owner/repo --number 42` creates `change_requests/CR-N-<slug>.txt` with the issue body.
+  - Given `gh` is NOT on PATH, the subcommand exits non-zero with a clear "install gh CLI from cli.github.com" message.
+  - Given a PR-create call from a branch with no commits ahead of base, the `gh pr create` exit code surfaces verbatim.
+
+### FR-055: Runtime-Extensible Skills Directory
+- **Description:** `register_builtin_skills(config)` MUST walk `~/.harness/skills/` (or the path named by `skills.user_skills_dir`) at startup and import every non-`_`-prefixed `*.py` file. Each loaded module MAY call `harness.skills.register(MySkill(...))` to add a `ToolSkill`/`PipelineSkill`/`SubAgentSkill` without modifying core code. Failures (syntax error, missing dep, import-time exception) MUST log and continue so one bad file never blocks startup.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a valid `~/.harness/skills/demo.py` that calls `register(...)` at module load, the skill appears in `SkillRegistry.list_all()` after `harness run` starts.
+  - Given a `~/.harness/skills/broken.py` that raises `RuntimeError` at import time, the harness logs the failure and continues without crashing.
+  - Given `~/.harness/skills/` does not exist, the loader silently no-ops.
+
+### FR-056: Repository Semantic Retrieval (`harness index`)
+- **Description:** The harness MUST ship a per-workspace semantic-retrieval index buildable via `harness index build`. Two backends MUST be supported: zero-dep `tfidf` (default, deterministic, pure Python with identifier-aware tokenisation) and opt-in `openai_embeddings` (using `OPENAI_API_KEY`, falling back to TF-IDF when the key is missing). Index storage MUST be SQLite at `~/.harness/repo_index/repo_index.db`. When `repo_index.enabled=true`, `planning_node` MUST query top-K chunks for the user prompt and inject them as a system context block capped at `repo_index.inject_max_bytes`. `harness index {build, status, clear}` MUST be exposed as a CLI subcommand family.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `harness index build -r /repo`, the SQLite store at `~/.harness/repo_index/repo_index.db` contains one row per chunk with `(workspace_id, file_path, chunk_index, vector_json)`.
+  - Given `repo_index.enabled=true`, the planner's system message includes a `### Repository context (semantic retrieval)` block when the index has been built.
+  - Given `OPENAI_API_KEY` is unset with `repo_index.backend=openai_embeddings`, the backend falls back to TF-IDF with a one-time warning.
+
+### FR-057: Per-Repository Session Memory
+- **Description:** The harness MUST persist a markdown session log per repository at `~/.harness/memory/<repo_id>.md`, where `repo_id` is the SHA-256 (first 16 hex chars) of `git remote get-url origin` if available, else the absolute workspace path. `planning_node` MUST read the file at start and prepend it as an extra system message; `cmd_run` and `cmd_resume` MUST append a session note (prompt summary, modified files, exit code) at end-of-run. File size MUST be FIFO-trimmed to `memory.max_bytes`. Default: `enabled=true`.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a cloned repo with `git remote get-url origin` returning a stable URL, the same memory file is read across hosts.
+  - Given `memory.enabled=false`, no read or write happens and the planner context excludes the memory block.
+  - Given a memory file exceeds `memory.max_bytes`, the FIFO trim drops the oldest `## Session` sections; the most recent entry is always preserved.
+
+### FR-058: Interactive Refinement REPL (`harness chat`)
+- **Description:** The harness MUST ship a `harness chat` subcommand that opens an interactive REPL reusing the Gateway, redactor, web/MCP tool loop, repo-memory injection, and (when enabled) repo-index injection. The REPL MUST NEVER auto-apply patches — the LLM may emit SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save <path>`, `/budget`, `/memory`. The conversation MUST be in-memory only in v1 (no cross-session persistence).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a `harness chat -r /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
+  - Given the assistant emits patch blocks, `/apply` invokes `process_llm_patch_output` against the workspace with a per-session HITL confirmation.
+  - Given `/build`, the configured `build_command` runs in the sandbox and the first 80 lines of output surface in the REPL.
+
+### FR-059: Coverage Reporting
+- **Description:** The harness MUST ship a `make coverage` target driven by `pytest-cov`. The target MUST emit a terminal summary, an HTML report under `htmlcov/`, and an XML report at `coverage.xml`. No CI gate on the coverage number is required in v1 — the metric is for visibility.
+- **Priority:** Could Have
+- **Acceptance Criteria:**
+  - Given `make coverage` succeeds, `htmlcov/index.html` exists and contains the per-file coverage view.
+  - Given `pytest-cov` is installed via the `dev` extras, the target completes without operator manual install.
+
+### FR-060: Multi-Agent Fan-Out Primitive
+- **Description:** The harness MUST expose a parallel-agent runner (`harness.fanout.run_parallel_agents`) with bounded asyncio semaphore concurrency (default 8) and shared-budget reservation/refund accounting. An adversarial-skeptic helper `run_with_verification` MUST run a finder + N independent verifiers and decide by majority vote. The runner MUST be exposed to the planner as a `SubAgentFanoutSkill` registered in the `SkillRegistry` so the planner can emit `<<<FANOUT_QUERY prompts='[...]'>>>` blocks for N parallel queries.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a list of `AgentSpec`s, `run_parallel_agents` returns results in input order, with `AgentResult.success=False` for any that failed (no exception escapes the runner).
+  - Given the shared budget would be exceeded mid-fan-out, the runner rejects subsequent reservations and the corresponding `AgentResult.error` mentions "budget exhausted".
+  - Given a `voted` verification with majority-refuted votes, `Verdict.is_real=False`.
+
+### FR-061: Configuration-Driven Speculative Execution (Rebuild)
+- **Description:** `harness.speculative.speculate_node` MUST expose six independent strategy axes via `speculative.*` config: `trigger` ∈ {`always`, `first_attempt_only`, `after_n_repair_failures` [default; threshold 2], `manual`}; `diversity_mode` ∈ {`temperature`, `prompt`, `model` [default], `mixed`}; `cost_strategy` ∈ {`equal_cost`, `cheap_first_sequential` [default], `cheap_parallel_then_expensive`, `all_cheap`}; `selection_strategy` ∈ {`first_pass` [default; `first_success` alias], `fewest_changes`, `voted`, `all_pass`}; `salvage_strategy` ∈ {`none` [default], `fewest_errors`, `voted_partial`, `merge`}; `voting` `{n_judges, judge_role}`. Legacy configs without the new keys MUST auto-upgrade with a one-time deprecation warning to byte-identical legacy behaviour.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `trigger=after_n_repair_failures` and `loop_counter.repair < threshold`, `speculate_node` is a no-op (falls through to the standard flow).
+  - Given `cost_strategy=cheap_first_sequential`, variants dispatch one at a time using `cheap_model`; the last variant uses `expensive_model`.
+  - Given a legacy config of `{enabled, num_variants, temperature, selection_strategy}`, `_upgrade_legacy_config` populates `diversity_mode=temperature`, `cost_strategy=equal_cost`, `salvage_strategy=merge`, `trigger=first_attempt_only` with a WARNING log.
+
+### FR-062: Cron-Driven Scheduled-Job Daemon (`harness schedule`)
+- **Description:** The harness MUST ship a `harness schedule {run, list, validate, once, history}` subcommand family backed by `harness/schedule.py`. The daemon MUST parse a hand-rolled cron syntax subset: `every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM` (DAY ∈ mon..sun); all times UTC. Each job MUST run as a `harness run` subprocess with a per-job log at `~/.harness/schedule_logs/<job>/<iso8601>.log`. History MUST persist to SQLite at `~/.harness/schedule.db`. `on_success` / `on_failure` MUST be generic shell hooks invoked via `/bin/sh -c` with `HARNESS_JOB_NAME` / `HARNESS_JOB_EXIT_CODE` / `HARNESS_JOB_DURATION_SEC` / `HARNESS_JOB_LOG_PATH` exported. In-flight tracking MUST prevent double-firing.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `schedule.enabled=true` and one due job, one `harness schedule run` tick spawns a subprocess and records the result in `schedule.db`.
+  - Given an in-flight job from a prior tick, the next tick does NOT fire a second instance.
+  - Given a malformed schedule string, `harness schedule validate` exits non-zero listing the offending job + the supported forms.
+
+### FR-063: Read-Only Web Dashboard (`harness dashboard`)
+- **Description:** The harness MUST ship a `harness dashboard` subcommand that runs a localhost-only HTTP server (default bind `127.0.0.1`, port 8729) over the harness's on-disk state. Views MUST include: sessions list, per-session detail, cost burn-down (Chart.js via CDN), scheduled-job history, repo-index status, per-repo memory list. The server MUST support optional bearer-token auth via `dashboard.token_env`; when set but the env var is empty the server MUST refuse to start (fail-closed). Zero new Python dependencies (stdlib `http.server.ThreadingHTTPServer`).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `harness dashboard --host 127.0.0.1 --port 8729`, an unauthenticated request without `Authorization` returns 401 when `token_env` is configured.
+  - Given the workspace has session logs and a built repo index, all five views render without error.
+  - Given `dashboard.token_env` names an empty env var, `start_server` raises `RuntimeError` and the subcommand exits 2.
+
+### FR-064: Interactive Web App (Dashboard Tier B + C)
+- **Description:** When `harness dashboard --writes-enabled` is set, the dashboard MUST add form-based editing of config sections (form schema derived from the live `_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA` tables), memory-file editing, schedule-job CRUD, and a "New run" form with both "Run now" (spawns `harness run` subprocess) and "Schedule it" (enqueues `web.db:web_oneshot_jobs` row picked up by the schedule daemon). Live event streams MUST flow via Server-Sent Events at `/api/sessions/<id>/events`. HITL prompts MUST surface in the UI via the existing `harness/hitl.py:HttpChannel`: the dashboard registers as the webhook URL, blocks the harness's POST while the UI displays the prompt, and signals back when the operator answers. Chat notes MUST queue per session and ride into the next HITL gate's `extra_notes`. Write paths MUST require a CSRF double-submit cookie + `X-CSRF-Token` header. Config writes MUST be atomic (tempfile + `os.replace`) and re-validated through `validate_config_strict` before landing.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `--writes-enabled` and a valid CSRF token, `POST /config/<section>` with a valid form body updates `config.json` atomically and re-renders the section with "Saved." flash.
+  - Given a write request without `X-CSRF-Token`, the server returns 403.
+  - Given `POST /run/now` with a workspace + prompt, the dashboard spawns the subprocess, sets `HARNESS_HITL_WEBHOOK_URL=http://<host>:<port>/hitl/webhook?session=<id>`, and registers the PID in the process registry.
+  - Given the harness POSTs a HITL prompt to `/hitl/webhook`, the request blocks until the UI POSTs `/sessions/<id>/hitl/answer` with the operator's decision.
+
 ---
 
 ## 3. System Scope
 
 ### In-Scope
-- CLI interface with 6 subcommands (run, resume, status, doctor, purge, metrics) plus `--version`
+- CLI interface with 12 subcommand families (`run`, `resume`, `chat`, `status`, `doctor`, `purge`, `metrics`, `gh {issue, pr-create, pr-comment}`, `index {build, status, clear}`, `schedule {run, list, validate, once, history}`, `dashboard`, `cache clear`) plus `--version`
 - LangGraph-based agent graph with 20+ nodes
 - Multi-provider LLM gateway (DeepSeek, Anthropic, OpenAI, Ollama)
 - Hierarchical JSON configuration with deep merge + recursive typo detection
@@ -561,6 +673,30 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Bare `harness run` with no flags:** Drops the operator into the setup wizard; supplying any of `-r`, `-p`, or `--manifest` bypasses the wizard.
 - **`--dev-deployment` not set + clean security scan:** Graph ends at the security-scan boundary; no Dockerfile / compose / `docker compose up` is produced. A `[cli] Code generated at <path>. Deployment phase skipped.` line is logged.
 - **`--git disable` + HITL abandon:** No git rollback is attempted; the workspace is left as the LLM left it (matches the operator's stated intent of running outside git).
+- **MCP server command rejected by allowlist:** Pool start logs the rejection and skips the server; the rest of the pool continues. The `harness doctor` check for that server reports `fail` with the rejection reason.
+- **MCP server start times out:** Server is skipped from the pool; its tools are absent from `SkillRegistry`. The LLM emitting `<<<MCP_CALL server=<name> ...>>>` sees a "server not registered" tool result.
+- **Filesystem MCP server attempted with `allow_local_filesystem_servers=false`:** Pool start raises `ValueError`; the dashboard/doctor surface the gating reason.
+- **Prompt cache prefix drift detected:** Warning logged + `cache_prefix_drift` event emitted; dispatch continues normally with the cache miss.
+- **Anthropic API rejects the cache_control payload shape:** Operator can flip `llm_dispatch.prompt_cache_enabled=false` to revert to the legacy string-form system payload as a single-flag rollback.
+- **Web tool URL fails SSRF guard:** Tool returns `{"error": "url rejected: ..."}` instead of fetching; the LLM sees the error message in its tool-result message.
+- **Web tool content-type not in allowlist:** Tool returns `{"error": "content-type ... not in allowlist"}` without the body.
+- **`gh` CLI not on PATH for `harness gh` subcommands:** Subcommand exits 1 with the install hint pointing at `https://cli.github.com/`.
+- **User skill file raises at import time:** Loader logs the file path + exception and continues with the next file; the registry shows the skills from successful imports only.
+- **Repo index built with one backend, queried with another:** Query loads the backend named in `repo_meta.backend` regardless of the live config; mismatched configs silently use the persisted backend.
+- **Repo index never built but `repo_index.enabled=true`:** Planner injection no-ops cleanly; no warning beyond a debug log.
+- **Per-repo memory file unreadable (permissions):** Read returns empty string; write silently fails with a warning log. Session continues without the memory block.
+- **`harness chat` budget exhausted mid-session:** REPL prints "budget exhausted (use /budget to confirm)" and refuses further dispatches. Operator types `/exit` to leave.
+- **`harness chat` `/apply` against an assistant message with no patch blocks:** Reports "no patch blocks detected in the last reply"; no files touched.
+- **Speculative trigger not met:** `speculate_node` logs the reason (`patching_count=X > 1` or `repair_count=X < threshold`) and falls through to the standard flow.
+- **Speculative cost_strategy=cheap_first_sequential with one cheap variant succeeding:** Subsequent variants are NOT dispatched (true cost savings); the registry reports `variant_results` for only the dispatched ones.
+- **Speculative legacy config (no new strategy keys):** `_upgrade_legacy_config` injects the legacy-compatible defaults with a one-time `WARNING: legacy config detected` log line.
+- **Fan-out shared budget exhausted mid-batch:** Subsequent agents return `AgentResult.success=False` with `error="shared budget exhausted ..."`; in-flight agents complete normally.
+- **Schedule daemon: due job in-flight from previous tick:** Job is skipped this tick (no double-fire); next tick after exit re-evaluates.
+- **Schedule daemon: one-shot web job consumed:** Row's `consumed_at` is set; the row remains in `web_oneshot_jobs` for audit but is never picked up again.
+- **Dashboard write request without `X-CSRF-Token`:** Server returns 403 with `csrf token mismatch`. The form action retries after a fresh GET re-issues the cookie.
+- **Dashboard `token_env` names an empty env var:** `resolve_expected_token` raises `RuntimeError`; subcommand exits 2.
+- **Dashboard HITL webhook held longer than 600s:** Server returns 504 to the harness; the harness's HttpChannel raises and the gate falls through to the local StdinChannel fallback (or the next configured channel).
+- **Dashboard config save fails strict validation:** Disk file untouched; form re-renders with per-field error messages from `validate_config_strict`.
 
 ### Boundary Conditions
 - **Max repair iterations:** 3 (hardcoded in `route_after_compiler`)
@@ -588,6 +724,21 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Default `--dev-deployment`:** off (deployment phase opt-in)
 - **Reverse-engineer architecture budget cap:** $0.50 USD (`change_requests.reverse_engineer_budget_usd`)
 - **Change-request file scan:** `change_requests/` top-level `.txt` files only; `applied/` archive subdirectory is skipped
+- **MCP tool-call timeout:** 30s (default; `mcp.tool_call_timeout_seconds`)
+- **MCP result payload cap:** 200 KB (default; `mcp.result_max_bytes`)
+- **Web tools per-fetch byte cap:** 200 KB (default; `web_tools.max_bytes`)
+- **Web tools per-dispatch tool-loop cap:** 3 rounds (default; `web_tools.tool_call_cap_per_dispatch`)
+- **Repo memory file cap:** 100 KB total (default; `memory.max_bytes`); 8 KB injected to planner (default; `memory.inject_max_bytes`)
+- **Repo index chunk window:** 200 lines with 20-line overlap (default; `repo_index.chunk_lines`, `repo_index.chunk_overlap`)
+- **Repo index top-K:** 5 chunks (default; `repo_index.top_k`); 4 KB injection cap (default; `repo_index.inject_max_bytes`)
+- **Fan-out concurrency cap:** 8 agents (default; `max_concurrency` arg to `run_parallel_agents`)
+- **Schedule daemon tick interval:** 60s (default; `schedule.tick_seconds`)
+- **Schedule daemon command allowlist:** Built-in `harness` binary path; operators can override via `schedule.harness_binary`
+- **Dashboard default bind:** `127.0.0.1:8729` (default; `dashboard.host`, `dashboard.port`)
+- **Dashboard sessions enumeration cap:** 200 sessions (default; `dashboard.sessions_max`)
+- **Dashboard HITL webhook hold timeout:** 600 s (operator UI must answer within 10 minutes or the harness's HttpChannel sees a 504)
+- **Speculative trigger threshold:** 2 repair failures (default; `speculative.n_repair_failures_threshold`)
+- **Speculative voting judges:** 3 (default; `speculative.voting.n_judges`); judge role: `code_reviewer` (default)
 
 ### Recovery Scenarios
 - **Process killed mid-graph:** Next `harness run` loads from latest checkpoint; LangGraph replays from the boundary.

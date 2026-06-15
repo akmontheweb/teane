@@ -277,18 +277,109 @@ harness/
 │   ├── project_exhaustion()      # Minutes until hard_cap_usd at current burn rate
 │   ├── format_human / format_table / format_prometheus
 │   └── write_atomic()    # <dest>.tmp → fsync → os.replace, atomic from a scraper's POV
-└── parser_registry.py    # Diagnostic parser plugins (FR-026)
-    ├── RustParser        # --error-format=json
-    ├── GccClangParser    # -fdiagnostics-format=json
-    ├── GoParser          # file:line:col: message
-    ├── PythonParser      # Traceback extraction
-    ├── JavaParser        # javac / maven / gradle diagnostic shapes
-    ├── TypeScriptParser  # tsc / eslint
-    ├── DartParser        # dart analyze / flutter build
-    ├── GenericParser     # file:line:col: severity: message
-    ├── register_parser / register_extension_parser
-    ├── get_parser / get_parser_for_extension / list_registered_parsers
-    └── detect_and_parse() # Auto-detect + parse
+├── parser_registry.py    # Diagnostic parser plugins (FR-026)
+│   ├── RustParser        # --error-format=json
+│   ├── GccClangParser    # -fdiagnostics-format=json
+│   ├── GoParser          # file:line:col: message
+│   ├── PythonParser      # Traceback extraction
+│   ├── JavaParser        # javac / maven / gradle diagnostic shapes
+│   ├── TypeScriptParser  # tsc / eslint
+│   ├── DartParser        # dart analyze / flutter build
+│   ├── GenericParser     # file:line:col: severity: message
+│   ├── register_parser / register_extension_parser
+│   ├── get_parser / get_parser_for_extension / list_registered_parsers
+│   └── detect_and_parse() # Auto-detect + parse
+├── mcp_client.py         # Model Context Protocol client (FR-051)
+│   ├── McpServerConfig / McpPoolConfig
+│   ├── StdioMcpClient    # JSON-RPC 2.0 over newline-delimited stdio
+│   ├── McpClientPool     # Concurrent server startup; per-server lifecycle
+│   ├── McpToolSkill      # ToolSkill subclass; mcp__<server>__<tool> names
+│   ├── parse_mcp_blocks / strip_mcp_blocks  # <<<MCP_CALL>>> text-DSL
+│   └── register_mcp_skills(pool)
+├── web_tools.py          # WebFetchSkill / WebSearchSkill (FR-053)
+│   ├── WebToolsConfig    # max_bytes / max_results / allow_private_ips / backends
+│   ├── html_to_text      # Tag stripper + entity decode
+│   ├── DuckDuckGoLiteBackend  # No-key search backend
+│   ├── WebFetchSkill / WebSearchSkill   # ToolSkill subclasses
+│   ├── parse_tool_blocks / strip_tool_blocks  # <<<WEB_FETCH>>>/<<<WEB_SEARCH>>>
+│   └── register_web_tool_skills(cfg)
+├── github_integration.py # `harness gh` family (FR-054)
+│   ├── gh_path / gh_available / gh_auth_status
+│   ├── fetch_issue       # gh issue view --json
+│   ├── ingest_issue_to_change_request  # Bridge → change_requests/CR-N-<slug>.txt
+│   ├── create_pr         # gh pr create
+│   └── post_pr_comment   # gh pr comment
+├── repo_index.py         # Semantic retrieval index (FR-056)
+│   ├── RepoIndexConfig   # backend / chunk_lines / top_k / inject_max_bytes
+│   ├── Chunker           # File walker + line windowing
+│   ├── _tokenize         # Identifier-aware (CamelCase + snake_case split)
+│   ├── TfidfBackend      # Pure-Python TF-IDF (default)
+│   ├── OpenAIEmbeddingsBackend  # Opt-in dense backend
+│   ├── build_index / get_stats / clear_index / query_top_chunks
+│   └── async_query_top_chunks  # asyncio.to_thread wrapper for planner
+├── repo_memory.py        # Per-repo session log (FR-057)
+│   ├── RepoMemoryConfig  # enabled / dir / max_bytes / inject_max_bytes
+│   ├── repo_identity     # SHA-256 of git origin URL or workspace path
+│   ├── read_repo_memory  # Returns trimmed file content for planner
+│   └── append_session_note  # FIFO-trimmed atomic append
+├── chat.py               # harness chat REPL (FR-058)
+│   ├── ChatSession       # Dataclass with reader/writer injection points
+│   ├── run_chat          # Top-level loop; handles slash commands
+│   ├── _handle_user_turn # Per-turn LLM dispatch + tool loop
+│   ├── _run_build        # /build executes configured build in sandbox
+│   ├── _apply_patches_from_last  # /apply with HITL confirmation
+│   └── _inject_repo_memory / _maybe_inject_repo_index
+├── fanout.py             # Multi-agent fan-out (FR-060)
+│   ├── AgentSpec / AgentResult / Verdict
+│   ├── run_parallel_agents  # Bounded semaphore + budget reservation/refund
+│   ├── run_with_verification  # Adversarial skeptic pattern
+│   ├── _parse_first_json     # JSON-from-noise extractor for judge verdicts
+│   ├── make_fanout_skill     # SubAgentFanoutSkill — exposes fan-out to planner
+│   └── register_fanout_skill # Registered in SkillRegistry at startup
+├── schedule.py           # Cron-driven daemon (FR-062)
+│   ├── Schedule / Job / ScheduleConfig
+│   ├── parse_schedule    # Hand-rolled cron subset (every Nm/h/d / daily / weekly)
+│   ├── next_run          # Compute next firing time (UTC; tz-aware required)
+│   ├── execute_job_once  # Subprocess + history + hooks
+│   ├── ScheduleDaemon    # Main loop with in-flight tracking
+│   │   ├── tick_once     # Fires due config jobs + due web one-shots
+│   │   ├── _due_oneshots / _fire_oneshot  # Web one-shot integration
+│   │   └── run_forever
+│   ├── record_run_started / record_run_finished / history_for_job
+│   └── _run_hook         # /bin/sh -c with HARNESS_JOB_* env vars
+├── dashboard.py          # Read-only viewer + interactive web app (FR-063 / FR-064)
+│   ├── DashboardConfig   # Host/port/token/csrf/writes_enabled/web_db_path
+│   ├── list_sessions / cost_burn_series / list_memory_files
+│   ├── repo_index_status / list_schedule_runs / read_memory_file
+│   ├── resolve_expected_token / resolve_csrf_token / check_auth / check_csrf
+│   ├── read_config_file / write_config_section_atomic   # Tier B
+│   ├── write_memory_file / add_schedule_job_to_config
+│   ├── spawn_harness_run / cancel_session               # Tier C
+│   ├── tail_session_events  # Generator backing SSE stream
+│   ├── dispatch(cfg, path)  # Pure routing function — tested without server
+│   ├── make_request_handler # Factory closes over cfg + tokens
+│   │   ├── do_GET / do_HEAD / _stream_sse
+│   │   ├── do_POST          # Routes /config/* /memory/* /run/* /sessions/* /hitl/*
+│   │   ├── _handle_config_save / _handle_memory_save / _handle_run_now
+│   │   ├── _handle_run_schedule / _handle_cancel / _handle_note
+│   │   ├── _handle_hitl_answer / _handle_hitl_webhook  # Blocking webhook
+│   │   └── _handle_schedule_add
+│   └── start_server      # Returns ServerHandle (carries csrf_token for tests)
+├── web_state.py          # Web app runtime state (FR-064)
+│   ├── WebProcess / ProcessRegistry    # Spawned-subprocess tracking
+│   ├── HitlQueue / PendingHitl         # Webhook ↔ UI bridge
+│   ├── open_web_db / web.db schema     # audit_log / run_presets / web_oneshot_jobs / chat_notes
+│   ├── queue_chat_note / consume_chat_notes / pending_chat_notes
+│   ├── add_oneshot_job / list_pending_oneshot_jobs / mark_oneshot_consumed
+│   ├── save_run_preset / list_run_presets / delete_run_preset
+│   └── append_audit / list_audit
+└── web_forms.py          # Form schema derivation (FR-064)
+    ├── FormField / FormSection / FormParseError
+    ├── kind_for_type_tuple    # bool→checkbox, int/float→number, list/dict→JSON textarea
+    ├── build_section          # Pulls from _KNOWN_NESTED_KEYS + _TYPE_SCHEMA
+    ├── all_sections           # All top-level config sections
+    ├── parse_value / parse_section_post  # Form POST → typed Python values
+    └── renderable_dotted_keys # Coverage gate for the drift detector test
 ```
 
 ### 3.2 Data Flow
@@ -763,6 +854,118 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: The builder image is ~3-4 GB on first pull. Once pulled, every subsequent build reuses the layer cache and per-build sandbox startup time drops by ~1.5s vs the dispatch path. Operators who want a smaller surface can still pin a slim image via `sandbox.docker_image` and accept the missing toolchains.
 
+### 5.36 MCP Client over Hand-Rolled JSON-RPC (FR-051)
+
+**Decision**: `harness/mcp_client.py` implements MCP client transport (stdio only in v1) via hand-rolled JSON-RPC 2.0 over newline-delimited JSON frames. No dependency on the upstream `mcp` Python SDK. Server commands flow through `harness/trust.py:validate_mcp_server_command` before any subprocess spawn. `McpClientPool` owns one `StdioMcpClient` per declared server; each tool advertised by `tools/list` registers as an `McpToolSkill` in the global `SkillRegistry` under the `mcp__<server>__<tool>` naming convention.
+
+**Rationale**: MCP is the de-facto interop standard (Claude Code, Cursor, Continue.dev, Goose, Cline, OpenAI agents all speak it). Adding it unlocks the entire MCP server ecosystem (databases, browsers, GitHub, search) without writing one-off tool integrations. The hand-rolled JSON-RPC keeps the core install dependency-clean — the upstream SDK pulls in ~10 transitives. The protocol surface we need (initialize / tools/list / tools/call) is ~150 LoC.
+
+**Trade-off**: We track the spec ourselves; spec evolution (e.g. WebSocket transport, prompts/resources/sampling capabilities) will land as additive code rather than via a library bump. v1 explicitly defers HTTP/SSE transport and the non-tools capabilities — most servers in the wild are stdio + tools.
+
+### 5.37 Provider Prompt Caching + Prefix-Stability Hasher (FR-052)
+
+**Decision**: `harness/gateway.py:AnthropicProvider.chat_completion` rewrites `payload["system"]` to list-of-blocks form with `cache_control: {"type": "ephemeral"}` when the model carries `supports_cache=True` and the gateway flag `prompt_cache_enabled=True`. The first user message gains a second cache breakpoint when ≥ 4 KB. Independently of provider, `Gateway.dispatch` runs a prefix-stability hasher (`hash_stable_prefix`) over the first two messages keyed by `(session, role)` and emits a `cache_prefix_drift` observability event when consecutive calls disagree. OpenAI / DeepSeek auto-cache cost accounting was already wired in `extract_usage` + `compute_cost`; the hasher surfaces silent cache misses against those providers too.
+
+**Rationale**: Caching is the dominant cost optimisation available — Anthropic prefix caching alone cuts long-session cost 60-90% on repeat dispatches. The hasher exists because OpenAI / DeepSeek auto-caches fire only on byte-identical prefixes; one whitespace drift in the planning blueprint silently kills the hit. The drift event makes the leak observable.
+
+**Trade-off**: Anthropic's list-of-blocks payload shape is a request-side change; `prompt_cache_enabled=false` is the single-flag rollback if a future API change rejects the shape. The drift hasher's `(session, role)` key is heuristic — it correctly catches the common cases (impact analysis context, READ_FILE results, planning blueprint) but misses cross-role caching opportunities.
+
+### 5.38 Web Research Tools via Text-DSL (FR-053)
+
+**Decision**: `harness/web_tools.py` ships `WebFetchSkill` + `WebSearchSkill` as `ToolSkill` instances. The planner emits `<<<WEB_FETCH url="...">>>` / `<<<WEB_SEARCH query="...">>>` blocks; `harness/graph.py:_run_tool_loop` intercepts them, dispatches via `SkillRegistry`, appends the result back as a `user` message, and re-dispatches up to `tool_call_cap_per_dispatch` rounds. Default search backend `duckduckgo_lite` requires no API key. Outbound URLs gate through `harness/trust.py:validate_outbound_url` (SSRF guard). Content-type allowlist + `max_bytes` cap on every fetch.
+
+**Rationale**: Peer agents routinely fetch docs and search the web; the harness had no primitive. Text-DSL keeps consistency with the existing patcher DSL (`<<<READ_FILE>>>`, `<<<CREATE_FILE>>>`) and avoids waiting on the unfinished native-function-calling wiring. The SSRF guard is hard-required — the LLM could otherwise trick the harness into hitting AWS metadata endpoints.
+
+**Trade-off**: Text-DSL means the LLM can emit malformed blocks; the parser is regex-bounded so malformed blocks fall through as literal text. When native function-calling lands the same `ToolSkill.to_tool_schema` JSON is reusable; the migration is additive.
+
+### 5.39 GitHub Integration via `gh` CLI (FR-054)
+
+**Decision**: `harness/github_integration.py` shells out to the `gh` CLI for issue read, PR create, PR comment. No new Python dep. The `harness gh issue --repo X --number Y` subcommand writes the issue body into the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow (PR-1 → PR-3) handles the planning + patching. Authentication flows through `gh auth status` — we don't store tokens.
+
+**Rationale**: The `gh` CLI is the canonical GitHub interface; it handles auth, rate limits, and API surface evolution. Using it directly means we don't ship our own GitHub client and avoid the maintenance tax of an OAuth flow + token storage. Wiring into the existing CR flow means the harness's change-request machinery (delta-aware planning, CR-N markers in patches, archive on success) just works for issue-driven sessions.
+
+**Trade-off**: Operators must have `gh` on PATH; corporate environments without it need to install it separately. The harness can't ship a vendored binary because `gh`'s platform variants are non-trivial.
+
+### 5.40 Runtime-Extensible Skills Directory (FR-055)
+
+**Decision**: `register_builtin_skills(config)` walks `~/.harness/skills/` (or the path named by `skills.user_skills_dir`) and imports every non-`_`-prefixed `*.py` file via `importlib.util.spec_from_file_location`. Each file's module-level body runs at import time; calls to `harness.skills.register(MySkill(...))` populate the global registry. Per-file try/except wraps each import so one bad file logs and is skipped.
+
+**Rationale**: Pre-shipped style guides (`harness/skills/*.md`) are not user-extensible. Letting operators drop `*.py` files into a directory matches the Claude Code skills loader pattern and keeps the harness's plugin model boringly simple — no manifest files, no entry point declarations, just import + register.
+
+**Trade-off**: Running arbitrary Python at startup is a foot-gun if `~/.harness/skills/` is world-writable; the doctor doesn't probe this. Operators are expected to treat the directory like their `~/.bashrc` — trusted source.
+
+### 5.41 Repository Semantic Retrieval (FR-056)
+
+**Decision**: `harness/repo_index.py` ships two backends behind an `IndexBackend` ABC: `TfidfBackend` (default, zero-dep, deterministic, identifier-aware tokenisation that splits CamelCase / snake_case into sub-tokens) and `OpenAIEmbeddingsBackend` (opt-in via `OPENAI_API_KEY`; falls back to TF-IDF on missing key). Index storage: SQLite at `~/.harness/repo_index/repo_index.db` with `(workspace_id, file_path, chunk_index, file_sha, content, vector_json)`. `planning_node` calls `async_query_top_chunks` once per dispatch and injects the top-K chunks as a system message capped at `inject_max_bytes`. CLI: `harness index {build, status, clear}`.
+
+**Rationale**: `harness/impact.py` is AST-only ("which symbols reference this function"); semantic retrieval complements it with "which other code chunks are semantically similar to the prompt". TF-IDF is the right default — deterministic, no API cost, no model download, identifier-aware tokenisation works surprisingly well on code. OpenAI embeddings is the upgrade path; both backends share the same storage schema so swapping is config-only.
+
+**Trade-off**: TF-IDF's relevance ceiling is lower than dense embeddings; the gap shows on prompts that paraphrase concepts ("auth flow" vs `def authenticate(...)`). Operators who care upgrade by flipping `repo_index.backend=openai_embeddings`.
+
+### 5.42 Per-Repository Session Memory (FR-057)
+
+**Decision**: `harness/repo_memory.py` writes a flat markdown log per repository at `~/.harness/memory/<repo_id>.md`, where `repo_id` is the first 16 hex chars of `sha256(git remote get-url origin)` (or the workspace path when no remote). Each session ends with an append (prompt summary, modified files, exit code) atomically via `tempfile + os.replace`. Read happens at `planning_node` start; recent entries inject as an extra system message. FIFO trim by `## Session` boundary keeps the file under `memory.max_bytes`.
+
+**Rationale**: LangGraph checkpoints resume one thread only — there's no per-repo "what we learned last time". A small markdown log gives the planner continuity across sessions for free. The `git remote get-url origin` identity makes the log portable across clones of the same repo so cross-machine continuity works without operator config.
+
+**Trade-off**: The memory file is markdown, not structured data — the planner reads it as opaque context. We could persist structured fields (sectors discussed, files touched, design decisions) but the cost of schematising outweighs the value when the planner can pattern-match on prose.
+
+### 5.43 Interactive Refinement REPL (`harness chat`) (FR-058)
+
+**Decision**: `harness/chat.py` opens an interactive stdin loop that reuses the Gateway, redactor, web/MCP `_run_tool_loop`, repo-memory injection, and (when enabled) repo-index injection. Patches are NEVER applied automatically; the LLM emits SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save`, `/budget`, `/memory`. The REPL accepts dependency-injectable reader/writer hooks so unit tests drive it with scripted input.
+
+**Rationale**: `harness run` is autonomous; `harness chat` is the inverse — conversational back-and-forth where the operator stays in control. Reusing the gateway / redactor / tools means budgeting, secret stripping, and web/MCP all keep working. The dependency-injection on reader/writer is the test-affordance pattern from `harness/hitl.py:HitlChannel`.
+
+**Trade-off**: In-memory only in v1 — closing the REPL loses the conversation. `--resume` is a clean follow-up; persistence would land in the existing checkpoint store.
+
+### 5.44 Multi-Agent Fan-Out Primitive (FR-060)
+
+**Decision**: `harness/fanout.py` provides `AgentSpec` / `AgentResult` / `Verdict` dataclasses, `run_parallel_agents` with bounded asyncio semaphore concurrency + shared-budget reservation/refund, and `run_with_verification` for the adversarial-skeptic pattern (one finder + N skeptics; majority vote). The runner is exposed to the planner as a `SubAgentFanoutSkill` registered in `SkillRegistry`; the planner can emit `<<<FANOUT_QUERY prompts='[...]'>>>` for N parallel queries.
+
+**Rationale**: Speculative execution (`harness/speculative.py`) and `SubAgentSkill` already had fan-out for narrow purposes; lifting it into a reusable primitive lets future graph integrations (parallel discovery per sector, parallel test generation per module, parallel security-fix attempts per finding) build on the same machinery. The reservation/refund accounting prevents N concurrent dispatches from overspending the cap.
+
+**Trade-off**: Budget accounting is per-call, not per-stage — a fan-out can spend the whole remaining budget if every agent's `budget_hint` is high enough. Operators control this via the per-call `max_concurrency` and `budget_hint` knobs.
+
+### 5.45 Configuration-Driven Speculative Execution (FR-061 — rebuild)
+
+**Decision**: `harness/speculative.py:speculate_node` exposes six independent strategy axes via config: `trigger` (when to engage), `diversity_mode` (how variants differ), `cost_strategy` (cost shape), `selection_strategy` (who wins), `salvage_strategy` (what to do when all fail), `voting` (judges for `selection_strategy=voted`). The default config (`trigger=after_n_repair_failures`, `diversity_mode=model`, `cost_strategy=cheap_first_sequential`, `selection_strategy=first_pass`, `salvage_strategy=none`) targets positive ROI by holding speculative back until sequential repair has stalled and by using cheaper models. `_upgrade_legacy_config` maps old-shape configs to byte-identical legacy behaviour with a one-time WARNING.
+
+**Rationale**: The original speculative shipped disabled because the fixed pipeline (3 same-model variants at temp 0.3 → first-pass → merge-on-fail) had negative ROI: variants converged on the same wrong solution, merge salvage produced incoherent workspaces, repair couldn't recover. The rebuild factors out the orchestration decisions so operators can pick a strategy that fits their workload.
+
+**Trade-off**: Six axes is a lot of config surface. The shipped defaults are chosen carefully; documentation and the `harness/web_forms.py` schema derivation keep the surface manageable.
+
+### 5.46 Cron-Driven Scheduled Job Daemon (FR-062)
+
+**Decision**: `harness/schedule.py` ships a foreground daemon (`harness schedule run`) that ticks every `tick_seconds` (default 60s), polls config-declared jobs in `schedule.jobs` AND web one-shot jobs in `~/.harness/web.db:web_oneshot_jobs`, and fires due jobs as `harness run` subprocesses with their own per-job log file. History persists to `~/.harness/schedule.db`. The cron syntax subset (`every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM`) is hand-rolled, no `croniter` dep. Notifications are generic shell hooks (`on_success` / `on_failure`) with `HARNESS_JOB_*` env vars exported.
+
+**Rationale**: Recurring runs ("regenerate failing tests every night", "open the security review every Monday") are high-value workloads. A foreground daemon under systemd / docker is simpler than reinventing process management. The hand-rolled cron subset covers >90% of real use cases; full POSIX cron is a clean follow-up. Generic shell hooks let operators wire Slack/Discord/PagerDuty/email in one curl line without us shipping per-vendor notifier code.
+
+**Trade-off**: Hand-rolled cron means we don't support `30 2 * * mon` — operators who need the full mini-language must either restructure or wait for the croniter follow-up. In-flight tracking is per-daemon-process; two daemons reading the same `schedule.db` would double-fire. Operators run one daemon per scheduler.
+
+### 5.47 Web Dashboard — Read-Only Tier (FR-063)
+
+**Decision**: `harness/dashboard.py` runs a stdlib `http.server.ThreadingHTTPServer` (default bind `127.0.0.1:8729`). Routes render the harness's on-disk state: sessions list + per-session detail (from `~/.harness/logs/*.jsonl`), cost burn-down chart (Chart.js via CDN), scheduled-job history (from `~/.harness/schedule.db`), repo-index status (from `~/.harness/repo_index/repo_index.db`), per-repo memory files. Routing is a pure `dispatch(cfg, path)` function so tests exercise it without standing up a server. Optional bearer-token auth via `dashboard.token_env`; the server refuses to start when the named env var is empty (fail-closed).
+
+**Rationale**: Operators wanted to see session history, cost, and scheduled-job state without tailing JSONL files. The dashboard is one artefact (no editor extension to install). Server-rendered HTML + Chart.js CDN keeps the build story trivial (no npm). Localhost-only default + opt-in token auth covers both single-user laptop and remote-access scenarios safely.
+
+**Trade-off**: Stdlib `http.server` is sync + threaded; high-traffic scenarios would prefer aiohttp/starlette. For single-operator dashboard load it's plenty.
+
+### 5.48 Interactive Web App — Tier B + C (FR-064)
+
+**Decision**: `harness dashboard --writes-enabled` extends the read-only dashboard with: form-based config editing (forms derived from `harness/web_forms.py:build_section` which walks `harness/cli.py:_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA`), memory-file editing, schedule-job CRUD, a "New run" form supporting both "Run now" (`harness/dashboard.py:spawn_harness_run` spawns subprocess + registers PID in `harness/web_state.py:ProcessRegistry`) and "Schedule it" (appends to `~/.harness/web.db:web_oneshot_jobs` which the schedule daemon picks up), SSE event stream at `/api/sessions/<id>/events`, HITL bridge via the existing `harness/hitl.py:HttpChannel` (the dashboard registers as the webhook URL and blocks the harness's POST while the UI displays the prompt, signalling back when the operator answers), and per-session chat notes queued for the next HITL gate. Write paths require a CSRF double-submit cookie + `X-CSRF-Token` header.
+
+**Rationale**: Form-based config editing eliminates a class of operator errors (typos, wrong types) without us hand-curating a per-section UI — the forms are *derived* from the strict validator, so new config keys appear in the UI the day they land in `_TYPE_SCHEMA`. The HITL bridge reuses `HttpChannel` rather than reinventing — `HttpChannel` already exists exactly for this scenario; the dashboard is its first consumer. CSRF double-submit cookie is the simplest defence against cross-origin form submission while remaining usable from vanilla JS.
+
+**Trade-off**: One Python file owns ~2,500 LoC of mixed HTTP + HTML + Python. A future split into a `harness/dashboard/` package is straightforward. The HITL "block the webhook handler until the operator answers" pattern relies on threaded request handling (works because `ThreadingHTTPServer`); under aiohttp it would be a long-poll. Both work.
+
+### 5.49 Web App State Layer (`harness/web_state.py`)
+
+**Decision**: A separate module owns the dashboard's runtime state so `harness/dashboard.py` stays focused on HTTP routing + rendering. `web_state.py` holds: `ProcessRegistry` (`{session_id → WebProcess}` of spawned subprocesses with TTL after termination), `HitlQueue` (`{request_id → PendingHitl}` with `threading.Event` to release blocked webhook handlers), and a small SQLite schema at `~/.harness/web.db` with tables `audit_log`, `run_presets`, `web_oneshot_jobs`, `chat_notes`. The schedule daemon imports `list_pending_oneshot_jobs` / `mark_oneshot_consumed` to drain the one-shot table during its tick.
+
+**Rationale**: Splitting state from HTTP makes the unit tests trivial — `tests/test_web_state.py` exercises the contracts without standing up a server. The web.db is operator-local and never shared across hosts; the four tables are intentionally narrow.
+
+**Trade-off**: An in-memory registry means the dashboard restart drops the live process tracking; the watcher threads that mark `exit_code` survive only as long as the dashboard. Operators who need persistence run the schedule daemon for everything (cron-style) and use the dashboard purely for observability.
+
 ---
 
 ## 6. Data Model Overview
@@ -861,6 +1064,87 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
     ├── api_base_url: str
     ├── supports_thinking: bool
     └── supports_cache: bool
+```
+
+### 6.4 Web App SQLite Store (`~/.harness/web.db`)
+
+The dashboard's runtime state and operator-driven mutations persist
+to a small SQLite at `~/.harness/web.db` (configurable via
+`dashboard.web_db_path`). Four tables, deliberately narrow:
+
+```
+web_db
+├── audit_log
+│   ├── id INTEGER PK AUTOINCREMENT
+│   ├── ts TEXT          # ISO8601 UTC
+│   ├── action TEXT      # config_save | run_now | run_schedule | cancel | hitl_answer | …
+│   ├── target TEXT      # section name / session id / job id
+│   └── detail TEXT      # JSON-ish, opaque
+├── run_presets
+│   ├── name TEXT PK
+│   ├── workspace TEXT
+│   ├── prompt TEXT
+│   ├── harness_args TEXT   # JSON list
+│   └── created_at TEXT
+├── web_oneshot_jobs
+│   ├── id INTEGER PK AUTOINCREMENT
+│   ├── name TEXT
+│   ├── fire_at_utc TEXT     # ISO8601 UTC
+│   ├── workspace TEXT
+│   ├── prompt TEXT
+│   ├── harness_args TEXT    # JSON list
+│   ├── created_at TEXT
+│   └── consumed_at TEXT     # NULL until schedule daemon fires it
+└── chat_notes
+    ├── id INTEGER PK AUTOINCREMENT
+    ├── session_id TEXT
+    ├── ts TEXT
+    ├── note TEXT
+    └── consumed_at TEXT     # NULL until prepended to next HITL extra_notes
+```
+
+The schedule daemon's `tick_once` reads `web_oneshot_jobs` alongside its
+config-driven jobs; entries fire once and are marked `consumed_at`.
+The dashboard's `_handle_hitl_answer` drains pending `chat_notes` for
+the session and prepends them to the response's `extra_notes`.
+
+### 6.5 Repo Index SQLite Store (`~/.harness/repo_index/repo_index.db`)
+
+Per-workspace semantic retrieval index. Two tables:
+
+```
+repo_index.db
+├── repo_meta
+│   ├── workspace_id TEXT PK  # SHA-256 hex prefix of absolute workspace path
+│   ├── backend TEXT          # "tfidf" | "openai_embeddings"
+│   ├── idf_json TEXT         # TF-IDF IDF vector serialised for query-time use
+│   ├── built_at TEXT         # ISO8601 UTC
+│   └── chunk_count INTEGER
+└── repo_chunks
+    ├── workspace_id TEXT
+    ├── file_path TEXT        # POSIX-relative
+    ├── chunk_index INTEGER
+    ├── file_sha TEXT
+    ├── content TEXT
+    ├── vector_json TEXT      # Sparse TF-IDF dict OR dense embedding list
+    └── PRIMARY KEY (workspace_id, file_path, chunk_index)
+```
+
+### 6.6 Schedule History SQLite Store (`~/.harness/schedule.db`)
+
+Per-job execution history persisted by the schedule daemon so
+`harness schedule list` / `history` survives restarts:
+
+```
+schedule.db
+└── schedule_runs
+    ├── job_name TEXT
+    ├── started_at TEXT       # ISO8601 UTC; PK component
+    ├── ended_at TEXT
+    ├── exit_code INTEGER
+    ├── duration_sec REAL
+    ├── log_path TEXT
+    └── PRIMARY KEY (job_name, started_at)
 ```
 
 ---

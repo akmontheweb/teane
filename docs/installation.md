@@ -262,6 +262,59 @@ If `gitleaks` is missing, the harness falls back to a regex-based Python secret 
 | `rustfmt` (Rust) | `rustup component add rustfmt` |
 | `clang-format` (C / C++) | `apt install clang-format`, `brew install clang-format`, or [LLVM Windows installer](https://releases.llvm.org/) |
 
+### GitHub CLI (optional — required for `harness gh` subcommands)
+
+The `harness gh issue` / `pr-create` / `pr-comment` subcommands shell out to the [`gh` CLI](https://cli.github.com/). Install once and authenticate; the harness never stores tokens.
+
+| Platform | Install |
+|----------|---------|
+| Linux (Debian/Ubuntu) | `sudo apt install gh` (or the [official installer](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)) |
+| macOS | `brew install gh` |
+| Windows native | `winget install GitHub.cli` |
+
+Then authenticate once:
+```bash
+gh auth login
+```
+
+Skip this section if you only run the harness against your own change-request files; `harness gh` is the only place that needs `gh` on PATH.
+
+### MCP servers (optional — required only if you enable `mcp.enabled=true`)
+
+Most MCP servers ship as npm packages launchable via `npx`; install Node.js once (`brew install node`, `apt install nodejs npm`, or [nodejs.org](https://nodejs.org/)) and the rest are declarative. Example `mcp.servers` entries that work out of the box:
+
+```jsonc
+{
+  "mcp": {
+    "enabled": true,
+    "servers": [
+      {
+        "name": "time",
+        "transport": "stdio",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-time"]
+      },
+      {
+        "name": "fetch",
+        "transport": "stdio",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-fetch"]
+      }
+    ]
+  }
+}
+```
+
+Filesystem MCP servers (`@modelcontextprotocol/server-filesystem`) bypass the harness's build sandbox and require an explicit opt-in:
+```jsonc
+{
+  "mcp": {
+    "allow_local_filesystem_servers": true,
+    ...
+  }
+}
+```
+
+`harness doctor` adds one row per server when `mcp.enabled=true` showing the tool count or the rejection reason.
+
 ## 8. Configure the Harness
 
 Configuration layers, lowest to highest priority:
@@ -422,6 +475,7 @@ For unattended runs (CI, scheduled jobs, services):
 
 ### Linux (systemd)
 
+One-shot run (single session, equivalent to the operator typing `harness run`):
 ```ini
 [Service]
 Environment=HOME=/srv/harness
@@ -432,7 +486,79 @@ WorkingDirectory=/srv/harness/workspace
 ExecStart=/srv/harness/.venvs/harness/bin/harness run -r . -p "..."
 ```
 
-`HOME` must be set explicitly so `~/.harness/` path expansion works.
+Scheduled-job daemon (`harness schedule run` — runs `schedule.jobs` from
+`config.json` on a cron-style timer; restart-on-failure recommended):
+```ini
+# /etc/systemd/system/harness-schedule.service
+[Unit]
+Description=myharness scheduled-job daemon
+After=network-online.target
+
+[Service]
+Type=simple
+User=harness
+Environment=HOME=/srv/harness
+Environment=ANTHROPIC_API_KEY=sk-...
+WorkingDirectory=/srv/harness/workspace
+ExecStart=/srv/harness/.venvs/harness/bin/harness schedule run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Web dashboard (`harness dashboard` — read-only by default; pass
+`--writes-enabled` for the interactive editing UI):
+```ini
+# /etc/systemd/system/harness-dashboard.service
+[Unit]
+Description=myharness web dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=harness
+Environment=HOME=/srv/harness
+# Bearer token gate (required when binding off-localhost):
+Environment=DASH_TOKEN=replace-with-a-long-random-string
+# Optional: persistent CSRF token across restarts:
+Environment=DASH_CSRF=replace-with-another-long-random-string
+WorkingDirectory=/srv/harness/workspace
+# --writes-enabled is OPTIONAL — omit for view-only.
+ExecStart=/srv/harness/.venvs/harness/bin/harness dashboard --writes-enabled
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then in `config.json`:
+```jsonc
+{
+  "dashboard": {
+    "enabled": true,
+    "host": "127.0.0.1",         // localhost only by default
+    "port": 8729,
+    "token_env": "DASH_TOKEN",
+    "csrf_token_env": "DASH_CSRF",
+    "writes_enabled": true
+  }
+}
+```
+
+`HOME` must be set explicitly on every unit so `~/.harness/` path expansion works.
+
+Enable + start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now harness-schedule.service
+sudo systemctl enable --now harness-dashboard.service
+sudo journalctl -fu harness-schedule.service   # follow logs
+```
+
+Run separate units rather than bundling — the dashboard config changes mean only the dashboard restarts, and a stuck dashboard request never affects schedule timing.
 
 ### Windows native (Task Scheduler)
 
@@ -460,6 +586,8 @@ harness doctor
 pip uninstall ai-agent-harness
 rm -rf ~/.harness     # Linux/macOS/WSL2
 ```
+
+`~/.harness/` holds the checkpoint DB, per-session JSONL logs, metrics, repo memory files, the repo index (`repo_index/`), schedule history (`schedule.db`), web app state (`web.db`), and the user-skills directory (`skills/`). Remove only what you don't want to keep.
 
 On Windows native: `pip uninstall ai-agent-harness` then `Remove-Item -Recurse $HOME\.harness` in PowerShell.
 

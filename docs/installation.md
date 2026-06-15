@@ -508,8 +508,9 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Web dashboard (`harness dashboard` — read-only by default; pass
-`--writes-enabled` for the interactive editing UI):
+Web dashboard (`harness web` — all features on by default; set
+`dashboard.writes_enabled: false` in `config.json` for a read-only
+deployment):
 ```ini
 # /etc/systemd/system/harness-dashboard.service
 [Unit]
@@ -525,8 +526,7 @@ Environment=DASH_TOKEN=replace-with-a-long-random-string
 # Optional: persistent CSRF token across restarts:
 Environment=DASH_CSRF=replace-with-another-long-random-string
 WorkingDirectory=/srv/harness/workspace
-# --writes-enabled is OPTIONAL — omit for view-only.
-ExecStart=/srv/harness/.venvs/harness/bin/harness dashboard --writes-enabled
+ExecStart=/srv/harness/.venvs/harness/bin/harness web
 Restart=on-failure
 RestartSec=10
 
@@ -542,8 +542,8 @@ Then in `config.json`:
     "host": "127.0.0.1",         // localhost only by default
     "port": 8729,
     "token_env": "DASH_TOKEN",
-    "csrf_token_env": "DASH_CSRF",
-    "writes_enabled": true
+    "csrf_token_env": "DASH_CSRF"
+    // writes_enabled defaults to true; set to false for a read-only deployment
   }
 }
 ```

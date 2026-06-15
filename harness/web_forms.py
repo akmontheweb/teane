@@ -40,6 +40,68 @@ FORM_KIND_TEXT = "text"
 FORM_KIND_TEXTAREA = "textarea"
 FORM_KIND_JSON_LIST = "json_list"
 FORM_KIND_JSON_DICT = "json_dict"
+FORM_KIND_SELECT = "select"       # str with a finite choice set
+
+
+# Enum tables: dotted-key → tuple of valid string values. When a field's
+# dotted key is in this map, the form renders a <select> and the parser
+# rejects any value not in the list. Seeded from cli.py's existing enum
+# frozensets — extend here as new bounded-choice fields land.
+def _field_choices() -> dict[str, tuple[str, ...]]:
+    # Late import — cli.py imports web_forms transitively, so deferring
+    # avoids a circular import at module load.
+    from harness.cli import _VALID_SANDBOX_BACKENDS, _VALID_SELECTION_STRATEGIES
+    return {
+        "sandbox.backend": tuple(sorted(_VALID_SANDBOX_BACKENDS)),
+        "speculative.selection_strategy": tuple(sorted(_VALID_SELECTION_STRATEGIES)),
+    }
+
+
+# Operator-facing descriptions per dotted key. The form's middle column
+# ("Meaning") reads from this map. Empty string when a key isn't listed —
+# the renderer falls back to "no description".
+_FIELD_DESCRIPTIONS: dict[str, str] = {
+    # Top-level scalars.
+    "build_command": "Shell command the harness runs after applying patches to verify the build.",
+    "allow_network": "Whether the sandbox may reach the network. Off by default for security.",
+    "product_spec_dir": "Folder name (relative to the workspace) containing the product spec the planner reads.",
+    "change_requests_dir": "Folder name (relative to the workspace) where the harness drops change-request markdown files.",
+    # Sandbox.
+    "sandbox.backend": "Sandbox engine. 'auto' picks the best available on this host.",
+    "sandbox.docker_image": "Docker image used when backend is 'docker'.",
+    "sandbox.docker_memory_limit": "Memory limit for the docker sandbox (e.g. '2g').",
+    "sandbox.docker_cpu_limit": "CPU limit for the docker sandbox (number of cores, may be fractional).",
+    # Token budget.
+    "token_budget.hard_cap_usd": "Hard ceiling on cumulative LLM spend per session. Exits when crossed.",
+    "token_budget.context_window_threshold_pct": "Trigger speculative compaction when context fills past this %.",
+    # Logging.
+    "logging.log_dir": "Directory where per-session JSONL logs are written.",
+    "logging.level": "Python logging level (DEBUG, INFO, WARNING, ERROR).",
+    # Schedule.
+    "schedule.enabled": "Whether the cron-driven scheduled-job daemon is on.",
+    "schedule.tick_seconds": "How often the daemon checks for due jobs.",
+    "schedule.harness_binary": "Path to the harness CLI (used to spawn scheduled runs).",
+    # Dashboard.
+    "dashboard.enabled": "Whether the web UI is allowed to start (the subcommand itself overrides this).",
+    "dashboard.host": "Bind host for the web UI. Default 127.0.0.1 for localhost-only.",
+    "dashboard.port": "Bind port for the web UI.",
+    "dashboard.token_env": "Env var name holding the bearer token. Empty disables auth.",
+    "dashboard.writes_enabled": "Allow the editing UI + Run-from-web. Off = read-only.",
+    "dashboard.docs_dir": "Folder of .md / .txt docs surfaced under View Documents.",
+    "dashboard.carbon_css_url": "URL to the Carbon Design System CSS. Override for air-gapped deploys.",
+    # Speculative.
+    "speculative.selection_strategy": "How parallel speculative attempts are picked.",
+    # Repo index.
+    "repo_index.enabled": "Inject semantic retrieval results into the planner context.",
+    "repo_index.backend": "Retrieval backend: 'tfidf' (default) or 'openai_embeddings'.",
+    "repo_index.top_k": "Number of chunks injected into the planner context.",
+    # Web tools.
+    "web_tools.enabled": "Register web_fetch / web_search skills with the gateway.",
+    "web_tools.max_bytes": "Max bytes returned by a single web_fetch call.",
+    "web_tools.timeout_seconds": "Timeout for web_fetch and web_search calls.",
+    # Persistence.
+    "persistence.db_path": "Path to the LangGraph checkpoint SQLite database.",
+}
 
 
 @dataclass
@@ -60,6 +122,8 @@ class FormField:
     required: bool = False
     secret: bool = False  # render as <input type=password>; never echo on errors
     placeholder: str = ""
+    choices: Optional[tuple[str, ...]] = None  # for FORM_KIND_SELECT
+    description: str = ""
 
     @property
     def dotted_key(self) -> str:
@@ -132,17 +196,22 @@ def build_section(
     field_names = sorted(_KNOWN_NESTED_KEYS.get(section, frozenset()))
     out = FormSection(section=section)
     section_data = (current_config or {}).get(section) or {}
+    choices_map = _field_choices()
     for name in field_names:
         dotted = f"{section}.{name}"
         type_tuple = _TYPE_SCHEMA.get(dotted)
         if type_tuple is None:
             logger.debug("[web_forms] no type entry for %s; skipping", dotted)
             continue
+        choices = choices_map.get(dotted)
+        kind = FORM_KIND_SELECT if choices else kind_for_type_tuple(type_tuple)
         out.fields.append(FormField(
             section=section, name=name,
-            kind=kind_for_type_tuple(type_tuple),
+            kind=kind,
             type_tuple=type_tuple,
             current_value=section_data.get(name),
+            choices=choices,
+            description=_FIELD_DESCRIPTIONS.get(dotted, ""),
         ))
     return out
 
@@ -177,6 +246,7 @@ def all_sections(
                     kind=kind_for_type_tuple(type_tuple),
                     type_tuple=type_tuple,
                     current_value=section_data.get(section),
+                    description=_FIELD_DESCRIPTIONS.get(section, ""),
                 )],
             ))
             continue
@@ -208,6 +278,17 @@ def parse_value(field_: FormField, raw: Any) -> Any:
     failure so the renderer can surface a per-field error.
     """
     kind = field_.kind
+    if kind == FORM_KIND_SELECT:
+        choice = "" if raw is None else str(raw).strip()
+        if not choice:
+            raise FormParseError(field_.dotted_key, "value required (pick one)")
+        choices = field_.choices or ()
+        if choice not in choices:
+            raise FormParseError(
+                field_.dotted_key,
+                f"value {choice!r} not in {list(choices)}",
+            )
+        return choice
     if kind == FORM_KIND_CHECKBOX:
         if isinstance(raw, bool):
             return raw

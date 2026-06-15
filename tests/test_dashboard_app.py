@@ -503,9 +503,13 @@ def test_sse_stream_emits_log_lines(tmp_path):
 # 10. New CLI surface — dashboard subcommand still accepts new flag
 # ---------------------------------------------------------------------------
 
-def test_dashboard_cli_accepts_writes_enabled_flag():
+def test_dashboard_cli_parses_without_writes_enabled_flag():
+    # All features ship by default — `harness web` does not need a
+    # `--writes-enabled` flag any more. Operators flip
+    # `dashboard.writes_enabled: false` in config.json to lock down.
     from harness.cli import build_parser
     parser = build_parser()
-    args = parser.parse_args(["dashboard", "--writes-enabled"])
-    assert args.command == "dashboard"
-    assert args.writes_enabled is True
+    args = parser.parse_args(["web"])
+    assert args.command == "web"
+    # The flag was removed; the argparse Namespace shouldn't carry it.
+    assert not hasattr(args, "writes_enabled")

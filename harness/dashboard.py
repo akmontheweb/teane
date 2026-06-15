@@ -1,4 +1,4 @@
-"""``harness dashboard`` — read-only web UI (#14).
+"""``harness web`` — read-only web UI (#14).
 
 Surfaces the data the harness already emits: session history (from
 ``~/.harness/logs/*.jsonl``), cost burn-down (the same events),
@@ -41,6 +41,7 @@ import socketserver
 import threading
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,14 @@ _DEFAULT_MEMORY_DIR = "~/.harness/memory"
 _DEFAULT_INDEX_DIR = "~/.harness/repo_index"
 _DEFAULT_SCHEDULE_DB = "~/.harness/schedule.db"
 _DEFAULT_STATIC_DIR = "~/.harness/dashboard_static"
+
+# Carbon Design System assets. v10 is the last vanilla (non-React) line —
+# v11 is React-only and would break this SSR layout. The pin is deliberate;
+# air-gapped operators can point dashboard.carbon_css_url at their own
+# mirror via the same static_dir + config knob pattern Chart.js uses.
+_DEFAULT_CARBON_CSS_URL = "https://unpkg.com/carbon-components@10.58.12/css/carbon-components.min.css"
+_DEFAULT_CARBON_JS_URL = "https://unpkg.com/carbon-components@10.58.12/scripts/carbon-components.min.js"
+_DEFAULT_DOCS_DIR = ""  # empty → resolve to <repo_root>/docs at request time
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +84,19 @@ class DashboardConfig:
     static_dir: str = _DEFAULT_STATIC_DIR
     chart_js_url: str = "https://cdn.jsdelivr.net/npm/chart.js"
     sessions_max: int = 200        # don't enumerate forever
-    # Tier B/C knobs.
-    writes_enabled: bool = False   # opt-in for editing forms + Run-from-web
+    # Tier B/C knobs. Writes-on is the DEFAULT — `harness web` ships
+    # the full UI without ceremony. Operators who need a read-only
+    # deployment can flip ``dashboard.writes_enabled: false`` in
+    # config.json; that gate still rejects POSTs and renders the
+    # informational "writes are disabled" panels on /run + /config-ui.
+    writes_enabled: bool = True
     csrf_token_env: str = ""       # CSRF token env var; auto-generated when empty + writes_enabled
     hitl_webhook_secret: str = ""  # shared secret the harness POSTs with
     web_db_path: str = "~/.harness/web.db"
     config_path: str = ""          # canonical config.json path; empty → use discover_config
+    carbon_css_url: str = _DEFAULT_CARBON_CSS_URL
+    carbon_js_url: str = _DEFAULT_CARBON_JS_URL
+    docs_dir: str = _DEFAULT_DOCS_DIR  # empty → <repo_root>/docs at request time
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "DashboardConfig":
@@ -110,11 +126,14 @@ class DashboardConfig:
             static_dir=str(section.get("static_dir", _DEFAULT_STATIC_DIR)),
             chart_js_url=str(section.get("chart_js_url", "https://cdn.jsdelivr.net/npm/chart.js")),
             sessions_max=max(1, min(10000, int(section.get("sessions_max", 200)))),
-            writes_enabled=bool(section.get("writes_enabled", False)),
+            writes_enabled=bool(section.get("writes_enabled", True)),
             csrf_token_env=str(section.get("csrf_token_env", "")),
             hitl_webhook_secret=str(section.get("hitl_webhook_secret", "")),
             web_db_path=str(section.get("web_db_path", "~/.harness/web.db")),
             config_path=str(section.get("config_path", "")),
+            carbon_css_url=str(section.get("carbon_css_url", _DEFAULT_CARBON_CSS_URL)),
+            carbon_js_url=str(section.get("carbon_js_url", _DEFAULT_CARBON_JS_URL)),
+            docs_dir=str(section.get("docs_dir", _DEFAULT_DOCS_DIR)),
         )
 
 
@@ -201,6 +220,166 @@ def _parse_session_log(session_id: str, path: str) -> SessionSummary:
     except OSError:
         pass
     return summary
+
+
+def _parse_iso_utc(value: str) -> Optional[datetime]:
+    """Best-effort ISO 8601 → aware UTC datetime. Returns None if the
+    value isn't parseable. Mirrors the harness's observability format
+    (``timestamp`` field in JSONL events)."""
+    from datetime import timezone
+    if not value:
+        return None
+    try:
+        # `fromisoformat` handles both naive and offset-bearing strings.
+        # Trailing 'Z' is not accepted pre-3.11 — normalise it.
+        normalised = value[:-1] + "+00:00" if value.endswith("Z") else value
+        dt = datetime.fromisoformat(normalised)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def summarize_sessions_window(
+    sessions: list[SessionSummary],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> dict[str, Any]:
+    """Aggregate completed/succeeded/failed counts, cumulative duration
+    (seconds) and cumulative cost over the [start, end] window. A
+    session counts towards the window if its ``started_at`` falls inside
+    it. Sessions with un-parseable timestamps are skipped silently.
+    """
+    completed = 0
+    succeeded = 0
+    failed = 0
+    duration_seconds = 0.0
+    cost_usd = 0.0
+    for s in sessions:
+        started = _parse_iso_utc(s.started_at)
+        if started is None or not (start_utc <= started <= end_utc):
+            continue
+        # Only an explicit ``exit_code`` (from a ``session_end`` event)
+        # counts as completed — `_parse_session_log` fills ``ended_at``
+        # with the last event timestamp for in-flight sessions, so we
+        # can't trust ``ended_at`` alone.
+        if s.exit_code is not None:
+            completed += 1
+            ended = _parse_iso_utc(s.ended_at)
+            if ended is not None:
+                duration_seconds += max(0.0, (ended - started).total_seconds())
+            if s.exit_code == 0:
+                succeeded += 1
+            else:
+                failed += 1
+        cost_usd += float(s.total_cost_usd or 0.0)
+    return {
+        "completed": completed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "duration_seconds": duration_seconds,
+        "cost_usd": cost_usd,
+    }
+
+
+def _last_event_name(log_path: str, *, tail_bytes: int = 4096) -> str:
+    """Read the tail of a JSONL log and return the ``event`` value of
+    the last fully-parseable line. Empty string when the file is
+    missing, empty, or unparseable."""
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.read(1)  # drop the partial first line
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    last_event = ""
+    for line in tail.splitlines():
+        evt = _safe_json(line)
+        if isinstance(evt, dict) and evt.get("event"):
+            last_event = str(evt["event"])
+    return last_event
+
+
+def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
+    """Sessions that are *currently in flight*. Union of:
+
+    1. The web-spawned :class:`ProcessRegistry` (covers runs started
+       from the Run Harness page).
+    2. JSONL logs whose tail does NOT contain a ``session_end`` event
+       and whose mtime is within the last 24 hours (covers runs
+       started from the CLI).
+
+    Web entries win on duplicate ``session_id`` because they carry
+    workspace + prompt context the log scan can't recover cheaply.
+    """
+    from datetime import datetime, timezone, timedelta
+    rows: dict[str, dict[str, Any]] = {}
+
+    log_dir = os.path.expanduser(cfg.log_dir)
+    if os.path.isdir(log_dir):
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
+        try:
+            entries = os.listdir(log_dir)
+        except OSError:
+            entries = []
+        for filename in entries:
+            if not filename.endswith(".jsonl"):
+                continue
+            path = os.path.join(log_dir, filename)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            if _last_event_name(path) == "session_end":
+                continue
+            sid = filename[:-len(".jsonl")]
+            # Pull the start timestamp + workspace from the first line.
+            started_at = ""
+            workspace_path = ""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        evt = _safe_json(line)
+                        if not evt:
+                            continue
+                        if evt.get("event") == "session_start":
+                            started_at = str(evt.get("timestamp") or "")
+                            workspace_path = str(evt.get("workspace_path") or "")
+                            break
+                        if not started_at:
+                            started_at = str(evt.get("timestamp") or "")
+            except OSError:
+                pass
+            rows[sid] = {
+                "session_id": sid,
+                "started_at": started_at,
+                "workspace_path": workspace_path,
+                "prompt": "",
+                "source": "cli",
+            }
+
+    try:
+        for proc in get_process_registry().list_running():
+            from datetime import datetime as _dt, timezone as _tz
+            iso = _dt.fromtimestamp(proc.started_at, tz=_tz.utc).isoformat()
+            rows[proc.session_id] = {
+                "session_id": proc.session_id,
+                "started_at": iso,
+                "workspace_path": proc.workspace_path,
+                "prompt": proc.prompt,
+                "source": "web",
+            }
+    except Exception:  # noqa: BLE001
+        # Registry may not be initialised in tests; tolerate.
+        pass
+
+    return sorted(rows.values(), key=lambda r: r["started_at"], reverse=True)
 
 
 def session_events(path: str, *, max_events: int = 1000) -> list[dict[str, Any]]:
@@ -410,50 +589,86 @@ def check_auth(
 # 4. HTTP handler
 # ---------------------------------------------------------------------------
 
+# myharness overrides on top of Carbon. Carbon ships its own type scale,
+# spacing tokens, table styles, etc. — we only add things Carbon doesn't:
+# the side-nav offset for main content, a couple of status-color helpers,
+# and the legacy .card/.ok/.fail classes some existing renderers still use.
 _BASE_CSS = """\
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-       margin: 0; padding: 0; color: #1f2328; background: #f6f8fa; }
-header { background: #24292f; color: #fff; padding: 14px 24px; }
-header a { color: #d0d7de; text-decoration: none; margin-right: 14px; font-size: 13px; }
-header a:hover { color: #fff; }
-header h1 { display: inline; font-size: 18px; margin: 0 24px 0 0; }
-main { max-width: 1180px; margin: 24px auto; padding: 0 16px; }
-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d0d7de;
-        border-radius: 6px; overflow: hidden; }
-th, td { padding: 8px 12px; border-bottom: 1px solid #d0d7de; text-align: left; font-size: 13px; }
-th { background: #f6f8fa; font-weight: 600; }
-tr:last-child td { border-bottom: none; }
-.muted { color: #6e7781; }
-.ok { color: #1a7f37; font-weight: 600; }
-.fail { color: #cf222e; font-weight: 600; }
-pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
-      padding: 12px; overflow: auto; font-size: 12.5px; line-height: 1.45; }
-.card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px;
-        padding: 16px; margin-bottom: 16px; }
-.card h2 { margin-top: 0; font-size: 16px; }
+body { margin: 0; }
+main.bx--content { margin-left: 16rem; padding: 2rem; min-height: calc(100vh - 3rem); background: #f4f4f4; }
+main.bx--content h2 { font-weight: 400; margin-top: 0; }
+.bx--side-nav__link--current, .bx--side-nav__link--current span { color: #fff !important; background: #393939; }
+.muted { color: #6f6f6f; }
+.ok { color: #198038; font-weight: 600; }
+.fail { color: #da1e28; font-weight: 600; }
+.card { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; margin-bottom: 1rem; }
+.card h2 { margin-top: 0; font-size: 1rem; font-weight: 600; }
+.card pre { background: #f4f4f4; padding: 0.75rem; overflow: auto; font-size: 0.85rem; }
+table { width: 100%; border-collapse: collapse; background: #fff; }
+th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #e0e0e0; text-align: left; font-size: 0.875rem; }
+th { background: #f4f4f4; font-weight: 600; }
+.tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); gap: 1rem; }
+.status-tile { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; }
+.status-tile h3 { margin: 0 0 0.75rem 0; font-size: 0.875rem; font-weight: 600; text-transform: uppercase; color: #525252; }
+.status-tile dl { margin: 0; display: grid; grid-template-columns: 1fr auto; row-gap: 0.25rem; column-gap: 1rem; font-size: 0.875rem; }
+.status-tile dt { color: #525252; }
+.status-tile dd { margin: 0; font-variant-numeric: tabular-nums; }
+.dash-tile { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; transition: background 0.1s; }
+.dash-tile:hover { background: #e8e8e8; }
+.dash-tile a { color: #0f62fe; text-decoration: none; display: block; }
+.dash-tile h3 { margin: 0 0 0.5rem 0; font-size: 1rem; font-weight: 600; }
+.dash-tile p { margin: 0; font-size: 0.875rem; color: #525252; }
+.tag { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 0.75rem; font-size: 0.75rem; font-weight: 500; }
+.tag-green { background: #defbe6; color: #0e6027; }
+.tag-red { background: #ffd7d9; color: #a2191f; }
+.tag-gray { background: #e0e0e0; color: #393939; }
 """
 
 
-def _layout(title: str, body: str, cfg: DashboardConfig) -> str:
+_NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
+    # (slug, label, href)
+    ("status", "View Status", "/status"),
+    ("run", "Run Harness", "/run"),
+    ("config", "Configure Harness", "/config-ui"),
+    ("dashboards", "View Dashboards", "/dashboards"),
+    ("docs", "View Documents", "/docs"),
+)
+
+
+def _render_side_nav(active: str) -> str:
+    items = []
+    for slug, label, href in _NAV_ITEMS:
+        cls = "bx--side-nav__link bx--side-nav__link--current" if slug == active else "bx--side-nav__link"
+        items.append(
+            f'<li class="bx--side-nav__item">'
+            f'<a class="{cls}" href="{href}">'
+            f'<span class="bx--side-nav__link-text">{html.escape(label)}</span>'
+            f'</a></li>'
+        )
+    return (
+        '<nav class="bx--side-nav bx--side-nav--expanded" aria-label="Side navigation">'
+        '<ul class="bx--side-nav__items">' + "".join(items) + '</ul></nav>'
+    )
+
+
+def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{html.escape(title)} — myharness dashboard</title>
+<title>{html.escape(title)} — myharness</title>
+<link rel="stylesheet" href="{html.escape(cfg.carbon_css_url)}">
 <style>{_BASE_CSS}</style>
 <script src="{html.escape(cfg.chart_js_url)}"></script>
 </head>
-<body>
-<header>
-  <h1>myharness</h1>
-  <a href="/">overview</a>
-  <a href="/sessions">sessions</a>
-  <a href="/cost">cost</a>
-  <a href="/schedule">schedule</a>
-  <a href="/index">repo index</a>
-  <a href="/memory">memory</a>
+<body class="bx--body">
+<header class="bx--header" role="banner">
+  <a class="bx--header__name" href="/status">
+    <span class="bx--header__name--prefix">myharness</span>
+  </a>
 </header>
-<main>
+{_render_side_nav(active)}
+<main class="bx--content">
 <h2>{html.escape(title)}</h2>
 {body}
 </main>
@@ -682,19 +897,19 @@ def _route_overview(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int,
 
 
 def _route_sessions(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Sessions", _render_sessions(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Sessions", _render_sessions(cfg), cfg, active="dashboards")
 
 
 def _route_session_detail(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
     return 200, "text/html; charset=utf-8", _layout(
         f"Session {params['sid']}",
         _render_session_detail(cfg, params["sid"]),
-        cfg,
+        cfg, active="dashboards",
     )
 
 
 def _route_cost(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Cost burn", _render_cost(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Cost burn", _render_cost(cfg), cfg, active="dashboards")
 
 
 def _route_api_cost_burn(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
@@ -702,26 +917,741 @@ def _route_api_cost_burn(cfg: DashboardConfig, _params: dict[str, str]) -> tuple
 
 
 def _route_schedule(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Scheduled runs", _render_schedule(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Scheduled runs", _render_schedule(cfg), cfg, active="dashboards")
 
 
 def _route_index(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Repo index", _render_index(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Repo index", _render_index(cfg), cfg, active="dashboards")
 
 
 def _route_memory(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Per-repo memory", _render_memory(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Per-repo memory", _render_memory(cfg), cfg, active="dashboards")
 
 
 def _route_memory_file(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
     status, body = _render_memory_file(cfg, params["name"])
     return status, "text/html; charset=utf-8", _layout(
-        f"Memory · {params['name']}", body, cfg,
+        f"Memory · {params['name']}", body, cfg, active="dashboards",
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. Carbon shell — 5 top-level pages
+# ---------------------------------------------------------------------------
+# Body sentinel for HTTP 302. dispatch() returns one tuple; the request
+# handler recognises this prefix and emits a real redirect.
+_REDIRECT_SENTINEL = "__REDIRECT__"
+
+
+def _route_root(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 302, "text/html; charset=utf-8", f"{_REDIRECT_SENTINEL}/status"
+
+
+def _route_status(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "View Status", _render_status(cfg), cfg, active="status",
+    )
+
+
+def _route_run(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "Run Harness", _render_run_harness(cfg), cfg, active="run",
+    )
+
+
+def _route_configure_harness(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "Configure Harness", _render_configure_harness(cfg), cfg, active="config",
+    )
+
+
+def _route_dashboards(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "View Dashboards", _render_dashboards_landing(cfg), cfg, active="dashboards",
+    )
+
+
+def _route_docs(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "View Documents", _render_docs_landing(cfg), cfg, active="docs",
+    )
+
+
+def _route_docs_file(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    relpath = urllib.parse.unquote(params["relpath"])
+    status, body = _render_docs_file(cfg, relpath)
+    title = f"Document · {relpath}" if status == 200 else "Document · not found"
+    return status, "text/html; charset=utf-8", _layout(title, body, cfg, active="docs")
+
+
+def _stub_panel(label: str) -> str:
+    return (
+        f"<div class='card'><p class='muted'>{html.escape(label)} — "
+        f"this page is the Phase 1 shell stub. Content lands in a "
+        f"subsequent phase.</p></div>"
+    )
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "—"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _status_tile(label: str, summary: dict[str, Any]) -> str:
+    return (
+        f"<div class='status-tile'>"
+        f"<h3>{html.escape(label)}</h3>"
+        f"<dl>"
+        f"<dt>Completed</dt><dd>{summary['completed']}</dd>"
+        f"<dt>Succeeded</dt><dd class='ok'>{summary['succeeded']}</dd>"
+        f"<dt>Failed</dt><dd class='fail'>{summary['failed']}</dd>"
+        f"<dt>Cumulative time</dt><dd>{_fmt_duration(summary['duration_seconds'])}</dd>"
+        f"<dt>Cumulative cost</dt><dd>{_fmt_cost(summary['cost_usd'])}</dd>"
+        f"</dl></div>"
+    )
+
+
+def _render_status(cfg: DashboardConfig) -> str:
+    from datetime import datetime, timezone, timedelta
+
+    sessions = list_sessions(cfg)
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+    month_start = now - timedelta(days=30)
+
+    section_a = (
+        "<div class='card'>"
+        "<h2>Summary</h2>"
+        "<div class='tile-grid'>"
+        + _status_tile("Today", summarize_sessions_window(sessions, day_start, now))
+        + _status_tile("Past 7 days", summarize_sessions_window(sessions, week_start, now))
+        + _status_tile("Past 30 days", summarize_sessions_window(sessions, month_start, now))
+        + "</div></div>"
+    )
+
+    running = list_running_sessions(cfg)
+    if running:
+        rows = []
+        for r in running:
+            rows.append(
+                f"<tr>"
+                f"<td><a href='/sessions/{_esc(r['session_id'])}'>{_esc(r['session_id'])}</a></td>"
+                f"<td>{_esc(r['started_at'])}</td>"
+                f"<td>{_esc(r['workspace_path'])}</td>"
+                f"<td><span class='tag tag-gray'>{_esc(r['source'])}</span></td>"
+                f"<td><a href='/sessions/{_esc(r['session_id'])}'>Open dashboard</a></td>"
+                f"</tr>"
+            )
+        section_b_body = (
+            "<table><tr><th>Session</th><th>Started</th><th>Workspace</th>"
+            "<th>Source</th><th></th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        section_b_body = "<p class='muted'>No sessions are running right now.</p>"
+    section_b = f"<div class='card'><h2>Running now</h2>{section_b_body}</div>"
+
+    today_sessions = [
+        s for s in sessions
+        if (d := _parse_iso_utc(s.started_at)) is not None and d >= day_start
+    ]
+    if today_sessions:
+        rows = []
+        for s in today_sessions:
+            started = _parse_iso_utc(s.started_at)
+            ended = _parse_iso_utc(s.ended_at)
+            if s.exit_code is None:
+                status_html = "<span class='tag tag-gray'>running</span>"
+                duration = "—"
+            elif s.exit_code == 0:
+                status_html = "<span class='tag tag-green'>succeeded</span>"
+                duration = _fmt_duration((ended - started).total_seconds()) if started and ended else "—"
+            else:
+                status_html = f"<span class='tag tag-red'>exit {s.exit_code}</span>"
+                duration = _fmt_duration((ended - started).total_seconds()) if started and ended else "—"
+            rows.append(
+                f"<tr>"
+                f"<td><a href='/sessions/{_esc(s.session_id)}'>{_esc(s.session_id)}</a></td>"
+                f"<td>{status_html}</td>"
+                f"<td>{duration}</td>"
+                f"<td>{_fmt_cost(s.total_cost_usd)}</td>"
+                f"<td><a href='/sessions/{_esc(s.session_id)}'>Open dashboard</a></td>"
+                f"</tr>"
+            )
+        section_c_body = (
+            "<table><tr><th>Session</th><th>Status</th><th>Duration</th>"
+            "<th>Cost</th><th></th></tr>" + "".join(rows) + "</table>"
+        )
+    else:
+        section_c_body = "<p class='muted'>No sessions started today.</p>"
+    section_c = f"<div class='card'><h2>Today's runs</h2>{section_c_body}</div>"
+
+    return section_a + section_b + section_c
+
+
+def _render_run_harness(cfg: DashboardConfig) -> str:
+    if not cfg.writes_enabled:
+        return (
+            "<div class='card'><p class='muted'>Writes are disabled "
+            "by <code>dashboard.writes_enabled: false</code> in "
+            "<code>config.json</code>. Flip it to <code>true</code> "
+            "(or remove the override — writes are on by default) to "
+            "run or schedule from this page.</p></div>"
+        )
+    csrf_token = resolve_csrf_token(cfg) or ""
+
+    # Pending one-shot jobs table. The schedule helper filters to
+    # "due now" by default — pass a far-future cutoff to surface every
+    # not-yet-consumed row, including ones scheduled for tomorrow.
+    from datetime import datetime, timezone
+    far_future = datetime(2999, 1, 1, tzinfo=timezone.utc)
+    try:
+        pending = list_pending_oneshot_jobs(db_path=cfg.web_db_path, now=far_future)
+    except Exception:  # noqa: BLE001
+        pending = []
+    if pending:
+        rows = []
+        for job in pending:
+            args_pretty = " ".join(html.escape(str(a)) for a in job["harness_args"])
+            rows.append(
+                f"<tr>"
+                f"<td>{_esc(job['fire_at_utc'])}</td>"
+                f"<td>{_esc(job['name'])}</td>"
+                f"<td>{_esc(job['workspace'])}</td>"
+                f"<td>{_esc(job['prompt'][:80])}</td>"
+                f"<td><span class='tag tag-gray'>scheduled</span></td>"
+                f"<td><code>{args_pretty}</code></td>"
+                f"</tr>"
+            )
+        pending_html = (
+            "<table><tr><th>Fire at (UTC)</th><th>Name</th><th>Workspace</th>"
+            "<th>Prompt</th><th>Status</th><th>Args</th></tr>"
+            + "".join(rows) + "</table>"
+        )
+    else:
+        pending_html = "<p class='muted'>No one-shot jobs scheduled.</p>"
+
+    form = f"""
+<div class='card'>
+  <h2>Start a harness run</h2>
+  <form id='run-form' method='post' action='/run/now'>
+    <input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>
+    <input type='hidden' id='fire-at-utc' name='fire_at_utc' value=''>
+    <div style='margin-bottom:1rem'>
+      <label class='bx--label' for='workspace'>Workspace path</label>
+      <input class='bx--text-input' id='workspace' name='workspace' type='text' required>
+    </div>
+    <div style='margin-bottom:1rem'>
+      <label class='bx--label' for='prompt'>Prompt</label>
+      <textarea class='bx--text-area' id='prompt' name='prompt' rows='4' required></textarea>
+    </div>
+    <div style='margin-bottom:1rem'>
+      <label class='bx--label' for='extra_args'>Extra harness args (space-separated)</label>
+      <input class='bx--text-input' id='extra_args' name='extra_args' type='text'
+             placeholder='--new_build=false --allow-network'>
+    </div>
+    <fieldset id='schedule-fields' style='display:none; border:none; padding:0; margin:1rem 0;'>
+      <legend class='bx--label'>Scheduled run</legend>
+      <div style='margin-bottom:1rem'>
+        <label class='bx--label' for='job_name'>Job name</label>
+        <input class='bx--text-input' id='job_name' name='name' type='text' placeholder='nightly retest'>
+      </div>
+      <div style='display:flex; gap:1rem; margin-bottom:1rem'>
+        <div style='flex:1'>
+          <label class='bx--label' for='fire_date'>Date (UTC)</label>
+          <input class='bx--date-picker__input' id='fire_date' type='date'>
+        </div>
+        <div style='flex:1'>
+          <label class='bx--label' for='fire_time'>Time (UTC)</label>
+          <input class='bx--time-picker__input' id='fire_time' type='time' step='60'>
+        </div>
+      </div>
+    </fieldset>
+    <div style='margin-top:1.5rem'>
+      <button class='bx--btn bx--btn--primary' type='submit'
+              formaction='/run/now' id='run-now-btn'>Run Now</button>
+      <button class='bx--btn bx--btn--secondary' type='button' id='reveal-schedule-btn'
+              style='margin-left:0.5rem'>Schedule A Run</button>
+      <button class='bx--btn bx--btn--primary' type='submit'
+              formaction='/run/schedule' id='confirm-schedule-btn'
+              style='margin-left:0.5rem; display:none'>Confirm Schedule</button>
+    </div>
+  </form>
+</div>
+<script>
+(function() {{
+  var reveal = document.getElementById('reveal-schedule-btn');
+  var confirm = document.getElementById('confirm-schedule-btn');
+  var runNow = document.getElementById('run-now-btn');
+  var fields = document.getElementById('schedule-fields');
+  var form = document.getElementById('run-form');
+  var fireDate = document.getElementById('fire_date');
+  var fireTime = document.getElementById('fire_time');
+  var fireAt = document.getElementById('fire-at-utc');
+  reveal.addEventListener('click', function() {{
+    fields.style.display = 'block';
+    confirm.style.display = 'inline-block';
+    runNow.style.display = 'none';
+    reveal.style.display = 'none';
+  }});
+  form.addEventListener('submit', function(e) {{
+    if (e.submitter && e.submitter.id === 'confirm-schedule-btn') {{
+      if (!fireDate.value || !fireTime.value) {{
+        e.preventDefault();
+        alert('Pick both a date and a time.');
+        return;
+      }}
+      fireAt.value = fireDate.value + 'T' + fireTime.value + ':00Z';
+    }}
+  }});
+}})();
+</script>
+"""
+
+    return f"""{form}
+<div class='card'>
+  <h2>Scheduled runs</h2>
+  {pending_html}
+</div>"""
+
+
+def _render_field_input_new(field) -> str:
+    """Render one form field as a Carbon-classed input. Mirrors the
+    legacy ``_render_field_input`` but reads the new ``choices`` and
+    ``description`` attributes and tags inputs with ``bx--*`` classes.
+    """
+    from harness.web_forms import (
+        FORM_KIND_CHECKBOX, FORM_KIND_JSON_DICT, FORM_KIND_JSON_LIST,
+        FORM_KIND_NUMBER_FLOAT, FORM_KIND_NUMBER_INT, FORM_KIND_SELECT,
+        FORM_KIND_TEXTAREA,
+    )
+    name_attr = html.escape(field.dotted_key)
+    current = field.current_value
+    if field.kind == FORM_KIND_CHECKBOX:
+        checked = "checked" if current else ""
+        return (
+            f"<input type='checkbox' name='{name_attr}' value='1' {checked}> "
+            f"<span class='muted'>(toggle)</span>"
+        )
+    if field.kind == FORM_KIND_SELECT:
+        opts = []
+        for choice in (field.choices or ()):
+            sel = "selected" if str(current) == choice else ""
+            opts.append(f"<option value='{html.escape(choice)}' {sel}>{html.escape(choice)}</option>")
+        return f"<select class='bx--select-input' name='{name_attr}'>" + "".join(opts) + "</select>"
+    if field.kind == FORM_KIND_NUMBER_INT:
+        val = "" if current is None else html.escape(str(current))
+        return f"<input class='bx--text-input' type='number' step='1' name='{name_attr}' value='{val}'>"
+    if field.kind == FORM_KIND_NUMBER_FLOAT:
+        val = "" if current is None else html.escape(str(current))
+        return f"<input class='bx--text-input' type='number' step='any' name='{name_attr}' value='{val}'>"
+    if field.kind in (FORM_KIND_JSON_LIST, FORM_KIND_JSON_DICT, FORM_KIND_TEXTAREA):
+        if current is None:
+            val = ""
+        elif isinstance(current, str):
+            val = current
+        else:
+            try:
+                val = json.dumps(current, indent=2)
+            except (TypeError, ValueError):
+                val = str(current)
+        return (
+            f"<textarea class='bx--text-area' name='{name_attr}' rows='4' "
+            f"style='font-family:monospace; width:100%'>{html.escape(val)}</textarea>"
+        )
+    # text / fallback.
+    val = "" if current is None else html.escape(str(current))
+    return f"<input class='bx--text-input' type='text' name='{name_attr}' value='{val}'>"
+
+
+def _render_configure_harness(cfg: DashboardConfig) -> str:
+    if not cfg.writes_enabled:
+        return (
+            "<div class='card'><p class='muted'>Writes are disabled "
+            "by <code>dashboard.writes_enabled: false</code> in "
+            "<code>config.json</code>. Current values are still "
+            "viewable read-only at <a href='/config'>Configuration (raw)</a>.</p></div>"
+        )
+
+    from harness.web_forms import all_sections
+    # Load the live config so the form pre-populates with current values.
+    current_config: dict[str, Any] = {}
+    try:
+        config_path = cfg.config_path or _config_file_path(cfg)
+        if config_path and os.path.isfile(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                current_config = json.load(f) or {}
+    except (OSError, json.JSONDecodeError):
+        current_config = {}
+
+    csrf_token = resolve_csrf_token(cfg) or ""
+    sections = all_sections(current_config=current_config)
+    panels = []
+    for sec in sections:
+        if not sec.fields:
+            # Section without renderable fields — show a one-line note so
+            # the operator knows it exists but isn't web-editable.
+            panels.append(
+                f"<li class='bx--accordion__item'>"
+                f"<button class='bx--accordion__heading' aria-expanded='false'>"
+                f"<span class='bx--accordion__title'>{html.escape(sec.section)}</span>"
+                f"</button>"
+                f"<div class='bx--accordion__content'>"
+                f"<p class='muted'>No web-editable fields registered for this section. "
+                f"Edit <code>config.json</code> directly.</p></div></li>"
+            )
+            continue
+        rows = []
+        for f in sec.fields:
+            description = html.escape(f.description) if f.description else "<span class='muted'>—</span>"
+            input_html = _render_field_input_new(f)
+            rows.append(
+                f"<tr>"
+                f"<td style='width:25%'><label class='bx--label'>{html.escape(f.name)}</label></td>"
+                f"<td style='width:45%' class='muted'>{description}</td>"
+                f"<td style='width:30%'>{input_html}</td>"
+                f"</tr>"
+            )
+        panel = (
+            f"<li class='bx--accordion__item'>"
+            f"<button class='bx--accordion__heading' aria-expanded='false'>"
+            f"<span class='bx--accordion__title'>{html.escape(sec.section)} "
+            f"<span class='muted'>({len(sec.fields)} field{'s' if len(sec.fields) != 1 else ''})</span>"
+            f"</span></button>"
+            f"<div class='bx--accordion__content'>"
+            f"<form method='post' action='/config/{html.escape(sec.section)}'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            f"<table>"
+            f"<tr><th>Key</th><th>Meaning</th><th>Value</th></tr>"
+            + "".join(rows) +
+            f"</table>"
+            f"<p><button class='bx--btn bx--btn--primary' type='submit'>Save {html.escape(sec.section)}</button></p>"
+            f"</form></div></li>"
+        )
+        panels.append(panel)
+
+    return (
+        "<div class='card'>"
+        "<h2>Configuration sections</h2>"
+        "<p class='muted'>Each section is one top-level key in <code>config.json</code>. "
+        "Save commits atomically and re-validates through the strict validator before landing.</p>"
+        f"<ul class='bx--accordion'>{''.join(panels)}</ul>"
+        "</div>"
+        "<div class='card'>"
+        "<p class='muted'>Deployment defaults live in <code>config/deployment.json</code> — "
+        "edit directly until web editing lands for that file.</p>"
+        "</div>"
+        # Minimal accordion JS — toggles aria-expanded + a CSS class. Carbon's
+        # bundled JS would also work but this is one inline handler.
+        "<script>"
+        "(function(){"
+        "var btns = document.querySelectorAll('.bx--accordion__heading');"
+        "btns.forEach(function(b){"
+        "  b.addEventListener('click', function(){"
+        "    var open = b.getAttribute('aria-expanded') === 'true';"
+        "    b.setAttribute('aria-expanded', open ? 'false' : 'true');"
+        "    var content = b.nextElementSibling;"
+        "    if (content) content.style.display = open ? 'none' : 'block';"
+        "  });"
+        "  var content = b.nextElementSibling;"
+        "  if (content) content.style.display = 'none';"
+        "});"
+        "})();"
+        "</script>"
+    )
+
+
+_DASHBOARD_TILES: tuple[tuple[str, str, str], ...] = (
+    # (title, description, href)
+    ("View Status", "Day / week / month summary plus what's running right now.", "/status"),
+    ("Cost burn-down", "Cumulative spend and per-call cost across every session.", "/cost"),
+    ("Sessions list", "Every harness session on disk with exit code and token totals.", "/sessions"),
+    ("Schedule history", "Past runs from the cron-driven scheduled-job daemon.", "/schedule"),
+    ("Repo index", "Status of the semantic retrieval index per workspace.", "/index"),
+    ("Memory list", "Per-repo memory files appended after each session.", "/memory"),
+    ("Live runs", "Currently-running processes spawned from this dashboard.", "/live"),
+    ("Configuration (raw)", "Section-by-section view of the legacy config form.", "/config"),
+)
+
+
+def _render_dashboards_landing(cfg: DashboardConfig) -> str:
+    tiles = []
+    for title, desc, href in _DASHBOARD_TILES:
+        tiles.append(
+            f"<div class='dash-tile'>"
+            f"<a href='{html.escape(href)}'>"
+            f"<h3>{html.escape(title)}</h3>"
+            f"<p>{html.escape(desc)}</p>"
+            f"</a></div>"
+        )
+    return (
+        "<div class='card'>"
+        "<h2>Available dashboards</h2>"
+        f"<div class='tile-grid'>{''.join(tiles)}</div>"
+        "</div>"
+    )
+
+
+_DOC_ALLOWED_EXTENSIONS = (".md", ".txt")
+
+
+def _resolve_docs_dir(cfg: DashboardConfig) -> str:
+    """Resolve ``cfg.docs_dir`` to an absolute path, falling back to
+    ``<repo_root>/docs`` (the harness package's own docs folder) when
+    the operator hasn't customised it. The fallback lets a freshly
+    installed harness show its shipped docs without configuration.
+    """
+    raw = cfg.docs_dir.strip()
+    if raw:
+        return os.path.abspath(os.path.expanduser(raw))
+    # Package install lives at .../harness/dashboard.py — the repo's
+    # docs/ folder sits one level above.
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(package_dir, os.pardir, "docs"))
+
+
+def list_docs(cfg: DashboardConfig) -> list[dict[str, Any]]:
+    """Files in the configured ``docs_dir`` (recursive, one level deep
+    of subdirs at most). Filters to the allowed extensions. Returns
+    list of ``{name, size, mtime, relpath}`` sorted by name."""
+    docs_dir = _resolve_docs_dir(cfg)
+    if not os.path.isdir(docs_dir):
+        return []
+    out: list[dict[str, Any]] = []
+    for root, _dirs, files in os.walk(docs_dir):
+        for filename in files:
+            if not filename.lower().endswith(_DOC_ALLOWED_EXTENSIONS):
+                continue
+            full = os.path.join(root, filename)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, docs_dir)
+            out.append({
+                "name": filename,
+                "relpath": rel,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+    out.sort(key=lambda r: r["relpath"].lower())
+    return out
+
+
+def read_doc_file(cfg: DashboardConfig, relpath: str) -> Optional[tuple[str, str]]:
+    """Read a doc file inside ``docs_dir`` with strict path-traversal
+    guards. Returns ``(content, extension)`` or ``None`` if the file
+    is missing, outside the docs root, or has a disallowed extension.
+    The caller decides how to render based on the extension.
+    """
+    if not relpath or "\x00" in relpath:
+        return None
+    docs_dir = os.path.realpath(_resolve_docs_dir(cfg))
+    candidate = os.path.realpath(os.path.join(docs_dir, relpath))
+    # Containment check — refuse anything that escapes docs_dir, even
+    # via symlinks. ``commonpath`` would also work; ``startswith`` with
+    # a trailing separator is enough here.
+    if not (candidate == docs_dir or candidate.startswith(docs_dir + os.sep)):
+        return None
+    ext = os.path.splitext(candidate)[1].lower()
+    if ext not in _DOC_ALLOWED_EXTENSIONS:
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    try:
+        with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(), ext
+    except OSError:
+        return None
+
+
+def render_markdown_minimal(text: str) -> str:
+    """A small, stdlib-only Markdown → HTML converter for the docs
+    viewer. Handles ATX headings (``# h1`` … ``###### h6``), fenced
+    code blocks (```` ``` ````), unordered/ordered lists, inline
+    ``code``, ``**bold**``, ``*italic*``, ``[link](url)``, blockquotes,
+    horizontal rules, and paragraphs. Escapes all user content before
+    inline rendering. Not CommonMark-strict; sufficient for the docs
+    we ship.
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code = False
+    code_buf: list[str] = []
+    code_lang = ""
+    list_kind: Optional[str] = None  # "ul" | "ol" | None
+    para_buf: list[str] = []
+
+    def flush_para() -> None:
+        if para_buf:
+            out.append("<p>" + _md_inline(" ".join(para_buf)) + "</p>")
+            para_buf.clear()
+
+    def flush_list() -> None:
+        nonlocal list_kind
+        if list_kind is not None:
+            out.append(f"</{list_kind}>")
+            list_kind = None
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        if in_code:
+            if line.strip().startswith("```"):
+                escaped = html.escape("\n".join(code_buf))
+                lang = f' class="language-{html.escape(code_lang)}"' if code_lang else ""
+                out.append(f"<pre><code{lang}>{escaped}</code></pre>")
+                code_buf.clear()
+                code_lang = ""
+                in_code = False
+            else:
+                code_buf.append(line)
+            continue
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_para()
+            flush_list()
+            in_code = True
+            code_lang = stripped[3:].strip()
+            continue
+        if not stripped:
+            flush_para()
+            flush_list()
+            continue
+        if stripped in ("---", "***", "___"):
+            flush_para()
+            flush_list()
+            out.append("<hr>")
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            flush_para()
+            flush_list()
+            level = len(heading_match.group(1))
+            out.append(f"<h{level}>{_md_inline(heading_match.group(2))}</h{level}>")
+            continue
+        ul_match = re.match(r"^[-*+]\s+(.*)$", stripped)
+        ol_match = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+        if ul_match:
+            flush_para()
+            if list_kind != "ul":
+                flush_list()
+                out.append("<ul>")
+                list_kind = "ul"
+            out.append(f"<li>{_md_inline(ul_match.group(1))}</li>")
+            continue
+        if ol_match:
+            flush_para()
+            if list_kind != "ol":
+                flush_list()
+                out.append("<ol>")
+                list_kind = "ol"
+            out.append(f"<li>{_md_inline(ol_match.group(2))}</li>")
+            continue
+        if stripped.startswith(">"):
+            flush_para()
+            flush_list()
+            out.append(f"<blockquote>{_md_inline(stripped.lstrip('>').strip())}</blockquote>")
+            continue
+        flush_list()
+        para_buf.append(stripped)
+    if in_code:  # unterminated fence — render what we have
+        escaped = html.escape("\n".join(code_buf))
+        out.append(f"<pre><code>{escaped}</code></pre>")
+    flush_para()
+    flush_list()
+    return "\n".join(out)
+
+
+def _md_inline(text: str) -> str:
+    """Inline markdown: escape first, then apply code/bold/italic/link
+    on the escaped string. Order matters — code spans first so backtick
+    content isn't re-interpreted."""
+    escaped = html.escape(text)
+    # Inline `code`. Capture is greedy-safe because we limit to backtick
+    # pairs on the same line.
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    # Links [text](url) — only allow http(s), relative, and anchor URLs
+    # to avoid javascript: payloads.
+    def _link(m: "re.Match[str]") -> str:
+        text_part, url = m.group(1), m.group(2)
+        if not re.match(r"^(https?:|/|#|[A-Za-z0-9_./\-]+)", url):
+            return m.group(0)
+        return f'<a href="{url}">{text_part}</a>'
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link, escaped)
+    # Bold **x** before italic *x* so ** doesn't get consumed as italic.
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KiB", "MiB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f} GiB"
+
+
+def _render_docs_landing(cfg: DashboardConfig) -> str:
+    docs = list_docs(cfg)
+    docs_dir = _resolve_docs_dir(cfg)
+    if not docs:
+        return (
+            f"<div class='card'>"
+            f"<h2>Documents</h2>"
+            f"<p class='muted'>No documents found in <code>{_esc(docs_dir)}</code>. "
+            f"Set <code>dashboard.docs_dir</code> in config.json to point at a folder of "
+            f"<code>.md</code> or <code>.txt</code> files.</p>"
+            f"</div>"
+        )
+    from datetime import datetime, timezone
+    rows = []
+    for doc in docs:
+        modified = datetime.fromtimestamp(doc["mtime"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        href = "/docs/" + urllib.parse.quote(doc["relpath"])
+        rows.append(
+            f"<tr>"
+            f"<td><a href='{href}'>{_esc(doc['relpath'])}</a></td>"
+            f"<td>{_fmt_size(int(doc['size']))}</td>"
+            f"<td>{modified}</td>"
+            f"</tr>"
+        )
+    return (
+        f"<div class='card'>"
+        f"<h2>Documents</h2>"
+        f"<p class='muted'>Source: <code>{_esc(docs_dir)}</code></p>"
+        "<table><tr><th>Document</th><th>Size</th><th>Modified (UTC)</th></tr>"
+        + "".join(rows) +
+        "</table></div>"
+    )
+
+
+def _render_docs_file(cfg: DashboardConfig, relpath: str) -> tuple[int, str]:
+    result = read_doc_file(cfg, relpath)
+    if result is None:
+        return 404, "<p class='fail'>Document not found.</p>"
+    content, ext = result
+    if ext == ".md":
+        rendered = render_markdown_minimal(content)
+        body = f"<div class='card markdown-body'>{rendered}</div>"
+    else:
+        body = f"<div class='card'><pre>{html.escape(content)}</pre></div>"
+    crumb = (
+        f"<p class='muted'><a href='/docs'>← All documents</a> · "
+        f"<code>{_esc(relpath)}</code></p>"
+    )
+    return 200, crumb + body
+
+
 _ROUTES: list[Route] = [
-    (re.compile(r"^/?$"), _route_overview),
+    (re.compile(r"^/?$"), _route_root),
     (re.compile(r"^/sessions/?$"), _route_sessions),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_session_detail),
     (re.compile(r"^/cost/?$"), _route_cost),
@@ -730,6 +1660,15 @@ _ROUTES: list[Route] = [
     (re.compile(r"^/index/?$"), _route_index),
     (re.compile(r"^/memory/?$"), _route_memory),
     (re.compile(r"^/memory/(?P<name>[A-Za-z0-9_.\-]+\.md)$"), _route_memory_file),
+    # Carbon shell — 5 new top-level pages. Each renders a stub in Phase 1.
+    (re.compile(r"^/status/?$"), _route_status),
+    (re.compile(r"^/run/?$"), _route_run),
+    (re.compile(r"^/config-ui/?$"), _route_configure_harness),
+    (re.compile(r"^/dashboards/?$"), _route_dashboards),
+    (re.compile(r"^/docs/?$"), _route_docs),
+    # Doc detail — relpath allows subdirs (e.g. notes/a.md) but the
+    # read_doc_file containment check rejects traversal regardless.
+    (re.compile(r"^/docs/(?P<relpath>[A-Za-z0-9_./\-]+\.(?:md|txt))$"), _route_docs_file),
 ]
 
 
@@ -834,6 +1773,15 @@ def make_request_handler(
             if ctype == "text/event-stream" and body.startswith("__SSE__"):
                 session_id = body[len("__SSE__"):]
                 self._stream_sse(session_id)
+                return
+            # 302 redirect sentinel (used by `/` → `/status`).
+            if status == 302 and body.startswith(_REDIRECT_SENTINEL):
+                target = body[len(_REDIRECT_SENTINEL):] or "/status"
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
                 return
             extra = {}
             cookie = self._csrf_set_cookie_header()
@@ -1262,6 +2210,7 @@ from harness.web_state import (  # noqa: E402  (intentional late import)
     add_oneshot_job,
     append_audit,
     consume_chat_notes,
+    list_pending_oneshot_jobs,
     pending_chat_notes,
     queue_chat_note,
 )
@@ -1650,8 +2599,8 @@ def _render_config_index(cfg: DashboardConfig) -> str:
     write_state = (
         "Writes are <strong>enabled</strong>. Forms can save changes."
         if cfg.writes_enabled else
-        "Writes are disabled. Pass <code>--writes-enabled</code> "
-        "to <code>harness dashboard</code> to enable editing."
+        "Writes are disabled by <code>dashboard.writes_enabled: false</code> "
+        "in <code>config.json</code>."
     )
     return (
         f"<div class='card'><p>{write_state}</p></div>"
@@ -1813,8 +2762,9 @@ def _render_memory_edit(cfg: DashboardConfig, name: str, csrf_token: Optional[st
 def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str = "") -> str:
     if not cfg.writes_enabled or csrf_token is None:
         return (
-            "<p class='muted'>Writes are disabled; cannot start runs from the web. "
-            "Pass <code>--writes-enabled</code> to <code>harness dashboard</code>.</p>"
+            "<p class='muted'>Writes are disabled by "
+            "<code>dashboard.writes_enabled: false</code> in "
+            "<code>config.json</code>; cannot start runs from the web.</p>"
         )
     flash_html = f"<div class='card ok'>{html.escape(flash)}</div>" if flash else ""
     return (
@@ -1921,25 +2871,25 @@ def _parse_form_body(body: bytes) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _route_live(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Live runs", _render_live(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Live runs", _render_live(cfg), cfg, active="dashboards")
 
 
 def _route_config_index(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Configuration", _render_config_index(cfg), cfg)
+    return 200, "text/html; charset=utf-8", _layout("Configuration", _render_config_index(cfg), cfg, active="dashboards")
 
 
 def _route_config_section(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
     csrf = resolve_csrf_token(cfg)
     body = _render_config_section(cfg, params["section"], csrf_token=csrf)
     return 200, "text/html; charset=utf-8", _layout(
-        f"Config · {params['section']}", body, cfg,
+        f"Config · {params['section']}", body, cfg, active="dashboards",
     )
 
 
 def _route_run_new(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
     csrf = resolve_csrf_token(cfg)
     return 200, "text/html; charset=utf-8", _layout(
-        "New run", _render_run_new(cfg, csrf), cfg,
+        "New run", _render_run_new(cfg, csrf), cfg, active="dashboards",
     )
 
 

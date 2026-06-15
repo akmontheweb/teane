@@ -405,9 +405,10 @@ curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
 - **CSRF token mismatch:** The token rotates per server restart unless
   `dashboard.csrf_token_env` pins it. After a restart, the browser's
   cookie is stale — reload the page to get a fresh cookie.
-- **403 "writes disabled":** Launch with `--writes-enabled` OR set
-  `dashboard.writes_enabled: true` in `config.json`. The flag also
-  matters for "Run from web" and HITL gates.
+- **403 "writes disabled":** Writes are on by default. If you see this
+  after starting `harness web`, something in `config.json` set
+  `dashboard.writes_enabled: false` — flip it back to `true` (or remove
+  the override entirely).
 - **Browser refuses to set cookies on HTTP:** Default
   `SameSite=Strict` cookies work on `http://localhost` but some
   browsers tighten this. Use a real domain + HTTPS via a reverse
@@ -443,7 +444,7 @@ curl -fsS http://127.0.0.1:8729/      # adjust host:port
 ## 11. `~/.harness/web.db` corrupt — dashboard crashes on startup
 
 ### Symptom
-- `harness dashboard` logs `sqlite3.DatabaseError: database disk image
+- `harness web` logs `sqlite3.DatabaseError: database disk image
   is malformed`.
 - The dashboard UI shows 500 errors on `/run/schedule` or
   `/sessions/<id>/note`.

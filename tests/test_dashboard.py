@@ -280,13 +280,21 @@ def test_list_memory_files_returns_metadata(tmp_path):
 # 4. dispatch — routes return the right shape
 # ---------------------------------------------------------------------------
 
-def test_dispatch_overview(tmp_path):
+def test_dispatch_root_redirects_to_status(tmp_path):
     cfg = _make_cfg(tmp_path)
-    status, ctype, body = dispatch(cfg, "/")
+    status, _ctype, body = dispatch(cfg, "/")
+    assert status == 302
+    assert body.endswith("/status")
+
+
+def test_dispatch_status_renders_with_side_nav(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    status, ctype, body = dispatch(cfg, "/status")
     assert status == 200
     assert "text/html" in ctype
-    assert "Overview" in body
-    assert "Sessions on disk" in body
+    assert "View Status" in body
+    assert "bx--side-nav" in body
+    assert "bx--side-nav__link--current" in body
 
 
 def test_dispatch_404_for_unknown(tmp_path):
@@ -366,7 +374,7 @@ def _free_port() -> int:
     return port
 
 
-def test_server_round_trip_returns_overview(tmp_path):
+def test_server_root_redirects_to_status_page(tmp_path):
     cfg = _make_cfg(tmp_path)
     cfg.host = "127.0.0.1"
     cfg.port = _free_port()
@@ -375,9 +383,10 @@ def test_server_round_trip_returns_overview(tmp_path):
     try:
         url = f"http://{cfg.host}:{cfg.port}/"
         with urllib.request.urlopen(url, timeout=2.0) as resp:
-            assert resp.status == 200
+            assert resp.status == 200  # urlopen follows 302
             body = resp.read().decode("utf-8")
-        assert "Overview" in body
+        assert "View Status" in body
+        assert "bx--side-nav" in body
     finally:
         handle.shutdown()
 
@@ -415,3 +424,235 @@ def test_server_refuses_to_start_when_token_env_empty(tmp_path, monkeypatch):
     cfg.port = _free_port()
     with pytest.raises(RuntimeError, match="empty"):
         start_server(cfg, blocking=False)
+
+
+# ---------------------------------------------------------------------------
+# Carbon shell & new top-level pages (#15)
+# ---------------------------------------------------------------------------
+
+def _utc_iso(minutes_ago=0):
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def test_layout_renders_carbon_link_and_side_nav(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    assert "carbon-components" in body  # CSS link
+    assert "bx--side-nav" in body
+    # All five top-level items present
+    for label in ("View Status", "Run Harness", "Configure Harness", "View Dashboards", "View Documents"):
+        assert label in body
+
+
+def test_status_page_highlights_status_nav_item(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    # The current item gets a bx--side-nav__link--current class
+    assert 'bx--side-nav__link bx--side-nav__link--current" href="/status"' in body
+
+
+def test_docs_page_highlights_docs_nav_item(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/docs")
+    assert 'bx--side-nav__link bx--side-nav__link--current" href="/docs"' in body
+
+
+# --- View Status ------------------------------------------------------------
+
+def test_status_summarises_today_succeeded_and_failed(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    # One succeeded today
+    _write_session_log(cfg.log_dir, "ok", [
+        {"event": "session_start", "timestamp": _utc_iso(60), "workspace_path": "/w"},
+        {"event": "llm_call", "timestamp": _utc_iso(60), "cost_usd": 0.05, "tokens_in": 10, "tokens_out": 5},
+        {"event": "session_end", "timestamp": _utc_iso(55), "exit_code": 0},
+    ])
+    # One failed today
+    _write_session_log(cfg.log_dir, "bad", [
+        {"event": "session_start", "timestamp": _utc_iso(40), "workspace_path": "/w"},
+        {"event": "session_end", "timestamp": _utc_iso(35), "exit_code": 1},
+    ])
+    _, _, body = dispatch(cfg, "/status")
+    assert "Today" in body
+    # 1 succeeded, 1 failed, 2 completed in the today tile
+    assert "Succeeded" in body and "Failed" in body
+    # Row for the succeeded session shows succeeded tag
+    assert "tag-green" in body
+    assert "tag-red" in body
+    # Open dashboard links exist for both
+    assert "/sessions/ok" in body
+    assert "/sessions/bad" in body
+
+
+def test_status_lists_running_session_with_no_session_end(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    # In-flight CLI session — last event is not session_end
+    _write_session_log(cfg.log_dir, "inflight", [
+        {"event": "session_start", "timestamp": _utc_iso(5), "workspace_path": "/w"},
+        {"event": "llm_call", "timestamp": _utc_iso(3), "cost_usd": 0.01},
+    ])
+    _, _, body = dispatch(cfg, "/status")
+    assert "Running now" in body
+    assert "inflight" in body
+    assert "tag-gray" in body  # source=cli tag
+
+
+# --- View Dashboards --------------------------------------------------------
+
+def test_dashboards_landing_lists_all_tile_links(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/dashboards")
+    for href in ("/status", "/cost", "/sessions", "/schedule", "/index", "/memory", "/live", "/config"):
+        assert f"href='{href}'" in body
+
+
+# --- View Documents ---------------------------------------------------------
+
+def test_docs_index_lists_md_files_only(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.md").write_text("# Alpha\nhello\n")
+    (docs_dir / "notes.txt").write_text("just text\n")
+    (docs_dir / "skip.bin").write_text("binary\n")
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    _, _, body = dispatch(cfg, "/docs")
+    assert "alpha.md" in body
+    assert "notes.txt" in body
+    assert "skip.bin" not in body
+
+
+def test_docs_file_renders_markdown_to_html(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "guide.md").write_text(
+        "# Heading\n\nA **bold** word and *italic*.\n\n"
+        "- item one\n- item two\n\n"
+        "```python\nprint('hi')\n```\n"
+    )
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    status, _, body = dispatch(cfg, "/docs/guide.md")
+    assert status == 200
+    assert "<h1>Heading</h1>" in body
+    assert "<strong>bold</strong>" in body
+    assert "<em>italic</em>" in body
+    assert "<ul>" in body and "<li>item one</li>" in body
+    assert '<code class="language-python">' in body or "<code>print" in body
+    # No download disposition
+    assert "attachment" not in body
+
+
+def test_docs_file_renders_txt_as_escaped_pre(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "raw.txt").write_text("<script>alert(1)</script>\n")
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    status, _, body = dispatch(cfg, "/docs/raw.txt")
+    assert status == 200
+    assert "<pre>" in body
+    # < and > escaped
+    assert "&lt;script&gt;" in body
+    assert "<script>alert" not in body
+
+
+def test_docs_file_rejects_path_traversal(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    secret = tmp_path / "secret.md"
+    secret.write_text("# secret\n")
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    # The regex route allows the chars; the containment check rejects.
+    # urllib-encoded ../ also rejected.
+    status, _, _ = dispatch(cfg, "/docs/..%2Fsecret.md")
+    # Either the route doesn't match (404 from default) or the read returns 404.
+    assert status == 404
+
+
+def test_docs_file_rejects_disallowed_extension(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "thing.bin").write_text("nope\n")
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    # The route regex itself only allows .md/.txt so we expect a 404 from dispatch.
+    status, _, _ = dispatch(cfg, "/docs/thing.bin")
+    assert status == 404
+
+
+# --- Run Harness ------------------------------------------------------------
+
+def test_run_page_renders_form_with_default_writes_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    # Default cfg has writes_enabled=True — the form should render with
+    # no extra flag.
+    cfg = _make_cfg(
+        tmp_path,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    assert cfg.writes_enabled is True
+    _, _, body = dispatch(cfg, "/run")
+    assert ">Run Now</button>" in body
+
+
+def test_run_page_says_writes_disabled_when_explicitly_off(tmp_path):
+    cfg = _make_cfg(tmp_path, writes_enabled=False)
+    _, _, body = dispatch(cfg, "/run")
+    assert "Writes are disabled" in body
+    # Hint points at the config knob, not a CLI flag.
+    assert "dashboard.writes_enabled" in body
+
+
+def test_run_page_renders_form_when_writes_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # Primary buttons
+    assert ">Run Now</button>" in body
+    assert ">Schedule A Run</button>" in body
+    # Hidden CSRF + fire-at-utc inputs
+    assert "name='csrf_token' value='tok'" in body
+    assert "id='fire-at-utc'" in body
+    # Scheduled-runs table heading
+    assert "Scheduled runs" in body
+
+
+# --- Configure Harness ------------------------------------------------------
+
+def test_config_ui_off_when_writes_explicitly_disabled(tmp_path):
+    cfg = _make_cfg(tmp_path, writes_enabled=False)
+    _, _, body = dispatch(cfg, "/config-ui")
+    assert "Writes are disabled" in body
+    assert "dashboard.writes_enabled" in body
+
+
+def test_config_ui_renders_accordion_with_dropdown_for_sandbox_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"sandbox": {"backend": "docker"}}))
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+        config_path=str(config_path),
+    )
+    _, _, body = dispatch(cfg, "/config-ui")
+    # Accordion structure
+    assert "bx--accordion" in body
+    assert "bx--accordion__item" in body
+    # Sandbox section + backend dropdown
+    assert ">sandbox " in body
+    assert "<select" in body and "name='sandbox.backend'" in body
+    # Current value preselected
+    assert "value='docker' selected" in body
+    # Description column populated
+    assert "Sandbox engine" in body
+    # Per-section save button
+    assert "Save sandbox" in body
+    # Deployment.json out-of-scope notice
+    assert "deployment.json" in body

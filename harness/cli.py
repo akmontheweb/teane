@@ -519,7 +519,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Cron-driven scheduled job daemon. Started with `harness schedule
     # run`. Default off. See harness/schedule.py.
     "schedule",
-    # Read-only web dashboard. Started with `harness dashboard`. Default
+    # Read-only web dashboard. Started with `harness web`. Default
     # bind 127.0.0.1; optional bearer-token auth. See harness/dashboard.py.
     "dashboard",
 })
@@ -693,6 +693,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Tier B/C extensions (web app).
         "writes_enabled", "csrf_token_env", "hitl_webhook_secret",
         "web_db_path", "config_path",
+        # Carbon Design System shell + docs viewer.
+        "carbon_css_url", "carbon_js_url", "docs_dir",
     }),
     # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
     "github": frozenset({"gh_path"}),
@@ -842,6 +844,9 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "dashboard.hitl_webhook_secret": (str,),
     "dashboard.web_db_path": (str,),
     "dashboard.config_path": (str,),
+    "dashboard.carbon_css_url": (str,),
+    "dashboard.carbon_js_url": (str,),
+    "dashboard.docs_dir": (str,),
     "github.gh_path": (str,),
     "repo_index.enabled": (bool,),
     "repo_index.backend": (str,),
@@ -5199,7 +5204,11 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    """``harness dashboard`` — start the read-only web UI."""
+    """``harness web`` — start the Carbon-styled web UI with all
+    features (View Status, Run Harness, Configure Harness, View
+    Dashboards, View Documents) enabled by default. Operators can flip
+    ``dashboard.writes_enabled: false`` in ``config.json`` for a
+    read-only deployment."""
     workspace_path = (
         os.path.abspath(args.workspace) if getattr(args, "workspace", None)
         else os.getcwd()
@@ -5222,8 +5231,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         dash_cfg.host = str(args.host)
     if getattr(args, "port", None):
         dash_cfg.port = int(args.port)
-    if getattr(args, "writes_enabled", False):
-        dash_cfg.writes_enabled = True
     try:
         start_server(dash_cfg, blocking=True)
     except RuntimeError as exc:
@@ -6459,9 +6466,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness dashboard` (#14) ---
+    # --- `harness web` (#14) ---
     dashboard_parser = subparsers.add_parser(
-        "dashboard",
+        "web",
         help="Read-only web UI over the harness's on-disk state (sessions, cost, schedule, repo index, memory).",
     )
     dashboard_parser.add_argument(
@@ -6477,14 +6484,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
-    dashboard_parser.add_argument(
-        "--writes-enabled",
-        action="store_true",
-        default=False,
-        help="Enable the editing UI + Run-from-web. Required to render form fields, save config, "
-             "start runs, and intercept HITL gates. Default off (read-only).",
-    )
-
     # --- `harness schedule` (#13) ---
     schedule_parser = subparsers.add_parser(
         "schedule",
@@ -6724,7 +6723,7 @@ def main() -> int:
             return 1
         elif args.command == "chat":
             return asyncio.run(cmd_chat(args))
-        elif args.command == "dashboard":
+        elif args.command == "web":
             return cmd_dashboard(args)
         elif args.command == "schedule":
             action = getattr(args, "schedule_action", None)

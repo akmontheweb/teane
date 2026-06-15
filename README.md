@@ -86,10 +86,14 @@ different host.
 |---------|---------|
 | `harness run` | Execute the full agent graph on a workspace. |
 | `harness resume` | Resume a crashed or interrupted session from its checkpoint. |
+| `harness chat` | Interactive refinement REPL — reuses the gateway, tools, and memory; no auto-apply. |
 | `harness status` | Read-only inspection of a checkpointed session. |
-| `harness doctor` | Run first-run healthchecks (git, API keys, sandbox, DB, config). |
+| `harness doctor` | Run first-run healthchecks (git, API keys, sandbox, DB, MCP servers, config). |
 | `harness purge` | Wipe checkpoint data. |
 | `harness metrics` | Per-session cost / burn-rate / Prometheus aggregation from logs. |
+| `harness index build/status/clear` | Manage the per-workspace semantic retrieval index (TF-IDF default; OpenAI embeddings opt-in). |
+| `harness gh issue/pr-create/pr-comment` | GitHub integration via the `gh` CLI — issue → change-request, PR open, PR comment. |
+| `harness cache clear` | Remove harness-owned Docker cache volumes (idempotent). |
 | `harness --version` | Print the installed harness version and exit. |
 
 ### `harness run`
@@ -118,6 +122,50 @@ different host.
 | `--build-cmd` | Override the build command. |
 | `--allow-network` | Permit outbound network in the sandbox. |
 | `-v`, `--verbose` | Debug-level logging. |
+
+### `harness chat`
+
+Interactive refinement REPL. Reuses the LLM gateway, web/MCP tool
+loop, per-repo memory, and (when enabled) the semantic-retrieval
+index. Patches the LLM emits are NEVER applied automatically — type
+`/apply` to commit them after reviewing.
+
+| Flag | Purpose |
+|------|---------|
+| `-r`, `--workspace` | Workspace path. Defaults to current directory. |
+| `--budget` | Optional per-session USD budget cap. Falls back to `token_budget.hard_cap_usd`. |
+
+In-REPL commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`,
+`/build`, `/save <path>`, `/budget`, `/memory`. Anything not starting
+with `/` is sent to the LLM as a user message.
+
+### `harness index`
+
+Per-workspace semantic retrieval index. When `repo_index.enabled=true`
+the planner queries it for the top-K chunks relevant to the user prompt
+and injects them as a system context block — complements the AST-based
+impact analysis with semantic retrieval. Two backends:
+zero-dependency `tfidf` (default) and opt-in `openai_embeddings`
+(requires `OPENAI_API_KEY`).
+
+| Subcommand | Purpose |
+|------------|---------|
+| `harness index build` | (Re)build the index for the workspace. |
+| `harness index status` | Print backend, chunk count, file count, build timestamp. |
+| `harness index clear` | Wipe the index for the workspace. |
+
+Each accepts `-r/--workspace`.
+
+### `harness gh`
+
+GitHub integration wrapping the `gh` CLI — no new Python deps.
+Authentication is whatever `gh auth status` reports.
+
+| Subcommand | Purpose |
+|------------|---------|
+| `harness gh issue --repo OWNER/NAME --number N` | Pull an issue into `change_requests/CR-N-<slug>.txt` so the existing CR flow processes it. |
+| `harness gh pr-create --title T --body B [--draft]` | Open a PR from the workspace's current branch. |
+| `harness gh pr-comment --repo OWNER/NAME --number N --body B` | Post a comment on an existing PR. |
 
 ### `harness status`
 
@@ -172,12 +220,28 @@ Configuration is layered, with later layers overriding earlier ones:
 3. `<workspace>/.harness_config.json` — per-project overrides; auto-generated
    on first run if missing.
 
-Top-level sections: `build_command`, `allow_network`, `sandbox`,
-`token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`,
-`logging`, `lintgate`, `deployment`, `metrics`. Unknown top-level *and*
-nested keys are warned about at load time with fuzzy-match suggestions —
-see [`docs/SPEC_REQUIREMENTS.md`](docs/SPEC_REQUIREMENTS.md) for the full
-schema.
+Top-level sections (full list, in roughly the order they appear in
+`config/config.json.example`):
+
+| Section | What it governs |
+|---------|-----------------|
+| `build_command`, `allow_network`, `product_spec_dir`, `change_requests_dir` | Workspace + CLI defaults. |
+| `sandbox` | Build-sandbox isolation (`docker` / `unshare` / `bare`), cache mounts, timeouts. |
+| `token_budget`, `node_throttle`, `llm_dispatch` | Spend caps, per-stage iteration limits, per-call max_tokens. `llm_dispatch.prompt_cache_enabled` toggles Anthropic `cache_control` markers + the prefix-stability drift telemetry. |
+| `models`, `model_routing` | Provider registry + per-role routing (planning / patching / repair / doc reviewer / code reviewer / Ollama fallback). |
+| `persistence`, `logging`, `debug`, `metrics` | Checkpoint DB, log dir, LLM-call dumps, Prometheus textfile output. |
+| `lintgate`, `compiler`, `patcher`, `speculative`, `test_generation` | Per-node behaviour knobs. The rebuilt `speculative` section exposes `trigger`, `diversity_mode`, `cost_strategy`, `selection_strategy`, `salvage_strategy`, and `voting` axes. |
+| `web_tools` | `WebFetchSkill` + `WebSearchSkill` exposure to the planner. Default off. |
+| `mcp` | Model Context Protocol client pool (stdio servers, command allowlist). Default off. |
+| `skills` | Runtime-extensible user skills directory (default `~/.harness/skills/`). |
+| `memory` | Per-repo session memory (planner reads prior-session notes; cmd_run appends on exit). Default on. |
+| `repo_index` | Semantic retrieval index. Default off; built via `harness index build`. |
+| `github` | Optional `gh_path` override for the `harness gh` subcommands. |
+| `deployment` | Dockerfile / docker-compose / Caddy artefact generation. |
+
+Unknown top-level *and* nested keys are warned about at load time with
+fuzzy-match suggestions — see [`docs/SPEC_REQUIREMENTS.md`](docs/SPEC_REQUIREMENTS.md)
+and `config/config.json.example` for the full per-key schema.
 
 ## Troubleshooting
 
@@ -236,6 +300,22 @@ pip install -e ".[dev]"
 make hooks-install
 make test
 ```
+
+### Coverage
+
+`make coverage` runs the pack with `pytest-cov`, prints a terminal
+summary, and writes an HTML report under `htmlcov/` plus an XML
+report at `coverage.xml` (handy for CI integrations).
+
+```bash
+make coverage           # terminal + htmlcov/ + coverage.xml
+make coverage SHOW=1    # also open the HTML report in a browser
+```
+
+The report covers the live test count and the percentage line-coverage
+of the `harness/` package. There is **no CI gate** on the coverage
+number today — the metric is for visibility; we'll set a defensible
+floor only after the rapid feature-shipping phase settles.
 
 The pre-commit hook runs the full pytest pack and blocks any commit that
 breaks the framework. GitHub Actions runs the same suite on every push and

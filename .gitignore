@@ -35,6 +35,9 @@ Thumbs.db
 
 # Test artifacts
 .coverage
+.coverage.*
+coverage.xml
+htmlcov/
 .pytest_cache/
 
 # Local agent metadata

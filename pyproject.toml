@@ -31,6 +31,11 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
+    # Coverage reporting consumed by `make coverage`. We deliberately don't
+    # gate CI on a minimum coverage number (yet) — the metric is for
+    # visibility, not a wall. The shipped target emits a terminal summary
+    # plus an HTML report under htmlcov/.
+    "pytest-cov>=5.0.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
     "pre-commit>=3.7.0",
@@ -59,6 +64,33 @@ target-version = "py311"
 # filenames happen to start with `test_` (e.g. harness/test_generation.py,
 # the auto-test-gen graph node) are not picked up as test files.
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# Source we want to measure. Excludes the test pack itself (we measure
+# the production code, not the tests) and vendored grammars / wheels.
+source = ["harness"]
+omit = [
+    "harness/vendor/*",
+    "harness/skills/*",   # markdown style guides, no Python
+    "harness/test_generation.py",  # confusingly-named module, not a test
+]
+# Background async tasks (gateway retries, MCP reader loops, etc.) make
+# concurrent reports unreliable without the multiprocessing concurrency
+# tracker.
+concurrency = ["thread"]
+
+[tool.coverage.report]
+# Skip the summary printout for files where we'd otherwise count
+# completely-unimported modules (e.g. a future provider class that no
+# test exercises yet). Keeps the % meaningful.
+skip_covered = false
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
 
 [tool.mypy]
 python_version = "3.11"

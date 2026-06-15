@@ -1,7 +1,7 @@
 # Auto-generated Makefile by harness
 # Detected project type: Python
 
-.PHONY: build clean test hooks-install release setup
+.PHONY: build clean test coverage hooks-install release setup
 
 # One-shot bootstrap for a fresh machine. Walks the operator through
 # 11 phases: platform / Python / git / sandbox probes → venv → pip
@@ -19,6 +19,25 @@ clean:
 
 test:
 	python -m pytest tests/ -q --tb=short
+
+# Run the pytest pack with coverage measurement. Emits a terminal
+# summary plus an HTML report at htmlcov/index.html. No CI gate
+# on the coverage number — this target is for local visibility.
+# Usage:
+#     make coverage           # measure harness/ package, terminal + HTML
+#     make coverage SHOW=1    # also open the HTML in a browser when done
+coverage:
+	@python -m pytest tests/ \
+	    --cov=harness \
+	    --cov-report=term-missing:skip-covered \
+	    --cov-report=html:htmlcov \
+	    --cov-report=xml:coverage.xml \
+	    -q --tb=short
+	@echo ""
+	@echo "HTML coverage report: htmlcov/index.html"
+	@if [ "$(SHOW)" = "1" ]; then \
+	    python -c "import webbrowser, os; webbrowser.open('file://' + os.path.abspath('htmlcov/index.html'))"; \
+	fi
 
 hooks-install:
 	python -m pre_commit install

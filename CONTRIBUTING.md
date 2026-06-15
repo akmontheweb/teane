@@ -24,8 +24,10 @@ files changed.
 
 **Do not bypass it casually.** The hook exists because:
 
-- Test discipline is the project's main correctness guarantee — 545+ tests
-  cover every module.
+- Test discipline is the project's main correctness guarantee — the
+  pack covers every module. The current count is surfaced live by
+  `make coverage` (terminal summary + HTML report under `htmlcov/`);
+  see the Coverage section in `README.md` for how to run it.
 - A green local hook is what makes the GitHub Actions matrix (3.11/3.12/3.13)
   green too.
 - `git commit --no-verify` is reserved for genuine emergencies (e.g. a flaky

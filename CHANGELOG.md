@@ -213,7 +213,10 @@ GC, model-agnostic gateway (OpenAI / Anthropic / DeepSeek / Ollama),
 three-phase HITL gate (Requirements / Architecture / Deployment),
 tree-sitter-backed multi-stack parsing (Python / Java / Node / Dart /
 Flutter), structured logging with optional LangSmith tracing, and a
-545-test regression pack.
+verified regression pack (current count surfaced via `make coverage`;
+the file's text originally claimed "545 tests" — the actual number
+has been higher since the slice batch landed and the claim has been
+moved out of the docs and into the live make target).
 
 Note: v1.0.0 is the version declared in `pyproject.toml` from project
 inception; it was not git-tagged. The first formal tagged release will

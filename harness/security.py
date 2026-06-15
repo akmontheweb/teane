@@ -972,6 +972,21 @@ _DEFAULT_BLOCK_ON: frozenset[str] = frozenset({"critical", "high"})
 _DEFAULT_WARN_ON: frozenset[str] = frozenset({"medium"})
 _DEFAULT_SCANNERS: tuple[str, ...] = ("gitleaks", "bandit", "semgrep", "trivy")
 
+# Install hints surfaced by `harness doctor` when a scanner binary is not
+# on PATH. Kept here (not in cli.py) so the runtime scanner code and the
+# doctor share one source of truth.
+SCANNER_INSTALL_HINTS: dict[str, str] = {
+    "gitleaks": (
+        "go install github.com/gitleaks/gitleaks/v8@latest"
+        "  # or download from github.com/gitleaks/gitleaks/releases"
+    ),
+    "bandit": "pipx install bandit  # or pip install --user bandit",
+    "semgrep": "pipx install semgrep  # or pip install --user semgrep",
+    "trivy": (
+        "see https://aquasecurity.github.io/trivy/latest/getting-started/installation/"
+    ),
+}
+
 
 @dataclass
 class SecurityScanPolicy:

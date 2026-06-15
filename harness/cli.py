@@ -3653,6 +3653,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Network:    %s", "enabled" if allow_network else "blocked")
     logger.info("  Prompt:     %s", args.prompt[:100] + ("..." if len(args.prompt) > 100 else ""))
     logger.info("  Discovery:  %s", "enabled (--discover)" if getattr(args, "discover", False) else "skipped (pass --discover to enable)")
+    logger.info(
+        "  Deployment: %s",
+        "enabled (--dev-deployment)"
+        if getattr(args, "dev_deployment", False)
+        else "skipped (pass --dev-deployment to deploy locally)",
+    )
     if spec_override:
         logger.info("  Spec:       SPEC_REQUIREMENTS.md (+SPEC_ARCHITECTURE.md) (%d chars)", len(spec_override))
     logger.info("=" * 60)
@@ -3671,6 +3677,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # Discovery runs only when --discover is explicitly passed.
             # --skip-discovery (old flag) is a no-op now but kept for compat.
             skip_discovery=not getattr(args, "discover", False),
+            # When False (default), the security-scan router short-circuits to
+            # END instead of routing into deployment_discovery_node. See
+            # route_after_security_scan in harness/graph.py.
+            dev_deployment=getattr(args, "dev_deployment", False),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(),
@@ -3732,6 +3742,19 @@ async def cmd_run(args: argparse.Namespace) -> int:
         git_guardian.commit_all_changes(session_id, modified_files, exit_code)
         git_guardian.restore_original_branch()
         git_guardian.pop_stash()
+        # When --dev-deployment was not passed, the harness ended right after
+        # the security scan; surface the next step explicitly so operators
+        # upgrading from the old auto-deploy default see why no Dockerfiles
+        # / docker-compose run happened. Flutter projects always end here
+        # regardless of the flag, so the hint is only useful when deployment
+        # would otherwise have run.
+        if not getattr(args, "dev_deployment", False):
+            logger.info(
+                "[cli] Code generated at %s. Deployment phase skipped. "
+                "Re-run with --dev-deployment to bring the app up locally "
+                "via docker compose.",
+                workspace_path,
+            )
     else:
         # Real build failure with no operator intervention — rollback as before.
         git_guardian.rollback(modified_files)
@@ -4345,6 +4368,180 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     return "pass", "live: " + ", ".join(live_present)
 
 
+# Caps the file walk that detects which extensions are present in the
+# workspace. Doctor must stay fast; this is enough to be representative
+# without scanning huge generated/vendored trees.
+_DOCTOR_EXTENSION_SCAN_FILE_LIMIT = 5000
+_DOCTOR_EXTENSION_SCAN_PRUNED_DIRS = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    "dist", "build", ".next", ".cache", "target",
+})
+
+
+def _doctor_workspace_extensions(workspace_path: str) -> set[str]:
+    """Return the set of file extensions present in the workspace.
+
+    Used to suppress formatter rows for languages the project doesn't
+    use — surfacing a missing ``clang-format`` warning on a pure-Python
+    project is noise, not signal. Bounded by file count and skips the
+    usual large directories so doctor stays fast.
+    """
+    present: set[str] = set()
+    if not os.path.isdir(workspace_path):
+        return present
+    seen = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _DOCTOR_EXTENSION_SCAN_PRUNED_DIRS]
+        for name in files:
+            seen += 1
+            if seen > _DOCTOR_EXTENSION_SCAN_FILE_LIMIT:
+                return present
+            ext = os.path.splitext(name)[1].lower()
+            if ext:
+                present.add(ext)
+    return present
+
+
+def _doctor_check_external_tools(
+    config: dict[str, Any],
+    workspace_path: str,
+) -> list[tuple[str, tuple[str, str]]]:
+    """Probe every external binary the harness shells out to.
+
+    Returns one ``(label, (status, detail))`` row per tool so each appears
+    on its own line in the doctor report. Severity is config-aware: a tool
+    is only marked ``fail`` when the operator's configuration actually
+    relies on it (e.g. docker when ``sandbox.backend == "docker"``).
+    Missing optional tools that have a working fallback become ``warn``.
+    Formatter rows are suppressed for extensions that don't appear in the
+    workspace.
+
+    The install hint (from ``security.SCANNER_INSTALL_HINTS`` for the
+    scanners and ``lintgate._DEFAULT_FORMATTERS[*].install_hint`` for the
+    formatters) is appended to the detail line on warn/fail rows.
+    """
+    from harness import lintgate, security
+
+    rows: list[tuple[str, tuple[str, str]]] = []
+
+    def _append(name: str, status: str, detail: str, hint: str = "") -> None:
+        if status in ("warn", "fail") and hint:
+            detail = f"{detail} — install: {hint}"
+        rows.append((f"external: {name}", (status, detail)))
+
+    security_cfg = config.get("security_scan") or config.get("security") or {}
+    enabled_scanners = tuple(security_cfg.get("scanners", security._DEFAULT_SCANNERS))
+
+    # --- Security scanners ---------------------------------------------------
+    for scanner in ("gitleaks", "bandit", "semgrep", "trivy"):
+        hint = security.SCANNER_INSTALL_HINTS.get(scanner, "")
+        if scanner not in enabled_scanners:
+            _append(scanner, "skip", f"not in security.scanners ({list(enabled_scanners)})")
+            continue
+        if shutil.which(scanner) is None:
+            if scanner == "gitleaks":
+                # Real gitleaks falls back to the in-process regex scanner.
+                _append(scanner, "warn", "not on PATH (Python fallback active)", hint)
+            else:
+                # bandit/semgrep/trivy have no in-process fallback — they
+                # are simply skipped when missing, reducing scan coverage.
+                _append(scanner, "warn", "not on PATH (scanner will be skipped)", hint)
+        else:
+            _append(scanner, "pass", "on PATH")
+
+    # --- Sandbox / deployment binaries --------------------------------------
+    sandbox_backend = (config.get("sandbox", {}).get("backend", "auto") or "auto").lower()
+    docker_present = shutil.which("docker") is not None
+    unshare_present = shutil.which("unshare") is not None
+
+    if sandbox_backend == "docker":
+        if docker_present:
+            _append("docker", "pass", "on PATH (sandbox.backend=docker)")
+        else:
+            _append(
+                "docker", "fail",
+                "not on PATH but sandbox.backend=docker",
+                "install Docker Engine: https://docs.docker.com/engine/install/",
+            )
+    elif sandbox_backend == "unshare":
+        _append(
+            "docker", "skip",
+            "sandbox.backend=unshare (docker not required for sandbox)",
+        )
+    elif sandbox_backend == "bare":
+        _append("docker", "skip", "sandbox.backend=bare (no isolation requested)")
+    else:  # auto
+        if docker_present:
+            _append("docker", "pass", "on PATH (sandbox.backend=auto)")
+        elif unshare_present:
+            _append(
+                "docker", "warn",
+                "not on PATH; sandbox.backend=auto will fall back to unshare",
+                "install Docker Engine: https://docs.docker.com/engine/install/",
+            )
+        else:
+            _append(
+                "docker", "fail",
+                "not on PATH and unshare also missing (sandbox.backend=auto)",
+                "install Docker Engine: https://docs.docker.com/engine/install/",
+            )
+
+    deployment_enabled = bool(config.get("deployment", {}).get("enabled", False))
+    compose_present = shutil.which("docker-compose") is not None or (
+        docker_present and _has_docker_compose_subcommand()
+    )
+    if deployment_enabled:
+        if compose_present:
+            _append("docker-compose", "pass", "compose available (deployment.enabled)")
+        else:
+            _append(
+                "docker-compose", "fail",
+                "not available but deployment.enabled=true",
+                "install Docker Compose: https://docs.docker.com/compose/install/",
+            )
+    else:
+        _append(
+            "docker-compose", "skip",
+            "deployment.enabled=false (compose not required)",
+        )
+
+    # --- Formatters / linters from lintgate (per-extension) -----------------
+    present_exts = _doctor_workspace_extensions(workspace_path)
+    seen_commands: set[str] = set()
+    for ext, spec in lintgate._DEFAULT_FORMATTERS.items():
+        if ext not in present_exts:
+            continue
+        for cmd in (spec.command, spec.linter_command):
+            if not cmd or cmd in seen_commands:
+                continue
+            seen_commands.add(cmd)
+            if shutil.which(cmd) is not None:
+                _append(cmd, "pass", f"on PATH (used for {ext} files)")
+            else:
+                _append(
+                    cmd, "warn",
+                    f"not on PATH; {ext} files will skip auto-format",
+                    spec.install_hint,
+                )
+
+    return rows
+
+
+def _has_docker_compose_subcommand() -> bool:
+    """Detect ``docker compose`` (v2 plugin) when the legacy ``docker-compose``
+    binary is absent. Cheap probe; returns False on any error."""
+    if shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
     """Sandbox backend is reachable (docker info / unshare echo)."""
     import shutil
@@ -4683,6 +4880,9 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             ("sandbox backend", _doctor_check_sandbox(config)),
             ("checkpoint db", _doctor_check_checkpoint_db(config)),
         ])
+        # External tools the harness shells out to. Emits one row per
+        # tool so each is visible individually in the report.
+        checks.extend(_doctor_check_external_tools(config, workspace_path))
     else:
         # Config invalid → mark downstream checks as skipped so the
         # operator sees they exist but understands they can't run yet.
@@ -4693,6 +4893,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             ("tree-sitter", ("skip", skipped_detail)),
             ("sandbox backend", ("skip", skipped_detail)),
             ("checkpoint db", ("skip", skipped_detail)),
+            ("external tools", ("skip", skipped_detail)),
         ])
 
     print()
@@ -5123,6 +5324,25 @@ def build_parser() -> argparse.ArgumentParser:
             "pipeline before code generation. Recommended for greenfield "
             "projects or when working from a blank workspace. Skipped by "
             "default for incremental patching sessions."
+        ),
+    )
+    # Deployment phase is OFF by default. After a clean security scan the
+    # harness stops; the operator inspects the generated code and re-runs
+    # with --dev-deployment to enter deployment discovery → DEPLOYMENT_BLUEPRINT
+    # → gatekeeper approval → `docker compose up`. Distinct from config's
+    # `deployment.enabled`, which only gates the final docker step inside
+    # deployment_node — see route_after_security_scan in harness/graph.py.
+    run_parser.add_argument(
+        "--dev-deployment", "--dev_deployment",
+        action="store_true",
+        default=False,
+        dest="dev_deployment",
+        help=(
+            "Continue past the security scan into deployment discovery, "
+            "DEPLOYMENT_BLUEPRINT.md generation, gatekeeper approval, and "
+            "`docker compose up`. Off by default — without this flag, the "
+            "harness stops after a clean security scan and prints the "
+            "workspace path."
         ),
     )
     # Keep --skip-discovery as a no-op alias for backward compatibility

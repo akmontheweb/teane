@@ -23,6 +23,7 @@ from harness.cli import (
     _gatekeeper_auto_approves,
     _read_spec_file,
     build_parser,
+    _doctor_check_external_tools,
 )
 
 
@@ -460,6 +461,29 @@ class TestBuildParser:
         except SystemExit:
             pass  # --help exits, expected
 
+    def test_dev_deployment_defaults_false(self):
+        # Default is opt-in: omit the flag and the harness will stop after
+        # a clean security scan instead of rolling forward into deployment.
+        parser = build_parser()
+        args = parser.parse_args(["run", "-r", "/tmp/x", "-p", "do x"])
+        assert args.dev_deployment is False
+
+    def test_dev_deployment_set_when_flag_passed(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run", "-r", "/tmp/x", "-p", "do x", "--dev-deployment"]
+        )
+        assert args.dev_deployment is True
+
+    def test_dev_deployment_underscore_alias(self):
+        # The flag also accepts the underscore form so users can pass
+        # --dev_deployment without thinking about the canonical spelling.
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run", "-r", "/tmp/x", "-p", "do x", "--dev_deployment"]
+        )
+        assert args.dev_deployment is True
+
 
 # ---------------------------------------------------------------------------
 # Interactive review loop (kept from prior file; unrelated to config change)
@@ -511,3 +535,118 @@ class TestInteractiveReviewLoopAsync:
 
         assert "Refined" in result
         assert "feedback notes" in result
+
+
+# ---------------------------------------------------------------------------
+# _doctor_check_external_tools — external-binary detection rows
+# ---------------------------------------------------------------------------
+
+class TestDoctorExternalTools:
+    """Verify the external-tools doctor check produces the right severity
+    and install-hint surface for each tool. ``shutil.which`` is monkeypatched
+    at the ``harness.cli`` module so both the in-helper lookups and the
+    docker-compose v2 probe share the fake."""
+
+    @staticmethod
+    def _config(scanners=None, sandbox_backend="auto", deployment_enabled=False):
+        cfg = {
+            "sandbox": {"backend": sandbox_backend},
+            "deployment": {"enabled": deployment_enabled},
+        }
+        if scanners is not None:
+            cfg["security_scan"] = {"scanners": list(scanners)}
+        return cfg
+
+    @staticmethod
+    def _rows_by_name(rows):
+        # rows are (label, (status, detail)); strip the "external: " prefix.
+        return {label.removeprefix("external: "): (status, detail)
+                for label, (status, detail) in rows}
+
+    def test_gitleaks_missing_warns_with_install_hint(self, tmp_path, monkeypatch):
+        import harness.cli as cli_mod
+
+        def fake_which(name):
+            return None if name == "gitleaks" else f"/usr/bin/{name}"
+        monkeypatch.setattr(cli_mod.shutil, "which", fake_which)
+
+        cfg = self._config(scanners=["gitleaks"])
+        rows = self._rows_by_name(_doctor_check_external_tools(cfg, str(tmp_path)))
+
+        assert "gitleaks" in rows
+        status, detail = rows["gitleaks"]
+        assert status == "warn"
+        assert "Python fallback" in detail
+        assert "install:" in detail
+        assert "gitleaks" in detail  # hint references the binary
+
+    def test_all_security_tools_present_pass(self, tmp_path, monkeypatch):
+        import harness.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+        # Avoid `docker compose version` actually running.
+        monkeypatch.setattr(
+            cli_mod, "_has_docker_compose_subcommand", lambda: True,
+        )
+
+        cfg = self._config(scanners=["gitleaks", "bandit", "semgrep", "trivy"])
+        rows = self._rows_by_name(_doctor_check_external_tools(cfg, str(tmp_path)))
+
+        for scanner in ("gitleaks", "bandit", "semgrep", "trivy"):
+            assert rows[scanner][0] == "pass", rows[scanner]
+        assert rows["docker"][0] == "pass"
+
+    def test_docker_missing_with_docker_backend_fails(self, tmp_path, monkeypatch):
+        import harness.cli as cli_mod
+
+        def fake_which(name):
+            return None if name == "docker" else f"/usr/bin/{name}"
+        monkeypatch.setattr(cli_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(
+            cli_mod, "_has_docker_compose_subcommand", lambda: False,
+        )
+
+        cfg = self._config(sandbox_backend="docker")
+        rows = self._rows_by_name(_doctor_check_external_tools(cfg, str(tmp_path)))
+
+        assert rows["docker"][0] == "fail"
+        assert "install:" in rows["docker"][1]
+
+    def test_no_formatter_row_for_absent_extension(self, tmp_path, monkeypatch):
+        import harness.cli as cli_mod
+
+        # Workspace contains only .py files → no clang-format / prettier rows.
+        (tmp_path / "a.py").write_text("print('hi')\n")
+        (tmp_path / "b.py").write_text("x = 1\n")
+
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            cli_mod, "_has_docker_compose_subcommand", lambda: False,
+        )
+
+        cfg = self._config(scanners=["gitleaks"])
+        rows = self._rows_by_name(_doctor_check_external_tools(cfg, str(tmp_path)))
+
+        # Negative assertions: tools tied to extensions we didn't create
+        # must NOT produce rows.
+        for missing in ("clang-format", "prettier", "rustfmt", "gofmt", "shfmt"):
+            assert missing not in rows, f"unexpected row for {missing}: {rows[missing]}"
+        # Positive: ruff (the .py formatter) should be present, as a warn.
+        assert "ruff" in rows
+        assert rows["ruff"][0] == "warn"
+
+    def test_disabled_scanner_is_skipped_not_warned(self, tmp_path, monkeypatch):
+        import harness.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(
+            cli_mod, "_has_docker_compose_subcommand", lambda: False,
+        )
+
+        # Operator opted out of trivy → its missing binary is informational,
+        # not a warning.
+        cfg = self._config(scanners=["gitleaks", "bandit", "semgrep"])
+        rows = self._rows_by_name(_doctor_check_external_tools(cfg, str(tmp_path)))
+
+        assert rows["trivy"][0] == "skip"
+        assert rows["gitleaks"][0] == "warn"

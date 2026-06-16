@@ -247,21 +247,26 @@ _PRODUCT_SPEC_DIR_NAME = "product_spec"
 _SPEC_ALLOWED_EXTS = frozenset({".txt", ".md"})
 _SKILL_ALLOWED_EXT = ".py"
 _MAX_SKILL_BYTES = 256 * 1024  # individual skill source files stay small
-_SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _MEMORY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
+_FILENAME_MAX_LEN = 255
 
 
 def _safe_basename(filename: str) -> str:
     """Strip directory components and reject empty / traversal names.
 
     Returns ``""`` for unsafe input so callers can surface a 400.
+    Spaces and other printable characters are allowed; only path
+    separators (already stripped by ``os.path.basename``), null bytes,
+    and other control characters are rejected.
     """
     if not filename:
         return ""
     base = os.path.basename(filename.replace("\\", "/"))
     if not base or base in {".", ".."}:
         return ""
-    if "\x00" in base or not _SAFE_FILENAME_RE.match(base):
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in base):
+        return ""
+    if len(base.encode("utf-8")) > _FILENAME_MAX_LEN:
         return ""
     return base
 

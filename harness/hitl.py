@@ -330,10 +330,41 @@ class HttpChannel(HitlChannel):
         """
         POST ``payload`` to the webhook URL and return the ``answer`` string.
         Retries on transient network errors; returns ``default_answer`` on failure.
+
+        Emits ``hitl_pending`` / ``hitl_resolved`` structured events into
+        the per-session JSONL so the dashboard's SSE stream can surface
+        the HITL banner the instant the prompt is sent — and clear it
+        the instant the operator's answer comes back. The harness uses
+        ``emit_event`` (deferred import) to avoid bootstrap-order tangles.
         """
         headers = {"Content-Type": "application/json"}
         if self._secret:
             headers["X-Harness-Signature"] = self._sign(payload)
+
+        # Decode just enough metadata for the structured event. The
+        # payload was JSON-encoded in ``_build_payload`` immediately
+        # before this call, so ``json.loads`` here is cheap and reliable.
+        meta_type = ""
+        meta_message = ""
+        try:
+            meta = json.loads(payload.decode("utf-8"))
+            meta_type = str(meta.get("type", ""))
+            meta_message = str(meta.get("message", ""))[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from harness.observability import emit_event
+            # Avoid kwarg names that collide with reserved LogRecord
+            # attributes (``message`` / ``asctime`` raise KeyError when
+            # passed via ``extra=``); ``prompt_message`` is a safe alias.
+            emit_event(
+                "hitl_pending",
+                hitl_type=meta_type,
+                webhook_url=self.url,
+                prompt_message=meta_message,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
@@ -347,7 +378,17 @@ class HttpChannel(HitlChannel):
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read().decode("utf-8")
                     data = json.loads(raw)
-                    return str(data.get("answer", default_answer))
+                    answer = str(data.get("answer", default_answer))
+                    try:
+                        from harness.observability import emit_event
+                        emit_event(
+                            "hitl_resolved",
+                            hitl_type=meta_type,
+                            answer=answer[:200],
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return answer
             except urllib.error.HTTPError as exc:
                 logger.warning(
                     "[hitl:http] Webhook returned HTTP %d on attempt %d/%d.",

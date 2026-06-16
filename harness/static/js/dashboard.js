@@ -344,6 +344,102 @@
   // opt out (e.g. /hitl/webhook, which uses a shared secret, not CSRF)
   // can set data-no-csrf-intercept.
 
+  // Operator-console slot helpers — see wireFormCsrf for entry point.
+  // The HITL pending card lives in #hitl-pending-slot; the chat-notes
+  // card lives in #chat-notes-slot. Both expose a /sessions/{sid}/...
+  // .html fragment endpoint that returns just their inner content so
+  // we can swap on submit + on SSE-driven HITL events without touching
+  // anything else on the page.
+
+  function getSessionIdFromSlot(slotId) {
+    var slot = document.getElementById(slotId);
+    return slot ? (slot.getAttribute("data-session-id") || "") : "";
+  }
+
+  function refreshSlot(slotId, urlBuilder) {
+    var slot = document.getElementById(slotId);
+    if (!slot) return Promise.resolve();
+    var sid = slot.getAttribute("data-session-id") || "";
+    if (!sid) return Promise.resolve();
+    return fetch(urlBuilder(sid), {
+      credentials: "same-origin",
+      headers: { "Accept": "text/html" },
+    }).then(function (resp) {
+      if (!resp.ok) return;
+      return resp.text().then(function (text) {
+        slot.innerHTML = text;
+        // Auto-focus the first HITL choice input if the slot now holds
+        // a pending prompt — same UX as the server-side render.
+        var first = slot.querySelector("input[name='choice']");
+        if (first) try { first.focus(); } catch (_e) { /* no-op */ }
+      });
+    }).catch(function () { /* leave stale HTML on transient failure */ });
+  }
+
+  function refreshHitlSlot() {
+    return refreshSlot("hitl-pending-slot", function (sid) {
+      return "/sessions/" + encodeURIComponent(sid) + "/hitl/pending.html";
+    });
+  }
+
+  function refreshChatNotesSlot() {
+    return refreshSlot("chat-notes-slot", function (sid) {
+      return "/sessions/" + encodeURIComponent(sid) + "/notes.html";
+    });
+  }
+
+  function submitAjaxSlotForm(form, action, submitter, kind) {
+    var csrf = readCookie("csrf_token");
+    var body = new URLSearchParams();
+    new FormData(form).forEach(function (v, k) {
+      body.append(k, typeof v === "string" ? v : "");
+    });
+    if (submitter && submitter.name) {
+      body.append(submitter.name, submitter.value || "");
+    }
+    var errEl = form.querySelector(
+      kind === "hitl-answer" ? ".hitl-form-error" : ".chat-note-error"
+    );
+    if (errEl) errEl.textContent = "";
+    var prevDisabled = false;
+    if (submitter && "disabled" in submitter) {
+      prevDisabled = submitter.disabled;
+      submitter.disabled = true;
+    }
+    fetch(action, {
+      method: "POST",
+      body: body.toString(),
+      credentials: "same-origin",
+      redirect: "follow",
+      headers: {
+        "X-CSRF-Token": csrf,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+    }).then(function (resp) {
+      return resp.text().then(function (text) {
+        if (!resp.ok) {
+          var msg = (text || "").trim() || ("Submit failed (" + resp.status + ")");
+          if (errEl) errEl.textContent = msg.slice(0, 240);
+          else toast(msg.slice(0, 240), "error");
+          if (submitter && "disabled" in submitter) submitter.disabled = prevDisabled;
+          return;
+        }
+        if (kind === "hitl-answer") {
+          // Drain the answered prompt + any further pending entries.
+          refreshHitlSlot();
+          refreshChatNotesSlot();  // answering a HITL also drains queued notes
+        } else {
+          refreshChatNotesSlot();
+        }
+      });
+    }).catch(function (err) {
+      var msg = "Submit failed: " + (err && err.message ? err.message : err);
+      if (errEl) errEl.textContent = msg.slice(0, 240);
+      else toast(msg, "error");
+      if (submitter && "disabled" in submitter) submitter.disabled = prevDisabled;
+    });
+  }
+
   function wireFormCsrf() {
     document.addEventListener("submit", function (evt) {
       var form = evt.target;
@@ -355,6 +451,16 @@
       if (method.toLowerCase() !== "post") return;
       var action = (submitter && submitter.getAttribute("formaction")) ||
                    form.action || window.location.href;
+
+      // Operator-console AJAX path: HITL answers and chat-notes refresh
+      // just their own DOM slot instead of reloading the whole page, so
+      // SSE log streams keep running and scroll position is preserved.
+      var ajaxKind = form.getAttribute("data-ajax");
+      if (ajaxKind === "hitl-answer" || ajaxKind === "chat-note") {
+        evt.preventDefault();
+        submitAjaxSlotForm(form, action, submitter, ajaxKind);
+        return;
+      }
 
       evt.preventDefault();
 
@@ -545,6 +651,15 @@
       try { data = JSON.parse(evt.data); } catch (_e) { data = { raw: evt.data }; }
       var kind = (data && data.event) || "unknown";
       var ts = (data && data.timestamp) || "";
+      // Phase 2: live HITL surfacing. When the harness's HttpChannel
+      // emits hitl_pending the dashboard's SSE stream delivers it here;
+      // refreshing the slot pulls the rendered form HTML (idempotent —
+      // empty when nothing's pending). hitl_resolved fires when the
+      // operator answers from a different tab; refreshing clears stale
+      // state without a full page reload.
+      if (kind === "hitl_pending" || kind === "hitl_resolved") {
+        refreshHitlSlot();
+      }
       var rest = Object.assign({}, data);
       delete rest.event;
       delete rest.timestamp;

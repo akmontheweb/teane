@@ -383,6 +383,36 @@ pre code { background: transparent; padding: 0; }
   overflow-x: auto;
 }
 
+/* Run console — chrome bar at the top of /run/console/{sid}.
+   Flex row: title left, exited-status tag center, Close console right. */
+.run-console-chrome {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 1px 0 rgba(22, 22, 22, 0.04);
+}
+.run-console-chrome__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+.run-console-chrome__title code {
+  font-weight: 400;
+  color: var(--c-text-soft);
+}
+.run-console-chrome__status { margin-left: var(--space-2); }
+.run-console-chrome .btn-close-console { margin-left: auto; }
+
+/* When the harness subprocess has exited, dim the chat-notes panel so
+   operators see at a glance that input no longer reaches a live run. */
+.run-console--exited #chat-notes-slot textarea,
+.run-console--exited #chat-notes-slot button { opacity: 0.55; pointer-events: none; }
+
 /* Pending HITL banner — sticky to viewport top so operators see it while
    scrolling event/stdout streams. Warn-color border + tinted bg lifts it
    above the standard .card chrome. */

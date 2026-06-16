@@ -886,6 +886,331 @@ def test_tail_session_stdout_yields_lines_then_exits(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Operator console — Currently Running list on /run + /run/console/{sid}
+# ---------------------------------------------------------------------------
+
+def test_run_page_shows_currently_running_with_pid(tmp_path):
+    """Operators need a way back into a live run from /run without
+    fishing through the historical session list. The Currently Running
+    card lists each registered subprocess with session id, started time,
+    PID, workspace, and a Console link. Without the PID column an
+    operator can't correlate the entry to ``ps`` / ``kill -9``."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        from harness.web_state import WebProcess
+        # The registry prunes entries whose PID is no longer alive
+        # before returning list_running() — use this test process's own
+        # PID so the fake entry survives the pruning pass.
+        live_pid = os.getpid()
+        reg = get_process_registry()
+        reg.register(WebProcess(
+            session_id="web-livethere",
+            pid=live_pid,
+            argv=["harness", "run"],
+            log_path=os.path.join(os.path.expanduser(cfg.log_dir),
+                                  "web-livethere.jsonl"),
+            workspace_path=str(tmp_path),
+            prompt="example",
+        ))
+        req = urllib.request.Request(
+            base_url + "/run",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        # Currently Running card + table id
+        assert "Currently running" in body
+        assert "running-runs-table" in body
+        # Session id, PID, and Console link must all be present
+        assert "web-livethere" in body
+        assert str(live_pid) in body
+        assert "/run/console/web-livethere" in body
+    finally:
+        handle.shutdown()
+
+
+def test_run_page_shows_no_runs_in_progress_when_empty(tmp_path):
+    """When no registered processes are running, the Currently Running
+    card still renders with a muted 'No runs in progress.' placeholder
+    rather than vanishing — operators rely on its presence to know the
+    feature exists."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        req = urllib.request.Request(
+            base_url + "/run",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        assert "Currently running" in body
+        assert "No runs in progress." in body
+    finally:
+        handle.shutdown()
+
+
+def test_run_console_returns_200_for_known_session(tmp_path):
+    """/run/console/{sid} is the operator's live cockpit for an active
+    run. It must render with the Close-console button (back to /run)
+    and the same content panels the historical session view uses."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "sess-cn.jsonl"), "w") as f:
+            f.write(json.dumps({"event": "session_start"}) + "\n")
+        req = urllib.request.Request(
+            base_url + "/run/console/sess-cn",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        assert "run-console-chrome" in body
+        assert "Close console" in body
+        assert "href='/run'" in body or 'href="/run"' in body
+        # The slot wrappers and SSE streams must render via the shared
+        # _render_session_with_hitl content.
+        assert "id='hitl-pending-slot'" in body or 'id="hitl-pending-slot"' in body
+        assert "id='stdout-stream'" in body or 'id="stdout-stream"' in body
+    finally:
+        handle.shutdown()
+
+
+def test_run_console_returns_404_for_unknown_session(tmp_path):
+    """A stale Console link (process gone, no on-disk log) must 404 so
+    the operator sees the broken URL instead of a confusing empty page."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(
+                base_url + "/run/console/nope-not-a-session",
+                timeout=4.0,
+            )
+        assert exc.value.code == 404
+    finally:
+        handle.shutdown()
+
+
+def test_run_console_marks_exited_when_process_terminated(tmp_path):
+    """For an exited run, the console keeps working (streams are
+    scrollable) but shows an 'Exited' tag and applies the
+    ``run-console--exited`` wrapper so CSS can dim the chat textarea."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    try:
+        from harness.web_state import WebProcess
+        reg = get_process_registry()
+        reg.register(WebProcess(
+            session_id="sess-done",
+            pid=1,
+            argv=[],
+            log_path=os.path.join(os.path.expanduser(cfg.log_dir),
+                                  "sess-done.jsonl"),
+        ))
+        reg.mark_terminated("sess-done", 0)
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "sess-done.jsonl"), "w") as f:
+            f.write(json.dumps({"event": "session_end", "exit_code": 0}) + "\n")
+        body = urllib.request.urlopen(
+            base_url + "/run/console/sess-done", timeout=4.0,
+        ).read().decode("utf-8")
+        assert "run-console--exited" in body
+        assert "Exited (code 0)" in body
+    finally:
+        handle.shutdown()
+
+
+def test_run_now_redirects_to_console(tmp_path, monkeypatch):
+    """After Run Now the operator must land on /run/console/{sid} so
+    the cockpit (live logs + inline HITL) opens immediately — NOT on
+    the historical session-detail page. The earlier UX bounced through
+    /sessions/{sid} which sat under Dashboards; operators read that as
+    'I got sent away from my run'."""
+    import subprocess
+
+    captured: dict = {}
+
+    class _StubPopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            self.pid = 12345
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _StubPopen)
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        # Disable urllib auto-follow so we can read the 303 Location.
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPRedirectHandler()  # default behaviour
+        )
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_a, **_kw):  # noqa: D401
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
+        data = urllib.parse.urlencode({
+            "workspace": str(tmp_path),
+            "prompt": "demo",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            base_url + "/run/now", data=data, method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-Token": csrf,
+                "Cookie": f"csrf_token={csrf}",
+            },
+        )
+        try:
+            resp = opener.open(req, timeout=4.0)
+            assert resp.status == 303
+            location = resp.headers.get("Location", "")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 303
+            location = exc.headers.get("Location", "")
+        assert location.startswith("/run/console/")
+    finally:
+        handle.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Operator console — AJAX slot endpoints + harness hitl_pending events
+# ---------------------------------------------------------------------------
+
+def test_hitl_pending_html_returns_card_html(tmp_path):
+    """The /sessions/{sid}/hitl/pending.html fragment endpoint powers
+    the SSE-driven live banner refresh — it returns just the HITL card
+    markup so the JS can swap ``#hitl-pending-slot`` innerHTML in place
+    without touching the rest of the page."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-ajax",
+            session_id="sess-ajax",
+            prompt={"gate": "REQUIREMENTS", "question": "approve?"},
+        )
+        req = urllib.request.Request(
+            base_url + "/sessions/sess-ajax/hitl/pending.html",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        resp = urllib.request.urlopen(req, timeout=4.0)
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type", "").startswith("text/html")
+        body = resp.read().decode("utf-8")
+        assert "hitl-alert" in body
+        assert "req-ajax" in body
+        assert "data-ajax='hitl-answer'" in body
+    finally:
+        handle.shutdown()
+
+
+def test_hitl_pending_html_returns_empty_when_nothing_pending(tmp_path):
+    """When no HITL is queued, the fragment endpoint returns an empty
+    body — JS uses that to clear the slot without a special-case."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    try:
+        resp = urllib.request.urlopen(
+            base_url + "/sessions/sess-empty/hitl/pending.html",
+            timeout=4.0,
+        )
+        assert resp.status == 200
+        assert resp.read().decode("utf-8") == ""
+    finally:
+        handle.shutdown()
+
+
+def test_notes_html_returns_chat_panel(tmp_path):
+    """/sessions/{sid}/notes.html powers the live chat-notes slot
+    refresh after a note submit. Must return the queued-notes list +
+    the textarea form."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    try:
+        resp = urllib.request.urlopen(
+            base_url + "/sessions/sess-notes/notes.html",
+            timeout=4.0,
+        )
+        assert resp.status == 200
+        body = resp.read().decode("utf-8")
+        assert "Chat notes" in body
+        assert "data-ajax='chat-note'" in body
+        # The CSRF field has to be present — JS sends X-CSRF-Token but
+        # the server also re-validates the form body field defensively.
+        assert "name='csrf_token'" in body
+    finally:
+        handle.shutdown()
+
+
+def test_http_channel_emits_hitl_pending_and_resolved_events(tmp_path):
+    """Phase 2 contract: HttpChannel._post emits ``hitl_pending`` to
+    the session JSONL right before the webhook POST, and
+    ``hitl_resolved`` immediately after the operator's answer comes
+    back. The dashboard's SSE stream relays these so the banner appears
+    / disappears in ~100ms — no polling, no page refresh."""
+    import logging
+    from harness.hitl import HttpChannel
+
+    captured: list[logging.LogRecord] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    cap = _Cap()
+    events_logger = logging.getLogger("harness.events")
+    events_logger.addHandler(cap)
+    events_logger.setLevel(logging.INFO)
+    try:
+        channel = HttpChannel("http://127.0.0.1:1/hitl/webhook", timeout=1.0,
+                              max_retries=0)
+
+        import urllib.request as _ur
+
+        class _StubResp:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        def _stub_urlopen(req, timeout=None):
+            return _StubResp(json.dumps({"answer": "a"}).encode("utf-8"))
+
+        original = _ur.urlopen
+        _ur.urlopen = _stub_urlopen  # type: ignore[assignment]
+        try:
+            out = channel.prompt("approve?", options=["a", "e"], default="e")
+            assert out == "a"
+        finally:
+            _ur.urlopen = original  # type: ignore[assignment]
+
+        kinds = [getattr(r, "event", None) for r in captured]
+        assert "hitl_pending" in kinds
+        assert "hitl_resolved" in kinds
+        # hitl_pending should fire BEFORE hitl_resolved.
+        assert kinds.index("hitl_pending") < kinds.index("hitl_resolved")
+    finally:
+        events_logger.removeHandler(cap)
+
+
+# ---------------------------------------------------------------------------
 # 9c. spawn_harness_run propagates the operator-wait timeout to the harness
 # ---------------------------------------------------------------------------
 

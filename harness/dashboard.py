@@ -1375,6 +1375,63 @@ def _route_session_detail(cfg: DashboardConfig, params: dict[str, str]) -> tuple
     )
 
 
+def _render_run_console_chrome(cfg: DashboardConfig, sid: str) -> str:
+    """Thin top bar for the operator console: "Run console — {sid}" on
+    the left, an Exited tag when the registry shows the process has
+    terminated, and a Close console button that returns to /run."""
+    proc = None
+    try:
+        proc = get_process_registry().get(sid)
+    except Exception:  # noqa: BLE001
+        proc = None
+    status_html = ""
+    if proc is not None and not proc.is_running:
+        ec = proc.exit_code
+        tag_class = "tag-green" if ec == 0 else "tag-red"
+        status_html = (
+            f"<span class='tag {tag_class} run-console-chrome__status'>"
+            f"Exited (code {int(ec) if ec is not None else 0})</span>"
+        )
+    return (
+        "<div class='run-console-chrome'>"
+        f"<h2 class='run-console-chrome__title'>Run console "
+        f"<code>{_esc(sid)}</code></h2>"
+        f"{status_html}"
+        "<a href='/run' class='bx--btn bx--btn--tertiary btn-close-console' "
+        "aria-label='Close console and return to Run Harness'>"
+        "<span aria-hidden='true'>&times;</span> Close console</a>"
+        "</div>"
+    )
+
+
+def _route_run_console(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    """Operator console: live cockpit for a single running (or recently
+    exited) harness subprocess. Reuses ``_render_session_with_hitl`` for
+    the content panels and wraps a Close-console chrome bar around them.
+    Returns 404 only when neither the registry nor the on-disk session
+    log knows about ``sid`` — a stale URL the operator can't act on."""
+    sid = params["sid"]
+    proc = None
+    try:
+        proc = get_process_registry().get(sid)
+    except Exception:  # noqa: BLE001
+        proc = None
+    log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{sid}.jsonl")
+    if proc is None and not os.path.isfile(log_path):
+        return 404, "text/plain; charset=utf-8", f"unknown session {sid}\n"
+    exited = proc is not None and not proc.is_running
+    wrapper_class = "run-console run-console--exited" if exited else "run-console"
+    body = (
+        f"<div class='{wrapper_class}'>"
+        + _render_run_console_chrome(cfg, sid)
+        + _render_session_with_hitl(cfg, sid)
+        + "</div>"
+    )
+    return 200, "text/html; charset=utf-8", _layout(
+        f"Run console — {sid}", body, cfg, active="run",
+    )
+
+
 def _route_cost(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
     return 200, "text/html; charset=utf-8", _layout("Cost burn", _render_cost(cfg), cfg, active="dashboards")
 
@@ -1892,7 +1949,46 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
 </script>
 """
 
+    # Currently running web-spawned harness processes. The Console link
+    # opens the live cockpit (logs + chat + HITL) for each entry; the
+    # operator can leave the console at any time and the registry entry
+    # stays here until the subprocess exits + the terminated-TTL expires.
+    try:
+        running = get_process_registry().list_running()
+    except Exception:  # noqa: BLE001
+        running = []
+    if running:
+        from datetime import datetime as _dt, timezone as _tz
+        running_rows = []
+        for proc in running:
+            started_iso = _dt.fromtimestamp(
+                proc.started_at, tz=_tz.utc,
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            running_rows.append(
+                "<tr>"
+                f"<td><code>{_esc(proc.session_id)}</code></td>"
+                f"<td>{_esc(started_iso)}</td>"
+                f"<td><code>{int(proc.pid)}</code></td>"
+                f"<td>{_esc(proc.workspace_path)}</td>"
+                f"<td><a class='bx--btn bx--btn--tertiary bx--btn--sm' "
+                f"href='/run/console/{_esc(proc.session_id)}'>"
+                f"{_icon('terminal')}Console</a></td>"
+                "</tr>"
+            )
+        running_html = (
+            "<div class='table-wrap'><table id='running-runs-table'>"
+            "<thead><tr><th>Session</th><th>Started</th><th>PID</th>"
+            "<th>Workspace</th><th></th></tr></thead>"
+            "<tbody>" + "".join(running_rows) + "</tbody></table></div>"
+        )
+    else:
+        running_html = "<p class='muted'>No runs in progress.</p>"
+
     return f"""{form}
+<div class='card'>
+  <h2>Currently running</h2>
+  {running_html}
+</div>
 <div class='card'>
   <h2>Scheduled runs</h2>
   {pending_html}
@@ -3174,7 +3270,7 @@ def make_request_handler(
                 self._send(500, "text/plain", f"spawn failed: {exc}\n")
                 return
             self.send_response(303)
-            self.send_header("Location", f"/sessions/{wp.session_id}")
+            self.send_header("Location", f"/run/console/{wp.session_id}")
             self.end_headers()
 
         def _handle_run_resume(self, form: dict[str, Any]) -> None:
@@ -3220,7 +3316,7 @@ def make_request_handler(
                 self._send(500, "text/plain", f"resume spawn failed: {exc}\n")
                 return
             self.send_response(303)
-            self.send_header("Location", f"/sessions/{wp.session_id}")
+            self.send_header("Location", f"/run/console/{wp.session_id}")
             self.end_headers()
 
         def _handle_run_schedule(self, form: dict[str, Any]) -> None:
@@ -4489,6 +4585,83 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
     )
 
 
+def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
+    """Render every currently-pending HITL card for ``session_id``.
+
+    Returns the inner HTML for the ``#hitl-pending-slot`` placeholder —
+    empty string when nothing is pending. Used both at first page render
+    (`_render_session_with_hitl`) and by the live-refresh endpoint that
+    the SSE-driven JS calls when a ``hitl_pending`` event arrives."""
+    csrf_token = resolve_csrf_token(cfg) or ""
+    csrf_field = (
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+    )
+    pending = get_hitl_queue().list_pending_for_session(session_id)
+    if not pending:
+        return ""
+    rows: list[str] = []
+    for idx, p in enumerate(pending):
+        prompt_text = html.escape(json.dumps(p.prompt, indent=2, default=str))
+        if cfg.writes_enabled and csrf_token:
+            autofocus = " autofocus" if idx == 0 else ""
+            form_html = (
+                f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer' "
+                "data-ajax='hitl-answer'>"
+                f"{csrf_field}"
+                f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
+                "<label>Choice (a/e/m/s)<br>"
+                f"<input type='text' name='choice' placeholder='a' required{autofocus}></label><br><br>"
+                "<label>Extra notes (optional)<br>"
+                "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
+                "<p><button>Submit decision</button></p>"
+                "<p class='hitl-form-error muted' role='alert'></p>"
+                "</form>"
+            )
+        else:
+            form_html = (
+                "<p class='muted'>Writes disabled — answer this prompt via "
+                f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
+                "with an authenticated client.</p>"
+            )
+        rows.append(
+            f"<div class='card hitl-alert'><h3>HITL pending — {_esc(p.request_id)}</h3>"
+            f"<pre>{prompt_text}</pre>"
+            f"{form_html}</div>"
+        )
+    return "".join(rows)
+
+
+def _render_chat_notes_card(cfg: DashboardConfig, session_id: str) -> str:
+    """Render the chat-notes card body — queued-notes list + textarea
+    form. Returns empty string when writes are disabled. Used at first
+    render and by the live-refresh endpoint after a note submit."""
+    csrf_token = resolve_csrf_token(cfg) or ""
+    if not (cfg.writes_enabled and csrf_token):
+        return ""
+    csrf_field = (
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+    )
+    try:
+        notes = pending_chat_notes(db_path=cfg.web_db_path, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        notes = []
+    note_rows = "".join(
+        f"<li>{html.escape(n['note'])} <span class='muted'>(queued {n['ts']})</span></li>"
+        for n in notes
+    )
+    return (
+        "<div class='card'><h3>Chat notes (queued for next HITL)</h3>"
+        f"<ul>{note_rows or '<li class=muted>none queued</li>'}</ul>"
+        f"<form method='post' action='/sessions/{_esc(session_id)}/note' "
+        "data-ajax='chat-note'>"
+        f"{csrf_field}"
+        "<textarea name='note' rows='3' cols='80' placeholder='Note to ride into the next HITL prompt'></textarea>"
+        "<p><button>Queue note</button></p>"
+        "<p class='chat-note-error muted' role='alert'></p>"
+        "</form></div>"
+    )
+
+
 def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
     """Detailed per-session view that includes pending HITL prompts +
     a queued-notes panel when writes are enabled.
@@ -4497,61 +4670,24 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
     render at the top with sticky-banner styling so they remain visible
     while the operator scrolls through events. Live streams (JSONL +
     raw stdout) sit at the bottom for the tail-style view operators
-    expect during a run."""
+    expect during a run.
+
+    The HITL card and chat-notes card live inside ID'd slots so the
+    SSE-driven JS can swap their inner HTML in place when a HITL
+    arrives or a chat note is queued — no page reload."""
     log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
     parts: list[str] = []
-    csrf_token = resolve_csrf_token(cfg) or ""
-    csrf_field = (
-        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+    parts.append(
+        f"<div id='hitl-pending-slot' data-session-id='{_esc(session_id)}'>"
+        + _render_pending_hitl_rows(cfg, session_id)
+        + "</div>"
     )
-    q = get_hitl_queue()
-    pending = q.list_pending_for_session(session_id)
-    if pending:
-        rows = []
-        for idx, p in enumerate(pending):
-            prompt_text = html.escape(json.dumps(p.prompt, indent=2, default=str))
-            if cfg.writes_enabled and csrf_token:
-                autofocus = " autofocus" if idx == 0 else ""
-                form_html = (
-                    f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer'>"
-                    f"{csrf_field}"
-                    f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
-                    "<label>Choice (a/e/m/s)<br>"
-                    f"<input type='text' name='choice' placeholder='a' required{autofocus}></label><br><br>"
-                    "<label>Extra notes (optional)<br>"
-                    "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
-                    "<p><button>Submit decision</button></p></form>"
-                )
-            else:
-                form_html = (
-                    "<p class='muted'>Writes disabled — answer this prompt via "
-                    f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
-                    "with an authenticated client.</p>"
-                )
-            rows.append(
-                f"<div class='card hitl-alert'><h3>HITL pending — {_esc(p.request_id)}</h3>"
-                f"<pre>{prompt_text}</pre>"
-                f"{form_html}</div>"
-            )
-        parts.append("".join(rows))
     parts.append(_render_session_detail(cfg, session_id))
-    if cfg.writes_enabled and csrf_token:
-        try:
-            notes = pending_chat_notes(db_path=cfg.web_db_path, session_id=session_id)
-        except Exception:  # noqa: BLE001
-            notes = []
-        note_rows = "".join(
-            f"<li>{html.escape(n['note'])} <span class='muted'>(queued {n['ts']})</span></li>"
-            for n in notes
-        )
-        parts.append(
-            "<div class='card'><h3>Chat notes (queued for next HITL)</h3>"
-            f"<ul>{note_rows or '<li class=muted>none queued</li>'}</ul>"
-            f"<form method='post' action='/sessions/{_esc(session_id)}/note'>"
-            f"{csrf_field}"
-            "<textarea name='note' rows='3' cols='80' placeholder='Note to ride into the next HITL prompt'></textarea>"
-            "<p><button>Queue note</button></p></form></div>"
-        )
+    parts.append(
+        f"<div id='chat-notes-slot' data-session-id='{_esc(session_id)}'>"
+        + _render_chat_notes_card(cfg, session_id)
+        + "</div>"
+    )
     if log_path:
         sse_url = f"/api/sessions/{_esc(session_id)}/events"
         parts.append(
@@ -4754,6 +4890,21 @@ def _route_session_stdout_sse_marker(cfg: DashboardConfig, params: dict[str, str
     return 200, "text/event-stream", f"__SSE_STDOUT__{params['sid']}"
 
 
+def _route_hitl_pending_html(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    """Return only the rendered HITL cards (HTML fragment, no chrome).
+    Lets dashboard.js swap the contents of ``#hitl-pending-slot`` in
+    place when an SSE ``hitl_pending`` event arrives, or after the
+    operator submits an answer. Empty body = nothing pending."""
+    return 200, "text/html; charset=utf-8", _render_pending_hitl_rows(cfg, params["sid"])
+
+
+def _route_chat_notes_html(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    """Return only the chat-notes card body (HTML fragment) for live
+    refresh of ``#chat-notes-slot`` after a note submit. Empty body
+    when writes are disabled."""
+    return 200, "text/html; charset=utf-8", _render_chat_notes_card(cfg, params["sid"])
+
+
 # ---------------------------------------------------------------------------
 # Tier C: webhook handler — returns sentinel; the do_POST handler blocks
 # ---------------------------------------------------------------------------
@@ -4774,7 +4925,10 @@ _ROUTES.extend([
     (re.compile(r"^/config/?$"), _route_config_index),
     (re.compile(r"^/config/(?P<section>[A-Za-z0-9_]+)/?$"), _route_config_section),
     (re.compile(r"^/run/new/?$"), _route_run_new),
+    (re.compile(r"^/run/console/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_run_console),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending/?$"), _route_hitl_pending),
+    (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending\.html$"), _route_hitl_pending_html),
+    (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/notes\.html$"), _route_chat_notes_html),
     (re.compile(r"^/api/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/events/?$"), _route_session_events_sse_marker),
     (re.compile(r"^/api/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/stdout/?$"), _route_session_stdout_sse_marker),
     (re.compile(r"^/hitl/webhook/?$"), _route_hitl_webhook_marker),

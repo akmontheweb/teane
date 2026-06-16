@@ -24,6 +24,7 @@ from harness.web_state import (
     append_audit,
     consume_chat_notes,
     delete_run_preset,
+    find_oneshot_jobs_near,
     list_all_oneshot_jobs,
     list_audit,
     list_pending_oneshot_jobs,
@@ -299,3 +300,66 @@ def test_open_web_db_creates_parent_dir(tmp_path):
         assert {"audit_log", "run_presets", "web_oneshot_jobs", "chat_notes"} <= names
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Configure-page overhaul: has_running_for_workspace + find_oneshot_jobs_near
+# ---------------------------------------------------------------------------
+
+def test_has_running_for_workspace_matches_active_process():
+    reg = ProcessRegistry()
+    a = WebProcess(
+        session_id="a", pid=1, argv=["harness"], log_path="/tmp/a",
+        workspace_path="/repo/one",
+    )
+    reg.register(a)
+    assert reg.has_running_for_workspace("/repo/one") is True
+    assert reg.has_running_for_workspace("/repo/two") is False
+    # Whitespace handling — a stray trailing space shouldn't bypass the check.
+    assert reg.has_running_for_workspace("  /repo/one  ") is True
+    # Terminated processes don't block a fresh run.
+    reg.mark_terminated("a", 0)
+    assert reg.has_running_for_workspace("/repo/one") is False
+
+
+def test_has_running_for_workspace_empty_input():
+    reg = ProcessRegistry()
+    assert reg.has_running_for_workspace("") is False
+
+
+def test_find_oneshot_jobs_near_returns_matches_in_window(tmp_path):
+    db = str(tmp_path / "web.db")
+    base = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+    # Jobs at -3, +6, +12, +25 minutes from base.
+    add_oneshot_job(db_path=db, name="minus3", fire_at_utc=base - timedelta(minutes=3),
+                    workspace="/ws")
+    add_oneshot_job(db_path=db, name="plus6", fire_at_utc=base + timedelta(minutes=6),
+                    workspace="/ws")
+    add_oneshot_job(db_path=db, name="plus12", fire_at_utc=base + timedelta(minutes=12),
+                    workspace="/ws")
+    add_oneshot_job(db_path=db, name="plus25", fire_at_utc=base + timedelta(minutes=25),
+                    workspace="/ws")
+    near = find_oneshot_jobs_near(db_path=db, fire_at_utc=base, window_minutes=10)
+    names = {entry["name"] for entry in near}
+    assert names == {"minus3", "plus6"}
+
+
+def test_find_oneshot_jobs_near_ignores_consumed(tmp_path):
+    db = str(tmp_path / "web.db")
+    fire_at = datetime(2030, 6, 1, 9, 0, tzinfo=UTC)
+    row_id = add_oneshot_job(db_path=db, name="done", fire_at_utc=fire_at,
+                              workspace="/ws")
+    mark_oneshot_consumed(db_path=db, job_id=row_id)
+    near = find_oneshot_jobs_near(
+        db_path=db, fire_at_utc=fire_at + timedelta(minutes=1),
+        window_minutes=10,
+    )
+    assert near == []
+
+
+def test_find_oneshot_jobs_near_rejects_naive_datetime(tmp_path):
+    db = str(tmp_path / "web.db")
+    with pytest.raises(ValueError):
+        find_oneshot_jobs_near(
+            db_path=db, fire_at_utc=datetime(2030, 1, 1, 12, 0),
+        )

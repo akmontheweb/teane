@@ -176,6 +176,16 @@ _DEFAULT_RECORD_SCHEMAS: dict[str, dict[str, Any]] = {
         "prompt": "",
         "extra_args": [],
     },
+    # Additional web-tool backends (the configure-page overhaul exposes
+    # this as a list under web_tools so operators can declare more than
+    # one search backend at once). The primary backend stays at
+    # web_tools.search_backend; this list is consulted afterwards.
+    "web_tools/backends": {
+        "name": "",
+        "enabled": True,
+        "search_backend": "",
+        "api_key_env": "",
+    },
 }
 
 
@@ -206,7 +216,7 @@ def default_record_schema(path: str) -> Optional[dict[str, Any]]:
 # validator's _KNOWN_NESTED_KEYS["model_routing"] understands.
 _ROUTING_ROLES: tuple[tuple[str, str, bool], ...] = (
     ("planning", "Planning", True),
-    ("patching", "Patching", False),       # validator has no patching_fallback
+    ("patching", "Patching", True),
     ("repair", "Repair", True),
     ("doc_reviewer", "Doc Review", True),
     ("code_reviewer", "Code Review", True),
@@ -278,14 +288,14 @@ def _render_routing_subgroup(
     mode_value: str = "",
     is_primary: bool = True,
 ) -> str:
-    """Render a Primary or Fallback subgroup: Model select + (for
-    Primary) Thinking-mode select.
+    """Render a Primary or Fallback subgroup: Model select + Thinking-mode
+    select.
 
-    The Thinking row only appears on the Primary subgroup because the
-    underlying config has ONE ``<role>_mode`` per role (it applies to
-    both primary and fallback). A note on the Primary's Thinking row
-    spells that out so operators don't expect to set a different mode
-    for the fallback.
+    Both primary and fallback subgroups now expose their own thinking
+    selector — primary writes ``<role>_mode``, fallback writes
+    ``<role>_fallback_mode``. When the fallback key is unset the
+    gateway resolves it to the primary's mode, preserving legacy
+    behaviour.
     """
     body: list[str] = []
     body.append(_render_routing_select(
@@ -294,13 +304,16 @@ def _render_routing_subgroup(
         label="Model name",
         sublabel=model_path.rsplit("/", 1)[-1],
     ))
-    if is_primary and mode_path is not None:
+    if mode_path is not None:
         body.append(_render_routing_select(
             path=mode_path, value=mode_value,
             options=list(_THINKING_MODES),
             label="Thinking mode",
             sublabel=mode_path.rsplit("/", 1)[-1],
-            extra_note="Applies to both primary and fallback for this role.",
+            extra_note=(
+                "" if is_primary
+                else "Leave blank to inherit the primary's mode."
+            ),
         ))
     return (
         f"<details class='ct-routing__sub' open>"
@@ -333,9 +346,11 @@ def render_model_routing(
         primary_path = f"{path}/{role_key}_primary"
         fallback_path = f"{path}/{role_key}_fallback"
         mode_path = f"{path}/{role_key}_mode"
+        fallback_mode_path = f"{path}/{role_key}_fallback_mode"
         primary_val = str(routing.get(f"{role_key}_primary", "") or "")
         fallback_val = str(routing.get(f"{role_key}_fallback", "") or "")
         mode_val = str(routing.get(f"{role_key}_mode", "") or "")
+        fallback_mode_val = str(routing.get(f"{role_key}_fallback_mode", "") or "")
 
         # Group header
         parts.append(
@@ -353,12 +368,14 @@ def render_model_routing(
             mode_path=mode_path, mode_value=mode_val,
             is_primary=True,
         ))
-        # Fallback subgroup — when the validator schema supports one
+        # Fallback subgroup — every role supports one now, including
+        # patching (added in the configure-page overhaul).
         if has_fallback:
             parts.append(_render_routing_subgroup(
                 title=f"{role_label} Fallback",
                 model_path=fallback_path, model_value=fallback_val,
                 available_models=available_models,
+                mode_path=fallback_mode_path, mode_value=fallback_mode_val,
                 is_primary=False,
             ))
         parts.append("</div></details>")
@@ -402,6 +419,7 @@ def render_model_routing(
     for role_key, _, _ in _ROUTING_ROLES:
         known.update({
             f"{role_key}_primary", f"{role_key}_mode", f"{role_key}_fallback",
+            f"{role_key}_fallback_mode",
         })
     known.update({"ollama_local_model", "ollama_local_backup", "force_local_only"})
     unknown = {k: v for k, v in routing.items() if k not in known}

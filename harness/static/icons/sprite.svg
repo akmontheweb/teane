@@ -122,4 +122,18 @@
     <path d="M17 15V8h-2v7H8v2h7v7h2v-7h7v-2z"/>
   </symbol>
 
+  <symbol id="i-folder" viewBox="0 0 32 32">
+    <path d="M27 28H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h7.41l3.3 3.29a1 1 0 0 0 .7.29H27a2 2 0 0 1 2 2v15a2 2 0 0 1-2 2zM5 7v19h22V11H16l-3-3z"/>
+  </symbol>
+
+  <symbol id="i-upload" viewBox="0 0 32 32">
+    <path d="M6 18h4v8h12v-8h4l-10-10L6 18zm2.83-2L16 8.83 23.17 16H20v8h-8v-8z"/>
+    <path d="M28 30H4v-2h24z"/>
+  </symbol>
+
+  <symbol id="i-trash-can" viewBox="0 0 32 32">
+    <path d="M12 12h2v12h-2zm6 0h2v12h-2z"/>
+    <path d="M4 6v2h2v20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8h2V6zm4 22V8h16v20zm4-26h8v2h-8z"/>
+  </symbol>
+
 </svg>

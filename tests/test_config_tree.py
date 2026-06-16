@@ -655,22 +655,24 @@ def test_model_routing_planning_has_primary_and_fallback_subgroups():
     assert ">Planning Fallback<" in html_out
 
 
-def test_model_routing_patching_has_only_primary_subgroup():
-    """Patching's validator schema doesn't include patching_fallback,
-    so the renderer must NOT emit a Patching Fallback subgroup."""
+def test_model_routing_patching_has_fallback_subgroup():
+    """Patching now supports a fallback model (added in the
+    configure-page overhaul) — the renderer must emit a Patching
+    Fallback subgroup with its own thinking-mode selector."""
     from harness.config_tree import render_model_routing
     html_out = render_model_routing(
         {"patching_primary": "x", "patching_mode": "no_thinking"},
         path="model_routing", available_models=[],
     )
     assert ">Patching Primary<" in html_out
-    assert ">Patching Fallback<" not in html_out
+    assert ">Patching Fallback<" in html_out
+    assert "value='model_routing/patching_fallback_mode'" in html_out
 
 
-def test_model_routing_thinking_mode_only_on_primary():
-    """The underlying config has ONE <role>_mode per role, so the
-    Thinking dropdown lives only on the Primary subgroup. The
-    Fallback subgroup omits it (with a note on Primary explaining)."""
+def test_model_routing_thinking_mode_on_primary_and_fallback():
+    """Primary writes <role>_mode, fallback writes <role>_fallback_mode.
+    Both subgroups now render their own thinking-mode dropdown so
+    operators can diverge the two paths."""
     from harness.config_tree import render_model_routing
     html_out = render_model_routing(
         {
@@ -679,10 +681,12 @@ def test_model_routing_thinking_mode_only_on_primary():
         },
         path="model_routing", available_models=[],
     )
-    # Exactly ONE __path[] for planning_mode (lives under Primary).
+    # Exactly one entry per mode key.
     assert html_out.count("value='model_routing/planning_mode'") == 1
-    # Explanatory note appears under the Primary mode row.
-    assert "Applies to both primary and fallback" in html_out
+    assert html_out.count("value='model_routing/planning_fallback_mode'") == 1
+    # Fallback explains the inheritance default (apostrophe is escaped
+    # for HTML — match on the unambiguous prefix).
+    assert "Leave blank to inherit the primary" in html_out
 
 
 def test_model_routing_model_dropdown_populates_from_available_models():

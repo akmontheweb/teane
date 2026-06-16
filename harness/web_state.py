@@ -200,6 +200,19 @@ class ProcessRegistry:
         with self._lock:
             return [p for p in self._procs.values() if p.is_running]
 
+    def has_running_for_workspace(self, workspace: str) -> bool:
+        """True if any currently-running entry has the same workspace
+        path. Used to block "Run Now" from launching a second harness
+        against a repo whose build/patch cycle is still active."""
+        wanted = (workspace or "").strip()
+        if not wanted:
+            return False
+        with self._lock:
+            return any(
+                p.is_running and (p.workspace_path or "").strip() == wanted
+                for p in self._procs.values()
+            )
+
     def remove(self, session_id: str) -> None:
         with self._lock:
             self._procs.pop(session_id, None)
@@ -451,6 +464,47 @@ def mark_oneshot_consumed(*, db_path: str, job_id: int) -> None:
                 "UPDATE web_oneshot_jobs SET consumed_at = ? WHERE id = ?",
                 (_utcnow_iso(), int(job_id)),
             )
+    finally:
+        conn.close()
+
+
+def find_oneshot_jobs_near(
+    *, db_path: str, fire_at_utc: datetime, window_minutes: int = 10,
+) -> list[dict[str, Any]]:
+    """Return unconsumed oneshot jobs whose ``fire_at_utc`` falls within
+    ``window_minutes`` of the supplied time (on either side).
+
+    Used by the dashboard's schedule form to block back-to-back jobs
+    that would land on the same daemon tick and step on each other.
+    """
+    import json
+    from datetime import timedelta
+    if fire_at_utc.tzinfo is None:
+        raise ValueError("fire_at_utc must be tz-aware (UTC)")
+    window = max(1, int(window_minutes))
+    lo = (fire_at_utc - timedelta(minutes=window)).isoformat(timespec="seconds")
+    hi = (fire_at_utc + timedelta(minutes=window)).isoformat(timespec="seconds")
+    conn = open_web_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, name, fire_at_utc, workspace, prompt, harness_args "
+            "FROM web_oneshot_jobs "
+            "WHERE consumed_at IS NULL AND fire_at_utc BETWEEN ? AND ? "
+            "ORDER BY fire_at_utc",
+            (lo, hi),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                args = json.loads(r[5]) if r[5] else []
+            except (TypeError, ValueError):
+                args = []
+            out.append({
+                "id": int(r[0]), "name": str(r[1]),
+                "fire_at_utc": str(r[2]), "workspace": str(r[3]),
+                "prompt": str(r[4] or ""), "harness_args": args,
+            })
+        return out
     finally:
         conn.close()
 

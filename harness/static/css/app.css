@@ -1260,3 +1260,191 @@ details.config-group[open] .config-group__toggle::before {
 .text-muted { color: var(--c-text-muted); }
 .text-soft  { color: var(--c-text-soft); }
 .fs-sm { font-size: 0.825em; }
+.mt-2 { margin-top: var(--space-2); }
+.inline-form { display: inline; }
+
+/* ---------- Modal scaffold (folder picker etc.) ------------------------- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal__dialog {
+  position: relative;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal__header,
+.modal__footer {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--c-border);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.modal__footer {
+  border-bottom: none;
+  border-top: 1px solid var(--c-border);
+  justify-content: flex-end;
+}
+
+.modal__title {
+  margin: 0;
+  font-size: 1rem;
+  flex: 1;
+}
+
+.modal__close {
+  background: transparent;
+  border: 0;
+  color: var(--c-text);
+  font-size: 1.4rem;
+  cursor: pointer;
+  padding: 0 var(--space-2);
+}
+
+.modal__body {
+  padding: var(--space-3) var(--space-4);
+  overflow: auto;
+  flex: 1;
+}
+
+body.modal-open { overflow: hidden; }
+
+/* ---------- Folder picker -------------------------------------------- */
+
+.folder-modal__path-row {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.folder-modal__path {
+  flex: 1;
+  font-family: var(--font-mono, monospace);
+}
+
+.browser-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--c-border);
+  background: var(--c-surface, var(--c-bg));
+}
+
+.browser-list__row {
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  border-bottom: 1px solid var(--c-border);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.9em;
+}
+
+.browser-list__row:hover,
+.browser-list__row:focus {
+  background: var(--c-bg-hover, rgba(255, 255, 255, 0.04));
+  outline: none;
+}
+
+.folder-modal__status {
+  margin: var(--space-3) 0 0;
+  min-height: 1rem;
+}
+
+/* ---------- Workspace + spec inputs on the Run page --------------- */
+
+.workspace-picker {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+
+.workspace-picker__input { flex: 1; }
+
+.spec-upload {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.spec-upload__name {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85em;
+}
+
+.spec-upload__clear {
+  padding: 0 var(--space-2);
+}
+
+/* ---------- Configure page: cancel + skills/memory extras ---------- */
+
+.ct-section__cancel { margin-left: var(--space-2); }
+
+.skill-files {
+  margin-top: var(--space-4);
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--space-3);
+}
+
+.skill-files__heading,
+.memory-new__heading {
+  margin: 0 0 var(--space-2);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.skill-file-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-3);
+}
+
+.skill-file-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--c-border);
+}
+
+.skill-file-row__name {
+  font-family: var(--font-mono, monospace);
+  flex: 1;
+}
+
+.skill-upload-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-2);
+}
+
+.memory-new {
+  margin-top: var(--space-4);
+  border-top: 1px solid var(--c-border);
+  padding-top: var(--space-3);
+}
+
+.memory-new__form { display: flex; flex-direction: column; gap: var(--space-3); }

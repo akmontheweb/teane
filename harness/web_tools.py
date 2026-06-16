@@ -99,10 +99,48 @@ class WebToolsConfig:
     # Cap on web tool dispatches per single graph-node call. Without this
     # the LLM can loop indefinitely on web_fetch → web_fetch → ...
     tool_call_cap_per_dispatch: int = 3
+    # Additional search-backend entries beyond the primary defined by
+    # ``search_backend`` above. Each item: {name, enabled, search_backend,
+    # api_key_env}. The configure page renders this as a + Add list so
+    # operators can register multiple backends alongside the primary.
+    backends: list[dict[str, Any]] = field(default_factory=list)
+
+    def active_backends(self) -> list[dict[str, Any]]:
+        """All configured backends in dispatch order: primary first
+        (from the top-level scalars) then every enabled entry from
+        ``backends``. Disabled entries are filtered out."""
+        out: list[dict[str, Any]] = []
+        if self.search_backend:
+            out.append({
+                "name": "primary",
+                "enabled": self.enabled,
+                "search_backend": self.search_backend,
+                "api_key_env": self.api_key_env,
+            })
+        for entry in self.backends:
+            if not isinstance(entry, dict):
+                continue
+            if not bool(entry.get("enabled", True)):
+                continue
+            if not str(entry.get("search_backend") or "").strip():
+                continue
+            out.append({
+                "name": str(entry.get("name") or entry.get("search_backend") or ""),
+                "enabled": True,
+                "search_backend": str(entry["search_backend"]),
+                "api_key_env": str(entry.get("api_key_env") or ""),
+            })
+        return out
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "WebToolsConfig":
         section = ((config or {}).get("web_tools") or {})
+        raw_backends = section.get("backends") or []
+        backends: list[dict[str, Any]] = []
+        if isinstance(raw_backends, list):
+            for entry in raw_backends:
+                if isinstance(entry, dict):
+                    backends.append(dict(entry))
         return cls(
             enabled=bool(section.get("enabled", False)),
             max_bytes=int(section.get("max_bytes", _DEFAULT_MAX_BYTES)),
@@ -116,6 +154,7 @@ class WebToolsConfig:
             tool_call_cap_per_dispatch=int(
                 section.get("tool_call_cap_per_dispatch", 3)
             ),
+            backends=backends,
         )
 
 

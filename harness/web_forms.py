@@ -622,7 +622,7 @@ _CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "dashboard",
-        "Dashboard",
+        "Harness Web",
         ("dashboard",),
     ),
     (

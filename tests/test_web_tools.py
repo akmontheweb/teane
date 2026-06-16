@@ -294,3 +294,70 @@ def test_register_builtin_skills_works_without_config_arg():
     register_builtin_skills()  # no config
     reg = SkillRegistry()
     assert reg.get("web_fetch") is None
+
+
+# ---------------------------------------------------------------------------
+# Configure-page overhaul: multi-instance web tools (backends list)
+# ---------------------------------------------------------------------------
+
+def test_web_tools_config_round_trips_backends_list():
+    from harness.web_tools import WebToolsConfig
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "duckduckgo_lite",
+            "backends": [
+                {"name": "brave", "enabled": True,
+                 "search_backend": "brave", "api_key_env": "BRAVE_KEY"},
+                {"name": "google", "enabled": False,
+                 "search_backend": "google", "api_key_env": "GOOGLE_KEY"},
+            ],
+        }
+    })
+    assert len(cfg.backends) == 2
+    names = [b["name"] for b in cfg.backends]
+    assert "brave" in names and "google" in names
+
+
+def test_web_tools_active_backends_filters_disabled_and_orders_primary_first():
+    from harness.web_tools import WebToolsConfig
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "duckduckgo_lite",
+            "backends": [
+                {"name": "brave", "enabled": True, "search_backend": "brave"},
+                {"name": "google", "enabled": False, "search_backend": "google"},
+                {"name": "no_backend", "enabled": True, "search_backend": ""},
+            ],
+        }
+    })
+    active = cfg.active_backends()
+    backends = [b["search_backend"] for b in active]
+    assert backends == ["duckduckgo_lite", "brave"]
+
+
+def test_web_tools_active_backends_skips_primary_when_blank():
+    from harness.web_tools import WebToolsConfig
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "search_backend": "",
+            "backends": [
+                {"name": "brave", "enabled": True, "search_backend": "brave"},
+            ],
+        }
+    })
+    active = cfg.active_backends()
+    assert [b["search_backend"] for b in active] == ["brave"]
+
+
+def test_web_tools_config_legacy_shape_still_loads():
+    """Configs without a ``backends`` key keep working — the field
+    defaults to an empty list."""
+    from harness.web_tools import WebToolsConfig
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {"enabled": True, "search_backend": "duckduckgo_lite"}
+    })
+    assert cfg.backends == []
+    active = cfg.active_backends()
+    assert active and active[0]["search_backend"] == "duckduckgo_lite"

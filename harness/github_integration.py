@@ -70,6 +70,24 @@ def gh_available(config: Optional[dict[str, Any]] = None) -> bool:
     return gh_path(config) is not None
 
 
+def default_repo(config: Optional[dict[str, Any]] = None) -> Optional[str]:
+    """Resolve the default ``owner/name`` pair from ``github.default_owner``
+    and ``github.default_repo``.
+
+    Returns ``None`` when either side is missing — callers should
+    keep requiring an explicit ``repo`` arg in that case. The configure
+    page surfaces both fields as plain text inputs; callers that build
+    a PR or ingest an issue without a repo override now have a config
+    fallback to lean on.
+    """
+    section = ((config or {}).get("github") or {})
+    owner = str(section.get("default_owner") or "").strip()
+    name = str(section.get("default_repo") or "").strip()
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}"
+
+
 @dataclass
 class GhAuthStatus:
     ok: bool

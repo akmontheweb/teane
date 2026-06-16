@@ -301,6 +301,100 @@ def test_spawn_harness_run_registers_process(tmp_path):
 # 5. Schedule-it enqueues a row
 # ---------------------------------------------------------------------------
 
+def test_run_now_blocks_when_workspace_already_running(tmp_path):
+    """Configure-page overhaul: ``/run/now`` returns 409 when the
+    workspace already has a live harness subprocess registered."""
+    from harness.dashboard import get_process_registry
+    from harness.web_state import WebProcess
+
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        # Pre-register a fake running process for this workspace.
+        get_process_registry().register(WebProcess(
+            session_id="busy", pid=99999, argv=["harness"],
+            workspace_path=str(tmp_path),
+        ))
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(
+                base_url + "/run/now",
+                body={"workspace": str(tmp_path), "prompt": "second"},
+                csrf=csrf,
+            )
+        assert exc.value.code == 409
+        assert b"already in progress" in exc.value.read()
+    finally:
+        handle.shutdown()
+
+
+def test_run_now_accepts_file_only_input(tmp_path):
+    """When the operator uploads a spec file via /api/upload-spec, the
+    Run-now form may submit with an empty ``prompt`` as long as
+    ``spec_file_path`` is set."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        # Empty prompt + no spec_file_path → 400.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(
+                base_url + "/run/now",
+                body={"workspace": str(tmp_path), "prompt": ""},
+                csrf=csrf,
+            )
+        assert exc.value.code == 400
+        # Empty prompt WITH a spec_file_path passes the form check
+        # (the spawn itself may then fail with the python stub binary,
+        # but we only care that the validation gate accepts it).
+        spec_path = str(tmp_path / "product_spec" / "x.md")
+        try:
+            _post(
+                base_url + "/run/now",
+                body={
+                    "workspace": str(tmp_path), "prompt": "",
+                    "spec_file_path": spec_path,
+                },
+                csrf=csrf,
+            )
+        except urllib.error.HTTPError as exc:
+            # 500 is acceptable — means the spawn ran but failed against
+            # the non-harness binary. What matters is "not 400".
+            assert exc.code != 400
+    finally:
+        handle.shutdown()
+
+
+def test_run_schedule_blocks_when_within_10_minutes(tmp_path):
+    """Two scheduled runs within 10 minutes of each other return 409."""
+    from harness.web_state import add_oneshot_job
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    base_time = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+    add_oneshot_job(
+        db_path=cfg.web_db_path, name="existing",
+        fire_at_utc=base_time, workspace=str(tmp_path),
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(
+                base_url + "/run/schedule",
+                body={
+                    "workspace": str(tmp_path), "prompt": "second",
+                    "fire_at_utc": (base_time + timedelta(minutes=5)).isoformat(),
+                    "name": "clash",
+                },
+                csrf=csrf,
+            )
+        assert exc.value.code == 409
+        msg = exc.value.read()
+        assert b"already scheduled" in msg
+        assert b"Pick a time" in msg
+    finally:
+        handle.shutdown()
+
+
 def test_run_schedule_enqueues_oneshot_row(tmp_path):
     cfg = _make_cfg(tmp_path)
     handle, base_url = _start(cfg)

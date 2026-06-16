@@ -278,3 +278,27 @@ def test_post_pr_comment_rejects_empty_body(monkeypatch):
     _stub_which_present(monkeypatch)
     with pytest.raises(ValueError):
         post_pr_comment("x/y", 42, "")
+
+
+# ---------------------------------------------------------------------------
+# default_repo() — configure-page GitHub fields (default_owner/default_repo)
+# ---------------------------------------------------------------------------
+
+def test_default_repo_returns_owner_slash_name_when_both_set():
+    from harness.github_integration import default_repo
+    cfg = {"github": {"default_owner": "acme", "default_repo": "harness"}}
+    assert default_repo(cfg) == "acme/harness"
+
+
+def test_default_repo_returns_none_when_either_missing():
+    from harness.github_integration import default_repo
+    assert default_repo({"github": {"default_owner": "acme"}}) is None
+    assert default_repo({"github": {"default_repo": "harness"}}) is None
+    assert default_repo({"github": {}}) is None
+    assert default_repo(None) is None
+
+
+def test_default_repo_strips_whitespace():
+    from harness.github_integration import default_repo
+    cfg = {"github": {"default_owner": "  acme  ", "default_repo": " harness "}}
+    assert default_repo(cfg) == "acme/harness"

@@ -93,11 +93,19 @@ COST_EQUAL = "equal_cost"                          # current behaviour
 COST_CHEAP_FIRST_SEQUENTIAL = "cheap_first_sequential"  # cheap one-by-one, expensive last
 COST_CHEAP_PARALLEL_THEN_EXPENSIVE = "cheap_parallel_then_expensive"
 COST_ALL_CHEAP = "all_cheap"
+# Multi-LLM gradient — variants consume ``variant_models`` in declared
+# cost order (variant 0 → variant_models[0], ..., variant N → variant_models[N]).
+# Unlike the two-tier strategies above, this honours the full list as a
+# monotonic cheap→expensive sequence. The last position is marked
+# expensive so the runner can prioritise / report cost the same way as
+# the cheap-first strategies.
+COST_GRADIENT_LOW_TO_HIGH = "gradient_low_to_high"
 COST_STRATEGIES = frozenset({
     COST_EQUAL,
     COST_CHEAP_FIRST_SEQUENTIAL,
     COST_CHEAP_PARALLEL_THEN_EXPENSIVE,
     COST_ALL_CHEAP,
+    COST_GRADIENT_LOW_TO_HIGH,
 })
 
 SELECT_FIRST_PASS = "first_pass"          # canonical name
@@ -439,6 +447,14 @@ def _build_variant_specs(cfg: "SpeculativeConfig") -> list[_VariantSpec]:
                 is_expensive = True
             elif cheap:
                 model = cheap
+        elif cfg.cost_strategy == COST_GRADIENT_LOW_TO_HIGH:
+            # Multi-LLM gradient — variants consume ``variant_models`` in
+            # declared order without modulo cycling, so the sequence stays
+            # monotonic cheap → expensive. Falls back to the diversity
+            # choice when the gradient runs out (i >= len(variant_models)).
+            if models_pool and i < len(models_pool):
+                model = models_pool[i]
+                is_expensive = (i == len(models_pool) - 1)
 
         # --- Resolve style suffix from the library when name is a key ---
         style_suffix = _PROMPT_STYLE_LIBRARY.get(style, style)

@@ -565,10 +565,15 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "model_routing": frozenset({
         "planning_primary", "planning_mode", "planning_fallback",
+        "planning_fallback_mode",
         "patching_primary", "patching_mode",
+        "patching_fallback", "patching_fallback_mode",
         "repair_primary", "repair_fallback", "repair_mode",
+        "repair_fallback_mode",
         "doc_reviewer_primary", "doc_reviewer_mode", "doc_reviewer_fallback",
+        "doc_reviewer_fallback_mode",
         "code_reviewer_primary", "code_reviewer_mode", "code_reviewer_fallback",
+        "code_reviewer_fallback_mode",
         "ollama_local_model", "ollama_local_backup", "force_local_only",
     }),
     "deployment": frozenset({
@@ -649,6 +654,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "max_bytes", "max_results", "search_backend",
         "api_key_env", "allow_private_ips", "timeout_seconds",
         "tool_call_cap_per_dispatch",
+        # Additional search-backend entries — each {name, enabled,
+        # search_backend, api_key_env}. Surfaced as a + Add list on the
+        # configure page so operators can register multiple backends
+        # alongside the primary defined by the scalars above.
+        "backends",
     }),
     # MCP client pool. enabled toggles registration of MCP servers as
     # subprocess clients + their tools as McpToolSkill entries.
@@ -697,7 +707,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "carbon_css_url", "carbon_js_url", "docs_dir",
     }),
     # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
-    "github": frozenset({"gh_path"}),
+    # default_owner / default_repo supply the fallback for PR creation
+    # and issue ingest when the caller doesn't disambiguate (the
+    # configure-page overhaul surfaces both as inputs on the GitHub card).
+    "github": frozenset({"gh_path", "default_owner", "default_repo"}),
     # Semantic retrieval index. enabled gates planner injection +
     # auto-build behaviour. backend = "tfidf" (default) | "openai_embeddings".
     # chunk_lines / chunk_overlap shape the per-file slicing. top_k bounds
@@ -760,17 +773,23 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "model_routing.planning_primary": (str,),
     "model_routing.planning_mode": (str,),
     "model_routing.planning_fallback": (str,),
+    "model_routing.planning_fallback_mode": (str,),
     "model_routing.patching_primary": (str,),
     "model_routing.patching_mode": (str,),
+    "model_routing.patching_fallback": (str,),
+    "model_routing.patching_fallback_mode": (str,),
     "model_routing.repair_primary": (str,),
     "model_routing.repair_fallback": (str,),
     "model_routing.repair_mode": (str,),
+    "model_routing.repair_fallback_mode": (str,),
     "model_routing.doc_reviewer_primary": (str,),
     "model_routing.doc_reviewer_mode": (str,),
     "model_routing.doc_reviewer_fallback": (str,),
+    "model_routing.doc_reviewer_fallback_mode": (str,),
     "model_routing.code_reviewer_primary": (str,),
     "model_routing.code_reviewer_mode": (str,),
     "model_routing.code_reviewer_fallback": (str,),
+    "model_routing.code_reviewer_fallback_mode": (str,),
     "model_routing.ollama_local_model": (str,),
     "model_routing.ollama_local_backup": (str,),
     "model_routing.force_local_only": (bool,),
@@ -810,6 +829,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "web_tools.allow_private_ips": (bool,),
     "web_tools.timeout_seconds": (int, float),
     "web_tools.tool_call_cap_per_dispatch": (int,),
+    "web_tools.backends": (list,),
     "mcp.enabled": (bool,),
     "mcp.tool_call_timeout_seconds": (int, float),
     "mcp.command_allowlist": (list,),
@@ -848,6 +868,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "dashboard.carbon_js_url": (str,),
     "dashboard.docs_dir": (str,),
     "github.gh_path": (str,),
+    "github.default_owner": (str,),
+    "github.default_repo": (str,),
     "repo_index.enabled": (bool,),
     "repo_index.backend": (str,),
     "repo_index.top_k": (int,),

@@ -305,6 +305,27 @@ def test_spec_builder_cost_all_cheap_overrides_diversity_models():
     assert all(s.model_override == "deepseek:chat" for s in specs)
 
 
+def test_spec_builder_cost_gradient_low_to_high_consumes_variant_models_in_order():
+    """The new gradient strategy walks ``variant_models`` monotonically
+    (no modulo cycling) so a 3-entry list assigns model[i] to variant i
+    and flags the last one as expensive."""
+    from harness.speculative import COST_GRADIENT_LOW_TO_HIGH
+    cfg = SpeculativeConfig.normalize({
+        "enabled": True,
+        "diversity_mode": DIVERSITY_MODEL,
+        "cost_strategy": COST_GRADIENT_LOW_TO_HIGH,
+        "num_variants": 3,
+        "variant_models": ["ollama:tiny", "openai:gpt-4o-mini", "anthropic:claude-opus"],
+    })
+    specs = _build_variant_specs(cfg)
+    assert specs[0].model_override == "ollama:tiny"
+    assert specs[1].model_override == "openai:gpt-4o-mini"
+    assert specs[2].model_override == "anthropic:claude-opus"
+    assert specs[0].is_expensive is False
+    assert specs[1].is_expensive is False
+    assert specs[2].is_expensive is True
+
+
 # ---------------------------------------------------------------------------
 # 5. Message style seeding
 # ---------------------------------------------------------------------------

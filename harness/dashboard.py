@@ -223,6 +223,236 @@ def _serve_static(cfg: DashboardConfig, relpath: str) -> tuple[int, str, bytes]:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Filesystem helpers — folder picker + uploads
+# ---------------------------------------------------------------------------
+
+_PRODUCT_SPEC_DIR_NAME = "product_spec"
+_SPEC_ALLOWED_EXTS = frozenset({".txt", ".md"})
+_SKILL_ALLOWED_EXT = ".py"
+_MAX_SKILL_BYTES = 256 * 1024  # individual skill source files stay small
+_SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_MEMORY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
+
+
+def _safe_basename(filename: str) -> str:
+    """Strip directory components and reject empty / traversal names.
+
+    Returns ``""`` for unsafe input so callers can surface a 400.
+    """
+    if not filename:
+        return ""
+    base = os.path.basename(filename.replace("\\", "/"))
+    if not base or base in {".", ".."}:
+        return ""
+    if "\x00" in base or not _SAFE_FILENAME_RE.match(base):
+        return ""
+    return base
+
+
+def _list_directory_entries(target: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """List immediate child directories of ``target``. Returns
+    ``(entries, error)``. Symlinks are followed for the is-dir check
+    but the listing itself does not recurse."""
+    if "\x00" in target:
+        return [], "path contains null byte"
+    abs_path = os.path.abspath(os.path.expanduser(target))
+    if not os.path.isdir(abs_path):
+        return [], f"not a directory: {abs_path}"
+    try:
+        names = sorted(os.listdir(abs_path), key=str.lower)
+    except OSError as exc:
+        return [], f"cannot list {abs_path}: {exc}"
+    entries: list[dict[str, Any]] = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(abs_path, name)
+        try:
+            is_dir = os.path.isdir(full)
+        except OSError:
+            continue
+        if not is_dir:
+            continue
+        entries.append({"name": name, "path": full})
+    return entries, None
+
+
+def _browse_response(query_path: str) -> tuple[int, str, str]:
+    """Build the JSON response for ``GET /api/browse?path=...``."""
+    raw = (query_path or "").strip() or os.path.expanduser("~")
+    abs_path = os.path.abspath(os.path.expanduser(raw))
+    entries, err = _list_directory_entries(abs_path)
+    if err is not None:
+        body = json.dumps({"ok": False, "error": err, "path": abs_path})
+        return 400, "application/json; charset=utf-8", body
+    parent = os.path.dirname(abs_path) if abs_path != os.path.dirname(abs_path) else ""
+    payload = {
+        "ok": True,
+        "path": abs_path,
+        "parent": parent,
+        "entries": entries,
+    }
+    return 200, "application/json; charset=utf-8", json.dumps(payload)
+
+
+def _persist_product_spec(
+    workspace: str, filename: str, data: bytes,
+) -> tuple[str, Optional[str]]:
+    """Write an uploaded spec file to ``<workspace>/product_spec/`` and
+    return ``(saved_path, error)``. The workspace must exist and the
+    filename must end in ``.txt`` or ``.md``."""
+    base = _safe_basename(filename)
+    if not base:
+        return "", "unsafe filename"
+    ext = os.path.splitext(base)[1].lower()
+    if ext not in _SPEC_ALLOWED_EXTS:
+        allowed = ", ".join(sorted(_SPEC_ALLOWED_EXTS))
+        return "", f"only {allowed} files are accepted (got {ext or '?'})"
+    abs_workspace = os.path.abspath(os.path.expanduser(workspace or ""))
+    if not os.path.isdir(abs_workspace):
+        return "", f"workspace does not exist: {abs_workspace}"
+    spec_dir = os.path.join(abs_workspace, _PRODUCT_SPEC_DIR_NAME)
+    try:
+        os.makedirs(spec_dir, exist_ok=True)
+    except OSError as exc:
+        return "", f"could not create {spec_dir}: {exc}"
+    target = os.path.join(spec_dir, base)
+    try:
+        with open(target, "wb") as f:
+            f.write(data)
+    except OSError as exc:
+        return "", f"write failed: {exc}"
+    return target, None
+
+
+def _write_web_input_sidecar(workspace: str, text: str) -> str:
+    """Mirror an operator-entered product requirement into
+    ``<workspace>/product_spec/web_input.md`` so the harness consolidator
+    picks it up alongside any uploaded files. Raises ``OSError`` on
+    failure."""
+    abs_workspace = os.path.abspath(os.path.expanduser(workspace or ""))
+    spec_dir = os.path.join(abs_workspace, _PRODUCT_SPEC_DIR_NAME)
+    os.makedirs(spec_dir, exist_ok=True)
+    target = os.path.join(spec_dir, "web_input.md")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(text)
+    return target
+
+
+def _resolved_user_skills_dir(cfg: "DashboardConfig") -> str:
+    """Resolve ``skills.user_skills_dir`` from the live config, falling
+    back to the same ``~/.harness/skills`` default that
+    ``harness.skills`` uses."""
+    try:
+        live = read_config_file(cfg) or {}
+    except Exception:  # noqa: BLE001 — defaults are fine if the config is broken
+        live = {}
+    raw = ((live.get("skills") or {}).get("user_skills_dir")
+           or "~/.harness/skills")
+    return os.path.abspath(os.path.expanduser(str(raw)))
+
+
+def _persist_user_skill(
+    cfg: "DashboardConfig", filename: str, data: bytes,
+) -> tuple[str, Optional[str]]:
+    base = _safe_basename(filename)
+    if not base:
+        return "", "unsafe filename"
+    if os.path.splitext(base)[1].lower() != _SKILL_ALLOWED_EXT:
+        return "", "only .py files are accepted"
+    if len(data) > _MAX_SKILL_BYTES:
+        return "", f"file exceeds {_MAX_SKILL_BYTES} bytes"
+    skills_dir = _resolved_user_skills_dir(cfg)
+    try:
+        os.makedirs(skills_dir, exist_ok=True)
+    except OSError as exc:
+        return "", f"could not create {skills_dir}: {exc}"
+    target = os.path.join(skills_dir, base)
+    try:
+        with open(target, "wb") as f:
+            f.write(data)
+    except OSError as exc:
+        return "", f"write failed: {exc}"
+    return target, None
+
+
+def _delete_user_skill(
+    cfg: "DashboardConfig", filename: str,
+) -> tuple[str, Optional[str]]:
+    base = _safe_basename(filename)
+    if not base:
+        return "", "unsafe filename"
+    if os.path.splitext(base)[1].lower() != _SKILL_ALLOWED_EXT:
+        return "", "only .py files can be deleted"
+    skills_dir = _resolved_user_skills_dir(cfg)
+    target = os.path.join(skills_dir, base)
+    # Containment — never let the form path climb out of skills_dir.
+    if os.path.realpath(os.path.dirname(target)) != os.path.realpath(skills_dir):
+        return "", "filename escapes skills directory"
+    if not os.path.isfile(target):
+        return "", f"no such skill: {base}"
+    try:
+        os.remove(target)
+    except OSError as exc:
+        return "", f"delete failed: {exc}"
+    return target, None
+
+
+def _list_user_skill_files(cfg: "DashboardConfig") -> list[str]:
+    """Return the basenames of every ``*.py`` file in the user skills
+    directory (sorted). The configure-page Skills card renders this list
+    with delete buttons."""
+    skills_dir = _resolved_user_skills_dir(cfg)
+    if not os.path.isdir(skills_dir):
+        return []
+    try:
+        return sorted(
+            name for name in os.listdir(skills_dir)
+            if name.endswith(_SKILL_ALLOWED_EXT)
+            and not name.startswith("_")
+            and os.path.isfile(os.path.join(skills_dir, name))
+        )
+    except OSError:
+        return []
+
+
+def _resolved_memory_dir(cfg: "DashboardConfig") -> str:
+    """Resolve ``memory.dir`` from the live config (default
+    ``~/.harness/memory``)."""
+    try:
+        live = read_config_file(cfg) or {}
+    except Exception:  # noqa: BLE001
+        live = {}
+    raw = ((live.get("memory") or {}).get("dir") or "~/.harness/memory")
+    return os.path.abspath(os.path.expanduser(str(raw)))
+
+
+def _persist_new_memory(
+    cfg: "DashboardConfig", name: str, content: str,
+) -> tuple[str, Optional[str]]:
+    name = (name or "").strip().lower()
+    if not _MEMORY_NAME_RE.match(name):
+        return "", (
+            "memory name must match [a-z0-9][a-z0-9_-]{0,63} "
+            "(lowercase letters, digits, hyphen, underscore)"
+        )
+    if not content.strip():
+        return "", "memory content is empty"
+    mem_dir = _resolved_memory_dir(cfg)
+    try:
+        os.makedirs(mem_dir, exist_ok=True)
+    except OSError as exc:
+        return "", f"could not create {mem_dir}: {exc}"
+    target = os.path.join(mem_dir, f"{name}.md")
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as exc:
+        return "", f"write failed: {exc}"
+    return target, None
+
+
+# ---------------------------------------------------------------------------
 # 2. Data adapters — read-only over the harness's existing on-disk state
 # ---------------------------------------------------------------------------
 
@@ -1473,13 +1703,31 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
       <legend class='bx--label run-panel__legend'>New session</legend>
       <div class='field'>
         <label class='bx--label' for='workspace'>Workspace path</label>
-        <input class='bx--text-input' id='workspace' name='workspace' type='text'
-               placeholder='/path/to/repo'>
+        <div class='workspace-picker'>
+          <input class='bx--text-input workspace-picker__input' id='workspace'
+                 name='workspace' type='text' placeholder='/path/to/repo' required>
+          <button type='button' class='bx--btn bx--btn--tertiary workspace-picker__btn'
+                  id='workspace-browse-btn' aria-label='Browse for workspace folder'>
+            {_icon("folder")}Browse
+          </button>
+        </div>
+        <p class='muted fs-sm mt-2'>A valid workspace path is required.</p>
       </div>
+      <input type='hidden' id='spec-file-path' name='spec_file_path' value=''>
       <div class='field'>
-        <label class='bx--label' for='prompt'>Prompt</label>
+        <label class='bx--label' for='prompt'>Product Requirement</label>
         <textarea class='bx--text-area' id='prompt' name='prompt' rows='4'
-                  placeholder='What should the harness do?'></textarea>
+                  placeholder='Enter your production specification here or upload a product specification document (in .txt or .md format)'></textarea>
+        <div class='spec-upload mt-2'>
+          <input type='file' id='spec-file' accept='.txt,.md' class='hidden'>
+          <button type='button' class='bx--btn bx--btn--tertiary spec-upload__btn'
+                  id='spec-upload-btn'>
+            {_icon("upload")}Upload product specification
+          </button>
+          <span class='spec-upload__name muted' id='spec-upload-name'></span>
+          <button type='button' class='spec-upload__clear bx--btn bx--btn--ghost hidden'
+                  id='spec-upload-clear' aria-label='Clear uploaded file'>&times;</button>
+        </div>
       </div>
       <fieldset class='field-group'>
         <legend class='bx--label'>Run options</legend>
@@ -1578,15 +1826,27 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
         alert('Pick a session from the list first.');
       }}
     }}
-    // Run Now requires workspace + prompt — surfaced inline (the inputs
-    // intentionally don't carry the `required` attribute because we
-    // share the form with the Resume panel which has neither field).
-    if (submitter && submitter.id === 'run-now-btn') {{
+    // Run Now / Schedule both require workspace + (prompt OR uploaded
+    // spec file) — surfaced inline (the inputs intentionally don't
+    // carry the `required` attribute because we share the form with
+    // the Resume panel which has neither field).
+    if (submitter && (submitter.id === 'run-now-btn' || submitter.id === 'confirm-schedule-btn')) {{
       var ws = document.getElementById('workspace');
       var pr = document.getElementById('prompt');
-      if (!ws.value.trim() || !pr.value.trim()) {{
+      var sf = document.getElementById('spec-file-path');
+      if (!ws.value.trim()) {{
         e.preventDefault();
-        alert('Workspace path and prompt are both required for a new session.');
+        if (window.toast) {{ toast('Workspace path is required.', 'error'); }}
+        else {{ alert('Workspace path is required.'); }}
+        return;
+      }}
+      var hasText = pr.value.trim().length > 0;
+      var hasFile = (sf && sf.value.trim().length > 0);
+      if (!hasText && !hasFile) {{
+        e.preventDefault();
+        var msg = 'Enter a product requirement or upload a .txt/.md document.';
+        if (window.toast) {{ toast(msg, 'error'); }}
+        else {{ alert(msg); }}
       }}
     }}
   }});
@@ -1735,6 +1995,106 @@ def _render_field_input_new(field) -> str:
     return f"<input class='bx--text-input' type='text' name='{name_attr}' value='{val}'>"
 
 
+# Display-name overrides keep config-key→form-label decoupled from the
+# wire format. The "dashboard" section is shown as "Web Defaults" under
+# the "Harness Web" group so the wording matches the rest of the app
+# (the underlying key stays ``dashboard`` for back-compat with existing
+# operator configs).
+_SECTION_LABEL_OVERRIDES: dict[str, str] = {
+    "dashboard": "Web Defaults",
+}
+
+
+def _render_section_extras(
+    cfg: "DashboardConfig", section_key: str, csrf_token: str,
+) -> str:
+    """Per-section augmentations rendered below the generic tree form.
+
+    Currently used by Skills (list + upload + delete of ``.py`` files
+    in ``user_skills_dir``) and Memory (a "New memory" inline editor
+    that writes ``<memory.dir>/<name>.md``). Returns empty string for
+    sections without extras."""
+    if section_key == "skills":
+        return _render_skills_extras(cfg, csrf_token)
+    if section_key == "memory":
+        return _render_memory_extras(cfg, csrf_token)
+    return ""
+
+
+def _render_skills_extras(cfg: "DashboardConfig", csrf_token: str) -> str:
+    files = _list_user_skill_files(cfg)
+    skills_dir = _resolved_user_skills_dir(cfg)
+    rows: list[str] = []
+    if files:
+        for name in files:
+            rows.append(
+                "<li class='skill-file-row'>"
+                f"<span class='skill-file-row__name'>{html.escape(name)}</span>"
+                "<form method='post' action='/api/skills/delete' class='inline-form'>"
+                f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+                f"<input type='hidden' name='filename' value='{html.escape(name)}'>"
+                "<button type='submit' class='bx--btn bx--btn--ghost skill-file-row__del' "
+                "aria-label='Delete skill'>"
+                f"{_icon('trash-can')}Delete</button>"
+                "</form>"
+                "</li>"
+            )
+    else:
+        rows.append(
+            "<li class='muted'>No user skill files yet. "
+            "Upload a <code>.py</code> module that calls "
+            "<code>harness.skills.register(...)</code> at import time.</li>"
+        )
+    return (
+        "<div class='skill-files'>"
+        "<h4 class='skill-files__heading'>Skill files in "
+        f"<code>{html.escape(skills_dir)}</code></h4>"
+        f"<ul class='skill-file-list'>{''.join(rows)}</ul>"
+        "<form method='post' action='/api/skills/upload' "
+        "enctype='multipart/form-data' class='skill-upload-form'>"
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+        "<label class='bx--label' for='skill-upload-input'>Upload a new skill (.py)</label>"
+        "<div class='skill-upload-row'>"
+        "<input type='file' id='skill-upload-input' name='file' accept='.py' required>"
+        "<button class='bx--btn bx--btn--secondary' type='submit'>"
+        f"{_icon('upload')}Upload skill</button>"
+        "</div>"
+        "</form>"
+        "</div>"
+    )
+
+
+def _render_memory_extras(cfg: "DashboardConfig", csrf_token: str) -> str:
+    mem_dir = _resolved_memory_dir(cfg)
+    return (
+        "<div class='memory-new'>"
+        "<h4 class='memory-new__heading'>Add a new memory</h4>"
+        "<p class='muted fs-sm'>Writes "
+        f"<code>{html.escape(mem_dir)}/&lt;name&gt;.md</code> "
+        "and shows up on the <a href='/memory'>Memory page</a> immediately.</p>"
+        "<form method='post' action='/api/memory/new' class='memory-new__form'>"
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+        "<div class='field'>"
+        "<label class='bx--label' for='memory-new-name'>Name</label>"
+        "<input class='bx--text-input' id='memory-new-name' name='name' "
+        "type='text' placeholder='my-memory' required>"
+        "</div>"
+        "<div class='field'>"
+        "<label class='bx--label' for='memory-new-content'>Content (markdown)</label>"
+        "<textarea class='bx--text-area' id='memory-new-content' name='content' "
+        "rows='6' placeholder='Markdown memory content' required></textarea>"
+        "</div>"
+        "<div class='actions'>"
+        "<button class='bx--btn bx--btn--primary' type='submit'>"
+        f"{_icon('save')}Save memory</button>"
+        "<button class='bx--btn bx--btn--secondary ct-section__cancel' "
+        "type='button'>Cancel</button>"
+        "</div>"
+        "</form>"
+        "</div>"
+    )
+
+
 def _render_configure_harness(cfg: DashboardConfig) -> str:
     if not cfg.writes_enabled:
         return (
@@ -1787,6 +2147,15 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
         # section still renders an editable shell.
         if live_value is None:
             live_value = {} if section_key in closed_shape_sections else ""
+        # Sections whose existing UI complaint was "Save button has no
+        # field to save" — pre-populate the known keys so each gets an
+        # editable row even on a fresh install. Strings only; booleans
+        # and ints in these sections aren't affected.
+        if section_key == "github" and isinstance(live_value, dict):
+            for known_key in ("gh_path", "default_owner", "default_repo"):
+                live_value.setdefault(known_key, "")
+        if section_key == "skills" and isinstance(live_value, dict):
+            live_value.setdefault("user_skills_dir", "~/.harness/skills")
         allow_add = section_key not in closed_shape_sections
         # model_routing gets a custom grouped renderer — Role → Primary/
         # Fallback → Model + Thinking — instead of the generic flat tree.
@@ -1809,11 +2178,17 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             count_text = f"({len(live_value)} item{'s' if len(live_value) != 1 else ''})"
         else:
             count_text = "(scalar)"
+        display_name = _SECTION_LABEL_OVERRIDES.get(section_key, section_key)
+        # Extras render below the standard tree form — used by sections
+        # that surface filesystem-backed assets (Skills, Memory) alongside
+        # their config knobs.
+        extras_html = _render_section_extras(cfg, section_key, csrf_token)
         return (
-            f"<details class='ct-section' data-section='{html.escape(section_key)}'>"
+            f"<details class='ct-section' data-section='{html.escape(section_key)}'"
+            f" id='section-{html.escape(section_key)}'>"
             f"<summary class='ct-section__head'>"
             f"<span class='ct-section__toggle' aria-hidden='true'>+</span>"
-            f"<span class='ct-section__name'>{html.escape(section_key)}</span>"
+            f"<span class='ct-section__name'>{html.escape(display_name)}</span>"
             f"<span class='muted ml-2 fs-sm'>{count_text}</span>"
             f"</summary>"
             f"<div class='ct-section__body'>"
@@ -1823,9 +2198,12 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             f"<div class='ct-tree'>{tree_html}</div>"
             f"<div class='actions'>"
             f"<button class='bx--btn bx--btn--primary' type='submit'>"
-            f"{_icon('save')}Save {html.escape(section_key)}</button>"
+            f"{_icon('save')}Save {html.escape(display_name)}</button>"
+            f"<button class='bx--btn bx--btn--secondary ct-section__cancel' "
+            f"type='button'>Cancel</button>"
             f"</div>"
             f"</form>"
+            f"{extras_html}"
             f"</div></details>"
         )
 
@@ -2323,6 +2701,15 @@ def make_request_handler(
             if not ok:
                 self._send(401, "text/plain; charset=utf-8", f"401 unauthorized: {detail}\n")
                 return
+            # /api/browse needs query-string access that the route table
+            # doesn't propagate, so it's handled inline here.
+            parsed_url = urllib.parse.urlparse(self.path)
+            if urllib.parse.unquote(parsed_url.path) == "/api/browse":
+                q = urllib.parse.parse_qs(parsed_url.query)
+                requested = (q.get("path", [""])[0] or "").strip()
+                status, ctype, body = _browse_response(requested)
+                self._send(status, ctype, body)
+                return
             try:
                 status, ctype, body = dispatch(cfg, self.path)
             except Exception:  # noqa: BLE001
@@ -2400,6 +2787,20 @@ def make_request_handler(
             except ValueError:
                 length = 0
             raw = self.rfile.read(length) if length > 0 else b""
+            content_type = self.headers.get("Content-Type") or ""
+
+            # Multipart uploads go through the dedicated dispatch path so
+            # the file bytes survive parsing. Everything else stays on
+            # the legacy urlencoded path.
+            if "multipart/form-data" in content_type.lower():
+                try:
+                    fields, files = _parse_multipart_body(raw, content_type)
+                except ValueError as exc:
+                    self._send(400, "text/plain", f"upload rejected: {exc}\n")
+                    return
+                self._dispatch_multipart(path, fields, files)
+                return
+
             form = _parse_form_body(raw)
 
             # Route the POST to the right handler.
@@ -2458,6 +2859,31 @@ def make_request_handler(
             # /schedule/jobs
             if path in ("/schedule/jobs", "/schedule/jobs/"):
                 self._handle_schedule_add(form)
+                return
+            # /api/skills/delete — urlencoded form with filename field.
+            if path == "/api/skills/delete":
+                self._handle_api_skills_delete(form)
+                return
+            # /api/memory/new — urlencoded form with name + content.
+            if path == "/api/memory/new":
+                self._handle_api_memory_new(form)
+                return
+            self._send(404, "text/plain", "404 not found\n")
+
+        def _dispatch_multipart(
+            self,
+            path: str,
+            fields: dict[str, str],
+            files: dict[str, tuple[str, bytes]],
+        ) -> None:
+            """Route multipart POSTs introduced by the configure-page +
+            run-page overhaul (product-spec upload, user-skills upload).
+            Returns 404 for any path not explicitly recognised."""
+            if path == "/api/upload-spec":
+                self._handle_api_upload_spec(fields, files)
+                return
+            if path == "/api/skills/upload":
+                self._handle_api_skills_upload(fields, files)
                 return
             self._send(404, "text/plain", "404 not found\n")
 
@@ -2580,17 +3006,52 @@ def make_request_handler(
         def _handle_run_now(self, form: dict[str, Any]) -> None:
             workspace = str(form.get("workspace") or "").strip()
             prompt = str(form.get("prompt") or "").strip()
-            if not workspace or not prompt:
-                self._send(400, "text/plain", "workspace and prompt required\n")
+            spec_file_path = str(form.get("spec_file_path") or "").strip()
+            if not workspace:
+                self._send(400, "text/plain", "workspace required\n")
+                return
+            # The Product Requirement input accepts either pasted text or
+            # an uploaded .txt/.md document (whose path lands in the
+            # hidden ``spec_file_path`` field via /api/upload-spec). At
+            # least one must be supplied so the harness has something to
+            # work from.
+            if not prompt and not spec_file_path:
+                self._send(
+                    400, "text/plain",
+                    "Provide a product requirement: either enter text or "
+                    "upload a .txt/.md document.\n",
+                )
+                return
+            # Block parallel runs against the same workspace — the
+            # build/patch pipeline isn't designed to interleave two
+            # concurrent sessions safely.
+            if get_process_registry().has_running_for_workspace(workspace):
+                self._send(
+                    409, "text/plain",
+                    f"A run is already in progress for {workspace}. "
+                    f"Try again once that build/patch cycle completes.\n",
+                )
                 return
             extra_args, flag_errors = _collect_run_argv(form)
             if flag_errors:
                 self._send(400, "text/plain",
                            "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
                 return
+            # When the operator both uploads a spec AND enters text, the
+            # text rides along as a sibling ``web_input.md`` inside the
+            # same ``product_spec/`` folder so the harness consolidator
+            # picks up both inputs.
+            if spec_file_path and prompt:
+                try:
+                    _write_web_input_sidecar(workspace, prompt)
+                except OSError as exc:
+                    logger.warning("[run] failed to write web_input.md: %s", exc)
             try:
+                # Pass an empty prompt when only a spec file was uploaded
+                # — the harness reads ``product_spec/*`` itself.
                 wp = spawn_harness_run(
-                    cfg, workspace=workspace, prompt=prompt,
+                    cfg, workspace=workspace,
+                    prompt=prompt or "(see product_spec/)",
                     extra_args=extra_args,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2627,13 +3088,21 @@ def make_request_handler(
             self.end_headers()
 
         def _handle_run_schedule(self, form: dict[str, Any]) -> None:
-            from datetime import datetime as _dt
+            from datetime import datetime as _dt, timedelta as _td
             workspace = str(form.get("workspace") or "").strip()
             prompt = str(form.get("prompt") or "").strip()
+            spec_file_path = str(form.get("spec_file_path") or "").strip()
             fire_raw = str(form.get("fire_at_utc") or "").strip()
             name = str(form.get("name") or "web-oneshot").strip() or "web-oneshot"
-            if not workspace or not prompt or not fire_raw:
-                self._send(400, "text/plain", "workspace, prompt, fire_at_utc required\n")
+            if not workspace or not fire_raw:
+                self._send(400, "text/plain", "workspace and fire_at_utc required\n")
+                return
+            if not prompt and not spec_file_path:
+                self._send(
+                    400, "text/plain",
+                    "Provide a product requirement: either enter text or "
+                    "upload a .txt/.md document.\n",
+                )
                 return
             try:
                 fire_at = _dt.fromisoformat(fire_raw.replace("Z", "+00:00"))
@@ -2643,16 +3112,43 @@ def make_request_handler(
             except ValueError as exc:
                 self._send(400, "text/plain", f"fire_at_utc invalid: {exc}\n")
                 return
+            # Block back-to-back schedules — two jobs landing on the same
+            # daemon tick can race on the same workspace or saturate the
+            # subprocess pool. The window matches the 10-minute spacing
+            # the configure-page overhaul surfaces in the UI hint.
+            try:
+                conflicts = find_oneshot_jobs_near(
+                    db_path=cfg.web_db_path,
+                    fire_at_utc=fire_at, window_minutes=10,
+                )
+            except Exception:  # noqa: BLE001 — DB issues shouldn't take the form down
+                conflicts = []
+            if conflicts:
+                suggested = (fire_at + _td(minutes=10)).isoformat(timespec="seconds")
+                clash = conflicts[0].get("fire_at_utc", "")
+                self._send(
+                    409, "text/plain",
+                    f"A run is already scheduled at {clash} (within 10 "
+                    f"minutes of {fire_at.isoformat(timespec='seconds')}). "
+                    f"Pick a time at least 10 minutes apart, e.g. {suggested}.\n",
+                )
+                return
             extra_args, flag_errors = _collect_run_argv(form)
             if flag_errors:
                 self._send(400, "text/plain",
                            "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
                 return
+            if spec_file_path and prompt:
+                try:
+                    _write_web_input_sidecar(workspace, prompt)
+                except OSError as exc:
+                    logger.warning("[schedule] failed to write web_input.md: %s", exc)
             try:
                 row_id = add_oneshot_job(
                     db_path=cfg.web_db_path, name=name,
                     fire_at_utc=fire_at, workspace=workspace,
-                    prompt=prompt, harness_args=extra_args,
+                    prompt=prompt or "(see product_spec/)",
+                    harness_args=extra_args,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._send(500, "text/plain", f"enqueue failed: {exc}\n")
@@ -2664,6 +3160,107 @@ def make_request_handler(
                 pass
             self.send_response(303)
             self.send_header("Location", "/schedule")
+            self.end_headers()
+
+        # ---- New file-upload + browser endpoints --------------------------
+
+        def _handle_api_upload_spec(
+            self,
+            fields: dict[str, str],
+            files: dict[str, tuple[str, bytes]],
+        ) -> None:
+            """Persist an uploaded product-spec document under
+            ``<workspace>/product_spec/``. The form carries the
+            workspace path (mandatory) plus the file part. Only ``.txt``
+            and ``.md`` filenames are accepted — anything else returns
+            400 so the JS surfaces a toast."""
+            workspace = (fields.get("workspace") or "").strip()
+            if not workspace:
+                self._send(400, "text/plain", "workspace required\n")
+                return
+            file_part = files.get("file")
+            if file_part is None:
+                self._send(400, "text/plain", "missing file part\n")
+                return
+            filename, data = file_part
+            saved_path, err = _persist_product_spec(workspace, filename, data)
+            if err is not None:
+                self._send(400, "text/plain", f"{err}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="spec_upload",
+                    target=workspace,
+                    detail=f"path={saved_path} bytes={len(data)}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            payload = json.dumps({"ok": True, "saved_as": saved_path})
+            self._send(200, "application/json; charset=utf-8", payload)
+
+        def _handle_api_skills_upload(
+            self,
+            fields: dict[str, str],
+            files: dict[str, tuple[str, bytes]],
+        ) -> None:
+            """Drop an uploaded ``.py`` skill into the configured user
+            skills directory. The directory is created if missing."""
+            file_part = files.get("file")
+            if file_part is None:
+                self._send(400, "text/plain", "missing file part\n")
+                return
+            filename, data = file_part
+            saved_path, err = _persist_user_skill(cfg, filename, data)
+            if err is not None:
+                self._send(400, "text/plain", f"{err}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="skill_upload",
+                    target=saved_path, detail=f"bytes={len(data)}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/config-ui#skills")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _handle_api_skills_delete(self, form: dict[str, Any]) -> None:
+            filename = str(form.get("filename") or "").strip()
+            removed, err = _delete_user_skill(cfg, filename)
+            if err is not None:
+                self._send(400, "text/plain", f"{err}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="skill_delete",
+                    target=removed, detail="",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/config-ui#skills")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _handle_api_memory_new(self, form: dict[str, Any]) -> None:
+            name = str(form.get("name") or "").strip()
+            content = str(form.get("content") or "")
+            saved_path, err = _persist_new_memory(cfg, name, content)
+            if err is not None:
+                self._send(400, "text/plain", f"{err}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="memory_new",
+                    target=saved_path, detail=f"bytes={len(content.encode('utf-8'))}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/config-ui#memory")
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def _handle_cancel(self, session_id: str) -> None:
@@ -2962,6 +3559,7 @@ from harness.web_state import (  # noqa: E402  (intentional late import)
     add_oneshot_job,
     append_audit,
     consume_chat_notes,
+    find_oneshot_jobs_near,
     list_pending_oneshot_jobs,
     pending_chat_notes,
     queue_chat_note,
@@ -3702,6 +4300,88 @@ def _parse_form_body(body: bytes) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+_MAX_MULTIPART_BYTES = 5 * 1024 * 1024  # 5 MiB — guards against huge uploads
+_MULTIPART_DISPOSITION_RE = re.compile(
+    rb'form-data;\s*(?:name="(?P<name>[^"]*)")?'
+    rb'(?:[^;]*?;\s*filename="(?P<filename>[^"]*)")?',
+    re.IGNORECASE,
+)
+
+
+def _parse_multipart_body(
+    body: bytes, content_type: str,
+) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    """Parse a ``multipart/form-data`` body.
+
+    Returns ``(fields, files)`` where ``fields`` maps field name → text
+    value (UTF-8 decoded) and ``files`` maps field name → (filename, bytes).
+
+    Deliberately minimal — supports the cases the dashboard's file
+    upload endpoints need (one or two text fields plus one file part).
+    Multiple parts sharing the same name keep only the last; that matches
+    how the form-encoded path already collapses single-value lists.
+
+    Raises ``ValueError`` when the body is malformed or oversized — callers
+    surface a 400.
+    """
+    if len(body) > _MAX_MULTIPART_BYTES:
+        raise ValueError(
+            f"upload exceeds {_MAX_MULTIPART_BYTES} bytes "
+            f"(got {len(body)})"
+        )
+    ct = content_type or ""
+    if "multipart/form-data" not in ct.lower():
+        raise ValueError("content-type is not multipart/form-data")
+    # Extract the boundary marker. RFC 2046 allows the value to be
+    # quoted; strip optional whitespace + quotes either way.
+    boundary = ""
+    for part in ct.split(";"):
+        part = part.strip()
+        if part.lower().startswith("boundary="):
+            boundary = part.split("=", 1)[1].strip().strip('"')
+            break
+    if not boundary:
+        raise ValueError("missing multipart boundary")
+    sep = b"--" + boundary.encode("ascii", errors="replace")
+    # Strip the leading separator + the trailing close marker.
+    chunks = body.split(sep)
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    for chunk in chunks:
+        chunk = chunk.lstrip(b"\r\n")
+        if not chunk or chunk == b"--" or chunk.startswith(b"--"):
+            continue
+        # Header / body delimiter is the empty line.
+        hb_split = chunk.split(b"\r\n\r\n", 1)
+        if len(hb_split) != 2:
+            continue
+        headers_blob, value = hb_split
+        # Drop the trailing CRLF that precedes the next boundary.
+        if value.endswith(b"\r\n"):
+            value = value[:-2]
+        name: Optional[str] = None
+        filename: Optional[str] = None
+        for header_line in headers_blob.split(b"\r\n"):
+            if header_line.lower().startswith(b"content-disposition:"):
+                disp = header_line.split(b":", 1)[1].strip()
+                m = _MULTIPART_DISPOSITION_RE.match(disp)
+                if m:
+                    nb = m.group("name")
+                    fb = m.group("filename")
+                    if nb is not None:
+                        name = nb.decode("utf-8", errors="replace")
+                    if fb is not None:
+                        filename = fb.decode("utf-8", errors="replace")
+                break
+        if not name:
+            continue
+        if filename is not None:
+            files[name] = (filename, value)
+        else:
+            fields[name] = value.decode("utf-8", errors="replace")
+    return fields, files
 
 
 # ---------------------------------------------------------------------------

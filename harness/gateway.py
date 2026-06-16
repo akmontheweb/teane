@@ -1164,20 +1164,30 @@ class GatewayConfig:
     planning_primary: str = ""
     planning_mode: str = "thinking_max"
     planning_fallback: str = ""
+    # Per-variant thinking mode for the fallback path. Defaults to the
+    # primary's mode when unset (legacy semantics: one mode for both).
+    planning_fallback_mode: str = ""
     patching_primary: str = ""
     patching_mode: str = "non_thinking"
+    # Patching now supports a fallback model (added in the configure-page
+    # overhaul). Empty primary stays disabled by ``_REQUIRED_ROUTING_FIELDS``.
+    patching_fallback: str = ""
+    patching_fallback_mode: str = ""
     repair_primary: str = ""
     repair_fallback: str = ""
     repair_mode: str = "thinking"
+    repair_fallback_mode: str = ""
     # Doc reviewer — fully independent of code reviewer. Empty primary == disabled.
     doc_reviewer_primary: str = ""
     doc_reviewer_mode: str = "thinking"
     doc_reviewer_fallback: str = ""
+    doc_reviewer_fallback_mode: str = ""
     max_doc_review_cycles: int = 1
     # Code reviewer — fully independent of doc reviewer. Empty primary == disabled.
     code_reviewer_primary: str = ""
     code_reviewer_mode: str = "thinking"
     code_reviewer_fallback: str = ""
+    code_reviewer_fallback_mode: str = ""
     max_code_review_cycles: int = 1
     # Hard ceiling on rounds of the discovery interview loop. Without this,
     # a confused user (or hostile LLM) can loop indefinitely on follow-up
@@ -2323,22 +2333,40 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
                 role_mt, max_tokens_default
             )
 
+    # Resolve per-variant thinking modes. The legacy ``<role>_mode`` key
+    # supplies the primary's mode AND — when ``<role>_fallback_mode`` is
+    # unset — the fallback's mode, preserving the old "one knob applies
+    # to both" semantics. The new explicit fallback-mode key lets the
+    # operator diverge the two paths from the configure page.
+    def _mode(role: str, primary_default: str) -> str:
+        return str(model_routing.get(f"{role}_mode", primary_default) or primary_default)
+
+    def _fallback_mode(role: str, primary_default: str) -> str:
+        explicit = str(model_routing.get(f"{role}_fallback_mode", "") or "")
+        return explicit if explicit else _mode(role, primary_default)
+
     gateway_config = GatewayConfig(
         planning_primary=model_routing.get("planning_primary", ""),
-        planning_mode=model_routing.get("planning_mode", "thinking_max"),
+        planning_mode=_mode("planning", "thinking_max"),
         planning_fallback=model_routing.get("planning_fallback", ""),
+        planning_fallback_mode=_fallback_mode("planning", "thinking_max"),
         patching_primary=model_routing.get("patching_primary", ""),
-        patching_mode=model_routing.get("patching_mode", "non_thinking"),
+        patching_mode=_mode("patching", "non_thinking"),
+        patching_fallback=model_routing.get("patching_fallback", ""),
+        patching_fallback_mode=_fallback_mode("patching", "non_thinking"),
         repair_primary=model_routing.get("repair_primary", ""),
         repair_fallback=model_routing.get("repair_fallback", ""),
-        repair_mode=model_routing.get("repair_mode", "thinking"),
+        repair_mode=_mode("repair", "thinking"),
+        repair_fallback_mode=_fallback_mode("repair", "thinking"),
         doc_reviewer_primary=model_routing.get("doc_reviewer_primary", ""),
-        doc_reviewer_mode=model_routing.get("doc_reviewer_mode", "thinking"),
+        doc_reviewer_mode=_mode("doc_reviewer", "thinking"),
         doc_reviewer_fallback=model_routing.get("doc_reviewer_fallback", ""),
+        doc_reviewer_fallback_mode=_fallback_mode("doc_reviewer", "thinking"),
         max_doc_review_cycles=_clamp_cycles(node_throttle.get("max_doc_review_cycles", 1), 1),
         code_reviewer_primary=model_routing.get("code_reviewer_primary", ""),
-        code_reviewer_mode=model_routing.get("code_reviewer_mode", "thinking"),
+        code_reviewer_mode=_mode("code_reviewer", "thinking"),
         code_reviewer_fallback=model_routing.get("code_reviewer_fallback", ""),
+        code_reviewer_fallback_mode=_fallback_mode("code_reviewer", "thinking"),
         max_code_review_cycles=_clamp_cycles(node_throttle.get("max_code_review_cycles", 1), 1),
         max_discovery_iterations=_clamp_discovery_iterations(
             node_throttle.get("max_discovery_iterations", 10)

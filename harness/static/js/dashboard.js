@@ -359,14 +359,29 @@
       evt.preventDefault();
 
       var csrf = readCookie("csrf_token");
-      var body = new URLSearchParams();
-      // Walk the form rather than using FormData so we cleanly skip
-      // disabled/unchecked controls — same shape parse_qs expects.
-      new FormData(form).forEach(function (v, k) {
-        body.append(k, typeof v === "string" ? v : "");
-      });
-      if (submitter && submitter.name) {
-        body.append(submitter.name, submitter.value || "");
+      // Multipart-encoded forms (file uploads) need their body sent as
+      // FormData so the browser sets the right Content-Type (with the
+      // multipart boundary). Everything else uses URLSearchParams as
+      // before — the harness's _parse_form_body only understands the
+      // urlencoded path.
+      var isMultipart = (form.enctype || "").toLowerCase() === "multipart/form-data";
+      var body;
+      var fetchHeaders = { "X-CSRF-Token": csrf };
+      if (isMultipart) {
+        body = new FormData(form);
+        if (submitter && submitter.name) {
+          body.append(submitter.name, submitter.value || "");
+        }
+      } else {
+        body = new URLSearchParams();
+        new FormData(form).forEach(function (v, k) {
+          body.append(k, typeof v === "string" ? v : "");
+        });
+        if (submitter && submitter.name) {
+          body.append(submitter.name, submitter.value || "");
+        }
+        fetchHeaders["Content-Type"] =
+          "application/x-www-form-urlencoded; charset=UTF-8";
       }
 
       var prevDisabled = false;
@@ -377,13 +392,10 @@
 
       fetch(action, {
         method: "POST",
-        body: body.toString(),
+        body: isMultipart ? body : body.toString(),
         credentials: "same-origin",
         redirect: "follow",
-        headers: {
-          "X-CSRF-Token": csrf,
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        },
+        headers: fetchHeaders,
       }).then(function (resp) {
         var finalUrl = resp.url || action;
         return resp.text().then(function (text) {
@@ -805,6 +817,233 @@
   // Boot
   // -------------------------------------------------------------------
 
+  // -------------------------------------------------------------------
+  // Workspace folder picker (configure-page overhaul)
+  // -------------------------------------------------------------------
+  //
+  // The dashboard runs locally for most operators, so a server-side
+  // directory listing is the simplest way to expose a real "Browse…"
+  // experience without forcing the user to type paths from memory.
+
+  function wireWorkspacePicker() {
+    var openBtn = document.getElementById("workspace-browse-btn");
+    var input = document.getElementById("workspace");
+    if (!openBtn || !input) return;
+    openBtn.addEventListener("click", function () {
+      openFolderModal(input.value || "");
+    });
+  }
+
+  function openFolderModal(seed) {
+    var modal = ensureFolderModal();
+    modal.classList.remove("hidden");
+    document.body.classList.add("modal-open");
+    var pathInput = modal.querySelector(".folder-modal__path");
+    var initial = (seed && seed.trim()) || "~";
+    if (pathInput) pathInput.value = initial;
+    loadFolderModal(initial);
+  }
+
+  function closeFolderModal() {
+    var modal = document.getElementById("folder-modal");
+    if (modal) modal.classList.add("hidden");
+    document.body.classList.remove("modal-open");
+  }
+
+  function ensureFolderModal() {
+    var existing = document.getElementById("folder-modal");
+    if (existing) return existing;
+    var modal = document.createElement("div");
+    modal.id = "folder-modal";
+    modal.className = "modal hidden";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.innerHTML =
+      '<div class="modal__backdrop" data-close="1"></div>' +
+      '<div class="modal__dialog folder-modal__dialog" role="document">' +
+        '<div class="modal__header">' +
+          '<h3 class="modal__title">Browse for workspace folder</h3>' +
+          '<button class="modal__close" type="button" data-close="1" ' +
+                  'aria-label="Close">&times;</button>' +
+        '</div>' +
+        '<div class="modal__body">' +
+          '<div class="folder-modal__path-row">' +
+            '<input type="text" class="bx--text-input folder-modal__path" ' +
+                   'aria-label="Current folder">' +
+            '<button type="button" class="bx--btn bx--btn--tertiary folder-modal__up" ' +
+                    'aria-label="Go up one level">Up</button>' +
+            '<button type="button" class="bx--btn bx--btn--tertiary folder-modal__go" ' +
+                    'aria-label="Go to typed path">Go</button>' +
+          '</div>' +
+          '<ul class="browser-list" tabindex="0"></ul>' +
+          '<p class="muted fs-sm folder-modal__status"></p>' +
+        '</div>' +
+        '<div class="modal__footer">' +
+          '<button class="bx--btn bx--btn--secondary" type="button" data-close="1">Cancel</button>' +
+          '<button class="bx--btn bx--btn--primary folder-modal__pick" type="button">' +
+            'Use this folder</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(modal);
+
+    // Wire up dismiss interactions.
+    modal.addEventListener("click", function (e) {
+      var target = e.target;
+      if (target && target.getAttribute("data-close") === "1") {
+        closeFolderModal();
+      }
+    });
+    modal.querySelector(".folder-modal__up").addEventListener("click", function () {
+      var p = modal.querySelector(".folder-modal__path");
+      var parts = (p.value || "").replace(/\/+$/g, "").split("/");
+      parts.pop();
+      var up = parts.join("/") || "/";
+      p.value = up;
+      loadFolderModal(up);
+    });
+    modal.querySelector(".folder-modal__go").addEventListener("click", function () {
+      var p = modal.querySelector(".folder-modal__path");
+      loadFolderModal(p.value || "/");
+    });
+    modal.querySelector(".folder-modal__path").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        loadFolderModal(e.target.value || "/");
+      }
+    });
+    modal.querySelector(".folder-modal__pick").addEventListener("click", function () {
+      var p = modal.querySelector(".folder-modal__path");
+      var ws = document.getElementById("workspace");
+      if (ws) ws.value = p.value || "";
+      closeFolderModal();
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !modal.classList.contains("hidden")) {
+        closeFolderModal();
+      }
+    });
+    return modal;
+  }
+
+  function loadFolderModal(path) {
+    var modal = document.getElementById("folder-modal");
+    if (!modal) return;
+    var list = modal.querySelector(".browser-list");
+    var status = modal.querySelector(".folder-modal__status");
+    var p = modal.querySelector(".folder-modal__path");
+    list.innerHTML = "<li class='muted'>Loading…</li>";
+    status.textContent = "";
+    var url = "/api/browse?path=" + encodeURIComponent(path);
+    fetch(url, { credentials: "same-origin" })
+      .then(function (resp) { return resp.json().catch(function () { return null; }); })
+      .then(function (data) {
+        if (!data || data.ok !== true) {
+          list.innerHTML = "";
+          status.textContent = (data && data.error) || "Could not list folder.";
+          return;
+        }
+        if (p) p.value = data.path || path;
+        if (!data.entries || data.entries.length === 0) {
+          list.innerHTML = "<li class='muted'>No subdirectories.</li>";
+          return;
+        }
+        list.innerHTML = "";
+        data.entries.forEach(function (entry) {
+          var li = document.createElement("li");
+          li.className = "browser-list__row";
+          li.textContent = entry.name + "/";
+          li.setAttribute("data-path", entry.path);
+          li.addEventListener("dblclick", function () { loadFolderModal(entry.path); });
+          li.addEventListener("click", function () {
+            if (p) p.value = entry.path;
+          });
+          list.appendChild(li);
+        });
+      })
+      .catch(function (err) {
+        list.innerHTML = "";
+        status.textContent = (err && err.message) || "Browse failed.";
+      });
+  }
+
+  // -------------------------------------------------------------------
+  // Run-page product-spec upload (configure-page overhaul)
+  // -------------------------------------------------------------------
+
+  function wireSpecUpload() {
+    var openBtn = document.getElementById("spec-upload-btn");
+    var fileInput = document.getElementById("spec-file");
+    var nameSpan = document.getElementById("spec-upload-name");
+    var clearBtn = document.getElementById("spec-upload-clear");
+    var pathInput = document.getElementById("spec-file-path");
+    var workspace = document.getElementById("workspace");
+    if (!openBtn || !fileInput || !pathInput) return;
+    openBtn.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", function () {
+      var f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      var lower = f.name.toLowerCase();
+      if (!(lower.endsWith(".txt") || lower.endsWith(".md"))) {
+        toast("Only .txt or .md files are accepted.", "error");
+        fileInput.value = "";
+        return;
+      }
+      if (!workspace || !workspace.value.trim()) {
+        toast("Set a workspace path first.", "error");
+        fileInput.value = "";
+        return;
+      }
+      var fd = new FormData();
+      fd.append("workspace", workspace.value);
+      fd.append("csrf_token", readCookie("csrf_token") || "");
+      fd.append("file", f, f.name);
+      openBtn.disabled = true;
+      fetch("/api/upload-spec", {
+        method: "POST",
+        body: fd,
+        credentials: "same-origin",
+        headers: { "X-CSRF-Token": readCookie("csrf_token") || "" },
+      }).then(function (resp) {
+        return resp.text().then(function (text) {
+          if (!resp.ok) throw new Error(text || ("HTTP " + resp.status));
+          var data;
+          try { data = JSON.parse(text); } catch (_e) { data = null; }
+          if (!data || !data.ok) throw new Error(text || "upload failed");
+          pathInput.value = data.saved_as || "";
+          if (nameSpan) nameSpan.textContent = f.name;
+          if (clearBtn) clearBtn.classList.remove("hidden");
+          toast("Uploaded " + f.name, "success");
+        });
+      }).catch(function (err) {
+        pathInput.value = "";
+        toast("Upload failed: " + (err && err.message ? err.message : err), "error");
+      }).finally(function () {
+        openBtn.disabled = false;
+        fileInput.value = "";
+      });
+    });
+    if (clearBtn) {
+      clearBtn.addEventListener("click", function () {
+        pathInput.value = "";
+        if (nameSpan) nameSpan.textContent = "";
+        clearBtn.classList.add("hidden");
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Configure-page Cancel button (revert in-flight edits)
+  // -------------------------------------------------------------------
+
+  function wireSectionCancel() {
+    document.addEventListener("click", function (evt) {
+      var btn = evt.target.closest && evt.target.closest(".ct-section__cancel");
+      if (!btn) return;
+      var form = btn.closest("form");
+      if (form) form.reset();
+    });
+  }
+
   function boot() {
     ensureToastHost();
     wireCopyButtons();
@@ -818,6 +1057,9 @@
     wireFormCsrf();
     wireRunModeFromQuery();
     wireToastFromQuery();
+    wireWorkspacePicker();
+    wireSpecUpload();
+    wireSectionCancel();
   }
 
   if (document.readyState === "loading") {

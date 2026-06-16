@@ -53,7 +53,20 @@ harness = "harness.cli:main"
 include = ["harness*"]
 
 [tool.setuptools.package-data]
-harness = ["cli.json", "model_prices.json"]
+harness = [
+    "cli.json",
+    "model_prices.json",
+    # Web UI static assets: CSS, JS, icon sprite, favicon, fonts. These
+    # are served by `harness web` from harness/static/ (or operator-
+    # overridden via dashboard.static_dir). Wheels must include them
+    # so an offline install renders the styled UI without a CDN hit.
+    "static/css/*.css",
+    "static/js/*.js",
+    "static/icons/*.svg",
+    "static/fonts/*",
+    "static/*.ico",
+    "static/*.png",
+]
 
 [tool.ruff]
 line-length = 120

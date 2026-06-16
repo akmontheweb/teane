@@ -138,6 +138,91 @@ class DashboardConfig:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Static asset serving — packaged CSS/JS/icons/fonts plus operator
+#     overrides via ``dashboard.static_dir``. Keeps the dashboard self-
+#     contained (no CDN required) and air-gap friendly: operators can
+#     drop a replacement ``app.css`` or ``sprite.svg`` into static_dir
+#     and it wins over the packaged copy without touching the wheel.
+# ---------------------------------------------------------------------------
+
+_PACKAGED_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# Whitelist of extensions we will serve and the content-type each maps to.
+# Everything else 404s — refusing to serve an unknown extension is the
+# defense against operators dropping a .py or .sh into static_dir and
+# having the browser try to execute it.
+_STATIC_CONTENT_TYPES: dict[str, str] = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".map": "application/json",
+}
+
+# Only allow safe path characters. The regex on the route enforces this
+# too, but defense-in-depth: nothing in static_dir is ever named with
+# spaces, colons, or backslashes, so refusing them outright is the
+# simplest containment story.
+_STATIC_SAFE_RELPATH = re.compile(r"^[A-Za-z0-9_./\-]+$")
+
+
+def _serve_static(cfg: DashboardConfig, relpath: str) -> tuple[int, str, bytes]:
+    """Serve a static asset for a `/static/<relpath>` (or `/favicon.ico`)
+    request.
+
+    Resolution order:
+      1. Operator override at ``$(cfg.static_dir)/<relpath>``.
+      2. Packaged file at ``harness/static/<relpath>``.
+
+    Containment is enforced via ``realpath`` so symlink-escape and
+    ``..`` traversal both fail closed. Disallowed extensions 404. The
+    returned body is ``bytes`` (binary-safe).
+    """
+    if not relpath or "\x00" in relpath or not _STATIC_SAFE_RELPATH.match(relpath):
+        return 404, "text/plain; charset=utf-8", b"404 not found\n"
+    if relpath.startswith("/") or ".." in relpath.split("/"):
+        return 404, "text/plain; charset=utf-8", b"404 not found\n"
+
+    ext = os.path.splitext(relpath)[1].lower()
+    content_type = _STATIC_CONTENT_TYPES.get(ext)
+    if content_type is None:
+        return 404, "text/plain; charset=utf-8", b"404 not found\n"
+
+    candidates: list[str] = []
+    override_dir = (cfg.static_dir or "").strip()
+    if override_dir:
+        candidates.append(os.path.expanduser(override_dir))
+    candidates.append(_PACKAGED_STATIC_DIR)
+
+    for root in candidates:
+        try:
+            root_real = os.path.realpath(root)
+            target = os.path.realpath(os.path.join(root, relpath))
+        except OSError:
+            continue
+        if not os.path.isdir(root_real):
+            continue
+        # Strict containment: the resolved target must live under the
+        # resolved root. Reject anything that climbs out via symlink or
+        # ``..``.
+        if not (target == root_real or target.startswith(root_real + os.sep)):
+            continue
+        if not os.path.isfile(target):
+            continue
+        try:
+            with open(target, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        return 200, content_type, data
+
+    return 404, "text/plain; charset=utf-8", b"404 not found\n"
+
+
+# ---------------------------------------------------------------------------
 # 2. Data adapters — read-only over the harness's existing on-disk state
 # ---------------------------------------------------------------------------
 
@@ -593,31 +678,19 @@ def check_auth(
 # spacing tokens, table styles, etc. — we only add things Carbon doesn't:
 # the side-nav offset for main content, a couple of status-color helpers,
 # and the legacy .card/.ok/.fail classes some existing renderers still use.
+# Bare-minimum inline fallback. The full stylesheet lives at
+# harness/static/css/app.css and is served via the /static/ route the
+# layout pulls in. Keeping a tiny inline copy means pages still render
+# something sensible (correct margins + tag colors) when an air-gap
+# operator hasn't yet mirrored the assets. Remove this fallback after
+# one release cycle.
 _BASE_CSS = """\
-body { margin: 0; }
-main.bx--content { margin-left: 16rem; padding: 2rem; min-height: calc(100vh - 3rem); background: #f4f4f4; }
-main.bx--content h2 { font-weight: 400; margin-top: 0; }
+body { margin: 0; font-family: 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif; }
+main.bx--content { margin-left: 16rem; padding: 2rem; background: #f4f4f4; min-height: calc(100vh - 3rem); }
 .bx--side-nav__link--current, .bx--side-nav__link--current span { color: #fff !important; background: #393939; }
 .muted { color: #6f6f6f; }
 .ok { color: #198038; font-weight: 600; }
 .fail { color: #da1e28; font-weight: 600; }
-.card { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; margin-bottom: 1rem; }
-.card h2 { margin-top: 0; font-size: 1rem; font-weight: 600; }
-.card pre { background: #f4f4f4; padding: 0.75rem; overflow: auto; font-size: 0.85rem; }
-table { width: 100%; border-collapse: collapse; background: #fff; }
-th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #e0e0e0; text-align: left; font-size: 0.875rem; }
-th { background: #f4f4f4; font-weight: 600; }
-.tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); gap: 1rem; }
-.status-tile { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; }
-.status-tile h3 { margin: 0 0 0.75rem 0; font-size: 0.875rem; font-weight: 600; text-transform: uppercase; color: #525252; }
-.status-tile dl { margin: 0; display: grid; grid-template-columns: 1fr auto; row-gap: 0.25rem; column-gap: 1rem; font-size: 0.875rem; }
-.status-tile dt { color: #525252; }
-.status-tile dd { margin: 0; font-variant-numeric: tabular-nums; }
-.dash-tile { background: #fff; border: 1px solid #e0e0e0; padding: 1rem; transition: background 0.1s; }
-.dash-tile:hover { background: #e8e8e8; }
-.dash-tile a { color: #0f62fe; text-decoration: none; display: block; }
-.dash-tile h3 { margin: 0 0 0.5rem 0; font-size: 1rem; font-weight: 600; }
-.dash-tile p { margin: 0; font-size: 0.875rem; color: #525252; }
 .tag { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 0.75rem; font-size: 0.75rem; font-weight: 500; }
 .tag-green { background: #defbe6; color: #0e6027; }
 .tag-red { background: #ffd7d9; color: #a2191f; }
@@ -625,28 +698,122 @@ th { background: #f4f4f4; font-weight: 600; }
 """
 
 
-_NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
-    # (slug, label, href)
-    ("status", "View Status", "/status"),
-    ("run", "Run Harness", "/run"),
-    ("config", "Configure Harness", "/config-ui"),
-    ("dashboards", "View Dashboards", "/dashboards"),
-    ("docs", "View Documents", "/docs"),
+def _icon(name: str, size: int = 16, klass: str = "") -> str:
+    """Render an inline reference to an icon symbol in
+    /static/icons/sprite.svg.
+
+    ``name`` is the symbol id without the ``i-`` prefix (e.g. ``launch``,
+    ``copy``, ``play``). Unknown names render as the empty string —
+    no Carbon-style placeholder — so a typo doesn't blow up a page.
+    """
+    if not name or not re.fullmatch(r"[a-z0-9\-]+", name):
+        return ""
+    klass_attr = f" {klass}".rstrip() if klass else ""
+    return (
+        f"<svg class=\"icon{klass_attr}\" width=\"{size}\" height=\"{size}\" "
+        f"aria-hidden=\"true\" focusable=\"false\">"
+        f"<use href=\"/static/icons/sprite.svg#i-{name}\"/></svg>"
+    )
+
+
+def _copyable(value: str, label: str = "Copy") -> str:
+    """Wrap a string in an inline ``<code>`` plus a copy-to-clipboard
+    button. The button carries the value in ``data-copy``; the JS in
+    dashboard.js delegates the click and shows a toast on success.
+
+    Use this for any short value an operator might want to paste into
+    a terminal: session ids, workspace paths, configuration keys.
+    """
+    val = html.escape(value or "")
+    label_attr = html.escape(label)
+    icon = _icon("copy", size=14)
+    return (
+        f"<span class='id-cell'>"
+        f"<code>{val}</code>"
+        f"<button class='copy-btn' type='button' data-copy='{val}' "
+        f"aria-label='{label_attr}' title='{label_attr}'>{icon}</button>"
+        f"</span>"
+    )
+
+
+def _breadcrumb(items: list[tuple[str, Optional[str]]]) -> str:
+    """Render a breadcrumb trail.
+
+    ``items`` is a list of ``(label, href)`` tuples. Pass ``href=None``
+    for the current page (the last item) — it renders as plain text.
+
+    Example::
+
+        _breadcrumb([("Sessions", "/sessions"), ("abc123", None)])
+    """
+    parts: list[str] = []
+    for label, href in items:
+        text = html.escape(label)
+        if href:
+            parts.append(
+                f"<li><a href='{html.escape(href)}'>{text}</a></li>"
+            )
+        else:
+            parts.append(
+                f"<li class='breadcrumb__current' aria-current='page'>{text}</li>"
+            )
+    return f"<ol class='breadcrumb' aria-label='Breadcrumb'>{''.join(parts)}</ol>"
+
+
+def _empty_state(
+    icon: str,
+    title: str,
+    body: str,
+    cta_text: Optional[str] = None,
+    cta_href: Optional[str] = None,
+) -> str:
+    """Render a centered empty-state card with an icon, headline,
+    explanatory paragraph, and an optional call-to-action button.
+
+    Use anywhere a renderer previously emitted a lone ``<p class='muted'>
+    No foo yet…</p>``. The CTA replaces the previous "go run the CLI"
+    hint with a one-click affordance.
+    """
+    cta_html = ""
+    if cta_text and cta_href:
+        cta_html = (
+            f"<p><a class='bx--btn bx--btn--primary' "
+            f"href='{html.escape(cta_href)}'>{_icon('add')}{html.escape(cta_text)}</a></p>"
+        )
+    return (
+        f"<div class='empty-state'>"
+        f"<div class='empty-state__icon'>{_icon(icon, size=32, klass='icon--lg')}</div>"
+        f"<h3 class='empty-state__title'>{html.escape(title)}</h3>"
+        f"<p class='empty-state__body'>{body}</p>"
+        f"{cta_html}"
+        f"</div>"
+    )
+
+
+_NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
+    # (slug, label, href, icon symbol name from sprite.svg)
+    ("status", "View Status", "/status", "chart-line"),
+    ("run", "Run Harness", "/run", "play"),
+    ("config", "Configure Harness", "/config-ui", "settings"),
+    ("dashboards", "View Dashboards", "/dashboards", "dashboard"),
+    ("docs", "View Documents", "/docs", "document"),
 )
 
 
 def _render_side_nav(active: str) -> str:
     items = []
-    for slug, label, href in _NAV_ITEMS:
+    for slug, label, href, icon_name in _NAV_ITEMS:
         cls = "bx--side-nav__link bx--side-nav__link--current" if slug == active else "bx--side-nav__link"
+        icon_svg = _icon(icon_name, size=16) if icon_name else ""
         items.append(
             f'<li class="bx--side-nav__item">'
             f'<a class="{cls}" href="{href}">'
+            f'{icon_svg}'
             f'<span class="bx--side-nav__link-text">{html.escape(label)}</span>'
             f'</a></li>'
         )
     return (
-        '<nav class="bx--side-nav bx--side-nav--expanded" aria-label="Side navigation">'
+        '<nav id="side-nav" class="bx--side-nav bx--side-nav--expanded" aria-label="Side navigation">'
         '<ul class="bx--side-nav__items">' + "".join(items) + '</ul></nav>'
     )
 
@@ -656,16 +823,31 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#161616">
 <title>{html.escape(title)} — myharness</title>
+<link rel="icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="{html.escape(cfg.carbon_css_url)}">
+<link rel="stylesheet" href="/static/css/app.css">
 <style>{_BASE_CSS}</style>
 <script src="{html.escape(cfg.chart_js_url)}"></script>
+<script defer src="/static/js/dashboard.js"></script>
 </head>
 <body class="bx--body">
 <header class="bx--header" role="banner">
+  <button id="nav-toggle" type="button" class="nav-toggle" aria-label="Toggle navigation"
+          aria-controls="side-nav" aria-expanded="false">
+    {_icon("menu", size=20)}
+  </button>
   <a class="bx--header__name" href="/status">
     <span class="bx--header__name--prefix">myharness</span>
   </a>
+  <div class="header-actions">
+    <button id="auto-refresh-toggle" type="button" class="auto-refresh-btn"
+            aria-pressed="false" title="Auto-refresh every 15s">
+      {_icon("renew", size=16)}<span class="auto-refresh-btn__label">Auto-refresh: off</span>
+    </button>
+  </div>
 </header>
 {_render_side_nav(active)}
 <main class="bx--content">
@@ -692,9 +874,15 @@ def _esc(value: Any) -> str:
 def _render_sessions(cfg: DashboardConfig) -> str:
     sessions = list_sessions(cfg)
     if not sessions:
-        return (
-            "<p class='muted'>No sessions yet. Run "
-            "<code>harness run -r ...</code> to populate this view.</p>"
+        return _empty_state(
+            icon="list",
+            title="No sessions yet",
+            body=(
+                "Run the harness via <a href='/run'>Run Harness</a> or the "
+                "<code>harness run</code> CLI to populate this view."
+            ),
+            cta_text="Run harness",
+            cta_href="/run",
         )
     rows = []
     for s in sessions:
@@ -704,36 +892,52 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             status, cls = "success", "ok"
         elif s.exit_code is not None:
             status, cls = f"exit {s.exit_code}", "fail"
+        sid = _esc(s.session_id)
         rows.append(
             f"<tr>"
-            f"<td><a href='/sessions/{_esc(s.session_id)}'>{_esc(s.session_id)}</a></td>"
+            f"<td><a href='/sessions/{sid}'>{sid}</a> "
+            f"<button class='copy-btn' type='button' data-copy='{sid}' "
+            f"aria-label='Copy session id'>{_icon('copy', size=14)}</button></td>"
             f"<td>{_esc(s.started_at)}</td>"
             f"<td>{_esc(s.ended_at)}</td>"
             f"<td class='{cls}'>{_esc(status)}</td>"
-            f"<td>{_fmt_int(s.llm_calls)}</td>"
-            f"<td>{_fmt_cost(s.total_cost_usd)}</td>"
-            f"<td>{_fmt_int(s.total_input_tokens)}</td>"
-            f"<td>{_fmt_int(s.total_output_tokens)}</td>"
+            f"<td class='num'>{_fmt_int(s.llm_calls)}</td>"
+            f"<td class='num'>{_fmt_cost(s.total_cost_usd)}</td>"
+            f"<td class='num'>{_fmt_int(s.total_input_tokens)}</td>"
+            f"<td class='num'>{_fmt_int(s.total_output_tokens)}</td>"
             f"<td><span class='muted'>{_esc(s.workspace_path)}</span></td>"
             f"</tr>"
         )
     return (
-        "<table>"
-        "<tr><th>session</th><th>started</th><th>ended</th><th>status</th>"
-        "<th>calls</th><th>cost</th><th>tokens in</th><th>tokens out</th>"
-        "<th>workspace</th></tr>"
-        + "".join(rows) + "</table>"
+        "<div class='table-wrap'><table id='sessions-table'>"
+        "<thead><tr>"
+        "<th data-sort='str'>session</th>"
+        "<th data-sort='date'>started</th>"
+        "<th data-sort='date'>ended</th>"
+        "<th data-sort='str'>status</th>"
+        "<th class='num' data-sort='num'>calls</th>"
+        "<th class='num' data-sort='num'>cost</th>"
+        "<th class='num' data-sort='num'>tokens in</th>"
+        "<th class='num' data-sort='num'>tokens out</th>"
+        "<th data-sort='str'>workspace</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table></div>"
     )
 
 
 def _render_session_detail(cfg: DashboardConfig, session_id: str) -> str:
     log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
+    crumb = _breadcrumb([
+        ("Sessions", "/sessions"),
+        (session_id, None),
+    ])
     if not os.path.isfile(log_path):
-        return f"<p class='fail'>No log file for session {_esc(session_id)}.</p>"
+        return crumb + f"<p class='fail'>No log file for session {_esc(session_id)}.</p>"
     events = session_events(log_path, max_events=2000)
     if not events:
-        return f"<p class='muted'>Session {_esc(session_id)} log is empty or unparseable.</p>"
-    body = []
+        return crumb + f"<p class='muted'>Session {_esc(session_id)} log is empty or unparseable.</p>"
+    body = [crumb]
     body.append(f"<div class='card'><h2>Events ({len(events)})</h2>")
     rows = []
     for evt in events[:200]:
@@ -800,13 +1004,16 @@ def _render_schedule(cfg: DashboardConfig) -> str:
             f"<td>{_esc(r['started_at'])}</td>"
             f"<td>{_esc(r['ended_at'])}</td>"
             f"<td class='{cls}'>{status}</td>"
-            f"<td>{(f'{duration:.1f}s' if duration is not None else '—')}</td>"
+            f"<td class='num'>{(f'{duration:.1f}s' if duration is not None else '—')}</td>"
             f"<td><span class='muted'>{_esc(r['log_path'])}</span></td>"
             f"</tr>"
         )
-    return ("<table><tr><th>job</th><th>started</th><th>ended</th>"
-            "<th>status</th><th>duration</th><th>log</th></tr>"
-            + "".join(rows) + "</table>")
+    return (
+        "<div class='table-wrap'><table id='schedule-table'>"
+        "<thead><tr><th>job</th><th>started</th><th>ended</th>"
+        "<th>status</th><th class='num'>duration</th><th>log</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
 
 
 def _render_index(cfg: DashboardConfig) -> str:
@@ -851,9 +1058,13 @@ def _render_memory(cfg: DashboardConfig) -> str:
 
 def _render_memory_file(cfg: DashboardConfig, name: str) -> tuple[int, str]:
     content = read_memory_file(cfg, name)
+    crumb = _breadcrumb([("Memory", "/memory"), (name, None)])
     if content is None:
-        return 404, "<p class='fail'>Memory file not found.</p>"
-    return 200, f"<div class='card'><h2>{_esc(name)}</h2><pre>{html.escape(content)}</pre></div>"
+        return 404, crumb + "<p class='fail'>Memory file not found.</p>"
+    return 200, (
+        crumb
+        + f"<div class='card'><h2>{_esc(name)}</h2><pre>{html.escape(content)}</pre></div>"
+    )
 
 
 def _render_overview(cfg: DashboardConfig) -> str:
@@ -1051,11 +1262,20 @@ def _render_status(cfg: DashboardConfig) -> str:
                 f"</tr>"
             )
         section_b_body = (
-            "<table><tr><th>Session</th><th>Started</th><th>Workspace</th>"
-            "<th>Source</th><th></th></tr>" + "".join(rows) + "</table>"
+            "<div class='table-wrap'><table id='running-now-table'>"
+            "<thead><tr>"
+            "<th data-sort='str'>Session</th>"
+            "<th data-sort='date'>Started</th>"
+            "<th data-sort='str'>Workspace</th>"
+            "<th data-sort='str'>Source</th>"
+            "<th></th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table></div>"
         )
     else:
-        section_b_body = "<p class='muted'>No sessions are running right now.</p>"
+        section_b_body = (
+            "<p class='muted mb-0'>No sessions are running right now. "
+            "Use <a href='/run'>Run Harness</a> to start one.</p>"
+        )
     section_b = f"<div class='card'><h2>Running now</h2>{section_b_body}</div>"
 
     today_sessions = [
@@ -1080,17 +1300,23 @@ def _render_status(cfg: DashboardConfig) -> str:
                 f"<tr>"
                 f"<td><a href='/sessions/{_esc(s.session_id)}'>{_esc(s.session_id)}</a></td>"
                 f"<td>{status_html}</td>"
-                f"<td>{duration}</td>"
-                f"<td>{_fmt_cost(s.total_cost_usd)}</td>"
+                f"<td class='num'>{duration}</td>"
+                f"<td class='num'>{_fmt_cost(s.total_cost_usd)}</td>"
                 f"<td><a href='/sessions/{_esc(s.session_id)}'>Open dashboard</a></td>"
                 f"</tr>"
             )
         section_c_body = (
-            "<table><tr><th>Session</th><th>Status</th><th>Duration</th>"
-            "<th>Cost</th><th></th></tr>" + "".join(rows) + "</table>"
+            "<div class='table-wrap'><table id='today-runs-table'>"
+            "<thead><tr>"
+            "<th data-sort='str'>Session</th>"
+            "<th data-sort='str'>Status</th>"
+            "<th class='num' data-sort='num'>Duration</th>"
+            "<th class='num' data-sort='num'>Cost</th>"
+            "<th></th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table></div>"
         )
     else:
-        section_c_body = "<p class='muted'>No sessions started today.</p>"
+        section_c_body = "<p class='muted mb-0'>No sessions started today.</p>"
     section_c = f"<div class='card'><h2>Today's runs</h2>{section_c_body}</div>"
 
     return section_a + section_b + section_c
@@ -1118,7 +1344,7 @@ def _render_run_flag_input(flag) -> str:
             sel = "selected" if str(flag.default).lower() == choice else ""
             opts.append(f"<option value='{choice}' {sel}>{choice.capitalize()}</option>")
         return (
-            f"<select class='bx--select-input' name='{name}' style='width:100%'>"
+            f"<select class='bx--select-input w-100' name='{name}'>"
             + "".join(opts) + "</select>"
         )
     if flag.kind == FORM_KIND_SELECT:
@@ -1129,7 +1355,7 @@ def _render_run_flag_input(flag) -> str:
                 f"<option value='{html.escape(choice)}' {sel}>{html.escape(choice)}</option>"
             )
         return (
-            f"<select class='bx--select-input' name='{name}' style='width:100%'>"
+            f"<select class='bx--select-input w-100' name='{name}'>"
             + "".join(opts) + "</select>"
         )
     if flag.kind == FORM_KIND_NUMBER_INT:
@@ -1140,13 +1366,13 @@ def _render_run_flag_input(flag) -> str:
             bounds.append(f"max='{flag.max_value}'")
         bound_attrs = (" " + " ".join(bounds)) if bounds else ""
         return (
-            f"<input class='bx--text-input' type='number' step='1' name='{name}' "
-            f"value='{default}' style='width:100%'{bound_attrs}>"
+            f"<input class='bx--text-input w-100' type='number' step='1' name='{name}' "
+            f"value='{default}'{bound_attrs}>"
         )
     # FORM_KIND_TEXT fallback.
     return (
-        f"<input class='bx--text-input' type='text' name='{name}' "
-        f"value='{default}' style='width:100%'>"
+        f"<input class='bx--text-input w-100' type='text' name='{name}' "
+        f"value='{default}'>"
     )
 
 
@@ -1159,7 +1385,7 @@ def _render_run_flag_rows() -> str:
             f"<tr>"
             f"<td><label class='bx--label' for='{html.escape(flag.field_id)}'>"
             f"{html.escape(flag.label)} "
-            f"<code class='muted' style='font-size:0.85em'>{html.escape(flag.flag)}</code>"
+            f"<code class='muted fs-sm'>{html.escape(flag.flag)}</code>"
             f"</label></td>"
             f"<td class='muted'>{html.escape(flag.description)}</td>"
             f"<td>{_render_run_flag_input(flag)}</td>"
@@ -1203,62 +1429,119 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
                 f"</tr>"
             )
         pending_html = (
-            "<table><tr><th>Fire at (UTC)</th><th>Name</th><th>Workspace</th>"
-            "<th>Prompt</th><th>Status</th><th>Args</th></tr>"
-            + "".join(rows) + "</table>"
+            "<div class='table-wrap'><table id='pending-jobs-table'>"
+            "<thead><tr><th>Fire at (UTC)</th><th>Name</th><th>Workspace</th>"
+            "<th>Prompt</th><th>Status</th><th>Args</th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table></div>"
         )
     else:
         pending_html = "<p class='muted'>No one-shot jobs scheduled.</p>"
 
     flag_rows = _render_run_flag_rows()
+    session_picker_html = _render_session_picker(cfg)
+
+    # The form carries TWO mutually-exclusive panels: the New-session
+    # panel (workspace + prompt + flags + schedule) and the Resume panel
+    # (session picker + optional workspace/prompt overrides). Switching
+    # is pure CSS via the hidden radios at the top of the form — no JS
+    # needed for the tab toggle itself.
     form = f"""
 <div class='card'>
   <h2>Start a harness run</h2>
-  <form id='run-form' method='post' action='/run/now'>
+  <form id='run-form' method='post' action='/run/now' class='run-form'>
     <input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>
     <input type='hidden' id='fire-at-utc' name='fire_at_utc' value=''>
-    <div style='margin-bottom:1rem'>
-      <label class='bx--label' for='workspace'>Workspace path</label>
-      <input class='bx--text-input' id='workspace' name='workspace' type='text' required>
+
+    <!-- Mode radios: hidden visually but drive the panel toggle below
+         via CSS sibling selectors. -->
+    <input type='radio' name='run_mode' id='mode-new' value='new' checked
+           class='run-mode-radio'>
+    <input type='radio' name='run_mode' id='mode-resume' value='resume'
+           class='run-mode-radio'>
+
+    <div class='run-tabs' role='tablist' aria-label='Session mode'>
+      <label for='mode-new' class='run-tab' role='tab'>
+        {_icon("add")}New session
+      </label>
+      <label for='mode-resume' class='run-tab' role='tab'>
+        {_icon("renew")}Resume existing session
+      </label>
     </div>
-    <div style='margin-bottom:1rem'>
-      <label class='bx--label' for='prompt'>Prompt</label>
-      <textarea class='bx--text-area' id='prompt' name='prompt' rows='4' required></textarea>
-    </div>
-    <fieldset style='border:1px solid var(--cds-ui-04, #8d8d8d); padding:1rem; margin:1rem 0;'>
-      <legend class='bx--label'>Run options</legend>
-      <p class='muted' style='margin-bottom:0.75rem'>One field per CLI flag. Leave a text/number field blank to use the harness default. Yes/No flags emit the flag only on Yes.</p>
-      <table style='width:100%'>
-        <tr><th style='text-align:left; width:30%'>Flag</th><th style='text-align:left; width:45%'>Meaning</th><th style='text-align:left; width:25%'>Value</th></tr>
-        {flag_rows}
-      </table>
-    </fieldset>
-    <fieldset id='schedule-fields' style='display:none; border:none; padding:0; margin:1rem 0;'>
-      <legend class='bx--label'>Scheduled run</legend>
-      <div style='margin-bottom:1rem'>
-        <label class='bx--label' for='job_name'>Job name</label>
-        <input class='bx--text-input' id='job_name' name='name' type='text' placeholder='nightly retest'>
+
+    <!-- NEW session panel (default) -->
+    <fieldset class='run-panel run-panel--new'>
+      <legend class='bx--label run-panel__legend'>New session</legend>
+      <div class='field'>
+        <label class='bx--label' for='workspace'>Workspace path</label>
+        <input class='bx--text-input' id='workspace' name='workspace' type='text'
+               placeholder='/path/to/repo'>
       </div>
-      <div style='display:flex; gap:1rem; margin-bottom:1rem'>
-        <div style='flex:1'>
-          <label class='bx--label' for='fire_date'>Date (UTC)</label>
-          <input class='bx--date-picker__input' id='fire_date' type='date'>
+      <div class='field'>
+        <label class='bx--label' for='prompt'>Prompt</label>
+        <textarea class='bx--text-area' id='prompt' name='prompt' rows='4'
+                  placeholder='What should the harness do?'></textarea>
+      </div>
+      <fieldset class='field-group'>
+        <legend class='bx--label'>Run options</legend>
+        <p class='muted mb-3'>One field per CLI flag. Leave a text/number field blank to use the harness default. Yes/No flags emit the flag only on Yes.</p>
+        <div class='table-wrap'>
+          <table class='w-100 run-options-table'>
+            <thead><tr><th>Flag</th><th>Meaning</th><th>Value</th></tr></thead>
+            <tbody>{flag_rows}</tbody>
+          </table>
         </div>
-        <div style='flex:1'>
-          <label class='bx--label' for='fire_time'>Time (UTC)</label>
-          <input class='bx--time-picker__input' id='fire_time' type='time' step='60'>
+      </fieldset>
+      <fieldset id='schedule-fields' class='hidden field-group'>
+        <legend class='bx--label'>Scheduled run</legend>
+        <div class='field'>
+          <label class='bx--label' for='job_name'>Job name</label>
+          <input class='bx--text-input' id='job_name' name='name' type='text' placeholder='nightly retest'>
         </div>
+        <div class='field flex gap-4'>
+          <div class='flex-1'>
+            <label class='bx--label' for='fire_date'>Date (UTC)</label>
+            <input class='bx--date-picker__input' id='fire_date' type='date'>
+          </div>
+          <div class='flex-1'>
+            <label class='bx--label' for='fire_time'>Time (UTC)</label>
+            <input class='bx--time-picker__input' id='fire_time' type='time' step='60'>
+          </div>
+        </div>
+      </fieldset>
+      <div class='actions'>
+        <button class='bx--btn bx--btn--primary' type='submit'
+                formaction='/run/now' id='run-now-btn'>{_icon("play")}Run Now</button>
+        <button class='bx--btn bx--btn--secondary' type='button' id='reveal-schedule-btn'>{_icon("calendar")}Schedule A Run</button>
+        <button class='bx--btn bx--btn--primary hidden' type='submit'
+                formaction='/run/schedule' id='confirm-schedule-btn'>{_icon("checkmark-filled")}Confirm Schedule</button>
       </div>
     </fieldset>
-    <div style='margin-top:1.5rem'>
-      <button class='bx--btn bx--btn--primary' type='submit'
-              formaction='/run/now' id='run-now-btn'>Run Now</button>
-      <button class='bx--btn bx--btn--secondary' type='button' id='reveal-schedule-btn'
-              style='margin-left:0.5rem'>Schedule A Run</button>
-      <button class='bx--btn bx--btn--primary' type='submit'
-              formaction='/run/schedule' id='confirm-schedule-btn'
-              style='margin-left:0.5rem; display:none'>Confirm Schedule</button>
-    </div>
+
+    <!-- RESUME session panel -->
+    <fieldset class='run-panel run-panel--resume'>
+      <legend class='bx--label run-panel__legend'>Resume existing session</legend>
+      <p class='muted mb-3'>Pick a session to continue from its last checkpoint.
+      Workspace is auto-detected from the checkpoint; supply an override only if
+      the path moved. The optional prompt is appended to the resumed conversation.</p>
+      {session_picker_html}
+      <details class='mt-4'>
+        <summary class='mb-3'>Optional overrides</summary>
+        <div class='field'>
+          <label class='bx--label' for='resume-workspace'>Workspace override (rarely needed)</label>
+          <input class='bx--text-input' id='resume-workspace' name='workspace' type='text'
+                 placeholder='Auto-detected from checkpoint'>
+        </div>
+        <div class='field'>
+          <label class='bx--label' for='resume-prompt'>Append prompt to resumed session</label>
+          <textarea class='bx--text-area' id='resume-prompt' name='prompt' rows='3'
+                    placeholder='Optional — leave blank to resume without a new prompt'></textarea>
+        </div>
+      </details>
+      <div class='actions'>
+        <button class='bx--btn bx--btn--primary' type='submit'
+                formaction='/run/resume' id='resume-now-btn'>{_icon("renew")}Resume Now</button>
+      </div>
+    </fieldset>
   </form>
 </div>
 <script>
@@ -1272,19 +1555,39 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
   var fireTime = document.getElementById('fire_time');
   var fireAt = document.getElementById('fire-at-utc');
   reveal.addEventListener('click', function() {{
-    fields.style.display = 'block';
-    confirm.style.display = 'inline-block';
-    runNow.style.display = 'none';
-    reveal.style.display = 'none';
+    fields.classList.remove('hidden');
+    confirm.classList.remove('hidden');
+    runNow.classList.add('hidden');
+    reveal.classList.add('hidden');
   }});
   form.addEventListener('submit', function(e) {{
-    if (e.submitter && e.submitter.id === 'confirm-schedule-btn') {{
+    var submitter = e.submitter;
+    if (submitter && submitter.id === 'confirm-schedule-btn') {{
       if (!fireDate.value || !fireTime.value) {{
         e.preventDefault();
         alert('Pick both a date and a time.');
         return;
       }}
       fireAt.value = fireDate.value + 'T' + fireTime.value + ':00Z';
+    }}
+    // Resume requires a session pick — block submission if none selected.
+    if (submitter && submitter.id === 'resume-now-btn') {{
+      var picked = form.querySelector("input[name='resume_session_id']:checked");
+      if (!picked) {{
+        e.preventDefault();
+        alert('Pick a session from the list first.');
+      }}
+    }}
+    // Run Now requires workspace + prompt — surfaced inline (the inputs
+    // intentionally don't carry the `required` attribute because we
+    // share the form with the Resume panel which has neither field).
+    if (submitter && submitter.id === 'run-now-btn') {{
+      var ws = document.getElementById('workspace');
+      var pr = document.getElementById('prompt');
+      if (!ws.value.trim() || !pr.value.trim()) {{
+        e.preventDefault();
+        alert('Workspace path and prompt are both required for a new session.');
+      }}
     }}
   }});
 }})();
@@ -1296,6 +1599,91 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
   <h2>Scheduled runs</h2>
   {pending_html}
 </div>"""
+
+
+def _render_session_picker(cfg: DashboardConfig) -> str:
+    """Render the "pick a session to resume" table for the Resume panel
+    on the Run Harness page.
+
+    Each row carries a labelled radio input (``resume_session_id``) so
+    submitting the form posts the chosen session id. The Delete column
+    holds a per-row mini-form that POSTs to ``/sessions/{sid}/purge``
+    and is OUTSIDE the surrounding Resume form (HTML forbids nested
+    <form> elements) — the table renders raw in the document so the
+    delete forms can be siblings of the picker, not children.
+
+    The table opts into sort + filter via ``data-sort`` attributes
+    (handled by dashboard.js' ``enhanceTable``)."""
+    sessions = list_sessions(cfg)
+    if not sessions:
+        return (
+            "<div class='card empty-state'>"
+            "<p class='muted'>No sessions on disk yet. Start a new session "
+            "via the <em>New session</em> tab — once it runs, it shows up "
+            "here for resume.</p></div>"
+        )
+    rows: list[str] = []
+    for s in sessions:
+        sid = _esc(s.session_id)
+        started = _esc(s.started_at) if s.started_at else "—"
+        ended = _esc(s.ended_at) if s.ended_at else "<span class='muted'>(running)</span>"
+        ws = s.workspace_path or ""
+        # "App name" heuristic: basename of the workspace path. Operators
+        # typically clone a repo into a directory named after the project,
+        # so this works well as a quick label. Falls back to the session
+        # id when no workspace is recorded.
+        app = os.path.basename(ws.rstrip("/")) if ws else s.session_id
+        if s.exit_code == 0:
+            status = "<span class='tag tag-green'>succeeded</span>"
+        elif s.exit_code is None:
+            status = "<span class='tag tag-gray'>running</span>"
+        else:
+            status = f"<span class='tag tag-red'>exit {s.exit_code}</span>"
+        radio_id = f"resume-row-{sid}"
+        # Delete button: a plain <button type='button'> so it's NOT a
+        # form submitter — the JS handler in dashboard.js
+        # (wireSessionPurge) does a fetch POST to
+        # /sessions/{sid}/purge with the CSRF header. This avoids
+        # nesting a <form> inside the surrounding Resume <form> (the
+        # HTML spec forbids that, and browsers handle it badly).
+        delete_btn = (
+            f"<button type='button' class='ct-remove session-row__delete' "
+            f"data-purge-session='{sid}' "
+            f"aria-label='Delete session {sid}' "
+            f"title='Permanently delete this session — checkpoint + log'>"
+            f"&times;</button>"
+        )
+        rows.append(
+            f"<tr class='session-row' data-row-session='{sid}'>"
+            f"<td class='session-row__pick'>"
+            f"<input type='radio' name='resume_session_id' value='{sid}' "
+            f"id='{radio_id}'>"
+            f"</td>"
+            f"<td><label for='{radio_id}' class='session-row__sid-label'>"
+            f"<code>{sid}</code></label></td>"
+            f"<td>{started}</td>"
+            f"<td>{ended}</td>"
+            f"<td><span class='muted'>{_esc(ws)}</span></td>"
+            f"<td>{_esc(app)}</td>"
+            f"<td>{status}</td>"
+            f"<td class='session-row__delete-cell'>{delete_btn}</td>"
+            f"</tr>"
+        )
+    return (
+        "<div class='table-wrap session-picker'>"
+        "<table id='resume-session-picker-table' class='session-picker__table'>"
+        "<thead><tr>"
+        "<th></th>"
+        "<th data-sort='str'>Session ID</th>"
+        "<th data-sort='date'>Created</th>"
+        "<th data-sort='date'>Last update</th>"
+        "<th data-sort='str'>Repo / workspace</th>"
+        "<th data-sort='str'>App</th>"
+        "<th data-sort='str'>Status</th>"
+        "<th>Delete</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
 
 
 def _render_field_input_new(field) -> str:
@@ -1356,7 +1744,9 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             "viewable read-only at <a href='/config'>Configuration (raw)</a>.</p></div>"
         )
 
-    from harness.web_forms import grouped_sections
+    from harness.config_tree import render_model_routing, render_tree
+    from harness.web_forms import _CONFIG_GROUPS
+
     # Load the live config so the form pre-populates with current values.
     current_config: dict[str, Any] = {}
     try:
@@ -1366,137 +1756,170 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
                 current_config = json.load(f) or {}
     except (OSError, json.JSONDecodeError):
         current_config = {}
+    # Strip the comment-only keys (those starting with "_") — they're
+    # documentation only and the harness loader drops them at startup.
+    current_config = {k: v for k, v in current_config.items() if not k.startswith("_")}
 
     csrf_token = resolve_csrf_token(cfg) or ""
-    groups = grouped_sections(current_config=current_config)
-    group_blocks: list[str] = []
-    for group in groups:
-        section_items: list[str] = []
-        editable_count = 0
-        for sec in group.sections:
-            if not sec.fields:
-                section_items.append(
-                    f"<li class='bx--accordion__item'>"
-                    f"<button class='bx--accordion__heading' aria-expanded='false' type='button'>"
-                    f"<span class='bx--accordion__title'>{html.escape(sec.section)}</span>"
-                    f"</button>"
-                    f"<div class='bx--accordion__content'>"
-                    f"<p class='muted'>No web-editable fields registered for this section. "
-                    f"Edit <code>config.json</code> directly.</p></div></li>"
-                )
-                continue
-            editable_count += 1
-            rows = []
-            for f in sec.fields:
-                description = html.escape(f.description) if f.description else "<span class='muted'>—</span>"
-                input_html = _render_field_input_new(f)
-                rows.append(
-                    f"<tr>"
-                    f"<td style='width:25%'><label class='bx--label'>{html.escape(f.name)}</label></td>"
-                    f"<td style='width:45%' class='muted'>{description}</td>"
-                    f"<td style='width:30%'>{input_html}</td>"
-                    f"</tr>"
-                )
-            section_items.append(
-                f"<li class='bx--accordion__item'>"
-                f"<button class='bx--accordion__heading' aria-expanded='false' type='button'>"
-                f"<span class='bx--accordion__title'>{html.escape(sec.section)} "
-                f"<span class='muted'>({len(sec.fields)} field{'s' if len(sec.fields) != 1 else ''})</span>"
-                f"</span></button>"
-                f"<div class='bx--accordion__content'>"
-                f"<form method='post' action='/config/{html.escape(sec.section)}'>"
-                f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
-                f"<table>"
-                f"<tr><th>Key</th><th>Meaning</th><th>Value</th></tr>"
-                + "".join(rows) +
-                f"</table>"
-                f"<p><button class='bx--btn bx--btn--primary' type='submit'>Save {html.escape(sec.section)}</button></p>"
-                f"</form></div></li>"
+
+    # Sections inside each group that have a closed-shape schema — for
+    # these we render with allow_add_keys=False so the operator doesn't
+    # see misleading + Add affordances at the top level.
+    closed_shape_sections: set[str] = set()
+    try:
+        from harness.cli import _KNOWN_NESTED_KEYS
+        closed_shape_sections = set(_KNOWN_NESTED_KEYS.keys())
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Sorted list of model keys from the live config — used by the
+    # custom model_routing renderer to populate "Model name" dropdowns.
+    available_models: list[str] = sorted(
+        (current_config.get("models") or {}).keys()
+    )
+
+    def _render_section_editor(section_key: str) -> str:
+        """Render one top-level section as a tree-shaped form posting
+        to /config-tree/<section>. Sections missing from the live
+        config get an empty editor (operator can fill in defaults)."""
+        live_value = current_config.get(section_key)
+        # Default empty containers for known sections so a missing
+        # section still renders an editable shell.
+        if live_value is None:
+            live_value = {} if section_key in closed_shape_sections else ""
+        allow_add = section_key not in closed_shape_sections
+        # model_routing gets a custom grouped renderer — Role → Primary/
+        # Fallback → Model + Thinking — instead of the generic flat tree.
+        # The form fields it emits still use the same __path[] flat
+        # schema, so parse_tree round-trips identically.
+        if section_key == "model_routing" and isinstance(live_value, dict):
+            tree_html = render_model_routing(
+                live_value, path=section_key,
+                available_models=available_models,
             )
-        section_count = len(group.sections)
-        section_word = "section" if section_count == 1 else "sections"
+        else:
+            tree_html = render_tree(
+                live_value, path=section_key, depth=0,
+                allow_add_keys=allow_add,
+            )
+        # Summary line: how many top-level keys/entries.
+        if isinstance(live_value, dict):
+            count_text = f"({len(live_value)} entr{'y' if len(live_value) == 1 else 'ies'})"
+        elif isinstance(live_value, list):
+            count_text = f"({len(live_value)} item{'s' if len(live_value) != 1 else ''})"
+        else:
+            count_text = "(scalar)"
+        return (
+            f"<details class='ct-section' data-section='{html.escape(section_key)}'>"
+            f"<summary class='ct-section__head'>"
+            f"<span class='ct-section__toggle' aria-hidden='true'>+</span>"
+            f"<span class='ct-section__name'>{html.escape(section_key)}</span>"
+            f"<span class='muted ml-2 fs-sm'>{count_text}</span>"
+            f"</summary>"
+            f"<div class='ct-section__body'>"
+            f"<form method='post' action='/config-tree/{html.escape(section_key)}' "
+            f"class='ct-form'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            f"<div class='ct-tree'>{tree_html}</div>"
+            f"<div class='actions'>"
+            f"<button class='bx--btn bx--btn--primary' type='submit'>"
+            f"{_icon('save')}Save {html.escape(section_key)}</button>"
+            f"</div>"
+            f"</form>"
+            f"</div></details>"
+        )
+
+    # Render each group from the existing _CONFIG_GROUPS so the page
+    # stays organised. Any top-level key in the live config that's not
+    # in any group lands in a synthesized "Other" group at the end.
+    placed_sections: set[str] = set()
+    group_blocks: list[str] = []
+    for slug, title, section_names in _CONFIG_GROUPS:
+        rendered_sections: list[str] = []
+        for section_key in section_names:
+            if section_key not in current_config and section_key not in closed_shape_sections \
+                    and not isinstance(current_config.get(section_key), (dict, list)):
+                # Section truly absent — skip in the UI (avoids noise).
+                continue
+            rendered_sections.append(_render_section_editor(section_key))
+            placed_sections.add(section_key)
+        if not rendered_sections:
+            continue
         group_blocks.append(
-            f"<div class='config-group' data-group='{html.escape(group.slug)}' "
-            f"style='margin-bottom:1rem; border:1px solid var(--cds-ui-04, #c6c6c6);'>"
-            f"<button type='button' class='config-group__heading' aria-expanded='false' "
-            f"style='width:100%; text-align:left; padding:0.75rem 1rem; background:var(--cds-ui-02, #f4f4f4); "
-            f"border:none; cursor:pointer; font-weight:600; font-size:1rem; display:flex; align-items:center;'>"
-            f"<span class='config-group__toggle' aria-hidden='true' "
-            f"style='display:inline-block; width:1.25rem; text-align:center; margin-right:0.5rem;'>+</span>"
-            f"<span class='config-group__title'>{html.escape(group.title)}</span>"
-            f"<span class='muted' style='margin-left:0.75rem; font-weight:normal; font-size:0.85em;'>"
-            f"({section_count} {section_word})</span>"
-            f"</button>"
-            f"<div class='config-group__body' style='display:none; padding:0.5rem 1rem 1rem 1rem;'>"
-            f"<ul class='bx--accordion'>{''.join(section_items)}</ul>"
-            f"</div></div>"
+            f"<details class='config-group' data-group='{html.escape(slug)}'>"
+            f"<summary class='config-group__heading'>"
+            f"<span class='config-group__toggle' aria-hidden='true'>+</span>"
+            f"<span class='config-group__title'>{html.escape(title)}</span>"
+            f"<span class='muted ml-2 fs-sm config-group__count'>"
+            f"({len(rendered_sections)} section{'s' if len(rendered_sections) != 1 else ''})</span>"
+            f"</summary>"
+            f"<div class='config-group__body'>"
+            + "".join(rendered_sections) +
+            "</div></details>"
+        )
+
+    # Catch-all: any top-level key NOT in any group becomes "Other".
+    other_sections: list[str] = []
+    for section_key in sorted(current_config.keys()):
+        if section_key in placed_sections:
+            continue
+        other_sections.append(_render_section_editor(section_key))
+    if other_sections:
+        group_blocks.append(
+            f"<details class='config-group' data-group='other'>"
+            f"<summary class='config-group__heading'>"
+            f"<span class='config-group__toggle' aria-hidden='true'>+</span>"
+            f"<span class='config-group__title'>Other</span>"
+            f"<span class='muted ml-2 fs-sm config-group__count'>"
+            f"({len(other_sections)} section{'s' if len(other_sections) != 1 else ''})</span>"
+            f"</summary>"
+            f"<div class='config-group__body'>"
+            + "".join(other_sections) +
+            "</div></details>"
         )
 
     return (
         "<div class='card'>"
         "<h2>Configuration sections</h2>"
-        "<p class='muted'>Settings are grouped by purpose. Click a group header to expand it, "
-        "then click a section inside to edit its fields. Save commits atomically and re-validates "
-        "through the strict validator before landing.</p>"
+        "<p class='muted'>Edit any value in <code>config.json</code> right here. "
+        "The structure mirrors the JSON file. Collections that can grow show a "
+        "<strong>+ Add</strong> button — for example, expand <em>LLM Registry → models</em> "
+        "to register a new model. Save commits atomically and re-validates through "
+        "the strict validator before landing.</p>"
         f"<div class='config-groups'>{''.join(group_blocks)}</div>"
         "</div>"
         "<div class='card'>"
         "<p class='muted'>Deployment defaults live in <code>config/deployment.json</code> — "
         "edit directly until web editing lands for that file.</p>"
         "</div>"
-        # Minimal JS for both the group +/- toggle and the inner section
-        # accordion. Each click flips aria-expanded, hides/shows the body,
-        # and swaps the +/- glyph.
-        "<script>"
-        "(function(){"
-        "var groups = document.querySelectorAll('.config-group__heading');"
-        "groups.forEach(function(g){"
-        "  g.addEventListener('click', function(){"
-        "    var open = g.getAttribute('aria-expanded') === 'true';"
-        "    g.setAttribute('aria-expanded', open ? 'false' : 'true');"
-        "    var body = g.nextElementSibling;"
-        "    if (body) body.style.display = open ? 'none' : 'block';"
-        "    var toggle = g.querySelector('.config-group__toggle');"
-        "    if (toggle) toggle.textContent = open ? '+' : '−';"
-        "  });"
-        "});"
-        "var btns = document.querySelectorAll('.bx--accordion__heading');"
-        "btns.forEach(function(b){"
-        "  b.addEventListener('click', function(){"
-        "    var open = b.getAttribute('aria-expanded') === 'true';"
-        "    b.setAttribute('aria-expanded', open ? 'false' : 'true');"
-        "    var content = b.nextElementSibling;"
-        "    if (content) content.style.display = open ? 'none' : 'block';"
-        "  });"
-        "  var content = b.nextElementSibling;"
-        "  if (content) content.style.display = 'none';"
-        "});"
-        "})();"
-        "</script>"
     )
 
 
-_DASHBOARD_TILES: tuple[tuple[str, str, str], ...] = (
-    # (title, description, href)
-    ("View Status", "Day / week / month summary plus what's running right now.", "/status"),
-    ("Cost burn-down", "Cumulative spend and per-call cost across every session.", "/cost"),
-    ("Sessions list", "Every harness session on disk with exit code and token totals.", "/sessions"),
-    ("Schedule history", "Past runs from the cron-driven scheduled-job daemon.", "/schedule"),
-    ("Repo index", "Status of the semantic retrieval index per workspace.", "/index"),
-    ("Memory list", "Per-repo memory files appended after each session.", "/memory"),
-    ("Live runs", "Currently-running processes spawned from this dashboard.", "/live"),
-    ("Configuration (raw)", "Section-by-section view of the legacy config form.", "/config"),
+_DASHBOARD_TILES: tuple[tuple[str, str, str, str], ...] = (
+    # (title, description, href, icon)
+    ("View Status", "Day / week / month summary plus what's running right now.", "/status", "chart-line"),
+    ("Cost burn-down", "Cumulative spend and per-call cost across every session.", "/cost", "chart-line"),
+    ("Sessions list", "Every harness session on disk with exit code and token totals.", "/sessions", "list"),
+    ("Schedule history", "Past runs from the cron-driven scheduled-job daemon.", "/schedule", "calendar"),
+    ("Repo index", "Status of the semantic retrieval index per workspace.", "/index", "search"),
+    ("Memory list", "Per-repo memory files appended after each session.", "/memory", "document"),
+    ("Live runs", "Currently-running processes spawned from this dashboard.", "/live", "terminal"),
+    ("Configuration (raw)", "Section-by-section view of the legacy config form.", "/config", "settings"),
 )
 
 
 def _render_dashboards_landing(cfg: DashboardConfig) -> str:
     tiles = []
-    for title, desc, href in _DASHBOARD_TILES:
+    for title, desc, href, icon_name in _DASHBOARD_TILES:
+        icon_svg = _icon(icon_name, size=24, klass="icon--lg dash-tile__icon")
         tiles.append(
             f"<div class='dash-tile'>"
             f"<a href='{html.escape(href)}'>"
+            f"{icon_svg}"
+            f"<div>"
             f"<h3>{html.escape(title)}</h3>"
             f"<p>{html.escape(desc)}</p>"
+            f"</div>"
             f"</a></div>"
         )
     return (
@@ -1726,8 +2149,8 @@ def _render_docs_landing(cfg: DashboardConfig) -> str:
         href = "/docs/" + urllib.parse.quote(doc["relpath"])
         rows.append(
             f"<tr>"
-            f"<td><a href='{href}'>{_esc(doc['relpath'])}</a></td>"
-            f"<td>{_fmt_size(int(doc['size']))}</td>"
+            f"<td><a href='{href}'>{_icon('document')}{_esc(doc['relpath'])}</a></td>"
+            f"<td class='num'>{_fmt_size(int(doc['size']))}</td>"
             f"<td>{modified}</td>"
             f"</tr>"
         )
@@ -1735,9 +2158,10 @@ def _render_docs_landing(cfg: DashboardConfig) -> str:
         f"<div class='card'>"
         f"<h2>Documents</h2>"
         f"<p class='muted'>Source: <code>{_esc(docs_dir)}</code></p>"
-        "<table><tr><th>Document</th><th>Size</th><th>Modified (UTC)</th></tr>"
-        + "".join(rows) +
-        "</table></div>"
+        "<div class='table-wrap'><table id='docs-table'>"
+        "<thead><tr><th>Document</th><th class='num'>Size</th><th>Modified (UTC)</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+        "</div>"
     )
 
 
@@ -1751,10 +2175,7 @@ def _render_docs_file(cfg: DashboardConfig, relpath: str) -> tuple[int, str]:
         body = f"<div class='card markdown-body'>{rendered}</div>"
     else:
         body = f"<div class='card'><pre>{html.escape(content)}</pre></div>"
-    crumb = (
-        f"<p class='muted'><a href='/docs'>← All documents</a> · "
-        f"<code>{_esc(relpath)}</code></p>"
-    )
+    crumb = _breadcrumb([("Documents", "/docs"), (relpath, None)])
     return 200, crumb + body
 
 
@@ -1823,13 +2244,17 @@ def make_request_handler(
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             logger.debug("[dashboard] %s - %s", self.client_address[0], format % args)
 
-        def _send(self, status: int, content_type: str, body: str,
-                   *, extra_headers: Optional[dict[str, str]] = None) -> None:
-            data = body.encode("utf-8")
+        def _send(self, status: int, content_type: str, body: Any,
+                   *, extra_headers: Optional[dict[str, str]] = None,
+                   cache_control: str = "no-store") -> None:
+            # Accept str (UTF-8 encoded) or bytes (binary-safe). Static
+            # assets need bytes for fonts/icons/favicons; the rest of
+            # the app keeps emitting strings.
+            data = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
             self.send_header("X-Content-Type-Options", "nosniff")
             for k, v in (extra_headers or {}).items():
                 self.send_header(k, v)
@@ -1864,9 +2289,36 @@ def make_request_handler(
             # double-submit pattern). For host-only localhost this is fine.
             return f"csrf_token={csrf_token}; Path=/; SameSite=Strict"
 
+        # ---- Static assets -----------------------------------------------
+
+        def _maybe_serve_static(self) -> bool:
+            """If the request is for a static asset, serve it and return
+            True. Otherwise return False so do_GET falls through to the
+            normal routing."""
+            parsed = urllib.parse.urlparse(self.path)
+            decoded = urllib.parse.unquote(parsed.path)
+            if decoded == "/favicon.ico":
+                relpath = "favicon.ico"
+            elif decoded.startswith("/static/"):
+                relpath = decoded[len("/static/"):]
+            else:
+                return False
+            status, ctype, data = _serve_static(cfg, relpath)
+            # Long cache for assets so reloads are cheap; ETag/version
+            # busting can come later if we start mutating files in place.
+            cache = "public, max-age=3600" if status == 200 else "no-store"
+            self._send(status, ctype, data, cache_control=cache)
+            return True
+
         # ---- GET ----------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 — stdlib API
+            # Static assets (css/js/icons/fonts/favicon) ship outside the
+            # auth gate so they render correctly on the 401 page itself
+            # and so air-gap mirrors don't need a token. They're public
+            # by design: nothing in static_dir is sensitive.
+            if self._maybe_serve_static():
+                return
             ok, detail = self._is_authed()
             if not ok:
                 self._send(401, "text/plain; charset=utf-8", f"401 unauthorized: {detail}\n")
@@ -1954,7 +2406,13 @@ def make_request_handler(
             self._dispatch_write(path, form)
 
         def _dispatch_write(self, path: str, form: dict[str, Any]) -> None:
-            # /config/<section>
+            # /config-tree/<section> — the new tree-shaped editor.
+            m = re.match(r"^/config-tree/(?P<section>[A-Za-z0-9_]+)/?$", path)
+            if m:
+                self._handle_config_tree_save(m.group("section"), form)
+                return
+            # /config/<section> — legacy curated editor (kept for the
+            # /config raw page that still wires it).
             m = re.match(r"^/config/(?P<section>[A-Za-z0-9_]+)/?$", path)
             if m:
                 self._handle_config_save(m.group("section"), form)
@@ -1968,6 +2426,10 @@ def make_request_handler(
             if path == "/run/now":
                 self._handle_run_now(form)
                 return
+            # /run/resume
+            if path == "/run/resume":
+                self._handle_run_resume(form)
+                return
             # /run/schedule
             if path == "/run/schedule":
                 self._handle_run_schedule(form)
@@ -1976,6 +2438,12 @@ def make_request_handler(
             m = re.match(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/cancel/?$", path)
             if m:
                 self._handle_cancel(m.group("sid"))
+                return
+            # /sessions/<sid>/purge — wipe everything: checkpoint rows
+            # + JSONL log. Mirrors `harness purge --session-id`.
+            m = re.match(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/purge/?$", path)
+            if m:
+                self._handle_session_purge(m.group("sid"))
                 return
             # /sessions/<sid>/note
             m = re.match(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/note/?$", path)
@@ -2030,6 +2498,73 @@ def make_request_handler(
             self._send(200, "text/html; charset=utf-8",
                        _layout(f"Config · {section_name}", body, cfg))
 
+        def _handle_config_tree_save(
+            self, section_name: str, form: dict[str, Any],
+        ) -> None:
+            """Save a top-level config section submitted by the tree
+            editor. The form payload carries ``__path[]`` / ``__type[]``
+            / ``__value[]`` arrays that :func:`parse_tree` rebuilds into
+            the original nested shape. The reconstructed root is itself
+            a dict whose only top-level key is ``section_name`` — we
+            extract that value and hand it to ``write_config_section_atomic``."""
+            from harness.config_tree import TreeParseError, parse_tree
+            try:
+                rebuilt = parse_tree(form)
+            except TreeParseError as exc:
+                self._send(
+                    400, "text/html; charset=utf-8",
+                    _layout(
+                        f"Config · {section_name}",
+                        f"<div class='card'><p class='fail'>"
+                        f"Could not parse form: {html.escape(str(exc))}</p>"
+                        f"<p><a href='/config-ui'>Back to Configure Harness</a></p>"
+                        f"</div>",
+                        cfg, active="config",
+                    ),
+                )
+                return
+            # ``rebuilt`` is the section dict (or list/scalar); the
+            # paths the renderer emits are all prefixed with the section
+            # name, so rebuilt looks like ``{section_name: <value>}``.
+            section_value = rebuilt.get(section_name) if isinstance(rebuilt, dict) else rebuilt
+            if section_value is None:
+                # Either the operator cleared every field, or the section
+                # was never present. Save an empty container so the validator
+                # sees an explicit shape rather than vanishing.
+                section_value = {}
+            ok, msg = write_config_section_atomic(cfg, section_name, section_value)
+            if not ok:
+                # Re-render the page with the failure surfaced as a flash.
+                body = _render_configure_harness(cfg)
+                fail_card = (
+                    f"<div class='card'><p class='fail'>"
+                    f"Save of <code>{html.escape(section_name)}</code> failed: "
+                    f"{html.escape(msg)}</p></div>"
+                )
+                self._send(
+                    400, "text/html; charset=utf-8",
+                    _layout("Configure Harness", fail_card + body, cfg, active="config"),
+                )
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="config_tree_save",
+                    target=section_name,
+                    detail=json.dumps(section_value, default=str)[:4096],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # PRG: redirect with ?saved=<section> so the toast surfaces
+            # on the next render (wireToastFromQuery in dashboard.js).
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                f"/config-ui?saved={urllib.parse.quote(section_name)}",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def _handle_memory_save(self, name: str, form: dict[str, Any]) -> None:
             content = form.get("content")
             if isinstance(content, list):
@@ -2060,6 +2595,32 @@ def make_request_handler(
                 )
             except Exception as exc:  # noqa: BLE001
                 self._send(500, "text/plain", f"spawn failed: {exc}\n")
+                return
+            self.send_response(303)
+            self.send_header("Location", f"/sessions/{wp.session_id}")
+            self.end_headers()
+
+        def _handle_run_resume(self, form: dict[str, Any]) -> None:
+            """Resume an existing checkpointed session. The form carries
+            ``resume_session_id`` (required), plus optional ``workspace``
+            override and ``prompt`` appendix. We spawn the same way
+            ``cmd_resume`` would, and the dashboard tracks it via the
+            existing process registry."""
+            session_id = str(form.get("resume_session_id") or "").strip()
+            if not session_id:
+                self._send(400, "text/plain", "resume_session_id required\n")
+                return
+            # Workspace/prompt are optional; the resume CLI auto-detects
+            # workspace from the checkpoint if omitted.
+            workspace = str(form.get("workspace") or "").strip() or None
+            prompt = str(form.get("prompt") or "").strip() or None
+            try:
+                wp = spawn_harness_resume(
+                    cfg, session_id=session_id,
+                    workspace=workspace, prompt=prompt,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, "text/plain", f"resume spawn failed: {exc}\n")
                 return
             self.send_response(303)
             self.send_header("Location", f"/sessions/{wp.session_id}")
@@ -2117,6 +2678,83 @@ def make_request_handler(
                 pass
             self.send_response(303)
             self.send_header("Location", "/live")
+            self.end_headers()
+
+        def _handle_session_purge(self, session_id: str) -> None:
+            """Wipe ``session_id`` completely from harness memory:
+            checkpoint rows in the SQLite store + the JSONL log file
+            on disk. Mirrors ``harness purge --session-id <id>``.
+
+            If the session is currently running, SIGTERM the process
+            first and wait briefly for it to exit before purging — a
+            running session would re-create the log file we just
+            deleted.
+            """
+            import shlex as _shlex
+            import subprocess as _sub
+            import time as _time
+
+            # 1. Stop the live process if any. cancel_session is a no-op
+            # when the session isn't running, so this is safe either way.
+            cancelled = cancel_session(session_id)
+            if cancelled:
+                # Give the process a brief grace period to flush + exit.
+                for _ in range(20):  # up to 2s
+                    entry = get_process_registry().get(session_id)
+                    if entry is None or not entry.is_running:
+                        break
+                    _time.sleep(0.1)
+
+            # 2. Spawn `harness purge --session-id <id>` synchronously
+            # and pass --yes so it doesn't try to read from stdin. We
+            # block until the subprocess returns so the redirect lands
+            # an up-to-date list back at the operator.
+            argv = ["harness", "purge", "--session-id", session_id]
+            try:
+                proc = _sub.run(
+                    argv, capture_output=True, text=True, timeout=30,
+                )
+            except _sub.TimeoutExpired:
+                self._send(
+                    504, "text/plain",
+                    f"purge timed out (>30s) for session {session_id}\n",
+                )
+                return
+            except FileNotFoundError:
+                self._send(
+                    500, "text/plain",
+                    "harness CLI not on PATH — cannot run purge\n",
+                )
+                return
+
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                self._send(
+                    500, "text/plain",
+                    f"purge failed (exit {proc.returncode}): {detail or 'no detail'}\n",
+                )
+                return
+
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="session_purge",
+                    target=session_id,
+                    detail=f"argv={_shlex.join(argv)} exit=0",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+            # PRG: redirect to the Run page with the Resume tab
+            # pre-selected and a toast telling the operator what just
+            # happened. dashboard.js' wireToastFromQuery surfaces it.
+            saved_msg = f"deleted+session+{session_id}"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                f"/run?mode=resume&saved={urllib.parse.quote(saved_msg)}",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
         def _handle_note(self, session_id: str, form: dict[str, Any]) -> None:
@@ -2620,6 +3258,93 @@ def spawn_harness_run(
     return wp
 
 
+def spawn_harness_resume(
+    cfg: DashboardConfig,
+    *,
+    session_id: str,
+    workspace: Optional[str] = None,
+    prompt: Optional[str] = None,
+    extra_args: Optional[list[str]] = None,
+    harness_binary: str = "harness",
+) -> WebProcess:
+    """Spawn a ``harness resume --session-id <id>`` subprocess for an
+    existing checkpointed session. Mirrors :func:`spawn_harness_run`'s
+    registry / log-tail / HITL webhook wiring so the dashboard tracks
+    the resumed session the same way it tracks a fresh one.
+
+    ``workspace`` is optional — the resume CLI auto-detects from the
+    checkpoint if omitted. ``prompt`` is optional and, when provided,
+    appended to the resumed conversation.
+    """
+    import subprocess as _sub
+
+    if not session_id:
+        raise ValueError("session_id is required for resume")
+
+    log_dir = os.path.expanduser(cfg.log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+    # Resume keeps the SAME session_id so subsequent log writes append
+    # to the existing JSONL — that's what makes the session look "live"
+    # again in the dashboard's session list.
+    log_path = os.path.join(log_dir, f"{session_id}.jsonl")
+    # Ensure the log file exists so the SSE tail can attach immediately.
+    open(log_path, "a", encoding="utf-8").close()
+
+    argv: list[str] = [harness_binary, "resume", "--session-id", session_id]
+    if workspace:
+        argv.extend(["--workspace", workspace])
+    if prompt:
+        argv.extend(["--prompt", prompt])
+    argv += list(extra_args or [])
+
+    env = dict(os.environ)
+    env["HARNESS_HITL_WEBHOOK_URL"] = (
+        f"http://{cfg.host}:{cfg.port}/hitl/webhook?session={session_id}"
+    )
+    if cfg.hitl_webhook_secret:
+        env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
+
+    proc = _sub.Popen(
+        argv,
+        stdout=open(log_path + ".stdout", "ab"),
+        stderr=_sub.STDOUT,
+        env=env,
+        start_new_session=True,
+    )
+    wp = WebProcess(
+        session_id=session_id, pid=proc.pid, argv=argv,
+        log_path=log_path,
+        workspace_path=workspace or "",
+        prompt=prompt or "",
+        popen=proc,
+    )
+    get_process_registry().register(wp)
+
+    def _watch():
+        try:
+            ec = proc.wait()
+        except Exception:  # noqa: BLE001
+            ec = -1
+        get_process_registry().mark_terminated(session_id, int(ec or 0))
+        try:
+            append_audit(
+                db_path=cfg.web_db_path, action="resume_exit",
+                target=session_id, detail=f"exit_code={ec}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_watch, daemon=True, name=f"web-resume-{session_id}").start()
+    try:
+        append_audit(
+            db_path=cfg.web_db_path, action="run_resume",
+            target=session_id, detail=f"argv={' '.join(argv)}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return wp
+
+
 def cancel_session(session_id: str) -> bool:
     """SIGTERM the process group for ``session_id``. Returns True when
     a signal was sent, False when no live process matches."""
@@ -2948,17 +3673,16 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
             "<p><button>Queue note</button></p></form></div>"
         )
     if log_path:
+        sse_url = f"/api/sessions/{_esc(session_id)}/events"
         parts.append(
             "<div class='card'><h3>Live events</h3>"
-            "<p class='muted'>EventSource streaming from "
-            f"<code>/api/sessions/{_esc(session_id)}/events</code>.</p>"
-            "<pre id='live-events' style='max-height:480px;overflow:auto'></pre>"
-            "<script>"
-            f"const es = new EventSource('/api/sessions/{_esc(session_id)}/events');"
-            "const pre = document.getElementById('live-events');"
-            "es.onmessage = (e) => { pre.textContent += e.data + '\\n'; };"
-            "es.addEventListener('close', () => es.close());"
-            "</script></div>"
+            "<p class='muted'>Streaming from "
+            f"<code>{sse_url}</code>. Click a chip to hide an event type.</p>"
+            "<div class='event-stream-filters' role='group' "
+            "aria-label='Filter events by type'></div>"
+            "<ul id='event-stream' class='event-stream' "
+            f"data-sse-url='{sse_url}'></ul>"
+            "</div>"
         )
     return "".join(parts)
 

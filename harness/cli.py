@@ -5203,43 +5203,473 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
 
 
-def cmd_dashboard(args: argparse.Namespace) -> int:
-    """``harness web`` — start the Carbon-styled web UI with all
-    features (View Status, Run Harness, Configure Harness, View
-    Dashboards, View Documents) enabled by default. Operators can flip
-    ``dashboard.writes_enabled: false`` in ``config.json`` for a
-    read-only deployment."""
-    workspace_path = (
-        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
-        else os.getcwd()
-    )
+# ---------------------------------------------------------------------------
+# `harness web start` / `harness web stop` — marker-driven lifecycle
+# ---------------------------------------------------------------------------
+#
+# A single marker file at ~/.harness/web.lock records the live web
+# server's pid, host, port, mode (foreground / background), log path,
+# and start timestamp. It's the single source of truth `harness web
+# stop` reads to find and stop the process. The marker is written
+# atomically (tmp + os.replace) so a crash mid-write doesn't leave a
+# half-baked file behind, and is removed both during clean shutdown
+# (signal handler / finally block in cmd_web_start) and at the top of
+# `harness web stop`. A stale marker (pid no longer alive) is treated
+# as no-server-running and silently cleaned up on the next start/stop.
+
+_WEB_MARKER_FILENAME = "web.lock"
+_WEB_LOG_FILENAME = "web.log"
+
+
+def _web_marker_path() -> str:
+    return os.path.join(os.path.expanduser("~/.harness"), _WEB_MARKER_FILENAME)
+
+
+def _web_log_path() -> str:
+    return os.path.join(os.path.expanduser("~/.harness"), _WEB_LOG_FILENAME)
+
+
+def _read_web_marker() -> Optional[dict[str, Any]]:
+    path = _web_marker_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_web_marker(data: dict[str, Any]) -> None:
+    path = _web_marker_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        # Best-effort cleanup of the half-written tmp file.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _delete_web_marker() -> None:
+    """Idempotent: missing-file is success, not an error."""
+    try:
+        os.unlink(_web_marker_path())
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("[web] could not remove marker %s: %s", _web_marker_path(), exc)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """True if a process with this pid currently exists on the system.
+    Signal 0 is the POSIX 'check existence' probe — it doesn't actually
+    deliver a signal."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else — still alive.
+        return True
+    except OSError:
+        return False
+
+
+def _utc_iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def cmd_web_start(args: argparse.Namespace) -> int:
+    """``harness web start [--host H] [--port N] [--background yes/no]``
+
+    Writes ``~/.harness/web.lock`` so ``harness web stop`` can find the
+    process later. Refuses to start a second instance when the marker
+    points at a live pid — the operator must stop the running one
+    first. A stale marker (pid dead) is treated as no-server-running
+    and silently overwritten.
+    """
+    # === 1. Single-instance gate ============================================
+    existing = _read_web_marker()
+    if existing is not None:
+        ex_pid = existing.get("pid")
+        if isinstance(ex_pid, int) and _is_pid_alive(ex_pid):
+            host = existing.get("host", "?")
+            port = existing.get("port", "?")
+            mode = existing.get("mode", "?")
+            log_path = existing.get("log_path") or "(none — foreground mode)"
+            print(
+                f"error: a harness web instance is already running "
+                f"(pid {ex_pid}, http://{host}:{port}, mode={mode}).\n"
+                f"  marker: {_web_marker_path()}\n"
+                f"  log:    {log_path}\n"
+                f"  Run 'harness web stop' first, then start a new instance.",
+                file=sys.stderr,
+            )
+            return 1
+        # Stale marker — the prior process crashed or was killed
+        # without cleanup. Drop it and proceed with the new start.
+        logger.info(
+            "[web] stale marker found (pid %r not alive); removing.", ex_pid,
+        )
+        _delete_web_marker()
+
+    # === 2. Background dispatch =============================================
+    background = (str(getattr(args, "background", "no")).lower() == "yes")
+    host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1")
+    port = int(getattr(args, "port", 9000) or 9000)
+
+    if background:
+        return _web_start_background(host=host, port=port)
+    return _web_start_foreground(host=host, port=port)
+
+
+def _web_start_foreground(*, host: str, port: int) -> int:
+    """Run the server in the current process. Writes the marker with
+    our own pid, installs a SIGTERM handler that triggers clean
+    shutdown, blocks until the server exits, then releases the socket
+    and removes the marker."""
+    import signal as _signal
+    import threading as _threading
+
+    workspace_path = os.getcwd()
     try:
         config = discover_config(workspace_path)
     except ConfigError:
         config = {}
+
     from harness.dashboard import DashboardConfig, start_server
     dash_cfg = DashboardConfig.from_config(config)
     if not dash_cfg.enabled:
-        # The subcommand still works without enabled=true — the operator
-        # is the one running it; the flag matters when the dashboard is
-        # surfaced through a process supervisor.
         logger.warning(
-            "[dashboard] dashboard.enabled is false; running anyway because "
-            "the operator launched the subcommand directly."
+            "[web] dashboard.enabled is false in config; running anyway "
+            "because the operator launched the subcommand directly."
         )
-    if getattr(args, "host", None):
-        dash_cfg.host = str(args.host)
-    if getattr(args, "port", None):
-        dash_cfg.port = int(args.port)
+    # CLI flags always win over config — the operator typed them.
+    dash_cfg.host = host
+    dash_cfg.port = port
+
+    server_handle = None
     try:
-        start_server(dash_cfg, blocking=True)
+        server_handle = start_server(dash_cfg, blocking=False)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except OSError as exc:
-        print(f"error: cannot bind {dash_cfg.host}:{dash_cfg.port}: {exc}", file=sys.stderr)
+        print(
+            f"error: cannot bind {dash_cfg.host}:{dash_cfg.port}: {exc}",
+            file=sys.stderr,
+        )
         return 1
+    assert server_handle is not None
+
+    # Write the marker AFTER the listening socket is bound — that way
+    # if bind fails we don't leave a misleading marker on disk. From
+    # this point on EVERYTHING is wrapped in a try/finally so a Ctrl-C
+    # or any exception still releases the socket and removes the
+    # marker — no stale lock files, no half-open ports.
+    _write_web_marker({
+        "pid": os.getpid(),
+        "host": dash_cfg.host,
+        "port": dash_cfg.port,
+        "mode": "foreground",
+        "log_path": "",
+        "started_at": _utc_iso_now(),
+    })
+
+    shutdown_evt = _threading.Event()
+
+    try:
+        # Signal handler runs in a separate thread so it can call
+        # server.shutdown() — calling shutdown() from the same thread
+        # that owns serve_forever would deadlock. server_close() (run
+        # in finally) releases the socket and the marker delete is
+        # the last cleanup step.
+        def _on_signal(signum, _frame):
+            if shutdown_evt.is_set():
+                return  # second Ctrl-C / SIGTERM is a no-op
+            shutdown_evt.set()
+            name = {2: "SIGINT (Ctrl-C)", 15: "SIGTERM"}.get(signum, f"signal {signum}")
+            # Print to stderr so the operator sees feedback even when
+            # the logger threshold hides INFO records.
+            print(f"\n[web] {name} received; shutting down cleanly...",
+                  file=sys.stderr, flush=True)
+            _threading.Thread(
+                target=server_handle.server.shutdown,
+                name="harness-web-shutdown", daemon=True,
+            ).start()
+
+        # Catch every signal that's *catchable* and means "please stop":
+        #   SIGTERM — `harness web stop`, `kill <pid>`, init shutdown
+        #   SIGINT  — Ctrl-C in the terminal
+        #   SIGHUP  — controlling terminal closed (parent shell exit)
+        #   SIGQUIT — Ctrl-\ on most terminals
+        # SIGKILL (kill -9) and SIGSTOP cannot be caught by any process —
+        # the OS terminates immediately. The stale marker left behind
+        # is auto-cleaned on the next `harness web start`.
+        for sig_name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
+            sig = getattr(_signal, sig_name, None)
+            if sig is None:
+                continue   # Windows / platform doesn't define this one
+            try:
+                _signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                # signal.signal() can raise inside non-main threads or
+                # on signals the kernel doesn't allow handlers for.
+                # Best-effort — at least SIGTERM/SIGINT will always work.
+                pass
+
+        # Belt-and-braces: register an atexit hook so even an uncaught
+        # exception path (or interpreter shutdown without our signal
+        # handler firing) still releases the socket + removes the
+        # marker. atexit doesn't run on SIGKILL — nothing does.
+        import atexit as _atexit
+        _our_pid = os.getpid()
+        def _atexit_cleanup() -> None:
+            try:
+                server_handle.server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                server_handle.server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+            # Only delete the marker if it still points at OUR pid —
+            # don't clobber a marker a subsequent `web start` may have
+            # written if our process lingered after the marker was
+            # already cleaned.
+            marker = _read_web_marker()
+            if marker and marker.get("pid") == _our_pid:
+                _delete_web_marker()
+        _atexit.register(_atexit_cleanup)
+
+        print(
+            f"[web] listening on http://{dash_cfg.host}:{dash_cfg.port}/  "
+            f"(pid {os.getpid()})\n"
+            f"[web] marker: {_web_marker_path()}\n"
+            f"[web] stop with: harness web stop  (or Ctrl-C)",
+        )
+
+        try:
+            # Block until the server thread exits. The signal handler
+            # spawns the shutdown thread which causes serve_forever to
+            # return, the server thread exits, and join() unblocks.
+            server_handle.thread.join()
+        except KeyboardInterrupt:
+            # Belt-and-braces fallback for the unlikely case where a
+            # Ctrl-C bypassed our SIGINT handler (e.g. delivered before
+            # signal.signal() ran, or from a parent shell that re-raises).
+            print("\n[web] Ctrl-C received; shutting down cleanly...",
+                  file=sys.stderr, flush=True)
+            try:
+                server_handle.server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                server_handle.thread.join(timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        # Release every resource the server is holding so the process
+        # exits clean. Order matters: shut down the server (in case
+        # the signal handler didn't get to), close the listening
+        # socket (so the next start can rebind immediately), and
+        # remove the marker file last. The atexit hook above is a
+        # safety net for paths that bypass this finally — but in the
+        # normal flow this block runs first and atexit's reads find
+        # the marker already gone (so it no-ops).
+        try:
+            server_handle.server.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            server_handle.server.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+        # Worker threads spawned by ThreadingMixIn are daemon threads
+        # (daemon_threads=True on _ThreadingServer) so they die with
+        # this process — no explicit join needed.
+        _delete_web_marker()
+        print("[web] stopped — marker removed, socket released.",
+              file=sys.stderr, flush=True)
     return 0
+
+
+def _web_start_background(*, host: str, port: int) -> int:
+    """Re-exec ourselves in foreground mode, fully detached, with
+    stdout/stderr redirected to ~/.harness/web.log. The child writes
+    the marker with its own pid; we wait briefly to confirm startup
+    succeeded and then rewrite the marker to flag mode='background'
+    and record the log path.
+    """
+    import time as _time
+
+    log_path = _web_log_path()
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        log_file = open(log_path, "ab")
+    except OSError as exc:
+        print(f"error: cannot open log file {log_path}: {exc}", file=sys.stderr)
+        return 1
+
+    # Re-exec self in foreground mode. start_new_session=True detaches
+    # the child from this terminal's session so it survives `exit`.
+    argv = [
+        sys.executable, "-m", "harness.cli", "web", "start",
+        "--host", host, "--port", str(port), "--background", "no",
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=log_file, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=os.getcwd(),
+        )
+    except OSError as exc:
+        print(f"error: could not spawn background process: {exc}", file=sys.stderr)
+        try:
+            log_file.close()
+        except OSError:
+            pass
+        return 1
+    finally:
+        # Parent doesn't need the log file handle once the child owns it.
+        try:
+            log_file.close()
+        except OSError:
+            pass
+
+    # Wait for the child to write its marker (means the listener is
+    # bound) — or for the child to exit prematurely (bind failure,
+    # config error, etc.). Either way bail within 5s.
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline:
+        if proc.poll() is not None:
+            # Child died early; surface what we can.
+            print(
+                f"error: background process exited early (code {proc.returncode}).\n"
+                f"  see {log_path} for details.",
+                file=sys.stderr,
+            )
+            return 1
+        marker = _read_web_marker()
+        if marker and marker.get("pid") == proc.pid:
+            break
+        _time.sleep(0.1)
+    else:
+        # No marker after the timeout but child still alive — odd, but
+        # don't fail the start; print a warning.
+        print(
+            f"warning: background process started (pid {proc.pid}) but "
+            f"didn't confirm via marker file within 5s. "
+            f"See {log_path} for details.",
+            file=sys.stderr,
+        )
+
+    # Annotate the marker with the background flag + log path so
+    # operators (and `web stop`) can find the logs later.
+    marker = _read_web_marker() or {}
+    marker["mode"] = "background"
+    marker["log_path"] = log_path
+    try:
+        _write_web_marker(marker)
+    except OSError as exc:
+        logger.warning("[web] could not annotate marker with background info: %s", exc)
+
+    print(
+        f"[web] started in background (pid {proc.pid}, http://{host}:{port}/).\n"
+        f"[web] logs:   {log_path}\n"
+        f"[web] marker: {_web_marker_path()}\n"
+        f"[web] stop with: harness web stop",
+    )
+    return 0
+
+
+def cmd_web_stop(args: argparse.Namespace) -> int:
+    """``harness web stop`` — read the marker, delete it, signal the
+    pid, and confirm the process exited. Idempotent: a missing marker
+    is reported as "no server running" with exit code 0 so scripts can
+    safely call it twice."""
+    import signal as _signal
+    import time as _time
+
+    marker = _read_web_marker()
+    if marker is None:
+        print(
+            f"[web] no server running (no marker at {_web_marker_path()}).",
+        )
+        return 0
+
+    pid = marker.get("pid")
+    host = marker.get("host", "?")
+    port = marker.get("port", "?")
+    if not isinstance(pid, int) or not _is_pid_alive(pid):
+        print(
+            f"[web] marker is stale (pid {pid!r} not alive); cleaning up.",
+        )
+        _delete_web_marker()
+        return 0
+
+    # Delete the marker FIRST so a concurrent `web start` doesn't
+    # block on a marker that's about to disappear and so a second
+    # `web stop` becomes a clean no-op.
+    _delete_web_marker()
+
+    # SIGTERM for graceful shutdown — the server's signal handler
+    # calls server.shutdown() + server_close() so the listening socket
+    # is released, then the process exits.
+    try:
+        os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        print(f"[web] pid {pid} already gone.")
+        return 0
+    except OSError as exc:
+        print(f"error: could not signal pid {pid}: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[web] sent SIGTERM to pid {pid} (http://{host}:{port}/). waiting for clean exit...")
+
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline:
+        if not _is_pid_alive(pid):
+            print(f"[web] stopped (pid {pid}).")
+            return 0
+        _time.sleep(0.1)
+
+    # Stubborn — escalate to SIGKILL.
+    print(
+        f"warning: pid {pid} didn't exit within 5s; sending SIGKILL.",
+        file=sys.stderr,
+    )
+    try:
+        os.kill(pid, _signal.SIGKILL)
+    except OSError:
+        pass
+    deadline = _time.time() + 2.0
+    while _time.time() < deadline:
+        if not _is_pid_alive(pid):
+            print(f"[web] forcibly killed (pid {pid}).")
+            return 0
+        _time.sleep(0.1)
+
+    print(
+        f"error: pid {pid} still alive after SIGKILL — manual intervention needed.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _resolve_schedule_config(args: argparse.Namespace) -> "Any":
@@ -6466,23 +6896,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness web` (#14) ---
+    # --- `harness web` (#14) — start / stop subcommands ---
     dashboard_parser = subparsers.add_parser(
         "web",
-        help="Read-only web UI over the harness's on-disk state (sessions, cost, schedule, repo index, memory).",
+        help="Carbon-styled web UI over the harness's on-disk state.",
+        description=(
+            "Manage the harness web UI.\n\n"
+            "The dashboard is a single-instance server per user — its pid, "
+            "host, and port are recorded in a marker file at ~/.harness/web.lock "
+            "so 'harness web stop' can find and stop it cleanly. A second "
+            "'web start' refuses to launch while a live instance is already "
+            "registered; stop it first.\n\n"
+            "Subcommands:\n"
+            "  start    Launch the web UI (foreground by default).\n"
+            "  stop     Stop the running web UI cleanly (SIGTERM, then SIGKILL after 5s).\n"
+        ),
+        epilog=(
+            "Examples:\n"
+            "  harness web start                          # foreground, http://127.0.0.1:9000\n"
+            "  harness web start --port 8080              # foreground on port 8080\n"
+            "  harness web start --host 0.0.0.0           # bind all interfaces\n"
+            "  harness web start --background yes         # detach; logs to ~/.harness/web.log\n"
+            "  harness web stop                           # graceful shutdown\n\n"
+            "Files:\n"
+            "  ~/.harness/web.lock     pid + host + port + mode (created at start, removed at stop)\n"
+            "  ~/.harness/web.log      stdout/stderr (background mode only)\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    dashboard_parser.add_argument(
-        "--host", default=None,
-        help="Bind host. Overrides dashboard.host (default 127.0.0.1).",
+    dashboard_subparsers = dashboard_parser.add_subparsers(
+        dest="web_action", help="Web action (start / stop).",
+        metavar="{start,stop}",
     )
-    dashboard_parser.add_argument(
-        "--port", type=int, default=None,
-        help="Bind port. Overrides dashboard.port (default 8729).",
+    # `harness web start`
+    web_start_parser = dashboard_subparsers.add_parser(
+        "start",
+        help="Start the web UI server.",
+        description=(
+            "Start the harness web UI.\n\n"
+            "Refuses to launch if another instance is already registered "
+            "(via the marker file ~/.harness/web.lock). Run 'harness web stop' "
+            "first to free the marker.\n\n"
+            "Foreground mode (default): the server runs in this terminal. "
+            "Ctrl-C triggers a clean shutdown — the listening socket is "
+            "released and the marker is removed before the process exits.\n\n"
+            "Background mode (--background yes): the server is re-spawned in "
+            "a detached subprocess, stdout/stderr are redirected to "
+            "~/.harness/web.log, and this command returns immediately."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  harness web start\n"
+            "      → http://127.0.0.1:9000 (foreground)\n\n"
+            "  harness web start --port 8080\n"
+            "      → http://127.0.0.1:8080 (foreground)\n\n"
+            "  harness web start --host 0.0.0.0 --port 8080\n"
+            "      → http://0.0.0.0:8080 (all interfaces, foreground)\n\n"
+            "  harness web start --background yes\n"
+            "      → detached on http://127.0.0.1:9000, logs to ~/.harness/web.log\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    dashboard_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
+    web_start_parser.add_argument(
+        "--host", default="127.0.0.1", metavar="HOST",
+        help="Bind host. Default: 127.0.0.1 (localhost only). "
+             "Pass 0.0.0.0 to bind every interface — when you do, set "
+             "dashboard.token_env in config.json so the server requires "
+             "a bearer token.",
+    )
+    web_start_parser.add_argument(
+        "--port", type=int, default=9000, metavar="PORT",
+        help="Bind port. Default: 9000.",
+    )
+    web_start_parser.add_argument(
+        "--background", choices=["yes", "no"], default="no", metavar="{yes,no}",
+        help="yes = detach (logs to ~/.harness/web.log), no = foreground. "
+             "Default: no.",
+    )
+    # `harness web stop`
+    dashboard_subparsers.add_parser(
+        "stop",
+        help="Stop the running web UI cleanly.",
+        description=(
+            "Stop the running harness web UI.\n\n"
+            "Reads ~/.harness/web.lock to find the pid, deletes the marker, "
+            "sends SIGTERM, and waits up to 5s for a clean exit. If the "
+            "process is still alive after 5s it escalates to SIGKILL.\n\n"
+            "Idempotent: returns 0 even if no marker is present (so scripts "
+            "can call 'web stop' unconditionally before 'web start')."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  harness web stop\n"
+            "      → reads ~/.harness/web.lock, SIGTERMs the pid, confirms\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # --- `harness schedule` (#13) ---
     schedule_parser = subparsers.add_parser(
@@ -6724,7 +7232,13 @@ def main() -> int:
         elif args.command == "chat":
             return asyncio.run(cmd_chat(args))
         elif args.command == "web":
-            return cmd_dashboard(args)
+            action = getattr(args, "web_action", None)
+            if action == "start":
+                return cmd_web_start(args)
+            if action == "stop":
+                return cmd_web_stop(args)
+            parser.parse_args([args.command, "--help"])
+            return 1
         elif args.command == "schedule":
             action = getattr(args, "schedule_action", None)
             if action == "run":

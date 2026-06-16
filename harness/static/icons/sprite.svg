@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  myharness Carbon Icons sprite.
+
+  Hand-picked subset of Carbon Icons v11 (Apache-2.0, IBM). Each <symbol>
+  uses a 32x32 viewBox to match the Carbon source so consumers can pick
+  any size via width/height. Reference from HTML as:
+
+    <svg class="icon" width="16" height="16">
+      <use href="/static/icons/sprite.svg#i-launch"/>
+    </svg>
+
+  Add more icons by copying the <path> contents of any Carbon icon at
+  https://carbondesignsystem.com/elements/icons/library/ and wrapping
+  them in <symbol id="i-NAME" viewBox="0 0 32 32">...</symbol>.
+
+  License: Apache-2.0 — see LICENSE for attribution.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+
+  <!-- Navigation / chrome -->
+  <symbol id="i-dashboard" viewBox="0 0 32 32">
+    <path d="M16 18a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm0 6a2 2 0 1 1 2-2 2 2 0 0 1-2 2z"/>
+    <path d="M4 4h10v10H4zm2 2v6h6V6zM18 4h10v10H18zm2 2v6h6V6zM4 18h10v10H4zm2 2v6h6v-6z"/>
+  </symbol>
+
+  <symbol id="i-play" viewBox="0 0 32 32">
+    <path d="M7 28a1 1 0 0 1-1-1V5a1 1 0 0 1 1.482-.876l20 11a1 1 0 0 1 0 1.752l-20 11A1 1 0 0 1 7 28z"/>
+  </symbol>
+
+  <symbol id="i-settings" viewBox="0 0 32 32">
+    <path d="M27 16.76v-1.53l1.92-1.68A2 2 0 0 0 29.3 11l-2.36-4a2 2 0 0 0-1.73-1 2 2 0 0 0-.64.1l-2.43.82a11.35 11.35 0 0 0-1.34-.78l-.51-2.51a2 2 0 0 0-2-1.61h-4.68a2 2 0 0 0-2 1.61l-.51 2.5a11.48 11.48 0 0 0-1.34.79l-2.42-.82a2 2 0 0 0-.64-.1 2 2 0 0 0-1.73 1L2.7 11a2 2 0 0 0 .38 2.55L5 15.24v1.53l-1.92 1.68A2 2 0 0 0 2.7 21l2.36 4a2 2 0 0 0 1.73 1 2 2 0 0 0 .64-.1l2.43-.82a11.35 11.35 0 0 0 1.34.78l.51 2.51a2 2 0 0 0 2 1.61h4.72a2 2 0 0 0 2-1.61l.51-2.5a11.48 11.48 0 0 0 1.34-.79l2.42.82a2 2 0 0 0 .64.1 2 2 0 0 0 1.73-1l2.28-4a2 2 0 0 0-.38-2.55zM25.21 24l-3.43-1.16a8.86 8.86 0 0 1-2.71 1.57L18.36 28h-4.72l-.71-3.55a9.36 9.36 0 0 1-2.7-1.57L6.79 24l-2.35-4 2.72-2.4a8.9 8.9 0 0 1 0-3.13L4.44 12l2.35-4 3.43 1.16a8.86 8.86 0 0 1 2.71-1.57L13.64 4h4.72l.71 3.55a9.36 9.36 0 0 1 2.7 1.57L25.21 8l2.35 4-2.72 2.4a8.9 8.9 0 0 1 0 3.13L27.56 20z"/>
+    <path d="M16 22a6 6 0 1 1 6-6 6 6 0 0 1-6 6zm0-10a4 4 0 1 0 4 4 4 4 0 0 0-4-4z"/>
+  </symbol>
+
+  <symbol id="i-document" viewBox="0 0 32 32">
+    <path d="M25.7 9.3l-7-7A.908.908 0 0 0 18 2H8a2.006 2.006 0 0 0-2 2v24a2.006 2.006 0 0 0 2 2h16a2.006 2.006 0 0 0 2-2V10a.91.91 0 0 0-.3-.7zM18 4.4l5.6 5.6H18zM24 28H8V4h8v6a2.006 2.006 0 0 0 2 2h6z"/>
+  </symbol>
+
+  <symbol id="i-home" viewBox="0 0 32 32">
+    <path d="M16.612 2.214a1.01 1.01 0 0 0-1.242 0L1 13.419l1.243 1.572L4 13.621V26a2.004 2.004 0 0 0 2 2h20a2.004 2.004 0 0 0 2-2V13.63L29.757 15 31 13.428zM18 26h-4v-8h4zm2 0v-8a2.002 2.002 0 0 0-2-2h-4a2.002 2.002 0 0 0-2 2v8H6V12.062l10-7.79 10 7.8V26z"/>
+  </symbol>
+
+  <symbol id="i-chart-line" viewBox="0 0 32 32">
+    <path d="M28 27V5h-2v8h-6V3h-2v18h-6V11H10v16H4V3H2v25a1 1 0 0 0 1 1h27v-2z"/>
+  </symbol>
+
+  <symbol id="i-terminal" viewBox="0 0 32 32">
+    <path d="M16 18h12v2H16zM9.4 13L4 7.6 5.4 6.2 12.2 13l-6.8 6.8L4 18.4z"/>
+    <path d="M28 4H4a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h24a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zM4 26V6h24v20z"/>
+  </symbol>
+
+  <symbol id="i-calendar" viewBox="0 0 32 32">
+    <path d="M26 4h-4V2h-2v2h-8V2h-2v2H6a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h20a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zM6 6h4v2h2V6h8v2h2V6h4v4H6zm0 20V12h20v14z"/>
+  </symbol>
+
+  <!-- Actions -->
+  <symbol id="i-launch" viewBox="0 0 32 32">
+    <path d="M26 28H6a2.003 2.003 0 0 1-2-2V6a2.003 2.003 0 0 1 2-2h10v2H6v20h20V16h2v10a2.003 2.003 0 0 1-2 2z"/>
+    <path d="M20 2v2h6.586L18 12.586 19.414 14 28 5.414V12h2V2z"/>
+  </symbol>
+
+  <symbol id="i-copy" viewBox="0 0 32 32">
+    <path d="M28 10v18H10V10h18m0-2H10a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2z"/>
+    <path d="M4 18H2V4a2 2 0 0 1 2-2h14v2H4z"/>
+  </symbol>
+
+  <symbol id="i-search" viewBox="0 0 32 32">
+    <path d="M29 27.586l-7.552-7.552a11.018 11.018 0 1 0-1.414 1.414L27.586 29zM4 13a9 9 0 1 1 9 9 9.01 9.01 0 0 1-9-9z"/>
+  </symbol>
+
+  <symbol id="i-filter" viewBox="0 0 32 32">
+    <path d="M18 28h-4a2 2 0 0 1-2-2V18.414L4.586 11A2 2 0 0 1 4 9.586V6a2 2 0 0 1 2-2h20a2 2 0 0 1 2 2v3.586A2 2 0 0 1 27.414 11L20 18.414V26a2 2 0 0 1-2 2zM6 6v3.586l8 8V26h4v-8.414l8-8V6z"/>
+  </symbol>
+
+  <symbol id="i-renew" viewBox="0 0 32 32">
+    <path d="M12 10H6.78A11 11 0 0 1 27 16h2A13 13 0 0 0 6 7.68V4H4v8h8zm8 12h5.22A11 11 0 0 1 5 16H3a13 13 0 0 0 23 8.32V28h2v-8h-8z"/>
+  </symbol>
+
+  <symbol id="i-sort-ascending" viewBox="0 0 32 32">
+    <path d="M27.6 20.6L24 24.2V4h-2v20.2l-3.6-3.6L17 22l6 6 6-6zM16 20H4v-2h12zm-4-6H4v-2h8zm-4-6H4V6h4z"/>
+  </symbol>
+
+  <symbol id="i-sort-descending" viewBox="0 0 32 32">
+    <path d="M27.6 11.4L24 7.8V28h-2V7.8l-3.6 3.6L17 10l6-6 6 6zM16 4h-4v2h4zm0 6H8v2h8zm0 6H4v2h12z"/>
+  </symbol>
+
+  <symbol id="i-checkmark-filled" viewBox="0 0 32 32">
+    <path d="M16 2a14 14 0 1 0 14 14A14 14 0 0 0 16 2zm-2 19.59l-5-5L10.59 15 14 18.41 21.41 11l1.596 1.586z"/>
+  </symbol>
+
+  <symbol id="i-warning-alt" viewBox="0 0 32 32">
+    <path d="M15 19h2v2h-2zM15 11h2v6h-2z"/>
+    <path d="M16 4a12 12 0 1 0 12 12A12 12 0 0 0 16 4m0-2A14 14 0 1 1 2 16 14 14 0 0 1 16 2z"/>
+  </symbol>
+
+  <symbol id="i-error-filled" viewBox="0 0 32 32">
+    <path d="M16 2a14 14 0 1 0 14 14A14 14 0 0 0 16 2zm5.4 21L9 10.6 10.6 9 23 21.4z"/>
+  </symbol>
+
+  <symbol id="i-chevron-right" viewBox="0 0 32 32">
+    <path d="M22 16L12 26l-1.4-1.4 8.6-8.6-8.6-8.6L12 6z"/>
+  </symbol>
+
+  <symbol id="i-menu" viewBox="0 0 32 32">
+    <path d="M4 6h24v2H4zm0 18h24v2H4zm0-12h24v2H4zm0 6h24v2H4z"/>
+  </symbol>
+
+  <symbol id="i-list" viewBox="0 0 32 32">
+    <path d="M10 6h18v2H10zm0 18h18v2H10zm0-12h18v2H10zm0 6h18v2H10z"/>
+    <circle cx="5" cy="7" r="2"/>
+    <circle cx="5" cy="13" r="2"/>
+    <circle cx="5" cy="19" r="2"/>
+    <circle cx="5" cy="25" r="2"/>
+  </symbol>
+
+  <symbol id="i-save" viewBox="0 0 32 32">
+    <path d="M27.71 9.29l-5-5A1 1 0 0 0 22 4H6a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h20a2 2 0 0 0 2-2V10a1 1 0 0 0-.29-.71zM12 6h8v4h-8zm8 20h-8v-8h8zm2 0v-8a2 2 0 0 0-2-2h-8a2 2 0 0 0-2 2v8H6V6h4v4a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6.41L26 10.41V26z"/>
+  </symbol>
+
+  <symbol id="i-add" viewBox="0 0 32 32">
+    <path d="M17 15V8h-2v7H8v2h7v7h2v-7h7v-2z"/>
+  </symbol>
+
+</svg>

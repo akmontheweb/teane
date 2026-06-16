@@ -17,6 +17,7 @@ import pytest
 
 from harness.dashboard import (
     DashboardConfig,
+    _serve_static,
     check_auth,
     cost_burn_series,
     dispatch,
@@ -362,6 +363,346 @@ def test_dispatch_index_renders_table_or_placeholder(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Static asset pipeline — packaged + operator-override + traversal
+# ---------------------------------------------------------------------------
+
+def test_serve_static_returns_packaged_css(tmp_path):
+    """The packaged harness/static/css/app.css ships with every wheel
+    and must be served as text/css when no operator override matches."""
+    cfg = _make_cfg(tmp_path)  # static_dir points at empty tmp dir
+    status, ctype, data = _serve_static(cfg, "css/app.css")
+    assert status == 200
+    assert ctype.startswith("text/css")
+    assert isinstance(data, (bytes, bytearray))
+
+
+def test_serve_static_returns_packaged_favicon(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    status, ctype, data = _serve_static(cfg, "favicon.ico")
+    assert status == 200
+    assert "icon" in ctype
+    # Real ICO files start with the 6-byte header 00 00 01 00 NN 00.
+    assert data[:4] == b"\x00\x00\x01\x00"
+
+
+def test_serve_static_returns_packaged_sprite_and_js(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    s1, c1, _ = _serve_static(cfg, "icons/sprite.svg")
+    assert s1 == 200 and "svg" in c1
+    s2, c2, _ = _serve_static(cfg, "js/dashboard.js")
+    assert s2 == 200 and "javascript" in c2
+
+
+def test_serve_static_operator_override_wins_over_packaged(tmp_path):
+    """An operator file at static_dir/css/app.css must shadow the
+    packaged copy. This is the air-gap escape hatch — mirror the
+    sheet into your own dir without rebuilding the wheel."""
+    override_root = tmp_path / "static-override"
+    (override_root / "css").mkdir(parents=True)
+    (override_root / "css" / "app.css").write_bytes(b"/* operator override */\n")
+    cfg = _make_cfg(tmp_path, static_dir=str(override_root))
+    status, ctype, data = _serve_static(cfg, "css/app.css")
+    assert status == 200
+    assert ctype.startswith("text/css")
+    assert data == b"/* operator override */\n"
+
+
+def test_serve_static_rejects_path_traversal(tmp_path):
+    """Even when an override dir exists, `..` segments must not escape
+    its containment. Defense-in-depth alongside the route regex."""
+    override_root = tmp_path / "static-override"
+    override_root.mkdir()
+    (tmp_path / "secret.css").write_text("/* not yours */")
+    cfg = _make_cfg(tmp_path, static_dir=str(override_root))
+    status, _, _ = _serve_static(cfg, "../secret.css")
+    assert status == 404
+
+
+def test_serve_static_rejects_disallowed_extension(tmp_path):
+    """Only the whitelisted extensions render. Otherwise an operator
+    could drop a .py / .sh / .html into static_dir and confuse a
+    browser that auto-executes."""
+    override_root = tmp_path / "static-override"
+    override_root.mkdir()
+    (override_root / "evil.html").write_bytes(b"<script>1</script>")
+    cfg = _make_cfg(tmp_path, static_dir=str(override_root))
+    status, _, _ = _serve_static(cfg, "evil.html")
+    assert status == 404
+
+
+def test_serve_static_rejects_missing_file(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    status, _, _ = _serve_static(cfg, "does/not/exist.css")
+    assert status == 404
+
+
+def test_layout_links_static_stylesheet_and_favicon_and_js(tmp_path):
+    """Every rendered page must pull in the external app.css, the
+    favicon, and the dashboard.js bundle. Defends against accidental
+    removal during future refactors."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    assert 'href="/static/css/app.css"' in body
+    assert 'href="/static/favicon.ico"' in body
+    assert 'src="/static/js/dashboard.js"' in body
+    assert 'name="viewport"' in body  # mobile-ready
+
+
+def test_side_nav_renders_icons_per_item(tmp_path):
+    """Each of the five top-level nav items shows an icon via the
+    /static/icons/sprite.svg sprite. Icons stay in sync via _NAV_ITEMS."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    # All five nav items must reference a sprite symbol.
+    for symbol in ("chart-line", "play", "settings", "dashboard", "document"):
+        assert f"#i-{symbol}" in body, f"missing nav icon {symbol!r}"
+
+
+def test_dashboards_landing_tiles_render_icons(tmp_path):
+    """Each tile on the /dashboards landing has an icon prefix so the
+    page reads as a real launcher, not a wall of links."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/dashboards")
+    # At least one icon symbol used, and the icon wrapper class present.
+    assert "dash-tile__icon" in body
+    assert "#i-" in body
+
+
+def test_run_now_button_has_play_icon_prefix(tmp_path, monkeypatch):
+    """The primary action button on /run uses the play icon for the
+    universal recognisable affordance."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path, csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # The button still ends with "Run Now</button>" (test contract from
+    # earlier PRs) but now has a #i-play sprite reference immediately
+    # before that text.
+    assert "#i-play" in body
+    assert ">Run Now</button>" in body
+
+
+def test_sessions_table_uses_thead_tbody(tmp_path):
+    """Modern table markup so Carbon's CSS bindings and our zebra/
+    sticky-header styling lock in. Add thead/tbody when adding new
+    tables — they're cheap and fix a lot of visual bugs."""
+    _write_session_log(tmp_path / "logs", "demo", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"},
+        {"event": "session_end", "timestamp": "2026-06-15T10:00:01Z", "exit_code": 0},
+    ])
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/sessions")
+    assert "<thead>" in body and "<tbody>" in body
+    assert "id='sessions-table'" in body
+    assert "table-wrap" in body
+
+
+def test_sessions_table_columns_have_sort_metadata(tmp_path):
+    """Every <th> on the sessions table opts into client-side sorting
+    via data-sort, so dashboard.js can wire up header-click sort
+    without server changes."""
+    _write_session_log(tmp_path / "logs", "demo", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"},
+        {"event": "session_end", "timestamp": "2026-06-15T10:00:01Z", "exit_code": 0},
+    ])
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/sessions")
+    # str / date / num kinds all present in the header row.
+    assert "data-sort='str'" in body
+    assert "data-sort='date'" in body
+    assert "data-sort='num'" in body
+
+
+def test_session_row_has_copy_button(tmp_path):
+    """Session IDs in the sessions table are copyable via the click-
+    delegated copy button. Operators paste these into terminals all
+    the time — saves a triple-click + Ctrl+C."""
+    _write_session_log(tmp_path / "logs", "abc123", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"},
+        {"event": "session_end", "timestamp": "2026-06-15T10:00:01Z", "exit_code": 0},
+    ])
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/sessions")
+    assert "data-copy='abc123'" in body
+    assert "copy-btn" in body
+
+
+def test_empty_sessions_renders_cta_to_run(tmp_path):
+    """Empty state replaces the lone muted paragraph with a real
+    component that includes an icon, a headline, and a one-click
+    button to start a run."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/sessions")
+    assert "empty-state" in body
+    assert "No sessions yet" in body
+    # CTA points at /run (the most common next action).
+    assert "href='/run'" in body
+    # Old "harness run -r ..." literal is no longer the only hint.
+    assert "empty-state__title" in body
+
+
+def test_session_detail_renders_breadcrumb(tmp_path):
+    """Detail pages show a breadcrumb trail so operators always know
+    where they are. The new helper replaces ad-hoc `← All foo` links."""
+    _write_session_log(tmp_path / "logs", "feed", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"},
+    ])
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/sessions/feed")
+    assert "class='breadcrumb'" in body
+    assert "aria-label='Breadcrumb'" in body
+    # Parent link + current page.
+    assert "href='/sessions'>Sessions</a>" in body
+    assert "breadcrumb__current" in body
+
+
+def test_docs_file_breadcrumb_replaces_old_links(tmp_path):
+    """The old `← All documents · {path}` markup is gone; the new
+    helper renders a real breadcrumb component instead."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "guide.md").write_text("# heading\n")
+    cfg = _make_cfg(tmp_path, docs_dir=str(docs_dir))
+    _, _, body = dispatch(cfg, "/docs/guide.md")
+    assert "class='breadcrumb'" in body
+    assert "← All documents" not in body  # legacy markup removed
+
+
+def test_layout_includes_auto_refresh_toggle(tmp_path):
+    """Every page surfaces the auto-refresh toggle in the header. The
+    JS in dashboard.js wires the click handler + localStorage state."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    assert 'id="auto-refresh-toggle"' in body
+    assert 'aria-pressed="false"' in body  # off by default
+    assert "Auto-refresh: off" in body
+
+
+def test_layout_includes_toast_surface_via_dashboard_js(tmp_path):
+    """The /static/js/dashboard.js bundle pulls in the toast helper
+    (ensureToastHost creates #toast-host on boot). Save handlers will
+    be wired to append ?saved=… in a follow-up; the surface is here."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    # The script tag references dashboard.js (toast helper lives in it).
+    assert 'src="/static/js/dashboard.js"' in body
+
+
+def test_run_page_has_new_and_resume_tabs(tmp_path, monkeypatch):
+    """Run Harness page exposes two mutually-exclusive modes via CSS-
+    driven radio tabs at the top of the form: New session (default,
+    checked) and Resume existing session."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path, csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # Both mode radios present, New is default.
+    assert "id='mode-new'" in body and "value='new' checked" in body
+    assert "id='mode-resume'" in body
+    # Both tab labels reachable.
+    assert ">New session" in body
+    assert ">Resume existing session" in body
+    # Both panels render.
+    assert "run-panel--new" in body
+    assert "run-panel--resume" in body
+    # Resume button posts to the new /run/resume handler.
+    assert "formaction='/run/resume'" in body
+    assert ">Resume Now</button>" in body
+
+
+def test_run_page_resume_panel_shows_session_picker_columns(tmp_path, monkeypatch):
+    """The Resume panel renders a session picker with all the columns
+    the operator needs: session id, created, last update, repo /
+    workspace, app name, status."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    # Seed two sessions: one finished, one running.
+    _write_session_log(tmp_path / "logs", "done-abc", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z",
+         "workspace_path": "/home/op/projects/myharness"},
+        {"event": "session_end", "timestamp": "2026-06-15T10:30:00Z", "exit_code": 0},
+    ])
+    _write_session_log(tmp_path / "logs", "live-xyz", [
+        {"event": "session_start", "timestamp": "2026-06-16T08:00:00Z",
+         "workspace_path": "/home/op/projects/widget"},
+    ])
+    cfg = _make_cfg(
+        tmp_path, csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # Column headers expected by the user.
+    for header in ("Session ID", "Created", "Last update", "Repo / workspace",
+                   "App", "Status"):
+        assert header in body, f"missing picker column {header!r}"
+    # Both sessions show up as rows.
+    assert "value='done-abc'" in body
+    assert "value='live-xyz'" in body
+    # "App" cell uses workspace basename.
+    assert ">myharness<" in body
+    assert ">widget<" in body
+    # The radio name is what the server reads on POST.
+    assert "name='resume_session_id'" in body
+    # The picker table opts into sort.
+    assert "id='resume-session-picker-table'" in body
+    assert "data-sort='date'" in body
+
+
+def test_resume_picker_has_delete_column_per_row(tmp_path, monkeypatch):
+    """Each row in the resume picker gets a Delete column with a
+    data-purge-session button so JS can POST to /sessions/{sid}/purge."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    _write_session_log(tmp_path / "logs", "del-target", [
+        {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z",
+         "workspace_path": "/home/op/projects/myharness"},
+        {"event": "session_end", "timestamp": "2026-06-15T10:01:00Z", "exit_code": 0},
+    ])
+    cfg = _make_cfg(
+        tmp_path, csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # Delete column header exists.
+    assert ">Delete</th>" in body
+    # Each row carries a data-purge-session button keyed to its sid.
+    assert "data-purge-session='del-target'" in body
+    # No nested <form> inside the resume form (HTML invalid). The
+    # delete is a plain button — JS handles the POST.
+    assert "action='/sessions/del-target/purge'" not in body
+    # The session row carries the sid for the JS click handler.
+    assert "data-row-session='del-target'" in body
+
+
+def test_run_page_resume_picker_empty_state(tmp_path, monkeypatch):
+    """When no sessions exist on disk, the resume panel shows a clear
+    empty-state pointer back to the New session tab."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path, csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # The picker shows the empty hint instead of a table.
+    assert "No sessions on disk yet" in body
+    assert "run-panel--resume" in body
+
+
+def test_layout_includes_mobile_nav_toggle(tmp_path):
+    """The hamburger button lives in the header and controls the side
+    nav (via aria-controls). CSS hides it above 768px; JS toggles
+    body[data-nav-open] on click."""
+    cfg = _make_cfg(tmp_path)
+    _, _, body = dispatch(cfg, "/status")
+    assert 'id="nav-toggle"' in body
+    assert 'aria-controls="side-nav"' in body
+    # The side-nav has the matching id so aria-controls resolves.
+    assert 'id="side-nav"' in body
+
+
+# ---------------------------------------------------------------------------
 # 5. End-to-end — real server, real socket
 # ---------------------------------------------------------------------------
 
@@ -424,6 +765,38 @@ def test_server_refuses_to_start_when_token_env_empty(tmp_path, monkeypatch):
     cfg.port = _free_port()
     with pytest.raises(RuntimeError, match="empty"):
         start_server(cfg, blocking=False)
+
+
+def test_server_serves_static_assets_without_auth(tmp_path, monkeypatch):
+    """Static assets must render even when the bearer-token gate is on
+    so the 401 page itself can be styled and so air-gap mirrors don't
+    need a token. Nothing in static/ is sensitive."""
+    monkeypatch.setenv("DASH_AUTH_TOKEN", "swordfish")
+    cfg = _make_cfg(tmp_path, token_env="DASH_AUTH_TOKEN")
+    cfg.host = "127.0.0.1"
+    cfg.port = _free_port()
+    handle = start_server(cfg, blocking=False)
+    assert handle is not None
+    try:
+        # No auth header — protected route is 401.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(
+                f"http://{cfg.host}:{cfg.port}/sessions", timeout=2.0,
+            )
+        assert exc.value.code == 401
+        # No auth header — static asset is 200.
+        with urllib.request.urlopen(
+            f"http://{cfg.host}:{cfg.port}/static/css/app.css", timeout=2.0,
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Content-Type", "").startswith("text/css")
+        # Favicon shorthand also works.
+        with urllib.request.urlopen(
+            f"http://{cfg.host}:{cfg.port}/favicon.ico", timeout=2.0,
+        ) as resp:
+            assert resp.status == 200
+    finally:
+        handle.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +1044,11 @@ def test_config_ui_off_when_writes_explicitly_disabled(tmp_path):
     assert "dashboard.writes_enabled" in body
 
 
-def test_config_ui_renders_accordion_with_dropdown_for_sandbox_backend(tmp_path, monkeypatch):
+def test_config_ui_renders_sandbox_section_via_tree_editor(tmp_path, monkeypatch):
+    """The sandbox section renders through the tree editor: each
+    sub-key gets a __path[]/__type[]/__value[] triple and the section
+    form posts to /config-tree/sandbox. Replaces the old curated
+    accordion + per-field dropdown."""
     monkeypatch.setenv("FAKE_CSRF", "tok")
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"sandbox": {"backend": "docker"}}))
@@ -683,19 +1060,17 @@ def test_config_ui_renders_accordion_with_dropdown_for_sandbox_backend(tmp_path,
         config_path=str(config_path),
     )
     _, _, body = dispatch(cfg, "/config-ui")
-    # Accordion structure
-    assert "bx--accordion" in body
-    assert "bx--accordion__item" in body
-    # Sandbox section + backend dropdown
-    assert ">sandbox " in body
-    assert "<select" in body and "name='sandbox.backend'" in body
-    # Current value preselected
-    assert "value='docker' selected" in body
-    # Description column populated
-    assert "Sandbox engine" in body
-    # Per-section save button
+    # Section renders with the new ct-section wrapper, not bx--accordion.
+    assert "data-section='sandbox'" in body
+    # The form posts to the new /config-tree/<section> handler.
+    assert "action='/config-tree/sandbox'" in body
+    # The current backend value is in a __path/__type/__value triple.
+    assert "name='__path[]' value='sandbox/backend'" in body
+    assert "name='__type[]' value='str'" in body
+    assert "value='docker'" in body
+    # Per-section save button preserves "Save sandbox" wording.
     assert "Save sandbox" in body
-    # Deployment.json out-of-scope notice
+    # Footer "deployment.json" notice still present.
     assert "deployment.json" in body
 
 
@@ -716,10 +1091,11 @@ def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, mo
         config_path=str(config_path),
     )
     _, _, body = dispatch(cfg, "/config-ui")
-    # Group container + clickable headings.
-    assert "config-group" in body
-    assert "config-group__heading" in body
-    # +/- toggle glyph in the heading.
+    # Outer group is a native <details> with the legacy class names
+    # preserved so operator CSS overrides keep working.
+    assert "<details class='config-group'" in body
+    assert "<summary class='config-group__heading'" in body
+    # Toggle glyph: "+" rendered in markup (CSS swaps to "−" when [open]).
     assert "config-group__toggle" in body and ">+<" in body
     # Group titles operators expect to see.
     for title in (
@@ -736,9 +1112,11 @@ def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, mo
         "Dashboard",
     ):
         assert title in body, f"missing group header {title!r}"
-    # Groups start collapsed (aria-expanded='false', body display:none).
-    assert "aria-expanded='false'" in body
-    assert "display:none" in body
-    # Inside, the existing section editors still render.
-    assert "name='sandbox.backend'" in body
-    assert "name='model_routing.planning_primary'" in body
+    # Groups start collapsed — <details> is closed by default.
+    assert "<details open" not in body  # no group is force-expanded
+    # Inside, the new tree editor renders one editor per section with
+    # path-encoded form fields targeting /config-tree/<section>.
+    assert "data-section='sandbox'" in body
+    assert "data-section='model_routing'" in body
+    assert "name='__path[]' value='sandbox/backend'" in body
+    assert "name='__path[]' value='model_routing/planning_primary'" in body

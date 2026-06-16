@@ -1,0 +1,1262 @@
+/* myharness web UI — application stylesheet.
+
+   Loaded by every page via _layout() in harness/dashboard.py. Pairs
+   with Carbon Components v10 (which the page also pulls in) and adds
+   the spacing scale, table polish, sticky chrome, icon sizing, and
+   utility classes the inline _BASE_CSS used to carry.
+
+   Class names that were already in _BASE_CSS (`.card`, `.muted`,
+   `.ok`, `.fail`, `.tile-grid`, `.status-tile`, `.dash-tile`, `.tag`,
+   `.tag-green/red/gray`) are preserved here so existing tests pass
+   and operators with overrides aren't surprised.
+
+   Air-gap operators can drop a replacement copy of this file into
+   ``$(dashboard.static_dir)/css/app.css`` and it will shadow the
+   packaged copy without rebuilding the wheel. */
+
+/* ---------- Design tokens ------------------------------------------------- */
+
+:root {
+  /* 8-pt spacing scale, lined up with Carbon's $spacing-* tokens. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  /* Carbon Gray 10/20/30/70/100 — the muted palette this UI lives in. */
+  --c-bg: #f4f4f4;
+  --c-surface: #ffffff;
+  --c-border: #e0e0e0;
+  --c-border-strong: #c6c6c6;
+  --c-text: #161616;
+  --c-text-muted: #525252;
+  --c-text-soft: #6f6f6f;
+
+  /* Status colors (Carbon Red 60 / Green 60 / Blue 60). */
+  --c-ok: #198038;
+  --c-fail: #da1e28;
+  --c-info: #0f62fe;
+  --c-warn: #f1c21b;
+
+  /* Layout dimensions. */
+  --header-h: 3rem;
+  --side-nav-w: 16rem;
+
+  --shadow-1: 0 1px 0 rgba(0, 0, 0, 0.06);
+  --shadow-2: 0 2px 6px rgba(0, 0, 0, 0.08);
+
+  --radius-sm: 2px;
+  --radius-md: 4px;
+}
+
+/* ---------- Base layout -------------------------------------------------- */
+
+html, body { background: var(--c-bg); color: var(--c-text); }
+
+body {
+  margin: 0;
+  font-family: 'IBM Plex Sans', 'Segoe UI', system-ui, -apple-system,
+               Roboto, Helvetica, Arial, sans-serif;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Header sticks so the brand + nav are always reachable. Index above
+   Carbon's side-nav so the bottom edge doesn't bleed through. */
+.bx--header {
+  position: sticky;
+  top: 0;
+  z-index: 8000;
+  box-shadow: var(--shadow-1);
+}
+
+main.bx--content {
+  margin-left: var(--side-nav-w);
+  padding: var(--space-6);
+  min-height: calc(100vh - var(--header-h));
+  background: var(--c-bg);
+}
+
+main.bx--content h2 {
+  font-weight: 400;
+  margin: 0 0 var(--space-5) 0;
+  font-size: 1.75rem;
+  letter-spacing: -0.01em;
+  color: var(--c-text);
+}
+
+/* Carbon's side-nav doesn't ship a current-page highlight color out of
+   the box for our use case — paint it dark gray to match the header. */
+.bx--side-nav__link--current,
+.bx--side-nav__link--current span { color: #fff !important; background: #393939; }
+
+/* Visible focus rings — Carbon's keyboard-focus shows by default but
+   tightening :focus-visible matches the rest of the chrome. */
+*:focus-visible {
+  outline: 2px solid var(--c-info);
+  outline-offset: 1px;
+}
+
+/* ---------- Cards & tiles ------------------------------------------------ */
+
+.card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-5);
+  margin-bottom: var(--space-5);
+  box-shadow: var(--shadow-1);
+}
+
+.card > h2,
+.card > h3 {
+  margin: 0 0 var(--space-4) 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--c-text);
+  letter-spacing: 0;
+}
+
+.card pre {
+  background: var(--c-bg);
+  padding: var(--space-3);
+  overflow: auto;
+  font-size: 0.825rem;
+  border-radius: var(--radius-sm);
+  margin: 0;
+}
+
+.card p:last-child { margin-bottom: 0; }
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: var(--space-4);
+}
+
+.status-tile {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
+.status-tile h3 {
+  margin: 0 0 var(--space-3) 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--c-text-muted);
+}
+
+.status-tile dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  row-gap: var(--space-1);
+  column-gap: var(--space-4);
+  font-size: 0.875rem;
+}
+
+.status-tile dt { color: var(--c-text-muted); }
+.status-tile dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.dash-tile {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.dash-tile:hover {
+  border-color: var(--c-border-strong);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-1px);
+}
+
+.dash-tile a {
+  color: var(--c-info);
+  text-decoration: none;
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+
+.dash-tile .dash-tile__icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--c-text-muted);
+}
+
+.dash-tile h3 { margin: 0 0 var(--space-1) 0; font-size: 1rem; font-weight: 600; color: var(--c-text); }
+.dash-tile p { margin: 0; font-size: 0.875rem; color: var(--c-text-muted); }
+
+/* ---------- Tables ------------------------------------------------------- */
+
+.table-wrap {
+  /* Horizontal scroll for narrow viewports without squishing the cells. */
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  background: var(--c-surface);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--c-surface);
+}
+
+table thead th {
+  background: var(--c-bg);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--c-text-muted);
+  border-bottom: 1px solid var(--c-border);
+  text-align: left;
+  padding: var(--space-3);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+table tbody td {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--c-border);
+  font-size: 0.875rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+/* Legacy markup (no thead/tbody) still gets reasonable styling. */
+table > tr > th { background: var(--c-bg); font-weight: 600; border-bottom: 1px solid var(--c-border); padding: var(--space-3); text-align: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--c-text-muted); }
+table > tr > td { padding: var(--space-3); border-bottom: 1px solid var(--c-border); font-size: 0.875rem; vertical-align: top; }
+
+table tbody tr:last-child td,
+table > tr:last-child > td { border-bottom: 0; }
+
+/* Zebra stripes; subtle hover. Applies to both modern and legacy markup. */
+table tbody tr:nth-child(even),
+table > tr:nth-child(even) { background: #fafafa; }
+table tbody tr:hover,
+table > tr:hover:not(:first-child) { background: #eef4ff; }
+
+/* Right-align + tabular figures for numeric columns. Renderers opt in
+   per-cell with `class='num'`. */
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Inline code chips. */
+code {
+  background: var(--c-bg);
+  padding: 0.05em 0.4em;
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, 'IBM Plex Mono', 'Cascadia Code', Menlo, monospace;
+  font-size: 0.825em;
+}
+
+pre code { background: transparent; padding: 0; }
+
+/* ---------- Status colors & tags ----------------------------------------- */
+
+.muted { color: var(--c-text-soft); }
+.ok { color: var(--c-ok); font-weight: 600; }
+.fail { color: var(--c-fail); font-weight: 600; }
+
+.tag {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+.tag-green { background: #defbe6; color: #0e6027; }
+.tag-red   { background: #ffd7d9; color: #a2191f; }
+.tag-gray  { background: #e0e0e0; color: #393939; }
+.tag-blue  { background: #d0e2ff; color: #002d9c; }
+
+/* ---------- Icons -------------------------------------------------------- */
+
+.icon {
+  display: inline-block;
+  vertical-align: -2px;
+  fill: currentColor;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.icon--lg { width: 24px; height: 24px; vertical-align: -6px; }
+.icon--sm { width: 12px; height: 12px; vertical-align: -1px; }
+
+/* Side-nav icons are tinted gray when inactive, white on the current page. */
+.bx--side-nav__link .icon {
+  margin-right: var(--space-3);
+  color: var(--c-text-muted);
+}
+
+.bx--side-nav__link--current .icon { color: #fff; }
+
+/* Button icon spacing. */
+.bx--btn .icon { margin-right: var(--space-2); }
+
+/* ---------- Forms -------------------------------------------------------- */
+
+.bx--label { font-weight: 500; color: var(--c-text); }
+
+.field { margin-bottom: var(--space-4); }
+.field--inline { display: flex; gap: var(--space-3); align-items: center; }
+.field-group {
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  margin: var(--space-4) 0;
+}
+.field-group legend { padding: 0 var(--space-2); font-weight: 500; }
+
+.actions { margin-top: var(--space-5); display: flex; gap: var(--space-2); flex-wrap: wrap; }
+
+/* ---------- Live event stream (PR-6) ----------------------------------- */
+
+.event-stream-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  min-height: 1.75rem;
+}
+
+.event-chip {
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: 999px;
+  padding: 2px var(--space-3);
+  font-size: 0.75rem;
+  cursor: pointer;
+  color: var(--c-text-muted);
+  font-family: inherit;
+}
+.event-chip:hover { border-color: var(--c-border-strong); color: var(--c-text); }
+.event-chip--on { background: var(--c-info); color: #fff; border-color: var(--c-info); }
+
+.event-stream {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 480px;
+  overflow: auto;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  background: var(--c-bg);
+}
+
+.event-stream li {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--c-border);
+  background: var(--c-surface);
+}
+.event-stream li:last-child { border-bottom: 0; }
+.event-stream li:hover { background: #fafafa; }
+
+.event-stream__head {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+.event-stream__type { text-transform: lowercase; letter-spacing: 0; }
+
+.event-stream__body {
+  margin: 0;
+  font-size: 0.8125rem;
+  background: var(--c-bg);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+
+/* ---------- Mobile responsive (PR-6) ----------------------------------- */
+
+.nav-toggle {
+  /* Hidden on desktop; revealed by the media query below. */
+  display: none;
+  background: transparent;
+  border: none;
+  color: #fff;
+  width: var(--header-h);
+  height: var(--header-h);
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+.nav-toggle:hover { background: #393939; }
+
+@media (max-width: 768px) {
+  .nav-toggle { display: inline-flex; }
+
+  /* Side-nav slides in/out via a body[data-nav-open] flag. Off-canvas
+     when closed; full-width drawer when opened. */
+  nav.bx--side-nav {
+    transform: translateX(-100%);
+    transition: transform 200ms ease;
+    width: 14rem;
+    box-shadow: var(--shadow-2);
+  }
+  body[data-nav-open="1"] nav.bx--side-nav { transform: translateX(0); }
+
+  /* Main content gets the full viewport width on small screens. */
+  main.bx--content {
+    margin-left: 0;
+    padding: var(--space-4);
+  }
+
+  main.bx--content h2 { font-size: 1.35rem; }
+
+  /* Backdrop: a darkening overlay over .bx--content when the nav is
+     open. Click-to-close handled by JS. */
+  body[data-nav-open="1"] main.bx--content::before {
+    content: "";
+    position: fixed;
+    inset: var(--header-h) 0 0 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 7000;
+  }
+
+  /* Auto-refresh label is verbose on small screens — show the icon
+     only and hide the text. */
+  .auto-refresh-btn__label { display: none; }
+
+  .card { padding: var(--space-4); }
+}
+
+/* ---------- Auto-refresh toggle (PR-5) ---------------------------------- */
+
+.header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-right: var(--space-3);
+}
+
+.auto-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: transparent;
+  border: 1px solid transparent;
+  color: #fff;
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8125rem;
+  font-family: inherit;
+  border-radius: var(--radius-sm);
+}
+.auto-refresh-btn:hover { background: #393939; }
+.auto-refresh-btn[aria-pressed="true"] { background: #393939; color: #d0e2ff; }
+.auto-refresh-btn[aria-pressed="true"] .icon { animation: spin 2s linear infinite; }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ---------- Sort indicators (PR-4) -------------------------------------- */
+
+.th-sortable { cursor: pointer; user-select: none; }
+.th-sortable:hover { background: #e8e8e8; }
+.th-sortable::after {
+  content: "";
+  display: inline-block;
+  margin-left: var(--space-2);
+  opacity: 0.35;
+  width: 0; height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-bottom: 5px solid currentColor;
+  vertical-align: middle;
+}
+.th-sorted-asc::after  { opacity: 1; border-bottom: 5px solid currentColor; border-top: 0; }
+.th-sorted-desc::after { opacity: 1; border-top: 5px solid currentColor; border-bottom: 0; }
+
+/* ---------- Table filter input (PR-4) ----------------------------------- */
+
+.table-filter-row {
+  margin-bottom: var(--space-3);
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+}
+.table-filter {
+  max-width: 320px;
+  flex: 1;
+}
+.table-filter-empty { font-size: 0.875rem; }
+
+/* ---------- Copy-to-clipboard button (PR-4) ----------------------------- */
+
+.id-cell { display: inline-flex; align-items: center; gap: var(--space-2); }
+
+.copy-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  cursor: pointer;
+  color: var(--c-text-muted);
+  line-height: 1;
+}
+.copy-btn:hover { background: var(--c-bg); border-color: var(--c-border); color: var(--c-text); }
+.copy-btn:focus-visible { background: var(--c-bg); }
+
+/* ---------- Breadcrumbs (PR-4) ------------------------------------------ */
+
+.breadcrumb {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-4) 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  font-size: 0.875rem;
+}
+.breadcrumb li { display: inline-flex; align-items: center; gap: var(--space-1); }
+.breadcrumb li + li::before { content: ""; display: inline-block; width: 0; height: 0;
+  border-left: 4px solid var(--c-text-soft);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  margin-right: var(--space-1);
+}
+.breadcrumb a { color: var(--c-text-muted); text-decoration: none; }
+.breadcrumb a:hover { color: var(--c-info); text-decoration: underline; }
+.breadcrumb .breadcrumb__current { color: var(--c-text); font-weight: 500; }
+
+/* ---------- Empty state (PR-4) ------------------------------------------ */
+
+.empty-state {
+  text-align: center;
+  padding: var(--space-6) var(--space-4);
+}
+.empty-state__icon { color: var(--c-text-muted); margin-bottom: var(--space-3); }
+.empty-state__title { font-size: 1.125rem; font-weight: 600; margin: 0 0 var(--space-2) 0; }
+.empty-state__body { color: var(--c-text-muted); margin: 0 auto var(--space-4) auto; max-width: 36rem; }
+.empty-state .bx--btn { display: inline-flex; align-items: center; }
+
+/* ---------- Toasts (PR-4 surface; PR-5 will trigger on save redirects) -- */
+
+.toast-host {
+  position: fixed;
+  bottom: var(--space-4);
+  right: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: 9000;
+  pointer-events: none;
+}
+
+.toast {
+  background: var(--c-text);
+  color: #fff;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  box-shadow: var(--shadow-2);
+  min-width: 16rem;
+  max-width: 28rem;
+  pointer-events: auto;
+  animation: toast-enter 180ms ease-out;
+}
+.toast--success { background: #198038; }
+.toast--error   { background: #da1e28; }
+.toast--leaving { opacity: 0; transition: opacity 200ms; }
+
+@keyframes toast-enter {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+
+/* ---------- Run Harness page: New / Resume tabs + session picker ------- */
+
+/* Pure-CSS tabs. The two mode radios are visually hidden but still
+   focusable + keyboard-operable; their :checked state drives which
+   panel is visible via sibling selectors below. */
+.run-form .run-mode-radio {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.run-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 0 0 var(--space-4) 0;
+  border-bottom: 1px solid var(--c-border);
+}
+
+.run-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  color: var(--c-text-muted);
+  font-weight: 500;
+  font-size: 0.875rem;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;     /* overlap with the parent's bottom border */
+  transition: color 80ms ease, border-color 80ms ease, background 80ms ease;
+  user-select: none;
+}
+.run-tab:hover { background: #fafafa; color: var(--c-text); }
+
+/* Active tab indicator — driven by the :checked state of the matching
+   radio that sits just before .run-tabs in the form. */
+.run-form #mode-new:checked ~ .run-tabs label[for="mode-new"],
+.run-form #mode-resume:checked ~ .run-tabs label[for="mode-resume"] {
+  color: var(--c-text);
+  font-weight: 600;
+  border-bottom-color: var(--c-info);
+  background: #fff;
+}
+.run-form #mode-new:focus-visible ~ .run-tabs label[for="mode-new"],
+.run-form #mode-resume:focus-visible ~ .run-tabs label[for="mode-resume"] {
+  outline: 2px solid var(--c-info);
+  outline-offset: -2px;
+}
+
+/* Panels: hide both by default, then show the one whose radio is on. */
+.run-panel {
+  display: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+.run-form #mode-new:checked ~ .run-panel--new { display: block; }
+.run-form #mode-resume:checked ~ .run-panel--resume { display: block; }
+
+.run-panel__legend {
+  /* Visually hidden — the tab itself provides the section title. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+/* ---- Session picker (Resume mode) ---- */
+
+.session-picker { margin-bottom: var(--space-3); }
+
+.session-picker__table { table-layout: auto; }
+.session-picker__table tbody tr { cursor: pointer; }
+.session-picker__table tbody tr:hover { background: #eef4ff; }
+
+/* When the row's radio is checked, highlight the whole row. The radio
+   sits inside the first <td>; we use :has() to bubble the checked
+   state up to the row. Modern browsers (Chrome ≥ 105, Safari ≥ 15.4,
+   Firefox ≥ 121) support :has() — older browsers just lose the row
+   highlight, which is a clean degradation. */
+.session-picker__table tbody tr:has(input[type="radio"]:checked) {
+  background: #d0e2ff;
+  outline: 1px solid var(--c-info);
+}
+
+.session-row__pick { width: 2.5rem; text-align: center; }
+.session-row__pick input[type="radio"] {
+  width: 1.125rem;
+  height: 1.125rem;
+  cursor: pointer;
+  margin: 0;
+}
+
+.session-row__sid-label {
+  display: inline-block;
+  cursor: pointer;
+  margin: 0;
+}
+.session-row__sid-label code {
+  font-size: 0.8125rem;
+}
+
+/* Delete cell: keeps the × button right-aligned and free of the
+   row-click radio toggle (the JS handler ignores INPUT/BUTTON clicks). */
+.session-row__delete-cell {
+  width: 4rem;
+  text-align: center;
+}
+.session-row__delete {
+  /* Inherits the .ct-remove circular-button base; just nudge size. */
+  width: 1.75rem;
+  height: 1.75rem;
+}
+.session-row__delete:disabled,
+.ct-remove--busy {
+  opacity: 0.5;
+  cursor: wait;
+  pointer-events: none;
+}
+
+/* ---------- model_routing custom renderer (3-level role tree) ---------- */
+
+.ct-routing { display: flex; flex-direction: column; gap: var(--space-3); }
+
+/* Role-level details (Planning, Patching, Repair, ...) */
+details.ct-routing__role {
+  border: 1px solid var(--c-border);
+  border-left: 3px solid var(--c-info);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+.ct-routing__role-head {
+  cursor: pointer;
+  padding: var(--space-3) var(--space-4);
+  background: linear-gradient(to bottom, #fafafa, #f4f4f4);
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--c-text);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  user-select: none;
+  border-radius: var(--radius-sm);
+}
+.ct-routing__role-head::-webkit-details-marker { display: none; }
+.ct-routing__role-head::marker { content: ""; }
+.ct-routing__role-head::before {
+  content: "▸";
+  color: var(--c-text-muted);
+  font-size: 0.75rem;
+  transition: transform 100ms ease;
+}
+details.ct-routing__role[open] .ct-routing__role-head::before {
+  transform: rotate(90deg);
+}
+details.ct-routing__role[open] .ct-routing__role-head {
+  border-bottom: 1px solid var(--c-border);
+}
+.ct-routing__role-body {
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Subgroup-level details (Primary / Fallback within each role) */
+details.ct-routing__sub {
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  background: #fcfcfc;
+}
+.ct-routing__sub-head {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  background: #fafafa;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--c-text-muted);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  user-select: none;
+  border-radius: var(--radius-sm);
+}
+.ct-routing__sub-head::-webkit-details-marker { display: none; }
+.ct-routing__sub-head::marker { content: ""; }
+.ct-routing__sub-head::before {
+  content: "▸";
+  color: var(--c-text-soft);
+  font-size: 0.75rem;
+  transition: transform 100ms ease;
+}
+details.ct-routing__sub[open] .ct-routing__sub-head::before {
+  transform: rotate(90deg);
+}
+details.ct-routing__sub[open] .ct-routing__sub-head {
+  color: var(--c-text);
+  border-bottom: 1px solid var(--c-border);
+}
+.ct-routing__sub-body {
+  padding: var(--space-3) var(--space-4);
+}
+
+/* ---------- Config tree editor (Configure Harness page) ----------------
+ *
+ * Layout system:
+ *   Every row in the editor uses one grid:  "[label 12rem] [value 1fr] [× 2rem]"
+ *   so labels, inputs, and delete buttons line up vertically across rows —
+ *   regardless of whether a given row has × (extensible entry) or not
+ *   (fixed-schema record field).
+ *
+ * Visual hierarchy (Vercel / Stripe / GitHub Settings inspiration):
+ *   - Section cards: clean white surface, subtle border, prominent header.
+ *   - Record cards: 1px accent on the left edge so collections read as a
+ *     stack of grouped units, not a soup of rows.
+ *   - Inputs: bounded at max-width: 28rem so they don't stretch absurdly.
+ *   - × button: 28×28 circular icon button, gray by default → red on hover.
+ *   - + Add: low-emphasis tertiary button so it doesn't fight the Save CTA.
+ */
+
+/* ---- Variables specific to the editor ---------------------------------- */
+
+:root {
+  --ct-label-col: 12rem;   /* uniform left column for every row */
+  --ct-action-col: 2rem;   /* fixed-width column for × button */
+  --ct-input-max: 28rem;   /* keep inputs from stretching forever */
+  --ct-record-accent: var(--c-info);
+}
+
+/* ---- Section (top-level config key, e.g. "models", "sandbox") --------- */
+
+details.ct-section {
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-md);
+  background: var(--c-surface);
+  margin: 0 0 var(--space-3) 0;
+  overflow: hidden;
+}
+
+.ct-section__head {
+  cursor: pointer;
+  padding: var(--space-3) var(--space-4);
+  background: #fafafa;
+  font-size: 0.9375rem;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  list-style: none;
+  user-select: none;
+}
+.ct-section__head::-webkit-details-marker { display: none; }
+.ct-section__head::marker { content: ""; }
+details.ct-section[open] .ct-section__head {
+  border-bottom: 1px solid var(--c-border);
+}
+
+.ct-section__toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  color: var(--c-text-muted);
+  font-weight: 400;
+  flex-shrink: 0;
+  position: relative;
+}
+details.ct-section[open] .ct-section__toggle { color: transparent; }
+details.ct-section[open] .ct-section__toggle::before {
+  content: "−";
+  color: var(--c-text);
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ct-section__name {
+  font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.ct-section__body { padding: var(--space-4) var(--space-5); }
+
+/* ---- The form & save button ------------------------------------------- */
+
+.ct-form { display: flex; flex-direction: column; gap: var(--space-4); }
+.ct-tree { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.ct-form .actions {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--c-border);
+  margin-top: var(--space-2);
+}
+
+/* ---- Object (closed-schema dict, e.g. record body, top-level section) - */
+
+.ct-object {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* The canonical row: every form row in the editor uses these columns so
+   they line up across the page regardless of whether a × is present. */
+.ct-row {
+  display: grid;
+  grid-template-columns: var(--ct-label-col) minmax(0, 1fr) var(--ct-action-col);
+  gap: var(--space-4);
+  align-items: center;        /* center label & input vertically */
+  padding: var(--space-2) 0;
+  min-height: 2.5rem;
+}
+.ct-row + .ct-row { border-top: 1px solid #f4f4f4; }
+
+.ct-row__label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--c-text);
+}
+.ct-row__key {
+  font-size: 0.7rem;
+  color: var(--c-text-soft);
+  background: transparent;
+  padding: 0;
+  letter-spacing: 0;
+}
+
+.ct-row__value {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.ct-row__value > * { max-width: var(--ct-input-max); }
+.ct-row__value .ct-input,
+.ct-row__value .ct-textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* When a dict-entry row carries a × delete (extensible dict-of-scalars). */
+.ct-row--dict-entry { /* same grid; the × naturally sits in column 3 */ }
+
+/* ---- Nested groups (a dict/list inside a closed-schema section body) -- */
+
+details.ct-nested {
+  margin: var(--space-2) 0 var(--space-3);
+}
+details.ct-nested > summary {
+  cursor: pointer;
+  padding: var(--space-2) 0;
+  font-weight: 600;
+  font-size: 0.875rem;
+  color: var(--c-text);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+details.ct-nested > summary::-webkit-details-marker { display: none; }
+details.ct-nested > summary::marker { content: ""; }
+details.ct-nested > summary::before {
+  content: "▸";
+  color: var(--c-text-muted);
+  font-size: 0.75rem;
+  display: inline-block;
+  transition: transform 100ms ease;
+}
+details.ct-nested[open] > summary::before { transform: rotate(90deg); }
+details.ct-nested > summary > code {
+  font-size: 0.7rem;
+  color: var(--c-text-soft);
+  background: transparent;
+  padding: 0;
+}
+.ct-nested__body {
+  padding-left: var(--space-4);
+  padding-top: var(--space-2);
+  border-left: 2px solid var(--c-border);
+  margin-left: 6px;
+}
+
+/* ---- Collections: dict-of-records / list-of-records ------------------- */
+
+.ct-dict, .ct-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* The card: each record gets the same chrome whether it's a model entry
+   or an MCP server entry. Left-edge accent reinforces "these are
+   grouped units". */
+details.ct-record {
+  border: 1px solid var(--c-border);
+  border-left: 3px solid var(--ct-record-accent);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  transition: box-shadow 100ms ease;
+}
+details.ct-record:hover { box-shadow: var(--shadow-1); }
+details.ct-record[open] { box-shadow: var(--shadow-1); }
+
+.ct-record__head {
+  cursor: pointer;
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  display: grid;
+  grid-template-columns: 1.25rem minmax(0, 1fr) auto var(--ct-action-col);
+  align-items: center;
+  gap: var(--space-3);
+  list-style: none;
+  user-select: none;
+}
+.ct-record__head::-webkit-details-marker { display: none; }
+.ct-record__head::marker { content: ""; }
+.ct-record__head::before {
+  content: "▸";
+  color: var(--c-text-muted);
+  font-size: 0.75rem;
+  transition: transform 100ms ease;
+  text-align: center;
+}
+details.ct-record[open] .ct-record__head::before { transform: rotate(90deg); }
+
+.ct-record__title {
+  font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+  font-weight: 600;
+  font-size: 0.875rem;
+  color: var(--c-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Editable key input: looks like a "tag" by default, becomes a proper
+   input on focus. Lives in the record header for new (or operator-
+   added) records so the operator can name it inline. */
+.ct-record__key-input {
+  font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+  font-weight: 600;
+  font-size: 0.875rem;
+  color: var(--c-text);
+  background: rgba(15, 98, 254, 0.06);
+  border: 1px dashed rgba(15, 98, 254, 0.45);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  outline: none;
+  min-width: 12rem;
+  max-width: 100%;
+  font-family-feature-settings: normal;
+}
+.ct-record__key-input:hover {
+  background: rgba(15, 98, 254, 0.1);
+  border-color: var(--c-info);
+}
+.ct-record__key-input:focus {
+  background: #fff;
+  border-style: solid;
+  border-color: var(--c-info);
+  box-shadow: 0 0 0 2px rgba(15, 98, 254, 0.2);
+}
+.ct-record__key-input:invalid {
+  border-color: var(--c-fail);
+  background: rgba(218, 30, 40, 0.06);
+}
+.ct-record__sub {
+  font-size: 0.75rem;
+  text-align: right;
+  white-space: nowrap;
+  color: var(--c-text-soft);
+}
+
+.ct-record__body {
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border-top: 1px solid var(--c-border);
+  background: #fcfcfc;
+}
+
+/* ---- List of scalars (e.g. sandbox.readonly_cache_mounts) ------------- */
+
+.ct-list__item {
+  display: grid;
+  grid-template-columns: var(--ct-label-col) minmax(0, 1fr) var(--ct-action-col);
+  gap: var(--space-4);
+  align-items: center;
+  padding: var(--space-2) 0;
+  min-height: 2.5rem;
+}
+.ct-list__item + .ct-list__item { border-top: 1px solid #f4f4f4; }
+
+.ct-list__index {
+  font-family: ui-monospace, monospace;
+  color: var(--c-text-soft);
+  font-size: 0.75rem;
+  text-align: right;
+  padding-right: var(--space-3);
+}
+
+.ct-list__value {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.ct-list__value > * { max-width: var(--ct-input-max); width: 100%; }
+
+/* ---- Add row at the bottom of an extensible collection ----------------
+ *
+ * The "new key" input + + Add button sit on one line. Flex (not grid)
+ * because the button needs more than the 2rem action column elsewhere.
+ */
+
+.ct-add-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--c-border);
+  margin-top: var(--space-2);
+}
+.ct-add-row .ct-new-key {
+  flex: 1;
+  max-width: var(--ct-input-max);
+  box-sizing: border-box;
+}
+.ct-add-row .ct-add {
+  flex-shrink: 0;
+  margin-top: 0;
+}
+
+/* The standalone + Add button (used by list-of-scalars and list-of-records
+   which don't need a key input). */
+.ct-add.bx--btn--tertiary {
+  font-size: 0.8125rem;
+  padding: 4px 14px;
+  min-height: 1.875rem;
+  align-self: flex-start;
+  margin-top: var(--space-2);
+}
+.ct-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+/* ---- × Remove (icon button) ------------------------------------------ */
+
+.ct-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--c-text-soft);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 1.125rem;
+  line-height: 1;
+  transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+}
+.ct-remove:hover {
+  background: var(--c-fail);
+  color: #fff;
+  border-color: var(--c-fail);
+}
+.ct-remove:focus-visible {
+  outline: 2px solid var(--c-info);
+  outline-offset: 1px;
+}
+
+/* On a record card, the × sits in column 4 of the head grid — no extra
+   styling needed beyond what .ct-remove provides. */
+.ct-remove--record { justify-self: end; }
+
+/* ---- Checkbox alignment ---------------------------------------------- */
+
+.ct-bool {
+  width: 1.125rem;
+  height: 1.125rem;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* ---------- Config groups (Configure Harness page) ---------------------- */
+
+.config-groups { display: flex; flex-direction: column; gap: var(--space-3); }
+
+details.config-group {
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--c-surface);
+}
+
+.config-group__heading {
+  /* Drop the default marker so we own the toggle glyph. */
+  list-style: none;
+  cursor: pointer;
+  padding: var(--space-3) var(--space-4);
+  background: var(--c-bg);
+  font-weight: 600;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  user-select: none;
+}
+
+.config-group__heading::-webkit-details-marker { display: none; }
+.config-group__heading::marker { content: ""; }
+
+.config-group__toggle {
+  display: inline-block;
+  width: 1.25rem;
+  text-align: center;
+  margin-right: var(--space-2);
+  font-weight: 400;
+  color: var(--c-text-muted);
+  font-variant-numeric: tabular-nums;
+  position: relative;
+}
+
+/* CSS-driven glyph swap. Markup carries "+" so zero-JS and snapshot
+   tests see the closed glyph; when the <details> is open, hide the
+   "+" via color:transparent and overlay "−" through ::before. */
+details.config-group[open] .config-group__toggle { color: transparent; }
+details.config-group[open] .config-group__toggle::before {
+  content: "−";
+  color: var(--c-text);
+  position: absolute;
+  inset: 0;
+  text-align: center;
+}
+
+.config-group__body { padding: var(--space-3) var(--space-4) var(--space-4); }
+
+/* ---------- Utility classes (absorb inline style attrs) ------------------ */
+
+.mb-0 { margin-bottom: 0 !important; }
+.mb-1 { margin-bottom: var(--space-1) !important; }
+.mb-2 { margin-bottom: var(--space-2) !important; }
+.mb-3 { margin-bottom: var(--space-3) !important; }
+.mb-4 { margin-bottom: var(--space-4) !important; }
+.mb-5 { margin-bottom: var(--space-5) !important; }
+
+.mt-3 { margin-top: var(--space-3); }
+.mt-4 { margin-top: var(--space-4); }
+.mt-5 { margin-top: var(--space-5); }
+
+.ml-2 { margin-left: var(--space-2); }
+
+.flex { display: flex; }
+.flex-1 { flex: 1; }
+.gap-1 { gap: var(--space-1); }
+.gap-2 { gap: var(--space-2); }
+.gap-3 { gap: var(--space-3); }
+.gap-4 { gap: var(--space-4); }
+
+.hidden { display: none !important; }
+.w-100 { width: 100%; }
+.text-muted { color: var(--c-text-muted); }
+.text-soft  { color: var(--c-text-soft); }
+.fs-sm { font-size: 0.825em; }

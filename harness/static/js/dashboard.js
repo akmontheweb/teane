@@ -332,6 +332,81 @@
   }
 
   // -------------------------------------------------------------------
+  // CSRF on form POSTs
+  // -------------------------------------------------------------------
+  //
+  // The server enforces a double-submit cookie pattern: every write
+  // route checks that the X-CSRF-Token request header matches the
+  // csrf_token cookie (both set on the previous authed GET). A native
+  // <form method=post> submission cannot set custom headers, so we
+  // intercept submits, re-POST via fetch() with the header attached,
+  // and replace the page with the response HTML. Forms that need to
+  // opt out (e.g. /hitl/webhook, which uses a shared secret, not CSRF)
+  // can set data-no-csrf-intercept.
+
+  function wireFormCsrf() {
+    document.addEventListener("submit", function (evt) {
+      var form = evt.target;
+      if (!form || form.tagName !== "FORM") return;
+      if (form.hasAttribute("data-no-csrf-intercept")) return;
+      var submitter = evt.submitter || null;
+      var method = (submitter && submitter.getAttribute("formmethod")) ||
+                   form.getAttribute("method") || "get";
+      if (method.toLowerCase() !== "post") return;
+      var action = (submitter && submitter.getAttribute("formaction")) ||
+                   form.action || window.location.href;
+
+      evt.preventDefault();
+
+      var csrf = readCookie("csrf_token");
+      var body = new URLSearchParams();
+      // Walk the form rather than using FormData so we cleanly skip
+      // disabled/unchecked controls — same shape parse_qs expects.
+      new FormData(form).forEach(function (v, k) {
+        body.append(k, typeof v === "string" ? v : "");
+      });
+      if (submitter && submitter.name) {
+        body.append(submitter.name, submitter.value || "");
+      }
+
+      var prevDisabled = false;
+      if (submitter && "disabled" in submitter) {
+        prevDisabled = submitter.disabled;
+        submitter.disabled = true;
+      }
+
+      fetch(action, {
+        method: "POST",
+        body: body.toString(),
+        credentials: "same-origin",
+        redirect: "follow",
+        headers: {
+          "X-CSRF-Token": csrf,
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        },
+      }).then(function (resp) {
+        var finalUrl = resp.url || action;
+        return resp.text().then(function (text) {
+          var ct = resp.headers.get("Content-Type") || "";
+          if (ct.indexOf("text/html") >= 0) {
+            try { window.history.replaceState(null, "", finalUrl); }
+            catch (_e) { /* cross-origin etc. */ }
+            document.open();
+            document.write(text);
+            document.close();
+          } else {
+            // Plain-text errors, downloads — let the browser navigate.
+            window.location.href = finalUrl;
+          }
+        });
+      }).catch(function (err) {
+        toast("Save failed: " + (err && err.message ? err.message : err), "error");
+        if (submitter && "disabled" in submitter) submitter.disabled = prevDisabled;
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------
   // /run?mode=resume — preselect the Resume tab on page load
   // -------------------------------------------------------------------
   //
@@ -740,6 +815,7 @@
     wireConfigTree();
     wireSessionPicker();
     wireSessionPurge();
+    wireFormCsrf();
     wireRunModeFromQuery();
     wireToastFromQuery();
   }

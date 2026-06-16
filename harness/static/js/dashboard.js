@@ -406,10 +406,21 @@
             document.open();
             document.write(text);
             document.close();
-          } else {
-            // Plain-text errors, downloads — let the browser navigate.
-            window.location.href = finalUrl;
+            return;
           }
+          // Non-HTML response. If the server reported an error, surface
+          // its plain-text message as a toast and stay on the form so
+          // the operator can correct the input. Navigating to finalUrl
+          // would land on the POST-only endpoint (e.g. /run/now) and
+          // hit the GET 404 page, hiding the real error.
+          if (!resp.ok) {
+            var msg = (text || "").trim() || ("Save failed (" + resp.status + ")");
+            toast(msg.slice(0, 240), "error");
+            if (submitter && "disabled" in submitter) submitter.disabled = prevDisabled;
+            return;
+          }
+          // 2xx non-HTML — downloads, JSON, etc. Let the browser navigate.
+          window.location.href = finalUrl;
         });
       }).catch(function (err) {
         toast("Save failed: " + (err && err.message ? err.message : err), "error");

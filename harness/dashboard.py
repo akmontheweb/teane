@@ -1814,12 +1814,12 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
         <summary class='mb-3'>Optional overrides</summary>
         <div class='field'>
           <label class='bx--label' for='resume-workspace'>Workspace override (rarely needed)</label>
-          <input class='bx--text-input' id='resume-workspace' name='workspace' type='text'
+          <input class='bx--text-input' id='resume-workspace' name='resume_workspace' type='text'
                  placeholder='Auto-detected from checkpoint'>
         </div>
         <div class='field'>
           <label class='bx--label' for='resume-prompt'>Append prompt to resumed session</label>
-          <textarea class='bx--text-area' id='resume-prompt' name='prompt' rows='3'
+          <textarea class='bx--text-area' id='resume-prompt' name='resume_prompt' rows='3'
                     placeholder='Optional — leave blank to resume without a new prompt'></textarea>
         </div>
       </details>
@@ -3178,9 +3178,14 @@ def make_request_handler(
                 self._send(400, "text/plain", "resume_session_id required\n")
                 return
             # Workspace/prompt are optional; the resume CLI auto-detects
-            # workspace from the checkpoint if omitted.
-            workspace = str(form.get("workspace") or "").strip() or None
-            prompt = str(form.get("prompt") or "").strip() or None
+            # workspace from the checkpoint if omitted. The Resume-panel
+            # inputs carry their own field names (``resume_workspace`` /
+            # ``resume_prompt``) so they don't collide with the New-session
+            # panel's ``workspace`` / ``prompt`` fields inside the same
+            # <form> — duplicated names would parse as a list and break
+            # both flows.
+            workspace = str(form.get("resume_workspace") or "").strip() or None
+            prompt = str(form.get("resume_prompt") or "").strip() or None
             if workspace:
                 workspace_resolved = os.path.expanduser(workspace)
                 if not os.path.isdir(workspace_resolved):

@@ -308,9 +308,43 @@ def _list_directory_entries(target: str) -> tuple[list[dict[str, Any]], Optional
 
 
 def _browse_response(query_path: str) -> tuple[int, str, str]:
-    """Build the JSON response for ``GET /api/browse?path=...``."""
+    """Build the JSON response for ``GET /api/browse?path=...``.
+
+    Restrict the visible filesystem to a handful of operator-friendly
+    roots — the home directory, /tmp, and the current working directory.
+    Without this, the endpoint exposes the entire host filesystem and
+    becomes a useful reconnaissance primitive once DNS rebinding /
+    no-auth-on-loopback puts a browser inside the same origin. Audit §3.13.
+    """
     raw = (query_path or "").strip() or os.path.expanduser("~")
     abs_path = os.path.abspath(os.path.expanduser(raw))
+    roots: list[str] = []
+    try:
+        roots.append(os.path.realpath(os.path.expanduser("~")))
+    except OSError:
+        pass
+    try:
+        roots.append(os.path.realpath(os.getcwd()))
+    except OSError:
+        pass
+    roots.append(os.path.realpath("/tmp"))
+    try:
+        target_real = os.path.realpath(abs_path)
+    except OSError:
+        target_real = abs_path
+    if not any(
+        target_real == r or target_real.startswith(r.rstrip("/") + os.sep)
+        for r in roots if r
+    ):
+        body = json.dumps({
+            "ok": False,
+            "error": (
+                "path outside allowed roots (home / cwd / /tmp). "
+                "Set dashboard.docs_dir or use the workspace browser instead."
+            ),
+            "path": abs_path,
+        })
+        return 403, "application/json; charset=utf-8", body
     entries, err = _list_directory_entries(abs_path)
     if err is not None:
         body = json.dumps({"ok": False, "error": err, "path": abs_path})

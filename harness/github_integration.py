@@ -47,6 +47,28 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_SECONDS = 30
 
 
+_GH_REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+
+
+def _validate_gh_repo(repo: str) -> None:
+    """Refuse repo values that don't match ``OWNER/NAME``.
+
+    Argv-mode in subprocess.run blocks shell injection but does NOT
+    block "flag confusion": a value of ``--something`` would be
+    treated by gh as a new flag rather than as the value of ``--repo``.
+    This regex matches the GitHub-API ``OWNER/NAME`` shape strictly.
+    Audit §3.12.
+    """
+    if not isinstance(repo, str):
+        raise ValueError("repo must be a string")
+    if not _GH_REPO_RE.fullmatch(repo):
+        raise ValueError(
+            f"repo {repo!r} does not match OWNER/NAME shape "
+            f"(letters/digits, dots, hyphens, underscores; "
+            f"must not start with '-')."
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. Availability + auth checks
 # ---------------------------------------------------------------------------
@@ -170,6 +192,11 @@ def fetch_issue(
             "gh CLI not found on PATH. Install it from "
             "https://cli.github.com/ and run `gh auth login`."
         )
+    # gh argv-mode blocks shell injection, but a value of `--draft` (or
+    # any flag-looking string) in repo would be treated as a flag and
+    # could escalate to gh-side privileges. Validate the repo shape
+    # (audit §3.12).
+    _validate_gh_repo(repo)
     fields = "number,title,body,labels,state,author,url"
     cmd = [
         binary, "issue", "view", str(number),
@@ -284,6 +311,12 @@ def create_pr(
         raise RuntimeError("gh CLI not found on PATH")
     if not title or not title.strip():
         raise ValueError("PR title must be non-empty")
+    # Reject flag-looking values (`--draft`, `--reviewer …`) that gh
+    # would otherwise treat as additional flags rather than as the
+    # value of --base. Argv-mode blocks shell injection but doesn't
+    # block flag-confusion. Audit §3.12.
+    if base.startswith("-"):
+        raise ValueError(f"--base value must not start with '-': {base!r}")
     cmd = [
         binary, "pr", "create",
         "--title", title,

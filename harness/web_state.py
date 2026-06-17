@@ -444,12 +444,33 @@ class HitlQueue:
     def register_pending(
         self, *, request_id: str, session_id: str, prompt: dict[str, Any],
     ) -> PendingHitl:
-        entry = PendingHitl(
-            request_id=request_id, session_id=session_id, prompt=prompt,
-        )
+        """Register a HITL prompt and return its PendingHitl entry.
+
+        Refuses to OVERWRITE an existing pending entry. The earlier
+        behaviour blindly replaced any prior registration under the same
+        ``request_id``, so a duplicate / malicious POST that reused a
+        live request_id orphaned the original blocked handler (the
+        original event/answer pair was discarded and the original
+        caller would then receive whatever response the new prompt
+        produced). Audit §3.14.
+        """
         with self._lock:
+            existing = self._pending.get(request_id)
+            if existing is not None:
+                # Idempotent re-registration: if the same session is
+                # re-sending the same request_id (network retry), we
+                # return the existing entry rather than replacing it.
+                if existing.session_id == session_id:
+                    return existing
+                raise ValueError(
+                    f"request_id {request_id!r} already pending for a "
+                    f"different session — refusing to overwrite (§3.14)."
+                )
+            entry = PendingHitl(
+                request_id=request_id, session_id=session_id, prompt=prompt,
+            )
             self._pending[request_id] = entry
-        return entry
+            return entry
 
     def list_pending_for_session(self, session_id: str) -> list[PendingHitl]:
         with self._lock:
@@ -491,9 +512,22 @@ class HitlQueue:
         prompt doesn't leak into the dashboard's HITL panel after
         the harness side gives up waiting. Returns True when an entry
         was found and removed, False when there was nothing to remove.
+
+        Refuses to clear if the entry's ``event`` has just been set —
+        an operator answer that landed in the same millisecond as the
+        timeout would otherwise be silently discarded (the UI reports
+        success, the harness sees the default response). Audit §1.15.
+        Callers should treat False as "operator answered first; consume
+        the response instead of using the default."
         """
         with self._lock:
-            return self._pending.pop(request_id, None) is not None
+            entry = self._pending.get(request_id)
+            if entry is None:
+                return False
+            if entry.event.is_set():
+                return False
+            self._pending.pop(request_id, None)
+            return True
 
     def clear_pending_for_session(self, session_id: str) -> int:
         """Remove every pending entry for a session that has ended.

@@ -258,18 +258,23 @@ class UnshareBackend(SandboxBackend):
         if not allow_network:
             ns_args.append("--net")  # CLONE_NEWNET — network isolation
 
-        # Build inner shell commands: bind-mount caches → cd workspace → execute build
+        # Build inner shell commands: bind-mount caches → cd workspace → execute build.
+        # Paths go through shlex.quote so operator-supplied paths
+        # containing apostrophes or spaces don't escape the single-quoted
+        # context. Audit §3.11.
+        import shlex as _shlex
         inner_commands: list[str] = []
 
         for cache_path in cache_mounts:
             expanded = os.path.expanduser(cache_path)
             if os.path.isdir(expanded):
-                inner_commands.append(f"mkdir -p '{expanded}' 2>/dev/null || true")
+                qe = _shlex.quote(expanded)
+                inner_commands.append(f"mkdir -p {qe} 2>/dev/null || true")
                 inner_commands.append(
-                    f"mount --bind -o ro '{expanded}' '{expanded}' 2>/dev/null || true"
+                    f"mount --bind -o ro {qe} {qe} 2>/dev/null || true"
                 )
 
-        inner_commands.append(f"cd '{workspace_path}'")
+        inner_commands.append(f"cd {_shlex.quote(workspace_path)}")
         inner_commands.append(shell_cmd)
 
         inner_script = " && ".join(inner_commands)
@@ -934,7 +939,11 @@ class BareBackend(SandboxBackend):
         if platform.system() == "Windows":
             cmd = ["cmd", "/c", f'cd /d "{workspace_path}" && {command}']
         else:
-            cmd = ["sh", "-c", f"cd '{workspace_path}' && {command}"]
+            # shlex-quote the workspace so apostrophes / spaces in the
+            # operator-supplied path don't escape the quoted context.
+            # Audit §3.11.
+            import shlex as _shlex
+            cmd = ["sh", "-c", f"cd {_shlex.quote(workspace_path)} && {command}"]
         logger.info("[sandbox:bare] Running without isolation (bare subprocess).")
         return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=extra_env)
 

@@ -1488,7 +1488,11 @@ class TestSandboxBackend:
         assert captured["cmd"][:2] == ["sh", "-c"], (
             f"Linux MUST still use ['sh', '-c', ...]; got {captured['cmd'][:2]!r}"
         )
-        assert captured["cmd"][2] == "cd '/tmp/work' && echo hello"
+        # shlex.quote is now applied to workspace_path (audit §3.11). For
+        # /tmp/work (no special chars) shlex.quote returns the path bare,
+        # so the resulting shell command is the same string sans the
+        # outer single quotes; functionally identical.
+        assert captured["cmd"][2] == "cd /tmp/work && echo hello"
 
     def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
         # Regression: docker info failure used to just return False with no

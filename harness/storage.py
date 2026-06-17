@@ -31,6 +31,68 @@ _CLEANSED_CONTENT_PLACEHOLDER = (
 )
 
 
+def _force_cleanse_checkpoint_messages(checkpoint: Any) -> Any:
+    """Last-resort fail-SAFE: rebuild a checkpoint with cleansed messages.
+
+    Used by aput's outer except: if the redaction wrapper itself raised
+    (unusual checkpoint shape, frozen dict, custom AgentState), this
+    walks the checkpoint defensively and replaces every messages-channel
+    entry's content with the placeholder. If even that walk fails the
+    messages channel is removed entirely — losing one checkpoint's
+    messages is preferable to persisting raw content.
+    """
+    try:
+        if not isinstance(checkpoint, dict):
+            return checkpoint
+        cv = checkpoint.get("channel_values")
+        if not isinstance(cv, dict) or "messages" not in cv:
+            return checkpoint
+        new_channels = dict(cv)
+        try:
+            new_channels["messages"] = _cleansed_messages(cv["messages"])
+        except Exception:  # noqa: BLE001
+            new_channels.pop("messages", None)
+        return {**checkpoint, "channel_values": new_channels}
+    except Exception:  # noqa: BLE001 — final fallback drops messages entirely
+        try:
+            if isinstance(checkpoint, dict):
+                cv = checkpoint.get("channel_values")
+                if isinstance(cv, dict):
+                    new_channels = {k: v for k, v in cv.items() if k != "messages"}
+                    return {**checkpoint, "channel_values": new_channels}
+        except Exception:  # noqa: BLE001
+            pass
+        return checkpoint
+
+
+def _force_cleanse_writes(writes: Any) -> Any:
+    """Last-resort fail-SAFE for aput_writes: cleanse `messages` channel writes.
+
+    Used when the redaction loop itself raises. We rebuild the writes tuple
+    list defensively and replace any `messages` value with the cleansed form.
+    On any structural surprise the offending entry is dropped.
+    """
+    out: list[Any] = []
+    try:
+        for entry in writes:
+            try:
+                channel, value = entry
+            except Exception:  # noqa: BLE001
+                continue
+            if channel == "messages":
+                try:
+                    out.append((channel, _cleansed_messages(value)))
+                except Exception:  # noqa: BLE001
+                    # Drop this write entirely rather than persist raw content.
+                    continue
+            else:
+                out.append((channel, value))
+    except Exception:  # noqa: BLE001
+        # Catastrophic — return empty writes list rather than persist raw content.
+        return []
+    return out
+
+
 def _cleansed_messages(messages: Any) -> list[Any]:
     """Return a copy of ``messages`` with every entry's ``content`` field
     replaced by a fixed placeholder.
@@ -268,6 +330,12 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         # Redact the `messages` channel inside the full state snapshot before
         # delegating to the LangGraph serializer. We mutate a shallow copy so
         # the in-memory state the running graph holds is untouched.
+        #
+        # Fail-SAFE: any exception in the redaction path MUST cleanse the
+        # messages channel before persistence. The earlier "log + fall through"
+        # approach silently persisted raw operator content (potentially
+        # carrying API keys / PII) when an unusual checkpoint shape tripped
+        # the redactor. See EDGE_CASE_AUDIT.md §1.3.
         try:
             channel_values = checkpoint.get("channel_values") if isinstance(checkpoint, dict) else None
             if isinstance(channel_values, dict) and "messages" in channel_values:
@@ -277,8 +345,12 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
                     new_channels = dict(channel_values)
                     new_channels["messages"] = redacted
                     checkpoint = {**checkpoint, "channel_values": new_channels}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[storage] aput redaction wrapper failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — fail SAFE, never leak raw content
+            logger.warning(
+                "[storage] aput redaction wrapper failed (%s); cleansing all "
+                "messages before persistence to avoid secret leakage.", exc,
+            )
+            checkpoint = _force_cleanse_checkpoint_messages(checkpoint)
         # Stamp the checkpoint schema version into the metadata blob (P2.4).
         # Use a shallow copy so we don't mutate LangGraph's internal dict.
         if isinstance(metadata, dict):
@@ -288,6 +360,9 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
     async def aput_writes(self, config, writes, task_id, task_path: str = ""):  # type: ignore[override]
         # aput_writes records the pending channel writes from a node return.
         # For the `messages` channel that value is the new messages list.
+        #
+        # Fail-SAFE: see aput() above. On any redactor exception we cleanse
+        # every `messages` write rather than letting raw content through.
         try:
             redacted_writes = []
             mutated = False
@@ -301,8 +376,13 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
                     redacted_writes.append((channel, value))
             if mutated:
                 writes = redacted_writes
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[storage] aput_writes redaction wrapper failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — fail SAFE, never leak raw content
+            logger.warning(
+                "[storage] aput_writes redaction wrapper failed (%s); "
+                "cleansing all messages writes before persistence to avoid "
+                "secret leakage.", exc,
+            )
+            writes = _force_cleanse_writes(writes)
         return await super().aput_writes(config, writes, task_id, task_path)
 
     async def _run_gc(self) -> int:
@@ -345,7 +425,24 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
             cp = _deserialize_checkpoint_blob(blob)
             ts_value = cp.get("ts", "") if isinstance(cp, dict) else ""
             if not ts_value or not isinstance(ts_value, str):
-                continue
+                # No usable ts: either truly corrupted (cannot be resumed)
+                # or the blob decoded to a dict that lacks a `ts` field.
+                # Probe with strict mode — if the decoder genuinely cannot
+                # read the blob, the row is unrecoverable and we delete it
+                # rather than let it accumulate forever (audit §5.4).
+                # A blob that decodes cleanly but lacks `ts` is left alone
+                # (might be a transient LangGraph format change).
+                try:
+                    _deserialize_checkpoint_blob(blob, strict=True)
+                    continue
+                except CheckpointCorruptedError:
+                    logger.warning(
+                        "[storage] GC: marking thread %s for deletion "
+                        "(checkpoint blob is undecodable).",
+                        thread_id,
+                    )
+                    expired_threads.append(thread_id)
+                    continue
             try:
                 dt = datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
                 if dt.tzinfo is None:

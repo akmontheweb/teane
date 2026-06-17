@@ -987,6 +987,9 @@ async def _execute_subprocess_with_timeout(
     else:
         streamer = MemoryLogStreamer()
 
+    proc: Optional[asyncio.subprocess.Process] = None
+    pgid: Optional[int] = None
+    reader_tasks: list[asyncio.Task[Any]] = []
     try:
         await streamer.open()
 
@@ -1002,7 +1005,6 @@ async def _execute_subprocess_with_timeout(
         # On Windows ``os.getpgid`` doesn't exist; leave ``pgid`` as ``None``
         # so the timeout-watchdog falls through to the cross-platform
         # ``proc.kill()`` path inside ``_kill_process_group``.
-        pgid: Optional[int] = None
         if hasattr(os, "getpgid"):
             try:
                 pgid = os.getpgid(proc.pid)
@@ -1010,7 +1012,7 @@ async def _execute_subprocess_with_timeout(
                 pgid = proc.pid
 
         async def _read_stdout() -> None:
-            assert proc.stdout is not None
+            assert proc is not None and proc.stdout is not None
             while True:
                 line = await proc.stdout.readline()
                 if not line:
@@ -1018,7 +1020,7 @@ async def _execute_subprocess_with_timeout(
                 await streamer.write_stdout(line)
 
         async def _read_stderr() -> None:
-            assert proc.stderr is not None
+            assert proc is not None and proc.stderr is not None
             while True:
                 line = await proc.stderr.readline()
                 if not line:
@@ -1026,12 +1028,13 @@ async def _execute_subprocess_with_timeout(
                 await streamer.write_stderr(line)
 
         async def _wait_with_timeout() -> int:
+            assert proc is not None
             try:
                 return await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
                 return -1  # Sentinel for timeout
 
-        reader_tasks: list[asyncio.Task[Any]] = [
+        reader_tasks = [
             asyncio.create_task(_read_stdout()),
             asyncio.create_task(_read_stderr()),
         ]
@@ -1088,6 +1091,34 @@ async def _execute_subprocess_with_timeout(
     except PermissionError:
         await streamer.close()
         return 126, f"Permission denied: {cmd[0]}", False, False
+    except asyncio.CancelledError:
+        # The caller (or a higher-level cancellation, e.g. Ctrl-C, gateway
+        # timeout, parent task cancel) is unwinding us. We MUST NOT leak
+        # the subprocess (it would run as an orphan) or the streamer temp
+        # files. Kill the process group, cancel reader tasks, close the
+        # streamer, and re-raise. Audit §1.4.
+        logger.info("[sandbox] Cancelled mid-build; tearing down subprocess + streamer.")
+        if proc is not None and proc.returncode is None:
+            try:
+                _kill_process_group(pgid, proc)
+            except Exception:  # noqa: BLE001
+                logger.exception("[sandbox] failed to kill process group on cancel.")
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        for task in reader_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        try:
+            await streamer.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     except Exception as exc:
         logger.exception("[sandbox] Unexpected subprocess error.")
         await streamer.close()

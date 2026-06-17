@@ -4235,6 +4235,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
         logger.exception("Graph execution failed with unhandled exception.")
         git_guardian.rollback()
         git_guardian.pop_stash()
+        # Commit any in-flight checkpoint write before close so that
+        # `harness resume --session-id <id>` can recover the last state
+        # the user saw on screen. Without the commit, aiosqlite drops
+        # everything that wasn't already flushed (audit §5.6).
+        try:
+            await checkpointer.conn.commit()
+        except Exception:  # noqa: BLE001 — best-effort; close still runs
+            logger.exception("[cli] checkpoint commit on error path failed.")
         await checkpointer.conn.close()
         return 1
 

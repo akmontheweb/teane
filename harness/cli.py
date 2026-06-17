@@ -1374,17 +1374,47 @@ def resolve_build_command(
 # 2. HITL Interactive Menu Loop
 # ---------------------------------------------------------------------------
 
-def _gatekeeper_auto_approves() -> bool:
+# --hitl-* flag pin: cmd_run calls _set_hitl_flags(...) once at startup
+# from args.hitl_req / hitl_arch / hitl_repair / hitl_deployment so each
+# gate callsite below can ask "should I prompt?" without re-reading args.
+# Tests / direct calls that never pin leave the map empty; the
+# _hitl_gate_enabled accessor then defaults to True so legacy unit tests
+# (which install a fake channel and expect prompts to fire) still work.
+_HITL_FLAGS: dict[str, bool] = {}
+
+
+def _set_hitl_flags(*, req: bool, arch: bool, repair: bool, deployment: bool) -> None:
+    """Pin the operator's --hitl-* choices for this run."""
+    _HITL_FLAGS.update({
+        "requirements": req,
+        "architecture": arch,
+        "repair":       repair,
+        "deployment":   deployment,
+    })
+
+
+def _hitl_gate_enabled(gate_name: str) -> bool:
+    """True when the operator wants this gate to prompt. When the pin
+    map is empty (tests / direct calls), defaults to True so legacy
+    behaviour is preserved — only `_set_hitl_flags` activates the
+    new opt-in semantics."""
+    return _HITL_FLAGS.get(gate_name, True)
+
+
+def _gatekeeper_auto_approves(gate_name: Optional[str] = None) -> bool:
     """
-    True when the gatekeeper should skip interactive approval — set in CI
-    or when the user opted in via HARNESS_AUTO_APPROVE, or when stdin is
-    not a TTY (a piped invocation has no way to answer the prompt).
+    True when the gatekeeper should skip interactive approval — when the
+    operator opted out via --hitl-<gate>=false, when CI=true,
+    HARNESS_AUTO_APPROVE=true, or when stdin isn't a TTY (a piped
+    invocation has no way to answer the prompt).
 
     Unlike the deploy preview gate (which fails closed on non-TTY because
     LLM-generated containers are about to launch), the spec/architecture
     gatekeeper has lower blast radius — a non-TTY here just means CI, so
     auto-approve is safe.
     """
+    if gate_name is not None and not _hitl_gate_enabled(gate_name):
+        return True   # operator opted out via --hitl-<gate>=false
     return (
         os.environ.get("CI", "").lower() == "true"
         or os.environ.get("HARNESS_AUTO_APPROVE", "").lower() == "true"
@@ -1444,9 +1474,14 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
     # as supported, but the gatekeeper was previously blocking on input()
     # even when those were set — making CI runs hang forever waiting on
     # stdin. Honor the env vars here as well as a non-TTY stdin.
-    if _gatekeeper_auto_approves():
+    # gate_name maps REQUIREMENTS/ARCHITECTURE/DEPLOYMENT to the
+    # lowercase keys _HITL_FLAGS uses, so --hitl-req=false /
+    # --hitl-arch=false / --hitl-deployment=false take the same
+    # auto-approve path as the env-var opt-out.
+    if _gatekeeper_auto_approves(gate_name=gate.lower()):
         logger.info(
-            "[gatekeeper] %s auto-approved (non-interactive: CI / HARNESS_AUTO_APPROVE / no TTY).",
+            "[gatekeeper] %s auto-approved (--hitl-<gate>=false / CI / "
+            "HARNESS_AUTO_APPROVE / no TTY).",
             gate_label,
         )
         return {
@@ -2047,12 +2082,22 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print()
 
         from harness.hitl import get_channel as _get_channel
-        choice = _get_channel().prompt(
-            "[HITL] Select action",
-            [k for k, _ in menu_options],
-            default="r",
-            option_labels={k: lbl for k, lbl in menu_options},
-        )
+        # --hitl-repair=false / env auto-approve: take the [r] resume
+        # default (matches the existing HARNESS_AUTO_APPROVE behaviour
+        # — proceed when possible). Skips the prompt entirely.
+        if not _hitl_gate_enabled("repair") or _gatekeeper_auto_approves():
+            choice = "r"
+            logger.info(
+                "[HITL] Repair menu auto-resumed "
+                "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
+            )
+        else:
+            choice = _get_channel().prompt(
+                "[HITL] Select action",
+                [k for k, _ in menu_options],
+                default="r",
+                option_labels={k: lbl for k, lbl in menu_options},
+            )
 
         if choice == "v":
             print()
@@ -2626,6 +2671,19 @@ async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
     while True:
         spec_content = _read_spec_file(spec_path)
         spec_size = len(spec_content) if spec_content else 0
+
+        # --hitl-req=false / env auto-approve: lock the synthesised
+        # spec and return immediately, no operator interaction. The
+        # in-graph REQUIREMENTS gatekeeper honours the same flag, so
+        # both surfaces of the requirements gate share one switch.
+        if not _hitl_gate_enabled("requirements") or _gatekeeper_auto_approves():
+            logger.info(
+                "[requirements] Review auto-approved "
+                "(--hitl-req=false / CI / HARNESS_AUTO_APPROVE / no TTY). "
+                "Locking spec at %d chars.",
+                spec_size,
+            )
+            return spec_content
 
         print()
         print("=" * 72)
@@ -3564,9 +3622,31 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     # Record git mode for every downstream code path that touches git
     # (GitGuardian init, _attempt_git_rollback, _perform_new_build_reset).
-    # Default to enabled when the attribute is missing — keeps tests and
-    # programmatic callers that construct args manually working unchanged.
-    _set_git_enabled(getattr(args, "git", "enable") == "enable")
+    # --git is now a bool (default False); the legacy str form
+    # ("enable"/"disable") is gone. getattr default `True` covers tests
+    # that construct args manually and expect git-on behaviour.
+    _set_git_enabled(bool(getattr(args, "git", True)))
+
+    # Pin the operator's --hitl-* choices for this run so the
+    # human_gatekeeper_node / interactive_review_loop / repair-menu
+    # callsites can short-circuit to auto-approve without re-reading
+    # args. See _hitl_gate_enabled in this module.
+    _set_hitl_flags(
+        req=bool(getattr(args, "hitl_req", False)),
+        arch=bool(getattr(args, "hitl_arch", False)),
+        repair=bool(getattr(args, "hitl_repair", False)),
+        deployment=bool(getattr(args, "hitl_deployment", False)),
+    )
+
+    # --yes only makes sense paired with --new-build. Reject the lone
+    # use early so the operator sees a clean parser error rather than
+    # a silent no-op far downstream.
+    if getattr(args, "assume_yes", False) and not bool(getattr(args, "new_build", False)):
+        print(
+            "error: --yes can only be used with --new-build true",
+            file=sys.stderr,
+        )
+        return 2
 
     # FIRST: deterministic config check. Reads + validates the canonical
     # config file with no side effects. Raises ConfigError (caught by
@@ -3635,18 +3715,17 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # Extract budget and sandbox settings
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)
-    allow_network = args.allow_network or config.get("allow_network", False)
+    # --allow-network is a real bool now (default true). Drop the
+    # OR-truthy coalesce against config — the CLI default IS the
+    # config-equivalent, and an explicit --allow-network false must
+    # NOT be silently overridden by a stale `allow_network: true` in
+    # config.json.
+    allow_network = bool(getattr(args, "allow_network", True))
 
-    # Apply CLI overrides for reviewer cycle caps before gateway init so the
-    # gateway picks them up. Clamping happens inside create_gateway_from_config.
-    spec_cycles = getattr(args, "spec_review_cycles", None)
-    code_cycles = getattr(args, "code_review_cycles", None)
-    if spec_cycles is not None or code_cycles is not None:
-        node_throttle_cfg = config.setdefault("node_throttle", {})
-        if spec_cycles is not None:
-            node_throttle_cfg["max_doc_review_cycles"] = spec_cycles
-        if code_cycles is not None:
-            node_throttle_cfg["max_code_review_cycles"] = code_cycles
+    # Reviewer cycle caps live in config.json now (the --spec-review-cycles
+    # / --code-review-cycles CLI flags were removed). The gateway will
+    # pick up config.node_throttle.max_doc_review_cycles /
+    # max_code_review_cycles directly.
 
     # Initialize the LLM Gateway and inject it for graph nodes
     from harness.gateway import create_gateway_from_config
@@ -3908,10 +3987,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if manifest_path:
         logger.info("[requirements] Synthesizing specification from %s", manifest_path)
         try:
-            # Resolve output_dir relative to the workspace, not the CWD where harness was invoked
-            output_dir = args.output_dir
-            if not os.path.isabs(output_dir):
-                output_dir = os.path.join(workspace_path, output_dir)
+            # Specs always land under the workspace's `docs/` directory.
+            # The standalone --output-dir flag was dropped; the only
+            # writable root is the workspace itself.
+            output_dir = os.path.join(workspace_path, "docs")
             spec_path = await synthesize_requirements(
                 manifest_path=manifest_path,
                 output_dir=output_dir,
@@ -4104,12 +4183,23 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Budget:     $%.2f", budget_usd)
     logger.info("  Network:    %s", "enabled" if allow_network else "blocked")
     logger.info("  Prompt:     %s", args.prompt[:100] + ("..." if len(args.prompt) > 100 else ""))
-    logger.info("  Discovery:  %s", "enabled (--discover)" if getattr(args, "discover", False) else "skipped (pass --discover to enable)")
+    logger.info(
+        "  Discovery:  %s",
+        "enabled (--spec-discovery true)"
+        if getattr(args, "spec_discovery", False)
+        else "skipped (pass --spec-discovery true to enable)",
+    )
     logger.info(
         "  Deployment: %s",
-        "enabled (--dev-deployment)"
-        if getattr(args, "dev_deployment", False)
-        else "skipped (pass --dev-deployment to deploy locally)",
+        "enabled (--deploy-dev true)"
+        if getattr(args, "deploy_dev", False)
+        else "skipped (pass --deploy-dev true to deploy locally)",
+    )
+    logger.info(
+        "  CD discovery: %s",
+        "enabled (--cd-discovery true)"
+        if getattr(args, "cd_discovery", False)
+        else "disabled (deployment will read deployment.json)",
     )
     if spec_override:
         logger.info("  Spec:       SPEC_REQUIREMENTS.md (+SPEC_ARCHITECTURE.md) (%d chars)", len(spec_override))
@@ -4126,13 +4216,19 @@ async def cmd_run(args: argparse.Namespace) -> int:
             session_id=session_id,
             checkpointer=checkpointer,
             thread_id=thread_id,
-            # Discovery runs only when --discover is explicitly passed.
-            # --skip-discovery (old flag) is a no-op now but kept for compat.
-            skip_discovery=not getattr(args, "discover", False),
+            # Discovery (both requirements + architecture interviews)
+            # runs only when --spec-discovery true is explicitly passed.
+            skip_discovery=not getattr(args, "spec_discovery", False),
             # When False (default), the security-scan router short-circuits to
             # END instead of routing into deployment_discovery_node. See
             # route_after_security_scan in harness/graph.py.
-            dev_deployment=getattr(args, "dev_deployment", False),
+            dev_deployment=getattr(args, "deploy_dev", False),
+            # Container-deployment discovery toggle. When False AND
+            # --deploy-dev is True, the deployment step reads
+            # deployment.json directly instead of synthesising a
+            # blueprint via deployment_discovery_node. See
+            # route_after_security_scan in harness/graph.py.
+            cd_discovery=getattr(args, "cd_discovery", False),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(),
@@ -4202,11 +4298,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # / docker-compose run happened. Flutter projects always end here
         # regardless of the flag, so the hint is only useful when deployment
         # would otherwise have run.
-        if not getattr(args, "dev_deployment", False):
+        if not getattr(args, "deploy_dev", False):
             logger.info(
                 "[cli] Code generated at %s. Deployment phase skipped. "
-                "Re-run with --dev-deployment to bring the app up locally "
-                "via docker compose.",
+                "Re-run with --deploy-dev true to bring the app up "
+                "locally via docker compose.",
                 workspace_path,
             )
     else:
@@ -4283,7 +4379,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     # Record git mode for the resumed session — same contract as cmd_run.
     # See the comment in cmd_run for why this is module-level state.
-    _set_git_enabled(getattr(args, "git", "enable") == "enable")
+    _set_git_enabled(bool(getattr(args, "git", True)))
 
     config = discover_config(workspace_path)
     persistence_cfg = config.get("persistence", {})
@@ -4314,7 +4410,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     build_command = resolve_build_command(args.build_cmd, config, workspace_path)
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)
-    allow_network = args.allow_network or config.get("allow_network", False)
+    # --allow-network is a real bool (default true). Drop the
+    # OR-truthy coalesce: an explicit --allow-network false must NOT be
+    # silently overridden by a stale `allow_network: true` in config.
+    allow_network = bool(getattr(args, "allow_network", True))
 
     # Initialize the LLM Gateway and inject it for graph nodes
     from harness.gateway import create_gateway_from_config
@@ -6700,26 +6799,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--version", "-V",
+        "--version", "-v",
         action="version",
         version=f"harness {_get_harness_version()}",
         help="Print the installed harness version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    # ----- shared parser helper -----
+    # Used by every true|false flag on the run subcommand. Accepts the
+    # common spellings ("true"/"false", "yes"/"no", "1"/"0", "on"/"off")
+    # case-insensitively. Defined at module-scope inside build_parser so
+    # every subparser that wants the same semantics can re-use it.
+    def _bool_choice(value: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        v = str(value).strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+        raise argparse.ArgumentTypeError(
+            f"Expected true|false (or yes|no, 1|0), got {value!r}"
+        )
+
     # --- `harness run` ---
     run_parser = subparsers.add_parser("run", help="Execute the agent graph on a workspace")
-    run_parser.add_argument(
-        "--output-dir", "-o",
-        default="./docs",
-        help="Directory to write SPEC_REQUIREMENTS.md (default: ./docs).",
-    )
     # --workspace and --prompt are NOT required at the argparse level so that
     # `harness run` with no flags can drop the user into the interactive
     # setup wizard (harness.wizard.run_setup_wizard). The handler enforces
     # "both or neither" — passing only one still errors out the same way.
     run_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Absolute or relative path to the target repository root.",
     )
@@ -6731,7 +6842,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--build-cmd",
         default=None,
-        help="Override the build command (e.g., 'make build'). Falls back to .harness_config.json or 'make build'.",
+        help="Override the build command (e.g., 'make build'). Falls back to config or 'make build'.",
     )
     run_parser.add_argument(
         "--session-id",
@@ -6743,60 +6854,78 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="LangGraph thread ID for checkpoint lookups. Defaults to session-id.",
     )
+    # --allow-network defaults to TRUE so the sandbox can pip/npm-install
+    # without an extra flag. Pass --allow-network false to block outbound
+    # traffic explicitly (e.g. when scanning untrusted spec input).
     run_parser.add_argument(
         "--allow-network",
-        action="store_true",
-        default=False,
-        help="Permit outbound network traffic in the sandbox.",
+        type=_bool_choice,
+        default=True,
+        metavar="true|false",
+        dest="allow_network",
+        help=(
+            "Permit outbound network traffic in the sandbox. Defaults to "
+            "true; pass --allow-network false to block."
+        ),
     )
     run_parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
         action="store_true",
         default=False,
         help="Enable debug-level logging.",
     )
-    # Discovery is OFF by default — most tasks are incremental patches on an
-    # existing codebase where the 20-minute exhaustive Q&A adds no value.
-    # Pass --discover to enable the full requirements/architecture interview.
+    # --spec-discovery true|false. When true, both the requirements
+    # discovery interview AND the architecture discovery interview run
+    # before the patcher. False (default) skips the discovery chain
+    # entirely — matches the prior --discover-not-passed behaviour.
     run_parser.add_argument(
-        "--discover",
-        action="store_true",
+        "--spec-discovery",
+        type=_bool_choice,
         default=False,
-        dest="discover",
+        metavar="true|false",
+        dest="spec_discovery",
         help=(
-            "Run the full requirements/architecture/deployment discovery "
-            "pipeline before code generation. Recommended for greenfield "
-            "projects or when working from a blank workspace. Skipped by "
-            "default for incremental patching sessions."
+            "When true, run BOTH the requirements and architecture "
+            "discovery interviews before code generation. Recommended for "
+            "greenfield projects. Defaults to false (skip both interviews)."
         ),
     )
-    # Deployment phase is OFF by default. After a clean security scan the
-    # harness stops; the operator inspects the generated code and re-runs
-    # with --dev-deployment to enter deployment discovery → DEPLOYMENT_BLUEPRINT
-    # → gatekeeper approval → `docker compose up`. Distinct from config's
-    # `deployment.enabled`, which only gates the final docker step inside
-    # deployment_node — see route_after_security_scan in harness/graph.py.
+    # --deploy-dev true|false. When true, the harness continues past the
+    # security scan into the deployment phase: either runs
+    # deployment_discovery_node (when --cd-discovery is true) or reads
+    # deployment.json (when --cd-discovery is false), then deploys to
+    # the dev environment via `docker compose up`. Default false stops
+    # right after the security scan.
     run_parser.add_argument(
-        "--dev-deployment", "--dev_deployment",
-        action="store_true",
+        "--deploy-dev",
+        type=_bool_choice,
         default=False,
-        dest="dev_deployment",
+        metavar="true|false",
+        dest="deploy_dev",
         help=(
-            "Continue past the security scan into deployment discovery, "
-            "DEPLOYMENT_BLUEPRINT.md generation, gatekeeper approval, and "
-            "`docker compose up`. Off by default — without this flag, the "
-            "harness stops after a clean security scan and prints the "
-            "workspace path."
+            "When true, continue past the security scan into deployment "
+            "(either discovery+blueprint or deployment.json-driven, "
+            "controlled by --cd-discovery), then `docker compose up`. "
+            "Defaults to false."
         ),
     )
-    # Keep --skip-discovery as a no-op alias for backward compatibility
-    # (it was the old default=False flag; now discovery is already off).
+    # --cd-discovery true|false. When true and --deploy-dev is also true,
+    # runs deployment_discovery_node to synthesise DEPLOYMENT_BLUEPRINT.md
+    # before deploying. When false, the deployment step reads
+    # deployment.json directly. When --deploy-dev is false this flag has
+    # no observable effect.
     run_parser.add_argument(
-        "--skip-discovery", "-s",
-        action="store_true",
+        "--cd-discovery",
+        type=_bool_choice,
         default=False,
-        dest="skip_discovery_compat",
-        help=argparse.SUPPRESS,  # hidden; no longer needed but kept for scripts
+        metavar="true|false",
+        dest="cd_discovery",
+        help=(
+            "Container-deployment discovery. When true (and --deploy-dev "
+            "is true), synthesise DEPLOYMENT_BLUEPRINT.md from the "
+            "codebase before deploying. When false, the deployment step "
+            "reads deployment.json directly. Defaults to false."
+        ),
     )
     # P1.7: workspace-lock override. When another live `harness run` holds
     # the workspace's session lock, the new run normally refuses to start.
@@ -6814,48 +6943,13 @@ def build_parser() -> argparse.ArgumentParser:
             "workspace will corrupt each other's patches."
         ),
     )
-    # Reviewer cycle caps. Activation is purely by which model slots are set
-    # in .harness_config.json; these flags only control how many times the
-    # cycle runs when active. Clamped to [0, 5]; 0 suspends the reviewer.
+    # --new-build true|false. When true, the harness deletes every file
+    # / dir at workspace root except product_spec/ and .git/, commits
+    # the cleanup on the base branch (master or main), and deletes
+    # every orphaned agent/patch-* branch — see _perform_new_build_reset.
+    # Pairs with --yes to skip the interactive confirmation prompt.
     run_parser.add_argument(
-        "--spec-review-cycles",
-        type=int,
-        default=None,
-        dest="spec_review_cycles",
-        help=(
-            "Override max_doc_review_cycles for this run (0-5). 0 suspends the "
-            "doc reviewer without clearing doc_reviewer_primary in config."
-        ),
-    )
-    run_parser.add_argument(
-        "--code-review-cycles",
-        type=int,
-        default=None,
-        dest="code_review_cycles",
-        help=(
-            "Override max_code_review_cycles for this run (0-5). 0 suspends "
-            "the code reviewer without clearing code_reviewer_primary in config."
-        ),
-    )
-    # --new-build / --new_build accepts true|false. Default false (treat the
-    # workspace as steady-state). When true, the harness deletes every file
-    # / dir at workspace root except product_spec/ and .git/, commits the
-    # cleanup on the base branch (master or main), and deletes every
-    # orphaned agent/patch-* branch — see _perform_new_build_reset. No
-    # confirmation prompt; the operator opted in by passing the flag.
-    def _bool_choice(value: str) -> bool:
-        if isinstance(value, bool):
-            return value
-        v = str(value).strip().lower()
-        if v in ("true", "1", "yes", "on"):
-            return True
-        if v in ("false", "0", "no", "off"):
-            return False
-        raise argparse.ArgumentTypeError(
-            f"Expected true|false (or yes|no, 1|0), got {value!r}"
-        )
-    run_parser.add_argument(
-        "--new-build", "--new_build",
+        "--new-build",
         dest="new_build",
         type=_bool_choice,
         default=False,
@@ -6866,38 +6960,86 @@ def build_parser() -> argparse.ArgumentParser:
             "`.git/`, commit the deletions on the base branch (master / "
             "main), and remove every orphaned `agent/patch-*` branch in the "
             "repo. The harness prints a preview and asks for confirmation "
-            "before deleting anything; pass --yes to skip the prompt for "
-            "automation. Runs before the patch branch for this session is "
-            "created, so the new branch forks from a fully clean baseline. "
-            "Defaults to false (steady-state — workspace contents are preserved)."
+            "before deleting anything; pass --yes alongside to skip the "
+            "prompt for automation. Defaults to false (steady-state)."
         ),
     )
+    # --yes is a confirmation MODIFIER for --new-build, not a standalone
+    # flag. cmd_run rejects --yes when --new-build is false (or omitted).
     run_parser.add_argument(
         "--yes", "-y",
         action="store_true",
         default=False,
         dest="assume_yes",
         help=(
-            "Skip the --new_build=true confirmation prompt. Intended for "
-            "automation / non-interactive runs. Has no effect when "
-            "--new_build is false."
+            "Skip the --new-build true confirmation prompt. ONLY valid "
+            "when --new-build is true; passing --yes alone is an error."
         ),
     )
-    # --git enable|disable. Default 'enable' preserves today's behavior
-    # (workspace is a git repo, GitGuardian stashes/branches/rolls back).
-    # 'disable' skips every git-aware path so users whose target repo
-    # isn't under git can still run the harness. Security scanners like
-    # gitleaks still run (they scan files, not history).
+    # --git true|false. Default FALSE — GitGuardian (stash, patch branch,
+    # rollback) is OFF unless the operator opts in. Pass --git true to
+    # restore the protection for git-tracked workspaces. Security
+    # scanners (gitleaks, etc.) still run either way.
     run_parser.add_argument(
         "--git",
-        choices=["enable", "disable"],
-        default="enable",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
         help=(
-            "Whether the workspace is a git repo. 'enable' (default) uses "
-            "GitGuardian for stash/patch-branch/rollback and requires the "
-            "workspace to be a git repo. 'disable' skips every git-aware "
-            "step — pick this when the target repo isn't under git. "
+            "Enable GitGuardian stash/patch-branch/rollback for the "
+            "workspace. True requires the workspace to be a git repo; "
+            "false skips every git-aware step. Defaults to false. "
             "Security scanners (gitleaks, etc.) still run either way."
+        ),
+    )
+    # ----- HITL gate switches (true => prompt, false => auto-approve) -----
+    # All four default to FALSE so `harness run` is fully autonomous
+    # out of the box. Set any flag to true to surface that gate to the
+    # operator. See harness/cli.py _hitl_gate_enabled and the wiring in
+    # human_gatekeeper_node / interactive_review_loop / the repair menu.
+    run_parser.add_argument(
+        "--hitl-req",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="hitl_req",
+        help=(
+            "When true, prompt the operator at the requirements gate "
+            "(both the pre-graph interactive review and the in-graph "
+            "REQUIREMENTS gatekeeper). Defaults to false (auto-approve)."
+        ),
+    )
+    run_parser.add_argument(
+        "--hitl-arch",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="hitl_arch",
+        help=(
+            "When true, prompt the operator at the ARCHITECTURE "
+            "gatekeeper. Defaults to false (auto-approve)."
+        ),
+    )
+    run_parser.add_argument(
+        "--hitl-repair",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="hitl_repair",
+        help=(
+            "When true, fire the repair-loop HITL menu when iteration "
+            "limits trip. Defaults to false (auto-resume)."
+        ),
+    )
+    run_parser.add_argument(
+        "--hitl-deployment",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="hitl_deployment",
+        help=(
+            "When true, prompt the operator at the DEPLOYMENT gatekeeper "
+            "before the dev deploy fires. Defaults to false (auto-approve)."
         ),
     )
 
@@ -6925,9 +7067,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_parser.add_argument(
         "--allow-network",
-        action="store_true",
-        default=False,
-        help="Permit outbound network traffic in the sandbox.",
+        type=_bool_choice,
+        default=True,
+        metavar="true|false",
+        dest="allow_network",
+        help=(
+            "Permit outbound network traffic in the sandbox. Defaults to "
+            "true; pass --allow-network false to block."
+        ),
     )
     resume_parser.add_argument(
         "--verbose", "-v",
@@ -6937,12 +7084,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_parser.add_argument(
         "--git",
-        choices=["enable", "disable"],
-        default="enable",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
         help=(
-            "Whether the workspace is a git repo. Should match the value "
-            "used when the session was originally started; passing a "
-            "different value than the original run may corrupt state."
+            "Enable GitGuardian for the resumed session. Should match the "
+            "value used when the session was originally started; passing a "
+            "different value than the original run may corrupt state. "
+            "Defaults to false (matches `harness run` default)."
         ),
     )
 

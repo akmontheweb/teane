@@ -337,6 +337,7 @@ class TestRouteAfterSecurityScan:
             "workspace_path": "/tmp/ws",
             "loop_counter": {"security": 0},
             "dev_deployment": False,
+            "cd_discovery": False,
         }
         state.update(overrides)
         return state
@@ -346,11 +347,30 @@ class TestRouteAfterSecurityScan:
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         assert route_after_security_scan(self._clean_state()) == "__end__"
 
-    def test_clean_scan_enters_deployment_when_dev_deployment_true(self, monkeypatch):
+    def test_clean_scan_enters_discovery_when_dev_deployment_and_cd_discovery_true(self, monkeypatch):
         import harness.impact as impact_mod
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
-        state = self._clean_state(dev_deployment=True)
+        # The classic flow: --deploy-dev true + --cd-discovery true → run
+        # the LLM-driven blueprint pipeline.
+        state = self._clean_state(dev_deployment=True, cd_discovery=True)
         assert route_after_security_scan(state) == "deployment_discovery_node"
+
+    def test_clean_scan_skips_discovery_when_cd_discovery_false(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # The new fast-path: --deploy-dev true + --cd-discovery false →
+        # straight to deployment_node, which reads deployment.json.
+        state = self._clean_state(dev_deployment=True, cd_discovery=False)
+        assert route_after_security_scan(state) == "deployment_node"
+
+    def test_clean_scan_ends_when_cd_discovery_true_but_dev_deployment_false(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # cd_discovery alone (no dev_deployment) is meaningless — the
+        # security-scan-clean → END path still wins because no deploy
+        # was requested.
+        state = self._clean_state(dev_deployment=False, cd_discovery=True)
+        assert route_after_security_scan(state) == "__end__"
 
     def test_flutter_short_circuits_regardless_of_dev_deployment(self, monkeypatch):
         import harness.impact as impact_mod

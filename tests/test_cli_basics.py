@@ -461,28 +461,43 @@ class TestBuildParser:
         except SystemExit:
             pass  # --help exits, expected
 
-    def test_dev_deployment_defaults_false(self):
+    def test_deploy_dev_defaults_false(self):
         # Default is opt-in: omit the flag and the harness will stop after
         # a clean security scan instead of rolling forward into deployment.
         parser = build_parser()
-        args = parser.parse_args(["run", "-r", "/tmp/x", "-p", "do x"])
-        assert args.dev_deployment is False
+        args = parser.parse_args(["run", "-w", "/tmp/x", "-p", "do x"])
+        assert args.deploy_dev is False
 
-    def test_dev_deployment_set_when_flag_passed(self):
+    def test_deploy_dev_true(self):
         parser = build_parser()
         args = parser.parse_args(
-            ["run", "-r", "/tmp/x", "-p", "do x", "--dev-deployment"]
+            ["run", "-w", "/tmp/x", "-p", "do x", "--deploy-dev", "true"]
         )
-        assert args.dev_deployment is True
+        assert args.deploy_dev is True
 
-    def test_dev_deployment_underscore_alias(self):
-        # The flag also accepts the underscore form so users can pass
-        # --dev_deployment without thinking about the canonical spelling.
+    def test_old_dev_deployment_flag_rejected(self):
+        # The legacy --dev-deployment / --dev_deployment forms are gone;
+        # argparse must surface the rename loudly instead of silently
+        # ignoring scripts that still pass them.
+        import pytest as _pytest
         parser = build_parser()
-        args = parser.parse_args(
-            ["run", "-r", "/tmp/x", "-p", "do x", "--dev_deployment"]
-        )
-        assert args.dev_deployment is True
+        with _pytest.raises(SystemExit):
+            parser.parse_args(
+                ["run", "-w", "/tmp/x", "-p", "do x", "--dev-deployment"],
+            )
+        with _pytest.raises(SystemExit):
+            parser.parse_args(
+                ["run", "-w", "/tmp/x", "-p", "do x", "--dev_deployment"],
+            )
+
+    def test_workspace_dash_r_short_alias_removed(self):
+        # `-r` used to be a third short alias for --workspace; the
+        # simplification keeps only -w. Asserting the rejection helps
+        # operators notice the change.
+        import pytest as _pytest
+        parser = build_parser()
+        with _pytest.raises(SystemExit):
+            parser.parse_args(["run", "-r", "/tmp/x", "-p", "do x"])
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +514,17 @@ class TestInteractiveReviewLoopAsync:
     async def test_refine_branch_awaits_helper_without_raising(self, tmp_path, monkeypatch):
         from harness import cli as cli_mod
         from harness.hitl import set_channel, reset_channel
+
+        # The new --hitl-req=false default + pytest's non-TTY stdin
+        # would auto-approve before the channel stub gets a chance.
+        # Force both off so the refine-branch path is actually exercised.
+        monkeypatch.setattr(
+            cli_mod, "_hitl_gate_enabled", lambda gate_name: True,
+        )
+        monkeypatch.setattr(
+            cli_mod, "_gatekeeper_auto_approves",
+            lambda gate_name=None: False,
+        )
 
         spec_path = tmp_path / "SPEC_REQUIREMENTS.md"
         spec_path.write_text("# Original\nA\n", encoding="utf-8")
@@ -758,3 +784,126 @@ class TestDispatchWithContinuation:
         assert content == "chunk1 chunk2 chunk3 chunk4"
         assert len(gw.dispatched_messages) == 4
         assert cost == pytest.approx(0.004)
+
+
+# ---------------------------------------------------------------------------
+# Flag-surface simplification: defaults, --yes wiring, removed flags
+# ---------------------------------------------------------------------------
+
+class TestRunParserSurface:
+    """Locks down the simplified run-parser surface so the next round of
+    refactoring can spot accidental regressions. Covers all four new
+    HITL toggles, --spec-discovery, --cd-discovery, --deploy-dev, the
+    --new-build / --yes pairing, the two default flips (--allow-network
+    true, --git false), and explicit rejection of every removed/renamed
+    flag."""
+
+    @staticmethod
+    def _args(*extra):
+        from harness.cli import build_parser
+        return build_parser().parse_args(
+            ["run", "-w", "/tmp/x", "-p", "do x", *extra],
+        )
+
+    def test_all_hitl_flags_default_false(self):
+        a = self._args()
+        assert a.hitl_req is False
+        assert a.hitl_arch is False
+        assert a.hitl_repair is False
+        assert a.hitl_deployment is False
+
+    def test_discovery_toggles_default_false(self):
+        a = self._args()
+        assert a.spec_discovery is False
+        assert a.cd_discovery is False
+        assert a.deploy_dev is False
+
+    def test_allow_network_defaults_true_git_defaults_false(self):
+        # Two default-flips relative to the legacy surface — locked
+        # down so a future refactor can't quietly reverse them.
+        a = self._args()
+        assert a.allow_network is True
+        assert a.git is False
+
+    def test_hitl_flag_accepts_true(self):
+        a = self._args("--hitl-req", "true", "--hitl-deployment", "true")
+        assert a.hitl_req is True
+        assert a.hitl_deployment is True
+        # The other two stay at their false default.
+        assert a.hitl_arch is False
+        assert a.hitl_repair is False
+
+    def test_bool_flag_accepts_yes_and_no(self):
+        # `_bool_choice` is the shared parser type; assert it
+        # tolerates the operator-friendly spellings, not just
+        # "true"/"false".
+        a = self._args(
+            "--hitl-req", "yes",
+            "--hitl-arch", "no",
+            "--cd-discovery", "1",
+            "--deploy-dev", "off",
+        )
+        assert a.hitl_req is True
+        assert a.hitl_arch is False
+        assert a.cd_discovery is True
+        assert a.deploy_dev is False
+
+    def test_bool_flag_rejects_garbage(self):
+        import pytest as _pytest
+        with _pytest.raises(SystemExit):
+            self._args("--hitl-req", "maybe")
+
+    def test_yes_alone_rejected_in_cmd_run(self, tmp_path):
+        # --yes is a confirmation modifier for --new-build, not a
+        # standalone flag. cmd_run (not the parser) returns 2 with a
+        # stderr message when --yes is passed without --new-build true.
+        import argparse
+        import io
+        import sys
+        from harness import cli as cli_mod
+        a = argparse.Namespace(
+            workspace=str(tmp_path), prompt="do x",
+            new_build=False, assume_yes=True,
+            hitl_req=False, hitl_arch=False, hitl_repair=False,
+            hitl_deployment=False, force_lock=False,
+        )
+        # Capture stderr so the test runner doesn't get a noisy line.
+        buf = io.StringIO()
+        orig = sys.stderr
+        sys.stderr = buf
+        try:
+            import asyncio
+            rc = asyncio.run(cli_mod.cmd_run(a))
+        finally:
+            sys.stderr = orig
+        assert rc == 2
+        assert "--yes can only be used with --new-build true" in buf.getvalue()
+
+    def test_removed_flags_rejected(self):
+        # Every dropped/renamed flag must fail loudly so operators
+        # relying on the legacy names see the rename immediately.
+        import pytest as _pytest
+        for arg in (
+            ["--skip-discovery"],
+            ["--discover"],
+            ["--dev-deployment"],
+            ["--dev_deployment"],
+            ["--new_build", "true"],
+            ["--output-dir", "./d"],
+            ["-o", "./d"],
+            ["--spec-review-cycles", "3"],
+            ["--code-review-cycles", "3"],
+        ):
+            with _pytest.raises(SystemExit):
+                self._args(*arg)
+
+    def test_version_short_alias_is_lowercase_v(self):
+        # --version short form moved from -V to -v as part of the
+        # consistency pass. Now `-v` on the top-level parser prints
+        # the version and exits.
+        import pytest as _pytest
+        from harness.cli import build_parser
+        with _pytest.raises(SystemExit) as exc:
+            build_parser().parse_args(["-v"])
+        # argparse exits 0 on a successful --version action.
+        assert exc.value.code == 0

@@ -153,12 +153,20 @@ class AgentState(TypedDict, total=False):
     repo_index_config: dict[str, Any]
     # Operator-controlled toggle for the entire deployment phase (discovery
     # → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose up). Set by the
-    # `--dev-deployment` CLI flag on `harness run`; default False. When False,
+    # `--deploy-dev` CLI flag on `harness run`; default False. When False,
     # route_after_security_scan short-circuits to END after a clean scan
     # instead of routing into deployment_discovery_node. Distinct from
     # `deployment_config["enabled"]`, which only gates the docker step
     # inside deployment_node once the phase is already running.
     dev_deployment: bool
+    # Container-deployment discovery toggle. Only meaningful when
+    # dev_deployment is True. When True, deployment_discovery_node runs
+    # and synthesises DEPLOYMENT_BLUEPRINT.md from the codebase. When
+    # False, the deployment step reads deployment.json directly and
+    # skips the LLM-driven discovery. Set by the `--cd-discovery` CLI
+    # flag on `harness run`; default False (matches the new operator-
+    # autonomous baseline).
+    cd_discovery: bool
     # Optional org-wide deployment policy loaded from config/deployment.json.
     # When populated, deployment_discovery_node injects it into the planning
     # LLM's prompt so already-resolved fields don't produce questions. Empty
@@ -203,6 +211,7 @@ def create_initial_state(
     archive_target_dir: str = "",
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
+    cd_discovery: bool = False,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -270,6 +279,7 @@ def create_initial_state(
         archive_target_dir=archive_target_dir,
         change_requests_config=dict(change_requests_config or {}),
         dev_deployment=bool(dev_deployment),
+        cd_discovery=bool(cd_discovery),
     )
 
 
@@ -7207,19 +7217,27 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "__end__"]:
+def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "__end__"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
     Decision matrix:
-        No security findings AND Flutter project → END (mobile builds don't
-                                                  fit the docker-compose deploy
-                                                  pipeline; user picks up the
-                                                  artifact from build/app/outputs/)
-        No security findings                    → deployment_discovery_node
-        Security findings AND sec_attempts < 2  → repair_node (fix the vulnerability)
-        Security findings AND sec_attempts >= 2 → human_intervention_node
-        budget_remaining <= 0                   → human_intervention_node
+        No security findings AND Flutter project       → END (mobile builds don't
+                                                          fit the docker-compose
+                                                          deploy pipeline)
+        No security findings AND dev_deployment=False  → END (operator opt-in gate)
+        No security findings AND dev_deployment=True
+          AND cd_discovery=True                        → deployment_discovery_node
+                                                          (synthesise blueprint
+                                                          via LLM interview)
+        No security findings AND dev_deployment=True
+          AND cd_discovery=False                       → deployment_node
+                                                          (skip discovery; the
+                                                          deploy step reads
+                                                          deployment.json)
+        Security findings AND sec_attempts < 2         → repair_node
+        Security findings AND sec_attempts >= 2        → human_intervention_node
+        budget_remaining <= 0                          → human_intervention_node
 
     Routes to repair_node so security findings travel through the same
     formatter (``_format_diagnostics_for_repair``) and escalation logic
@@ -7252,16 +7270,29 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         if workspace_path and _is_flutter_project(workspace_path):
             logger.info("[router] Flutter project detected. Skipping deploy pipeline (M-1). Routing to END.")
             return "__end__"
-        # Operator opt-in gate (--dev-deployment). When the flag is absent
-        # the harness stops after a clean security scan; the operator can
-        # inspect the generated code, then re-run with --dev-deployment to
-        # enter discovery → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose.
+        # Operator opt-in gate (--deploy-dev). When the flag is false the
+        # harness stops after a clean security scan; the operator can
+        # inspect the generated code, then re-run with --deploy-dev true
+        # to enter the deployment phase.
         if not state.get("dev_deployment", False):
             logger.info(
-                "[router] Security scan clean. --dev-deployment not set; "
+                "[router] Security scan clean. --deploy-dev not set; "
                 "skipping deployment phase. Routing to END."
             )
             return "__end__"
+        # --cd-discovery picks between the LLM-driven blueprint pipeline
+        # (deployment_discovery_node → interview → gatekeeper →
+        # deployment_node) and the deployment.json-driven fast path
+        # (straight to deployment_node, which reads
+        # deployment_defaults via state and synthesises the blueprint
+        # from workspace telemetry alone). Both end in deployment_node.
+        if not state.get("cd_discovery", False):
+            logger.info(
+                "[router] Security scan clean. --cd-discovery=false; "
+                "skipping deployment discovery interview and routing "
+                "straight to deployment_node (reads deployment.json)."
+            )
+            return "deployment_node"
         logger.info("[router] Security scan clean. Routing to deployment discovery.")
         return "deployment_discovery_node"
 
@@ -7610,6 +7641,10 @@ def build_graph() -> Any:
         route_after_security_scan,
         {
             "deployment_discovery_node": "deployment_discovery_node",
+            # Fast-path for --deploy-dev=true + --cd-discovery=false:
+            # the router routes straight to deployment_node, which
+            # picks up deployment.json via state.deployment_defaults.
+            "deployment_node": "deployment_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
             "__end__": END,
@@ -7837,6 +7872,7 @@ async def run_graph(
     archive_target_dir: str = "",
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
+    cd_discovery: bool = False,
     repo_memory_config: Optional[dict[str, Any]] = None,
     repo_index_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
@@ -7881,6 +7917,7 @@ async def run_graph(
         archive_target_dir=archive_target_dir,
         change_requests_config=change_requests_config,
         dev_deployment=dev_deployment,
+        cd_discovery=cd_discovery,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node

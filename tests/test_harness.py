@@ -2887,7 +2887,8 @@ class TestGatekeeperPromptIsLabeled:
         monkeypatch.delenv("CI", raising=False)
         monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
         monkeypatch.setattr(
-            "harness.cli._gatekeeper_auto_approves", lambda: False,
+            "harness.cli._gatekeeper_auto_approves",
+            lambda gate_name=None: False,
         )
 
         channel, captured = self._capture_channel("a")
@@ -2929,7 +2930,8 @@ class TestGatekeeperPromptIsLabeled:
         monkeypatch.delenv("CI", raising=False)
         monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
         monkeypatch.setattr(
-            "harness.cli._gatekeeper_auto_approves", lambda: False,
+            "harness.cli._gatekeeper_auto_approves",
+            lambda gate_name=None: False,
         )
 
         channel, captured = self._capture_channel("a")
@@ -2966,6 +2968,18 @@ def test_interactive_review_loop_prompt_uses_labeled_options(monkeypatch, tmp_pa
     import asyncio as _asyncio
     from harness import cli as cli_mod
     from harness.hitl import set_channel, reset_channel
+
+    # Force the interactive path — the new --hitl-req=false default
+    # would auto-approve before any prompt() call. Also force the
+    # env-var/non-TTY auto-approve back off so the channel stub gets
+    # exercised inside pytest's non-TTY harness.
+    monkeypatch.setattr(
+        "harness.cli._hitl_gate_enabled", lambda gate_name: True,
+    )
+    monkeypatch.setattr(
+        "harness.cli._gatekeeper_auto_approves",
+        lambda gate_name=None: False,
+    )
 
     spec_path = tmp_path / "SPEC_REQUIREMENTS.md"
     spec_path.write_text("# Spec\n", encoding="utf-8")
@@ -3007,6 +3021,141 @@ def test_interactive_review_loop_prompt_uses_labeled_options(monkeypatch, tmp_pa
     assert "Approve" in labels["a"]
     assert "Refine" in labels["b"]
     assert "Manual" in labels["c"] or "IDE" in labels["c"]
+
+
+# ===========================================================================
+# --hitl-* flag wiring — each toggle short-circuits its surface
+# ===========================================================================
+
+class TestHitlFlagsWiring:
+    """The four --hitl-* CLI toggles each gate one HITL surface. When
+    a flag is false the corresponding ``channel.prompt`` call MUST NOT
+    fire — the surface auto-approves and the run continues. These
+    tests pin _HITL_FLAGS and assert the channel stub's prompt() is
+    never invoked.
+    """
+
+    @staticmethod
+    def _exploding_channel():
+        """A HITL channel stub whose every prompt() call fails the
+        test loudly. Used to assert auto-approve paths never reach
+        the channel layer."""
+        class _Channel:
+            def prompt(self, *a, **kw):
+                raise AssertionError(
+                    "channel.prompt() called — auto-approve path missed"
+                )
+
+            def notes(self, *a, **kw):
+                return ""
+
+            def confirm(self, *a, **kw):
+                return False
+
+            def wait_for_manual_edit(self, *a, **kw):
+                return None
+        return _Channel()
+
+    @staticmethod
+    def _seed_spec(tmpdir: str, filename: str) -> str:
+        docs = os.path.join(tmpdir, "docs")
+        os.makedirs(docs, exist_ok=True)
+        path = os.path.join(docs, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# spec\n")
+        return path
+
+    def test_requirements_gate_auto_approves_when_hitl_req_false(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node, _set_hitl_flags
+        from harness.hitl import set_channel, reset_channel
+
+        # All four off: the requirements gate must short-circuit
+        # without touching the channel.
+        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        set_channel(self._exploding_channel())
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir, "SPEC_REQUIREMENTS.md")
+                result = human_gatekeeper_node({
+                    "current_gate": "REQUIREMENTS",
+                    "workspace_path": tmpdir,
+                    "spec_requirements_path": spec,
+                    "messages": [],
+                    "loop_counter": {},
+                })
+        finally:
+            reset_channel()
+            # Reset module pin so later tests don't inherit our False set.
+            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+        assert result["node_state"]["gatekeeper_action"] == "approve"
+
+    def test_architecture_gate_auto_approves_when_hitl_arch_false(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node, _set_hitl_flags
+        from harness.hitl import set_channel, reset_channel
+
+        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        set_channel(self._exploding_channel())
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir, "SPEC_ARCHITECTURE.md")
+                result = human_gatekeeper_node({
+                    "current_gate": "ARCHITECTURE",
+                    "workspace_path": tmpdir,
+                    "spec_architecture_path": spec,
+                    "messages": [],
+                    "loop_counter": {},
+                })
+        finally:
+            reset_channel()
+            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+        assert result["node_state"]["gatekeeper_action"] == "approve"
+
+    def test_deployment_gate_auto_approves_when_hitl_deployment_false(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node, _set_hitl_flags
+        from harness.hitl import set_channel, reset_channel
+
+        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        set_channel(self._exploding_channel())
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir, "DEPLOYMENT_BLUEPRINT.md")
+                result = human_gatekeeper_node({
+                    "current_gate": "DEPLOYMENT",
+                    "workspace_path": tmpdir,
+                    "deployment_blueprint_path": spec,
+                    "messages": [],
+                    "loop_counter": {},
+                })
+        finally:
+            reset_channel()
+            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+        assert result["node_state"]["gatekeeper_action"] == "approve"
+
+    def test_interactive_review_auto_approves_when_hitl_req_false(self, monkeypatch, tmp_path):
+        # interactive_review_loop is the pre-graph requirements gate;
+        # --hitl-req=false MUST short-circuit it the same way it
+        # short-circuits the in-graph REQUIREMENTS gatekeeper.
+        import asyncio
+        from harness import cli as cli_mod
+        from harness.cli import _set_hitl_flags
+        from harness.hitl import set_channel, reset_channel
+
+        spec_path = tmp_path / "SPEC_REQUIREMENTS.md"
+        spec_path.write_text("# Spec body\n", encoding="utf-8")
+
+        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        set_channel(self._exploding_channel())
+        try:
+            result = asyncio.run(
+                cli_mod.interactive_review_loop(str(spec_path), gateway=None),
+            )
+        finally:
+            reset_channel()
+            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+        # The auto-approve path returns the on-disk spec content
+        # unchanged — locking the synthesised spec without operator
+        # interaction.
+        assert result == "# Spec body\n"
 
 
 # ===========================================================================
@@ -5297,16 +5446,28 @@ class TestGitGuardianLifecycle:
 class TestSecurityScanRouting:
 
     def test_route_after_security_scan_clean(self):
-        # A clean security scan now routes into deployment only when the
-        # operator opted in via --dev-deployment (state["dev_deployment"]
-        # = True). Without the flag the router ends the run and the
-        # workspace is handed back with the generated code in place.
+        # A clean security scan routes into deployment_discovery_node when
+        # the operator opted into BOTH --deploy-dev AND --cd-discovery.
+        # When --cd-discovery is false the router skips discovery and
+        # goes straight to deployment_node (separate test below).
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir, dev_deployment=True)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
+            state["cd_discovery"] = True
             assert route_after_security_scan(state) == "deployment_discovery_node"
+
+    def test_route_after_security_scan_clean_no_cd_discovery(self):
+        # --deploy-dev true + --cd-discovery false → straight to
+        # deployment_node, which reads deployment.json.
+        from harness.graph import route_after_security_scan
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir, dev_deployment=True)
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = []
+            state["cd_discovery"] = False
+            assert route_after_security_scan(state) == "deployment_node"
 
     def test_route_after_security_scan_clean_without_dev_deployment(self):
         # New default: clean scan + no --dev-deployment → END. The whole
@@ -5888,29 +6049,33 @@ class TestCLI:
         parser = build_parser()
         assert parser.prog == "harness"
 
-    def test_discovery_off_by_default(self):
-        # Regression: the exhaustive 8-sector discovery pipeline used to run
-        # on every invocation. It now requires explicit --discover.
+    def test_spec_discovery_off_by_default(self):
+        # --spec-discovery (renamed from --discover) defaults to false, so
+        # the requirements + architecture discovery interviews are skipped
+        # unless the operator opts in explicitly.
         from harness.cli import build_parser
         parser = build_parser()
         args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t"])
-        assert getattr(args, "discover", False) is False
+        assert args.spec_discovery is False
 
-    def test_discover_flag_enables_discovery(self):
+    def test_spec_discovery_true_enables_discovery(self):
         from harness.cli import build_parser
         parser = build_parser()
-        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t", "--discover"])
-        assert args.discover is True
+        args = parser.parse_args(
+            ["run", "--workspace", ".", "--prompt", "t", "--spec-discovery", "true"],
+        )
+        assert args.spec_discovery is True
 
-    def test_skip_discovery_flag_still_parses_for_backcompat(self):
-        # Old --skip-discovery flag is preserved as a no-op so existing scripts
-        # don't break. The new default already skips discovery anyway.
+    def test_skip_discovery_flag_removed(self):
+        # The deprecated --skip-discovery / -s flag is gone; argparse must
+        # reject it so operators relying on it notice the rename.
+        import pytest as _pytest
         from harness.cli import build_parser
         parser = build_parser()
-        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t", "--skip-discovery"])
-        # The flag parses without error; it doesn't change the discovery decision
-        # (discover stays False; that's already the default).
-        assert getattr(args, "discover", False) is False
+        with _pytest.raises(SystemExit):
+            parser.parse_args(
+                ["run", "--workspace", ".", "--prompt", "t", "--skip-discovery"],
+            )
 
     def test_validate_config_strict_raises_on_typo(self):
         # The harness consolidated to a single canonical config file

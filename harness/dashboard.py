@@ -4202,6 +4202,10 @@ def spawn_harness_run(
         session_id=session_id, pid=proc.pid, argv=argv,
         log_path=log_path, workspace_path=workspace, prompt=prompt,
         popen=proc, pgid=spawn_pgid,
+        # We start a watcher thread below — flag the entry so
+        # _prune_dead_locked doesn't race to mark exit_code=-1
+        # before the watcher records the real exit (audit §2.15).
+        watcher_pending=True,
     )
     get_process_registry().register(wp)
 
@@ -4314,6 +4318,8 @@ def spawn_harness_resume(
         workspace_path=workspace or "",
         prompt=prompt or "",
         popen=proc, pgid=spawn_pgid,
+        # Watcher thread set up below — see audit §2.15.
+        watcher_pending=True,
     )
     get_process_registry().register(wp)
 
@@ -4382,13 +4388,24 @@ def tail_session_events(
     max_lines: int = 5000,
     poll_interval: float = 0.5,
     follow: bool = True,
+    idle_polls_before_giveup: int = 600,
 ):
     """Generator that yields decoded JSON event lines as they appear in
     the log file. Stops when ``follow`` is False and we hit EOF, or
-    when the caller breaks out."""
+    when the caller breaks out.
+
+    Idle-watchdog (audit §1.7): if ``idle_polls_before_giveup`` consecutive
+    poll cycles pass with NO new bytes AND no matching live entry in the
+    process registry, the generator returns. Without this watchdog, an
+    SSE thread can outlive the registry's TTL-prune of the terminated
+    entry and spin forever — one leaked ``ThreadingMixIn`` worker per
+    stale browser tab.
+    """
     pos = 0
     yielded = 0
+    idle_polls = 0
     while True:
+        produced_this_pass = False
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(pos)
@@ -4399,6 +4416,7 @@ def tail_session_events(
                         evt = _safe_json(line)
                         if evt is not None:
                             yield evt
+                            produced_this_pass = True
                             yielded += 1
                             if yielded >= max_lines:
                                 return
@@ -4410,23 +4428,38 @@ def tail_session_events(
         time.sleep(poll_interval)
         # Heuristic shutdown: if the process for this log is gone +
         # terminated, stop following after one more pass.
+        registry_match: Optional[Any] = None
         try:
             reg = get_process_registry()
             for proc in reg.list_all():
-                if proc.log_path == log_path and not proc.is_running:
-                    # Drain remaining and exit.
-                    try:
-                        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                            f.seek(pos)
-                            for tail_line in f:
-                                evt = _safe_json(tail_line)
-                                if evt is not None:
-                                    yield evt
-                    except OSError:
-                        pass
-                    return
+                if proc.log_path == log_path:
+                    registry_match = proc
+                    if not proc.is_running:
+                        # Drain remaining and exit.
+                        try:
+                            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                                f.seek(pos)
+                                for tail_line in f:
+                                    evt = _safe_json(tail_line)
+                                    if evt is not None:
+                                        yield evt
+                        except OSError:
+                            pass
+                        return
+                    break
         except Exception:  # noqa: BLE001
             pass
+        # Idle-watchdog accounting. Reset whenever we produced a line
+        # OR a matching registry entry exists (run hasn't been pruned).
+        if produced_this_pass or registry_match is not None:
+            idle_polls = 0
+        else:
+            idle_polls += 1
+            if idle_polls >= idle_polls_before_giveup:
+                # No new bytes for ~ idle_polls × poll_interval AND the
+                # registry no longer knows about this run — assume the
+                # operator's tab is stale and stop following.
+                return
 
 
 def tail_session_stdout(

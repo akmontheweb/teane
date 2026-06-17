@@ -556,7 +556,17 @@ class DockerBackend(SandboxBackend):
             # outer timeout, or `restore_workspace_ownership=False`), sweep
             # the bind-mount on the host. Best-effort: silently exits if the
             # host user lacks CAP_CHOWN.
-            self._host_side_ownership_sweep(workspace_path)
+            #
+            # Wrapped in run_in_executor so the synchronous ``find -exec
+            # chown`` subprocess (timeout=30s) doesn't stall the asyncio
+            # event loop on large workspaces. Audit §2.10.
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, self._host_side_ownership_sweep, workspace_path,
+                )
+            except Exception as sweep_exc:  # noqa: BLE001
+                logger.debug("[sandbox] host-side sweep failed: %s", sweep_exc)
 
     def _ensure_cache_volumes(self, cache_mounts: list[str]) -> None:
         """Idempotently `docker volume create` each cache mount's named volume.
@@ -1048,14 +1058,16 @@ async def _execute_subprocess_with_timeout(
         exit_code = await wait_task
 
         if exit_code == -1:
-            # Timeout — kill the entire process group
+            # Timeout — kill the entire process group (non-blocking; uses
+            # await asyncio.sleep so other coroutines keep making progress
+            # during the 3 s SIGTERM→SIGKILL grace. Audit §1.12.)
             timed_out = True
             logger.warning(
                 "[sandbox] Build timed out after %ds. Killing process group %s.",
                 timeout_seconds,
                 pgid,
             )
-            _kill_process_group(pgid, proc)
+            await _kill_process_group_async(pgid, proc)
             # Do NOT call proc.communicate() here — the reader tasks below
             # are still draining stdout/stderr, and communicate() racing
             # them on the same pipes can deadlock or duplicate output. Just
@@ -1100,7 +1112,7 @@ async def _execute_subprocess_with_timeout(
         logger.info("[sandbox] Cancelled mid-build; tearing down subprocess + streamer.")
         if proc is not None and proc.returncode is None:
             try:
-                _kill_process_group(pgid, proc)
+                await _kill_process_group_async(pgid, proc)
             except Exception:  # noqa: BLE001
                 logger.exception("[sandbox] failed to kill process group on cancel.")
             try:
@@ -1200,9 +1212,19 @@ class DiskLogStreamer:
         self._total_bytes: int = 0
         self._overflow_count: int = 0
 
+    # Aging janitor: keep retained logs (from successful builds whose
+    # close(keep_on_success=True) intentionally left the temp files
+    # behind) for this many days before sweeping at next open(). Audit
+    # §2.9. Set to 0 to keep forever (matches the historical behaviour).
+    _LOG_RETENTION_DAYS: int = 7
+
     async def open(self) -> None:
         """Create temp files for log output."""
         os.makedirs(self.temp_dir, exist_ok=True)
+        # Boot-time janitor: remove harness_*.std{out,err}.log files older
+        # than _LOG_RETENTION_DAYS so kept-on-success files and crash-
+        # leaked tmps don't accumulate forever. Audit §2.9.
+        self._janitor_sweep_old_logs()
 
         import tempfile as tfile
         self._stdout_file = tfile.NamedTemporaryFile(
@@ -1223,6 +1245,35 @@ class DiskLogStreamer:
         self._stderr_path = self._stderr_file.name
 
         logger.debug("[logstream:disk] Opened temp logs: stdout=%s stderr=%s", self._stdout_path, self._stderr_path)
+
+    def _janitor_sweep_old_logs(self) -> None:
+        """Remove harness_* log files older than _LOG_RETENTION_DAYS.
+
+        Best-effort: any IO error is swallowed (the streamer's hot path
+        must not stall on a janitor failure). Audit §2.9.
+        """
+        retention = self.__class__._LOG_RETENTION_DAYS
+        if retention <= 0:
+            return
+        cutoff = time.time() - (retention * 86400.0)
+        try:
+            for name in os.listdir(self.temp_dir):
+                if not name.startswith("harness_"):
+                    continue
+                if not (name.endswith(".stdout.log") or name.endswith(".stderr.log")):
+                    continue
+                full = os.path.join(self.temp_dir, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    try:
+                        os.unlink(full)
+                    except OSError:
+                        pass
+        except OSError:
+            return
 
     async def write_stdout(self, data: bytes) -> None:
         if self._stdout_file is None:
@@ -1397,9 +1448,13 @@ class DiskLogStreamer:
 
 
 def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -> None:
-    """
-    Kill an entire process group. Sends SIGTERM first, waits 3s,
-    then escalates to SIGKILL if the group still exists.
+    """Synchronous SIGTERM-then-SIGKILL of an entire process group.
+
+    NOTE: This blocks the event loop with ``time.sleep(3.0)`` between the
+    TERM and the KILL. Prefer :func:`_kill_process_group_async` from async
+    callers — see audit §1.12 — but keep this sync entry-point for the
+    handful of callers that already had to be synchronous (atexit
+    shutdown hooks, etc.).
 
     On Windows ``os.killpg`` does not exist; the existing
     ``except (ProcessLookupError, OSError)`` clauses would NOT catch the
@@ -1410,7 +1465,6 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
     is unavailable.
     """
     if pgid is not None and hasattr(os, "killpg"):
-        # POSIX path — IDENTICAL to the pre-Windows behaviour.
         try:
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
@@ -1427,6 +1481,87 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
         proc.kill()
     except ProcessLookupError:
         pass
+
+
+async def _kill_process_group_async(
+    pgid: Optional[int], proc: asyncio.subprocess.Process,
+) -> None:
+    """Async SIGTERM→SIGKILL of a process group without blocking the event loop.
+
+    Replaces the time.sleep(3.0) in _kill_process_group with await
+    asyncio.sleep(3.0), so callers inside the asyncio runtime no longer
+    freeze every other coroutine (gateway dispatch, MCP polling, SSE
+    callbacks, schedule daemon ticks) for the grace period. Audit §1.12.
+    """
+    if pgid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+        await asyncio.sleep(3.0)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def run_subprocess_kill_on_timeout(
+    argv: list[str],
+    *,
+    timeout: float,
+    cwd: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+    capture_stderr_separately: bool = True,
+) -> tuple[int, bytes, bytes, bool]:
+    """Run a subprocess that is reliably killed on ``asyncio.TimeoutError``.
+
+    The bare ``asyncio.wait_for(proc.communicate(), timeout=…)`` pattern
+    used across the codebase cancels the communicate task but DOES NOT
+    kill the child. The child + its pipe FDs + (for docker/find/etc.)
+    its background work all keep running. Audit §2.3 / §2.5 / §2.6 / §2.13.
+
+    Returns ``(exit_code, stdout, stderr, timed_out)``. On timeout the
+    process group is SIGTERMed then SIGKILLed, ``exit_code`` is -9, and
+    ``timed_out`` is True.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=(asyncio.subprocess.PIPE if capture_stderr_separately
+                else asyncio.subprocess.STDOUT),
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    pgid: Optional[int] = None
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            pgid = proc.pid
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout or b"", stderr or b"", False
+    except asyncio.TimeoutError:
+        await _kill_process_group_async(pgid, proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        return -9, b"", b"timed out", True
+    except asyncio.CancelledError:
+        # Caller is unwinding — don't leak the child.
+        await _kill_process_group_async(pgid, proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------

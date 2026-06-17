@@ -285,11 +285,17 @@ class StdioMcpClient:
         if self._proc is None:
             return
         proc = self._proc
-        # Cancel pending requests so the caller doesn't hang.
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(McpError({"message": "client shutting down"}))
+        # Snapshot-and-clear so the reader loop can't re-look up an entry
+        # we're about to set_exception on (and race with set_result),
+        # which would raise InvalidStateError. Audit §1.13.
+        pending_snapshot = dict(self._pending)
         self._pending.clear()
+        for fut in pending_snapshot.values():
+            if not fut.done():
+                try:
+                    fut.set_exception(McpError({"message": "client shutting down"}))
+                except asyncio.InvalidStateError:
+                    pass
         # Stop the reader first so we don't fight stdout EOF on terminate.
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -337,7 +343,13 @@ class StdioMcpClient:
                 "message": f"timeout waiting for {method} response after {timeout}s",
             }) from exc
         finally:
+            # Drop our registration and, if the caller was cancelled
+            # while the request was still in flight, cancel the future
+            # too so it can be garbage-collected immediately rather than
+            # waiting for shutdown to drain it. Audit §1.13.
             self._pending.pop(req_id, None)
+            if not future.done():
+                future.cancel()
 
     async def _notify(self, method: str, params: Optional[dict[str, Any]] = None) -> None:
         msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
@@ -424,6 +436,49 @@ class McpClientPool:
     def __init__(self, config: McpPoolConfig):
         self.config = config
         self.clients: dict[str, StdioMcpClient] = {}
+        # Library-level safety net: ensure spawned MCP subprocesses are
+        # SIGTERMed at interpreter exit even when the harness is embedded
+        # (tests, dashboard subcommands constructing pools directly) and
+        # cli.py's atexit hook never registered. Audit §2.8.
+        try:
+            import atexit
+            atexit.register(self._atexit_kill)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _atexit_kill(self) -> None:
+        """Synchronous best-effort SIGTERM at interpreter shutdown.
+
+        Cannot rely on asyncio at this point — the event loop may already
+        be gone. Walk the live clients and signal their process groups
+        directly. Audit §2.8.
+        """
+        for client in list(self.clients.values()):
+            proc = getattr(client, "_proc", None)
+            if proc is None:
+                continue
+            if getattr(proc, "returncode", 0) is not None:
+                continue
+            try:
+                pid = proc.pid
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except OSError:
+                            pass
+                else:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
 
     @property
     def started(self) -> bool:

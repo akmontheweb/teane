@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from contextlib import contextmanager
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -259,15 +260,23 @@ def append_session_note(
         section += f"- Notes: {_redact_home(extra_notes.strip())}\n"
 
     try:
-        prior = ""
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                prior = f.read()
-        if not prior:
-            prior = _HEADER_TEMPLATE
-        combined = prior + section
-        combined = _trim_to_max_bytes(combined, cfg.max_bytes)
-        _atomic_write_text(path, combined)
+        # Serialise concurrent appenders via an fcntl lock on a sibling
+        # lock file. Without this, two ``harness run`` processes pointing
+        # at the same repo memory file could both read the same ``prior``
+        # blob, both write back a tmp + rename, and the second writer
+        # would overwrite the first writer's new section (audit §1.14).
+        # Best-effort: on platforms without fcntl we fall through and
+        # accept the older behaviour.
+        with _memory_file_lock(path):
+            prior = ""
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    prior = f.read()
+            if not prior:
+                prior = _HEADER_TEMPLATE
+            combined = prior + section
+            combined = _trim_to_max_bytes(combined, cfg.max_bytes)
+            _atomic_write_text(path, combined)
     except OSError as exc:
         logger.warning("[repo_memory] write failed for %s: %s", path, exc)
         return None
@@ -303,21 +312,72 @@ def _trim_to_max_bytes(text: str, max_bytes: int) -> str:
 
 
 def _atomic_write_text(path: str, content: str) -> None:
-    """Write text to ``path`` via ``<path>.tmp`` + ``os.replace`` so
-    readers never see a half-written file.
+    """Write text to ``path`` via ``<path>.<pid>.<uuid>.tmp`` + ``os.replace``
+    so readers never see a half-written file AND so two concurrent writers
+    don't share the same staging tmp filename (audit §1.14).
 
     The destination file is also chmod'd to 0600 (owner read/write only).
     Memory files record workspace paths and session metadata; tightening
     permissions keeps them inaccessible to other local accounts even
     though ``~/.harness`` lives under the operator's own home.
     """
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
+    import uuid as _uuid
+    tmp = f"{path}.{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp"
     try:
-        os.chmod(tmp, 0o600)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            # Non-POSIX filesystems may reject chmod; fail open rather than
+            # block the memory write.
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        # On any error, ensure the tmp doesn't linger in the user's
+        # ~/.harness/memory dir as an orphan.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _memory_file_lock(path: str):
+    """Hold an exclusive fcntl lock on ``<path>.lock`` for the duration of
+    a read-modify-write on ``path``. The lock file is created next to the
+    memory file. Audit §1.14.
+
+    On platforms without fcntl (Windows native), yields without locking —
+    the harness is best-effort here; concurrent appenders on Windows can
+    still race but the harness is primarily run on POSIX.
+    """
+    lock_path = path + ".lock"
+    try:
+        import fcntl  # type: ignore[import-not-found]
+    except ImportError:
+        yield
+        return
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
     except OSError:
-        # Non-POSIX filesystems may reject chmod; fail open rather than
-        # block the memory write.
-        pass
-    os.replace(tmp, path)
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            # Fall through unlocked rather than block the memory write.
+            yield
+            return
+        yield
+    finally:
+        try:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+        except Exception:  # noqa: BLE001
+            pass

@@ -18,7 +18,6 @@ Integration:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shutil
@@ -535,17 +534,15 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
 
                 logger.info("[lintgate_node] Formatting %s with %s", filepath, spec.command)
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        spec.command,
-                        *spec.args,
-                        full_path,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                    # Use the shared kill-on-timeout helper so a wedged
+                    # formatter doesn't leak a Python interpreter per file
+                    # per repair iteration (audit §2.6).
+                    from harness.sandbox import run_subprocess_kill_on_timeout
+                    rc, stdout, stderr, _timed_out = await run_subprocess_kill_on_timeout(
+                        [spec.command, *spec.args, full_path],
+                        timeout=30.0,
                     )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=30.0
-                    )
-                    if proc.returncode == 0:
+                    if rc == 0:
                         files_formatted.append(filepath)
                         logger.debug("[lintgate_node] Formatted %s successfully.", filepath)
                     else:
@@ -553,9 +550,6 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                         if err_msg:
                             format_errors.append(f"{filepath}: {err_msg[:200]}")
                             logger.warning("[lintgate_node] Format failed for %s: %s", filepath, err_msg[:200])
-                except asyncio.TimeoutError:
-                    format_errors.append(f"{filepath}: Formatter timed out")
-                    logger.warning("[lintgate_node] Formatter timed out for %s", filepath)
                 except Exception as exc:
                     format_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Format error for %s: %s", filepath, exc)
@@ -594,17 +588,13 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
 
                 logger.info("[lintgate_node] Linting %s with %s", filepath, spec.linter_command)
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        spec.linter_command,
-                        *spec.linter_args,
-                        full_path,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                    # Shared kill-on-timeout helper, audit §2.6.
+                    from harness.sandbox import run_subprocess_kill_on_timeout
+                    rc, stdout, stderr, _timed_out = await run_subprocess_kill_on_timeout(
+                        [spec.linter_command, *spec.linter_args, full_path],
+                        timeout=60.0,
                     )
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=60.0
-                    )
-                    if proc.returncode == 0:
+                    if rc == 0:
                         files_linted.append(filepath)
                         logger.debug("[lintgate_node] Linted %s successfully.", filepath)
                     else:
@@ -612,9 +602,6 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                         if err_msg:
                             lint_errors.append(f"{filepath}: {err_msg[:500]}")
                             logger.warning("[lintgate_node] Lint failed for %s: %s", filepath, err_msg[:500])
-                except asyncio.TimeoutError:
-                    lint_errors.append(f"{filepath}: Linter timed out")
-                    logger.warning("[lintgate_node] Linter timed out for %s", filepath)
                 except Exception as exc:
                     lint_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Lint error for %s: %s", filepath, exc)
@@ -630,23 +617,19 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                 continue
             logger.info("[lintgate_node] Lint-only check on pre-existing %s (no format).", filepath)
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    spec.linter_command,
-                    *spec.linter_args,
-                    full_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                # Shared kill-on-timeout helper, audit §2.6.
+                from harness.sandbox import run_subprocess_kill_on_timeout
+                rc, stdout, stderr, _timed_out = await run_subprocess_kill_on_timeout(
+                    [spec.linter_command, *spec.linter_args, full_path],
+                    timeout=60.0,
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-                if proc.returncode == 0:
+                if rc == 0:
                     files_linted.append(filepath)
                 else:
                     err_msg = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
                     if err_msg:
                         lint_errors.append(f"{filepath}: {err_msg[:500]}")
                         logger.warning("[lintgate_node] Lint-only failed for %s: %s", filepath, err_msg[:500])
-            except asyncio.TimeoutError:
-                lint_errors.append(f"{filepath}: Linter timed out")
             except Exception as exc:
                 lint_errors.append(f"{filepath}: {exc}")
 

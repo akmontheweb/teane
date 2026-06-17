@@ -4174,6 +4174,20 @@ async def cmd_run(args: argparse.Namespace) -> int:
         except Exception as exc:
             logger.error("[requirements] Requirement refinement failed: %s", exc)
             return 1
+        finally:
+            # Delete the temp manifest the moment the refinement block is
+            # done with it — the consolidated spec lands under docs/ in the
+            # workspace, so the /tmp copy serves no further purpose. Without
+            # this cleanup every greenfield run leaked one /tmp/harness_spec_*
+            # carrying the full product spec (audit §2.7 / §7.1).
+            if manifest_path:
+                try:
+                    os.unlink(manifest_path)
+                except OSError as cleanup_exc:
+                    logger.debug(
+                        "[requirements] manifest temp cleanup failed (%s): %s",
+                        manifest_path, cleanup_exc,
+                    )
     # If we got here, manifest_path is always set — _load_consolidated_product_spec
     # either succeeded or already returned 1 above. The old "fall through with
     # no spec" branch is gone with the product_spec/ folder mandate.

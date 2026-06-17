@@ -165,55 +165,82 @@ async def run_parallel_agents(
                     ),
                 )
             t0 = time.monotonic()
+            # ``reconciled`` flips True once we have either dispatched
+            # the spend (delta-refund inside the success path) or
+            # refunded the reservation due to an error. The finally
+            # block uses it as a fail-safe so cancellation, a missing
+            # ``response.usage``, or any unexpected exception cannot
+            # leak the reservation (audit §1.8).
+            reconciled = False
             try:
-                # Pass a *per-call* cap that's the larger of the
-                # reservation and the shared budget so the gateway's
-                # internal pre-flight guard doesn't reject the call
-                # against a tiny per-task reservation. The shared
-                # accounting happens at our layer using the response's
-                # usage.cost_usd.
-                async with budget_lock:
-                    per_call_cap = max(reservation, state["budget"] + reservation)
-                response, _ignored_dispatch_budget = await asyncio.wait_for(
-                    gateway.dispatch(
-                        messages=_messages_for(spec),
-                        role=spec.role,
-                        budget_remaining_usd=per_call_cap,
-                        model_override=spec.model_override,
-                    ),
-                    timeout=spec.timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                await _refund(reservation)
+                try:
+                    # Pass a *per-call* cap that's the larger of the
+                    # reservation and the shared budget so the gateway's
+                    # internal pre-flight guard doesn't reject the call
+                    # against a tiny per-task reservation. The shared
+                    # accounting happens at our layer using the response's
+                    # usage.cost_usd.
+                    async with budget_lock:
+                        per_call_cap = max(reservation, state["budget"] + reservation)
+                    response, _ignored_dispatch_budget = await asyncio.wait_for(
+                        gateway.dispatch(
+                            messages=_messages_for(spec),
+                            role=spec.role,
+                            budget_remaining_usd=per_call_cap,
+                            model_override=spec.model_override,
+                        ),
+                        timeout=spec.timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    await _refund(reservation)
+                    reconciled = True
+                    return AgentResult(
+                        name=spec.name, success=False,
+                        error=f"timeout after {spec.timeout_seconds}s",
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await _refund(reservation)
+                    reconciled = True
+                    logger.exception("[fanout] agent %s crashed", spec.name)
+                    return AgentResult(
+                        name=spec.name, success=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    )
+                # Defensive cost extraction — a non-numeric or missing
+                # cost_usd previously raised here, jumped to the outer
+                # CancelledError window, and leaked the reservation.
+                try:
+                    actual_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    actual_cost = 0.0
+                # Reconcile the reservation against the real spend. When the
+                # agent came in under the reservation, refund the difference;
+                # when it overshot, deduct the extra (may push the shared
+                # budget negative — caller's responsibility to clamp).
+                delta = reservation - actual_cost
+                if delta != 0:
+                    await _refund(delta)
+                reconciled = True
+                elapsed = int((time.monotonic() - t0) * 1000)
                 return AgentResult(
-                    name=spec.name, success=False,
-                    error=f"timeout after {spec.timeout_seconds}s",
-                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    name=spec.name, success=True,
+                    content=response.content or "",
+                    cost_usd=actual_cost,
+                    elapsed_ms=elapsed,
+                    metadata=dict(spec.metadata),
                 )
-            except Exception as exc:  # noqa: BLE001
-                await _refund(reservation)
-                logger.exception("[fanout] agent %s crashed", spec.name)
-                return AgentResult(
-                    name=spec.name, success=False,
-                    error=f"{type(exc).__name__}: {exc}",
-                    elapsed_ms=int((time.monotonic() - t0) * 1000),
-                )
-            actual_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
-            # Reconcile the reservation against the real spend. When the
-            # agent came in under the reservation, refund the difference;
-            # when it overshot, deduct the extra (may push the shared
-            # budget negative — caller's responsibility to clamp).
-            delta = reservation - actual_cost
-            if delta != 0:
-                await _refund(delta)
-            elapsed = int((time.monotonic() - t0) * 1000)
-            return AgentResult(
-                name=spec.name, success=True,
-                content=response.content or "",
-                cost_usd=actual_cost,
-                elapsed_ms=elapsed,
-                metadata=dict(spec.metadata),
-            )
+            finally:
+                # Fail-SAFE: if we exit without reconciling (CancelledError
+                # bubbling, sibling-cancellation under gather, an unexpected
+                # exception type), refund the full reservation so the shared
+                # budget doesn't slowly bleed across fanouts. Audit §1.8.
+                if not reconciled:
+                    try:
+                        await _refund(reservation)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     raw = await asyncio.gather(
         *(_run_one(s) for s in specs), return_exceptions=False,

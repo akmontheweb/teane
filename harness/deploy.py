@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -1102,15 +1103,50 @@ def _compose_argv() -> tuple[str, ...]:
     return ("docker", "compose")
 
 
-async def _run_docker_inspect(container_name: str) -> dict[str, Any]:
-    """Run docker inspect and return parsed status."""
+def _compose_project_name(workspace_path: str) -> str:
+    """Derive a stable Docker-Compose project name from the workspace path.
+
+    Without an explicit ``-p`` arg, Compose uses the cwd basename — so
+    two workspaces both named ``app`` would share one Docker project
+    namespace, with concurrent ``up``s racing and ``down --remove-orphans``
+    accidentally killing the other's containers. Audit §2.4.
+
+    We hash the workspace's realpath and prefix with ``harness-`` so the
+    name is also a useful clue when listing ``docker ps``.
+    """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "inspect", container_name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        real = os.path.realpath(workspace_path)
+    except Exception:  # noqa: BLE001
+        real = workspace_path
+    digest = hashlib.sha256((real or "").encode("utf-8")).hexdigest()[:12]
+    return f"harness-{digest}"
+
+
+def _compose_argv_for(workspace_path: str) -> tuple[str, ...]:
+    """``_compose_argv`` plus a stable ``-p PROJECT`` derived from the workspace.
+
+    All compose invocations should pass through this so up/down/logs/config
+    all target the same project namespace per workspace. Audit §2.4.
+    """
+    return (*_compose_argv(), "-p", _compose_project_name(workspace_path))
+
+
+async def _run_docker_inspect(container_name: str) -> dict[str, Any]:
+    """Run docker inspect and return parsed status.
+
+    Uses the shared kill-on-timeout helper so a Docker daemon lock-up
+    doesn't leak one zombie ``docker inspect`` per service per 2-second
+    health-poll tick (audit §2.13).
+    """
+    try:
+        from harness.sandbox import run_subprocess_kill_on_timeout
+        rc, stdout, stderr, timed_out = await run_subprocess_kill_on_timeout(
+            ["docker", "inspect", container_name], timeout=10.0,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        if proc.returncode != 0:
+        if timed_out:
+            return {"name": container_name, "status": "error", "health": "none",
+                    "exit_code": -1, "running": False, "error": "docker inspect timed out (killed)"}
+        if rc != 0:
             return {"name": container_name, "status": "error", "health": "none", "exit_code": -1, "running": False, "error": stderr.decode("utf-8", errors="replace").strip()}
 
         data = json.loads(stdout.decode("utf-8"))
@@ -1131,20 +1167,23 @@ async def _run_docker_inspect(container_name: str) -> dict[str, Any]:
 
 
 async def _get_compose_services(workspace_path: str, compose_file: str) -> list[str]:
-    """Get service names from docker-compose config."""
+    """Get service names from docker-compose config.
+
+    Uses kill-on-timeout (§2.3) and the per-workspace project name (§2.4).
+    """
     compose_path = os.path.join(workspace_path, compose_file)
     if not os.path.isfile(compose_path):
         return []
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *_compose_argv(), "-f", compose_path, "config", "--services",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        from harness.sandbox import run_subprocess_kill_on_timeout
+        rc, stdout, _stderr, timed_out = await run_subprocess_kill_on_timeout(
+            [*_compose_argv_for(workspace_path), "-f", compose_path, "config", "--services"],
+            timeout=10.0,
             cwd=workspace_path,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        if proc.returncode == 0:
-            return [line.strip() for line in stdout.decode("utf-8").splitlines() if line.strip()]
-        return []
+        if timed_out or rc != 0:
+            return []
+        return [line.strip() for line in stdout.decode("utf-8").splitlines() if line.strip()]
     except Exception:
         return []
 
@@ -1185,6 +1224,16 @@ async def health_check_loop(
                 all_healthy = False
                 break
 
+            # Terminal-unhealthy short-circuit (audit §4.17): a container that
+            # is "running" but has a healthcheck that has permanently flipped
+            # to "unhealthy" will never recover — keep polling wastes the full
+            # timeout and produces a misleading "timed out" diagnostic. Treat
+            # it as a failure now.
+            if status == "running" and result["health"] == "unhealthy":
+                failed.append({**result, "error": "container is running but healthcheck reports unhealthy"})
+                all_healthy = False
+                break
+
             if status not in ("running",) and result["health"] not in ("healthy",):
                 all_healthy = False
 
@@ -1201,17 +1250,18 @@ async def health_check_loop(
 
         await asyncio.sleep(interval_seconds)
 
-    # Capture logs on failure
+    # Capture logs on failure — kill-on-timeout (§2.3) + project name (§2.4).
     logs_output = ""
     compose_path = os.path.join(workspace_path, compose_file)
     if os.path.isfile(compose_path):
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *_compose_argv(), "-f", compose_path, "logs", "--tail=100",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            from harness.sandbox import run_subprocess_kill_on_timeout
+            _rc, stdout, stderr, _to = await run_subprocess_kill_on_timeout(
+                [*_compose_argv_for(workspace_path), "-f", compose_path,
+                 "logs", "--tail=100"],
+                timeout=10.0,
                 cwd=workspace_path,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
             logs_output = stdout.decode("utf-8", errors="replace") or stderr.decode("utf-8", errors="replace")
         except Exception:
             logs_output = "Failed to capture logs."
@@ -1364,34 +1414,35 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    # Build
+    # Build — use shared kill-on-timeout + per-workspace project name.
+    # Audit §2.3 / §2.4.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *_compose_argv(), "-f", compose_path, "up", "--build", "-d",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        from harness.sandbox import run_subprocess_kill_on_timeout
+        rc, _stdout, stderr, timed_out = await run_subprocess_kill_on_timeout(
+            [*_compose_argv_for(workspace_path), "-f", compose_path, "up", "--build", "-d"],
+            timeout=180.0,
             cwd=workspace_path,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
-        if proc.returncode != 0:
+        if timed_out:
+            return {
+                "compiler_errors": [{
+                    "file": compose_file, "line": 0, "column": 0, "severity": "error",
+                    "error_code": "DEPLOYMENT_BUILD_TIMEOUT",
+                    "message": "[DEPLOYMENT FAULT]: Build timed out after 180s.",
+                }],
+                "loop_counter": {"deployment": 1},
+            }
+        if rc != 0:
             return {
                 "compiler_errors": [{
                     "file": compose_file, "line": 0, "column": 0, "severity": "error",
                     "error_code": "DEPLOYMENT_BUILD_FAILED",
-                    "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={proc.returncode}).",
+                    "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={rc}).",
                     "semantic_context": stderr.decode("utf-8", errors="replace")[:500],
                 }],
                 "loop_counter": {"deployment": 1},
             }
         logger.info("[deployment_node] Container build successful.")
-    except asyncio.TimeoutError:
-        return {
-            "compiler_errors": [{
-                "file": compose_file, "line": 0, "column": 0, "severity": "error",
-                "error_code": "DEPLOYMENT_BUILD_TIMEOUT",
-                "message": "[DEPLOYMENT FAULT]: Build timed out after 180s.",
-            }],
-            "loop_counter": {"deployment": 1},
-        }
     except FileNotFoundError:
         return {
             "compiler_errors": [{
@@ -1433,17 +1484,24 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def teardown_containers(workspace_path: str, compose_file: str = "docker-compose.yml") -> bool:
-    """Stop and remove all containers."""
+    """Stop and remove all containers.
+
+    Kill-on-timeout (§2.3) + per-workspace project name (§2.4) so
+    teardown only ever touches containers belonging to THIS workspace
+    — not another harness session that happens to have a same-basename
+    workspace.
+    """
     compose_path = os.path.join(workspace_path, compose_file)
     if not os.path.isfile(compose_path):
         return False
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *_compose_argv(), "-f", compose_path, "down", "--remove-orphans",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        from harness.sandbox import run_subprocess_kill_on_timeout
+        rc, _stdout, _stderr, timed_out = await run_subprocess_kill_on_timeout(
+            [*_compose_argv_for(workspace_path), "-f", compose_path,
+             "down", "--remove-orphans"],
+            timeout=30.0,
             cwd=workspace_path,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        return True
+        return (not timed_out) and rc == 0
     except Exception:
         return False

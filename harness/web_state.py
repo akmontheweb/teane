@@ -189,6 +189,12 @@ class WebProcess:
     terminated_at: Optional[float] = None
     popen: Any = None  # subprocess.Popen or asyncio.subprocess.Process
     pgid: Optional[int] = None  # captured at spawn for race-free killpg
+    # Set True by the dashboard spawn paths that start a watcher thread
+    # which will record the real exit code via mark_terminated. When True,
+    # _prune_dead_locked must NOT overwrite exit_code with -1 just because
+    # the kernel says the pid is dead — the watcher is about to record
+    # the authoritative exit. Audit §2.15.
+    watcher_pending: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -367,11 +373,20 @@ class ProcessRegistry:
         to terminated. Without this, a subprocess killed with SIGKILL
         (which the watcher thread can't catch via ``proc.wait``) leaves
         a permanent "running" entry in the registry — and the UI keeps
-        showing a stale badge until the dashboard restarts."""
+        showing a stale badge until the dashboard restarts.
+
+        Entries marked ``watcher_pending=True`` are SKIPPED — a watcher
+        thread is about to record the real exit code via mark_terminated.
+        Overwriting it here with -1 would produce a brief UI flicker
+        showing "exit_code=-1" before the watcher's real value replaces
+        it. Audit §2.15.
+        """
         if not self._procs:
             return
         for sid, p in list(self._procs.items()):
             if p.is_running and not _pid_alive(p.pid):
+                if p.watcher_pending:
+                    continue
                 p.exit_code = -1
                 p.terminated_at = time.time()
 

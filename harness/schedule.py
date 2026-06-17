@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import re
 import shlex
 import sqlite3
@@ -659,12 +660,20 @@ async def _run_hook(
     env["HARNESS_JOB_EXIT_CODE"] = str(exit_code)
     env["HARNESS_JOB_DURATION_SEC"] = f"{duration_sec:.2f}"
     env["HARNESS_JOB_LOG_PATH"] = log_path
+    proc = None
+    pgid: Optional[int] = None
     try:
         proc = await asyncio.create_subprocess_shell(
             hook, env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
+        if hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, OSError):
+                pgid = proc.pid
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode != 0:
             logger.warning(
@@ -673,7 +682,20 @@ async def _run_hook(
                 (stdout or b"").decode("utf-8", errors="replace")[:500],
             )
     except asyncio.TimeoutError:
-        logger.warning("[schedule:%s] hook timed out after 30s", job_name)
+        logger.warning("[schedule:%s] hook timed out after 30s; killing process group.", job_name)
+        if proc is not None:
+            # Without this kill the /bin/sh -c tree (curl, wget, etc.)
+            # keeps running forever — one leak per job fire, every tick.
+            # Audit §2.5.
+            try:
+                from harness.sandbox import _kill_process_group_async
+                await _kill_process_group_async(pgid, proc)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("[schedule:%s] hook error: %s", job_name, exc)
 
@@ -881,7 +903,14 @@ class ScheduleDaemon:
 
     async def run_forever(self) -> int:
         """Main loop. Returns when the asyncio task is cancelled
-        (Ctrl-C / SIGTERM)."""
+        (Ctrl-C / SIGTERM).
+
+        On cancellation, signals SIGTERM to every still-running
+        ``schedule_runs`` row's pid so the spawned ``harness run``
+        subprocesses don't continue as orphans after the daemon exits
+        (audit §2.1). Without this drain, repeated daemon stop/start
+        cycles accumulated stray harness processes.
+        """
         self.initialise_due_times()
         logger.info(
             "[schedule] starting with %d enabled job(s); tick=%ds",
@@ -897,4 +926,57 @@ class ScheduleDaemon:
                 await asyncio.sleep(self.cfg.tick_seconds)
         except asyncio.CancelledError:
             logger.info("[schedule] cancellation received; shutting down.")
+            self._drain_inflight_subprocesses()
             return 0
+
+    def _drain_inflight_subprocesses(self) -> None:
+        """Send SIGTERM (then SIGKILL after 5 s) to every in-flight pid.
+
+        On a clean daemon shutdown we don't want spawned ``harness run``
+        children to continue as orphans (audit §2.1). Best-effort: any
+        process we can't signal (gone, EPERM) is just left alone.
+        """
+        try:
+            rows = find_inflight_runs(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[schedule] shutdown drain read failed: %s", exc)
+            return
+        signalled: list[int] = []
+        for row in rows:
+            pid = row.get("pid")
+            if pid is None or not _pid_alive_int(pid):
+                continue
+            try:
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        os.kill(pid, signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+                signalled.append(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+        if not signalled:
+            return
+        logger.info(
+            "[schedule] shutdown drain: SIGTERMed %d in-flight subprocess(es); "
+            "waiting up to 5s before SIGKILL.", len(signalled),
+        )
+        deadline = time.monotonic() + 5.0
+        while signalled and time.monotonic() < deadline:
+            signalled = [pid for pid in signalled if _pid_alive_int(pid)]
+            if signalled:
+                time.sleep(0.2)
+        # Anything still alive after the grace gets SIGKILL.
+        for pid in signalled:
+            try:
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        os.kill(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass

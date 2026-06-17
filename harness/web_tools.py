@@ -342,12 +342,44 @@ async def _web_fetch_impl(
         "Accept": "text/html,application/json,text/plain,text/markdown;q=0.9,*/*;q=0.1",
     }
     try:
+        # SSRF hardening (audit §3.1): we manually follow redirects so
+        # each hop's Location header is re-validated through
+        # validate_outbound_url. With follow_redirects=True, httpx would
+        # silently follow a 302 to http://169.254.169.254/...; the
+        # original-URL validator never sees it.
+        current_url = url
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(cfg.timeout_seconds, connect=10.0),
-            follow_redirects=True,
+            follow_redirects=False,
             headers=headers,
         ) as client:
-            response = await client.get(url)
+            response = None
+            for hop in range(5):  # bounded redirect chain
+                response = await client.get(current_url)
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    break
+                next_loc = response.headers.get("location") or ""
+                if not next_loc:
+                    break
+                # Resolve relative Location values against the current URL.
+                try:
+                    from urllib.parse import urljoin
+                    candidate = urljoin(current_url, next_loc)
+                except Exception:  # noqa: BLE001
+                    return {"url": url, "error": f"unparseable Location header at hop {hop}: {next_loc!r}"}
+                try:
+                    validate_outbound_url(candidate, allow_private_ips=cfg.allow_private_ips)
+                except ValueError as exc:
+                    return {
+                        "url": url,
+                        "status_code": response.status_code,
+                        "error": f"redirect target rejected at hop {hop}: {exc}",
+                    }
+                current_url = candidate
+            else:
+                return {"url": url, "error": "redirect chain exceeded 5 hops"}
+
+        assert response is not None  # one of the loop iterations ran
         # Validate content-type
         ct = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ct and not any(ct == allowed or ct.startswith(allowed) for allowed in _ALLOWED_CONTENT_TYPES):

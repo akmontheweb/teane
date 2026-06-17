@@ -106,6 +106,11 @@ class DashboardConfig:
     carbon_css_url: str = _DEFAULT_CARBON_CSS_URL
     carbon_js_url: str = _DEFAULT_CARBON_JS_URL
     docs_dir: str = _DEFAULT_DOCS_DIR  # empty → <repo_root>/docs at request time
+    # Default-secure gate (audit §3.10). When False (the default) the
+    # dashboard refuses to bind on a non-loopback host without
+    # ``token_env`` set. Operators who want an unauthenticated public
+    # dashboard must explicitly flip this true.
+    allow_unauthenticated_bind: bool = False
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "DashboardConfig":
@@ -151,6 +156,9 @@ class DashboardConfig:
             carbon_css_url=str(section.get("carbon_css_url", _DEFAULT_CARBON_CSS_URL)),
             carbon_js_url=str(section.get("carbon_js_url", _DEFAULT_CARBON_JS_URL)),
             docs_dir=str(section.get("docs_dir", _DEFAULT_DOCS_DIR)),
+            allow_unauthenticated_bind=bool(
+                section.get("allow_unauthenticated_bind", False)
+            ),
         )
 
 
@@ -1088,6 +1096,84 @@ def _render_side_nav(active: str) -> str:
     )
 
 
+def _redact_secret_fields_for_audit(section: Any, parsed: Any) -> Any:
+    """Redact any dotted-key value declared ``secret=True`` in ``section``
+    before the ``parsed`` payload is JSON-serialised into web.db's
+    ``audit_log.detail`` column. Audit §3.9.
+
+    ``section`` is the :class:`FormSection` shape returned by
+    ``web_forms.build_section`` — each ``FormField`` carries a
+    ``secret: bool`` and a ``dotted_key`` (e.g. ``models.0.api_key``).
+    """
+    try:
+        from harness.web_forms import FormSection  # noqa: F401 — type hint only
+        secret_keys: set[str] = set()
+        for field in getattr(section, "fields", []) or []:
+            if getattr(field, "secret", False):
+                secret_keys.add(getattr(field, "dotted_key", "") or "")
+        if not secret_keys:
+            return parsed
+    except Exception:  # noqa: BLE001 — best-effort
+        return parsed
+
+    def _walk(value: Any, path: str) -> Any:
+        if path in secret_keys:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {
+                k: _walk(v, f"{path}.{k}" if path else str(k))
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                _walk(v, f"{path}.{i}") for i, v in enumerate(value)
+            ]
+        return value
+
+    return _walk(parsed, "")
+
+
+_DEFAULT_CARBON_CSS_URL = "https://unpkg.com/carbon-components/css/carbon-components.min.css"
+_DEFAULT_CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js"
+
+# Allowlist of hosts permitted as ``carbon_css_url`` / ``chart_js_url``
+# values. Operators wanting a different CDN must update both this list
+# and their config. Audit §3.8.
+_CDN_ALLOWED_HOSTS = frozenset({
+    "unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
+})
+
+
+def _safe_cdn_url(url: str, *, kind: str) -> str:
+    """Return ``url`` if it parses as an ``https://`` URL whose host is
+    in :data:`_CDN_ALLOWED_HOSTS`. Otherwise fall back to the bundled
+    default. Audit §3.8 — without this, an attacker who flips the
+    config value (default-loopback dashboard with CSRF, see §3.10)
+    could inject ``javascript:alert(1)`` (etc.) into a <script src> /
+    <link href> attribute. ``html.escape`` does not block dangerous
+    schemes."""
+    fallback = _DEFAULT_CSS if kind == "css" else _DEFAULT_CHART_JS_URL
+    if not isinstance(url, str):
+        return fallback
+    candidate = url.strip()
+    if not candidate:
+        return fallback
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(candidate)
+    except ValueError:
+        return fallback
+    if parsed.scheme.lower() != "https":
+        return fallback
+    host = (parsed.hostname or "").lower()
+    if host not in _CDN_ALLOWED_HOSTS:
+        return fallback
+    return candidate
+
+
+_DEFAULT_CSS = _DEFAULT_CARBON_CSS_URL
+
+
 def _static_asset_version(cfg: DashboardConfig, relpath: str) -> str:
     """Return a short cache-busting token for a static asset, derived
     from the file's mtime. Static responses set
@@ -1113,6 +1199,12 @@ def _static_asset_version(cfg: DashboardConfig, relpath: str) -> str:
 def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> str:
     app_css_v = _static_asset_version(cfg, "css/app.css")
     dashboard_js_v = _static_asset_version(cfg, "js/dashboard.js")
+    # Scheme-validate CDN URLs before interpolation. html.escape doesn't
+    # block ``javascript:`` schemes, and an attacker who can flip these
+    # config values (default loopback dashboard with auth off + CSRF) can
+    # otherwise inject arbitrary script into the dashboard origin. Audit §3.8.
+    safe_carbon = _safe_cdn_url(cfg.carbon_css_url, kind="css")
+    safe_chart = _safe_cdn_url(cfg.chart_js_url, kind="js")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1121,10 +1213,10 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
 <meta name="theme-color" content="#161616">
 <title>{html.escape(title)} — myharness</title>
 <link rel="icon" href="/static/favicon.ico">
-<link rel="stylesheet" href="{html.escape(cfg.carbon_css_url)}">
+<link rel="stylesheet" href="{html.escape(safe_carbon)}">
 <link rel="stylesheet" href="/static/css/app.css?v={app_css_v}">
 <style>{_BASE_CSS}</style>
-<script src="{html.escape(cfg.chart_js_url)}"></script>
+<script src="{html.escape(safe_chart)}"></script>
 <script defer src="/static/js/dashboard.js?v={dashboard_js_v}"></script>
 </head>
 <body class="bx--body">
@@ -3136,8 +3228,13 @@ def make_request_handler(
                            _layout(f"Config · {section_name}", body, cfg))
                 return
             try:
+                # Redact any field flagged secret=True before persisting
+                # the diff to audit_log — the raw form would otherwise
+                # carry e.g. models[].api_key cleartext into web.db
+                # forever. Audit §3.9.
+                safe_parsed = _redact_secret_fields_for_audit(section, parsed)
                 append_audit(db_path=cfg.web_db_path, action="config_save",
-                             target=section_name, detail=json.dumps(parsed, default=str))
+                             target=section_name, detail=json.dumps(safe_parsed, default=str))
             except Exception:  # noqa: BLE001
                 pass
             body = _render_config_section(
@@ -3377,6 +3474,18 @@ def make_request_handler(
             spec_file_path = str(form.get("spec_file_path") or "").strip()
             fire_raw = str(form.get("fire_at_utc") or "").strip()
             name = str(form.get("name") or "web-oneshot").strip() or "web-oneshot"
+            # Name validation: the value lands inside HARNESS_JOB_NAME which
+            # the schedule daemon exports to operator-supplied shell hooks.
+            # A name containing shell-metacharacters would be expanded by
+            # `/bin/sh -c <hook>` when the hook references the env var
+            # unquoted (a common pattern). Audit §3.4.
+            import re as _re
+            if not _re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+                self._send(
+                    400, "text/plain",
+                    "name must match [A-Za-z0-9._-]{1,64}; got: " + name[:64] + "\n",
+                )
+                return
             if not workspace or not fire_raw:
                 self._send(400, "text/plain", "workspace and fire_at_utc required\n")
                 return
@@ -3589,7 +3698,21 @@ def make_request_handler(
             # and pass --yes so it doesn't try to read from stdin. We
             # block until the subprocess returns so the redirect lands
             # an up-to-date list back at the operator.
-            argv = ["harness", "purge", "--session-id", session_id]
+            #
+            # Resolve the harness binary to an absolute path via
+            # shutil.which so an attacker who can write to an earlier
+            # directory in PATH (``./harness`` if cwd is in PATH, a
+            # writable ~/bin entry) can't shadow our binary and gain RCE
+            # in the dashboard's privilege. Audit §3.6.
+            import shutil as _shutil
+            harness_bin = _shutil.which("harness")
+            if not harness_bin or not os.path.isabs(harness_bin):
+                self._send(
+                    500, "text/plain",
+                    "harness CLI not found on PATH; cannot purge.\n",
+                )
+                return
+            argv = [harness_bin, "purge", "--session-id", session_id]
             try:
                 proc = _sub.run(
                     argv, capture_output=True, text=True, timeout=30,
@@ -3804,7 +3927,26 @@ def start_server(
     CLI's default), this runs ``serve_forever`` on the current thread
     and returns ``None`` when the operator Ctrl-C's it. When
     ``blocking=False``, the server starts on a background thread and a
-    handle is returned for tests to shut down."""
+    handle is returned for tests to shut down.
+
+    Default-secure (audit §3.10): refuse to bind on a non-loopback host
+    when no ``token_env`` is configured. Operators who genuinely want an
+    unauthenticated, exposed dashboard must opt in by setting
+    ``dashboard.allow_unauthenticated_bind`` true. Loopback (127.0.0.1
+    / ::1) deployments still default to auth-disabled for backward
+    compatibility (the threat model there is local-account-only).
+    """
+    host_lower = (cfg.host or "").strip().lower()
+    loopback = host_lower in ("127.0.0.1", "::1", "localhost", "")
+    allow_unauth = bool(getattr(cfg, "allow_unauthenticated_bind", False))
+    if not loopback and not cfg.token_env and not allow_unauth:
+        raise RuntimeError(
+            f"refusing to start the dashboard on {cfg.host}:{cfg.port} "
+            f"without an auth token (audit §3.10). Set "
+            f"dashboard.token_env to the name of an env var that holds "
+            f"the bearer token, OR set dashboard.allow_unauthenticated_bind "
+            f"true to acknowledge an unauthenticated exposed deployment."
+        )
     expected_token = resolve_expected_token(cfg)
     csrf = resolve_csrf_token(cfg)
     # One-shot audit-log retention sweep at server start. Otherwise the
@@ -4129,9 +4271,19 @@ def spawn_harness_run(
     """Spawn a `harness run` subprocess, register it, and return the
     :class:`WebProcess` handle. Sets ``HARNESS_HITL_WEBHOOK_URL`` so the
     harness's HttpChannel POSTs HITL prompts back to this dashboard.
+
+    Resolves ``harness_binary`` via :func:`shutil.which` when not absolute
+    so a same-host attacker who plants ``./harness`` in cwd or a writable
+    PATH entry can't shadow the real binary (audit §3.6).
     """
+    import shutil as _shutil
     import subprocess as _sub
     import uuid as _uuid
+
+    if not os.path.isabs(harness_binary):
+        resolved = _shutil.which(harness_binary)
+        if resolved and os.path.isabs(resolved):
+            harness_binary = resolved
 
     session_id = f"web-{_uuid.uuid4().hex[:12]}"
     log_dir = os.path.expanduser(cfg.log_dir)
@@ -4252,11 +4404,21 @@ def spawn_harness_resume(
     ``workspace`` is optional — the resume CLI auto-detects from the
     checkpoint if omitted. ``prompt`` is optional and, when provided,
     appended to the resumed conversation.
+
+    ``harness_binary`` is resolved via :func:`shutil.which` to an absolute
+    path so a writable directory earlier in PATH can't shadow the binary
+    (audit §3.6).
     """
+    import shutil as _shutil
     import subprocess as _sub
 
     if not session_id:
         raise ValueError("session_id is required for resume")
+
+    if not os.path.isabs(harness_binary):
+        resolved = _shutil.which(harness_binary)
+        if resolved and os.path.isabs(resolved):
+            harness_binary = resolved
 
     log_dir = os.path.expanduser(cfg.log_dir)
     os.makedirs(log_dir, exist_ok=True)

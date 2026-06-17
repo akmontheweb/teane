@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 # High-confidence regex patterns for known secret formats. These are
 # always on — they have low false-positive rates because they match
 # specific provider prefixes / structures.
+#
+# Private-key / SSH-key regexes accept BOTH ``\n`` and ``\r\n`` line
+# endings AND inlined ``\\n`` escapes (the common pattern when a key
+# value is embedded inside a JSON string field). Audit §3.7.
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # OpenAI API keys
     (re.compile(r'\b(sk-(?:proj-)?[A-Za-z0-9]{20,})\b'), "OpenAI API key"),
@@ -48,12 +52,24 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\b(hf_[A-Za-z0-9]{20,})\b'), "Hugging Face token"),
     # AWS Access Key ID (NOT secret key — that requires entropy detection)
     (re.compile(r'\b(AKIA[0-9A-Z]{16})\b'), "AWS Access Key"),
+    # npm registry tokens (audit §3.7)
+    (re.compile(r'\b(npm_[A-Za-z0-9]{30,})\b'), "npm token"),
+    # Slack webhook URLs (audit §3.7)
+    (re.compile(r'(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)'), "Slack webhook"),
+    # Discord bot tokens (three base64url segments separated by ``.``)
+    (re.compile(r'\b([MN][A-Za-z0-9_-]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,})\b'), "Discord bot token"),
+    # Azure storage account key (audit §3.7) — ``AccountKey=<base64>``
+    (re.compile(r'(AccountKey=[A-Za-z0-9+/=]{20,})'), "Azure storage key"),
+    # GCP service-account JSON keys — fingerprint by `"type": "service_account"`
+    # plus the surrounding object braces. Catches inlined credentials in
+    # JSON strings or pasted secrets. Audit §3.7.
+    (re.compile(r'(\{[^{}]*"type"\s*:\s*"service_account"[^{}]*"private_key"[^{}]*})', re.DOTALL), "GCP service-account key"),
     # Generic API key patterns (long alphanumeric strings following 'key=', 'token=', etc.)
     (re.compile(r'(?i)(?:api[_-]?key|secret|token|password|auth)\s*[:=]\s*[\'"]?([A-Za-z0-9+/._\-=]{20,})[\'"]?'), "Generic credential"),
     # JWT tokens
     (re.compile(r'\b(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b'), "JWT token"),
-    # Private key PEM blocks
-    (re.compile(r'-----BEGIN (?:RSA|EC|DSA|OPENSSH|ENCRYPTED) PRIVATE KEY-----\n(?:[A-Za-z0-9+/=\n]{40,})-----END'), "Private key"),
+    # Private key PEM blocks — tolerate \r\n and inlined \\n escapes.
+    (re.compile(r'-----BEGIN (?:RSA|EC|DSA|OPENSSH|ENCRYPTED) PRIVATE KEY-----(?:\\n|\n|\r\n)(?:[A-Za-z0-9+/=\s\\]{40,}?)-----END'), "Private key"),
     # Connection strings with credentials
     (re.compile(r'(?:postgres|mysql|mongodb|redis|sqlite)://[^:]+:[^@\s]+@'), "Database connection string"),
     # Stripe keys
@@ -63,8 +79,8 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\b([0-9]+-[A-Za-z0-9_]{32,}\.apps\.googleusercontent\.com)\b'), "Google OAuth client"),
     # Slack tokens
     (re.compile(r'\b(xox[bpras]-[A-Za-z0-9-]{10,})\b'), "Slack token"),
-    # Private SSH keys
-    (re.compile(r'-----BEGIN OPENSSH PRIVATE KEY-----\n(?:[A-Za-z0-9+/=\n]{40,})-----END'), "SSH private key"),
+    # Private SSH keys — tolerate \r\n and inlined \\n.
+    (re.compile(r'-----BEGIN OPENSSH PRIVATE KEY-----(?:\\n|\n|\r\n)(?:[A-Za-z0-9+/=\s\\]{40,}?)-----END'), "SSH private key"),
 ]
 
 # Note: bare "high-entropy hex/base64" matchers (formerly part of
@@ -249,6 +265,15 @@ class SecretScanner:
 
         Returns:
             Tuple of (redacted_messages, combined RedactionResult).
+
+        Handles BOTH the string-content shape used by the OpenAI /
+        DeepSeek chat completions API and the **typed-content list**
+        shape used by Anthropic (and by the harness for tool-use turns)
+        where ``content`` is a list of ``{"type": "text"|"tool_use"|
+        "tool_result", ...}`` blocks. Audit §3.7 — the earlier
+        implementation silently skipped list-form content, so secrets
+        inside ``tool_use.input`` or ``tool_result.content`` shipped
+        to the provider AND landed in ``~/.harness/debug/*.txt`` dumps.
         """
         combined = RedactionResult()
         redacted = []
@@ -260,8 +285,53 @@ class SecretScanner:
                 new_msg["content"] = new_content
                 combined.replacements += result.replacements
                 combined.redacted_types.update(result.redacted_types)
+            elif isinstance(content, list):
+                new_msg["content"] = self._redact_typed_content_list(content, combined)
             redacted.append(new_msg)
         return redacted, combined
+
+    def _redact_typed_content_list(
+        self, blocks: list[Any], combined: "RedactionResult",
+    ) -> list[Any]:
+        """Walk an Anthropic-style typed-content list and redact every
+        string-valued field. Audit §3.7."""
+        out: list[Any] = []
+        for block in blocks:
+            if isinstance(block, dict):
+                out.append(self._redact_dict_strings(block, combined))
+            elif isinstance(block, str):
+                new_text, result = self.redact_text(block)
+                combined.replacements += result.replacements
+                combined.redacted_types.update(result.redacted_types)
+                out.append(new_text)
+            else:
+                out.append(block)
+        return out
+
+    def _redact_dict_strings(
+        self, d: dict[str, Any], combined: "RedactionResult",
+    ) -> dict[str, Any]:
+        """Recurse into a typed-content block, redacting any string leaves.
+
+        Handles common nested shapes:
+          {"type": "text", "text": "..."}                  ← Anthropic text block
+          {"type": "tool_use", "input": {...}}             ← tool call args
+          {"type": "tool_result", "content": "..." | [..]}  ← tool output
+        """
+        out: dict[str, Any] = {}
+        for key, value in d.items():
+            if isinstance(value, str):
+                new_str, result = self.redact_text(value)
+                combined.replacements += result.replacements
+                combined.redacted_types.update(result.redacted_types)
+                out[key] = new_str
+            elif isinstance(value, dict):
+                out[key] = self._redact_dict_strings(value, combined)
+            elif isinstance(value, list):
+                out[key] = self._redact_typed_content_list(value, combined)
+            else:
+                out[key] = value
+        return out
 
     def redact_file_if_sensitive(self, filepath: str) -> Optional[str]:
         """

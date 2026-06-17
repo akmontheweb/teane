@@ -38,7 +38,13 @@ def safe_resolve(workspace_root: str, filepath: str) -> str:
       - empty / None paths
       - absolute paths (``/etc/passwd``)
       - parent-traversal (``../../etc/passwd``)
+      - **NUL byte** in the path (would terminate C strings early)
       - symlinks pointing outside the workspace (via realpath)
+      - **symlinks in any *parent* component** that resolve outside the
+        workspace — audit §3.5. realpath alone on a non-existent path
+        returns ``workspace_real + filepath`` literally; we explicitly
+        walk each existing parent component so a symlink inside the
+        workspace cannot redirect a write outside it.
       - Windows mixed-drive joins
 
     Returns the absolute, real (symlink-resolved) path on success.
@@ -46,11 +52,14 @@ def safe_resolve(workspace_root: str, filepath: str) -> str:
     """
     if not filepath:
         raise ValueError("filepath must be non-empty")
+    if "\x00" in filepath:
+        raise ValueError("NUL byte rejected in path")
     if os.path.isabs(filepath):
         raise ValueError(f"absolute path rejected: {filepath!r}")
 
     workspace_real = os.path.realpath(workspace_root)
-    candidate = os.path.realpath(os.path.join(workspace_real, filepath))
+    joined = os.path.join(workspace_real, filepath)
+    candidate = os.path.realpath(joined)
 
     try:
         common = os.path.commonpath([candidate, workspace_real])
@@ -59,6 +68,36 @@ def safe_resolve(workspace_root: str, filepath: str) -> str:
 
     if common != workspace_real:
         raise ValueError(f"path escapes workspace: {filepath!r} -> {candidate}")
+
+    # Per-component symlink walk (audit §3.5): catch the case where any
+    # existing parent component is itself a symlink pointing outside the
+    # workspace. ``os.path.realpath`` on a non-existent leaf returns
+    # ``<resolved-prefix>/<literal-tail>``, so a malicious symlink
+    # ``workspace/proxy → /etc`` followed by a CREATE_FILE of
+    # ``proxy/new.txt`` would *appear* to land inside the workspace
+    # because ``new.txt`` doesn't exist yet. Resolving each existing
+    # component individually catches it.
+    parts = []
+    head, tail = os.path.split(joined)
+    while head and head != workspace_real and head not in parts:
+        parts.append(head)
+        head, _ = os.path.split(head)
+    for component in parts:
+        if not os.path.lexists(component):
+            continue
+        try:
+            real_component = os.path.realpath(component)
+        except OSError:
+            continue
+        try:
+            shared = os.path.commonpath([real_component, workspace_real])
+        except ValueError:
+            raise ValueError(f"unresolvable path: {filepath!r}")
+        if shared != workspace_real:
+            raise ValueError(
+                f"parent symlink escapes workspace: {component} -> "
+                f"{real_component} (rejecting {filepath!r})"
+            )
 
     return candidate
 
@@ -445,7 +484,8 @@ def _ip_in_private_range(host: str) -> bool:
     """Return True when ``host`` is an IP literal inside a non-routable or
     cloud-metadata range — RFC 1918, link-local (169.254/16), loopback
     (127/8), or 0.0.0.0/8. Returns False for hostnames (they're resolved
-    later by httpx) and for malformed IPs (so the caller decides).
+    by :func:`_resolved_addresses_are_safe`) and for malformed IPs (so the
+    caller decides).
     """
     import ipaddress
     try:
@@ -460,11 +500,43 @@ def _ip_in_private_range(host: str) -> bool:
     return False
 
 
+def _resolve_host_addresses(host: str) -> list[str]:
+    """Resolve ``host`` to all of its address families (A + AAAA).
+
+    Returns a list of textual addresses. Raises ``ValueError`` on
+    resolution failure. The caller should pass each address through
+    :func:`_ip_in_private_range` to decide whether the host is safe.
+
+    Pre-resolving and inspecting every result closes the DNS-rebinding
+    audit hole (§3.2): the earlier guard accepted any hostname and let
+    httpx do the resolution opaquely, so ``evil.example.com → A 10.0.0.1``
+    or ``→ A 169.254.169.254`` got through.
+    """
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"DNS resolution failed for {host!r}: {exc}") from exc
+    out: list[str] = []
+    for family, _socktype, _proto, _canonname, sockaddr in infos:
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        if family == socket.AF_INET6:
+            # sockaddr is (host, port, flowinfo, scopeid) — first element is
+            # the IPv6 textual address.
+            addr = sockaddr[0]
+        if addr and addr not in out:
+            out.append(str(addr))
+    return out
+
+
 def validate_outbound_url(
     url: str,
     *,
     allow_private_ips: bool = False,
     allowed_schemes: tuple[str, ...] = ("http", "https"),
+    resolve_dns: bool = True,
 ) -> str:
     """Validate an LLM-supplied outbound URL before the harness fetches it.
 
@@ -481,6 +553,9 @@ def validate_outbound_url(
         - IP literals inside loopback / link-local / RFC-1918 / unspecified
           ranges unless ``allow_private_ips=True``
         - Hostnames ``localhost`` / ``localhost.localdomain``
+        - **Hostnames whose DNS resolves to private/loopback/link-local
+          addresses** when ``resolve_dns=True`` (audit §3.2). Set to False
+          only for tests that don't want to hit the network.
         - Missing netloc
 
     Returns the URL unchanged on success.
@@ -508,6 +583,31 @@ def validate_outbound_url(
             raise ValueError(
                 f"private/loopback/link-local IP rejected (SSRF guard): {url!r}"
             )
+        # DNS rebinding guard (§3.2): for non-IP hosts, resolve and check
+        # every A / AAAA. We accept the (small) cost of one synchronous
+        # getaddrinfo call here in exchange for closing the cloud-metadata
+        # primitive. Skipped only when the caller explicitly opts out.
+        try:
+            import ipaddress as _ipa
+            _ipa.ip_address(host_lower)
+            is_literal_ip = True
+        except ValueError:
+            is_literal_ip = False
+        if (not is_literal_ip) and resolve_dns:
+            try:
+                addrs = _resolve_host_addresses(host_lower)
+            except ValueError:
+                # Resolution failure is itself a refusal — better to fail
+                # closed than let httpx silently resolve to whatever its
+                # own resolver picks.
+                raise
+            for addr in addrs:
+                if _ip_in_private_range(addr):
+                    raise ValueError(
+                        f"hostname {host_lower!r} resolves to a "
+                        f"private/loopback/link-local address ({addr}) — "
+                        f"refusing to fetch (SSRF / DNS-rebinding guard)."
+                    )
     return url
 
 

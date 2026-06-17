@@ -447,6 +447,15 @@ class CommandValidator:
     """
 
     # Default whitelist: safe build/dev tools
+    # NB: ``sh`` / ``bash`` / ``dash`` are intentionally NOT in the default
+    # allowlist. Audit §3.3 — letting shells through and then short-
+    # circuiting the per-segment check on ``base_cmd in ("sh","bash","...")``
+    # was a full validator bypass: an LLM-emitted ``bash -c 'cat /etc/shadow'``
+    # passes both the whitelist (one segment, basename=bash, skipped) and
+    # the blocklist (no individual blocked token). Operators who really
+    # need a shell wrapper in their build_command must opt in by adding
+    # ``sh``/``bash`` to ``security.allowed_commands`` AND ensuring the
+    # inner command is sanitised at the call site.
     DEFAULT_ALLOWED_COMMANDS: set[str] = {
         "make", "cmake", "ninja",
         "gcc", "g++", "clang", "clang++", "cc", "c++",
@@ -457,11 +466,9 @@ class CommandValidator:
         "javac", "java", "mvn", "gradle",
         "pytest", "unittest", "tox", "nox",
         "dotnet", "msbuild",
-        "sh", "bash", "dash",
         "echo", "cat", "ls", "cp", "mv", "mkdir", "rm", "chmod", "chown",
         "git", "hg",
         "docker", "docker-compose", "podman",
-        "env", "export", "source",
         "test", "[",
         "true", "false",
     }
@@ -587,8 +594,18 @@ class CommandValidator:
                 continue
             base_cmd = os.path.basename(tokens[0])  # Strip path if present
 
-            # Skip common shell builtins and operators
-            if base_cmd in ("", "sh", "bash", ".", "source", "export", "env", "exec"):
+            # Skip common shell builtins and operators.
+            #
+            # NOTE: ``sh`` / ``bash`` / ``dash`` are intentionally NOT in
+            # this skip-list (audit §3.3). Earlier they were skipped here,
+            # but in combination with their presence in the default
+            # allowlist that meant ``bash -c 'arbitrary'`` was a wholesale
+            # validator bypass — the basename was ``bash``, the loop
+            # continued, and the inner shell payload was never inspected.
+            # If a build legitimately needs ``bash -c '...'``, the operator
+            # must add ``bash`` to ``security.allowed_commands`` and accept
+            # that the validator can no longer see inside the ``-c`` arg.
+            if base_cmd in ("", ".", "source", "export", "env", "exec"):
                 continue
 
             if base_cmd not in self.allowed_commands:

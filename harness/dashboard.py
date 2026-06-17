@@ -4609,6 +4609,101 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
     )
 
 
+def _render_hitl_prompt_body(
+    prompt: dict[str, Any], autofocus: str,
+) -> tuple[str, str, str]:
+    """Render the operator-facing widgets for a single HITL prompt dict.
+
+    Returns ``(question_html, input_html, button_label)``:
+
+    * ``question_html`` — the readable question line shown above the
+      input (empty when the prompt has no message or carries its own
+      contextual prose, e.g. ``wait_for_edit``).
+    * ``input_html`` — the form controls the operator interacts with
+      (dropdown / textarea / hidden field).  Always contains a field
+      named ``choice`` so ``_handle_hitl_answer`` keeps working.
+    * ``button_label`` — submit button text appropriate to the prompt
+      type ("Submit decision" / "Submit notes" / "Done editing").
+
+    Prompts that don't carry a ``type`` key (free-form dicts written by
+    older callers or tests) fall back to the legacy JSON-dump-plus-
+    text-input rendering so we never lose information."""
+    kind = str(prompt.get("type") or "")
+    message = str(prompt.get("message") or "")
+    options = list(prompt.get("options") or [])
+    labels = dict(prompt.get("option_labels") or {})
+    default = prompt.get("default")
+
+    if not kind:
+        prompt_text = html.escape(json.dumps(prompt, indent=2, default=str))
+        question_html = f"<pre>{prompt_text}</pre>"
+        input_html = (
+            "<label>Choice (a/e/m/s)<br>"
+            f"<input type='text' name='choice' placeholder='a' required{autofocus}></label><br><br>"
+            "<label>Extra notes (optional)<br>"
+            "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
+        )
+        return question_html, input_html, "Submit decision"
+
+    question_html = (
+        f"<p class='hitl-question'><strong>Question:</strong> {_esc(message)}</p>"
+        if message else ""
+    )
+
+    if kind == "prompt" and options:
+        opts_html = "".join(
+            f"<option value='{_esc(k)}'"
+            f"{' selected' if k == default else ''}>"
+            f"[{_esc(k)}] {_esc(labels.get(k, k))}</option>"
+            for k in options
+        )
+        input_html = (
+            "<label>Your choice<br>"
+            f"<select name='choice' required{autofocus}>{opts_html}</select></label>"
+        )
+        return question_html, input_html, "Submit decision"
+
+    if kind == "confirm":
+        if isinstance(default, bool):
+            default_letter = "y" if default else "n"
+        else:
+            default_str = str(default or "").lower()
+            default_letter = "y" if default_str in ("y", "yes", "true", "1") else "n"
+        opts_html = (
+            f"<option value='y'{' selected' if default_letter == 'y' else ''}>Yes</option>"
+            f"<option value='n'{' selected' if default_letter == 'n' else ''}>No</option>"
+        )
+        input_html = (
+            "<label>Confirm<br>"
+            f"<select name='choice' required{autofocus}>{opts_html}</select></label>"
+        )
+        return question_html, input_html, "Submit decision"
+
+    if kind == "notes":
+        input_html = (
+            "<input type='hidden' name='choice' value='ok'>"
+            "<label>Your notes<br>"
+            f"<textarea name='extra_notes' rows='4' cols='80' required{autofocus}></textarea></label>"
+        )
+        return question_html, input_html, "Submit notes"
+
+    if kind == "wait_for_edit":
+        # For wait_for_edit the `message` field carries the file path,
+        # so swap the generic question line for the contextual prose.
+        wait_html = (
+            "<p class='muted'>Harness is paused waiting for you to finish editing "
+            f"<code>{_esc(message)}</code>. Click <b>Done editing</b> to release it.</p>"
+            "<input type='hidden' name='choice' value='done'>"
+        )
+        return "", wait_html, "Done editing"
+
+    prompt_text = html.escape(json.dumps(prompt, indent=2, default=str))
+    fallback_input = (
+        f"<input type='text' name='choice' placeholder='answer' required{autofocus}>"
+    )
+    return f"<pre>{prompt_text}</pre>", fallback_input, "Submit decision"
+
+
 def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
     """Render every currently-pending HITL card for ``session_id``.
 
@@ -4625,31 +4720,31 @@ def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
         return ""
     rows: list[str] = []
     for idx, p in enumerate(pending):
-        prompt_text = html.escape(json.dumps(p.prompt, indent=2, default=str))
+        autofocus = " autofocus" if idx == 0 else ""
+        question_html, input_html, button_label = _render_hitl_prompt_body(
+            p.prompt, autofocus,
+        )
         if cfg.writes_enabled and csrf_token:
-            autofocus = " autofocus" if idx == 0 else ""
             form_html = (
+                f"{question_html}"
                 f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer' "
                 "data-ajax='hitl-answer'>"
                 f"{csrf_field}"
                 f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
-                "<label>Choice (a/e/m/s)<br>"
-                f"<input type='text' name='choice' placeholder='a' required{autofocus}></label><br><br>"
-                "<label>Extra notes (optional)<br>"
-                "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
-                "<p><button>Submit decision</button></p>"
+                f"{input_html}"
+                f"<p><button>{html.escape(button_label)}</button></p>"
                 "<p class='hitl-form-error muted' role='alert'></p>"
                 "</form>"
             )
         else:
             form_html = (
+                f"{question_html}"
                 "<p class='muted'>Writes disabled — answer this prompt via "
                 f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
                 "with an authenticated client.</p>"
             )
         rows.append(
             f"<div class='card hitl-alert'><h3>HITL pending — {_esc(p.request_id)}</h3>"
-            f"<pre>{prompt_text}</pre>"
             f"{form_html}</div>"
         )
     return "".join(rows)

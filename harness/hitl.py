@@ -60,6 +60,7 @@ class HitlChannel(ABC):
         message: str,
         options: list[str],
         default: Optional[str] = None,
+        option_labels: Optional[dict[str, str]] = None,
     ) -> str:
         """
         Present a menu prompt and return the user's selection.
@@ -69,6 +70,11 @@ class HitlChannel(ABC):
             options: Valid single-character (or short) answer strings.
             default: Answer returned automatically in non-interactive mode.
                      If None and the channel is non-interactive, raises.
+            option_labels: Optional human-readable description for each
+                     option key. Stdin/File channels ignore this; the
+                     HttpChannel forwards it in the webhook body so a
+                     UI on the other end can render a labeled dropdown
+                     instead of a free-text input.
 
         Returns:
             The selected option string (lowercased).
@@ -127,7 +133,9 @@ class StdinChannel(HitlChannel):
         message: str,
         options: list[str],
         default: Optional[str] = None,
+        option_labels: Optional[dict[str, str]] = None,
     ) -> str:
+        del option_labels  # stdin already prints its own menu
         opts_str = "/".join(options)
         if _auto_approve():
             chosen = default if default is not None else (options[0] if options else "")
@@ -232,7 +240,9 @@ class FileChannel(HitlChannel):
         message: str,
         options: list[str],
         default: Optional[str] = None,
+        option_labels: Optional[dict[str, str]] = None,
     ) -> str:
+        del option_labels  # file channel matches by message substring
         answer = self._lookup(message)
         logger.info("[hitl:file] prompt → %r", answer)
         return answer
@@ -276,8 +286,11 @@ class HttpChannel(HitlChannel):
         {
           "type":    "prompt" | "confirm" | "notes" | "wait_for_edit",
           "message": "<prompt text>",
-          "options": ["a", "b", "c"],   // only for "prompt" type
-          "default": "a"                 // null if no default
+          "options": ["a", "b", "c"],          // only for "prompt" type
+          "default": "a",                        // null if no default
+          "option_labels": {"a": "Approve",     // optional; only for "prompt".
+                            "b": "Edit hint",   // present when the caller wants
+                            "c": "Manual"}      // the UI to render a labeled dropdown
         }
 
     Expected response (HTTP 200, Content-Type: application/json):
@@ -309,13 +322,16 @@ class HttpChannel(HitlChannel):
 
     def _build_payload(self, type_: str, message: str,
                        options: Optional[list[str]] = None,
-                       default: Optional[str] = None) -> bytes:
+                       default: Optional[str] = None,
+                       option_labels: Optional[dict[str, str]] = None) -> bytes:
         body: dict[str, Any] = {
             "type": type_,
             "message": message,
             "options": options or [],
             "default": default,
         }
+        if option_labels:
+            body["option_labels"] = option_labels
         return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     def _sign(self, body: bytes) -> str:
@@ -416,9 +432,13 @@ class HttpChannel(HitlChannel):
         message: str,
         options: list[str],
         default: Optional[str] = None,
+        option_labels: Optional[dict[str, str]] = None,
     ) -> str:
         effective_default = default if default is not None else (options[0] if options else "")
-        payload = self._build_payload("prompt", message, options, effective_default)
+        payload = self._build_payload(
+            "prompt", message, options, effective_default,
+            option_labels=option_labels,
+        )
         answer = self._post(payload, effective_default)
         logger.info("[hitl:http] prompt %r → %r", message[:60], answer)
         return answer

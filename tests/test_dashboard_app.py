@@ -1142,6 +1142,167 @@ def test_hitl_pending_html_returns_empty_when_nothing_pending(tmp_path):
         handle.shutdown()
 
 
+def _fetch_hitl_card(base_url: str, csrf: str, session_id: str) -> str:
+    req = urllib.request.Request(
+        base_url + f"/sessions/{session_id}/hitl/pending.html",
+        headers={"Cookie": f"csrf_token={csrf}"},
+    )
+    return urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+
+
+def test_hitl_render_prompt_kind_uses_labeled_dropdown(tmp_path):
+    """A ``type: prompt`` HITL with ``option_labels`` must render as a
+    select-dropdown whose option text spells out what each answer
+    means — not a JSON dump with a single-letter free-text input.
+
+    This is the core operator-facing fix: the question reads as prose
+    and the dropdown labels remove the need to memorise cli.py's menu
+    letters."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    assert csrf
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-prompt",
+            session_id="sess-typed",
+            prompt={
+                "type": "prompt",
+                "message": "Select action",
+                "options": ["v", "r", "q"],
+                "default": "r",
+                "option_labels": {
+                    "v": "View active file diffs",
+                    "r": "Resume graph execution",
+                    "q": "Abandon session",
+                },
+            },
+        )
+        body = _fetch_hitl_card(base_url, csrf, "sess-typed")
+        assert "<select name='choice'" in body
+        # No free-text choice input on typed prompts.
+        assert "<input type='text' name='choice'" not in body
+        # Question rendered as prose (not raw JSON).
+        assert "Select action" in body
+        # Each option carries its human-readable label, prefixed with
+        # the key so operators who know the cli shortcut still see it.
+        assert "[v] View active file diffs" in body
+        assert "[r] Resume graph execution" in body
+        assert "[q] Abandon session" in body
+        # `default: r` must be preselected.
+        assert "value='r' selected" in body
+    finally:
+        handle.shutdown()
+
+
+def test_hitl_render_prompt_without_labels_still_shows_dropdown(tmp_path):
+    """When the harness sends a ``type: prompt`` payload but omits
+    ``option_labels`` (legacy clients), the dashboard still renders a
+    dropdown — option text falls back to the key alone — instead of
+    dumping JSON."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-bare",
+            session_id="sess-bare",
+            prompt={
+                "type": "prompt",
+                "message": "Pick one",
+                "options": ["a", "b"],
+                "default": "a",
+            },
+        )
+        body = _fetch_hitl_card(base_url, csrf, "sess-bare")
+        assert "<select name='choice'" in body
+        assert "[a] a" in body and "[b] b" in body
+    finally:
+        handle.shutdown()
+
+
+def test_hitl_render_confirm_kind_renders_yes_no(tmp_path):
+    """``type: confirm`` HITL (the abandon-confirmation follow-up
+    when an operator picks [q]) must render as a Yes/No dropdown with
+    the default preselected — not a JSON dump."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-confirm",
+            session_id="sess-confirm",
+            prompt={
+                "type": "confirm",
+                "message": "Confirm abandon?",
+                "options": [],
+                "default": "n",
+            },
+        )
+        body = _fetch_hitl_card(base_url, csrf, "sess-confirm")
+        assert "Confirm abandon?" in body
+        assert "<select name='choice'" in body
+        assert "value='y'>Yes" in body
+        assert "value='n' selected>No" in body
+    finally:
+        handle.shutdown()
+
+
+def test_hitl_render_notes_kind_renders_required_textarea(tmp_path):
+    """``type: notes`` HITL (free-text hint injection) must render the
+    textarea as the required answer field, with a hidden ``choice``
+    placeholder so the existing answer handler still accepts the
+    submission."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-notes",
+            session_id="sess-notes",
+            prompt={
+                "type": "notes",
+                "message": "Enter repair hint",
+                "options": [],
+                "default": "",
+            },
+        )
+        body = _fetch_hitl_card(base_url, csrf, "sess-notes")
+        assert "Enter repair hint" in body
+        assert "<input type='hidden' name='choice' value='ok'>" in body
+        assert "<textarea name='extra_notes'" in body and "required" in body
+        assert "Submit notes" in body
+    finally:
+        handle.shutdown()
+
+
+def test_hitl_render_wait_for_edit_renders_done_button(tmp_path):
+    """``type: wait_for_edit`` HITL must surface the file path the
+    harness is blocked on and a "Done editing" button. The hidden
+    ``choice=done`` placeholder satisfies the existing answer handler
+    contract — any 200 unblocks the harness."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        get_hitl_queue().register_pending(
+            request_id="req-wait",
+            session_id="sess-wait",
+            prompt={
+                "type": "wait_for_edit",
+                "message": "/workspace/foo.py",
+                "options": [],
+                "default": "done",
+            },
+        )
+        body = _fetch_hitl_card(base_url, csrf, "sess-wait")
+        assert "/workspace/foo.py" in body
+        assert "<input type='hidden' name='choice' value='done'>" in body
+        assert "Done editing" in body
+    finally:
+        handle.shutdown()
+
+
 def test_notes_html_returns_chat_panel(tmp_path):
     """/sessions/{sid}/notes.html powers the live chat-notes slot
     refresh after a note submit. Must return the queued-notes list +

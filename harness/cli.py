@@ -2004,6 +2004,20 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     if modified_files:
         diffs_text = "Modified files:\n" + "\n".join(f"  - {f}" for f in modified_files)
 
+    # Single source of truth for both the stdin menu and the rich
+    # HTTP-webhook payload (option_labels). The web dashboard reads
+    # option_labels to render a labeled dropdown instead of a free-text
+    # input — keep these strings short and operator-friendly.
+    menu_options: list[tuple[str, str]] = [
+        ("v", "View active file diffs"),
+        ("r", "Resume graph execution (re-run compilation node)"),
+        ("e", "Inject manual hint instruction for the repair node"),
+        ("m", "Pause for manual edits (wait while you fix files in your IDE)"),
+        ("b", "Increase session budget limit (+ $2.00)"),
+        ("s", "Save & Quit (resume later)"),
+        ("q", "Abandon session and execute Git rollback"),
+    ]
+
     while True:
         print()
         print("=" * 80)
@@ -2017,20 +2031,16 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print(error_text)
         print()
         print("Options:")
-        print("  [v] View active file diffs")
-        print("  [r] Resume graph execution (re-run compilation node)")
-        print("  [e] Inject manual hint instruction string for the repair node")
-        print("  [m] Pause for manual edits (notifies harness to wait while you fix files in your IDE)")
-        print("  [b] Increase session budget limit (+ $2.00)")
-        print("  [s] Save & Quit (resume later)")
-        print("  [q] Abandon session and execute Git rollback")
+        for key, label in menu_options:
+            print(f"  [{key}] {label}")
         print()
 
         from harness.hitl import get_channel as _get_channel
         choice = _get_channel().prompt(
             "[HITL] Select action",
-            ["v", "r", "e", "m", "b", "s", "q"],
+            [k for k, _ in menu_options],
             default="r",
+            option_labels={k: lbl for k, lbl in menu_options},
         )
 
         if choice == "v":

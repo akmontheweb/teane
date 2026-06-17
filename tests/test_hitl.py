@@ -257,6 +257,37 @@ class TestHttpChannel:
             assert captured[0]["body"]["type"] == "prompt"
             assert captured[0]["body"]["message"] == "Choose option"
             assert captured[0]["body"]["options"] == ["a", "b", "c"]
+            # option_labels is omitted from the payload when the caller
+            # didn't pass any — older webhook receivers must not see an
+            # unexpected field. New receivers will see it when supplied
+            # (covered by the next test).
+            assert "option_labels" not in captured[0]["body"]
+        finally:
+            server.shutdown()
+
+    def test_prompt_forwards_option_labels_when_supplied(self):
+        """When the caller passes option_labels, HttpChannel forwards
+        them in the webhook body so a UI on the other end can render a
+        labeled dropdown instead of a single-letter input. cli.py's
+        hitl_menu_loop passes the [v]/[r]/[e]/... menu this way."""
+        server, url, captured = self._serve(b'{"answer": "r"}')
+        try:
+            ch = HttpChannel(url)
+            labels = {
+                "v": "View diffs",
+                "r": "Resume graph execution",
+                "q": "Abandon session",
+            }
+            result = ch.prompt(
+                "Select action",
+                ["v", "r", "q"],
+                default="r",
+                option_labels=labels,
+            )
+            assert result == "r"
+            body = captured[0]["body"]
+            assert body["option_labels"] == labels
+            assert body["default"] == "r"
         finally:
             server.shutdown()
 

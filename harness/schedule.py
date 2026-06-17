@@ -326,31 +326,82 @@ CREATE TABLE IF NOT EXISTS schedule_runs (
     exit_code       INTEGER,
     duration_sec    REAL,
     log_path        TEXT,
+    pid             INTEGER,
     PRIMARY KEY (job_name, started_at)
 );
 CREATE INDEX IF NOT EXISTS idx_schedule_job_time
     ON schedule_runs (job_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_schedule_in_flight
+    ON schedule_runs (ended_at, pid);
 """
 
 
+def _ensure_schedule_pid_column(conn: sqlite3.Connection) -> None:
+    """Migrate older schedule_runs tables to include the `pid` column.
+
+    Originally the schema had no pid column; in-flight tracking was
+    purely in-memory (`ScheduleDaemon._in_flight`). On daemon crash the
+    set was lost and the job could re-fire on restart even while the
+    original was still running (audit §1.5). New rows now carry the
+    subprocess pid; existing rows get NULL via ADD COLUMN.
+    """
+    try:
+        cur = conn.execute("PRAGMA table_info(schedule_runs)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "pid" not in cols:
+            conn.execute("ALTER TABLE schedule_runs ADD COLUMN pid INTEGER")
+            conn.commit()
+    except sqlite3.DatabaseError:  # pragma: no cover
+        pass
+
+
 def _open_history(cfg: ScheduleConfig) -> sqlite3.Connection:
+    """Open schedule history DB with WAL + busy_timeout, leak-safe.
+
+    Audit §1.11 (WAL needed for multi-writer coexistence between the
+    daemon and dashboard process) and §2.14 (close the connection if
+    schema migration raises).
+    """
     path = os.path.expanduser(cfg.history_db)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.executescript(_SCHEMA_SQL)
+    try:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except sqlite3.DatabaseError:  # pragma: no cover — best-effort
+            pass
+        conn.executescript(_SCHEMA_SQL)
+        _ensure_schedule_pid_column(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     return conn
 
 
 def record_run_started(
     cfg: ScheduleConfig, *, job_name: str, started_at: datetime, log_path: str,
+    pid: Optional[int] = None,
 ) -> None:
+    """Insert (or replace) a row marking this run started.
+
+    ``pid`` is the running subprocess pid so an orphan-detection pass on
+    daemon restart can flip dead in-flight rows to ``ended_at`` (audit
+    §1.5). Older callers pass nothing → pid stays NULL → orphan-detection
+    skips them (backwards-compatible).
+    """
     conn = _open_history(cfg)
     try:
         with conn:
             conn.execute(
                 "INSERT OR REPLACE INTO schedule_runs "
-                "(job_name, started_at, log_path) VALUES (?, ?, ?)",
-                (job_name, started_at.isoformat(), log_path),
+                "(job_name, started_at, log_path, pid) VALUES (?, ?, ?, ?)",
+                (job_name, started_at.isoformat(), log_path,
+                 int(pid) if pid is not None else None),
             )
     finally:
         conn.close()
@@ -366,11 +417,57 @@ def record_run_finished(
         with conn:
             conn.execute(
                 "UPDATE schedule_runs SET ended_at = ?, exit_code = ?, "
-                "duration_sec = ? WHERE job_name = ? AND started_at = ?",
+                "duration_sec = ?, pid = NULL "
+                "WHERE job_name = ? AND started_at = ?",
                 (
                     _utcnow().isoformat(), exit_code, duration_sec,
                     job_name, started_at.isoformat(),
                 ),
+            )
+    finally:
+        conn.close()
+
+
+def find_inflight_runs(cfg: ScheduleConfig) -> list[dict[str, Any]]:
+    """Return rows that started but never finished (``ended_at IS NULL``).
+
+    Returned dicts include ``pid`` so the daemon can probe each on
+    boot via ``os.kill(pid, 0)`` and decide whether the process is
+    still alive (re-attach / skip-this-tick) or truly orphaned (mark
+    as exit_code=-1 so the row falls out of the in-flight set).
+    """
+    conn = _open_history(cfg)
+    try:
+        rows = conn.execute(
+            "SELECT job_name, started_at, log_path, pid FROM schedule_runs "
+            "WHERE ended_at IS NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"job_name": r[0], "started_at": r[1], "log_path": r[2],
+         "pid": (int(r[3]) if r[3] is not None else None)}
+        for r in rows
+    ]
+
+
+def reap_orphan_run(
+    cfg: ScheduleConfig, *, job_name: str, started_at: str,
+) -> None:
+    """Mark an in-flight row as terminated with exit_code=-1.
+
+    Used by the daemon on boot when ``_pid_alive`` reports the row's
+    pid is dead — the subprocess died before recording its exit, so
+    we close the row defensively so it doesn't keep the slot ``busy``
+    forever (audit §1.5).
+    """
+    conn = _open_history(cfg)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE schedule_runs SET ended_at = ?, exit_code = -1, "
+                "pid = NULL WHERE job_name = ? AND started_at = ?",
+                (_utcnow().isoformat(), job_name, started_at),
             )
     finally:
         conn.close()
@@ -430,6 +527,28 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _pid_alive_int(pid: int) -> bool:
+    """True if a process with this pid currently exists on the system.
+
+    Used by the daemon's boot-time orphan reconciliation to decide
+    whether an in-flight row from a prior daemon corresponds to a
+    still-running process (adopt) or a dead one (reap). Signal 0 is
+    the POSIX existence probe; it doesn't actually deliver a signal.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else — still alive.
+        return True
+    except OSError:
+        return False
+
+
 def _log_path_for(cfg: ScheduleConfig, job_name: str, started_at: datetime) -> str:
     base = os.path.expanduser(cfg.log_dir)
     job_dir = os.path.join(base, _safe_filename(job_name))
@@ -464,6 +583,7 @@ async def execute_job_once(
     """
     started_at = now or _utcnow()
     log_path = _log_path_for(cfg, job.name, started_at)
+    # Record start without pid first; the pid only exists after spawn.
     record_run_started(cfg, job_name=job.name, started_at=started_at, log_path=log_path)
 
     argv = build_run_command(cfg, job)
@@ -476,6 +596,20 @@ async def execute_job_once(
                 *argv, stdout=log_fh, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            # Update the row with the live pid so orphan-detection on
+            # daemon restart can decide whether to reap or re-attach
+            # (audit §1.5). Best-effort: if the update fails the row
+            # just stays in the "no pid" state and is skipped.
+            try:
+                record_run_started(
+                    cfg, job_name=job.name, started_at=started_at,
+                    log_path=log_path, pid=proc.pid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[schedule:%s] pid stamp failed (%s); orphan-detection "
+                    "will skip this row.", job.name, exc,
+                )
             exit_code = await proc.wait()
     except Exception as exc:  # noqa: BLE001 — subprocess crashes shouldn't kill the daemon
         logger.exception("[schedule:%s] subprocess error: %s", job.name, exc)
@@ -562,7 +696,13 @@ class ScheduleDaemon:
 
     def initialise_due_times(self) -> None:
         """Seed ``_next_due`` from history (or the current time if the
-        job has never run). Called once at daemon start."""
+        job has never run). Called once at daemon start.
+
+        Also reconciles stale in-flight rows in the history DB: a prior
+        daemon may have crashed/SIGKILL'd mid-run, leaving a row with
+        ``ended_at IS NULL`` but a dead pid. Audit §1.5.
+        """
+        self._reconcile_inflight_history()
         now = _utcnow()
         for job in self.cfg.jobs:
             if not job.enabled:
@@ -579,6 +719,52 @@ class ScheduleDaemon:
             self._next_due[job.name] = next_run(
                 job.schedule, after=now, last_started=last_started,
             )
+
+    def _reconcile_inflight_history(self) -> None:
+        """Inspect schedule_runs rows with ``ended_at IS NULL`` on daemon
+        boot. Two cases:
+
+          * pid is dead (or missing)   → mark as orphaned (exit_code=-1)
+          * pid is alive               → assume the prior process is still
+                                         working; add to ``_in_flight`` so
+                                         this daemon won't fire a duplicate
+
+        This closes the audit §1.5 gap where an in-memory ``_in_flight``
+        set was lost across daemon restarts and a long-running job could
+        be fired twice.
+        """
+        try:
+            rows = find_inflight_runs(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[schedule] in-flight reconcile read failed (%s); proceeding "
+                "without orphan check.", exc,
+            )
+            return
+        for row in rows:
+            pid = row.get("pid")
+            job_name = str(row.get("job_name", ""))
+            started_at = str(row.get("started_at", ""))
+            if pid is None or not _pid_alive_int(pid):
+                logger.info(
+                    "[schedule] reaping orphan run job=%s started_at=%s "
+                    "(pid=%s no longer alive).", job_name, started_at, pid,
+                )
+                try:
+                    reap_orphan_run(
+                        self.cfg, job_name=job_name, started_at=started_at,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[schedule] reap_orphan_run failed for %s: %s",
+                        job_name, exc,
+                    )
+                continue
+            logger.info(
+                "[schedule] adopting still-running prior job: %s (pid=%s)",
+                job_name, pid,
+            )
+            self._in_flight.add(job_name)
 
     def jobs_due(self, *, now: Optional[datetime] = None) -> list[Job]:
         """Return the subset of enabled jobs whose ``next_due`` time
@@ -650,7 +836,32 @@ class ScheduleDaemon:
         """Build a transient :class:`Job` from a web one-shot row and
         run it through :func:`execute_job_once`. Mark consumed
         regardless of exit code so a failed run doesn't re-fire next
-        tick (operators re-enqueue from the UI if they want a retry)."""
+        tick (operators re-enqueue from the UI if they want a retry).
+
+        Claims the row atomically BEFORE firing so a second daemon /
+        manual ``harness schedule once`` invocation can't race ahead
+        and run the same job twice. Audit §1.1.
+        """
+        # Atomic claim: any concurrent firer trying to grab the same
+        # row gets `False` here and skips, while we proceed exclusively.
+        try:
+            from harness.web_state import claim_oneshot_job
+            claimed = claim_oneshot_job(
+                db_path=self.cfg.web_db_path, job_id=int(row["id"]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[schedule] failed to atomic-claim oneshot %s (%s); "
+                "skipping to avoid double-fire.", row.get("id"), exc,
+            )
+            return {"oneshot_id": row.get("id"), "skipped": "claim_failed"}
+        if not claimed:
+            logger.info(
+                "[schedule] oneshot %s already consumed by another firer; "
+                "skipping.", row.get("id"),
+            )
+            return {"oneshot_id": row.get("id"), "skipped": "already_consumed"}
+
         # The schedule field is required by Job but only used by
         # next_run; execute_job_once ignores it. Pick a no-op shape.
         try:
@@ -664,17 +875,7 @@ class ScheduleDaemon:
             prompt=str(row.get("prompt") or ""),
             harness_args=list(row.get("harness_args") or []),
         )
-        try:
-            result = await execute_job_once(self.cfg, job)
-        finally:
-            try:
-                from harness.web_state import mark_oneshot_consumed
-                mark_oneshot_consumed(db_path=self.cfg.web_db_path, job_id=int(row["id"]))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[schedule] failed to mark oneshot %s consumed: %s",
-                    row.get("id"), exc,
-                )
+        result = await execute_job_once(self.cfg, job)
         result["oneshot_id"] = row["id"]
         return result
 

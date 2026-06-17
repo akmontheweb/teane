@@ -22,11 +22,15 @@ import pytest
 def _release_module_lock():
     """Some tests above might have left a lock on the module-level slot
     (e.g. when running the suite in the same interpreter). Clear it so
-    each test starts fresh."""
+    each test starts fresh. The lock is keyed per-workspace path now
+    (see audit §1.9) so we drop every entry rather than overwriting a
+    single singleton."""
     import harness.cli as cli_mod
-    cli_mod._WORKSPACE_LOCK_HANDLE = None
+    if hasattr(cli_mod, "_WORKSPACE_LOCK_HANDLES"):
+        cli_mod._WORKSPACE_LOCK_HANDLES.clear()
     yield
-    cli_mod._WORKSPACE_LOCK_HANDLE = None
+    if hasattr(cli_mod, "_WORKSPACE_LOCK_HANDLES"):
+        cli_mod._WORKSPACE_LOCK_HANDLES.clear()
 
 
 def _spawn_lock_holder(workspace: str, sleep_seconds: float = 3.0) -> subprocess.Popen:

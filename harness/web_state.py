@@ -96,19 +96,46 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Enable WAL + a generous busy timeout on a freshly-opened connection.
+
+    Without these, concurrent writers (dashboard handler thread doing
+    ``append_audit`` while the schedule daemon does ``record_run_started``
+    against the same DB) hit ``OperationalError: database is locked`` on
+    contention. See EDGE_CASE_AUDIT.md §1.11.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except sqlite3.DatabaseError:  # pragma: no cover — best-effort
+        pass
+
+
 def open_web_db(path: str = _DEFAULT_WEB_DB) -> sqlite3.Connection:
     """Open (creating + migrating if needed) the web.db SQLite store.
 
     Caller closes; per-request open/close keeps the contention story
     simple at the cost of a few extra fopens per page load — fine for a
     single-operator dashboard.
+
+    Wrapped in try/except so the connection is closed if ``executescript``
+    raises (corrupt DB, disk full, migration bug). Audit §2.14.
     """
     expanded = os.path.expanduser(path)
     parent = os.path.dirname(expanded)
     if parent:
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(expanded)
-    conn.executescript(_SCHEMA_SQL)
+    try:
+        _apply_sqlite_pragmas(conn)
+        conn.executescript(_SCHEMA_SQL)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     return conn
 
 
@@ -144,6 +171,9 @@ class WebProcess:
 
     ``pid`` is the PID inside the registry; ``popen`` carries the
     asyncio / subprocess handle that the cancel handler signals.
+    ``pgid`` is captured immediately after spawn so the cancel path
+    can call ``os.killpg(pgid, …)`` race-free even if the original
+    pid is later recycled to an unrelated process. Audit §1.2.
     ``log_path`` is where the per-session JSONL lands so the SSE
     stream knows what to tail.
     """
@@ -158,6 +188,7 @@ class WebProcess:
     exit_code: Optional[int] = None
     terminated_at: Optional[float] = None
     popen: Any = None  # subprocess.Popen or asyncio.subprocess.Process
+    pgid: Optional[int] = None  # captured at spawn for race-free killpg
 
     @property
     def is_running(self) -> bool:
@@ -190,6 +221,15 @@ class ProcessRegistry:
         self._procs: dict[str, WebProcess] = {}
         self._lock = threading.RLock()
         self._terminated_ttl_seconds = terminated_ttl_seconds
+        # Workspaces that have passed `has_running_for_workspace` and are
+        # mid-spawn but not yet registered. Closes the TOCTOU where two
+        # concurrent /run/now requests both see "nothing running" and both
+        # spawn (audit §1.10). Operations:
+        #   acquire_pending(ws) -> True if reservation granted, False if
+        #                          another reservation/run already covers ws
+        #   release_pending(ws) -> remove the reservation
+        # has_running_for_workspace considers both pending and registered.
+        self._pending_workspaces: set[str] = set()
 
     def register(self, proc: WebProcess) -> None:
         with self._lock:
@@ -227,20 +267,100 @@ class ProcessRegistry:
     def has_running_for_workspace(self, workspace: str) -> bool:
         """True if any currently-running entry has the same workspace
         path. Used to block "Run Now" from launching a second harness
-        against a repo whose build/patch cycle is still active."""
+        against a repo whose build/patch cycle is still active.
+
+        Also returns True when a concurrent reservation is mid-spawn
+        for this workspace (audit §1.10) — without this guard, two
+        nearly-simultaneous /run/now requests would both pass the check
+        and both spawn before either was registered.
+        """
         wanted = (workspace or "").strip()
         if not wanted:
             return False
         with self._lock:
             self._prune_dead_locked()
+            if wanted in self._pending_workspaces:
+                return True
             return any(
                 p.is_running and (p.workspace_path or "").strip() == wanted
                 for p in self._procs.values()
             )
 
+    def acquire_pending(self, workspace: str) -> bool:
+        """Reserve ``workspace`` for an in-progress spawn. Returns True
+        if the reservation was granted; False if another reservation or
+        running entry already covers it. Audit §1.10."""
+        wanted = (workspace or "").strip()
+        if not wanted:
+            return False
+        with self._lock:
+            self._prune_dead_locked()
+            if wanted in self._pending_workspaces:
+                return False
+            if any(
+                p.is_running and (p.workspace_path or "").strip() == wanted
+                for p in self._procs.values()
+            ):
+                return False
+            self._pending_workspaces.add(wanted)
+            return True
+
+    def release_pending(self, workspace: str) -> None:
+        """Release a reservation taken by ``acquire_pending``."""
+        wanted = (workspace or "").strip()
+        if not wanted:
+            return
+        with self._lock:
+            self._pending_workspaces.discard(wanted)
+
     def remove(self, session_id: str) -> None:
         with self._lock:
             self._procs.pop(session_id, None)
+
+    def signal_running(self, session_id: str, sig: int) -> bool:
+        """Atomically: check the entry is still running, then send ``sig``
+        to its process group via the stored ``pgid`` captured at spawn.
+
+        Holding the registry lock for the entire check + send prevents
+        the watcher thread from marking the entry terminated mid-kill,
+        and using the stored pgid (not ``os.getpgid(pid)``) avoids the
+        PID-reuse race where a recycled pid maps to an unrelated
+        process. Audit §1.2.
+
+        Returns True if a signal was sent, False if no live process
+        matched.
+        """
+        with self._lock:
+            entry = self._procs.get(session_id)
+            if entry is None or not entry.is_running:
+                return False
+            # Prefer popen.poll() as a kernel-level liveness check —
+            # the popen handle is immune to PID reuse because it
+            # references the underlying process object directly.
+            popen = entry.popen
+            if popen is not None and hasattr(popen, "poll"):
+                try:
+                    if popen.poll() is not None:
+                        # Process already exited — let the watcher mark it.
+                        return False
+                except Exception:  # noqa: BLE001
+                    pass
+            pgid = entry.pgid
+            if pgid is None or not hasattr(os, "killpg"):
+                # Fall back to popen.send_signal (still has a tiny PID-
+                # reuse window but better than os.getpgid(pid) re-resolution).
+                if popen is not None and hasattr(popen, "send_signal"):
+                    try:
+                        popen.send_signal(sig)
+                        return True
+                    except (ProcessLookupError, PermissionError, OSError):
+                        return False
+                return False
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
+            return True
 
     def _prune_dead_locked(self) -> None:
         """Flip any "still running" entry whose PID is no longer alive
@@ -408,10 +528,20 @@ def queue_chat_note(
 def consume_chat_notes(*, db_path: str, session_id: str) -> list[str]:
     """Atomically claim all pending chat notes for ``session_id``,
     returning their bodies in order. Subsequent calls return ``[]``
-    until new notes are queued."""
+    until new notes are queued.
+
+    Uses ``BEGIN IMMEDIATE`` so the SELECT+UPDATE pair runs under a
+    RESERVED write lock from the start. Without this, two concurrent
+    readers (e.g. dashboard handler + HITL webhook handler) can both
+    pass the SELECT under SHARED locks, both UPDATE, and both return
+    the same notes — duplicated operator instructions in the LLM's
+    next turn. Audit §1.6.
+    """
     conn = open_web_db(db_path)
     try:
-        with conn:
+        conn.isolation_level = None  # explicit-mode for BEGIN IMMEDIATE
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT id, note FROM chat_notes "
                 "WHERE session_id = ? AND consumed_at IS NULL "
@@ -419,6 +549,7 @@ def consume_chat_notes(*, db_path: str, session_id: str) -> list[str]:
                 (session_id,),
             ).fetchall()
             if not rows:
+                conn.execute("COMMIT")
                 return []
             ids = [r[0] for r in rows]
             placeholders = ",".join("?" for _ in ids)
@@ -426,7 +557,14 @@ def consume_chat_notes(*, db_path: str, session_id: str) -> list[str]:
                 f"UPDATE chat_notes SET consumed_at = ? WHERE id IN ({placeholders})",
                 (_utcnow_iso(), *ids),
             )
+            conn.execute("COMMIT")
             return [str(r[1]) for r in rows]
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
     finally:
         conn.close()
 
@@ -531,6 +669,30 @@ def mark_oneshot_consumed(*, db_path: str, job_id: int) -> None:
                 "UPDATE web_oneshot_jobs SET consumed_at = ? WHERE id = ?",
                 (_utcnow_iso(), int(job_id)),
             )
+    finally:
+        conn.close()
+
+
+def claim_oneshot_job(*, db_path: str, job_id: int) -> bool:
+    """Atomically claim a one-shot job by setting ``consumed_at`` from NULL.
+
+    Returns ``True`` when this caller won the race (the row was previously
+    unconsumed and is now claimed), or ``False`` when another caller had
+    already consumed it.
+
+    Without an atomic claim, two scheduler poll-fire cycles racing on the
+    same DB can both pass the SELECT-pending check and both fire the same
+    one-shot. See EDGE_CASE_AUDIT.md §1.1.
+    """
+    conn = open_web_db(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE web_oneshot_jobs SET consumed_at = ? "
+                "WHERE id = ? AND consumed_at IS NULL",
+                (_utcnow_iso(), int(job_id)),
+            )
+            return (cur.rowcount or 0) > 0
     finally:
         conn.close()
 

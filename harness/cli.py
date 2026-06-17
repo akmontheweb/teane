@@ -152,10 +152,12 @@ def _make_git_guardian(workspace_path: str):
 # Workspace lock (P1.7) — single-writer guard
 # ---------------------------------------------------------------------------
 
-# Module-level pin: the lock-file handle MUST outlive cmd_run's locals so
-# the OS holds the lock for the lifetime of the process. Releasing on exit
-# is automatic.
-_WORKSPACE_LOCK_HANDLE: Any = None
+# Module-level pin: the lock-file handles MUST outlive cmd_run's locals so
+# the OS holds the locks for the lifetime of the process. Keyed by workspace
+# path so a re-entrant acquisition (cmd_chat after cmd_run, or two different
+# workspaces in the same process) doesn't overwrite an earlier handle and
+# silently release its fcntl lock via GC. Audit §1.9 / §5.20.
+_WORKSPACE_LOCK_HANDLES: dict[str, Any] = {}
 
 
 def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
@@ -167,10 +169,11 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
     — we trade hardening for compatibility there since the alternatives
     (msvcrt.locking, file deletion handshake) bring their own surprises.
 
-    Stash the handle in a module-level slot so the GC doesn't release the
-    lock the moment cmd_run's local goes out of scope.
+    Stash the handle in a per-workspace slot so:
+      - the GC doesn't release the lock when cmd_run's local goes out of scope
+      - a second acquisition for a different workspace doesn't accidentally
+        evict the first lock's handle (audit §1.9 / §5.20)
     """
-    global _WORKSPACE_LOCK_HANDLE
     try:
         import fcntl  # type: ignore[import-not-found]
     except ImportError:
@@ -180,8 +183,13 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
         return None
 
     lock_path = os.path.join(workspace_path, ".harness_session.lock")
+    # Open without truncation. The earlier ``mode="w"`` truncated the file
+    # before flock acquired the lock — concurrent acquirers could blow away
+    # the holder's diagnostic ``pid=NNN`` line. Open as O_RDWR|O_CREAT,
+    # take the lock, THEN truncate + write the pid (audit §1.9).
     try:
-        fh = open(lock_path, "w", encoding="utf-8")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fh = os.fdopen(fd, "r+", encoding="utf-8")
     except OSError as exc:
         logger.warning(
             "[lock] Could not create lock file %s: %s. Proceeding without lock.",
@@ -218,13 +226,25 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
             fh.close()
             return False
 
+    # Now that we hold the lock, truncate and write the holder pid so
+    # operators inspecting the file see the live owner. No other process
+    # can be mid-write because we hold the EX lock.
     try:
+        fh.seek(0)
+        fh.truncate()
         fh.write(f"pid={os.getpid()}\n")
         fh.flush()
     except OSError:
         pass
 
-    _WORKSPACE_LOCK_HANDLE = fh
+    # Pin in the per-workspace slot. Use realpath to merge symlinked
+    # workspace aliases so two callers using different but equivalent
+    # paths can't both think they hold the lock.
+    try:
+        key = os.path.realpath(workspace_path)
+    except Exception:  # noqa: BLE001
+        key = workspace_path
+    _WORKSPACE_LOCK_HANDLES[key] = fh
     logger.info("[lock] Acquired workspace lock: %s (pid=%d)", lock_path, os.getpid())
     return fh
 

@@ -3277,42 +3277,52 @@ def make_request_handler(
                 return
             # Block parallel runs against the same workspace — the
             # build/patch pipeline isn't designed to interleave two
-            # concurrent sessions safely.
-            if get_process_registry().has_running_for_workspace(workspace):
+            # concurrent sessions safely. Atomic reservation closes the
+            # TOCTOU where two concurrent /run/now requests both pass the
+            # check (audit §1.10).
+            reg = get_process_registry()
+            if not reg.acquire_pending(workspace):
                 self._send(
                     409, "text/plain",
                     f"A run is already in progress for {workspace}. "
                     f"Try again once that build/patch cycle completes.\n",
                 )
                 return
-            extra_args, flag_errors = _collect_run_argv(form)
-            if flag_errors:
-                self._send(400, "text/plain",
-                           "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
-                return
-            # When the operator both uploads a spec AND enters text, the
-            # text rides along as a sibling ``web_input.md`` inside the
-            # same ``product_spec/`` folder so the harness consolidator
-            # picks up both inputs.
-            if spec_file_path and prompt:
-                try:
-                    _write_web_input_sidecar(workspace, prompt)
-                except OSError as exc:
-                    logger.warning("[run] failed to write web_input.md: %s", exc)
             try:
-                # Pass an empty prompt when only a spec file was uploaded
-                # — the harness reads ``product_spec/*`` itself.
-                wp = spawn_harness_run(
-                    cfg, workspace=workspace,
-                    prompt=prompt or "(see product_spec/)",
-                    extra_args=extra_args,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._send(500, "text/plain", f"spawn failed: {exc}\n")
-                return
-            self.send_response(303)
-            self.send_header("Location", f"/run/console/{wp.session_id}")
-            self.end_headers()
+                extra_args, flag_errors = _collect_run_argv(form)
+                if flag_errors:
+                    self._send(400, "text/plain",
+                               "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
+                    return
+                # When the operator both uploads a spec AND enters text, the
+                # text rides along as a sibling ``web_input.md`` inside the
+                # same ``product_spec/`` folder so the harness consolidator
+                # picks up both inputs.
+                if spec_file_path and prompt:
+                    try:
+                        _write_web_input_sidecar(workspace, prompt)
+                    except OSError as exc:
+                        logger.warning("[run] failed to write web_input.md: %s", exc)
+                try:
+                    # Pass an empty prompt when only a spec file was uploaded
+                    # — the harness reads ``product_spec/*`` itself.
+                    wp = spawn_harness_run(
+                        cfg, workspace=workspace,
+                        prompt=prompt or "(see product_spec/)",
+                        extra_args=extra_args,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send(500, "text/plain", f"spawn failed: {exc}\n")
+                    return
+                self.send_response(303)
+                self.send_header("Location", f"/run/console/{wp.session_id}")
+                self.end_headers()
+            finally:
+                # Once the spawn has registered the WebProcess, the
+                # has_running_for_workspace check will see it; release
+                # the reservation so future runs can still be blocked
+                # by the registered entry, not by a stale pending flag.
+                reg.release_pending(workspace)
 
         def _handle_run_resume(self, form: dict[str, Any]) -> None:
             """Resume an existing checkpointed session. The form carries
@@ -4157,20 +4167,41 @@ def spawn_harness_run(
     # child), then close the parent's copy so the dashboard process doesn't
     # leak one FD per spawned run.
     stdout_fh = open(log_path + ".stdout", "ab")
+    proc_ok = False
     try:
-        proc = _sub.Popen(
-            argv,
-            stdout=stdout_fh,
-            stderr=_sub.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            proc = _sub.Popen(
+                argv,
+                stdout=stdout_fh,
+                stderr=_sub.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            proc_ok = True
+        finally:
+            stdout_fh.close()
     finally:
-        stdout_fh.close()
+        if not proc_ok:
+            # Popen raised — drop the empty stdout file we created so the
+            # log dir doesn't accumulate zero-byte detritus (audit §2.11).
+            try:
+                os.unlink(log_path + ".stdout")
+            except OSError:
+                pass
+    # Capture pgid immediately after spawn so the cancel path can target
+    # the original process group even if the kernel later recycles the
+    # pid to an unrelated process (audit §1.2). Under start_new_session
+    # the child is the leader of its own group so pgid == pid here.
+    spawn_pgid: Optional[int] = None
+    if hasattr(os, "getpgid"):
+        try:
+            spawn_pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            spawn_pgid = proc.pid
     wp = WebProcess(
         session_id=session_id, pid=proc.pid, argv=argv,
         log_path=log_path, workspace_path=workspace, prompt=prompt,
-        popen=proc,
+        popen=proc, pgid=spawn_pgid,
     )
     get_process_registry().register(wp)
 
@@ -4252,22 +4283,37 @@ def spawn_harness_resume(
 
     # See spawn_harness_run for why we close the parent FD after Popen.
     stdout_fh = open(log_path + ".stdout", "ab")
+    proc_ok = False
     try:
-        proc = _sub.Popen(
-            argv,
-            stdout=stdout_fh,
-            stderr=_sub.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            proc = _sub.Popen(
+                argv,
+                stdout=stdout_fh,
+                stderr=_sub.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            proc_ok = True
+        finally:
+            stdout_fh.close()
     finally:
-        stdout_fh.close()
+        if not proc_ok:
+            try:
+                os.unlink(log_path + ".stdout")
+            except OSError:
+                pass
+    spawn_pgid: Optional[int] = None
+    if hasattr(os, "getpgid"):
+        try:
+            spawn_pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            spawn_pgid = proc.pid
     wp = WebProcess(
         session_id=session_id, pid=proc.pid, argv=argv,
         log_path=log_path,
         workspace_path=workspace or "",
         prompt=prompt or "",
-        popen=proc,
+        popen=proc, pgid=spawn_pgid,
     )
     get_process_registry().register(wp)
 
@@ -4297,17 +4343,33 @@ def spawn_harness_resume(
 
 
 def cancel_session(session_id: str) -> bool:
-    """SIGTERM the process group for ``session_id``. Returns True when
-    a signal was sent, False when no live process matches."""
+    """SIGTERM the process group for ``session_id``, escalating to
+    SIGKILL after a short grace period if the process refuses to exit.
+
+    Uses the registry's atomic ``signal_running`` so the pgid captured
+    at spawn time (immune to PID reuse) is targeted — not a re-resolution
+    via ``os.getpgid(pid)`` which can race with kernel pid recycling
+    and end up signalling an unrelated process. Audit §1.2 / §2.2.
+
+    Returns True when at least the SIGTERM landed (we declared the
+    cancellation attempt), False when no live process matched.
+    """
     import signal as _signal
+    import time as _time
     reg = get_process_registry()
-    entry = reg.get(session_id)
-    if entry is None or not entry.is_running:
+    if not reg.signal_running(session_id, _signal.SIGTERM):
         return False
-    try:
-        os.killpg(os.getpgid(entry.pid), _signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
+    # Give the child up to 5 seconds to exit cleanly before SIGKILL.
+    # The watcher thread will mark the entry terminated when proc.wait
+    # returns, so we poll the registry rather than holding the lock.
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        entry = reg.get(session_id)
+        if entry is None or not entry.is_running:
+            return True
+        _time.sleep(0.1)
+    # Grace expired — escalate. Audit §2.2 (no-SIGKILL-escalation).
+    reg.signal_running(session_id, _signal.SIGKILL)
     return True
 
 

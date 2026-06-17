@@ -791,6 +791,18 @@
         return;
       }
     });
+    // Bool checkboxes have no `name` — their sibling hidden __value[]
+    // input carries the truthiness so the parallel form arrays stay
+    // balanced. Keep them in sync as the operator toggles the box.
+    document.addEventListener("change", function (evt) {
+      var box = evt.target.closest && evt.target.closest("input.ct-bool");
+      if (!box) return;
+      var sib = box.previousElementSibling;
+      while (sib && !sib.hasAttribute("data-ct-bool-value")) {
+        sib = sib.previousElementSibling;
+      }
+      if (sib) sib.value = box.checked ? "true" : "false";
+    });
   }
 
   function handleRemove(btn) {
@@ -967,8 +979,8 @@
   function scalarInputHtml(typeTag, value) {
     if (typeTag === "bool") {
       return (
-        '<input type="hidden" name="__value[]" value="false">' +
-        '<input type="checkbox" class="ct-bool" name="__value[]" value="true">'
+        '<input type="hidden" name="__value[]" value="false" data-ct-bool-value>' +
+        '<input type="checkbox" class="ct-bool" data-ct-bool-checkbox>'
       );
     }
     if (typeTag === "int") {

@@ -479,14 +479,18 @@ def _input_for_scalar(path: str, value: Any) -> str:
     )
     safe_val = "" if value is None else str(value)
     if tag == TYPE_BOOL:
-        # Hidden "off" sentinel + checkbox; if the checkbox is unchecked
-        # only the "off" value reaches us. The parser strips the sentinel.
+        # Single hidden `__value[]` carries the truthiness; the visible
+        # checkbox has NO name and is kept in sync by JS. Two named
+        # inputs would unbalance the parallel __path/__type/__value
+        # arrays whenever the box is checked.
         checked = "checked" if value else ""
+        bool_val = "true" if value else "false"
         return (
             hidden
-            + _hidden("__value[]", "false")
-            + f"<input type='checkbox' class='ct-bool' name='__value[]' "
-              f"value='true' {checked}>"
+            + f"<input type='hidden' name='__value[]' value='{bool_val}' "
+              f"data-ct-bool-value>"
+            + f"<input type='checkbox' class='ct-bool' "
+              f"data-ct-bool-checkbox {checked}>"
         )
     if tag == TYPE_INT:
         return (

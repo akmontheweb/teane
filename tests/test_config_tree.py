@@ -92,16 +92,19 @@ def test_render_int_uses_number_input():
     assert "name='__type[]' value='int'" in html
 
 
-def test_render_bool_uses_checkbox_with_hidden_off_sentinel():
+def test_render_bool_uses_checkbox_backed_by_hidden_value():
     html_true = render_tree(True, path="flag")
     html_false = render_tree(False, path="flag")
-    # Both render a hidden 'false' sentinel + the checkbox.
-    assert "name='__value[]' value='false'" in html_true
+    # Exactly ONE __value[] per bool — the visible checkbox is unnamed
+    # and JS syncs it into the sibling hidden input.
+    assert html_true.count("name='__value[]'") == 1
+    assert "name='__value[]' value='true'" in html_true
     assert "type='checkbox'" in html_true
+    assert "data-ct-bool-checkbox" in html_true
     assert "checked" in html_true
-    # Off case has no `checked` attribute.
-    assert "type='checkbox'" in html_false
+    assert html_false.count("name='__value[]'") == 1
     assert "name='__value[]' value='false'" in html_false
+    assert "type='checkbox'" in html_false
 
 
 def test_render_long_string_uses_textarea():
@@ -290,9 +293,10 @@ def _harvest_form_payload_from_html(html):
 
     Pair up the parallel hidden __path[] / __type[] entries with the
     following __value[] entry. Order matters: render_tree emits them
-    tightly grouped per scalar. Bool fields emit TWO __value entries
-    (sentinel + box). Strip <template>...</template> blocks first so
-    we don't harvest the placeholder rows.
+    tightly grouped per scalar. Bool fields emit a single hidden
+    __value[] (the visible checkbox has no name). Strip
+    <template>...</template> blocks first so we don't harvest the
+    placeholder rows.
     """
     cleaned = re.sub(r"<template[^>]*>.*?</template>", "", html, flags=re.DOTALL)
     # Walk per leaf — scan forward from each __path occurrence to the
@@ -342,20 +346,13 @@ def _harvest_form_payload_from_html(html):
             leaves.append((leaf_path, leaf_type, [picked]))
             cursor = end
             continue
-        # input value='...' attrs for __value[]
+        # input value='...' attrs for __value[]. The checkbox itself
+        # has no name attribute, so this captures only the hidden
+        # input that actually carries the value.
         ivals = re.findall(
             r"name='__value\[\]'\s+value='([^']*)'", window,
         )
-        # bool: the input might be a checkbox with `checked` attribute,
-        # in which case value='true' is present. If not checked, only
-        # the hidden sentinel 'false' is here.
-        if leaf_type == TYPE_BOOL:
-            if "checked" in window and "value='true'" in window:
-                leaves.append((leaf_path, leaf_type, ["false", "true"]))
-            else:
-                leaves.append((leaf_path, leaf_type, ["false"]))
-        else:
-            leaves.append((leaf_path, leaf_type, ivals or [""]))
+        leaves.append((leaf_path, leaf_type, ivals or [""]))
         cursor = end
     # Flatten in order.
     out_paths: list[str] = []

@@ -22,6 +22,7 @@ from harness.dashboard import (
     cost_burn_series,
     dispatch,
     list_memory_files,
+    list_running_sessions,
     list_schedule_runs,
     list_sessions,
     read_memory_file,
@@ -197,6 +198,67 @@ def test_list_sessions_parses_events(tmp_path):
     assert s.total_input_tokens == 180
     assert s.total_output_tokens == 90
     assert s.workspace_path == "/tmp/repo"
+
+
+def test_list_running_sessions_excludes_logs_without_session_start(tmp_path):
+    """Dashboard-boot tombstones — JSONL files that hold only
+    ``init_observability`` startup chatter (no ``event`` field
+    anywhere) — must NOT appear as running sessions. Without this
+    filter, every ``harness web start`` left behind a phantom row
+    that piled up across restarts (17 phantoms after a few cycles
+    in one operator session)."""
+    cfg = _make_cfg(tmp_path)
+    log_dir = cfg.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    # Tombstone: plain logger output, no event field at all.
+    tombstone = os.path.join(log_dir, "web-deadbeef0001.jsonl")
+    with open(tombstone, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": "2026-06-17T05:14:16Z", "level": "INFO",
+            "logger": "harness",
+            "msg": "Session log file: ...",
+        }) + "\n")
+        f.write(json.dumps({
+            "ts": "2026-06-17T05:14:16Z", "level": "INFO",
+            "logger": "harness.gateway",
+            "msg": "[gateway] Registered model 'openai:gpt-4o'.",
+        }) + "\n")
+    rows = list_running_sessions(cfg)
+    assert rows == [], (
+        f"expected dashboard-boot tombstone to be filtered, got: {rows}"
+    )
+
+
+def test_list_running_sessions_includes_logs_with_session_start_but_no_session_end(tmp_path):
+    """An in-flight harness run emits ``session_start`` at the top of
+    its log and won't write ``session_end`` until it finishes — the
+    only signal that a real run is currently live. That signature
+    must keep the row visible."""
+    cfg = _make_cfg(tmp_path)
+    _write_session_log(cfg.log_dir, "live-sess", [
+        {"event": "session_start", "timestamp": "2026-06-17T05:20:00Z",
+         "workspace_path": "/tmp/ciod"},
+        {"event": "llm_call", "timestamp": "2026-06-17T05:20:10Z",
+         "tokens_in": 100, "tokens_out": 50, "cost_usd": 0.02},
+    ])
+    rows = list_running_sessions(cfg)
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "live-sess"
+    assert rows[0]["workspace_path"] == "/tmp/ciod"
+    assert rows[0]["source"] == "cli"
+
+
+def test_list_running_sessions_still_excludes_session_end_logs(tmp_path):
+    """Regression guard for the original behaviour: a log whose tail
+    event is ``session_end`` is a completed run, never a running
+    one — independent of the new ``session_start`` requirement."""
+    cfg = _make_cfg(tmp_path)
+    _write_session_log(cfg.log_dir, "done-sess", [
+        {"event": "session_start", "timestamp": "2026-06-17T05:15:00Z"},
+        {"event": "session_end", "timestamp": "2026-06-17T05:16:00Z",
+         "exit_code": 0},
+    ])
+    assert list_running_sessions(cfg) == []
 
 
 def test_cost_burn_series_aggregates_and_orders(tmp_path):

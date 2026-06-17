@@ -676,7 +676,18 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
             if _last_event_name(path) == "session_end":
                 continue
             sid = filename[:-len(".jsonl")]
-            # Pull the start timestamp + workspace from the first line.
+            # Walk the log once, looking for a ``session_start`` event.
+            # A log without one isn't a harness graph run — it's a
+            # bootstrap log from the dashboard server itself (every
+            # ``harness web start`` calls init_observability and gets
+            # a per-process JSONL holding gateway model registrations
+            # but no event fields). Counting those as "running"
+            # sessions caused dashboards to surface 17 phantom rows
+            # after a few stop/start cycles. Real runs always emit
+            # session_start at the top of the log, so its presence
+            # is the load-bearing marker; ``session_end`` (or its
+            # absence here) tells us whether the run is in-flight.
+            has_session_start = False
             started_at = ""
             workspace_path = ""
             try:
@@ -686,6 +697,7 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
                         if not evt:
                             continue
                         if evt.get("event") == "session_start":
+                            has_session_start = True
                             started_at = str(evt.get("timestamp") or "")
                             workspace_path = str(evt.get("workspace_path") or "")
                             break
@@ -693,6 +705,8 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
                             started_at = str(evt.get("timestamp") or "")
             except OSError:
                 pass
+            if not has_session_start:
+                continue
             rows[sid] = {
                 "session_id": sid,
                 "started_at": started_at,

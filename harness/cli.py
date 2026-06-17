@@ -767,7 +767,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.expensive_model": (str,),
     "speculative.cheap_model": (str,),
     "speculative.voting": (dict,),
-    "llm_dispatch.max_tokens_default": (int,),
+    "llm_dispatch.max_tokens_default": (int, str, type(None)),
     "llm_dispatch.max_tokens_per_role": (dict,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "web_tools.enabled": (bool,),
@@ -1104,24 +1104,43 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                     f"(3 recommended), got {n_var}."
                 )
 
-    # LLM dispatch: clamp max_tokens to a range that makes sense across
-    # every supported provider. Below 256 → useless truncated replies;
-    # above 32768 → blows past per-request output caps on every supported
-    # model. Also validate that per-role values are positive ints (the
-    # role names themselves aren't enumerated here — unknown roles in
-    # max_tokens_per_role get silently ignored at dispatch time so adding
-    # a new NodeRole doesn't require a validator update).
+    # LLM dispatch: a blank value (None / "" / 0 / missing key) means
+    # "no per-call max_tokens" — the gateway omits the parameter and the
+    # provider's own per-request output cap takes over. A value that IS
+    # provided is clamped to [256, 32768]: below 256 → useless truncated
+    # replies; above 32768 → blows past per-request output caps on every
+    # supported model. Role names in max_tokens_per_role aren't enumerated
+    # here — unknown roles get silently ignored at dispatch time so
+    # adding a new NodeRole doesn't require a validator update.
     dispatch_cfg = config.get("llm_dispatch", {})
     if isinstance(dispatch_cfg, dict):
         _MIN_MAX_TOKENS = 256
         _MAX_MAX_TOKENS = 32768
-        default_mt = dispatch_cfg.get("max_tokens_default")
-        if isinstance(default_mt, int) and not isinstance(default_mt, bool):
-            if default_mt < _MIN_MAX_TOKENS or default_mt > _MAX_MAX_TOKENS:
+
+        def _validate_max_tokens(dotted: str, raw: Any) -> None:
+            if raw is None or raw == 0 or raw == "":
+                return
+            if isinstance(raw, str):
                 errors.append(
-                    f"'llm_dispatch.max_tokens_default' must be in "
-                    f"[{_MIN_MAX_TOKENS}, {_MAX_MAX_TOKENS}], got {default_mt}."
+                    f"'{dotted}' must be an int, null, or blank, "
+                    f"got string {raw!r}."
                 )
+                return
+            if not isinstance(raw, int) or isinstance(raw, bool):
+                errors.append(
+                    f"'{dotted}' must be an int, got {type(raw).__name__}."
+                )
+                return
+            if raw < _MIN_MAX_TOKENS or raw > _MAX_MAX_TOKENS:
+                errors.append(
+                    f"'{dotted}' must be in "
+                    f"[{_MIN_MAX_TOKENS}, {_MAX_MAX_TOKENS}], got {raw}."
+                )
+
+        _validate_max_tokens(
+            "llm_dispatch.max_tokens_default",
+            dispatch_cfg.get("max_tokens_default"),
+        )
         per_role = dispatch_cfg.get("max_tokens_per_role", {})
         if isinstance(per_role, dict):
             for role_name, role_mt in per_role.items():
@@ -1131,18 +1150,10 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                         f"non-empty role-name strings, got {role_name!r}."
                     )
                     continue
-                if not isinstance(role_mt, int) or isinstance(role_mt, bool):
-                    errors.append(
-                        f"'llm_dispatch.max_tokens_per_role.{role_name}' "
-                        f"must be an int, got {type(role_mt).__name__}."
-                    )
-                    continue
-                if role_mt < _MIN_MAX_TOKENS or role_mt > _MAX_MAX_TOKENS:
-                    errors.append(
-                        f"'llm_dispatch.max_tokens_per_role.{role_name}' "
-                        f"must be in [{_MIN_MAX_TOKENS}, {_MAX_MAX_TOKENS}], "
-                        f"got {role_mt}."
-                    )
+                _validate_max_tokens(
+                    f"llm_dispatch.max_tokens_per_role.{role_name}",
+                    role_mt,
+                )
 
     # --- 5. Env var presence for every model referenced by routing ---
     referenced_models: set[str] = set()

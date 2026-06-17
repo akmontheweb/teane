@@ -2398,18 +2398,32 @@ class TestGateway:
         assert gw._max_tokens_for(NodeRole.PATCHING) == 4096
         assert gw._max_tokens_for(NodeRole.CODE_REVIEWER) == 4096
 
-    def test_max_tokens_for_ignores_non_positive_value(self):
-        # If a config writer manages to slip a zero/negative through (e.g.
-        # via the programmatic GatewayConfig path that bypasses
-        # validate_config_strict), _max_tokens_for must NOT pass it to the
-        # provider — fall back to the default instead.
+    def test_max_tokens_for_blank_per_role_overrides_default_with_none(self):
+        # A per-role entry whose key is present but value is blank (None /
+        # zero / negative) means "no limit for this role" — it overrides
+        # the default instead of inheriting it. The dispatch site then
+        # skips injecting max_tokens.
         from harness.gateway import Gateway, GatewayConfig, NodeRole
         gw = Gateway(GatewayConfig(
             max_tokens_default=4096,
-            max_tokens_per_role={"repair": 0, "doc_reviewer": -1},
+            max_tokens_per_role={"repair": None, "doc_reviewer": 0},
         ))
-        assert gw._max_tokens_for(NodeRole.REPAIR) == 4096
-        assert gw._max_tokens_for(NodeRole.DOC_REVIEWER) == 4096
+        assert gw._max_tokens_for(NodeRole.REPAIR) is None
+        assert gw._max_tokens_for(NodeRole.DOC_REVIEWER) is None
+        # Roles NOT in the map still inherit the default.
+        assert gw._max_tokens_for(NodeRole.PLANNING) == 4096
+
+    def test_max_tokens_for_returns_none_when_default_blank(self):
+        # When max_tokens_default is None ("no limit") AND a role isn't in
+        # the per-role map, the resolver returns None and dispatch skips
+        # max_tokens injection.
+        from harness.gateway import Gateway, GatewayConfig, NodeRole
+        gw = Gateway(GatewayConfig(
+            max_tokens_default=None,
+            max_tokens_per_role={"repair": 8192},
+        ))
+        assert gw._max_tokens_for(NodeRole.PLANNING) is None
+        assert gw._max_tokens_for(NodeRole.REPAIR) == 8192
 
     def test_create_gateway_from_config_loads_llm_dispatch(self):
         # End-to-end: the JSON-shaped llm_dispatch section ends up on the
@@ -2469,7 +2483,9 @@ class TestGateway:
         assert gw.config.max_tokens_per_role["repair"] == 32768
 
     def test_create_gateway_from_config_defaults_when_section_absent(self):
-        # No llm_dispatch in config → GatewayConfig defaults (4096 / empty map).
+        # No llm_dispatch in config → "no limit" everywhere: the gateway
+        # omits max_tokens from the provider call and lets the provider's
+        # own per-request cap apply.
         from harness.gateway import create_gateway_from_config
         cfg = {
             "models": {
@@ -2488,8 +2504,73 @@ class TestGateway:
             },
         }
         gw = create_gateway_from_config(cfg)
-        assert gw.config.max_tokens_default == 4096
+        assert gw.config.max_tokens_default is None
         assert gw.config.max_tokens_per_role == {}
+
+    def test_create_gateway_from_config_blank_default_means_unlimited(self):
+        # An explicit null/empty/0 max_tokens_default resolves to None on
+        # the GatewayConfig — same as if the key were missing entirely.
+        from harness.gateway import create_gateway_from_config
+        base = {
+            "models": {
+                "openai:gpt-4o-mini": {
+                    "provider": "openai", "model_id": "gpt-4o-mini",
+                    "context_window": 128000,
+                    "input_cost_per_1m": 0.15, "output_cost_per_1m": 0.60,
+                    "api_base_url": "https://api.openai.com/v1",
+                    "supports_thinking": False, "api_key": "",
+                },
+            },
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "openai:gpt-4o-mini",
+                "repair_primary": "openai:gpt-4o-mini",
+            },
+        }
+        for blank in (None, "", 0):
+            cfg = {**base, "llm_dispatch": {"max_tokens_default": blank}}
+            gw = create_gateway_from_config(cfg)
+            assert gw.config.max_tokens_default is None, (
+                f"expected None for blank={blank!r}"
+            )
+
+    def test_create_gateway_from_config_blank_per_role_overrides_default(self):
+        # A per-role entry that's present-but-blank resolves to None on
+        # the GatewayConfig — "no limit for this role", overriding the
+        # default rather than inheriting it.
+        from harness.gateway import create_gateway_from_config, NodeRole
+        cfg = {
+            "models": {
+                "openai:gpt-4o-mini": {
+                    "provider": "openai", "model_id": "gpt-4o-mini",
+                    "context_window": 128000,
+                    "input_cost_per_1m": 0.15, "output_cost_per_1m": 0.60,
+                    "api_base_url": "https://api.openai.com/v1",
+                    "supports_thinking": False, "api_key": "",
+                },
+            },
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o-mini",
+                "patching_primary": "openai:gpt-4o-mini",
+                "repair_primary": "openai:gpt-4o-mini",
+            },
+            "llm_dispatch": {
+                "max_tokens_default": 16384,
+                "max_tokens_per_role": {
+                    "planning": None,    # explicit no-limit override
+                    "patching": 4096,    # explicit cap
+                    # repair absent → inherits default 16384
+                },
+            },
+        }
+        gw = create_gateway_from_config(cfg)
+        assert gw.config.max_tokens_default == 16384
+        assert gw.config.max_tokens_per_role["planning"] is None
+        assert gw.config.max_tokens_per_role["patching"] == 4096
+        # _max_tokens_for honours all three branches.
+        assert gw._max_tokens_for(NodeRole.PLANNING) is None
+        assert gw._max_tokens_for(NodeRole.PATCHING) == 4096
+        assert gw._max_tokens_for(NodeRole.REPAIR) == 16384
 
     @pytest.mark.asyncio
     async def test_dispatch_injects_per_role_max_tokens(self):
@@ -2544,6 +2625,59 @@ class TestGateway:
         assert seen_kwargs.get("max_tokens") == 8192, (
             f"REPAIR role should have received max_tokens=8192, "
             f"got {seen_kwargs.get('max_tokens')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_max_tokens_when_unlimited(self):
+        # When the resolver returns None ("no limit"), dispatch must NOT
+        # inject max_tokens into provider kwargs — the provider's own
+        # per-request output cap should apply instead.
+        from harness.gateway import (
+            Gateway, GatewayConfig, NodeRole, ModelSpec, register_model,
+        )
+        from harness.redactor import create_redactor_from_config
+        create_redactor_from_config({})
+
+        register_model(
+            "ollama:dispatch-mt-unlimited-test",
+            ModelSpec(provider="ollama", model_id="unlimited-test",
+                      context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+
+        gateway = Gateway(GatewayConfig(
+            repair_primary="ollama:dispatch-mt-unlimited-test",
+            max_tokens_default=None,
+            max_tokens_per_role={"repair": None},
+        ))
+
+        seen_kwargs: dict = {}
+        original = gateway._get_provider
+
+        async def spy_get_provider(model_key):
+            provider = await original(model_key)
+
+            async def spy_chat(**kwargs):
+                seen_kwargs.update(kwargs)
+                raise RuntimeError("stop before network call")
+
+            provider.chat_completion = spy_chat  # type: ignore[assignment]
+            return provider
+
+        gateway._get_provider = spy_get_provider  # type: ignore[assignment]
+
+        try:
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "x"}],
+                role=NodeRole.REPAIR,
+                budget_remaining_usd=1.0,
+            )
+        except RuntimeError:
+            pass  # expected — spy raises before network
+
+        assert "max_tokens" not in seen_kwargs, (
+            f"dispatch should NOT inject max_tokens when resolver returns "
+            f"None, but provider saw max_tokens={seen_kwargs.get('max_tokens')!r}"
         )
 
     @pytest.mark.asyncio

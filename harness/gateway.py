@@ -1496,14 +1496,18 @@ class GatewayConfig:
     ssl_verify: Union[bool, str] = True
     # Per-call max_tokens ceiling. Used by Gateway._max_tokens_for(role).
     # max_tokens_default is the fallback when a role isn't listed in
-    # max_tokens_per_role. Both are clamped to [256, 32768] in
-    # validate_config_strict so the gateway can trust the values here.
+    # max_tokens_per_role. Provided ints are clamped to [256, 32768] in
+    # validate_config_strict. ``None`` means "no limit" — the gateway
+    # omits the ``max_tokens`` kwarg from the provider call and lets the
+    # provider's own per-request output cap take over. A blank per-role
+    # entry overrides the default with "no limit" (it does NOT inherit
+    # max_tokens_default); a missing per-role entry inherits the default.
     # For reasoning-mode models (deepseek-v4-pro) the ceiling is shared
     # between the hidden thinking trace and the visible content — bumping
     # repair to 8192 is the recommended baseline so the thinking trace +
     # patch blocks both fit.
-    max_tokens_default: int = 4096
-    max_tokens_per_role: dict[str, int] = field(default_factory=dict)
+    max_tokens_default: Optional[int] = None
+    max_tokens_per_role: dict[str, Optional[int]] = field(default_factory=dict)
     # Prompt caching master switch. When True (default) and the selected
     # model carries ``supports_cache=True``, the gateway emits provider-
     # specific cache directives:
@@ -1788,20 +1792,27 @@ class Gateway:
             return self.config.code_reviewer_mode.lower() in ("thinking", "thinking_max")
         return False
 
-    def _max_tokens_for(self, role: NodeRole) -> int:
+    def _max_tokens_for(self, role: NodeRole) -> Optional[int]:
         """Resolve the per-call max_tokens ceiling for ``role``.
 
         Looks up ``llm_dispatch.max_tokens_per_role.<role>`` from config;
-        falls back to ``llm_dispatch.max_tokens_default``. Roles absent
-        from the map (e.g. a future NodeRole addition shipped before the
-        operator updates config) inherit the default — they don't crash.
-        validate_config_strict already clamped both values into
-        [256, 32768], so the result is always usable.
+        falls back to ``llm_dispatch.max_tokens_default``. Returning
+        ``None`` means "no limit" — the dispatch path omits the
+        ``max_tokens`` kwarg and the provider's own per-request cap
+        applies.
+
+        A per-role entry whose key is present but value is blank
+        (``None``) overrides the default with "no limit" rather than
+        inheriting it. A missing key falls through to the default. Roles
+        absent from the map (e.g. a future NodeRole addition shipped
+        before the operator updates config) inherit the default — they
+        don't crash. validate_config_strict already clamped provided
+        ints into [256, 32768], so non-None results are always usable.
         """
         per_role = self.config.max_tokens_per_role or {}
-        value = per_role.get(role.value)
-        if isinstance(value, int) and value > 0:
-            return value
+        if role.value in per_role:
+            value = per_role[role.value]
+            return value if isinstance(value, int) and value > 0 else None
         return self.config.max_tokens_default
 
     def _get_models_with_keys(self) -> list[tuple[str, ModelSpec]]:
@@ -2095,14 +2106,19 @@ class Gateway:
         # (e.g. summarizer prompts that want a hard 1024 cap regardless of
         # global config). The default per-role values come from
         # llm_dispatch.max_tokens_per_role in config.json; see
-        # Gateway._max_tokens_for for resolution order.
+        # Gateway._max_tokens_for for resolution order. When the resolver
+        # returns None ("no limit"), we skip injection entirely so the
+        # provider's own per-request output cap applies.
         if "max_tokens" not in llm_kwargs:
-            llm_kwargs["max_tokens"] = self._max_tokens_for(role)
+            resolved_max_tokens = self._max_tokens_for(role)
+            if resolved_max_tokens is not None:
+                llm_kwargs["max_tokens"] = resolved_max_tokens
 
         # Execute with retry/backoff
         logger.info(
-            "[gateway] Dispatching to %s (role=%s, thinking=%s, max_tokens=%d).",
-            model_key, role.value, thinking, llm_kwargs["max_tokens"],
+            "[gateway] Dispatching to %s (role=%s, thinking=%s, max_tokens=%s).",
+            model_key, role.value, thinking,
+            llm_kwargs.get("max_tokens", "unlimited"),
         )
 
         import time as _time
@@ -2572,18 +2588,27 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 30
         return value
 
-    def _clamp_max_tokens(raw: Any, fallback: int) -> int:
-        """Clamp llm_dispatch.max_tokens_* into [256, 32768].
+    def _resolve_max_tokens(raw: Any) -> Optional[int]:
+        """Resolve an llm_dispatch.max_tokens_* value.
 
-        validate_config_strict already enforces this range when the
-        section is present in config.json, but this clamp is the second
-        line of defense for programmatic callers that hand-build a
-        config dict (tests, embed-in-pipeline use cases).
+        Returns ``None`` (meaning "no limit") for blank inputs:
+        missing key (None), empty string, or zero. validate_config_strict
+        already rejects garbage strings / wrong types when the config
+        comes from a config.json file, so the type-coercion branch here
+        is the second line of defense for programmatic callers that
+        hand-build a config dict (tests, embed-in-pipeline use cases).
+
+        Provided positive ints are clamped to [256, 32768] for defense
+        in depth.
         """
+        if raw is None or raw == "" or raw == 0:
+            return None
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return fallback
+            return None
+        if value <= 0:
+            return None
         if value < 256:
             logger.warning("max_tokens %d < 256; clamping to 256.", value)
             return 256
@@ -2593,18 +2618,16 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         return value
 
     llm_dispatch = config_dict.get("llm_dispatch", {}) or {}
-    max_tokens_default = _clamp_max_tokens(
-        llm_dispatch.get("max_tokens_default", 4096), 4096
+    max_tokens_default = _resolve_max_tokens(
+        llm_dispatch.get("max_tokens_default")
     )
     raw_per_role = llm_dispatch.get("max_tokens_per_role", {}) or {}
-    max_tokens_per_role: dict[str, int] = {}
+    max_tokens_per_role: dict[str, Optional[int]] = {}
     if isinstance(raw_per_role, dict):
         for role_name, role_mt in raw_per_role.items():
             if not isinstance(role_name, str) or not role_name.strip():
                 continue
-            max_tokens_per_role[role_name] = _clamp_max_tokens(
-                role_mt, max_tokens_default
-            )
+            max_tokens_per_role[role_name] = _resolve_max_tokens(role_mt)
 
     # Resolve per-variant thinking modes. The legacy ``<role>_mode`` key
     # supplies the primary's mode AND — when ``<role>_fallback_mode`` is

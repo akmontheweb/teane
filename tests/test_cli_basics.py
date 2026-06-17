@@ -292,6 +292,35 @@ class TestValidateConfigStrict:
         assert "max_tokens_defalt" in str(exc.value)
         assert "max_tokens_default" in str(exc.value)  # difflib suggestion
 
+    def test_llm_dispatch_default_null_accepted(self, openai_key):
+        # null/empty/0 mean "no limit" — they must not be rejected.
+        for blank in (None, "", 0):
+            cfg = _min_valid_config()
+            cfg["llm_dispatch"] = {"max_tokens_default": blank}
+            validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_per_role_null_accepted(self, openai_key):
+        # A blank per-role entry means "no limit for this role" — overrides
+        # the default rather than inheriting it. Validation accepts any of
+        # null / "" / 0.
+        for blank in (None, "", 0):
+            cfg = _min_valid_config()
+            cfg["llm_dispatch"] = {
+                "max_tokens_default": 4096,
+                "max_tokens_per_role": {"planning": blank},
+            }
+            validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_default_non_empty_string_rejected(self, openai_key):
+        # Strings are accepted by the broadened type schema, but a non-empty
+        # string is garbage — it must still be rejected with a clear message.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {"max_tokens_default": "4096"}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "max_tokens_default" in str(exc.value)
+        assert "int, null, or blank" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # discover_config — single-source loader

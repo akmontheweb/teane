@@ -832,7 +832,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.33 Optional Org-Wide `deployment_defaults` Section + Enter-to-Accept Discovery (FR-048)
 
-**Decision**: Discovery prompts now bake a default value into each question, and a bare Enter records the default as the answer. An optional `deployment_defaults` section in `config/config.json` (schema documented in `config/config.json.example`) declares pre-resolved deployment-discovery fields (`network.reverse_proxy`, `secrets.manager`, `storage.volume_root`, `infra_sync.conflict_policy`, …) across four sub-sections: `network`, `storage`, `secrets`, `infra_sync`. `load_deployment_defaults(cfg)` pulls the section out of the parsed config at startup and `deployment_discovery_node` injects the resolved fields into the planner prompt so no question fires for them. Absent section (or `{}`) = full questionnaire as before.
+**Decision**: Discovery prompts now bake a default value into each question, and a bare Enter records the default as the answer. An optional `deployment_defaults` section in `config/config.json` (schema documented inline in the same file via `_deployment_defaults_comment`) declares pre-resolved deployment-discovery fields (`network.reverse_proxy`, `secrets.manager`, `storage.volume_root`, `infra_sync.conflict_policy`, …) across four sub-sections: `network`, `storage`, `secrets`, `infra_sync`. `load_deployment_defaults(cfg)` pulls the section out of the parsed config at startup and `deployment_discovery_node` injects the resolved fields into the planner prompt so no question fires for them. Absent section (or `{}`) = full questionnaire as before.
 
 **Rationale**: Most teams have a fixed deployment story (same target env, same reverse proxy, same secret store across all projects). Re-answering the same questions on every project was friction with no signal. Consolidating the policy into `config.json` (rather than a second standalone file) honors the harness's "single SOLE config source" principle — one strict validator covers everything, the dashboard's generic config-tree editor renders the section for free, and operators never have to wonder which file owns which knob.
 
@@ -1208,7 +1208,7 @@ schedule.db
 | `cli.json` | Shipped with package | Absolute fallback defaults |
 | `~/.harness/config.json` | User home | Global default models and settings |
 | `.harness_config.json` | Workspace root | Per-project override (highest priority) |
-| `config/config.json` → `deployment_defaults` (optional) | Repo config | Org-wide deployment-discovery defaults (FR-048); absent / `{}` = full questionnaire. Schema documented in `config/config.json.example`. |
+| `config/config.json` → `deployment_defaults` (optional) | Repo config | Org-wide deployment-discovery defaults (FR-048); absent / `{}` = full questionnaire. Schema documented inline via `_deployment_defaults_comment` in the same file. |
 | `requirements-prod.txt` | Repo root | Exact transitive pins for reproducible pilot installs (`pip install -e . --constraint requirements-prod.txt`) |
 | `LICENSE` | Repo root | MIT license; referenced from `pyproject.toml` so wheels ship it |
 

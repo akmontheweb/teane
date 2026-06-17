@@ -311,7 +311,7 @@ def _upgrade_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
             "[speculative] legacy config detected; mapping to "
             "diversity_mode=%r cost_strategy=%r salvage_strategy=%r "
             "trigger=%r. Migrate to the new keys to silence this "
-            "warning — see config/config.json.example.",
+            "warning — see config/config.json.",
             DIVERSITY_TEMPERATURE, COST_EQUAL, SALVAGE_MERGE,
             TRIGGER_FIRST_ATTEMPT_ONLY,
         )

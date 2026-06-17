@@ -386,7 +386,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `harness run -w /tmp/x -p "fix bug"`, the wizard is skipped.
 
 ### FR-048: Per-Question Discovery Defaults + Optional Org-Wide `deployment_defaults` Section
-- **Description:** Each discovery question MUST accept a bare Enter (empty input) as "use the default value baked into the prompt." The harness MUST also load an optional org-wide policy from the `deployment_defaults` section of `config/config.json`; when populated, its already-resolved fields MUST be injected into the deployment-discovery LLM prompt as known answers so the planner does not re-ask. The section is OPTIONAL — when absent or `{}`, the full questionnaire is preserved. The `config/config.json.example` template MUST document the section's schema and example values.
+- **Description:** Each discovery question MUST accept a bare Enter (empty input) as "use the default value baked into the prompt." The harness MUST also load an optional org-wide policy from the `deployment_defaults` section of `config/config.json`; when populated, its already-resolved fields MUST be injected into the deployment-discovery LLM prompt as known answers so the planner does not re-ask. The section is OPTIONAL — when absent or `{}`, the full questionnaire is preserved. `config/config.json` MUST document the section's schema and example values inline via its `_deployment_defaults_comment` field.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given a discovery question with a documented default and the operator hits Enter, the default is recorded as the answer and a CONFIRM line is logged.
@@ -553,7 +553,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Change-request folder mode (`change_requests/*.txt` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
 - One-shot reverse-engineer of `SPEC_ARCHITECTURE.md` on first contact with a brownfield repo, gated by `change_requests.reverse_engineer_budget_usd` ($0.50 default)
 - Interactive setup wizard on bare `harness run` (new-vs-resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`)
-- Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment_defaults` section in `config.json` (schema documented in `config/config.json.example`) that pre-resolves deployment-discovery answers
+- Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment_defaults` section in `config.json` (schema documented inline in `config/config.json`) that pre-resolves deployment-discovery answers
 - Workspace git-awareness toggle (`--git true|false`, default `false`); when `false`, every git-aware step is a no-op so non-git workspaces still work
 - Single kitchen-sink builder image (`harness/vendor/Dockerfile.builder`, Python + Node + Go + Java + Rust + Dart + Make) shared by compiler / lintgate / test-generation nodes; per-command image dispatch retired
 - Per-stack Makefile skills (`harness/skills/makefile_python.md`, `makefile_node.md`, `makefile_go.md`, `makefile_java.md`, `makefile_rust.md`, `makefile_dart.md`) so the LLM emits a real `Makefile` for each stack

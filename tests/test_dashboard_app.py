@@ -319,7 +319,8 @@ def test_api_config_mtime_endpoint_serves_current_mtime(tmp_path):
         )
         assert resp.status == 200
         payload = json.loads(resp.read().decode("utf-8"))
-        assert payload["mtime_ns"] == os.stat(cfg.config_path).st_mtime_ns
+        # mtime_ns is serialized as a string — see _route_api_config_mtime.
+        assert payload["mtime_ns"] == str(os.stat(cfg.config_path).st_mtime_ns)
     finally:
         handle.shutdown()
 

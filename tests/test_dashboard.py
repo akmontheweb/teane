@@ -1253,7 +1253,9 @@ def test_api_config_mtime_returns_current_ns(tmp_path):
     assert status == 200
     assert "application/json" in ctype
     payload = json.loads(body)
-    assert payload["mtime_ns"] == _os.stat(str(config_path)).st_mtime_ns
+    # Serialized as a STRING so JavaScript's JSON.parse doesn't lose
+    # precision on modern ns mtimes (~1.75e18, well past 2**53).
+    assert payload["mtime_ns"] == str(_os.stat(str(config_path)).st_mtime_ns)
 
 
 def test_api_config_mtime_returns_null_when_missing(tmp_path):

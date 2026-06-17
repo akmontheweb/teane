@@ -1255,8 +1255,11 @@
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (payload) {
           if (!payload) return;
-          // Compare as strings — JSON ints round-trip through json()
-          // as numbers but baseline is always a string from the DOM.
+          // Compare as strings. The server sends mtime_ns as a string
+          // (modern ns mtimes are ~1.75e18 — past Number.MAX_SAFE_INTEGER
+          // ~9.007e15 — so parsing as a JS number loses the trailing
+          // digits and the banner would fire on every poll even when
+          // the file is untouched).
           var current = payload.mtime_ns == null ? "" : String(payload.mtime_ns);
           if (current && current !== baseline) {
             stop();

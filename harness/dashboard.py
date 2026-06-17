@@ -1538,9 +1538,16 @@ def _route_api_config_mtime(
     """Return the current ``config.json`` mtime as JSON. The Configure
     page polls this every few seconds and shows a "config changed
     externally — Reload" banner when the value differs from the
-    snapshot stamped at page-render time."""
+    snapshot stamped at page-render time.
+
+    ``mtime_ns`` is serialized as a STRING — modern nanosecond mtimes
+    (~1.75e18) exceed ``Number.MAX_SAFE_INTEGER`` (~9.007e15) and lose
+    precision when parsed by JavaScript's ``JSON.parse``. A string
+    round-trips exactly so the JS baseline (stamped from Python's
+    ``str(int)`` in the HTML) compares cleanly against the polled
+    value without spuriously firing the stale banner."""
     mtime_ns = config_file_mtime_ns(cfg)
-    payload = {"mtime_ns": mtime_ns}
+    payload = {"mtime_ns": None if mtime_ns is None else str(mtime_ns)}
     return 200, "application/json", json.dumps(payload)
 
 

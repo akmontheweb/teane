@@ -321,6 +321,79 @@ class TestValidateConfigStrict:
         assert "max_tokens_default" in str(exc.value)
         assert "int, null, or blank" in str(exc.value)
 
+    # --- llm_dispatch.continue_on_length ---
+
+    def test_llm_dispatch_continue_on_length_valid_passes(self, openai_key):
+        # All five known roles can be set; the validator must accept.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "continue_on_length": {
+                "planning": False,
+                "patching": True,
+                "repair": False,
+                "doc_reviewer": False,
+                "code_reviewer": False,
+            },
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_continue_on_length_missing_passes(self, openai_key):
+        # The map is optional — omission falls back to
+        # graph._CONTINUE_ON_LENGTH_DEFAULTS (only patching on).
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "max_tokens_per_role": {"patching": 16384},
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_continue_on_length_partial_passes(self, openai_key):
+        # Operator can override one role and inherit defaults for the rest.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "continue_on_length": {"planning": True},
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_dispatch_continue_on_length_wrong_type_rejected(
+        self, openai_key,
+    ):
+        # Per-role values must be bool, not int / string / etc.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "continue_on_length": {"patching": "yes"},
+        }
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        msg = str(exc.value)
+        assert "continue_on_length.patching" in msg
+        assert "must be a bool" in msg
+
+    def test_llm_dispatch_continue_on_length_int_rejected(self, openai_key):
+        # 0/1 are tempting bool-likes but Python's isinstance(x, bool) is
+        # strict; the validator must reject them so operators get a clear
+        # error rather than silently treating 1 as True.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "continue_on_length": {"repair": 1},
+        }
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "continue_on_length.repair" in str(exc.value)
+        assert "must be a bool" in str(exc.value)
+
+    def test_llm_dispatch_continue_on_length_empty_role_key_rejected(
+        self, openai_key,
+    ):
+        # Empty / whitespace role names are nonsensical.
+        cfg = _min_valid_config()
+        cfg["llm_dispatch"] = {
+            "continue_on_length": {"": True},
+        }
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        assert "continue_on_length" in str(exc.value)
+        assert "non-empty role-name strings" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # discover_config — single-source loader

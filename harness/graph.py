@@ -141,6 +141,15 @@ class AgentState(TypedDict, total=False):
     sandbox_config: dict[str, Any]
     lintgate_config: dict[str, Any]
     deployment_config: dict[str, Any]
+    # Per-call LLM dispatch parameters loaded from the ``llm_dispatch``
+    # section of config.json. Nodes read
+    # ``llm_dispatch_config["continue_on_length"][<role>]`` to decide
+    # whether to re-prompt the model when the previous dispatch
+    # returned ``finish_reason == "length"``. See the
+    # ``_llm_dispatch_comment`` block in config/config.json for the
+    # per-role risk profile. Empty dict = inherit defaults (only
+    # patching continues on length).
+    llm_dispatch_config: dict[str, Any]
     # Per-repo memory config (#7). dict shape mirrors the ``memory``
     # section of config.json: {enabled, dir, max_bytes, inject_max_bytes}.
     # planning_node reads it to decide whether to inject prior-session
@@ -1153,6 +1162,141 @@ def _web_tool_cap_from_state(_state: "AgentState") -> int:
 # applies to the number of *re-dispatches*; the model can ask for
 # multiple files in one round and each counts as a single round.
 _PATCHING_READ_FILE_CAP = 6
+
+# Cap on continuation cycles for nodes that opt into
+# llm_dispatch.continue_on_length.<role>. See the comment on that
+# section in config/config.json for the per-role risk profile.
+_MAX_CONTINUATION_CYCLES = 3
+
+# Per-role default for ``continue_on_length`` when the operator's
+# config.json omits the section or the role entry. Patching's default
+# is True because full-stack blueprints regularly exceed its 16384
+# token cap; every other node defaults to False because the failure
+# mode is more nuanced (see _llm_dispatch_comment in config.json).
+_CONTINUE_ON_LENGTH_DEFAULTS: dict[str, bool] = {
+    "planning": False,
+    "patching": True,
+    "repair": False,
+    "doc_reviewer": False,
+    "code_reviewer": False,
+}
+
+
+def _resolve_continue_on_length(
+    state: "AgentState", role: str,
+) -> bool:
+    """Resolve the per-role ``continue_on_length`` flag.
+
+    Reads ``state.llm_dispatch_config.continue_on_length.<role>``;
+    falls back to :data:`_CONTINUE_ON_LENGTH_DEFAULTS` when the
+    operator's config omits the section or the role entry. A missing /
+    None config produces the documented default behaviour (only
+    patching continues on length).
+    """
+    cfg = state.get("llm_dispatch_config", {}) or {}
+    role_map = cfg.get("continue_on_length") or {}
+    default = _CONTINUE_ON_LENGTH_DEFAULTS.get(role, False)
+    val = role_map.get(role, default)
+    return bool(val) if val is not None else default
+
+
+async def _continue_on_length(
+    *,
+    initial_response: Any,
+    initial_budget: float,
+    messages: list["MessageDict"],
+    dispatch: Any,
+    continue_prompt: str,
+    enabled: bool,
+    role_label: str,
+) -> tuple[Any, float, list[str]]:
+    """Run the finish_reason==length continuation loop for a node.
+
+    The patching node has used this pattern since session
+    web-6d5ef9b18f6a — when the LLM hits its output-token cap mid-
+    response, append the truncated assistant turn + a role-specific
+    'continue' user prompt and re-dispatch, up to
+    :data:`_MAX_CONTINUATION_CYCLES`. Other nodes opt into the same
+    pattern via ``llm_dispatch.continue_on_length.<role>`` in
+    config.json.
+
+    Parameters
+    ----------
+    initial_response:
+        The response from the node's first dispatch.
+    initial_budget:
+        The post-first-dispatch budget; later cycles thread through
+        ``dispatch`` and the final value is returned.
+    messages:
+        The conversation list mutated in place — the helper appends
+        ``assistant`` + ``user`` turns per cycle.
+    dispatch:
+        Async callable ``(messages, budget) -> (response, new_budget)``.
+        The caller captures any extra per-cycle state (tool results,
+        files-seen maps) via the closure.
+    continue_prompt:
+        Role-specific user-turn text appended on each cycle. Patching
+        keeps its existing DSL-flavoured prompt; planning / repair /
+        reviewer nodes supply their own (see callers).
+    enabled:
+        Pass the resolved config flag. When False, returns immediately
+        with the initial response — no continuation, no extra cost.
+    role_label:
+        Used for the per-cycle info log line and the "still truncated"
+        warning.
+
+    Returns
+    -------
+    ``(final_response, final_budget, accumulated_text_chunks)``. The
+    caller decides what to do with the chunks — patching concatenates
+    them through ``process_llm_patch_output``; planning / reviewer
+    nodes use them as-is.
+    """
+    accumulated_chunks: list[str] = [initial_response.content or ""]
+    if not enabled:
+        return initial_response, initial_budget, accumulated_chunks
+    # Skip continuation when the model returned tool_calls — tool-use
+    # mode already multi-turns inside its own loop (e.g. patching's
+    # _patching_tool_loop) and a second continuation here would
+    # double-charge for content the model already finalised.
+    if getattr(initial_response, "tool_calls", None):
+        return initial_response, initial_budget, accumulated_chunks
+
+    response = initial_response
+    budget = initial_budget
+    continuation_cycles = 0
+    # ``getattr`` with a "stop" default keeps stub responses in tests
+    # (which historically omit finish_reason) on the non-continuation
+    # path — only real gateway responses with an explicit "length"
+    # trigger the loop.
+    while (
+        getattr(response, "finish_reason", "stop") == "length"
+        and continuation_cycles < _MAX_CONTINUATION_CYCLES
+    ):
+        continuation_cycles += 1
+        logger.info(
+            "[%s] hit output token cap (cycle %d/%d) — requesting "
+            "continuation.",
+            role_label, continuation_cycles, _MAX_CONTINUATION_CYCLES,
+        )
+        messages.append(MessageDict(
+            role="assistant", content=response.content or "",
+        ))
+        messages.append(MessageDict(
+            role="user", content=continue_prompt,
+        ))
+        response, budget = await dispatch(messages, budget)
+        accumulated_chunks.append(response.content or "")
+    if (
+        continuation_cycles >= _MAX_CONTINUATION_CYCLES
+        and getattr(response, "finish_reason", "stop") == "length"
+    ):
+        logger.warning(
+            "[%s] LLM still truncated after %d continuation cycle(s); "
+            "accepting what landed and moving on.",
+            role_label, _MAX_CONTINUATION_CYCLES,
+        )
+    return response, budget, accumulated_chunks
 # Cap on bytes returned per read_file tool_result so a single edit
 # attempt against a multi-megabyte file can't blow the context window.
 # Aligns with the harness's existing READ_FILE text-DSL cap.
@@ -1633,6 +1777,38 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             budget_remaining_usd=budget,
         )
 
+        # Continuation on finish_reason=="length" — opt-in via
+        # llm_dispatch.continue_on_length.planning. See the
+        # _llm_dispatch_comment block in config/config.json for the
+        # risk profile (continuation may introduce duplicated headings
+        # / second summary paragraphs; reach for it only when planning
+        # truncation is observed in logs).
+        async def _planning_dispatch(msgs, budget_remaining):
+            return await gateway.dispatch(
+                messages=list(msgs),
+                role=NodeRole.PLANNING,
+                budget_remaining_usd=budget_remaining,
+            )
+
+        response, new_budget, _planning_chunks = await _continue_on_length(
+            initial_response=response,
+            initial_budget=new_budget,
+            messages=messages,
+            dispatch=_planning_dispatch,
+            continue_prompt=(
+                "You hit the output token cap mid-plan. Continue from "
+                "where you stopped — emit only the remaining plan "
+                "sections (e.g. additional modules, deployment notes, "
+                "follow-ups). Do not restate sections you already "
+                "produced."
+            ),
+            enabled=_resolve_continue_on_length(state, "planning"),
+            role_label="planning_node",
+        )
+        _planning_combined_content = "\n".join(
+            chunk for chunk in _planning_chunks if chunk
+        )
+
         # Update token tracker (per-stage attribution: planning)
         token_tracker = state.get("token_tracker", {})
         token_tracker = gateway.aggregate_tokens(
@@ -1644,7 +1820,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
         # blocks fall through with a "tool not registered" notice and
         # the LLM proceeds without them — no graph rewiring needed.
         final_content, messages, new_budget, tool_rounds = await _run_tool_loop(
-            initial_response_content=response.content,
+            initial_response_content=_planning_combined_content,
             messages=messages,
             gateway=gateway,
             role=NodeRole.PLANNING,
@@ -1932,71 +2108,52 @@ Generate your patches NOW. Only the blocks above. No other text."""
         )
 
         # Continuation on finish_reason=="length": the patching role's
-        # output cap (8192 tokens by default — see
-        # config/config.json:llm_dispatch.max_tokens_per_role.patching)
-        # is enough for a few hundred lines of patches, but a full-stack
-        # blueprint that wants both backend AND frontend modules
-        # routinely runs past it. Without continuation the harness
-        # accepts the truncated DSL, moves into repair, and never
-        # re-introduces the missing files — session web-6d5ef9b18f6a
-        # is the canonical example (backend only, no React tree).
-        # Only the text-DSL path needs an outer loop; tool-use mode
-        # already multi-turns inside _patching_tool_loop and a second
-        # continuation here would double-charge for content the LLM
-        # already finalised.
-        _initial_tool_calls = getattr(response, "tool_calls", None) or []
-        accumulated_text_chunks: list[str] = [response.content or ""]
-        _PATCHING_CONTINUE_PROMPT = (
-            "You hit the output token cap mid-patch. Continue with "
-            "ADDITIONAL CREATE_FILE / REPLACE_BLOCK / DELETE_BLOCK / "
-            "INSERT_AT_BLOCK blocks for the remaining files in the "
-            "architecture inventory (e.g. the frontend / client tier "
-            "when the backend was emitted first). Do NOT repeat "
-            "blocks you've already emitted; emit only the missing "
-            "ones. Same DSL rules as before — block syntax only, "
-            "no prose outside the blocks."
-        )
-        continuation_cycles = 0
-        # ``getattr`` with a "stop" default keeps stub responses in
-        # tests (which historically omit finish_reason) on the
-        # non-continuation path — only real gateway responses with an
-        # explicit "length" trigger the loop.
-        while (
-            not _initial_tool_calls
-            and getattr(response, "finish_reason", "stop") == "length"
-            and continuation_cycles < 3
-        ):
-            continuation_cycles += 1
-            logger.info(
-                "[patching_node] Initial patch round hit output token "
-                "cap (cycle %d/3) — requesting continuation.",
-                continuation_cycles,
-            )
-            messages.append(MessageDict(
-                role="assistant", content=response.content or "",
-            ))
-            messages.append(MessageDict(
-                role="user", content=_PATCHING_CONTINUE_PROMPT,
-            ))
-            response, new_budget, messages, tool_files_seen = await _patching_tool_loop(
+        # output cap is enough for a few hundred lines of patches, but
+        # a full-stack blueprint that wants both backend AND frontend
+        # modules routinely runs past it. Without continuation the
+        # harness accepts the truncated DSL, moves into repair, and
+        # never re-introduces the missing files — session
+        # web-6d5ef9b18f6a is the canonical example (backend only, no
+        # React tree). Patching's default is ``True`` (see
+        # _CONTINUE_ON_LENGTH_DEFAULTS); operators can override per role
+        # via llm_dispatch.continue_on_length in config.json. The shared
+        # helper handles the cycle accounting + cap warning and
+        # already skips when the response carries tool_calls (tool-use
+        # mode multi-turns inside _patching_tool_loop).
+
+        async def _patching_dispatch(msgs, budget_remaining):
+            nonlocal messages, tool_files_seen
+            resp, new_b, msgs_out, files_out = await _patching_tool_loop(
                 gateway=gateway,
-                messages=messages,
-                budget=new_budget,
+                messages=msgs,
+                budget=budget_remaining,
                 workspace=workspace,
                 use_tools=use_tools,
                 tools=PATCH_TOOLS,
                 state=state,
             )
-            accumulated_text_chunks.append(response.content or "")
-        if (
-            continuation_cycles >= 3
-            and getattr(response, "finish_reason", "stop") == "length"
-        ):
-            logger.warning(
-                "[patching_node] LLM still truncated after 3 "
-                "continuation cycle(s); accepting what landed and "
-                "moving on to repair.",
-            )
+            messages = msgs_out
+            tool_files_seen = files_out
+            return resp, new_b
+
+        response, new_budget, accumulated_text_chunks = await _continue_on_length(
+            initial_response=response,
+            initial_budget=new_budget,
+            messages=messages,
+            dispatch=_patching_dispatch,
+            continue_prompt=(
+                "You hit the output token cap mid-patch. Continue with "
+                "ADDITIONAL CREATE_FILE / REPLACE_BLOCK / DELETE_BLOCK / "
+                "INSERT_AT_BLOCK blocks for the remaining files in the "
+                "architecture inventory (e.g. the frontend / client tier "
+                "when the backend was emitted first). Do NOT repeat "
+                "blocks you've already emitted; emit only the missing "
+                "ones. Same DSL rules as before — block syntax only, "
+                "no prose outside the blocks."
+            ),
+            enabled=_resolve_continue_on_length(state, "patching"),
+            role_label="patching_node",
+        )
 
         # Update token tracker (per-stage attribution: patching).
         # Note: aggregate_tokens here only sees the FINAL response's
@@ -4510,6 +4667,34 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         workspace = state.get("workspace_path", os.getcwd())
         response, new_budget = await _dispatch_repair(messages, budget)
 
+        # Continuation on finish_reason=="length" — opt-in via
+        # llm_dispatch.continue_on_length.repair. Cost-aware: repair
+        # already dispatches once per repair iteration plus an inner
+        # READ_FILE round, so enabling this multiplies dispatches by
+        # up to 3×. See _llm_dispatch_comment in config/config.json.
+        response, new_budget, _repair_chunks = await _continue_on_length(
+            initial_response=response,
+            initial_budget=new_budget,
+            messages=messages,
+            dispatch=_dispatch_repair,
+            continue_prompt=(
+                "You hit the output token cap mid-repair. Continue "
+                "with ADDITIONAL CREATE_FILE / REPLACE_BLOCK / "
+                "DELETE_BLOCK / INSERT_AT_BLOCK blocks for the "
+                "remaining files. Do NOT repeat blocks you've already "
+                "emitted. Same DSL rules as before — block syntax "
+                "only, no prose outside blocks."
+            ),
+            enabled=_resolve_continue_on_length(state, "repair"),
+            role_label="repair_node",
+        )
+        # Splice the accumulated chunks into the final response so
+        # downstream READ_FILE parsing + the patcher see every block
+        # across continuation cycles. LLMResponse is a mutable
+        # dataclass — see harness/gateway.py:LLMResponse.
+        if len(_repair_chunks) > 1:
+            response.content = "\n".join(c for c in _repair_chunks if c)
+
         # READ_FILE inline resolve (B3): if the LLM emitted READ_FILE blocks
         # instead of (or alongside) patch blocks, resolve them here without
         # consuming a repair iteration. The model fans out a single
@@ -6511,6 +6696,7 @@ async def review_and_revise_spec(
     gateway: Any,
     budget_remaining_usd: float,
     user_goal: str,
+    llm_dispatch_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Run the independent doc-reviewer critique + revise pass on a spec
     file. Writes ``SPEC_{REQUIREMENTS,ARCHITECTURE}_REVIEW.md`` alongside
@@ -6562,6 +6748,23 @@ async def review_and_revise_spec(
         {"role": "user", "content": critique_user_prompt},
     ]
 
+    # Resolve the doc_reviewer continue_on_length flag. JSON critique
+    # continuation is RISKY — concatenating cycles often yields
+    # malformed JSON; the parse fallback below treats it as empty and
+    # skips revision. Default is False; see _llm_dispatch_comment in
+    # config/config.json.
+    _doc_continue_enabled = False
+    if isinstance(llm_dispatch_config, dict):
+        _doc_continue_map = (
+            llm_dispatch_config.get("continue_on_length") or {}
+        )
+        _doc_continue_enabled = bool(
+            _doc_continue_map.get(
+                "doc_reviewer",
+                _CONTINUE_ON_LENGTH_DEFAULTS.get("doc_reviewer", False),
+            )
+        )
+
     try:
         critique_response, new_budget = await gateway.dispatch(
             messages=critique_messages,
@@ -6571,6 +6774,31 @@ async def review_and_revise_spec(
     except Exception as exc:
         logger.warning("[spec_review] Reviewer dispatch failed: %s — passing through.", exc)
         return result
+
+    async def _critique_dispatch(msgs, budget_remaining):
+        return await gateway.dispatch(
+            messages=list(msgs),
+            role=NodeRole.DOC_REVIEWER,
+            budget_remaining_usd=budget_remaining,
+        )
+
+    critique_response, new_budget, _critique_chunks = await _continue_on_length(
+        initial_response=critique_response,
+        initial_budget=new_budget,
+        messages=critique_messages,
+        dispatch=_critique_dispatch,
+        continue_prompt=(
+            "You hit the output token cap mid-critique. Continue the "
+            "JSON critique — emit additional issues / gaps / clarity "
+            "items not yet included. Stay inside the same JSON object."
+        ),
+        enabled=_doc_continue_enabled,
+        role_label="spec_review:critique",
+    )
+    if len(_critique_chunks) > 1:
+        critique_response.content = "\n".join(
+            c for c in _critique_chunks if c
+        )
     result["new_budget_usd"] = new_budget
     result["token_usage_list"].append(critique_response.usage)
 
@@ -6616,6 +6844,31 @@ async def review_and_revise_spec(
             role=NodeRole.PLANNING,
             budget_remaining_usd=new_budget,
         )
+
+        async def _revise_dispatch(msgs, budget_remaining):
+            return await gateway.dispatch(
+                messages=list(msgs),
+                role=NodeRole.PLANNING,
+                budget_remaining_usd=budget_remaining,
+            )
+
+        revised_response, new_budget, _revise_chunks = await _continue_on_length(
+            initial_response=revised_response,
+            initial_budget=new_budget,
+            messages=revise_messages,
+            dispatch=_revise_dispatch,
+            continue_prompt=(
+                "You hit the output token cap mid-revise. Continue "
+                "the revised spec markdown from where you stopped. "
+                "Do not restart from the top."
+            ),
+            enabled=_doc_continue_enabled,
+            role_label="spec_review:revise",
+        )
+        if len(_revise_chunks) > 1:
+            revised_response.content = "\n".join(
+                c for c in _revise_chunks if c
+            )
         result["new_budget_usd"] = new_budget
         result["token_usage_list"].append(revised_response.usage)
     except Exception as exc:
@@ -6701,6 +6954,7 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
         gateway=gateway,
         budget_remaining_usd=budget,
         user_goal=user_goal,
+        llm_dispatch_config=state.get("llm_dispatch_config", {}),
     )
     if not review_result["ok"]:
         # Helper logged the reason; pass through.
@@ -6848,6 +7102,37 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         logger.warning("[code_review] Reviewer dispatch failed: %s — passing through.", exc)
         return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
 
+    # Continuation on finish_reason=="length" — opt-in via
+    # llm_dispatch.continue_on_length.code_reviewer. JSON critique
+    # continuation is RISKY (see _llm_dispatch_comment in
+    # config/config.json); default is False.
+    _code_continue_enabled = _resolve_continue_on_length(state, "code_reviewer")
+
+    async def _code_critique_dispatch(msgs, budget_remaining):
+        return await gateway.dispatch(
+            messages=list(msgs),
+            role=NodeRole.CODE_REVIEWER,
+            budget_remaining_usd=budget_remaining,
+        )
+
+    critique_response, new_budget, _code_critique_chunks = await _continue_on_length(
+        initial_response=critique_response,
+        initial_budget=new_budget,
+        messages=critique_messages,
+        dispatch=_code_critique_dispatch,
+        continue_prompt=(
+            "You hit the output token cap mid-critique. Continue the "
+            "JSON critique — emit additional findings only. Stay "
+            "inside the same JSON object."
+        ),
+        enabled=_code_continue_enabled,
+        role_label="code_review:critique",
+    )
+    if len(_code_critique_chunks) > 1:
+        critique_response.content = "\n".join(
+            c for c in _code_critique_chunks if c
+        )
+
     token_tracker = gateway.aggregate_tokens(state.get("token_tracker", {}), critique_response.usage)
 
     try:
@@ -6970,6 +7255,31 @@ Generate the patches that address every finding below. Output only the blocks �
             role=NodeRole.PATCHING,
             budget_remaining_usd=new_budget,
         )
+
+        async def _code_repatch_dispatch(msgs, budget_remaining):
+            return await gateway.dispatch(
+                messages=list(msgs),
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=budget_remaining,
+            )
+
+        repatch_response, new_budget, _code_repatch_chunks = await _continue_on_length(
+            initial_response=repatch_response,
+            initial_budget=new_budget,
+            messages=repatch_messages,
+            dispatch=_code_repatch_dispatch,
+            continue_prompt=(
+                "You hit the output token cap mid-repatch. Continue "
+                "with the remaining patch blocks. Same DSL — no "
+                "prose outside blocks."
+            ),
+            enabled=_code_continue_enabled,
+            role_label="code_review:repatch",
+        )
+        if len(_code_repatch_chunks) > 1:
+            repatch_response.content = "\n".join(
+                c for c in _code_repatch_chunks if c
+            )
     except Exception as exc:
         logger.warning("[code_review] Re-patch dispatch failed: %s — proceeding without re-patch.", exc)
         return {
@@ -7882,6 +8192,7 @@ async def run_graph(
     cd_discovery: bool = False,
     repo_memory_config: Optional[dict[str, Any]] = None,
     repo_index_config: Optional[dict[str, Any]] = None,
+    llm_dispatch_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -7946,6 +8257,8 @@ async def run_graph(
         initial_state["repo_memory_config"] = repo_memory_config
     if repo_index_config is not None:
         initial_state["repo_index_config"] = repo_index_config
+    if llm_dispatch_config is not None:
+        initial_state["llm_dispatch_config"] = llm_dispatch_config
     # Plumb the smoke-check flag into state so compiler_node can read it
     # without reaching out to config (which the graph module doesn't
     # touch directly today).

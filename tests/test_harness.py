@@ -6744,5 +6744,286 @@ class TestSpeculative:
             assert env["PYTEST_ADDOPTS"].startswith("-o cache_dir=")
 
 
+class TestContinueOnLengthHelper:
+    """Direct-call tests for graph._continue_on_length + the per-role
+    flag resolver. Exercising the helper in isolation (rather than
+    through the full node graph) gives us deterministic coverage of
+    every branch: flag off, tool-calls present, finish_reason variants,
+    the 3-cycle cap, and the role-specific defaults.
+    """
+
+    def _make_response(self, content: str, finish_reason: str = "stop",
+                       tool_calls=None):
+        from harness.gateway import LLMResponse, TokenUsage
+        return LLMResponse(
+            content=content,
+            model="test-model",
+            usage=TokenUsage(
+                input_tokens=1, output_tokens=1, cached_tokens=0,
+                cache_creation_tokens=0, cost_usd=0.0,
+            ),
+            finish_reason=finish_reason,
+            tool_calls=tool_calls or [],
+        )
+
+    def _make_dispatch(self, scripted_responses):
+        # Returns an (async dispatch callable, call_log) pair. The
+        # callable pops scripted responses in order; the log records
+        # the messages snapshot it was handed each call so tests can
+        # assert that continue prompts were appended in sequence.
+        call_log: list[dict] = []
+        queue = list(scripted_responses)
+
+        async def _dispatch(msgs, budget_remaining):
+            call_log.append({
+                "messages": list(msgs),
+                "budget": budget_remaining,
+            })
+            if not queue:
+                raise AssertionError(
+                    "dispatch called more times than scripted"
+                )
+            resp = queue.pop(0)
+            return resp, budget_remaining - 0.001
+
+        return _dispatch, call_log
+
+    def test_disabled_returns_initial_response_no_dispatch(self):
+        import asyncio
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response("chunk-1", finish_reason="length")
+            dispatch, log = self._make_dispatch([])
+            messages: list = []
+            resp, budget, chunks = await _continue_on_length(
+                initial_response=initial,
+                initial_budget=1.0,
+                messages=messages,
+                dispatch=dispatch,
+                continue_prompt="continue please",
+                enabled=False,
+                role_label="test_role",
+            )
+            assert resp is initial
+            assert budget == 1.0
+            assert chunks == ["chunk-1"]
+            assert log == []
+            assert messages == []
+
+        asyncio.run(_go())
+
+    def test_enabled_but_finish_reason_stop_no_continuation(self):
+        import asyncio
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response("done", finish_reason="stop")
+            dispatch, log = self._make_dispatch([])
+            messages: list = []
+            resp, budget, chunks = await _continue_on_length(
+                initial_response=initial,
+                initial_budget=1.0,
+                messages=messages,
+                dispatch=dispatch,
+                continue_prompt="continue please",
+                enabled=True,
+                role_label="test_role",
+            )
+            assert resp is initial
+            assert chunks == ["done"]
+            assert log == []
+
+        asyncio.run(_go())
+
+    def test_enabled_tool_calls_skip_continuation(self):
+        # Tool-use mode already multi-turns inside its own loop. The
+        # helper must not double-charge by re-prompting on top.
+        import asyncio
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response(
+                "text + tool", finish_reason="length",
+                tool_calls=[{"id": "1", "name": "read_file", "input": {}}],
+            )
+            dispatch, log = self._make_dispatch([])
+            messages: list = []
+            resp, budget, chunks = await _continue_on_length(
+                initial_response=initial,
+                initial_budget=1.0,
+                messages=messages,
+                dispatch=dispatch,
+                continue_prompt="continue please",
+                enabled=True,
+                role_label="test_role",
+            )
+            assert resp is initial
+            assert chunks == ["text + tool"]
+            assert log == []
+
+        asyncio.run(_go())
+
+    def test_one_continuation_until_finish_reason_stop(self):
+        import asyncio
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response("part-1", finish_reason="length")
+            second = self._make_response("part-2", finish_reason="stop")
+            dispatch, log = self._make_dispatch([second])
+            messages: list = []
+            resp, budget, chunks = await _continue_on_length(
+                initial_response=initial,
+                initial_budget=1.0,
+                messages=messages,
+                dispatch=dispatch,
+                continue_prompt="continue!",
+                enabled=True,
+                role_label="test_role",
+            )
+            assert resp is second
+            assert chunks == ["part-1", "part-2"]
+            assert len(log) == 1
+            # Helper appended assistant turn + user continue prompt
+            # before re-dispatching.
+            assert messages[-2]["role"] == "assistant"
+            assert messages[-2]["content"] == "part-1"
+            assert messages[-1]["role"] == "user"
+            assert messages[-1]["content"] == "continue!"
+
+        asyncio.run(_go())
+
+    def test_cap_at_three_cycles(self, caplog):
+        # 4 length responses → exactly 3 continuation dispatches
+        # (initial + 3) and a warning logged for the unfinished tail.
+        import asyncio
+        import logging
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response("c0", finish_reason="length")
+            rest = [
+                self._make_response("c1", finish_reason="length"),
+                self._make_response("c2", finish_reason="length"),
+                self._make_response("c3", finish_reason="length"),
+            ]
+            dispatch, log = self._make_dispatch(rest)
+            messages: list = []
+            with caplog.at_level(logging.WARNING):
+                resp, budget, chunks = await _continue_on_length(
+                    initial_response=initial,
+                    initial_budget=1.0,
+                    messages=messages,
+                    dispatch=dispatch,
+                    continue_prompt="more",
+                    enabled=True,
+                    role_label="test_role",
+                )
+            assert len(log) == 3, "must cap at 3 continuation dispatches"
+            assert chunks == ["c0", "c1", "c2", "c3"]
+            assert any(
+                "still truncated" in r.message and "test_role" in r.message
+                for r in caplog.records
+                if r.levelno >= logging.WARNING
+            )
+
+        asyncio.run(_go())
+
+    def test_messages_grow_two_per_cycle(self):
+        # Each continuation cycle appends exactly one assistant turn
+        # and one user turn to the messages list.
+        import asyncio
+        from harness.graph import _continue_on_length
+
+        async def _go():
+            initial = self._make_response("a", finish_reason="length")
+            rest = [
+                self._make_response("b", finish_reason="length"),
+                self._make_response("c", finish_reason="stop"),
+            ]
+            dispatch, _log = self._make_dispatch(rest)
+            messages: list = []
+            await _continue_on_length(
+                initial_response=initial,
+                initial_budget=1.0,
+                messages=messages,
+                dispatch=dispatch,
+                continue_prompt="cont",
+                enabled=True,
+                role_label="test_role",
+            )
+            # Two cycles × (assistant, user) = 4 messages.
+            assert len(messages) == 4
+            assert [m["role"] for m in messages] == [
+                "assistant", "user", "assistant", "user",
+            ]
+            assert [m["content"] for m in messages] == [
+                "a", "cont", "b", "cont",
+            ]
+
+        asyncio.run(_go())
+
+
+class TestResolveContinueOnLength:
+    """Coverage for graph._resolve_continue_on_length — the per-role
+    flag lookup with documented defaults. The defaults table is
+    load-bearing: omitting the config (or any role within it) MUST
+    preserve current behaviour (only patching continues on length)."""
+
+    def test_default_when_state_lacks_config(self):
+        from harness.graph import _resolve_continue_on_length
+        state: dict = {}
+        assert _resolve_continue_on_length(state, "patching") is True
+        assert _resolve_continue_on_length(state, "planning") is False
+        assert _resolve_continue_on_length(state, "repair") is False
+        assert _resolve_continue_on_length(state, "doc_reviewer") is False
+        assert _resolve_continue_on_length(state, "code_reviewer") is False
+
+    def test_default_when_continue_map_missing(self):
+        from harness.graph import _resolve_continue_on_length
+        state = {"llm_dispatch_config": {"max_tokens_default": 4096}}
+        assert _resolve_continue_on_length(state, "patching") is True
+        assert _resolve_continue_on_length(state, "planning") is False
+
+    def test_per_role_override_wins(self):
+        from harness.graph import _resolve_continue_on_length
+        state = {
+            "llm_dispatch_config": {
+                "continue_on_length": {
+                    "planning": True,
+                    "patching": False,
+                    "doc_reviewer": True,
+                },
+            },
+        }
+        assert _resolve_continue_on_length(state, "planning") is True
+        assert _resolve_continue_on_length(state, "patching") is False
+        assert _resolve_continue_on_length(state, "doc_reviewer") is True
+        # Unset roles inherit defaults.
+        assert _resolve_continue_on_length(state, "repair") is False
+        assert _resolve_continue_on_length(state, "code_reviewer") is False
+
+    def test_unknown_role_defaults_false(self):
+        # Defensive: a role not in the defaults table falls back to
+        # False rather than crashing. Lets the helper be reused for
+        # future nodes without a code change to the resolver.
+        from harness.graph import _resolve_continue_on_length
+        state: dict = {}
+        assert _resolve_continue_on_length(state, "future_node") is False
+
+    def test_null_role_value_falls_back_to_default(self):
+        # A null per-role entry is treated like "unset" — fall back to
+        # the documented default for that role rather than coercing
+        # to False.
+        from harness.graph import _resolve_continue_on_length
+        state = {
+            "llm_dispatch_config": {
+                "continue_on_length": {"patching": None},
+            },
+        }
+        assert _resolve_continue_on_length(state, "patching") is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

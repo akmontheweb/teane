@@ -546,7 +546,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # enabled defaults to FALSE (the node short-circuits to the standard
     # patching flow). Flip to True per-config when running a workload where
     # parallel exploration is likely to find a passing variant — see the
-    # speculative.enabled discussion in config.json.example. num_variants is
+    # speculative.enabled discussion in config/config.json. num_variants is
     # the fork count; temperature controls per-variant diversity (sweet spot
     # 0.2-0.4 for code); selection_strategy is the winner-pick rule.
     "speculative": frozenset({
@@ -565,6 +565,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # names, so future NodeRole additions don't break this list.
     "llm_dispatch": frozenset({
         "max_tokens_default", "max_tokens_per_role",
+        # Per-role bool map controlling the finish_reason=="length"
+        # continuation loop in graph._continue_on_length. Per-role
+        # defaults live in graph._CONTINUE_ON_LENGTH_DEFAULTS; an
+        # operator-supplied entry overrides the default for that role.
+        # See the _llm_dispatch_comment block in config.json for the
+        # per-role risk profile.
+        "continue_on_length",
         # Prompt caching master switch. Default True. Falls back to the
         # legacy string-form Anthropic system payload when False, and
         # silences the prefix-stability drift events. Single-flag
@@ -769,6 +776,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.voting": (dict,),
     "llm_dispatch.max_tokens_default": (int, str, type(None)),
     "llm_dispatch.max_tokens_per_role": (dict,),
+    "llm_dispatch.continue_on_length": (dict,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "web_tools.enabled": (bool,),
     "web_tools.max_bytes": (int,),
@@ -1154,6 +1162,21 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                     f"llm_dispatch.max_tokens_per_role.{role_name}",
                     role_mt,
                 )
+
+        continue_map = dispatch_cfg.get("continue_on_length", {})
+        if isinstance(continue_map, dict):
+            for role_name, role_flag in continue_map.items():
+                if not isinstance(role_name, str) or not role_name.strip():
+                    errors.append(
+                        f"'llm_dispatch.continue_on_length' keys must be "
+                        f"non-empty role-name strings, got {role_name!r}."
+                    )
+                    continue
+                if not isinstance(role_flag, bool):
+                    errors.append(
+                        f"'llm_dispatch.continue_on_length.{role_name}' "
+                        f"must be a bool, got {type(role_flag).__name__}."
+                    )
 
     # --- 5. Env var presence for every model referenced by routing ---
     referenced_models: set[str] = set()
@@ -4005,6 +4028,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                         gateway=gateway,
                         budget_remaining_usd=budget_usd,
                         user_goal=args.prompt or "",
+                        llm_dispatch_config=config.get("llm_dispatch", {}),
                     )
                     if review_result["ok"] and review_result.get("review_path"):
                         logger.info(
@@ -4080,6 +4104,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                                 gateway=gateway,
                                 budget_remaining_usd=budget_usd,
                                 user_goal=args.prompt or "",
+                                llm_dispatch_config=config.get("llm_dispatch", {}),
                             )
                             if arch_review_result["ok"] and arch_review_result.get("review_path"):
                                 logger.info(
@@ -4204,6 +4229,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             change_requests_config=config.get("change_requests", {}),
             repo_memory_config=config.get("memory", {}),
             repo_index_config=config.get("repo_index", {}),
+            llm_dispatch_config=config.get("llm_dispatch", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -4550,6 +4576,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
+            llm_dispatch_config=config.get("llm_dispatch", {}),
         )
     except Exception:
         logger.exception("Resume execution failed.")
@@ -5244,7 +5271,7 @@ def _doctor_check_global_config() -> tuple[str, str]:
     path = _get_global_config_path()
     if not os.path.isfile(path):
         return "fail", (
-            f"missing {path} — run scripts/setup.py or copy config/config.json.example to config/config.json"
+            f"missing {path} — run scripts/setup.py or restore the file from git"
         )
     try:
         with open(path, "r", encoding="utf-8") as f:

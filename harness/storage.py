@@ -638,8 +638,11 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
                 return False, None, str(e)
 
         def _try_json() -> tuple[bool, Any, Optional[str]]:
+            # Audit §5.16: strict decode so a truncated UTF-8 sequence
+            # in a message field surfaces as a corruption signal rather
+            # than getting silently mangled with U+FFFD replacements.
             try:
-                return True, json.loads(blob.decode("utf-8", errors="replace")), None
+                return True, json.loads(blob.decode("utf-8", errors="strict")), None
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 return False, None, str(e)
 
@@ -698,7 +701,17 @@ def validate_checkpoint_schema(metadata_blob: Any) -> Optional[int]:
       - Version < MIN_RESUMABLE_SCHEMA_VERSION: incompatible older format.
         Refuse with the same explicit error.
     """
-    metadata = _deserialize_checkpoint_blob(metadata_blob)
+    # Audit §5.15: use strict decode so a corrupted metadata blob is
+    # treated as a schema mismatch instead of silently allowing resume
+    # against unknown state. A blob that decodes cleanly but lacks the
+    # version stamp falls into the legacy path below.
+    try:
+        metadata = _deserialize_checkpoint_blob(metadata_blob, strict=True)
+    except CheckpointCorruptedError as exc:
+        raise CheckpointSchemaMismatchError(
+            f"Checkpoint metadata blob is undecodable: {exc}. Refusing to "
+            f"resume — the on-disk state cannot be trusted."
+        ) from exc
     if not isinstance(metadata, dict):
         return None
     raw = metadata.get(SCHEMA_VERSION_METADATA_KEY)
@@ -1002,12 +1015,23 @@ async def purge_checkpoints(db_path: str) -> int:
     import aiosqlite
 
     async with aiosqlite.connect(expanded_path) as db:
-        # Writes must be deleted first due to FK-like dependency
-        cursor = await db.execute("DELETE FROM writes")
-        deleted = cursor.rowcount
-        cursor = await db.execute("DELETE FROM checkpoints")
-        deleted += cursor.rowcount
-        await db.commit()
+        # Audit §5.17: explicit BEGIN IMMEDIATE + rollback-on-error so
+        # a mid-loop OSError between the two DELETEs can't leave the
+        # DB with writes wiped but orphan checkpoints retained.
+        deleted = 0
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("DELETE FROM writes")
+            deleted = cursor.rowcount or 0
+            cursor = await db.execute("DELETE FROM checkpoints")
+            deleted += cursor.rowcount or 0
+            await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
     logger.info("[storage] Purged all data: %d rows deleted.", deleted)
     return deleted

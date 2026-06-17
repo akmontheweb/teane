@@ -650,6 +650,96 @@ def get_stats(
         conn.close()
 
 
+def update_index_for_files(
+    workspace_path: str,
+    modified_files: Iterable[str],
+    cfg: Optional[RepoIndexConfig] = None,
+) -> int:
+    """Re-chunk and re-index only the listed files. Audit §6.5.
+
+    For TF-IDF this triggers a full rebuild because the IDF score
+    depends on the whole-corpus document frequency, so per-file
+    re-vectorisation would silently use stale weights. For the
+    embedding backend only the modified files are re-chunked and
+    re-vectorised; the rest of the index is left intact.
+
+    Best-effort: any failure logs and returns 0 so the caller (the
+    graph nodes that just landed patches) never crashes on an index
+    update path. Returns the number of chunks refreshed.
+    """
+    cfg = cfg or RepoIndexConfig()
+    file_list = [str(p) for p in modified_files if p]
+    if not file_list:
+        return 0
+    workspace_id = _workspace_id(workspace_path)
+    try:
+        existing = get_stats(workspace_path, cfg)
+    except Exception:  # noqa: BLE001
+        existing = None
+    if existing is None:
+        # No prior index — nothing to update incrementally.
+        return 0
+    if existing.backend == "tfidf":
+        # IDF is corpus-wide; correct re-fit needs the full corpus.
+        try:
+            stats = build_index(workspace_path, cfg)
+            return stats.chunk_count
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[repo_index] tfidf rebuild failed: %s", exc)
+            return 0
+    if existing.backend != "openai_embeddings":
+        return 0
+    # Embedding backend: rebuild just the listed files.
+    try:
+        chunker = Chunker(cfg)
+        backend = make_backend(cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[repo_index] backend init failed: %s", exc)
+        return 0
+    new_chunks: list[Chunk] = []
+    for rel in file_list:
+        try:
+            new_chunks.extend(chunker.chunks_for_file(workspace_path, rel))
+        except Exception:  # noqa: BLE001 — skip unreadable files
+            continue
+    if not new_chunks:
+        return 0
+    try:
+        vectors = backend.fit_chunks(new_chunks)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[repo_index] re-vectorise failed: %s", exc)
+        return 0
+    conn = _open_db(cfg)
+    try:
+        with conn:
+            placeholders = ",".join("?" for _ in file_list)
+            conn.execute(
+                f"DELETE FROM repo_chunks WHERE workspace_id = ? AND "
+                f"file_path IN ({placeholders})",
+                (workspace_id, *file_list),
+            )
+            conn.executemany(
+                "INSERT INTO repo_chunks (workspace_id, file_path, chunk_index, "
+                "file_sha, content, vector_json) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        workspace_id, ch.file_path, ch.chunk_index,
+                        ch.file_sha(), ch.content, vec,
+                    )
+                    for ch, vec in zip(new_chunks, vectors)
+                ],
+            )
+            conn.execute(
+                "UPDATE repo_meta SET built_at = ?, chunk_count = "
+                "(SELECT COUNT(*) FROM repo_chunks WHERE workspace_id = ?) "
+                "WHERE workspace_id = ?",
+                (_now_iso(), workspace_id, workspace_id),
+            )
+    finally:
+        conn.close()
+    return len(new_chunks)
+
+
 def clear_index(
     workspace_path: str, cfg: Optional[RepoIndexConfig] = None,
 ) -> int:

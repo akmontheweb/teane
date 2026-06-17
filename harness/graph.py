@@ -2339,6 +2339,27 @@ Generate your patches NOW. Only the blocks above. No other text."""
             except Exception as _impact_exc:  # noqa: BLE001
                 logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
 
+            # Audit §6.5: invalidate / refresh the repo index for the
+            # files we just changed so the planner's "top relevant
+            # chunks" injection doesn't ship pre-patch content on
+            # subsequent dispatches. Best-effort: index churn must
+            # never fail the patching node.
+            try:
+                from harness.repo_index import (
+                    update_index_for_files, RepoIndexConfig,
+                )
+                idx_cfg_dict = (state.get("repo_index_config") or {}) if isinstance(state, dict) else {}
+                if idx_cfg_dict:
+                    _idx_cfg = RepoIndexConfig(**{
+                        k: v for k, v in idx_cfg_dict.items()
+                        if k in RepoIndexConfig.__dataclass_fields__
+                    })
+                else:
+                    _idx_cfg = RepoIndexConfig()
+                update_index_for_files(workspace, list(modified_files), _idx_cfg)
+            except Exception as _idx_exc:  # noqa: BLE001
+                logger.debug("[repo_index] incremental update failed: %s", _idx_exc)
+
         logger.info(
             "[patching_node] Patches applied. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
             "patches=%d succeed=%d fail=%d",
@@ -2684,8 +2705,31 @@ def _strip_build_output_noise(raw_output: str) -> str:
     if not raw_output:
         return raw_output
     kept: list[str] = []
+    # Audit §6.9: a *Warning header (e.g. "foo.py:42: DeprecationWarning:
+    # use X instead") is typically followed by the offending source line
+    # and an empty separator. Drop the header AND the indented follow-up
+    # lines until the first blank/separator so the LLM sees neither the
+    # warning nor its stack-style continuation.
+    skip_indented_until_blank = False
     for line in raw_output.splitlines():
+        if skip_indented_until_blank:
+            stripped = line.strip()
+            if not stripped:
+                skip_indented_until_blank = False
+                continue
+            # Continuation lines are typically indented OR start with
+            # an identifier-like token (the source-line snippet pytest /
+            # python prints). Drop indented lines; stop on non-indented
+            # non-blank (a new diagnostic).
+            if line[:1] in (" ", "\t"):
+                continue
+            skip_indented_until_blank = False
         if any(p.search(line) for p in _BUILD_OUTPUT_NOISE_PATTERNS):
+            # If this looked like a Warning header line, also skip the
+            # following indented lines (the source-snippet that follows
+            # the ``...py:NN: SomeWarning: message`` header).
+            if "Warning" in line:
+                skip_indented_until_blank = True
             continue
         kept.append(line)
     # Preserve trailing-newline shape so the slicer's char-budget math
@@ -4949,6 +4993,24 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             except Exception as _impact_exc:  # noqa: BLE001
                 logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
 
+            # Audit §6.5: refresh the repo index for changed files.
+            try:
+                from harness.repo_index import (
+                    update_index_for_files as _update_idx,
+                    RepoIndexConfig as _RIConfig,
+                )
+                idx_cfg_dict = (state.get("repo_index_config") or {}) if isinstance(state, dict) else {}
+                if idx_cfg_dict:
+                    _idx_cfg = _RIConfig(**{
+                        k: v for k, v in idx_cfg_dict.items()
+                        if k in _RIConfig.__dataclass_fields__
+                    })
+                else:
+                    _idx_cfg = _RIConfig()
+                _update_idx(workspace, list(modified_files), _idx_cfg)
+            except Exception as _idx_exc:  # noqa: BLE001
+                logger.debug("[repo_index] incremental update failed: %s", _idx_exc)
+
         # Per-iteration commit (C3): when this round landed any patches,
         # commit the working tree with a structured per-iteration message
         # so the operator can `git log` / `git bisect` between iterations
@@ -5406,6 +5468,25 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "[router] %d consecutive repair iteration(s) landed zero patches. "
             "Loop is stuck; routing to HITL early (saves %d remaining iteration(s)).",
             consecutive_zero, max(0, max_iterations - total_repairs),
+        )
+        return _transition("human_intervention_node")
+
+    # Audit §6.1: generic no-progress tripwire that is NOT gated on
+    # has_autofixable. The earlier guard exempted any iteration that
+    # had an autofixable diagnostic — but an alternating cycle (pip
+    # missing → autofix → wheel missing → autofix → pip missing again)
+    # resets the per-symbol counter and slips past the same-symbol
+    # ceiling. After 5 consecutive zero-patch rounds we escalate even
+    # when autofix is in play; that's enough cycles to give a real
+    # autofix progression a fair chance while still bounding loops
+    # that aren't actually making the build move forward.
+    _GENERIC_NO_PROGRESS_LIMIT = 5
+    if consecutive_zero >= _GENERIC_NO_PROGRESS_LIMIT:
+        logger.warning(
+            "[router] %d consecutive repair iteration(s) landed zero real "
+            "patches even with autofix in play. Loop is not advancing "
+            "(likely alternating MISSING_DEP cycle); routing to HITL.",
+            consecutive_zero,
         )
         return _transition("human_intervention_node")
 

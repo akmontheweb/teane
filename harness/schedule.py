@@ -394,16 +394,54 @@ def record_run_started(
     daemon restart can flip dead in-flight rows to ``ended_at`` (audit
     §1.5). Older callers pass nothing → pid stays NULL → orphan-detection
     skips them (backwards-compatible).
+
+    Audit §1.16: if a row already exists for the (job_name, started_at)
+    pair (two runs colliding in the same second — leap-second tick, a
+    manual ``harness schedule once`` racing a daemon tick), bump the
+    timestamp by 1 µs until the insert succeeds rather than replacing
+    the prior row's log_path / pid.
     """
     conn = _open_history(cfg)
     try:
         with conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO schedule_runs "
-                "(job_name, started_at, log_path, pid) VALUES (?, ?, ?, ?)",
-                (job_name, started_at.isoformat(), log_path,
-                 int(pid) if pid is not None else None),
-            )
+            iso = started_at.isoformat()
+            attempt = 0
+            while attempt < 1000:
+                try:
+                    conn.execute(
+                        "INSERT INTO schedule_runs "
+                        "(job_name, started_at, log_path, pid) VALUES (?, ?, ?, ?)",
+                        (job_name, iso, log_path,
+                         int(pid) if pid is not None else None),
+                    )
+                    return
+                except sqlite3.IntegrityError:
+                    # PK collision (same job_name+started_at). The most
+                    # common path is record_run_started being called twice
+                    # for the SAME run (once at spawn, once with the pid)
+                    # — that's an intentional REPLACE so keep that
+                    # behaviour for true duplicates by detecting pid
+                    # presence on the existing row.
+                    existing = conn.execute(
+                        "SELECT pid FROM schedule_runs "
+                        "WHERE job_name = ? AND started_at = ?",
+                        (job_name, iso),
+                    ).fetchone()
+                    if existing is None or (existing[0] is None and pid is not None):
+                        # Genuine re-stamp of the same run (pid landed
+                        # after the original insert) — replace, not bump.
+                        conn.execute(
+                            "INSERT OR REPLACE INTO schedule_runs "
+                            "(job_name, started_at, log_path, pid) VALUES (?, ?, ?, ?)",
+                            (job_name, iso, log_path,
+                             int(pid) if pid is not None else None),
+                        )
+                        return
+                    # Different run colliding in the same second: bump
+                    # the iso timestamp by 1 µs and try again.
+                    started_at = started_at + timedelta(microseconds=1)
+                    iso = started_at.isoformat()
+                    attempt += 1
     finally:
         conn.close()
 

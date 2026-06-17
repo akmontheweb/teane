@@ -4046,19 +4046,29 @@ from harness.web_state import (  # noqa: E402  (intentional late import)
 
 _process_registry: Optional[ProcessRegistry] = None
 _hitl_queue: Optional[HitlQueue] = None
+# Audit §1.17: guard lazy-init under ThreadingMixIn. Without this lock,
+# two concurrent first-call threads could both enter the ``is None``
+# branch, both instantiate, and one would lose its handle — registrations
+# routed to the loser are silently dropped.
+_shared_state_lock = threading.Lock()
 
 
 def get_process_registry() -> ProcessRegistry:
     global _process_registry
+    # Double-checked pattern: cheap path stays lock-free once initialised.
     if _process_registry is None:
-        _process_registry = ProcessRegistry()
+        with _shared_state_lock:
+            if _process_registry is None:
+                _process_registry = ProcessRegistry()
     return _process_registry
 
 
 def get_hitl_queue() -> HitlQueue:
     global _hitl_queue
     if _hitl_queue is None:
-        _hitl_queue = HitlQueue()
+        with _shared_state_lock:
+            if _hitl_queue is None:
+                _hitl_queue = HitlQueue()
     return _hitl_queue
 
 
@@ -4066,8 +4076,9 @@ def reset_shared_state() -> None:
     """Test hook — drop the shared registry + queue so each test gets
     isolated state."""
     global _process_registry, _hitl_queue
-    _process_registry = None
-    _hitl_queue = None
+    with _shared_state_lock:
+        _process_registry = None
+        _hitl_queue = None
 
 
 # ---------------------------------------------------------------------------

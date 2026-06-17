@@ -1601,19 +1601,37 @@ _LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\|\s?")
 def _strip_line_number_prefixes(search: str) -> Optional[str]:
     """Strip a uniform ``\\s*\\d+\\|\\s?`` prefix from every non-blank line
     of ``search`` and return the result. Returns ``None`` when the prefix
-    doesn't appear on every non-blank line (i.e. the search doesn't look
-    like a copy-paste from the patcher's annotated wider-context window).
+    doesn't appear on every non-blank line OR when the numeric prefixes
+    don't form a contiguous monotone run starting from some line N
+    (i.e. the search doesn't look like a copy-paste from the patcher's
+    annotated wider-context window).
 
-    The conservative "every non-blank line must match" rule prevents the
-    stripper from mangling user content that happens to start with a
-    digit and pipe by coincidence.
+    The conservative "every non-blank line must match AND numbers form a
+    contiguous run" rule prevents the stripper from mangling user content
+    where multiple lines happen to start with a digit and pipe by
+    coincidence (audit §6.11) — e.g. markdown documenting the patcher's
+    own annotation format, code that arrays integers into pipe-separated
+    output, etc.
     """
     lines = search.splitlines(keepends=True)
     non_blank = [line for line in lines if line.strip()]
     if not non_blank:
         return None
-    if not all(_LINE_NUMBER_PREFIX_RE.match(line) for line in non_blank):
+    matches = [_LINE_NUMBER_PREFIX_RE.match(line) for line in non_blank]
+    if not all(matches):
         return None
+    # Audit §6.11: require the numeric prefixes to form a contiguous
+    # monotonically-increasing run. The patcher's annotated context
+    # window emits ``  N| line`` for consecutive N — coincidental matches
+    # in arbitrary content rarely have that shape.
+    try:
+        nums = [int(m.group(0).strip().rstrip("|").strip()) for m in matches]
+    except (AttributeError, ValueError):
+        return None
+    if len(nums) >= 2:
+        for prev, curr in zip(nums, nums[1:]):
+            if curr != prev + 1:
+                return None
     stripped = [
         _LINE_NUMBER_PREFIX_RE.sub("", line) if line.strip() else line
         for line in lines

@@ -829,7 +829,19 @@ class AnthropicProvider(BaseLLM):
             payload["temperature"] = 1.0
             # Ensure max_tokens accommodates the thinking budget + visible reply
             if max_tokens <= budget:
-                payload["max_tokens"] = budget + 1024
+                # Audit §4.16: log when we silently rewrite a caller-supplied
+                # max_tokens upward to fit the thinking budget so cost-control
+                # surprise doesn't go undetected.
+                rewritten = budget + 1024
+                logger.warning(
+                    "[anthropic] thinking mode: caller-supplied max_tokens=%d "
+                    "is below the %d-token thinking budget; rewriting to %d "
+                    "(model=%s). Reduce models.%s.thinking_budget_tokens or "
+                    "the per-role max_tokens cap to avoid this.",
+                    max_tokens, budget, rewritten,
+                    self.spec.model_id, self.spec.model_id,
+                )
+                payload["max_tokens"] = rewritten
 
         logger.debug("[anthropic] Sending completion request. model=%s thinking=%s",
                      self.spec.model_id, thinking and self.spec.supports_thinking)
@@ -1442,20 +1454,32 @@ def _delay_from_rate_limit_headers(
                 dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
                 delta = (dt - datetime.now(timezone.utc)).total_seconds()
                 if delta > 0:
-                    return delta
+                    # Audit §4.15: cap so a malformed future timestamp
+                    # can't pin one dispatch for hours.
+                    return min(delta, _RA_MAX)
             except (TypeError, ValueError):
                 pass
 
-    # 3. OpenAI X-RateLimit-Reset (epoch seconds)
+    # 3. OpenAI X-RateLimit-Reset (epoch seconds). Audit §4.15: the
+    # earlier ``target > now`` heuristic misclassified stale epoch
+    # values that happen to be in the past, returning the raw value
+    # (1.7 billion seconds) as the delay. Cap both interpretations to
+    # ``_RA_MAX`` so a malformed header can never make us sleep
+    # forever.
     x_reset = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset-requests")
     if x_reset:
         try:
             target = float(x_reset)
             now = datetime.now(timezone.utc).timestamp()
-            # Heuristic: if value > now, it's epoch; else seconds-from-now
-            delta = target - now if target > now else target
+            # If value looks like a recent epoch (within ±30 days of now)
+            # interpret as epoch; otherwise treat as seconds-from-now.
+            month_seconds = 30 * 86400.0
+            if abs(target - now) < month_seconds and target >= now:
+                delta = target - now
+            else:
+                delta = max(0.0, target)
             if delta > 0:
-                return delta
+                return min(delta, _RA_MAX)
         except ValueError:
             pass
 
@@ -1463,7 +1487,7 @@ def _delay_from_rate_limit_headers(
     rl_reset = headers.get("RateLimit-Reset")
     if rl_reset:
         try:
-            return max(0.0, float(rl_reset))
+            return max(0.0, min(float(rl_reset), _RA_MAX))
         except ValueError:
             pass
 

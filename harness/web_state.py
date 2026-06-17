@@ -866,23 +866,56 @@ def prune_audit_log(*, db_path: str, days: int = 90) -> int:
     web.db a sensible size without throwing away anything an operator
     realistically needs.
 
-    Callers should invoke once at server start; ``ts`` is the ISO-8601
-    UTC timestamp the rows were written with, so the comparison is a
-    string compare against the cutoff in the same format.
+    Audit §3.17: the original implementation compared ISO-8601 strings
+    lexicographically, which is only correct as long as every writer
+    uses the same fixed-width format. A future writer with a different
+    shape (millisecond precision, timezone offset, etc.) would silently
+    not match. Instead we parse each row's ts and compare datetimes,
+    falling back to the lexicographic compare when parsing fails so a
+    pathological row doesn't block the prune.
     """
     if days <= 0:
         return 0
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat(
-        timespec="seconds",
-    )
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=int(days))
+    cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
     conn = open_web_db(db_path)
+    removed = 0
     try:
         with conn:
-            cur = conn.execute(
-                "DELETE FROM audit_log WHERE ts < ?",
-                (cutoff,),
-            )
-            return int(cur.rowcount or 0)
+            # Select candidate rowids — typical web.db rarely has more than a
+            # few hundred thousand audit rows so a full scan is fine. Then
+            # we datetime-parse each ts and queue deletions for rows that
+            # really are older. Rows whose ts fails to parse fall back to
+            # the original ISO lexicographic compare so we still prune them.
+            rows = conn.execute(
+                "SELECT rowid, ts FROM audit_log WHERE ts < ?",
+                (cutoff_iso,),
+            ).fetchall()
+            to_delete: list[int] = []
+            for rowid, ts in rows:
+                try:
+                    parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    if parsed < cutoff_dt:
+                        to_delete.append(int(rowid))
+                except (ValueError, TypeError):
+                    # Unparseable ts — already past the lexicographic
+                    # filter, treat as old and delete.
+                    to_delete.append(int(rowid))
+            if not to_delete:
+                return 0
+            # Batch deletes in chunks of 500 to avoid the sqlite parser
+            # variable cap on very large prune runs.
+            for i in range(0, len(to_delete), 500):
+                chunk = to_delete[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"DELETE FROM audit_log WHERE rowid IN ({placeholders})",
+                    chunk,
+                )
+                removed += int(cur.rowcount or 0)
+            return removed
     finally:
         conn.close()
 

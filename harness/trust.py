@@ -458,7 +458,21 @@ SCRUBBED_BUILD_ENV_VARS: frozenset[str] = frozenset({
     # Package registry / SaaS
     "NPM_TOKEN", "PYPI_TOKEN", "STRIPE_SECRET_KEY", "SLACK_TOKEN",
     "DATABASE_URL",  # may carry credentials; re-export explicitly if needed
+    # Audit §3.16: scrub these too — a build doesn't need them by default,
+    # and leaving them through lets a hostile LLM-generated test exfiltrate
+    # the operator's host kubeconfig, ssh-agent socket, or proxy creds.
+    "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+    "KUBECONFIG",
 })
+
+
+# Prefix patterns (case-insensitive) for env vars to scrub. Useful when
+# the family is open-ended (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, ALL_PROXY,
+# plus their lowercase forms; *_COOKIES; etc.). Audit §3.16.
+_SCRUBBED_BUILD_ENV_PREFIXES: tuple[str, ...] = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
 
 
 def safe_subprocess_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
@@ -470,7 +484,11 @@ def safe_subprocess_env(extra: Optional[dict[str, str]] = None) -> dict[str, str
     Every subprocess runner in the harness should call this instead of
     ``os.environ.copy()`` directly.
     """
-    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_BUILD_ENV_VARS}
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in SCRUBBED_BUILD_ENV_VARS
+        and not any(k == p or k.startswith(p + "_") for p in _SCRUBBED_BUILD_ENV_PREFIXES)
+    }
     if extra:
         env.update(extra)
     return env

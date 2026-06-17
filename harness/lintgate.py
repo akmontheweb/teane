@@ -687,6 +687,34 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
         status_parts.append("  No formatters triggered (tools not installed or no matching file types).")
     messages.append({"role": "system", "content": "\n".join(status_parts)})
 
+    # Audit §6.12: lintgate's auto-formatters mutated `files_formatted`
+    # on disk. The patcher's idempotency check compares against the
+    # hashes recorded when the LLM last read each file — so without a
+    # refresh, the next REPLACE_BLOCK on a formatted file would mis-
+    # match. Re-hash the formatted files and update files_seen_by_llm
+    # in node_state so the downstream patch node sees current content.
+    refreshed_hashes: dict[str, str] = {}
+    if files_formatted:
+        try:
+            import hashlib as _hashlib
+            for filepath in files_formatted:
+                full_path = _resolve_path(filepath, workspace_path)
+                if not full_path or not os.path.isfile(full_path):
+                    continue
+                try:
+                    with open(full_path, "rb") as _fh:
+                        refreshed_hashes[filepath] = _hashlib.sha256(
+                            _fh.read()
+                        ).hexdigest()
+                except OSError:
+                    continue
+        except Exception as exc:  # noqa: BLE001 — best-effort hash refresh
+            logger.debug("[lintgate] hash refresh failed: %s", exc)
+    # Merge into the existing files_seen_by_llm dict so the patcher's
+    # idempotency check sees the post-format hashes on the next pass.
+    prior_seen = (state.get("node_state", {}) or {}).get("files_seen_by_llm") or {}
+    merged_seen = {**prior_seen, **refreshed_hashes}
+
     return {
         "messages": messages,
         "node_state": {
@@ -710,7 +738,8 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                     }
                     for d in web_asset_diagnostics
                 ],
-            }
+            },
+            "files_seen_by_llm": merged_seen,
         }
     }
 

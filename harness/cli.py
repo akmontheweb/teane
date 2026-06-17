@@ -289,8 +289,14 @@ def _get_global_config_path() -> str:
 
     The harness package lives at ``<root>/harness/``, so the parent of
     this module's directory is the repo root.
+
+    Audit §5.19: resolve symlinks via :func:`os.path.realpath` so a
+    ``pip install -e`` from a symlinked checkout (or any deployment
+    where the harness module is symlinked) still locates the real
+    source repo's ``config/`` directory rather than pointing inside a
+    venv site-packages copy.
     """
-    package_dir = os.path.dirname(os.path.abspath(__file__))
+    package_dir = os.path.dirname(os.path.realpath(__file__))
     repo_root = os.path.dirname(package_dir)
     return os.path.join(repo_root, "config", "config.json")
 

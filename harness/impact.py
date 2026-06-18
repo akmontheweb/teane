@@ -1041,6 +1041,109 @@ def _detect_source_root(workspace_path: str) -> Optional[str]:
     return best_name
 
 
+def _detect_source_roots(workspace_path: str) -> list[str]:
+    """Return every top-level directory that holds substantial source code.
+
+    Same scan as :func:`_detect_source_root`, but does NOT collapse the
+    answer to a single dominant directory. Multi-root monorepo layouts
+    (``client/`` + ``server/``, ``frontend/`` + ``backend/``, ``api/`` +
+    ``worker/``) need every meaningful source dir in the patcher
+    allowlist — using only the dominant one rejects every patch
+    targeting the smaller side.
+
+    Reduction rules:
+      1. When a directory in :data:`_PREFERRED_SOURCE_NAMES` holds source
+         files, return just that single dir. The convention is
+         authoritative: when the repo follows the standard ``src/`` /
+         ``app/`` shape, treat it as canonical.
+      2. Otherwise return every top-level dir whose source file count is
+         "substantial": ``count >= max(2, 0.15 * largest_dir_count)``.
+         The threshold filters out scratch / example dirs but keeps both
+         sides of a roughly balanced ``client/`` + ``server/`` split.
+      3. Include any top-level Python-package dir (``__init__.py``
+         present) with at least one source file, even if it falls under
+         the substantial threshold — a small package still owns its
+         space.
+      4. Empty list when no source files exist anywhere (greenfield) or
+         when source lives only at the workspace root (flat layout).
+
+    Returned names are bare directory names — no trailing slash, no path
+    prefix. Order is descending by source file count so callers that want
+    a "primary" root can read element 0.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return []
+
+    try:
+        entries = os.listdir(workspace_path)
+    except OSError:
+        return []
+
+    counts: dict[str, int] = {}
+    package_dirs: set[str] = set()
+    files_scanned = 0
+
+    for entry in entries:
+        full = os.path.join(workspace_path, entry)
+        if not os.path.isdir(full):
+            continue
+        if entry.startswith(".") or entry in _NEVER_SOURCE_DIRS:
+            continue
+
+        if os.path.isfile(os.path.join(full, "__init__.py")):
+            package_dirs.add(entry)
+
+        dir_count = 0
+        for sub_root, sub_dirs, sub_files in os.walk(full):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+            ]
+            for fname in sub_files:
+                if os.path.splitext(fname)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                    dir_count += 1
+                    files_scanned += 1
+                    if files_scanned >= _MAX_FILES_PER_SCAN:
+                        break
+            if files_scanned >= _MAX_FILES_PER_SCAN:
+                break
+        counts[entry] = dir_count
+        if files_scanned >= _MAX_FILES_PER_SCAN:
+            break
+
+    # Rule 1: preferred-name match wins solo. When `src/` (or `app/`,
+    # `lib/`, ...) actually contains code, the repo follows the canonical
+    # layout — treat it as the single source root even if other dirs
+    # incidentally contain source files (vendored snippets, scratch dirs).
+    preferred_with_source = {
+        name: cnt for name, cnt in counts.items()
+        if name in _PREFERRED_SOURCE_NAMES and cnt > 0
+    }
+    if preferred_with_source:
+        best = max(preferred_with_source.items(), key=lambda kv: kv[1])
+        return [best[0]]
+
+    if not counts:
+        return []
+
+    max_count = max(counts.values())
+    if max_count == 0:
+        # No source in any subdir. Surface package-dir candidates so an
+        # empty-but-defined Python package still gets allowlisted.
+        return sorted(package_dirs)
+
+    threshold = max(2, max_count * 0.15)
+    selected: dict[str, int] = {
+        name: cnt for name, cnt in counts.items() if cnt >= threshold
+    }
+    for pkg in package_dirs:
+        cnt = counts.get(pkg, 0)
+        if cnt > 0 and pkg not in selected:
+            selected[pkg] = cnt
+
+    return [name for name, _ in sorted(selected.items(), key=lambda kv: kv[1], reverse=True)]
+
+
 def _is_greenfield_workspace(workspace_path: str) -> bool:
     """True when the workspace has no source files anywhere — a true
     greenfield project where the LLM is about to scaffold from scratch.

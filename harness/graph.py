@@ -377,18 +377,31 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     section, so the LLM sees the same rules as the patcher applies.
     """
     from harness.impact import (
-        _detect_source_root,
+        _detect_source_roots,
         _is_greenfield_workspace,
         _workspace_basename_variants,
     )
-    root = _detect_source_root(workspace_path)
+    roots = _detect_source_roots(workspace_path)
 
-    if root:
+    if roots:
+        # Each detected root contributes its own directory prefix. Tests
+        # co-located inside a root (e.g. `client/src/Foo.test.jsx` next
+        # to `client/src/Foo.jsx`, the Jest/RTL convention) pass via the
+        # `<root>/` prefix automatically — they don't need an extra
+        # allowlist entry. Top-level `tests/` / `test/` / `__tests__/`
+        # are kept for integration-test suites that live at workspace
+        # root regardless of the source layout.
         allowlist: list[str] = [
-            f"{root}/",
+            *[f"{r}/" for r in roots],
             "tests/", "test/", "__tests__/",
             *_ROOT_ALLOWLIST_FILES,
         ]
+        if len(roots) > 1:
+            logger.info(
+                "[allowlist] Multi-root workspace %s — allowing patches "
+                "under %s. Each root carries its own co-located tests.",
+                workspace_path, [f"{r}/" for r in roots],
+            )
     elif _is_greenfield_workspace(workspace_path):
         # Greenfield project (no source files yet) — the LLM IS the one
         # defining the layout, so constraining its package directory name
@@ -474,9 +487,9 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     # actually use. A pure FastAPI project doesn't need the Angular skill
     # in its system prompt; trimming saves ~2-3 KB per call and reduces
     # noise in the prompt.
-    from harness.impact import _detect_workspace_stack, _detect_source_root
+    from harness.impact import _detect_workspace_stack, _detect_source_roots
     workspace_tags = _detect_workspace_stack(workspace_path)
-    source_root = _detect_source_root(workspace_path)
+    source_roots = _detect_source_roots(workspace_path)
 
     # Tier 1: Harness skills (harness/skills/*.md) — agent standards +
     # stack-specific skills filtered by `applies_to:` frontmatter.
@@ -516,11 +529,12 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     # outside the allowlist are rejected with a clear error so the LLM
     # tries again with the constraint in mind.
     layout_block = ""
-    if source_root:
+    if len(source_roots) == 1:
+        root = source_roots[0]
         layout_block = (
             f"## Workspace Layout (mandatory)\n"
-            f"The workspace organizes its source under `{source_root}/`. "
-            f"**All new source files MUST be created under `{source_root}/`.** "
+            f"The workspace organizes its source under `{root}/`. "
+            f"**All new source files MUST be created under `{root}/`.** "
             f"Do NOT place new modules at workspace root.\n\n"
             f"The only files that may live at workspace root are: "
             f"`setup.py`, `setup.cfg`, `pyproject.toml`, `conftest.py`, "
@@ -530,6 +544,37 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
             f"`test/`, or `__tests__/` per the language convention. "
             f"CREATE_FILE blocks that target other root paths will be "
             f"rejected by the patcher.\n"
+        )
+    elif len(source_roots) > 1:
+        roots_inline = ", ".join(f"`{r}/`" for r in source_roots)
+        primary = source_roots[0]
+        layout_block = (
+            f"## Workspace Layout (mandatory — multi-root monorepo)\n"
+            f"This workspace is a multi-root monorepo. Source lives under: "
+            f"{roots_inline}. **All new source files MUST be created under "
+            f"one of these roots** — do NOT place new modules at workspace "
+            f"root or in any other top-level directory.\n\n"
+            f"When you create a file, choose the root whose existing code is "
+            f"the closest match. As rough guidance: front-end / UI code "
+            f"(React, Vue, Angular, browser bundles) belongs in the "
+            f"client-side root; HTTP handlers, models, and background "
+            f"workers belong in the server-side root. When the choice is "
+            f"ambiguous, prefer `{primary}/` (the largest existing root).\n\n"
+            f"Tests follow the convention of the root they exercise. JS / TS "
+            f"tests are typically co-located next to source as "
+            f"`*.test.{{js,jsx,ts,tsx}}` — that is allowed under any "
+            f"detected root. Python tests typically live in a sibling "
+            f"`tests/` subdirectory (e.g. `server/tests/`) or in a top-level "
+            f"`tests/`. The patcher rejects any CREATE_FILE / "
+            f"REPLACE_BLOCK that targets a top-level directory not in this "
+            f"list.\n\n"
+            f"The only files that may live at workspace root are: "
+            f"`setup.py`, `setup.cfg`, `pyproject.toml`, `package.json`, "
+            f"`conftest.py`, `manage.py`, `__init__.py`, `wsgi.py`, "
+            f"`asgi.py`, `main.py`, `requirements*.txt`, `tox.ini`, "
+            f"`pytest.ini`, `MANIFEST.in`, `.gitignore`, `Makefile`, plus "
+            f"the standard JS tool configs (`jest.config.*`, `vite.config.*`, "
+            f"`tsconfig*.json`, `.eslintrc*`, `.prettierrc*`, `.babelrc*`).\n"
         )
 
     # Web-app file manifest contract: only injected when this is a web

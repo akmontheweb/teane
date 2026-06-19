@@ -1015,7 +1015,7 @@ async def _execute_subprocess_with_timeout(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # Create new process group (PGID = PID)
+            **_platform.new_process_group_kwargs(),  # POSIX: start_new_session; Windows: CREATE_NEW_PROCESS_GROUP
             env=env,
         )
 
@@ -1461,7 +1461,7 @@ class DiskLogStreamer:
 
 
 def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -> None:
-    """Synchronous SIGTERM-then-SIGKILL of an entire process group.
+    """Synchronous SIGTERM-then-SIGKILL of an entire process group/tree.
 
     NOTE: This blocks the event loop with ``time.sleep(3.0)`` between the
     TERM and the KILL. Prefer :func:`_kill_process_group_async` from async
@@ -1469,13 +1469,11 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
     handful of callers that already had to be synchronous (atexit
     shutdown hooks, etc.).
 
-    On Windows ``os.killpg`` does not exist; the existing
-    ``except (ProcessLookupError, OSError)`` clauses would NOT catch the
-    resulting ``AttributeError`` and the harness would crash the moment a
-    build timed out. Gate the POSIX path on ``hasattr(os, "killpg")`` and
-    fall through to ``proc.kill()`` (asyncio's cross-platform terminator,
-    which maps to ``TerminateProcess`` on Win32) when the syscall family
-    is unavailable.
+    POSIX: SIGTERM the group via ``os.killpg``, sleep, SIGKILL the group.
+    Windows: ``taskkill /T /PID`` (graceful), wait, then ``taskkill /T /F``
+    (force) — both walk the WMI parent-child tree so grandchildren get
+    reaped along with the parent. Dispatched through
+    :func:`harness._platform.kill_process_tree`.
     """
     if pgid is not None and hasattr(os, "killpg"):
         try:
@@ -1489,7 +1487,15 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
             except (ProcessLookupError, OSError):
                 pass
         return
-    # Windows OR pgid-unavailable fallback: kill the parent process.
+    # Windows OR pgid-unavailable fallback: kill the whole tree of the
+    # spawned process by pid. taskkill /T walks the parent-child tree on
+    # Windows; on POSIX-without-killpg we just SIGKILL the parent.
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        _platform.kill_process_tree(pid, force=False)
+        time.sleep(3.0)
+        _platform.kill_process_tree(pid, force=True)
+        return
     try:
         proc.kill()
     except ProcessLookupError:
@@ -1499,12 +1505,15 @@ def _kill_process_group(pgid: Optional[int], proc: asyncio.subprocess.Process) -
 async def _kill_process_group_async(
     pgid: Optional[int], proc: asyncio.subprocess.Process,
 ) -> None:
-    """Async SIGTERM→SIGKILL of a process group without blocking the event loop.
+    """Async SIGTERM→SIGKILL of a process group/tree without blocking the event loop.
 
     Replaces the time.sleep(3.0) in _kill_process_group with await
     asyncio.sleep(3.0), so callers inside the asyncio runtime no longer
     freeze every other coroutine (gateway dispatch, MCP polling, SSE
     callbacks, schedule daemon ticks) for the grace period. Audit §1.12.
+
+    Windows path delegates to :func:`harness._platform.kill_process_tree`
+    which shells out to ``taskkill /T`` so grandchildren are reaped too.
     """
     if pgid is not None and hasattr(os, "killpg"):
         try:
@@ -1516,6 +1525,12 @@ async def _kill_process_group_async(
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+        return
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        _platform.kill_process_tree(pid, force=False)
+        await asyncio.sleep(3.0)
+        _platform.kill_process_tree(pid, force=True)
         return
     try:
         proc.kill()
@@ -1549,7 +1564,7 @@ async def run_subprocess_kill_on_timeout(
                 else asyncio.subprocess.STDOUT),
         cwd=cwd,
         env=env,
-        start_new_session=True,
+        **_platform.new_process_group_kwargs(),
     )
     pgid: Optional[int] = None
     if hasattr(os, "getpgid"):

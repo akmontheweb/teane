@@ -4390,7 +4390,7 @@ def spawn_harness_run(
                 stdout=stdout_fh,
                 stderr=_sub.STDOUT,
                 env=env,
-                start_new_session=True,
+                **_platform.new_process_group_kwargs(),
             )
             proc_ok = True
         finally:
@@ -4520,7 +4520,7 @@ def spawn_harness_resume(
                 stdout=stdout_fh,
                 stderr=_sub.STDOUT,
                 env=env,
-                start_new_session=True,
+                **_platform.new_process_group_kwargs(),
             )
             proc_ok = True
         finally:
@@ -4600,10 +4600,17 @@ def cancel_session(session_id: str) -> bool:
             return True
         _time.sleep(0.1)
     # Grace expired — escalate. Audit §2.2 (no-SIGKILL-escalation).
-    # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM,
-    # which the Win32 runtime maps to TerminateProcess — semantically
-    # a hard kill, same outcome.
-    reg.signal_running(session_id, getattr(_signal, "SIGKILL", _signal.SIGTERM))
+    # On POSIX this is killpg(SIGKILL) which reaches every descendant.
+    # On Windows, SIGKILL doesn't exist and popen.send_signal only kills
+    # the parent — grandchildren leak. Route through _platform.kill_process_tree
+    # which shells out to taskkill /T /F on Windows (walks the WMI parent-
+    # child tree) and falls back to killpg(SIGKILL) on POSIX.
+    if _platform.is_windows():
+        entry = reg.get(session_id)
+        if entry is not None and entry.is_running:
+            _platform.kill_process_tree(entry.pid, force=True)
+    else:
+        reg.signal_running(session_id, getattr(_signal, "SIGKILL", _signal.SIGTERM))
     return True
 
 

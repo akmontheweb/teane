@@ -25,6 +25,8 @@ import subprocess
 import sys
 from typing import Any, Optional
 
+from harness import _platform
+
 # Configure logging for the CLI
 logging.basicConfig(
     level=logging.INFO,
@@ -6257,8 +6259,9 @@ def _web_start_background(*, host: str, port: int) -> int:
         print(f"error: cannot open log file {log_path}: {exc}", file=sys.stderr)
         return 1
 
-    # Re-exec self in foreground mode. start_new_session=True detaches
-    # the child from this terminal's session so it survives `exit`.
+    # Re-exec self in foreground mode. POSIX start_new_session / Windows
+    # CREATE_NEW_PROCESS_GROUP both detach the child from this terminal's
+    # session/console so it survives `exit`.
     argv = [
         sys.executable, "-m", "harness.cli", "web", "start",
         "--host", host, "--port", str(port), "--background", "no",
@@ -6268,7 +6271,7 @@ def _web_start_background(*, host: str, port: int) -> int:
             argv,
             stdout=log_file, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            **_platform.new_process_group_kwargs(),
             cwd=os.getcwd(),
         )
     except OSError as exc:

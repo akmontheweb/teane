@@ -54,7 +54,12 @@ def test_safe_resolve_rejects_parent_symlink_escape(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     symlink_path = ws / "proxy"
-    os.symlink(str(outside), str(symlink_path))
+    # Windows refuses symlink creation without admin or developer mode;
+    # skip cleanly rather than mask the assertion under an OSError.
+    try:
+        os.symlink(str(outside), str(symlink_path))
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform")
     with pytest.raises(ValueError, match="(escapes|symlink)"):
         trust.safe_resolve(str(ws), "proxy/new.txt")
 

@@ -656,7 +656,7 @@ async def execute_job_once(
         with open(log_path, "wb") as log_fh:
             proc = await asyncio.create_subprocess_exec(
                 *argv, stdout=log_fh, stderr=subprocess.STDOUT,
-                start_new_session=True,
+                **_platform.new_process_group_kwargs(),
             )
             # Update the row with the live pid so orphan-detection on
             # daemon restart can decide whether to reap or re-attach
@@ -748,7 +748,7 @@ async def _run_hook(
             *argv, env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
+            **_platform.new_process_group_kwargs(),
         )
         if hasattr(os, "getpgid"):
             try:
@@ -1049,18 +1049,12 @@ class ScheduleDaemon:
             signalled = [pid for pid in signalled if _pid_alive_int(pid)]
             if signalled:
                 time.sleep(0.2)
-        # Anything still alive after the grace gets the kill signal.
-        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM,
-        # which Win32 maps to TerminateProcess (semantically a hard kill).
-        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        # Anything still alive after the grace gets reaped along with
+        # its descendants. On POSIX kill_process_tree uses
+        # killpg(SIGKILL); on Windows it shells out to taskkill /T /F
+        # which walks the WMI parent-child tree.
         for pid in signalled:
             try:
-                if hasattr(os, "killpg"):
-                    try:
-                        os.killpg(os.getpgid(pid), kill_sig)
-                    except (ProcessLookupError, OSError):
-                        os.kill(pid, kill_sig)
-                else:
-                    os.kill(pid, kill_sig)
-            except (ProcessLookupError, PermissionError, OSError):
+                _platform.kill_process_tree(pid, force=True)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
                 pass

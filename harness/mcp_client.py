@@ -48,6 +48,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from harness import _platform
 from harness.skills import (
     SkillSchema,
     SkillType,
@@ -237,7 +238,10 @@ class StdioMcpClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                start_new_session=True,  # own process group → clean shutdown
+                # POSIX: start_new_session; Windows: CREATE_NEW_PROCESS_GROUP.
+                # Either way the child is the root of its own group so the
+                # shutdown path can reap the whole tree cleanly.
+                **_platform.new_process_group_kwargs(),
             )
             self._reader_task = asyncio.create_task(
                 self._read_loop(), name=f"mcp-reader-{self.config.name}",
@@ -303,18 +307,30 @@ class StdioMcpClient:
             self._stderr_task.cancel()
         try:
             if proc.returncode is None:
-                # SIGTERM the whole process group (we set start_new_session).
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    proc.terminate()
+                # Graceful: SIGTERM the whole process group on POSIX;
+                # taskkill /T (no /F) on Windows for a parallel "send
+                # Ctrl+Break to the tree" semantic. Both leave grandchildren
+                # a moment to clean up before the force-kill below.
+                if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.terminate()
+                else:
+                    _platform.kill_process_tree(proc.pid, force=False)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        proc.kill()
+                    # Force: SIGKILL the group on POSIX; taskkill /T /F on
+                    # Windows so grandchildren are reaped too.
+                    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+                        try:
+                            os.killpg(os.getpgid(proc.pid), kill_sig)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            proc.kill()
+                    else:
+                        _platform.kill_process_tree(proc.pid, force=True)
                     await proc.wait()
         finally:
             self._proc = None

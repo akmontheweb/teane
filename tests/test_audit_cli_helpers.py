@@ -37,7 +37,12 @@ def test_get_global_config_path_resolves_symlinks(tmp_path, monkeypatch):
 
     symlinked = tmp_path / "venv" / "site-packages" / "harness"
     symlinked.parent.mkdir(parents=True)
-    os.symlink(str(real_repo / "harness"), str(symlinked))
+    # Windows refuses symlink creation without admin or developer mode;
+    # skip cleanly rather than fail the assertion below.
+    try:
+        os.symlink(str(real_repo / "harness"), str(symlinked))
+    except OSError:
+        pytest.skip("symlinks unavailable on this platform")
 
     # Point __file__ at the symlinked path.
     monkeypatch.setattr(

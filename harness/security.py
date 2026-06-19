@@ -990,6 +990,22 @@ _DEFAULT_BLOCK_ON: frozenset[str] = frozenset({"critical", "high"})
 _DEFAULT_WARN_ON: frozenset[str] = frozenset({"medium"})
 _DEFAULT_SCANNERS: tuple[str, ...] = ("gitleaks", "bandit", "semgrep", "trivy")
 
+# Workspace-relative paths the scanners should NOT walk. `docs/` and
+# `product_spec/` live in every greenfield workspace and almost always
+# contain fenced code snippets (JWT examples, SQL placeholders, env
+# stubs) that trip semgrep's `--config=auto` ruleset. The patcher's
+# spec-driven allowlist refuses writes to those directories, so any
+# finding the LLM tries to fix there is guaranteed to bounce — creating
+# a HITL ping-pong loop. Excluding them up-front matches the patcher's
+# scope: code is in roots[].path; everything else is documentation.
+_DEFAULT_EXCLUDE_PATHS: tuple[str, ...] = ("docs", "product_spec")
+
+# Multiplier on `max_security_fix_attempts`. When the same finding has
+# survived (max_attempts × this) trips through compile → security_scan →
+# HITL → resume, the loop is thrashing — terminate the run rather than
+# loop until something times out and silently shadows the finding.
+_HARD_SECURITY_CEILING_MULTIPLIER: int = 3
+
 # Install hints surfaced by `harness doctor` when a scanner binary is not
 # on PATH. Kept here (not in cli.py) so the runtime scanner code and the
 # doctor share one source of truth.
@@ -1029,6 +1045,7 @@ class SecurityScanPolicy:
     scanners: tuple[str, ...] = _DEFAULT_SCANNERS
     allowlist_rules: frozenset[str] = frozenset()
     max_findings_to_route_to_repair: int = 10
+    exclude_paths: tuple[str, ...] = _DEFAULT_EXCLUDE_PATHS
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "SecurityScanPolicy":
@@ -1039,6 +1056,17 @@ class SecurityScanPolicy:
         warn_on = cfg.get("warn_on")
         scanners = cfg.get("scanners")
         allowlist = cfg.get("allowlist_rules")
+        # `exclude_paths`: workspace-relative dirs the scanners skip. An
+        # explicit empty list disables the default — operators who really
+        # want to scan docs/ can set ``"exclude_paths": []``.
+        excludes_raw = cfg.get("exclude_paths")
+        if isinstance(excludes_raw, (list, tuple)):
+            excludes = tuple(
+                _normalize_exclude_path(p) for p in excludes_raw
+                if isinstance(p, str) and _normalize_exclude_path(p)
+            )
+        else:
+            excludes = _DEFAULT_EXCLUDE_PATHS
         return cls(
             block_on=(
                 frozenset(s.lower() for s in block_on)
@@ -1064,7 +1092,22 @@ class SecurityScanPolicy:
             max_findings_to_route_to_repair=int(
                 cfg.get("max_findings_to_route_to_repair", 10)
             ),
+            exclude_paths=excludes,
         )
+
+
+def _normalize_exclude_path(p: str) -> str:
+    """Strip ``./`` and trailing slashes; drop absolute paths and ``..``
+    segments (they'd let an operator point the exclusion outside the
+    workspace and bypass the gate entirely)."""
+    if not isinstance(p, str):
+        return ""
+    s = p.strip().lstrip("/").rstrip("/")
+    while s.startswith("./"):
+        s = s[2:]
+    if not s or s.startswith("..") or "/.." in s or s == ".":
+        return ""
+    return s
 
 
 def apply_policy(
@@ -1215,6 +1258,7 @@ async def run_gitleaks_scan(
     workspace_path: str,
     gitleaks_path: str = "gitleaks",
     timeout_seconds: int = 15,
+    exclude_paths: Sequence[str] = (),
 ) -> ScannerOutcome:
     """Run gitleaks for secret detection.
 
@@ -1261,6 +1305,11 @@ async def run_gitleaks_scan(
 
     findings = _parse_gitleaks_json(stdout)
     findings = [f for f in findings if not _is_harness_owned_path(f.file)]
+    # gitleaks has no clean --exclude flag for ad-hoc paths (it wants a
+    # full config file). Filter post-hoc so the same exclude_paths list
+    # applies uniformly across all four scanners.
+    if exclude_paths:
+        findings = [f for f in findings if not _path_under_excludes(f.file, exclude_paths)]
     if findings:
         logger.warning("[security_scan] gitleaks found %d secret(s).", len(findings))
     else:
@@ -1270,6 +1319,23 @@ async def run_gitleaks_scan(
         status=ScannerStatus.FOUND if findings else ScannerStatus.OK,
         findings=findings,
     )
+
+
+def _path_under_excludes(rel_path: str, exclude_paths: Sequence[str]) -> bool:
+    """True when ``rel_path`` is inside one of the excluded directories.
+
+    The path comparison is path-component-wise (so ``docs2/x.md`` is NOT
+    excluded by ``docs``) and case-sensitive (workspaces are POSIX-style)."""
+    if not rel_path:
+        return False
+    norm = rel_path.replace("\\", "/").lstrip("/")
+    for ex in exclude_paths:
+        if not ex:
+            continue
+        prefix = ex.rstrip("/") + "/"
+        if norm == ex or norm.startswith(prefix):
+            return True
+    return False
 
 
 # Files the harness owns / writes into the workspace that legitimately
@@ -1449,6 +1515,7 @@ async def run_bandit_scan(
     workspace_path: str,
     bandit_path: str = "bandit",
     timeout_seconds: int = 15,
+    exclude_paths: Sequence[str] = (),
 ) -> ScannerOutcome:
     """Bandit (Python SAST). No-ops with status OK when no .py files
     are present so a polyglot repo doesn't waste a timer slot on it."""
@@ -1461,7 +1528,16 @@ async def run_bandit_scan(
         logger.debug("[security_scan] bandit not on PATH. Skipping Python SAST.")
         return ScannerOutcome(scanner="bandit", status=ScannerStatus.NOT_INSTALLED)
 
-    cmd = [resolved, "-r", "-f", "json", "-ll", "-q", workspace_path]
+    cmd = [resolved, "-r", "-f", "json", "-ll", "-q"]
+    # Bandit's -x flag wants a comma-separated list of paths (absolute
+    # or relative to its CWD). Resolve to absolute against workspace so
+    # bandit never has to guess.
+    abs_excludes = [
+        os.path.join(workspace_path, ex) for ex in exclude_paths if ex
+    ]
+    if abs_excludes:
+        cmd.extend(["-x", ",".join(abs_excludes)])
+    cmd.append(workspace_path)
     exit_code, stdout, stderr = await _run_subprocess_scanner(
         cmd, timeout_seconds=timeout_seconds, label="bandit",
     )
@@ -1492,6 +1568,7 @@ async def run_semgrep_scan(
     workspace_path: str,
     semgrep_path: str = "semgrep",
     timeout_seconds: int = 30,
+    exclude_paths: Sequence[str] = (),
 ) -> ScannerOutcome:
     """Semgrep (universal SAST). Useful for JS/TS/Go and as a
     cross-language second opinion alongside bandit on Python."""
@@ -1502,8 +1579,15 @@ async def run_semgrep_scan(
 
     cmd = [
         resolved, "scan", "--config=auto", "--json", "--quiet",
-        "--no-git-ignore", workspace_path,
+        "--no-git-ignore",
     ]
+    # semgrep accepts repeated `--exclude <pattern>` flags. Pass each
+    # excluded directory by name so the matcher skips them anywhere in
+    # the workspace tree.
+    for ex in exclude_paths:
+        if ex:
+            cmd.extend(["--exclude", ex])
+    cmd.append(workspace_path)
     exit_code, stdout, stderr = await _run_subprocess_scanner(
         cmd, timeout_seconds=timeout_seconds, label="semgrep",
     )
@@ -1533,6 +1617,7 @@ async def run_trivy_scan(
     workspace_path: str,
     trivy_path: str = "trivy",
     timeout_seconds: int = 60,
+    exclude_paths: Sequence[str] = (),
 ) -> ScannerOutcome:
     """Trivy filesystem scan for dependency / package vulnerabilities.
 
@@ -1582,6 +1667,12 @@ async def run_trivy_scan(
         cmd.extend(["--cache-dir", cache_dir])
     if skip_db_update:
         cmd.append("--skip-db-update")
+    # trivy fs supports `--skip-dirs <dir>` (repeatable). Skip the same
+    # documentation directories as the SAST scanners so trivy doesn't
+    # parse vendored lockfiles bundled inside example docs.
+    for ex in exclude_paths:
+        if ex:
+            cmd.extend(["--skip-dirs", ex])
     cmd.append(workspace_path)
     exit_code, stdout, stderr = await _run_subprocess_scanner(
         cmd, timeout_seconds=timeout_seconds, label="trivy",
@@ -1721,12 +1812,14 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
     policy = SecurityScanPolicy.from_config(sec_cfg)
 
     logger.info(
-        "[security_scan_node] Starting audit on %s | scanners=%s | block=%s warn=%s ignore_below=%s",
+        "[security_scan_node] Starting audit on %s | scanners=%s | block=%s warn=%s "
+        "ignore_below=%s exclude_paths=%s",
         workspace_path,
         list(policy.scanners),
         sorted(policy.block_on),
         sorted(policy.warn_on),
         policy.ignore_below,
+        list(policy.exclude_paths),
     )
 
     # Build the task list dynamically — only enabled scanners run.
@@ -1736,24 +1829,28 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
             workspace_path,
             gitleaks_path=sec_cfg.get("gitleaks_path", ""),
             timeout_seconds=timeout_sec,
+            exclude_paths=policy.exclude_paths,
         ))
     if "bandit" in policy.scanners:
         tasks.append(run_bandit_scan(
             workspace_path,
             bandit_path=sec_cfg.get("bandit_path", ""),
             timeout_seconds=timeout_sec,
+            exclude_paths=policy.exclude_paths,
         ))
     if "semgrep" in policy.scanners:
         tasks.append(run_semgrep_scan(
             workspace_path,
             semgrep_path=sec_cfg.get("semgrep_path", ""),
             timeout_seconds=timeout_sec,
+            exclude_paths=policy.exclude_paths,
         ))
     if "trivy" in policy.scanners:
         tasks.append(run_trivy_scan(
             workspace_path,
             trivy_path=sec_cfg.get("trivy_path", ""),
             timeout_seconds=trivy_timeout,
+            exclude_paths=policy.exclude_paths,
         ))
 
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1792,6 +1889,7 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
             "block_on": sorted(policy.block_on),
             "warn_on": sorted(policy.warn_on),
             "ignore_below": policy.ignore_below,
+            "exclude_paths": list(policy.exclude_paths),
         },
         "scanners_clean": sorted(ran_clean),
         "scanners_not_installed": sorted(not_installed),

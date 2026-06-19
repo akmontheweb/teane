@@ -8284,7 +8284,22 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
     budget_remaining: float = state.get("budget_remaining_usd", 0.0)
     loop_counter: dict[str, int] = state.get("loop_counter", {})
     sec_attempts: int = loop_counter.get("security", 0)
-    max_sec_attempts: int = 2
+    sec_cfg = state.get("security_scan_config", {}) or {}
+    max_sec_attempts: int = int(sec_cfg.get("max_security_fix_attempts", 2))
+    # Hard ceiling for the HITL ping-pong loop. In auto-resume mode
+    # (--hitl-repair=false / CI / no TTY) the HITL menu re-routes back
+    # to compiler_node without resetting the security counter, so the
+    # same finding can survive arbitrarily many trips through the gate
+    # — turning into a thrash loop that only ends when something else
+    # (semgrep timeout, budget, code-review cap) shadows it. Past this
+    # ceiling the run terminates rather than pretend the loop is
+    # productive. The default ratio is 3x; operators can tune via the
+    # `hard_security_loop_ceiling` config key.
+    from harness.security import _HARD_SECURITY_CEILING_MULTIPLIER
+    hard_ceiling = int(sec_cfg.get(
+        "hard_security_loop_ceiling",
+        max_sec_attempts * _HARD_SECURITY_CEILING_MULTIPLIER,
+    ))
     compiler_errors = state.get("compiler_errors", [])
 
     # Check budget first
@@ -8336,11 +8351,28 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         logger.info("[router] Security scan clean. Routing to deployment discovery.")
         return "deployment_discovery_node"
 
-    # Security findings exist — check attempt limit
+    # Security findings exist — first check the HARD ceiling. Past this
+    # point the HITL ping-pong is thrashing (most often: the LLM keeps
+    # proposing a patch the spec-driven allowlist rejects, e.g. edits
+    # into ``docs/SPEC_ARCHITECTURE.md``). Terminate the run rather than
+    # keep looping. The build is incomplete — exit will be non-zero.
+    if sec_attempts >= hard_ceiling:
+        logger.error(
+            "[router] Security HITL ping-pong hard ceiling reached "
+            "(attempts=%d, ceiling=%d). %d finding(s) survived %d HITL "
+            "resume(s) without being fixed. Terminating without deployment — "
+            "operator must inspect findings manually.",
+            sec_attempts, hard_ceiling, len(compiler_errors),
+            sec_attempts - max_sec_attempts,
+        )
+        return "__end__"
+
+    # Security findings exist — check soft attempt limit (route to HITL)
     if sec_attempts >= max_sec_attempts:
         logger.warning(
-            "[router] Security fix limit reached (%d/%d). %d finding(s) remain. Routing to HITL.",
-            sec_attempts, max_sec_attempts, len(compiler_errors),
+            "[router] Security fix limit reached (%d/%d). %d finding(s) remain. "
+            "Routing to HITL (hard ceiling at %d).",
+            sec_attempts, max_sec_attempts, len(compiler_errors), hard_ceiling,
         )
         return "human_intervention_node"
 

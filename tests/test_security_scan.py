@@ -832,3 +832,282 @@ class TestSecurityScanNode:
         })
         assert result["node_state"]["security_scan"]["passed"] is True
         assert result["node_state"]["security_scan"]["scanners_clean"] == ["gitleaks"]
+
+
+# ---------------------------------------------------------------------------
+# exclude_paths: scanners must skip docs/ by default so the spec-driven
+# patcher allowlist (which already rejects writes to docs/) never sees a
+# fix request it has to reject — that was the cause of session 0ee7807d's
+# 9-iteration HITL ping-pong loop where semgrep flagged code snippets in
+# docs/SPEC_ARCHITECTURE.md and the LLM's patches kept bouncing.
+# ---------------------------------------------------------------------------
+
+
+class TestExcludePathsPolicy:
+
+    def test_default_excludes_docs_and_product_spec(self):
+        p = SecurityScanPolicy()
+        assert "docs" in p.exclude_paths
+        assert "product_spec" in p.exclude_paths
+
+    def test_from_config_overrides_default_excludes(self):
+        p = SecurityScanPolicy.from_config({"exclude_paths": ["fixtures", "examples"]})
+        assert p.exclude_paths == ("fixtures", "examples")
+        # The defaults are NOT merged in — explicit list is authoritative.
+        assert "docs" not in p.exclude_paths
+
+    def test_from_config_empty_list_disables_excludes(self):
+        # Operator who genuinely wants to scan docs/ can opt in.
+        p = SecurityScanPolicy.from_config({"exclude_paths": []})
+        assert p.exclude_paths == ()
+
+    def test_from_config_missing_key_uses_default(self):
+        # Legacy config: untouched policies still get the safe default.
+        p = SecurityScanPolicy.from_config({"enabled": True})
+        assert "docs" in p.exclude_paths
+
+    def test_normalize_strips_leading_slashes_and_dot(self):
+        from harness.security import _normalize_exclude_path
+        assert _normalize_exclude_path("./docs") == "docs"
+        assert _normalize_exclude_path("/docs/") == "docs"
+        assert _normalize_exclude_path("docs/sub/") == "docs/sub"
+
+    def test_normalize_rejects_parent_traversal(self):
+        # ``../etc/passwd`` as an "exclude path" would let an operator
+        # silently mark anything outside the workspace as out-of-scope.
+        # The normalizer drops these entirely.
+        from harness.security import _normalize_exclude_path
+        assert _normalize_exclude_path("..") == ""
+        assert _normalize_exclude_path("../etc") == ""
+        assert _normalize_exclude_path("a/../etc") == ""
+        assert _normalize_exclude_path(".") == ""
+        assert _normalize_exclude_path("") == ""
+
+
+class TestPathUnderExcludes:
+
+    def test_direct_match(self):
+        from harness.security import _path_under_excludes
+        assert _path_under_excludes("docs/x.md", ["docs"]) is True
+
+    def test_nested_match(self):
+        from harness.security import _path_under_excludes
+        assert _path_under_excludes("docs/a/b/c.md", ["docs"]) is True
+
+    def test_prefix_collision_not_excluded(self):
+        # ``docs`` must not exclude ``docs2/``. The check is path-component
+        # based, not raw startswith.
+        from harness.security import _path_under_excludes
+        assert _path_under_excludes("docs2/x.md", ["docs"]) is False
+
+    def test_empty_excludes_list_excludes_nothing(self):
+        from harness.security import _path_under_excludes
+        assert _path_under_excludes("docs/x.md", []) is False
+
+    def test_handles_backslash_input(self):
+        # Defensive — even on POSIX a finding could carry a Windows-style
+        # path from a vendored scanner. Normalize before comparing.
+        from harness.security import _path_under_excludes
+        assert _path_under_excludes("docs\\x.md", ["docs"]) is True
+
+
+# ---------------------------------------------------------------------------
+# Scanner command construction — confirm exclude_paths reaches the wire.
+# We monkeypatch _run_subprocess_scanner to capture the argv each scanner
+# would actually execute, then assert the right flags landed.
+# ---------------------------------------------------------------------------
+
+
+class TestScannerExcludeFlagWiring:
+
+    @pytest.fixture
+    def capture_cmd(self, monkeypatch):
+        from harness import security as sec
+        captured: dict[str, list[str]] = {}
+
+        async def fake_run(cmd, timeout_seconds=15, label="scanner"):
+            captured["cmd"] = list(cmd)
+            # Return an "empty findings" successful exit so the caller's
+            # parsing path runs but emits no findings. Each parser is
+            # already covered by its own tests; we're only checking argv.
+            return 0, "{}", ""
+
+        monkeypatch.setattr(sec, "_run_subprocess_scanner", fake_run)
+        monkeypatch.setattr(sec, "shutil", _StubShutil())
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_semgrep_passes_exclude_per_flag(self, capture_cmd):
+        from harness.security import run_semgrep_scan
+        await run_semgrep_scan(
+            "/ws", semgrep_path="semgrep",
+            exclude_paths=("docs", "product_spec"),
+        )
+        cmd = capture_cmd["cmd"]
+        # Each excluded dir gets its own ``--exclude <dir>`` pair; the
+        # workspace path is the LAST positional.
+        assert cmd.count("--exclude") == 2
+        assert "docs" in cmd
+        assert "product_spec" in cmd
+        assert cmd[-1] == "/ws"
+
+    @pytest.mark.asyncio
+    async def test_semgrep_no_excludes_omits_flag(self, capture_cmd):
+        from harness.security import run_semgrep_scan
+        await run_semgrep_scan(
+            "/ws", semgrep_path="semgrep", exclude_paths=(),
+        )
+        assert "--exclude" not in capture_cmd["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_bandit_passes_comma_separated_excludes(
+        self, capture_cmd, monkeypatch,
+    ):
+        # Bandit only runs when .py files are detected; stub that out so
+        # the run_bandit_scan body actually issues the subprocess call.
+        from harness import security as sec
+        monkeypatch.setattr(
+            sec, "_scan_workspace_languages", lambda _p: (True, False, False),
+        )
+        from harness.security import run_bandit_scan
+        await run_bandit_scan(
+            "/ws", bandit_path="bandit",
+            exclude_paths=("docs", "product_spec"),
+        )
+        cmd = capture_cmd["cmd"]
+        # Bandit wants ONE ``-x`` followed by comma-separated absolute
+        # paths. Resolved against /ws so bandit's CWD doesn't matter.
+        assert "-x" in cmd
+        idx = cmd.index("-x")
+        assert cmd[idx + 1] == "/ws/docs,/ws/product_spec"
+
+    @pytest.mark.asyncio
+    async def test_bandit_no_excludes_omits_x_flag(
+        self, capture_cmd, monkeypatch,
+    ):
+        from harness import security as sec
+        monkeypatch.setattr(
+            sec, "_scan_workspace_languages", lambda _p: (True, False, False),
+        )
+        from harness.security import run_bandit_scan
+        await run_bandit_scan(
+            "/ws", bandit_path="bandit", exclude_paths=(),
+        )
+        assert "-x" not in capture_cmd["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_trivy_passes_skip_dirs_per_flag(self, capture_cmd):
+        from harness.security import run_trivy_scan
+        await run_trivy_scan(
+            "/ws", trivy_path="trivy",
+            exclude_paths=("docs", "product_spec"),
+        )
+        cmd = capture_cmd["cmd"]
+        # Trivy wants ``--skip-dirs <dir>`` repeated.
+        assert cmd.count("--skip-dirs") == 2
+        assert "docs" in cmd
+        assert "product_spec" in cmd
+
+    @pytest.mark.asyncio
+    async def test_gitleaks_post_filters_excluded_findings(self, monkeypatch):
+        # gitleaks doesn't accept ad-hoc --exclude paths cleanly, so the
+        # excludes are applied as a post-filter on the parsed findings.
+        from harness import security as sec
+        gitleaks_json = json.dumps([
+            {"RuleID": "generic-api-key", "File": "docs/SPEC_ARCHITECTURE.md",
+             "StartLine": 5, "Description": "JWT example", "Match": "x",
+             "Secret": "y", "Tags": []},
+            {"RuleID": "generic-api-key", "File": "src/auth.py",
+             "StartLine": 9, "Description": "real key", "Match": "x",
+             "Secret": "y", "Tags": []},
+        ])
+
+        async def fake_run(cmd, timeout_seconds=15, label="scanner"):
+            return 0, gitleaks_json, ""
+
+        monkeypatch.setattr(sec, "_run_subprocess_scanner", fake_run)
+        monkeypatch.setattr(sec, "shutil", _StubShutil())
+
+        outcome = await sec.run_gitleaks_scan(
+            "/ws", gitleaks_path="gitleaks", exclude_paths=("docs",),
+        )
+        # Only the src/auth.py finding survives — the docs/ one was filtered.
+        files = [f.file for f in outcome.findings]
+        assert files == ["src/auth.py"]
+
+
+class _StubShutil:
+    """Make ``shutil.which`` succeed so the scanner adapter doesn't
+    short-circuit on NOT_INSTALLED before reaching its subprocess call."""
+    @staticmethod
+    def which(name):
+        return f"/usr/bin/{name}" if name else None
+
+
+# ---------------------------------------------------------------------------
+# HITL ping-pong hard ceiling. After 3 × max_security_fix_attempts the
+# router gives up and ends the run rather than keep auto-resuming a
+# loop that can't make progress (cf. session 0ee7807d, where the LLM
+# kept proposing patches to docs/SPEC_ARCHITECTURE.md that the spec
+# allowlist refused, and the loop only broke when semgrep timed out).
+# ---------------------------------------------------------------------------
+
+
+class TestRouterHardCeiling:
+
+    def _make_state(self, *, attempts: int, max_attempts: int = 2,
+                    hard_ceiling: int = None, errors: int = 1) -> dict[str, Any]:
+        cfg: dict[str, Any] = {"max_security_fix_attempts": max_attempts}
+        if hard_ceiling is not None:
+            cfg["hard_security_loop_ceiling"] = hard_ceiling
+        return {
+            "budget_remaining_usd": 5.0,
+            "loop_counter": {"security": attempts},
+            "security_scan_config": cfg,
+            "compiler_errors": [
+                {"file": "x.py", "line": 1, "message": "stub"}
+            ] * errors,
+        }
+
+    def test_below_soft_cap_routes_to_repair(self):
+        from harness.graph import route_after_security_scan
+        # 1 attempt, cap is 2 → still within the repair budget.
+        state = self._make_state(attempts=1, max_attempts=2)
+        assert route_after_security_scan(state) == "repair_node"
+
+    def test_at_soft_cap_routes_to_hitl(self):
+        from harness.graph import route_after_security_scan
+        # At the soft cap (2/2) we go to HITL — operator decides.
+        state = self._make_state(attempts=2, max_attempts=2)
+        assert route_after_security_scan(state) == "human_intervention_node"
+
+    def test_at_hard_ceiling_routes_to_end(self):
+        from harness.graph import route_after_security_scan
+        # Default ceiling = 3 * max_attempts = 6. At 6/2 the auto-resume
+        # loop is provably non-productive; terminate.
+        state = self._make_state(attempts=6, max_attempts=2)
+        assert route_after_security_scan(state) == "__end__"
+
+    def test_past_hard_ceiling_routes_to_end(self):
+        from harness.graph import route_after_security_scan
+        state = self._make_state(attempts=9, max_attempts=2)
+        assert route_after_security_scan(state) == "__end__"
+
+    def test_explicit_hard_ceiling_override(self):
+        from harness.graph import route_after_security_scan
+        # Operator can lower the ceiling to catch the loop sooner.
+        state = self._make_state(
+            attempts=3, max_attempts=2, hard_ceiling=3,
+        )
+        assert route_after_security_scan(state) == "__end__"
+
+    def test_ceiling_does_not_fire_when_no_findings(self):
+        from harness.graph import route_after_security_scan
+        # No compiler_errors → the security gate passed; ceiling check
+        # shouldn't trigger even with sec_attempts past the hard cap.
+        # (This guards against routing a clean build straight to END.)
+        state = self._make_state(
+            attempts=99, max_attempts=2, errors=0,
+        )
+        state["dev_deployment"] = False  # → installation_doc_node
+        assert route_after_security_scan(state) == "installation_doc_node"

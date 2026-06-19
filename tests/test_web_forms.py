@@ -289,8 +289,8 @@ def test_run_flags_covers_run_parser_bools():
         "spec_discovery",
         "deploy_dev",
         "cd_discovery",
-        "hitl_req",
-        "hitl_arch",
+        "hitl_requirement",
+        "hitl_architecture",
         "hitl_repair",
         "hitl_deployment",
     }
@@ -331,19 +331,37 @@ def test_build_run_argv_select_emits_flag_equals_value():
     assert "--git=true" in argv
 
 
-def test_build_run_argv_hitl_flags_emit_when_true():
+def test_build_run_argv_hitl_flags_at_default_emit_nothing():
+    # Default is now "true" for every --hitl-* flag; an operator who
+    # leaves them alone should NOT emit the token. The CLI argparse
+    # default (None) then defers to config.json's hitl.* block, falling
+    # back to the in-code default of True.
     from harness.web_forms import build_run_argv_from_form
     argv, errors = build_run_argv_from_form({
-        "flag.hitl_req": "true",
-        "flag.hitl_arch": "true",
+        "flag.hitl_requirement": "true",
+        "flag.hitl_architecture": "true",
         "flag.hitl_repair": "true",
         "flag.hitl_deployment": "true",
     })
     assert errors == []
-    assert "--hitl-req=true" in argv
-    assert "--hitl-arch=true" in argv
-    assert "--hitl-repair=true" in argv
-    assert "--hitl-deployment=true" in argv
+    assert not any(a.startswith("--hitl-") for a in argv)
+
+
+def test_build_run_argv_hitl_flags_emit_when_operator_opts_out():
+    # Operator explicitly chooses false → emit the flag so the resolver
+    # routes it as an explicit CLI override (highest precedence).
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({
+        "flag.hitl_requirement": "false",
+        "flag.hitl_architecture": "false",
+        "flag.hitl_repair": "false",
+        "flag.hitl_deployment": "false",
+    })
+    assert errors == []
+    assert "--hitl-requirement=false" in argv
+    assert "--hitl-architecture=false" in argv
+    assert "--hitl-repair=false" in argv
+    assert "--hitl-deployment=false" in argv
 
 
 def test_build_run_argv_deploy_dev_and_cd_discovery():

@@ -43,6 +43,14 @@
         "max_doc_review_cycles": 2,
         "max_patch_repair_iterations": 8
     },
+    "_hitl_comment": "Human-in-the-loop gate switches. Each flag controls whether the corresponding gate prompts the operator (true) or auto-approves (false). Resolution precedence at run start: (1) the matching --hitl-* CLI flag when explicitly passed; (2) the value in this block; (3) the harness's last-resort default of true. The third tier means: if neither the CLI nor this file says otherwise, every gate prompts. Auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE=true, no TTY) still apply on top — those force auto-approve regardless of how this resolves. requirement = requirements gatekeeper + the pre-graph interactive spec review. architecture = architecture gatekeeper. repair = the repair-loop HITL menu when iteration ceilings trip. deployment = deployment gatekeeper before --deploy-dev fires. layout_divergence = the spec_layout_divergence menu fires when on-disk source drifts from SPEC_ARCHITECTURE.md's workspace_layout block.",
+    "hitl": {
+        "requirement": true,
+        "architecture": true,
+        "repair": true,
+        "deployment": true,
+        "layout_divergence": true
+    },
     "_models_comment": "Model registry. Every LLM the harness can dispatch to must be declared here. The key (e.g. 'openai:gpt-4o-mini') is the routing handle used in model_routing below. Required fields per spec: provider (openai/anthropic/deepseek/ollama), model_id (vendor's name), context_window (max tokens). Cost fields drive the budget tracker. supports_thinking=true allows the gateway to enable extended-thinking mode when the role's *_mode is 'thinking' or 'thinking_max'. supports_cache=true enables prefix-caching for that provider. api_key is ALWAYS empty here \u2014 set keys as env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY). The gateway reads env vars at dispatch time and ignores the api_key field. Ollama models run locally so no env var is required.",
     "models": {
         "openai:gpt-4o": {

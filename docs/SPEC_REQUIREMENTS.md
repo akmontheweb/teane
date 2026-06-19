@@ -727,7 +727,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Default `--spec-discovery`:** false (requirements + architecture interviews opt-in)
 - **Default `--git`:** false (GitGuardian opt-in)
 - **Default `--new-build`:** false (steady-state)
-- **Default `--hitl-req` / `--hitl-arch` / `--hitl-repair` / `--hitl-deployment`:** false (autonomous; gates auto-approve)
+- **Default `--hitl-requirement` / `--hitl-architecture` / `--hitl-repair` / `--hitl-deployment` / `--hitl-layout-divergence`:** resolved as CLI flag (when explicitly passed) > `config.json`'s `hitl.*` block > `true` (gates prompt unless the operator opts out at either tier). Auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE=true, non-TTY stdin) still override on top — those force auto-approve regardless of the resolved value.
 - **Default `--allow-network`:** true (sandbox has network unless `--allow-network false`)
 - **Reverse-engineer architecture budget cap:** $0.50 USD (`change_requests.reverse_engineer_budget_usd`)
 - **Change-request file scan:** `change_requests/` top-level `.txt` files only; `applied/` archive subdirectory is skipped

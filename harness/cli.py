@@ -451,6 +451,10 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "patcher",
     # Change-request behaviour knobs (reverse_engineer_budget_usd etc.).
     "change_requests",
+    # Default HITL gate switches. The matching --hitl-* CLI flag wins when
+    # explicitly passed; this section is the second tier; the in-code
+    # default (True) is the last-resort. See _resolve_hitl_flags.
+    "hitl",
     # Web research tool skills (web_fetch / web_search). Default off — the
     # gateway path is unchanged when disabled. See harness/web_tools.py.
     "web_tools",
@@ -711,6 +715,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # one-shot LLM walk in reverse_engineer_architecture_node so a large
     # codebase doesn't blow the session budget on first contact.
     "change_requests": frozenset({"reverse_engineer_budget_usd"}),
+    # Default values for each --hitl-* gate switch. The CLI flag, when
+    # explicitly passed, wins. See _resolve_hitl_flags.
+    "hitl": frozenset({
+        "requirement", "architecture", "repair", "deployment",
+        "layout_divergence",
+    }),
 }
 
 
@@ -730,6 +740,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "patcher.use_structured_tools": (bool,),
     "compiler.run_prod_import_smoke_check": (bool,),
     "change_requests.reverse_engineer_budget_usd": (int, float),
+    "hitl.requirement": (bool,),
+    "hitl.architecture": (bool,),
+    "hitl.repair": (bool,),
+    "hitl.deployment": (bool,),
+    "hitl.layout_divergence": (bool,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -1406,26 +1421,88 @@ def resolve_build_command(
 # ---------------------------------------------------------------------------
 
 # --hitl-* flag pin: cmd_run calls _set_hitl_flags(...) once at startup
-# from args.hitl_req / hitl_arch / hitl_repair / hitl_deployment so each
-# gate callsite below can ask "should I prompt?" without re-reading args.
+# with the values returned by _resolve_hitl_flags — which threads the
+# three-tier precedence (CLI > config.json > True) so each gate
+# callsite below can ask "should I prompt?" without re-reading args.
 # Tests / direct calls that never pin leave the map empty; the
 # _hitl_gate_enabled accessor then defaults to True so legacy unit tests
 # (which install a fake channel and expect prompts to fire) still work.
 _HITL_FLAGS: dict[str, bool] = {}
 
+# The five HITL gates the resolver knows about. Tuples of
+# (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
+# and the config-tree validation stay aligned. New gates added here
+# automatically pick up the same three-tier resolution. Names use full
+# words (``requirement``, not ``req``; ``architecture``, not ``arch``)
+# so the operator-facing CLI flag, the config.json key, and the in-code
+# gate-name all match.
+_HITL_GATES: tuple[tuple[str, str, str], ...] = (
+    ("requirement",        "hitl_requirement",        "requirement"),
+    ("architecture",       "hitl_architecture",       "architecture"),
+    ("repair",             "hitl_repair",             "repair"),
+    ("deployment",         "hitl_deployment",         "deployment"),
+    ("layout_divergence",  "hitl_layout_divergence",  "layout_divergence"),
+)
+
+
+def _resolve_hitl_flags(
+    args: Any,
+    config: dict[str, Any],
+) -> dict[str, bool]:
+    """Resolve effective HITL gate values via three-tier precedence.
+
+    For each gate:
+      1. The matching CLI flag when it was explicitly passed
+         (the argparse default is the ``None`` sentinel — anything
+         other than ``None`` means the operator typed ``--hitl-foo
+         true|false`` on the command line).
+      2. The matching key under ``config.json``'s ``hitl`` block.
+         Non-bool values are rejected by ``validate_config_strict``
+         before we get here.
+      3. ``True`` — the harness-level safe default: when neither the
+         CLI nor the config has an opinion, the gate prompts.
+
+    Returns the resolved map keyed by gate-name (``req``, ``arch``,
+    ``repair``, ``deployment``, ``layout_divergence``) ready to hand
+    to :func:`_set_hitl_flags` (which uses different parameter names).
+    The auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE,
+    non-TTY stdin) still apply on top of this and are checked in
+    :func:`_gatekeeper_auto_approves`.
+    """
+    cfg_block = config.get("hitl") if isinstance(config, dict) else None
+    if not isinstance(cfg_block, dict):
+        cfg_block = {}
+    resolved: dict[str, bool] = {}
+    for gate, args_attr, cfg_key in _HITL_GATES:
+        cli_val = getattr(args, args_attr, None)
+        if cli_val is not None:
+            resolved[gate] = bool(cli_val)
+            continue
+        if cfg_key in cfg_block and isinstance(cfg_block[cfg_key], bool):
+            resolved[gate] = cfg_block[cfg_key]
+            continue
+        resolved[gate] = True
+    return resolved
+
 
 def _set_hitl_flags(
     *,
-    req: bool,
-    arch: bool,
+    requirement: bool,
+    architecture: bool,
     repair: bool,
     deployment: bool,
     layout_divergence: bool = False,
 ) -> None:
-    """Pin the operator's --hitl-* choices for this run."""
+    """Pin the operator's --hitl-* choices for this run.
+
+    Keys MUST match ``_HITL_GATES[0]`` so ``_hitl_gate_enabled`` lookups
+    succeed at every gate callsite. The four mandatory kwargs use the
+    same singular full-word naming as the CLI flags
+    (``--hitl-requirement``, ``--hitl-architecture``, ...) — no
+    abbreviations, no plural/singular mismatch."""
     _HITL_FLAGS.update({
-        "requirements":      req,
-        "architecture":      arch,
+        "requirement":       requirement,
+        "architecture":      architecture,
         "repair":            repair,
         "deployment":        deployment,
         "layout_divergence": layout_divergence,
@@ -1518,11 +1595,20 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
     # as supported, but the gatekeeper was previously blocking on input()
     # even when those were set — making CI runs hang forever waiting on
     # stdin. Honor the env vars here as well as a non-TTY stdin.
-    # gate_name maps REQUIREMENTS/ARCHITECTURE/DEPLOYMENT to the
-    # lowercase keys _HITL_FLAGS uses, so --hitl-req=false /
-    # --hitl-arch=false / --hitl-deployment=false take the same
-    # auto-approve path as the env-var opt-out.
-    if _gatekeeper_auto_approves(gate_name=gate.lower()):
+    # state["current_gate"] is the upper-case routing token
+    # (REQUIREMENTS / ARCHITECTURE / DEPLOYMENT). _HITL_FLAGS keys use the
+    # singular full-word form (requirement / architecture / deployment) so
+    # they match --hitl-requirement / --hitl-architecture / --hitl-deployment
+    # and the config.json hitl.* block. Normalise here so the gate_name
+    # lookup hits the right entry.
+    _gate_to_hitl_key = {
+        "REQUIREMENTS": "requirement",
+        "ARCHITECTURE": "architecture",
+        "DEPLOYMENT":   "deployment",
+    }
+    if _gatekeeper_auto_approves(
+        gate_name=_gate_to_hitl_key.get(gate, gate.lower())
+    ):
         logger.info(
             "[gatekeeper] %s auto-approved (--hitl-<gate>=false / CI / "
             "HARNESS_AUTO_APPROVE / no TTY).",
@@ -2979,14 +3065,15 @@ async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
         spec_content = _read_spec_file(spec_path)
         spec_size = len(spec_content) if spec_content else 0
 
-        # --hitl-req=false / env auto-approve: lock the synthesised
-        # spec and return immediately, no operator interaction. The
-        # in-graph REQUIREMENTS gatekeeper honours the same flag, so
-        # both surfaces of the requirements gate share one switch.
-        if not _hitl_gate_enabled("requirements") or _gatekeeper_auto_approves():
+        # --hitl-requirement=false / env auto-approve: lock the
+        # synthesised spec and return immediately, no operator
+        # interaction. The in-graph REQUIREMENTS gatekeeper honours the
+        # same flag, so both surfaces of the requirements gate share one
+        # switch.
+        if not _hitl_gate_enabled("requirement") or _gatekeeper_auto_approves():
             logger.info(
                 "[requirements] Review auto-approved "
-                "(--hitl-req=false / CI / HARNESS_AUTO_APPROVE / no TTY). "
+                "(--hitl-requirement=false / CI / HARNESS_AUTO_APPROVE / no TTY). "
                 "Locking spec at %d chars.",
                 spec_size,
             )
@@ -3949,18 +4036,6 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # that construct args manually and expect git-on behaviour.
     _set_git_enabled(bool(getattr(args, "git", True)))
 
-    # Pin the operator's --hitl-* choices for this run so the
-    # human_gatekeeper_node / interactive_review_loop / repair-menu
-    # callsites can short-circuit to auto-approve without re-reading
-    # args. See _hitl_gate_enabled in this module.
-    _set_hitl_flags(
-        req=bool(getattr(args, "hitl_req", False)),
-        arch=bool(getattr(args, "hitl_arch", False)),
-        repair=bool(getattr(args, "hitl_repair", False)),
-        deployment=bool(getattr(args, "hitl_deployment", False)),
-        layout_divergence=bool(getattr(args, "hitl_layout_divergence", False)),
-    )
-
     # --yes only makes sense paired with --new-build. Reject the lone
     # use early so the operator sees a clean parser error rather than
     # a silent no-op far downstream.
@@ -3978,6 +4053,27 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # vars for routed models. By running this before _acquire_workspace_lock
     # we avoid leaving a stale lock file when the operator's config is bad.
     config = discover_config(workspace_path)
+
+    # Pin the operator's --hitl-* choices for this run so the
+    # human_gatekeeper_node / interactive_review_loop / repair-menu
+    # callsites can short-circuit to auto-approve without re-reading
+    # args. Three-tier precedence: CLI flag > config.json `hitl` > True.
+    # See _resolve_hitl_flags + _hitl_gate_enabled in this module.
+    _resolved_hitl = _resolve_hitl_flags(args, config)
+    _set_hitl_flags(
+        requirement=_resolved_hitl["requirement"],
+        architecture=_resolved_hitl["architecture"],
+        repair=_resolved_hitl["repair"],
+        deployment=_resolved_hitl["deployment"],
+        layout_divergence=_resolved_hitl["layout_divergence"],
+    )
+    logger.info(
+        "[cli] HITL gates resolved: requirement=%s architecture=%s "
+        "repair=%s deployment=%s layout_divergence=%s",
+        _resolved_hitl["requirement"], _resolved_hitl["architecture"],
+        _resolved_hitl["repair"], _resolved_hitl["deployment"],
+        _resolved_hitl["layout_divergence"],
+    )
 
     # P1.7: workspace-level advisory lock. Without this, two concurrent
     # `harness run -r <same workspace>` invocations both read and write
@@ -7390,74 +7486,81 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     # ----- HITL gate switches (true => prompt, false => auto-approve) -----
-    # All four default to FALSE so `harness run` is fully autonomous
-    # out of the box. Set any flag to true to surface that gate to the
-    # operator. See harness/cli.py _hitl_gate_enabled and the wiring in
-    # human_gatekeeper_node / interactive_review_loop / the repair menu.
+    # Each flag's effective value is resolved in three tiers (see
+    # _resolve_hitl_flags): (1) the CLI flag when explicitly passed;
+    # (2) the matching value in config.json's `hitl` section; (3) True.
+    # The argparse default is the `None` SENTINEL — argparse can't
+    # distinguish "operator omitted" from "operator passed false" with a
+    # plain bool default, so we leave it null here and let the resolver
+    # fall through to the next tier when None.
     run_parser.add_argument(
-        "--hitl-req",
+        "--hitl-requirement",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
-        dest="hitl_req",
+        dest="hitl_requirement",
         help=(
             "When true, prompt the operator at the requirements gate "
             "(both the pre-graph interactive review and the in-graph "
-            "REQUIREMENTS gatekeeper). Defaults to false (auto-approve)."
+            "REQUIREMENTS gatekeeper). Falls back to config.json's "
+            "hitl.requirement, then to true."
         ),
     )
     run_parser.add_argument(
-        "--hitl-arch",
+        "--hitl-architecture",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
-        dest="hitl_arch",
+        dest="hitl_architecture",
         help=(
             "When true, prompt the operator at the ARCHITECTURE "
-            "gatekeeper. Defaults to false (auto-approve)."
+            "gatekeeper. Falls back to config.json's hitl.architecture, "
+            "then to true."
         ),
     )
     run_parser.add_argument(
         "--hitl-repair",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
         dest="hitl_repair",
         help=(
             "When true, fire the repair-loop HITL menu when iteration "
-            "limits trip. Defaults to false (auto-resume)."
+            "limits trip. Falls back to config.json's hitl.repair, "
+            "then to true."
         ),
     )
     run_parser.add_argument(
         "--hitl-deployment",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
         dest="hitl_deployment",
         help=(
             "When true, prompt the operator at the DEPLOYMENT gatekeeper "
-            "before the dev deploy fires. Defaults to false (auto-approve)."
+            "before the dev deploy fires. Falls back to config.json's "
+            "hitl.deployment, then to true."
         ),
     )
     # --hitl-layout-divergence true|false. When the spec-driven patcher
     # allowlist (built from SPEC_ARCHITECTURE.md's workspace_layout block)
     # finds substantial source files in top-level dirs the spec didn't
-    # declare, the harness can either log-and-continue (default) or pause
-    # for operator reconciliation. Default false matches the rest of the
-    # HITL flags — autonomous runs stay autonomous. Log + observability
-    # event fire either way; only the interactive gate is gated by this
-    # flag.
+    # declare, the harness can either log-and-continue or pause for
+    # operator reconciliation. Resolved the same three-tier way as the
+    # other --hitl-* flags. Log + observability event fire either way;
+    # only the interactive gate is gated by this flag.
     run_parser.add_argument(
         "--hitl-layout-divergence",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
         dest="hitl_layout_divergence",
         help=(
             "When true, prompt the operator when the on-disk top-level "
             "layout drifts from SPEC_ARCHITECTURE.md's workspace_layout "
             "block by ≥3 source files (or ≥15%% of workspace source) in "
-            "an unspec'd directory. Defaults to false (log-only). The "
+            "an unspec'd directory. Falls back to config.json's "
+            "hitl.layout_divergence, then to true. The "
             "spec_layout_divergence observability event fires regardless."
         ),
     )

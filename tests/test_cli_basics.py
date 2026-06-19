@@ -643,7 +643,7 @@ class TestInteractiveReviewLoopAsync:
         from harness import cli as cli_mod
         from harness.hitl import set_channel, reset_channel
 
-        # The new --hitl-req=false default + pytest's non-TTY stdin
+        # The new --hitl-requirement=false default + pytest's non-TTY stdin
         # would auto-approve before the channel stub gets a chance.
         # Force both off so the refine-branch path is actually exercised.
         monkeypatch.setattr(
@@ -933,12 +933,17 @@ class TestRunParserSurface:
             ["run", "-w", "/tmp/x", "-p", "do x", *extra],
         )
 
-    def test_all_hitl_flags_default_false(self):
+    def test_all_hitl_flags_default_to_none_sentinel(self):
+        # argparse default is now the None sentinel — `_resolve_hitl_flags`
+        # uses None to mean "operator did not pass the flag", which is the
+        # signal to fall through to config.json's hitl.* block (and then
+        # the in-code True default).
         a = self._args()
-        assert a.hitl_req is False
-        assert a.hitl_arch is False
-        assert a.hitl_repair is False
-        assert a.hitl_deployment is False
+        assert a.hitl_requirement is None
+        assert a.hitl_architecture is None
+        assert a.hitl_repair is None
+        assert a.hitl_deployment is None
+        assert a.hitl_layout_divergence is None
 
     def test_discovery_toggles_default_false(self):
         a = self._args()
@@ -954,32 +959,33 @@ class TestRunParserSurface:
         assert a.git is False
 
     def test_hitl_flag_accepts_true(self):
-        a = self._args("--hitl-req", "true", "--hitl-deployment", "true")
-        assert a.hitl_req is True
+        a = self._args("--hitl-requirement", "true", "--hitl-deployment", "true")
+        assert a.hitl_requirement is True
         assert a.hitl_deployment is True
-        # The other two stay at their false default.
-        assert a.hitl_arch is False
-        assert a.hitl_repair is False
+        # The other two stay at the None sentinel (not passed → defer
+        # to the resolver).
+        assert a.hitl_architecture is None
+        assert a.hitl_repair is None
 
     def test_bool_flag_accepts_yes_and_no(self):
         # `_bool_choice` is the shared parser type; assert it
         # tolerates the operator-friendly spellings, not just
         # "true"/"false".
         a = self._args(
-            "--hitl-req", "yes",
-            "--hitl-arch", "no",
+            "--hitl-requirement", "yes",
+            "--hitl-architecture", "no",
             "--cd-discovery", "1",
             "--deploy-dev", "off",
         )
-        assert a.hitl_req is True
-        assert a.hitl_arch is False
+        assert a.hitl_requirement is True
+        assert a.hitl_architecture is False
         assert a.cd_discovery is True
         assert a.deploy_dev is False
 
     def test_bool_flag_rejects_garbage(self):
         import pytest as _pytest
         with _pytest.raises(SystemExit):
-            self._args("--hitl-req", "maybe")
+            self._args("--hitl-requirement", "maybe")
 
     def test_yes_alone_rejected_in_cmd_run(self, tmp_path):
         # --yes is a confirmation modifier for --new-build, not a
@@ -992,7 +998,7 @@ class TestRunParserSurface:
         a = argparse.Namespace(
             workspace=str(tmp_path), prompt="do x",
             new_build=False, assume_yes=True,
-            hitl_req=False, hitl_arch=False, hitl_repair=False,
+            hitl_requirement=False, hitl_architecture=False, hitl_repair=False,
             hitl_deployment=False, force_lock=False,
         )
         # Capture stderr so the test runner doesn't get a noisy line.
@@ -1035,3 +1041,140 @@ class TestRunParserSurface:
             build_parser().parse_args(["-v"])
         # argparse exits 0 on a successful --version action.
         assert exc.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# HITL flag resolution: CLI > config.json > True (the three-tier precedence
+# the operator-facing config_comment promises).
+# ---------------------------------------------------------------------------
+
+class TestResolveHitlFlags:
+    """Cover every cell of the CLI × config × default precedence
+    matrix so a future refactor can't quietly drop a tier."""
+
+    def _args(self, **overrides) -> object:
+        # argparse leaves un-passed flags as None when the argument's
+        # default is the sentinel. Match that shape.
+        class _A:
+            pass
+        a = _A()
+        for k in ("hitl_requirement", "hitl_architecture", "hitl_repair",
+                  "hitl_deployment", "hitl_layout_divergence"):
+            setattr(a, k, overrides.get(k))
+        return a
+
+    def test_cli_explicit_true_wins_over_config_false(self):
+        from harness.cli import _resolve_hitl_flags
+        args = self._args(hitl_requirement=True)
+        cfg = {"hitl": {"requirement": False}}
+        assert _resolve_hitl_flags(args, cfg)["requirement"] is True
+
+    def test_cli_explicit_false_wins_over_config_true(self):
+        from harness.cli import _resolve_hitl_flags
+        args = self._args(hitl_requirement=False)
+        cfg = {"hitl": {"requirement": True}}
+        assert _resolve_hitl_flags(args, cfg)["requirement"] is False
+
+    def test_cli_unset_falls_through_to_config_true(self):
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        cfg = {"hitl": {"repair": True}}
+        assert _resolve_hitl_flags(args, cfg)["repair"] is True
+
+    def test_cli_unset_falls_through_to_config_false(self):
+        # Config-set false is honored — operators can opt out of HITL
+        # at the org level by setting hitl.* = false in config.json
+        # and never passing the CLI flag.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        cfg = {"hitl": {"repair": False}}
+        assert _resolve_hitl_flags(args, cfg)["repair"] is False
+
+    def test_cli_unset_config_absent_defaults_to_true(self):
+        # Neither tier set → safe default is "prompt the operator".
+        # This is the intentional behaviour change vs. the legacy
+        # argparse default=False that made autonomous runs silent.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        cfg = {}
+        out = _resolve_hitl_flags(args, cfg)
+        assert out["requirement"] is True
+        assert out["architecture"] is True
+        assert out["repair"] is True
+        assert out["deployment"] is True
+        assert out["layout_divergence"] is True
+
+    def test_missing_hitl_section_is_not_an_error(self):
+        # Legacy config files without a `hitl` block must keep working;
+        # the resolver treats the missing section the same as an empty
+        # dict and falls through to the True default.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        out = _resolve_hitl_flags(args, {"build_command": "make"})
+        assert out["architecture"] is True
+
+    def test_non_dict_hitl_block_is_ignored(self):
+        # Defensive: a malformed `hitl` value (list, string, null) gets
+        # treated as absent rather than raising. The strict config
+        # validator catches the malformed value separately.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        for bad in ([], "always", None, 42):
+            out = _resolve_hitl_flags(args, {"hitl": bad})
+            assert out["requirement"] is True, f"hitl={bad!r} should fall back to default"
+
+    def test_non_bool_config_value_falls_through(self):
+        # Config validator already rejects non-bool, but if a caller
+        # bypasses validation the resolver shouldn't coerce a string
+        # "false" into True. It treats the value as absent and falls
+        # through to the default.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args()
+        cfg = {"hitl": {"requirement": "false"}}  # malformed type
+        assert _resolve_hitl_flags(args, cfg)["requirement"] is True
+
+    def test_mixed_precedence_across_gates_in_one_call(self):
+        # The five gates resolve independently — a CLI override on one
+        # gate doesn't leak into the others.
+        from harness.cli import _resolve_hitl_flags
+        args = self._args(hitl_architecture=False, hitl_repair=True)
+        cfg = {"hitl": {"requirement": False, "deployment": False}}
+        out = _resolve_hitl_flags(args, cfg)
+        assert out["requirement"] is False       # config wins (CLI unset)
+        assert out["architecture"] is False      # CLI override
+        assert out["repair"] is True             # CLI override
+        assert out["deployment"] is False        # config wins
+        assert out["layout_divergence"] is True  # nothing set → default
+
+
+class TestHitlConfigValidation:
+    """Verify the strict config validator accepts the new `hitl` block
+    and rejects malformed variants — so an operator typo in
+    ``hitl.repare`` fails fast instead of silently no-op-ing."""
+
+    def test_valid_hitl_section_passes(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["hitl"] = {
+            "requirement": True, "architecture": True, "repair": False,
+            "deployment": True, "layout_divergence": False,
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_typoed_hitl_key_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["hitl"] = {"reqiurements": True}  # typo
+        with pytest.raises(ConfigError):
+            validate_config_strict(cfg, source="test")
+
+    def test_non_bool_hitl_value_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["hitl"] = {"requirement": "yes"}
+        with pytest.raises(ConfigError):
+            validate_config_strict(cfg, source="test")
+
+    def test_partial_hitl_block_passes(self, openai_key):
+        # Operators only need to override the gates they care about;
+        # missing keys fall through to the True default at runtime.
+        cfg = _min_valid_config()
+        cfg["hitl"] = {"repair": False}
+        validate_config_strict(cfg, source="test")

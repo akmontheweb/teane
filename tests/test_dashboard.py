@@ -1116,8 +1116,8 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
         "flag.spec_discovery",
         "flag.deploy_dev",
         "flag.cd_discovery",
-        "flag.hitl_req",
-        "flag.hitl_arch",
+        "flag.hitl_requirement",
+        "flag.hitl_architecture",
         "flag.hitl_repair",
         "flag.hitl_deployment",
     ):
@@ -1136,7 +1136,7 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
     # CLI flag names are echoed so operators learn the vocabulary.
     for flag in (
         "--git", "--new-build", "--spec-discovery", "--deploy-dev",
-        "--cd-discovery", "--hitl-req", "--hitl-arch", "--hitl-repair",
+        "--cd-discovery", "--hitl-requirement", "--hitl-architecture", "--hitl-repair",
         "--hitl-deployment",
     ):
         assert flag in body, f"expected {flag!r} to appear in /run body"

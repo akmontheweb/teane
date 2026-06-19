@@ -3107,7 +3107,7 @@ def test_interactive_review_loop_prompt_uses_labeled_options(monkeypatch, tmp_pa
     from harness import cli as cli_mod
     from harness.hitl import set_channel, reset_channel
 
-    # Force the interactive path — the new --hitl-req=false default
+    # Force the interactive path — the new --hitl-requirement=false default
     # would auto-approve before any prompt() call. Also force the
     # env-var/non-TTY auto-approve back off so the channel stub gets
     # exercised inside pytest's non-TTY harness.
@@ -3203,13 +3203,13 @@ class TestHitlFlagsWiring:
             f.write("# spec\n")
         return path
 
-    def test_requirements_gate_auto_approves_when_hitl_req_false(self, monkeypatch):
+    def test_requirements_gate_auto_approves_when_hitl_requirement_false(self, monkeypatch):
         from harness.cli import human_gatekeeper_node, _set_hitl_flags
         from harness.hitl import set_channel, reset_channel
 
         # All four off: the requirements gate must short-circuit
         # without touching the channel.
-        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        _set_hitl_flags(requirement=False, architecture=False, repair=False, deployment=False)
         set_channel(self._exploding_channel())
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3224,14 +3224,14 @@ class TestHitlFlagsWiring:
         finally:
             reset_channel()
             # Reset module pin so later tests don't inherit our False set.
-            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+            _set_hitl_flags(requirement=True, architecture=True, repair=True, deployment=True)
         assert result["node_state"]["gatekeeper_action"] == "approve"
 
-    def test_architecture_gate_auto_approves_when_hitl_arch_false(self, monkeypatch):
+    def test_architecture_gate_auto_approves_when_hitl_architecture_false(self, monkeypatch):
         from harness.cli import human_gatekeeper_node, _set_hitl_flags
         from harness.hitl import set_channel, reset_channel
 
-        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        _set_hitl_flags(requirement=False, architecture=False, repair=False, deployment=False)
         set_channel(self._exploding_channel())
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3245,14 +3245,14 @@ class TestHitlFlagsWiring:
                 })
         finally:
             reset_channel()
-            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+            _set_hitl_flags(requirement=True, architecture=True, repair=True, deployment=True)
         assert result["node_state"]["gatekeeper_action"] == "approve"
 
     def test_deployment_gate_auto_approves_when_hitl_deployment_false(self, monkeypatch):
         from harness.cli import human_gatekeeper_node, _set_hitl_flags
         from harness.hitl import set_channel, reset_channel
 
-        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        _set_hitl_flags(requirement=False, architecture=False, repair=False, deployment=False)
         set_channel(self._exploding_channel())
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3266,12 +3266,12 @@ class TestHitlFlagsWiring:
                 })
         finally:
             reset_channel()
-            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+            _set_hitl_flags(requirement=True, architecture=True, repair=True, deployment=True)
         assert result["node_state"]["gatekeeper_action"] == "approve"
 
-    def test_interactive_review_auto_approves_when_hitl_req_false(self, monkeypatch, tmp_path):
+    def test_interactive_review_auto_approves_when_hitl_requirement_false(self, monkeypatch, tmp_path):
         # interactive_review_loop is the pre-graph requirements gate;
-        # --hitl-req=false MUST short-circuit it the same way it
+        # --hitl-requirement=false MUST short-circuit it the same way it
         # short-circuits the in-graph REQUIREMENTS gatekeeper.
         import asyncio
         from harness import cli as cli_mod
@@ -3281,7 +3281,7 @@ class TestHitlFlagsWiring:
         spec_path = tmp_path / "SPEC_REQUIREMENTS.md"
         spec_path.write_text("# Spec body\n", encoding="utf-8")
 
-        _set_hitl_flags(req=False, arch=False, repair=False, deployment=False)
+        _set_hitl_flags(requirement=False, architecture=False, repair=False, deployment=False)
         set_channel(self._exploding_channel())
         try:
             result = asyncio.run(
@@ -3289,7 +3289,7 @@ class TestHitlFlagsWiring:
             )
         finally:
             reset_channel()
-            _set_hitl_flags(req=True, arch=True, repair=True, deployment=True)
+            _set_hitl_flags(requirement=True, architecture=True, repair=True, deployment=True)
         # The auto-approve path returns the on-disk spec content
         # unchanged — locking the synthesised spec without operator
         # interaction.

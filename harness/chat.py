@@ -33,7 +33,10 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from harness.graph import MessageDict
 
 logger = logging.getLogger(__name__)
 
@@ -215,15 +218,16 @@ async def _handle_user_turn(session: ChatSession, user_text: str) -> bool:
     try:
         from harness.graph import _run_tool_loop, _web_tool_cap_from_state
         from harness.gateway import NodeRole as _NR
-        cap = _web_tool_cap_from_state({})  # type: ignore[arg-type]
-        final_content, session.messages, new_budget, rounds = await _run_tool_loop(
+        cap = _web_tool_cap_from_state({})
+        final_content, new_messages, new_budget, rounds = await _run_tool_loop(
             initial_response_content=response.content,
-            messages=session.messages,
+            messages=cast("list[MessageDict]", session.messages),
             gateway=session.gateway,
             role=_NR.PLANNING,
             budget=session.budget_remaining_usd,
             cap=cap,
         )
+        session.messages = cast("list[dict[str, Any]]", new_messages)
         session.budget_remaining_usd = new_budget
         if rounds:
             session.writer(f"[chat] ran {rounds} tool round(s)")

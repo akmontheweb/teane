@@ -319,7 +319,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         try:
             # redact_messages tolerates non-dict items and is a no-op if the
             # global scanner hasn't been configured.
-            return redact_messages(messages)  # type: ignore[arg-type]
+            return redact_messages(messages)
         except Exception as exc:  # noqa: BLE001 — fail SAFE on redactor crashes
             logger.warning(
                 "[storage] message redaction failed (%s); cleansing content "
@@ -327,7 +327,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
             )
             return _cleansed_messages(messages)
 
-    async def aput(self, config, checkpoint, metadata, new_versions):  # type: ignore[override]
+    async def aput(self, config, checkpoint, metadata, new_versions):
         # Redact the `messages` channel inside the full state snapshot before
         # delegating to the LangGraph serializer. We mutate a shallow copy so
         # the in-memory state the running graph holds is untouched.
@@ -358,7 +358,9 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
             metadata = {**metadata, SCHEMA_VERSION_METADATA_KEY: CHECKPOINT_SCHEMA_VERSION}
         return await super().aput(config, checkpoint, metadata, new_versions)
 
-    async def aput_writes(self, config, writes, task_id, task_path: str = ""):  # type: ignore[override]
+    async def aput_writes(
+        self, config: Any, writes: Any, task_id: Any, task_path: str = "",
+    ) -> Any:
         # aput_writes records the pending channel writes from a node return.
         # For the `messages` channel that value is the new messages list.
         #
@@ -616,9 +618,9 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
         # checkpoint was corrupted when in fact the resume was succeeding
         # via the silent JSON fallback.
         try:
-            import msgpack
+            import msgpack  # type: ignore[import-untyped]
         except ImportError:
-            msgpack = None  # type: ignore[assignment]
+            msgpack = None
 
         # First non-whitespace byte → format hint. JSON objects/arrays/strings
         # always start with `{`, `[`, or `"` (0x7B / 0x5B / 0x22). Anything
@@ -960,7 +962,7 @@ async def create_checkpointer(
     backend: str = "sqlite",
     db_path: str = "~/.harness/checkpoints.db",
     ttl_days: int = 30,
-) -> BaseCheckpointSaver:
+) -> BaseCheckpointSaver[Any]:
     """
     Factory: create the appropriate checkpointer backend.
 

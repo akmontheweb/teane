@@ -133,13 +133,13 @@ class _NullGitGuardian:
     def stash_if_dirty(self) -> bool: return False
     def pop_stash(self) -> bool: return False
     def create_patch_branch(self, session_id: str) -> bool: return False
-    def commit_repair_iteration(self, *args, **kwargs) -> bool: return True
-    def commit_all_changes(self, *args, **kwargs) -> bool: return True
-    def rollback(self, *args, **kwargs) -> bool: return False
+    def commit_repair_iteration(self, *args: Any, **kwargs: Any) -> bool: return True
+    def commit_all_changes(self, *args: Any, **kwargs: Any) -> bool: return True
+    def rollback(self, *args: Any, **kwargs: Any) -> bool: return False
     def restore_original_branch(self) -> bool: return False
 
 
-def _make_git_guardian(workspace_path: str):
+def _make_git_guardian(workspace_path: str) -> Any:
     """Return a real ``GitGuardian`` when ``--git true`` is in effect,
     otherwise a no-op :class:`_NullGitGuardian`. One place to swap so the
     call sites stay clean."""
@@ -2619,6 +2619,9 @@ For each module the implementation will contain:
 - Build command the harness will execute (matches the workspace setup).
 - Run command for local development.
 
+### 8. Required Inventory Blocks
+{inventory_instruction}
+
 ## Approved Requirements Specification
 {requirements}
 
@@ -2680,7 +2683,11 @@ async def synthesize_architecture(
     )
 
     from harness.gateway import NodeRole
-    prompt = _ARCHITECTURE_SYNTHESIS_PROMPT.format(requirements=requirements)
+    from harness.architecture_inventory import ARCHITECTURE_INVENTORY_INSTRUCTION
+    prompt = _ARCHITECTURE_SYNTHESIS_PROMPT.format(
+        requirements=requirements,
+        inventory_instruction=ARCHITECTURE_INVENTORY_INSTRUCTION,
+    )
     messages = [
         {"role": "system", "content": "You are a technical architecture expert. Output clean, structured Markdown."},
         {"role": "user", "content": prompt},
@@ -3941,13 +3948,23 @@ def _append_repo_memory_safely(
         logger.debug("[cli] repo memory append skipped: %s", exc)
 
 
-async def _maybe_start_mcp_pool(config: dict[str, Any]) -> Optional[Any]:
+async def _maybe_start_mcp_pool(
+    config: dict[str, Any],
+    workspace_path: Optional[str] = None,
+) -> Optional[Any]:
     """Build + start an :class:`McpClientPool` from ``config.mcp`` when
     ``mcp.enabled=true``. Registers every advertised tool into the
     SkillRegistry via ``register_mcp_skills``. Returns the pool (or
     ``None`` when disabled / failed) so the caller can hand it to
     later cleanup. Failures log and return ``None`` — MCP is additive,
     a bad config must not block the harness from running.
+
+    When ``workspace_path`` is provided, the workspace stack is detected
+    via :func:`impact._detect_workspace_stack` and passed to
+    ``register_mcp_skills`` so servers declaring a ``tags`` list that
+    doesn't overlap the workspace are skipped. Servers without declared
+    tags are always registered. When ``workspace_path`` is None (legacy
+    callers / tests), no filtering is applied.
     """
     try:
         from harness.mcp_client import (
@@ -3974,10 +3991,18 @@ async def _maybe_start_mcp_pool(config: dict[str, Any]) -> Optional[Any]:
         logger.exception("[cli:mcp] pool failed to start: %s", exc)
         await pool.shutdown()
         return None
+    workspace_tags: Optional[set[str]] = None
+    if workspace_path:
+        try:
+            from harness.impact import _detect_workspace_stack
+            workspace_tags = _detect_workspace_stack(workspace_path) or None
+        except Exception as exc:  # noqa: BLE001 — workspace detection is best-effort
+            logger.debug("[cli:mcp] workspace stack detection skipped: %s", exc)
     try:
-        registered = register_mcp_skills(pool)
-        logger.info("[cli:mcp] registered %d tool(s) from %d server(s).",
-                    registered, len(pool.clients))
+        registered = register_mcp_skills(pool, workspace_tags=workspace_tags)
+        logger.info("[cli:mcp] registered %d tool(s) from %d server(s) (workspace_tags=%s).",
+                    registered, len(pool.clients),
+                    sorted(workspace_tags) if workspace_tags else "<unfiltered>")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[cli:mcp] skill registration failed: %s", exc)
     _register_pool_for_shutdown(pool)
@@ -4175,7 +4200,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # tool-block interceptor can dispatch them. An atexit handler tears
     # the subprocesses down on a clean exit; Ctrl-C is handled by the
     # outer asyncio cancel path which also triggers the same shutdown.
-    _mcp_pool = await _maybe_start_mcp_pool(config)
+    _mcp_pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
@@ -4398,7 +4423,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
         )
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(preloaded_consolidated_spec)
+            f.write(preloaded_consolidated_spec or "")
         logger.info(
             "[requirements] Product spec sourced from %s "
             "(consolidated → %s).", resolved_spec_dir, manifest_path,
@@ -4616,7 +4641,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     thread_id = args.thread_id if args.thread_id else session_id
 
     logger.info("=" * 60)
-    logger.info("AI Agent Harness — Starting Graph Execution")
+    logger.info("Teane — Starting Graph Execution")
     logger.info("  Workspace:  %s", workspace_path)
     logger.info("  Build Cmd:  %s", build_command)
     logger.info("  Session ID: %s", session_id)
@@ -4685,10 +4710,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # unset on the command line (default), follow --new-build —
             # greenfield runs get an install doc; incremental change
             # requests skip it. Explicit --install-doc true|false wins.
-            install_doc=(
+            install_doc=bool(
                 getattr(args, "install_doc", None)
                 if getattr(args, "install_doc", None) is not None
-                else bool(getattr(args, "new_build", False))
+                else getattr(args, "new_build", False)
             ),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
@@ -4784,8 +4809,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("Graph Execution Complete")
     logger.info("  Exit Code:      %d", exit_code)
     logger.info("  Modified Files: %d", len(modified_files))
-    for f in modified_files:
-        logger.info("    - %s", f)
+    for modified in modified_files:
+        logger.info("    - %s", modified)
     logger.info("  Token Cost:     $%.6f", total_cost)
     logger.info("  Session ID:     %s", session_id)
     logger.info("=" * 60)
@@ -4871,8 +4896,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     )
 
     # Verify that the thread exists
+    from typing import cast as _cast
+    from langchain_core.runnables import RunnableConfig
     config_for_get = {"configurable": {"thread_id": args.session_id}}
-    existing = await checkpointer.aget(config_for_get)
+    existing = await checkpointer.aget(_cast(RunnableConfig, config_for_get))
     if existing is None:
         logger.error("No checkpoint found for session '%s'.", args.session_id)
         await checkpointer.conn.close()
@@ -4917,7 +4944,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     # tool-block interceptor can dispatch them. An atexit handler tears
     # the subprocesses down on a clean exit; Ctrl-C is handled by the
     # outer asyncio cancel path which also triggers the same shutdown.
-    _mcp_pool = await _maybe_start_mcp_pool(config)
+    _mcp_pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
@@ -5909,7 +5936,7 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     # so dedupe via set() to avoid double-probing.
     for grammar_name in sorted(set(grammar_names_map.values())):
         try:
-            language = get_language(grammar_name)  # type: ignore[arg-type]
+            language = get_language(grammar_name)
             parser = Parser()
             parser.language = language
             sample = snippets.get(grammar_name, "x\n")
@@ -6604,7 +6631,7 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         create_redactor_from_config(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[cli:chat] redactor init skipped: %s", exc)
-    pool = await _maybe_start_mcp_pool(config)  # noqa: F841
+    pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)  # noqa: F841
 
     budget = (
         float(args.budget) if getattr(args, "budget", None) is not None
@@ -7315,7 +7342,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="teane",
         description=(
-            "AI Agent Harness — Production-grade, model-agnostic LangGraph agent\n"
+            "Teane — production-grade, model-agnostic LangGraph agent\n"
             "for autonomous code generation, sandboxed builds, and bulletproof persistence.\n\n"
             "Quick Start:\n"
             "  teane run -r /path/to/repo -p \"Your engineering task description\"\n"

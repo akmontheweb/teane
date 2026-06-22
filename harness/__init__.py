@@ -1,5 +1,5 @@
 """
-AI Agent Harness — Production-grade, model-agnostic LangGraph agent for autonomous code generation,
+Teane — production-grade, model-agnostic LangGraph agent for autonomous code generation,
 sandboxed build execution, and bulletproof persistence.
 
 Modules:

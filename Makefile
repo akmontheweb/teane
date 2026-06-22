@@ -1,11 +1,11 @@
 # Auto-generated Makefile by harness
 # Detected project type: Python
 
-.PHONY: build clean test coverage hooks-install release setup
+.PHONY: build clean test coverage hooks-install release setup eval eval-compare
 
 # One-shot bootstrap for a fresh machine. Walks the operator through
 # 11 phases: platform / Python / git / sandbox probes → venv → pip
-# install → LLM config wizard → harness doctor → optional tools →
+# install → LLM config wizard → teane doctor → optional tools →
 # summary. See docs/installation.md §0 for the scripted-install
 # overview, or scripts/setup.py --help for CLI flags.
 setup:
@@ -55,3 +55,15 @@ hooks-install:
 BUMP ?= patch
 release:
 	@python scripts/release.py --bump=$(BUMP)
+
+# Run the eval harness (audit #29). Walks every task in
+# `evals/golden_set.yaml`, drives `teane run` against a fresh temp
+# workspace per task, and writes `evals/results.json`. See
+# evals/README.md for the schema and how to add tasks.
+eval:
+	@python -m evals.run_eval
+
+# Print a delta table comparing `evals/results.json` against
+# `evals/baseline.json`. Exit 1 on regression so CI can gate on it.
+eval-compare:
+	@python -m evals.compare

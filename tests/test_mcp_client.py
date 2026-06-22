@@ -437,6 +437,69 @@ async def test_mcp_tool_skill_dispatches_via_pool():
     _drop_mcp_skills()
 
 
+class _TaggedDummyPool(_DummyPool):
+    """``_DummyPool`` variant that exposes a ``config`` with per-server tags
+    so ``register_mcp_skills(workspace_tags=...)`` has something to filter on.
+    """
+
+    def __init__(
+        self,
+        tools_per_server: dict[str, list[dict[str, Any]]],
+        server_tags: dict[str, list[str]],
+    ):
+        super().__init__(tools_per_server)
+        from harness.mcp_client import McpPoolConfig, McpServerConfig
+        self.config = McpPoolConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(name=name, command=["echo"], tags=server_tags.get(name, []))
+                for name in tools_per_server
+            ],
+        )
+
+
+def test_register_mcp_skills_filters_by_workspace_tags():
+    _drop_mcp_skills()
+    pool = _TaggedDummyPool(
+        tools_per_server={
+            "py-helper": [{"name": "lint"}],
+            "node-helper": [{"name": "lint"}],
+            "universal": [{"name": "search"}],
+        },
+        server_tags={
+            "py-helper": ["python"],
+            "node-helper": ["node", "javascript"],
+            "universal": [],  # no tags → always included
+        },
+    )
+    count = register_mcp_skills(pool, workspace_tags={"python"})  # type: ignore[arg-type]
+    # py-helper + universal register; node-helper is dropped.
+    assert count == 2
+    reg = SkillRegistry()
+    assert reg.get("mcp__py-helper__lint") is not None
+    assert reg.get("mcp__universal__search") is not None
+    assert reg.get("mcp__node-helper__lint") is None
+    _drop_mcp_skills()
+
+
+def test_register_mcp_skills_no_workspace_tags_means_no_filtering():
+    _drop_mcp_skills()
+    pool = _TaggedDummyPool(
+        tools_per_server={
+            "py-helper": [{"name": "lint"}],
+            "node-helper": [{"name": "lint"}],
+        },
+        server_tags={
+            "py-helper": ["python"],
+            "node-helper": ["node"],
+        },
+    )
+    # workspace_tags=None → register everything regardless of declared tags.
+    count = register_mcp_skills(pool, workspace_tags=None)  # type: ignore[arg-type]
+    assert count == 2
+    _drop_mcp_skills()
+
+
 # ---------------------------------------------------------------------------
 # 6. Filesystem-server safety gate
 # ---------------------------------------------------------------------------

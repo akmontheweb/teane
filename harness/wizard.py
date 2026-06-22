@@ -31,6 +31,10 @@ import getpass
 import logging
 import os
 import sys
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from harness.hitl import HitlChannel
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +143,7 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
 # Step 1 — API keys
 # ---------------------------------------------------------------------------
 
-def _check_and_prompt_api_keys(config: dict) -> None:
+def _check_and_prompt_api_keys(config: dict[str, Any]) -> None:
     """Scan ``config["models"]`` for any provider whose ``{PROVIDER}_API_KEY``
     env var is unset, and prompt the user to enter each missing key. Sets
     ``os.environ[env_var]`` so downstream code (gateway dispatch, sandbox
@@ -184,7 +188,7 @@ def _check_and_prompt_api_keys(config: dict) -> None:
 # Step 0 — new vs resume
 # ---------------------------------------------------------------------------
 
-def _ask_session_mode(channel) -> str:
+def _ask_session_mode(channel: "HitlChannel") -> str:
     """Ask whether to start a new session or resume an existing one.
 
     Returns ``"run"`` (new) or ``"resume"``. Default is ``"run"`` so a
@@ -287,7 +291,7 @@ def _list_recent_sessions_sync(
     return rows
 
 
-def _ask_session_id(channel, db_path: str) -> str:
+def _ask_session_id(channel: "HitlChannel", db_path: str) -> str:
     """Prompt for a session id. Show a numbered list of recent sessions
     when the checkpoint DB has any; the operator can pick a number or
     type any session id directly.
@@ -348,7 +352,7 @@ def _ask_session_id(channel, db_path: str) -> str:
 # Steps 1-5 — runtime prompts
 # ---------------------------------------------------------------------------
 
-def _ask_workspace(channel) -> str:
+def _ask_workspace(channel: "HitlChannel") -> str:
     default = os.getcwd()
     while True:
         print("\nStep 1 of 5: Workspace path (the target repo to operate on).")
@@ -364,7 +368,7 @@ def _ask_workspace(channel) -> str:
         return resolved
 
 
-def _ask_prompt(channel) -> str:
+def _ask_prompt(channel: "HitlChannel") -> str:
     while True:
         print("\nStep 2 of 5: Engineering task / prompt.")
         print("  Example: \"Refactor the auth module to use JWT.\"")
@@ -374,7 +378,7 @@ def _ask_prompt(channel) -> str:
         print("  The prompt can't be empty. Try again.")
 
 
-def _ask_git(channel) -> bool:
+def _ask_git(channel: "HitlChannel") -> bool:
     print("\nStep 3 of 5: Enable GitGuardian for the workspace?")
     print("  y = true   (GitGuardian stashes / branches / rolls back; requires a git repo)")
     print("  n = false  (skip every git step — pick this if no git repo)")
@@ -384,7 +388,7 @@ def _ask_git(channel) -> bool:
     return choice == "y"
 
 
-def _ask_new_build(channel) -> bool:
+def _ask_new_build(channel: "HitlChannel") -> bool:
     print("\nStep 4 of 5: Treat this as a brand-new build?")
     print(
         "  Deletes every file at the workspace root EXCEPT product_spec/\n"
@@ -393,7 +397,7 @@ def _ask_new_build(channel) -> bool:
     return channel.confirm("New build?", default=False)
 
 
-def _ask_discover(channel) -> bool:
+def _ask_discover(channel: "HitlChannel") -> bool:
     print("\nStep 5 of 5: Run the full discovery pipeline?")
     print(
         "  Discovery walks through requirements / architecture / deployment\n"

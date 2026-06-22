@@ -1,5 +1,5 @@
 """
-Unit tests for the AI Agent Harness modules.
+Unit tests for the Teane modules.
 Tests cover: graph, patcher, sandbox, security, storage, lintgate, deploy, redactor, impact.
 """
 import asyncio

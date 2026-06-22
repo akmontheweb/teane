@@ -37,7 +37,10 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Optional, cast, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from harness.graph import AgentState
 
 logger = logging.getLogger(__name__)
 
@@ -533,7 +536,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # tests follow the `test_cr_N_*` naming convention and reference the
     # CR in their docstrings. No-op (empty string) outside CR mode.
     from harness.graph import _build_change_request_preamble
-    user_prompt = _build_change_request_preamble(state, "tests") + user_prompt
+    user_prompt = _build_change_request_preamble(cast("AgentState", state), "tests") + user_prompt
     messages.append({"role": "user", "content": user_prompt})
 
     budget = float(state.get("budget_remaining_usd", 2.00))

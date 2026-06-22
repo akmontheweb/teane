@@ -92,6 +92,11 @@ class McpServerConfig:
     # documented key — operators put the right key name in the env dict
     # directly when needed; api_key_env is just a convenience).
     api_key_env: str = ""
+    # Workspace tags this server is relevant for (e.g. ["python", "web"]).
+    # Empty list = applies to every workspace (status-quo behaviour).
+    # ``register_mcp_skills`` uses the intersection against the runtime
+    # workspace tags to decide whether to expose this server's tools.
+    tags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "McpServerConfig":
@@ -101,6 +106,7 @@ class McpServerConfig:
             command=list(raw.get("command", [])),
             env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
             api_key_env=str(raw.get("api_key_env", "")),
+            tags=[str(t) for t in (raw.get("tags") or [])],
         )
 
 
@@ -687,15 +693,44 @@ class McpToolSkill(ToolSkill):
             return {"error": f"unexpected error: {exc}"}
 
 
-def register_mcp_skills(pool: McpClientPool) -> int:
+def register_mcp_skills(
+    pool: McpClientPool,
+    *,
+    workspace_tags: Optional[set[str]] = None,
+) -> int:
     """Walk the pool's started clients and register one
     :class:`McpToolSkill` per advertised tool. Returns the total
     registered. Idempotent — re-registering a skill overwrites the
     previous entry, matching :meth:`SkillRegistry.register`.
+
+    When ``workspace_tags`` is provided, a server is included only if
+    its declared ``tags`` intersect ``workspace_tags``. Servers with no
+    declared tags (empty list) are always included — that keeps the
+    pre-existing default behaviour. When ``workspace_tags`` is None,
+    no filtering is applied (also status-quo).
     """
     from harness.skills import register
+
+    # Build a name → tag-set map from the pool's config so we can decide
+    # per-server. Servers without an entry default to empty (= always
+    # registered). Pool stubs in tests may not expose a ``config`` —
+    # fall back to an empty map (no filtering possible) in that case.
+    server_tag_map: dict[str, set[str]] = {}
+    pool_config = getattr(pool, "config", None)
+    if pool_config is not None and getattr(pool_config, "servers", None) is not None:
+        server_tag_map = {s.name: set(s.tags) for s in pool_config.servers}
+
     count = 0
+    skipped: list[str] = []
     for server_name, tools in pool.list_all_tools().items():
+        server_tags = server_tag_map.get(server_name, set())
+        if (
+            workspace_tags is not None
+            and server_tags
+            and not (server_tags & workspace_tags)
+        ):
+            skipped.append(server_name)
+            continue
         for tool in tools:
             if not isinstance(tool, dict) or not tool.get("name"):
                 continue
@@ -703,6 +738,11 @@ def register_mcp_skills(pool: McpClientPool) -> int:
                 server_name=server_name, tool_descriptor=tool, pool=pool,
             ))
             count += 1
+    if skipped:
+        logger.info(
+            "[mcp] skipped %d server(s) not matching workspace_tags=%s: %s",
+            len(skipped), sorted(workspace_tags or set()), skipped,
+        )
     return count
 
 

@@ -243,7 +243,7 @@ _MAX_DISCOVERY_BYTES = 1_000_000
 _MAX_DISCOVERY_DEPTH = 10
 
 
-def _json_depth(node: Any, _seen: Optional[set] = None) -> int:
+def _json_depth(node: Any, _seen: Optional[set[int]] = None) -> int:
     """Return the maximum nesting depth of a parsed JSON tree.
 
     Cycle-safe via an id() set so a malformed object graph can't OOM us.

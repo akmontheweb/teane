@@ -429,6 +429,94 @@ class TestMobilePlatformDetection:
         assert "android" not in tags
 
 
+class TestArchitectureSpecAugmentation:
+    """Regression tests for the SPEC_ARCHITECTURE.md tag-augmentation path.
+
+    Greenfield ``--new-build`` runs reset the workspace to empty before
+    the planner fires, so filesystem detection alone returns no stack
+    tags — and the web-app file-manifest contract (graph.py:1049) keys
+    off ``"html" in tags``, so it never injects and the planner emits a
+    backend-only blueprint. Mining the architecture spec for stack hints
+    bridges that gap. Augmentation is purely additive.
+    """
+
+    def _write_spec(self, workspace, body):
+        docs = os.path.join(workspace, "docs")
+        os.makedirs(docs, exist_ok=True)
+        with open(os.path.join(docs, "SPEC_ARCHITECTURE.md"), "w") as f:
+            f.write(body)
+
+    def test_empty_workspace_no_spec_stays_empty(self, workspace):
+        from harness.impact import _detect_workspace_stack
+        assert _detect_workspace_stack(workspace) == set()
+
+    def test_spec_workspace_layout_block_seeds_frontend_tags(self, workspace):
+        from harness.impact import _detect_workspace_stack
+        self._write_spec(workspace, '\n'.join([
+            '# Arch',
+            '```json',
+            '{"workspace_layout": {"roots": ['
+            '{"path": "server", "purpose": "api", "stack": "fastapi"},'
+            '{"path": "client", "purpose": "web", "stack": "vue"}'
+            '], "test_placement": "co-located", "root_files": []}}',
+            '```',
+        ]))
+        tags = _detect_workspace_stack(workspace)
+        # Frontend root → vue + transitive html/css/node
+        assert "vue" in tags
+        assert "html" in tags
+        assert "css" in tags
+        # Backend root → fastapi + python
+        assert "fastapi" in tags
+        assert "python" in tags
+
+    def test_spec_freetext_react_fastapi_seeds_full_stack(self, workspace):
+        from harness.impact import _detect_workspace_stack
+        self._write_spec(
+            workspace,
+            "Frontend: React 18 SPA with TypeScript.\n"
+            "Backend: FastAPI on PostgreSQL.\n",
+        )
+        tags = _detect_workspace_stack(workspace)
+        assert {"react", "html", "css", "fastapi", "python", "postgres", "typescript"} <= tags
+
+    def test_spec_flask_only_does_not_imply_frontend(self, workspace):
+        from harness.impact import _detect_workspace_stack
+        self._write_spec(workspace, "A Flask service returning JSON. No SPA.")
+        tags = _detect_workspace_stack(workspace)
+        assert "python" in tags
+        # No frontend tags — Flask alone must not trigger the web-app
+        # file-manifest contract.
+        assert "html" not in tags
+        assert "css" not in tags
+        assert "react" not in tags
+        assert "vue" not in tags
+
+    def test_spec_augmentation_is_additive_does_not_override_manifest(
+        self, workspace,
+    ):
+        from harness.impact import _detect_workspace_stack
+        # Manifest says React; spec mentions Vue. Both should appear —
+        # augmentation never strips the manifest-derived tag.
+        with open(os.path.join(workspace, "package.json"), "w") as f:
+            f.write('{"dependencies": {"react": "^18"}}')
+        self._write_spec(workspace, "We will use Vue 3 for the SPA.")
+        tags = _detect_workspace_stack(workspace)
+        assert "react" in tags
+        assert "vue" in tags
+
+    def test_spec_passing_mention_without_context_does_not_fire(
+        self, workspace,
+    ):
+        from harness.impact import _detect_workspace_stack
+        # "React" alone is too ambiguous; the regex requires a context
+        # word (version number, "SPA", "frontend", etc.).
+        self._write_spec(workspace, "The system has a reactive design.")
+        tags = _detect_workspace_stack(workspace)
+        assert "react" not in tags
+        assert "html" not in tags
+
+
 class TestSystemPromptInjection:
     """Integration: _build_system_prompt assembles the Coding Style Guides
     section only when relevant tags are present."""

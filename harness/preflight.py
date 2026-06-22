@@ -483,7 +483,7 @@ def probe_long_paths() -> CheckResult:
             section="REQUIRED",
         )
     try:
-        import winreg  # type: ignore[import-not-found]
+        import winreg  # type: ignore[import-not-found, unused-ignore]
     except ImportError:
         return CheckResult(
             name="long paths",
@@ -497,14 +497,14 @@ def probe_long_paths() -> CheckResult:
         '-PropertyType DWORD -Force   # then reboot. Run as Administrator.'
     )
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
+        key = winreg.OpenKey(  # type: ignore[attr-defined, unused-ignore]
+            winreg.HKEY_LOCAL_MACHINE,  # type: ignore[attr-defined, unused-ignore]
             r"SYSTEM\CurrentControlSet\Control\FileSystem",
         )
         try:
-            val, _kind = winreg.QueryValueEx(key, "LongPathsEnabled")
+            val, _kind = winreg.QueryValueEx(key, "LongPathsEnabled")  # type: ignore[attr-defined, unused-ignore]
         finally:
-            winreg.CloseKey(key)
+            winreg.CloseKey(key)  # type: ignore[attr-defined, unused-ignore]
     except (OSError, FileNotFoundError):
         return CheckResult(
             name="long paths",

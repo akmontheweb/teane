@@ -44,7 +44,7 @@ import urllib.parse
 from harness import _platform
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1843,7 +1843,7 @@ def _collect_run_argv(form: dict[str, Any]) -> tuple[list[str], list[str]]:
     return build_run_argv_from_form(form)
 
 
-def _render_run_flag_input(flag) -> str:
+def _render_run_flag_input(flag: Any) -> str:
     """Render one CLI flag's input element. Mirrors the Carbon styling of
     the config form so the two screens feel consistent."""
     from harness.web_forms import (
@@ -2268,7 +2268,7 @@ def _render_session_picker(cfg: DashboardConfig) -> str:
     )
 
 
-def _render_field_input_new(field) -> str:
+def _render_field_input_new(field: Any) -> str:
     """Render one form field as a Carbon-classed input. Mirrors the
     legacy ``_render_field_input`` but reads the new ``choices`` and
     ``description`` attributes and tags inputs with ``bx--*`` classes.
@@ -3872,7 +3872,7 @@ def make_request_handler(
                 return
             try:
                 append_audit(db_path=cfg.web_db_path, action="schedule_add",
-                             target=job["name"], detail=msg)
+                             target=str(job["name"]), detail=msg)
             except Exception:  # noqa: BLE001
                 pass
             self.send_response(303)
@@ -3889,7 +3889,7 @@ def make_request_handler(
                 qs = urllib.parse.parse_qs(parsed_url.query)
                 provided = (
                     self.headers.get("X-HITL-Secret")
-                    or (qs.get("secret") or [None])[0]
+                    or (qs.get("secret") or [""])[0]
                 )
                 if not provided or not hmac.compare_digest(provided, secret_required):
                     self._send(401, "text/plain", "401 hitl webhook secret mismatch\n")
@@ -4624,7 +4624,7 @@ def tail_session_events(
     poll_interval: float = 0.5,
     follow: bool = True,
     idle_polls_before_giveup: int = 600,
-):
+) -> Iterator[dict[str, Any]]:
     """Generator that yields decoded JSON event lines as they appear in
     the log file. Stops when ``follow`` is False and we hit EOF, or
     when the caller breaks out.
@@ -4702,7 +4702,7 @@ def tail_session_stdout(
     max_lines: int = 5000,
     poll_interval: float = 0.5,
     follow: bool = True,
-):
+) -> Iterator[dict[str, Any]]:
     """Generator that yields raw stdout/stderr lines as they appear in
     the harness subprocess's combined stdout file. Each yield is a dict
     ``{"text": <line>}`` so the SSE framing stays uniform with

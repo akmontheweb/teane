@@ -280,3 +280,34 @@ class TestDiagnosticFormatting:
         out = d.format_compiler_style()
         assert out.startswith("style.css:1:1: error:")
         assert "did you mean 'src/styles.css'" in out
+
+
+# --- Greenfield arch-synth prompt carries the inventory contract -------------
+
+
+class TestGreenfieldArchSynthPromptIncludesInventoryContract:
+    """The greenfield :data:`harness.cli._ARCHITECTURE_SYNTHESIS_PROMPT`
+    must splice in :data:`ARCHITECTURE_INVENTORY_INSTRUCTION` so every
+    spec it produces carries the ``files`` + ``workspace_layout`` JSON
+    blocks. Without those, the planner has no inventory to cross-check
+    against and the patcher's allowlist falls back to a filesystem
+    heuristic — the failure mode that shipped backend-only on the
+    full-stack ciod build.
+    """
+
+    def test_prompt_formats_with_inventory_instruction_placeholder(self):
+        from harness.cli import _ARCHITECTURE_SYNTHESIS_PROMPT
+        from harness.architecture_inventory import ARCHITECTURE_INVENTORY_INSTRUCTION
+        formatted = _ARCHITECTURE_SYNTHESIS_PROMPT.format(
+            requirements="dummy reqs",
+            inventory_instruction=ARCHITECTURE_INVENTORY_INSTRUCTION,
+        )
+        # Inventory contract markers must be present.
+        assert "file inventory" in formatted.lower()
+        assert "workspace_layout" in formatted
+        assert "\"files\":" in formatted
+        # The contract appears BEFORE the requirements block so the LLM
+        # treats it as a content requirement, not an afterthought.
+        contract_pos = formatted.find("workspace_layout")
+        reqs_pos = formatted.find("dummy reqs")
+        assert 0 < contract_pos < reqs_pos

@@ -46,6 +46,42 @@ def _failure(ts: str, name: str) -> dict:
     return {"ts": ts, "level": "ERROR", "logger": "harness.events", "msg": "", "event": name}
 
 
+def _tool_succeeded(ts: str, tool: str) -> dict:
+    return {
+        "ts": ts,
+        "level": "INFO",
+        "logger": "harness.events",
+        "msg": "",
+        "event": "tool_call_succeeded",
+        "tool_name": tool,
+    }
+
+
+def _tool_failed(ts: str, tool: str, reason: str = "boom") -> dict:
+    return {
+        "ts": ts,
+        "level": "ERROR",
+        "logger": "harness.events",
+        "msg": "",
+        "event": "tool_call_failed",
+        "tool_name": tool,
+        "reason": reason,
+    }
+
+
+def _system_prompt_built(ts: str, chars: int, lines: int, tree_lines: int = 0) -> dict:
+    return {
+        "ts": ts,
+        "level": "INFO",
+        "logger": "harness.events",
+        "msg": "",
+        "event": "system_prompt_built",
+        "chars": chars,
+        "lines": lines,
+        "tree_lines": tree_lines,
+    }
+
+
 _FIXED_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -139,6 +175,148 @@ class TestAggregateSession:
         assert m.first_ts is None
         assert m.last_ts is None
         assert m.recent_burn_rate_usd_per_min == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 1b. Cache-hit rate (#26) and per-tool error rate (#15, #27)
+# ---------------------------------------------------------------------------
+
+class TestCacheHitRate:
+
+    def test_empty_session_returns_zero(self):
+        from harness.metrics import SessionMetrics
+        assert SessionMetrics(session_id="x").cache_hit_rate() == 0.0
+
+    def test_basic_ratio(self):
+        from harness.metrics import SessionMetrics
+        m = SessionMetrics(session_id="x", tokens_in=200, cached_tokens=800)
+        assert m.cache_hit_rate() == pytest.approx(0.80)
+
+    def test_no_cached_returns_zero(self):
+        from harness.metrics import SessionMetrics
+        m = SessionMetrics(session_id="x", tokens_in=500, cached_tokens=0)
+        assert m.cache_hit_rate() == 0.0
+
+    def test_aggregated_from_llm_call_events(self, tmp_path):
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-cache.jsonl"
+        _write_jsonl(str(log), [
+            _llm_call("2026-06-10T11:55:00+00:00", 0.10, tin=100, cached=900),
+            _llm_call("2026-06-10T11:56:00+00:00", 0.10, tin=100, cached=900),
+        ])
+        m = aggregate_session("sess-cache", str(tmp_path), now=_FIXED_NOW)
+        # 1800 cached / (200 input + 1800 cached) = 0.90
+        assert m.cache_hit_rate() == pytest.approx(0.90)
+
+
+class TestToolErrorRate:
+
+    def test_no_calls_returns_zero(self):
+        from harness.metrics import SessionMetrics
+        assert SessionMetrics(session_id="x").tool_error_rate("read_file") == 0.0
+        assert SessionMetrics(session_id="x").tool_error_rates() == {}
+
+    def test_aggregates_succeeded_and_failed(self, tmp_path):
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-tool.jsonl"
+        _write_jsonl(str(log), [
+            _tool_succeeded("2026-06-10T11:55:00+00:00", "read_file"),
+            _tool_succeeded("2026-06-10T11:55:30+00:00", "read_file"),
+            _tool_failed("2026-06-10T11:56:00+00:00", "read_file"),
+            _tool_succeeded("2026-06-10T11:56:30+00:00", "web_search"),
+            _tool_failed("2026-06-10T11:57:00+00:00", "web_search"),
+        ])
+        m = aggregate_session("sess-tool", str(tmp_path), now=_FIXED_NOW)
+        # read_file: 3 calls total (2 succeeded + 1 failed), 1 error → 33%.
+        assert m.tool_call_count == {"read_file": 3, "web_search": 2}
+        assert m.tool_error_count == {"read_file": 1, "web_search": 1}
+        assert m.tool_error_rate("read_file") == pytest.approx(1 / 3)
+        assert m.tool_error_rate("web_search") == pytest.approx(0.5)
+        assert m.tool_error_rate("unknown_tool") == 0.0
+
+    def test_tool_call_failed_only_still_counts_as_attempt(self, tmp_path):
+        # A tool that always fails should show 100% error rate, not 0%.
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-fail.jsonl"
+        _write_jsonl(str(log), [
+            _tool_failed("2026-06-10T11:55:00+00:00", "broken_tool"),
+            _tool_failed("2026-06-10T11:56:00+00:00", "broken_tool"),
+        ])
+        m = aggregate_session("sess-fail", str(tmp_path), now=_FIXED_NOW)
+        assert m.tool_call_count == {"broken_tool": 2}
+        assert m.tool_error_count == {"broken_tool": 2}
+        assert m.tool_error_rate("broken_tool") == 1.0
+
+    def test_missing_tool_name_falls_back_to_unknown(self, tmp_path):
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-nname.jsonl"
+        # Event with no tool_name field — should still be counted under "unknown".
+        rec = {
+            "ts": "2026-06-10T11:55:00+00:00",
+            "level": "INFO",
+            "logger": "harness.events",
+            "msg": "",
+            "event": "tool_call_succeeded",
+        }
+        _write_jsonl(str(log), [rec])
+        m = aggregate_session("sess-nname", str(tmp_path), now=_FIXED_NOW)
+        assert m.tool_call_count == {"unknown": 1}
+
+
+class TestToJsonableShapeNew:
+
+    def test_includes_new_fields(self):
+        from harness.metrics import SessionMetrics
+        m = SessionMetrics(
+            session_id="x",
+            tokens_in=100,
+            cached_tokens=900,
+            tool_call_count={"read_file": 4},
+            tool_error_count={"read_file": 1},
+        )
+        out = m.to_jsonable()
+        assert out["cache_hit_rate"] == pytest.approx(0.90)
+        assert out["tool_call_count"] == {"read_file": 4}
+        assert out["tool_error_count"] == {"read_file": 1}
+        assert out["tool_error_rates"]["read_file"] == pytest.approx(0.25)
+
+
+class TestSystemPromptSize:
+
+    def test_records_latest_prompt_size(self, tmp_path):
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-prompt.jsonl"
+        _write_jsonl(str(log), [
+            _system_prompt_built("2026-06-10T11:55:00+00:00", chars=10_000, lines=120),
+            # Second emission overwrites — most-recent wins.
+            _system_prompt_built("2026-06-10T11:55:30+00:00", chars=8_000, lines=80),
+        ])
+        m = aggregate_session("sess-prompt", str(tmp_path), now=_FIXED_NOW)
+        assert m.system_prompt_chars == 8_000
+        assert m.system_prompt_lines == 80
+
+
+class TestPrometheusNewMetrics:
+
+    def test_emits_new_gauges(self, tmp_path):
+        from harness.metrics import aggregate_session, format_prometheus
+        log = tmp_path / "promnew.jsonl"
+        _write_jsonl(str(log), [
+            _llm_call("2026-06-10T11:55:00+00:00", 0.10, tin=100, cached=900),
+            _tool_succeeded("2026-06-10T11:55:10+00:00", "read_file"),
+            _tool_failed("2026-06-10T11:55:20+00:00", "read_file"),
+        ])
+        m = aggregate_session("promnew", str(tmp_path), now=_FIXED_NOW)
+        text = format_prometheus([m], hard_cap_usd=2.00)
+        for metric in [
+            "harness_session_cache_hit_rate",
+            "harness_tool_calls_total",
+            "harness_tool_errors_total",
+            "harness_tool_error_rate",
+        ]:
+            assert f"# HELP {metric}" in text
+            assert f"# TYPE {metric}" in text
+        assert 'tool="read_file"' in text
 
 
 # ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ from contextlib import contextmanager
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +346,7 @@ def _atomic_write_text(path: str, content: str) -> None:
 
 
 @contextmanager
-def _memory_file_lock(path: str):
+def _memory_file_lock(path: str) -> Iterator[None]:
     """Hold an exclusive file lock on ``<path>.lock`` for the duration of
     a read-modify-write on ``path``. The lock file is created next to the
     memory file. Audit §1.14.

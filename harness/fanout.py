@@ -347,7 +347,7 @@ def _parse_first_json(text: str) -> Optional[dict[str, Any]]:
 # 4. SubAgentFanoutSkill — text-DSL surface for the planner
 # ---------------------------------------------------------------------------
 
-def make_fanout_skill():
+def make_fanout_skill() -> "Any":
     """Construct the :class:`harness.skills.ToolSkill` the planner can
     invoke via ``<<<FANOUT_QUERY prompts='[...]'>>>``. Each entry in
     ``prompts`` is either a bare string (used as the user prompt) or

@@ -1,4 +1,4 @@
-# AI Agent Harness — Requirements Specification
+# Teane — Requirements Specification
 
 *Refreshed from current codebase state. Companion to `SPEC_ARCHITECTURE.md`.*
 
@@ -6,7 +6,7 @@
 
 ## 1. Executive Summary
 
-AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--deploy-dev`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Go / Rust / Dart / Flutter — all built on a single kitchen-sink builder image so polyglot workspaces share one container.
+Teane is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--deploy-dev`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Go / Rust / Dart / Flutter — all built on a single kitchen-sink builder image so polyglot workspaces share one container.
 
 ---
 

@@ -1183,14 +1183,14 @@ def _parse_gitleaks_json(stdout: str) -> list[SecurityFinding]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        rule_id = item.get("RuleID", item.get("rule_id", "unknown-secret"))
+        rule_id = str(item.get("RuleID", item.get("rule_id", "unknown-secret")))
         findings.append(SecurityFinding(
             scanner="gitleaks",
             rule_id=rule_id,
             severity="high",
-            file=item.get("File", item.get("file", "")),
+            file=str(item.get("File", item.get("file", ""))),
             line=int(item.get("StartLine", item.get("line", 0)) or 0),
-            message=item.get("Description", item.get("description", f"Secret detected: {rule_id}")),
+            message=str(item.get("Description", item.get("description", f"Secret detected: {rule_id}"))),
             cwe="CWE-798",  # Use of Hard-coded Credentials
             confidence="high",
         ))
@@ -1394,21 +1394,23 @@ def _parse_bandit_json(stdout: str) -> list[SecurityFinding]:
         return []
     if not isinstance(data, dict):
         return []
-    results = data.get("results") if isinstance(data.get("results"), list) else []
+    _results_raw = data.get("results")
+    results: list[Any] = _results_raw if isinstance(_results_raw, list) else []
 
     findings: list[SecurityFinding] = []
     for r in results:
         if not isinstance(r, dict):
             continue
-        cwe_obj = r.get("issue_cwe") if isinstance(r.get("issue_cwe"), dict) else {}
+        _cwe_raw = r.get("issue_cwe")
+        cwe_obj: dict[str, Any] = _cwe_raw if isinstance(_cwe_raw, dict) else {}
         cwe_id = cwe_obj.get("id")
         findings.append(SecurityFinding(
             scanner="bandit",
-            rule_id=r.get("test_id", "BANDIT"),
+            rule_id=str(r.get("test_id", "BANDIT")),
             severity=_normalize_severity("bandit", r.get("issue_severity", "")),
-            file=r.get("filename", ""),
+            file=str(r.get("filename", "")),
             line=int(r.get("line_number", 0) or 0),
-            message=r.get("issue_text", r.get("test_name", "Bandit finding")),
+            message=str(r.get("issue_text", r.get("test_name", "Bandit finding"))),
             cwe=f"CWE-{cwe_id}" if cwe_id else None,
             confidence=str(r.get("issue_confidence", "medium")).lower(),
         ))
@@ -1424,14 +1426,17 @@ def _parse_semgrep_json(stdout: str) -> list[SecurityFinding]:
         return []
     if not isinstance(data, dict):
         return []
-    results = data.get("results") if isinstance(data.get("results"), list) else []
+    _results_raw = data.get("results")
+    results: list[Any] = _results_raw if isinstance(_results_raw, list) else []
 
     findings: list[SecurityFinding] = []
     for r in results:
         if not isinstance(r, dict):
             continue
-        extra = r.get("extra") if isinstance(r.get("extra"), dict) else {}
-        meta = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+        _extra_raw = r.get("extra")
+        extra: dict[str, Any] = _extra_raw if isinstance(_extra_raw, dict) else {}
+        _meta_raw = extra.get("metadata")
+        meta: dict[str, Any] = _meta_raw if isinstance(_meta_raw, dict) else {}
         cwe_raw = meta.get("cwe")
         if isinstance(cwe_raw, list) and cwe_raw:
             cwe = str(cwe_raw[0])
@@ -1451,11 +1456,11 @@ def _parse_semgrep_json(stdout: str) -> list[SecurityFinding]:
         confidence_raw = meta.get("confidence", "medium")
         findings.append(SecurityFinding(
             scanner="semgrep",
-            rule_id=r.get("check_id", "semgrep.unknown"),
+            rule_id=str(r.get("check_id", "semgrep.unknown")),
             severity=_normalize_severity("semgrep", extra.get("severity", "")),
-            file=r.get("path", ""),
+            file=str(r.get("path", "")),
             line=int((r.get("start") or {}).get("line", 0) or 0),
-            message=extra.get("message", "Semgrep finding"),
+            message=str(extra.get("message", "Semgrep finding")),
             cwe=cwe,
             confidence=str(confidence_raw).lower() if isinstance(confidence_raw, str) else "medium",
         ))
@@ -1476,18 +1481,21 @@ def _parse_trivy_json(stdout: str) -> list[SecurityFinding]:
         return []
     if not isinstance(data, dict):
         return []
-    results = data.get("Results") if isinstance(data.get("Results"), list) else []
+    _results_raw = data.get("Results")
+    results: list[Any] = _results_raw if isinstance(_results_raw, list) else []
 
     findings: list[SecurityFinding] = []
     for result in results:
         if not isinstance(result, dict):
             continue
         target = result.get("Target", "")
-        vulns = result.get("Vulnerabilities") if isinstance(result.get("Vulnerabilities"), list) else []
+        _vulns_raw = result.get("Vulnerabilities")
+        vulns: list[Any] = _vulns_raw if isinstance(_vulns_raw, list) else []
         for v in vulns:
             if not isinstance(v, dict):
                 continue
-            cwe_ids = v.get("CweIDs") if isinstance(v.get("CweIDs"), list) else []
+            _cwe_raw = v.get("CweIDs")
+            cwe_ids: list[Any] = _cwe_raw if isinstance(_cwe_raw, list) else []
             cwe = str(cwe_ids[0]) if cwe_ids else None
             if cwe and not cwe.upper().startswith("CWE-"):
                 cwe = f"CWE-{cwe}"

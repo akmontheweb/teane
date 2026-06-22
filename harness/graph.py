@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal, Optional, cast
 
 from typing_extensions import TypedDict
 
@@ -60,9 +60,14 @@ class DiagnosticObjectDict(TypedDict):
 
 
 class MessageDict(TypedDict, total=False):
-    """A single conversation turn in the messages array."""
+    """A single conversation turn in the messages array.
+
+    ``content`` may be a plain string (the common case) or a list of
+    Anthropic-style structured content blocks (text / tool_use /
+    tool_result) for messages that span multiple block types.
+    """
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: Any
     name: Optional[str]
     tool_calls: Optional[list[dict[str, Any]]]
     tool_call_id: Optional[str]
@@ -92,7 +97,10 @@ class AgentState(TypedDict, total=False):
     modified_files: list[str]
     compiler_errors: list[DiagnosticObjectDict]
     token_tracker: TokenTrackerDict
-    loop_counter: dict[str, int]
+    # Mostly int counters per node ("planning", "patching", "repair", ...),
+    # but a few sentinel-string entries piggy-back on the dict too
+    # (e.g. "missing_dep_last_symbol", "replace_block_misses_per_file").
+    loop_counter: dict[str, Any]
     allow_network: bool
     build_command: str
     budget_remaining_usd: float
@@ -216,6 +224,19 @@ class AgentState(TypedDict, total=False):
     # Loaded from the "change_requests" section of config.json by run_graph.
     # Read by reverse_engineer_architecture_node for the budget cap.
     change_requests_config: dict[str, Any]
+    # Audit #18 — files changed since the most recent green compile. Cleared
+    # when ``compiler_node`` returns ``exit_code == 0``; appended-to by any
+    # node that mutates source after that point (currently only
+    # ``code_review_node`` on a successful repatch). The router consults
+    # this set before terminal exit so a post-green mutation can't slip out
+    # un-verified. Empty list = no drift = safe to exit.
+    pending_mutations: list[str]
+    # When True (config ``pre_exit_verify=true``), the router forces one
+    # extra compile before terminal exit whenever ``pending_mutations`` is
+    # non-empty. Default False — the existing per-node re-routes already
+    # cover the known cases; this is defence-in-depth for future nodes that
+    # forget to set their own re-verify flag.
+    pre_exit_verify: bool
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -263,7 +284,7 @@ def create_initial_state(
         system_prompt = (
             spec_override
             + "\n\n---\n\n"
-            + _build_system_prompt(workspace_path, build_command)
+            + _build_and_emit_system_prompt(workspace_path, build_command)
         )
         # When a user-approved spec already exists (from the pre-flight
         # product_spec_dir refinement), skip the graph's discovery
@@ -272,7 +293,7 @@ def create_initial_state(
         # conversation-history compilation.
         skip_discovery = True
     else:
-        system_prompt = _build_system_prompt(workspace_path, build_command)
+        system_prompt = _build_and_emit_system_prompt(workspace_path, build_command)
     return AgentState(
         workspace_path=workspace_path,
         messages=[
@@ -308,6 +329,8 @@ def create_initial_state(
         cd_discovery=bool(cd_discovery),
         install_doc=bool(install_doc),
         installation_doc_path="",
+        pending_mutations=[],
+        pre_exit_verify=False,
     )
 
 
@@ -373,7 +396,7 @@ def _is_node_config_file(name: str) -> bool:
 SPEC_ARCHITECTURE_REL_PATH = os.path.join("docs", "SPEC_ARCHITECTURE.md")
 
 
-def _read_spec_layout(workspace_path: str):
+def _read_spec_layout(workspace_path: str) -> Any:
     """Read ``<workspace>/docs/SPEC_ARCHITECTURE.md`` and parse its
     ``workspace_layout`` block. Returns a :class:`LayoutParseResult`
     or ``None`` when the spec file is absent / unreadable.
@@ -435,7 +458,7 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     return _filesystem_allowlist(workspace_path)
 
 
-def _spec_driven_allowlist(workspace_path: str, layout) -> list[str]:
+def _spec_driven_allowlist(workspace_path: str, layout: Any) -> list[str]:
     """Build the tier-1 allowlist from a parsed workspace_layout block.
 
     The spec's ``roots`` list IS the prefix set. The standard test trees
@@ -475,7 +498,7 @@ def _spec_driven_allowlist(workspace_path: str, layout) -> list[str]:
 _LAYOUT_DIVERGENCE_CACHE: dict[str, list[str]] = {}
 
 
-def _resolve_layout_divergence(workspace_path: str, layout) -> list[str]:
+def _resolve_layout_divergence(workspace_path: str, layout: Any) -> list[str]:
     """Detect spec/disk divergence; emit telemetry; consult the operator
     when the HITL gate is enabled. Returns extra allowlist prefixes to
     add to the spec-driven base.
@@ -668,7 +691,7 @@ def _filesystem_allowlist(workspace_path: str) -> Optional[list[str]]:
     return allowlist
 
 
-def _check_layout_disk_divergence(workspace_path: str, layout) -> Optional[dict[str, Any]]:
+def _check_layout_disk_divergence(workspace_path: str, layout: Any) -> Optional[dict[str, Any]]:
     """Compare the spec's declared roots against the on-disk top-level
     directories. Detect cases where the workspace has drifted away from
     SPEC_ARCHITECTURE.md.
@@ -793,7 +816,7 @@ def _append_runtime_root_entries(workspace_path: str, allowlist: list[str]) -> N
         pass
 
 
-def _format_spec_layout_block(spec_layout) -> str:
+def _format_spec_layout_block(spec_layout: Any) -> str:
     """Render the spec's ``workspace_layout`` block as the system-prompt
     Workspace Layout section.
 
@@ -901,6 +924,9 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     Construct the static, immutable system prompt anchored at messages[0].
     This prompt is never mutated or truncated — it maximizes prefix caching
     across all downstream LLM calls because its position and content are fixed.
+
+    Emits a ``system_prompt_built`` observability event with ``chars`` and
+    ``lines`` so the harness can track prompt bloat over time (audit #8).
     """
     tree = _snapshot_directory_tree(workspace_path)
 
@@ -1235,10 +1261,56 @@ content:
 """
 
 
-def _snapshot_directory_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 50) -> str:
+def _build_and_emit_system_prompt(workspace_path: str, build_command: str) -> str:
+    """Wrap :func:`_build_system_prompt` so callers get the same prompt but
+    a ``system_prompt_built`` observability event also lands in the log.
+
+    Kept separate from ``_build_system_prompt`` so unit tests that only care
+    about prompt content (the majority) stay synchronous and don't have to
+    stub out observability.
+    """
+    prompt = _build_system_prompt(workspace_path, build_command)
+    try:
+        from harness.observability import emit_event
+        tree_lines = prompt.split("## Directory Structure", 1)
+        emit_event(
+            "system_prompt_built",
+            chars=len(prompt),
+            lines=prompt.count("\n") + 1,
+            tree_lines=(
+                tree_lines[1].split("\n## ", 1)[0].count("\n")
+                if len(tree_lines) > 1 else 0
+            ),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never block
+        pass
+    return prompt
+
+
+_TREE_NOISE_DIRS = frozenset({
+    "node_modules", "__pycache__", "target", "build", "dist", ".git",
+    # Audit (#8/#9): keep the tree small enough that the system prompt
+    # stays under the 60-line aspirational target without hiding any
+    # real source. These directories carry vendored artefacts, caches,
+    # or generated output — useful to operators, noise for the LLM.
+    ".venv", "venv", "env", ".tox", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".idea", ".vscode", ".gradle", ".next", ".nuxt",
+    "coverage", "htmlcov", ".cache", "vendor",
+})
+
+
+def _snapshot_directory_tree(
+    path: str, max_depth: int = 3, max_files_per_dir: int = 20,
+) -> str:
     """
     Generate a lightweight directory tree snapshot for the system prompt.
     Limits depth and file count to avoid bloating the prompt.
+
+    Audit (#8): defaults tightened from (depth=4, files=50) to (3, 20).
+    The previous defaults could emit 500+ tree lines on a midsize repo;
+    the LLM rarely needs more than the top-2 layers + a representative
+    file list to orient. Files past the cap collapse into a single
+    ``... (N more files)`` marker so the cardinality stays visible.
     """
     lines: list[str] = []
     try:
@@ -1247,12 +1319,11 @@ def _snapshot_directory_tree(path: str, max_depth: int = 4, max_files_per_dir: i
             if depth > max_depth:
                 dirs.clear()
                 continue
-            # Skip hidden and common noise directories
+            # Skip hidden and common noise directories.
             dirs[:] = [
                 d
                 for d in sorted(dirs)
-                if not d.startswith(".")
-                and d not in ("node_modules", "__pycache__", "target", "build", "dist", ".git")
+                if not d.startswith(".") and d not in _TREE_NOISE_DIRS
             ]
             indent = "  " * (depth + 1)
             rel = os.path.relpath(root, path)
@@ -1953,7 +2024,8 @@ async def _patching_tool_loop(
             # dispatch.
             args = call.get("input") or {}
             rel = str(args.get("file_path") or "").strip()
-            if rel and not result_text.startswith("Error:"):
+            is_error = result_text.startswith("Error:")
+            if rel and not is_error:
                 try:
                     import hashlib as _hl
                     files_seen[rel] = _hl.sha256(
@@ -1961,6 +2033,18 @@ async def _patching_tool_loop(
                     ).hexdigest()
                 except Exception:  # noqa: BLE001 — best-effort
                     pass
+            try:
+                from harness.observability import emit_event, log_failure
+                if is_error:
+                    log_failure(
+                        "tool_call_failed",
+                        tool_name="read_file",
+                        reason=result_text[:200],
+                    )
+                else:
+                    emit_event("tool_call_succeeded", tool_name="read_file")
+            except Exception:  # noqa: BLE001 — telemetry must never block
+                pass
         messages.append(MessageDict(role="user", content=tool_results))
         # Re-dispatch.
         try:
@@ -2084,16 +2168,41 @@ async def _run_tool_loop(
         for block in blocks:
             skill = registry.get(block.skill_name)
             if skill is None:
+                try:
+                    from harness.observability import log_failure
+                    log_failure(
+                        "tool_call_failed",
+                        tool_name=block.skill_name,
+                        reason="not_registered",
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must never block
+                    pass
                 tool_results.append(
                     f"[tool {block.skill_name}] not registered "
                     f"(set web_tools.enabled=true in config to enable)."
                 )
                 continue
+            failure_reason: Optional[str] = None
             try:
                 result = await skill.execute(**block.kwargs)
             except Exception as exc:  # noqa: BLE001 — never let a skill blow up the graph
                 logger.exception("[tool_loop] skill %s failed", block.skill_name)
-                result = {"error": f"unexpected error: {exc}"}
+                failure_reason = f"unexpected error: {exc}"
+                result = {"error": failure_reason}
+            if failure_reason is None and isinstance(result, dict) and result.get("error"):
+                failure_reason = str(result.get("error"))
+            try:
+                from harness.observability import emit_event, log_failure
+                if failure_reason is not None:
+                    log_failure(
+                        "tool_call_failed",
+                        tool_name=block.skill_name,
+                        reason=failure_reason[:200],
+                    )
+                else:
+                    emit_event("tool_call_succeeded", tool_name=block.skill_name)
+            except Exception:  # noqa: BLE001 — telemetry must never block
+                pass
             tool_results.append(
                 f"[tool {block.skill_name}({block.kwargs})] -> {result!r}"
             )
@@ -2366,7 +2475,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
                 os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
                 if workspace_path else ""
             )
-            arch_files: list = []
+            arch_files: list[Any] = []
             if arch_path and os.path.isfile(arch_path):
                 with open(arch_path, "r", encoding="utf-8") as _f:
                     arch_md = _f.read()
@@ -2805,7 +2914,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
         else:
             status_msg = f"[System]: Failed to apply {fail_count} patch(es)."
         if allowlist_rejections:
-            rejected_paths = ", ".join(sorted({r["file"] for r in allowlist_rejections}))
+            rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
             status_msg += (
                 f"\n[Allowlist] Rejected paths outside the configured layout: "
                 f"{rejected_paths}. Allowed roots: {allowed_paths}."
@@ -2821,13 +2930,14 @@ Generate your patches NOW. Only the blocks above. No other text."""
         if modified_files:
             try:
                 from harness.impact import ImpactAnalyzer
-                impact_cfg = (state.get("impact_config") or {}) if isinstance(state, dict) else {}
+                _impact_raw = state.get("impact_config") if isinstance(state, dict) else None
+                impact_cfg: dict[str, Any] = _impact_raw if isinstance(_impact_raw, dict) else {}
                 _impact = ImpactAnalyzer(
                     workspace_path=workspace,
                     max_scan_files=int(impact_cfg.get("max_scan_files", 500)),
                     enabled=bool(impact_cfg.get("enabled", True)),
                 )
-                _impact.analyze_and_warn(list(modified_files), messages)
+                _impact.analyze_and_warn(list(modified_files), messages)  # type: ignore[arg-type]
             except Exception as _impact_exc:  # noqa: BLE001
                 logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
 
@@ -4412,6 +4522,14 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     loop_counter = state.get("loop_counter", {})
     loop_counter = dict(loop_counter)
     loop_counter["compiler"] = loop_counter.get("compiler", 0) + 1
+    # Audit #18 — when the router sent us back here purely to re-verify
+    # post-green mutations (no failure to repair, just defence-in-depth),
+    # record that this final-verify slot has now been spent. The router
+    # checks this counter so a single extra re-compile can't expand into
+    # a thrash loop.
+    is_pre_exit_verify = bool(state.get("pending_mutations"))
+    if is_pre_exit_verify:
+        loop_counter["final_verify"] = loop_counter.get("final_verify", 0) + 1
 
     workspace = state.get("workspace_path", os.getcwd())
     build_cmd = state.get("build_command", "make build")
@@ -4581,7 +4699,8 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # ``advisory`` for this build_command — useful for tools like
     # ``terraform validate`` that emit non-zero on benign drift. Listed
     # codes get folded to 0 so the repair loop doesn't fire on noise.
-    compiler_cfg = state.get("compiler_config") or {}
+    _compiler_cfg_raw = state.get("compiler_config")
+    compiler_cfg: dict[str, Any] = _compiler_cfg_raw if isinstance(_compiler_cfg_raw, dict) else {}
     advisory_codes = compiler_cfg.get("advisory_exit_codes") or []
     if exit_code != 0 and isinstance(advisory_codes, list):
         try:
@@ -4792,8 +4911,48 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         logger.info("[compiler_node] Build succeeded. Applying memory cleanse.")
         cleanse_update = apply_memory_cleanse(state, resolution_kind="compiler_success")
         return_dict.update(cleanse_update)
+        # Audit #18 — green compile clears the post-green-mutation tracker.
+        # Anything appended after this point reflects a real drift between
+        # what tests verified and what's on disk.
+        return_dict["pending_mutations"] = []
 
     return return_dict
+
+
+def _repair_budget_warning(total_repairs: int, cap: int) -> Optional[str]:
+    """Return a soft system-message warning when repair iterations are
+    running out (audit #19).
+
+    The harness already enforces ``cap`` as a hard ceiling — past it the
+    router moves to HITL. The warning fires at the last two iterations
+    (``remaining <= 2``) so the LLM has a chance to adjust strategy
+    *before* it gets cut off. A model that knows it's near the wall
+    favours small surgical edits over rewrites, which is exactly the
+    right move late in a run.
+
+    Returns ``None`` when there's still slack. The 2-step ramp (medium
+    warning at remaining==2, hard warning at remaining==1) gives the
+    model a chance to register the signal before the final attempt.
+    """
+    if cap <= 0:
+        return None
+    remaining = cap - total_repairs
+    if remaining <= 0 or remaining > 2:
+        return None
+    if remaining == 1:
+        return (
+            "[System budget warning] This is the LAST repair iteration "
+            "before the harness routes to human intervention. Emit the "
+            "smallest possible patch that fixes the failing diagnostic — "
+            "no refactors, no rewrites, no speculative cleanups. If the "
+            "fix is uncertain, prefer a narrow change over a broad one."
+        )
+    return (
+        "[System budget warning] 2 repair iterations remain before the "
+        "harness escalates. Favour focused, surgical fixes over broad "
+        "changes. If the same error keeps recurring across attempts, "
+        "narrow the scope rather than widening it."
+    )
 
 
 async def repair_node(state: AgentState) -> dict[str, Any]:
@@ -4830,7 +4989,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if cleanse_update:
             # Mutate the state's messages view in-place so the rest of this
             # node (which reads state.get("messages")) sees the trimmed list.
-            state = dict(state)
+            state = cast(AgentState, dict(state))
             state["messages"] = cleanse_update["messages"]
 
     # Build a concise repair prompt from structured diagnostics. Drop any
@@ -4871,7 +5030,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     web_asset_diags = web_asset_diagnostics_to_standard(
         lintgate_state.get("web_asset_errors", [])
     )
-    combined_input = list(errors) + web_asset_diags
+    combined_input: list[dict[str, Any]] = [dict(e) for e in errors] + list(web_asset_diags)
     unhandled, applied_fixes = await apply_autofixes(combined_input, workspace_path)
     # Strip any web-asset diagnostics that the LLM should NOT see in the
     # compiler-errors framing — they're already surfaced via the lint_errors
@@ -4882,9 +5041,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     autofix_modified_files = list(state.get("modified_files", []))
     autofix_messages = list(state.get("messages", []))
     if applied_fixes:
-        for r in applied_fixes:
-            if r.file not in autofix_modified_files:
-                autofix_modified_files.append(r.file)
+        for afr in applied_fixes:
+            if afr.file not in autofix_modified_files:
+                autofix_modified_files.append(afr.file)
         sys_msg = autofix_system_message(applied_fixes)
         if sys_msg:
             autofix_messages.append({"role": "system", "content": sys_msg})
@@ -4914,7 +5073,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         }
 
     # The LLM only sees the unhandled tail.
-    errors = unhandled
+    errors = cast("list[DiagnosticObjectDict]", unhandled)
 
     # Promote the wider-context file-content snippets from prior patch
     # failures to a top-of-prompt section BEFORE the diagnostic block.
@@ -4970,8 +5129,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # Fix #3: if any file has accumulated ≥ 2 consecutive REPLACE_BLOCK
     # misses, force the LLM out of the pattern with an explicit "use a
     # different operation" directive before the diagnostics.
+    _rb_per_file_raw = loop_counter.get("replace_block_misses_per_file")
     error_summary += _format_replace_block_miss_directive(
-        loop_counter.get("replace_block_misses_per_file") or {}
+        _rb_per_file_raw if isinstance(_rb_per_file_raw, dict) else {}
     )
     # Fix #5: when diagnostics point at test files but the error shape
     # looks like a production-cascade (ImportError / NameError / F821 /
@@ -5027,14 +5187,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     prior_rejections = state.get("node_state", {}).get("allowlist_rejections") or []
     if prior_rejections:
         prior_allowed = state.get("node_state", {}).get("allowed_paths") or []
-        rejected_paths = sorted({r.get("file", "") for r in prior_rejections if r.get("file")})
+        prior_rejected_paths: list[str] = sorted({str(r.get("file", "")) for r in prior_rejections if r.get("file")})
         rejection_block = (
             "\n## Allowlist Rejections (PREVIOUS attempt)\n"
             "Your last attempt produced patches targeting paths the patcher's "
             "skill allowlist rejected. These patches did NOT land on disk. "
             "Do NOT re-propose the same paths verbatim — relocate the file or "
             "use one of the allowed roots.\n"
-            f"Rejected: {rejected_paths}\n"
+            f"Rejected: {prior_rejected_paths}\n"
             f"Allowed roots: {prior_allowed}\n"
         )
         error_summary += rejection_block
@@ -5214,6 +5374,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 f"The build failed with the following errors. Generate precise SEARCH/REPLACE "
                 f"patches to fix them.\n\n{error_summary}"
             )
+        # Soft turn-budget warning (audit #19). Injected as a system
+        # message so the LLM treats it with authority. Fires only on the
+        # last two repair iterations; quiet otherwise.
+        budget_warning = _repair_budget_warning(total_repairs, max_repair_attempts)
+        if budget_warning is not None:
+            messages.append(MessageDict(role="system", content=budget_warning))
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    "repair_budget_warning",
+                    total_repairs=total_repairs,
+                    cap=max_repair_attempts,
+                    remaining=max_repair_attempts - total_repairs,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+
         # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
         # Then append the strict format reminder (same as patching_node).
@@ -5425,7 +5602,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             failed_files = [r.file for r in patch_results if not r.success]
             status_msg += f" Failed: {', '.join(failed_files)}."
         if allowlist_rejections:
-            rejected_paths = ", ".join(sorted({r["file"] for r in allowlist_rejections}))
+            rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
             status_msg += (
                 f"\n[Allowlist] Rejected paths outside the configured layout: "
                 f"{rejected_paths}. Allowed roots: {allowed_paths}."
@@ -5454,7 +5631,8 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # operation this round. The next iteration's prompt will direct
         # the LLM to use a different operation on any file at ≥ 2
         # consecutive misses — see _format_replace_block_miss_directive.
-        rb_misses = dict(loop_counter.get("replace_block_misses_per_file", {}) or {})
+        _rb_raw = loop_counter.get("replace_block_misses_per_file", {})
+        rb_misses: dict[str, int] = dict(_rb_raw) if isinstance(_rb_raw, dict) else {}
         for r in patch_results:
             op_str = (
                 r.operation.value if hasattr(r.operation, "value") else str(r.operation)
@@ -5475,13 +5653,14 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         if modified_files:
             try:
                 from harness.impact import ImpactAnalyzer as _ImpactAnalyzer
-                impact_cfg = (state.get("impact_config") or {}) if isinstance(state, dict) else {}
+                _impact_raw = state.get("impact_config") if isinstance(state, dict) else None
+                impact_cfg: dict[str, Any] = _impact_raw if isinstance(_impact_raw, dict) else {}
                 _impact = _ImpactAnalyzer(
                     workspace_path=workspace,
                     max_scan_files=int(impact_cfg.get("max_scan_files", 500)),
                     enabled=bool(impact_cfg.get("enabled", True)),
                 )
-                _impact.analyze_and_warn(list(modified_files), messages)
+                _impact.analyze_and_warn(list(modified_files), messages)  # type: ignore[arg-type]
             except Exception as _impact_exc:  # noqa: BLE001
                 logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
 
@@ -5648,8 +5827,8 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
         trigger_reason = "persistent_build_failure"
 
     # Inject trigger reason into state so the menu can display it
-    state_dict = dict(state)
-    state_dict["node_state"] = dict(state_dict.get("node_state", {}))
+    state_dict: dict[str, Any] = dict(state)
+    state_dict["node_state"] = dict(state_dict.get("node_state") or {})
     state_dict["node_state"]["current_node"] = "human_intervention"
     state_dict["node_state"]["hitl_trigger"] = trigger_reason
     state_dict["node_state"]["hitl_active"] = True
@@ -5857,7 +6036,7 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         no_tests_collected AND empty repo  → human_intervention_node
     """
     exit_code: int = state.get("exit_code", -1)
-    loop_counter: dict[str, int] = state.get("loop_counter", {})
+    loop_counter: dict[str, Any] = state.get("loop_counter", {})
     budget_remaining: float = state.get("budget_remaining_usd", 0.0)
     total_repairs: int = loop_counter.get("total_repairs", 0)
     # Read the repair-loop limit from the operator's config (single source:
@@ -5870,7 +6049,9 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         if gw is not None else 3
     )
 
-    def _transition(dest: str) -> str:
+    _Dest = Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node"]
+
+    def _transition(dest: _Dest) -> _Dest:
         try:
             from harness.observability import emit_event
             emit_event("node_transition",
@@ -6795,7 +6976,7 @@ JSON. No markdown, no explanation, no code blocks."""
                 top_keys,
             )
 
-        messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
+        messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
 
         logger.info("[reqs_disc] Round %d: %d questions across %d modules (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_questions, len(modules), critical_count, complete, budget)
@@ -6953,7 +7134,7 @@ JSON. No markdown, no explanation, no code blocks."""
         total_q = sum(len(m.get("questions", [])) for m in modules)
         critical_count = sum(1 for m in modules for q in m.get("questions", []) if q.get("critical"))
 
-        messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
+        messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
 
         logger.info("[arch_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_q, critical_count, complete, budget)
@@ -7124,7 +7305,7 @@ JSON. No markdown, no explanation, no code blocks.""" + resolved_block
         total_q = sum(len(m.get("questions", [])) for m in modules)
         critical_count = sum(1 for m in modules for q in m.get("questions", []) if q.get("critical"))
 
-        messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
+        messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
 
         logger.info("[deploy_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_q, critical_count, complete, budget)
@@ -7400,9 +7581,9 @@ async def review_and_revise_spec(
         f"## Specification Under Review ({gate})\n{original_spec}\n\n"
         "Produce the JSON critique now."
     )
-    critique_messages = [
-        {"role": "system", "content": _SPEC_REVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": critique_user_prompt},
+    critique_messages: list[MessageDict] = [
+        MessageDict(role="system", content=_SPEC_REVIEW_SYSTEM_PROMPT),
+        MessageDict(role="user", content=critique_user_prompt),
     ]
 
     # Resolve the doc_reviewer continue_on_length flag. JSON critique
@@ -7460,7 +7641,7 @@ async def review_and_revise_spec(
     result["token_usage_list"].append(critique_response.usage)
 
     try:
-        from harness.trust import _strip_code_fences  # type: ignore
+        from harness.trust import _strip_code_fences
         critique_text = _strip_code_fences(critique_response.content)
     except Exception:
         critique_text = critique_response.content.strip()
@@ -7489,11 +7670,11 @@ async def review_and_revise_spec(
     revise_prompt = _SPEC_REVISE_INSTRUCTION_TEMPLATE.format(
         gate=gate,
         original_spec=original_spec,
-        critique_json=json.dumps(critique, indent=2),
+        critique_json=json.dumps(critique, indent=2, sort_keys=True),
     )
-    revise_messages = [
-        {"role": "system", "content": "You are a senior specification author. Output clean Markdown only."},
-        {"role": "user", "content": revise_prompt},
+    revise_messages: list[MessageDict] = [
+        MessageDict(role="system", content="You are a senior specification author. Output clean Markdown only."),
+        MessageDict(role="user", content=revise_prompt),
     ]
     try:
         revised_response, new_budget = await gateway.dispatch(
@@ -7578,7 +7759,7 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
         logger.info("[spec_review] gate=%s — out of reviewer scope, passing through.", gate)
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
 
-    spec_path = state.get(path_key, "")
+    spec_path = str(state.get(path_key, "") or "")
     budget = state.get("budget_remaining_usd", 0.0)
 
     if not doc_reviewer_primary:
@@ -7660,7 +7841,7 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
         },
     }
     if gate == "REQUIREMENTS":
-        delta["reviewer_comments_requirements"] = json.dumps(critique)
+        delta["reviewer_comments_requirements"] = json.dumps(critique, sort_keys=True)
     if followups:
         delta["discovery_questions"] = discovery_payload
     return delta
@@ -7744,9 +7925,9 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         "## Modified Files\n" + "\n".join(snapshot_chunks) +
         "\n\nProduce the JSON critique now."
     )
-    critique_messages = [
-        {"role": "system", "content": _CODE_REVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": critique_user_prompt},
+    critique_messages: list[MessageDict] = [
+        MessageDict(role="system", content=_CODE_REVIEW_SYSTEM_PROMPT),
+        MessageDict(role="user", content=critique_user_prompt),
     ]
 
     try:
@@ -7793,7 +7974,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
     token_tracker = gateway.aggregate_tokens(state.get("token_tracker", {}), critique_response.usage)
 
     try:
-        from harness.trust import _strip_code_fences  # type: ignore
+        from harness.trust import _strip_code_fences
         critique_text = _strip_code_fences(critique_response.content)
     except Exception:
         critique_text = critique_response.content.strip()
@@ -7849,7 +8030,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
-            "reviewer_comments_code": json.dumps(critique),
+            "reviewer_comments_code": json.dumps(critique, sort_keys=True),
             "node_state": {
                 "current_node": "code_review",
                 "skipped": False,
@@ -7897,13 +8078,13 @@ content:
 Generate the patches that address every finding below. Output only the blocks — no other text."""
 
     repatch_user_prompt = (
-        f"## Reviewer Findings (JSON)\n```json\n{json.dumps(critique, indent=2)}\n```\n\n"
+        f"## Reviewer Findings (JSON)\n```json\n{json.dumps(critique, indent=2, sort_keys=True)}\n```\n\n"
         f"## Modified Files Snapshot\n" + "\n".join(snapshot_chunks) +
         f"\n\n{_CODE_REVIEW_FORMAT_REMINDER}"
     )
-    repatch_messages = [
-        {"role": "system", "content": "You are a senior software engineer. Apply the reviewer's feedback as patch blocks only."},
-        {"role": "user", "content": repatch_user_prompt},
+    repatch_messages: list[MessageDict] = [
+        MessageDict(role="system", content="You are a senior software engineer. Apply the reviewer's feedback as patch blocks only."),
+        MessageDict(role="user", content=repatch_user_prompt),
     ]
 
     try:
@@ -7943,7 +8124,7 @@ Generate the patches that address every finding below. Output only the blocks �
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
-            "reviewer_comments_code": json.dumps(critique),
+            "reviewer_comments_code": json.dumps(critique, sort_keys=True),
             "node_state": {
                 "current_node": "code_review",
                 "skipped": False,
@@ -7969,12 +8150,24 @@ Generate the patches that address every finding below. Output only the blocks �
         len(findings), success_count, len(patch_results), repatched,
     )
 
+    # Audit #18 — record any files this node mutated since the last green
+    # compile. The router consults this set before terminal exit. Existing
+    # ``route_after_code_review`` already re-routes to compiler_node when
+    # repatched=True, which will clear the set; tracking the file names
+    # here is defence-in-depth for any future node that mutates without
+    # setting its own re-verify flag.
+    prior_pending = list(state.get("pending_mutations") or [])
+    delta = [f for f in (new_modified_files or []) if f not in modified_files]
+    if delta:
+        prior_pending = prior_pending + delta
+
     return {
         "modified_files": new_modified_files,
         "token_tracker": token_tracker,
         "budget_remaining_usd": new_budget,
         "loop_counter": loop_counter,
-        "reviewer_comments_code": json.dumps(critique),
+        "reviewer_comments_code": json.dumps(critique, sort_keys=True),
+        "pending_mutations": prior_pending,
         "node_state": {
             "current_node": "code_review",
             "skipped": False,
@@ -8016,7 +8209,7 @@ async def generate_deployment_spec_node(state: AgentState) -> dict[str, Any]:
 
 ## Workspace Telemetry
 ```json
-{json.dumps(telemetry, indent=2, default=str)}
+{json.dumps(telemetry, indent=2, default=str, sort_keys=True)}
 ```
 
 ## Architecture Spec
@@ -8178,7 +8371,6 @@ def route_after_discovery(state: AgentState) -> str:
     # branch so a user who keeps typing DONE doesn't trap us either.
     cap = 10
     try:
-        from harness.gateway import get_gateway_config
         gw_config = get_gateway_config()
         if gw_config is not None:
             cap = int(getattr(gw_config, "max_discovery_iterations", 10) or 10)
@@ -8258,7 +8450,7 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "installation_doc_node", "__end__"]:
+def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "installation_doc_node", "compiler_node", "__end__"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
@@ -8291,9 +8483,10 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
     compiler verifies the fix and security_scan_node re-verifies clean.
     """
     budget_remaining: float = state.get("budget_remaining_usd", 0.0)
-    loop_counter: dict[str, int] = state.get("loop_counter", {})
+    loop_counter: dict[str, Any] = state.get("loop_counter", {})
     sec_attempts: int = loop_counter.get("security", 0)
-    sec_cfg = state.get("security_scan_config", {}) or {}
+    _sec_cfg_raw = state.get("security_scan_config", {}) or {}
+    sec_cfg: dict[str, Any] = _sec_cfg_raw if isinstance(_sec_cfg_raw, dict) else {}
     max_sec_attempts: int = int(sec_cfg.get("max_security_fix_attempts", 2))
     # Hard ceiling for the HITL ping-pong loop. In auto-resume mode
     # (--hitl-repair=false / CI / no TTY) the HITL menu re-routes back
@@ -8318,6 +8511,35 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
 
     # If no compiler_errors populated, security scan passed
     if not compiler_errors:
+        # Audit #18 — defensive pre-exit verification. When the operator
+        # opts in (compiler.pre_exit_verify=true) AND a post-green node has
+        # mutated source since the last green compile AND we haven't
+        # already burned a final-verify pass, re-run the compiler before
+        # any terminal route. Capped at one re-verify per session via
+        # ``loop_counter["final_verify"]`` so a flaky test can't trap us.
+        pending = state.get("pending_mutations") or []
+        already_verified = bool(loop_counter.get("final_verify", 0))
+        if (
+            state.get("pre_exit_verify", False)
+            and pending
+            and not already_verified
+        ):
+            logger.info(
+                "[router] pre_exit_verify: %d pending mutation(s) since "
+                "last green compile (%s). Re-running compiler before exit.",
+                len(pending), pending[:5],
+            )
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    "pre_exit_verify_triggered",
+                    pending_count=len(pending),
+                    pending_files=list(pending)[:20],
+                )
+            except Exception:  # noqa: BLE001 — telemetry must never block
+                pass
+            return "compiler_node"
+
         # Mobile short-circuit (M-1): Flutter projects don't fit the
         # docker-compose deployment model. Skip deployment_* and end after
         # the security scan passes. iOS builds need macOS anyway and would
@@ -8503,15 +8725,15 @@ def build_graph() -> Any:
 
     # Register security scan node for SAST + secret auditing (post-compile gatekeeper)
     from harness.security import security_scan_node as _security_scan_node
-    graph.add_node("security_scan_node", _security_scan_node)
+    graph.add_node("security_scan_node", _security_scan_node)  # type: ignore[type-var]
 
     # Register lintgate node for deterministic format verification
     from harness.lintgate import lintgate_node as _lintgate_node
-    graph.add_node("lintgate_node", _lintgate_node)
+    graph.add_node("lintgate_node", _lintgate_node)  # type: ignore[type-var]
 
     # Register speculative node for multi-variant branching
     from harness.speculative import speculate_node as _speculate_node
-    graph.add_node("speculative_node", _speculate_node)
+    graph.add_node("speculative_node", _speculate_node)  # type: ignore[type-var]
 
     # Register test-generation node — runs after speculative branching, before
     # lintgate, so the deterministic lint pass formats generated tests too.
@@ -8519,7 +8741,7 @@ def build_graph() -> Any:
         test_generation_node as _test_generation_node,
         route_after_test_generation as _route_after_test_generation,
     )
-    graph.add_node("test_generation_node", _test_generation_node)
+    graph.add_node("test_generation_node", _test_generation_node)  # type: ignore[type-var]
 
     # Register change-request ingest entry point and the one-shot
     # reverse-engineer architecture synthesis node that runs once on
@@ -8535,11 +8757,11 @@ def build_graph() -> Any:
     graph.add_node("architecture_discovery_node", architecture_discovery_node)
     graph.add_node("write_spec_node", write_spec_node)
     from harness.cli import discovery_interview_loop as _discovery_interview_loop
-    graph.add_node("discovery_interview_loop", _discovery_interview_loop)
+    graph.add_node("discovery_interview_loop", _discovery_interview_loop)  # type: ignore[type-var]
 
     # Register human gatekeeper node for final review
     from harness.cli import human_gatekeeper_node as _human_gatekeeper_node
-    graph.add_node("human_gatekeeper_node", _human_gatekeeper_node)
+    graph.add_node("human_gatekeeper_node", _human_gatekeeper_node)  # type: ignore[type-var]
 
     # Register reviewer LLM nodes (DOC_REVIEWER + CODE_REVIEWER). Each is a
     # no-op when its corresponding *_reviewer_primary slot is unset in config.
@@ -8780,7 +9002,7 @@ def build_graph() -> Any:
 
     # Register deployment node
     from harness.deploy import deployment_node as _deployment_node
-    graph.add_node("deployment_node", _deployment_node)
+    graph.add_node("deployment_node", _deployment_node)  # type: ignore[type-var]
 
     # Deployment conditional edges. On success the router below short-
     # circuits to installation_doc_node (which then routes to END);
@@ -9079,6 +9301,13 @@ async def run_graph(
         initial_state["run_prod_import_smoke_check"] = bool(
             compiler_config.get("run_prod_import_smoke_check", True)
         )
+        # Audit #18 — opt-in defensive re-compile before terminal exit when
+        # a post-green node mutated source. Default False; the per-node
+        # re-routes (route_after_code_review → compiler when repatched)
+        # already cover the known cases.
+        initial_state["pre_exit_verify"] = bool(
+            compiler_config.get("pre_exit_verify", False)
+        )
 
     # Pre-flight toolchain adaptation: flip ``allow_network`` and
     # ``read_only_root`` to match the build command's install needs NOW so
@@ -9169,7 +9398,7 @@ async def run_graph(
 
     with active_session_scope(session_id):
         # Execute the graph — ainvoke streams all state updates and returns final state
-        final_state: AgentState = await compiled_graph.ainvoke(invoke_input, config)  # type: ignore[arg-type,return-value]
+        final_state: AgentState = await compiled_graph.ainvoke(invoke_input, config)
 
     logger.info("[run_graph] Graph execution complete. Final exit_code=%d", final_state.get("exit_code", -1))
     return final_state

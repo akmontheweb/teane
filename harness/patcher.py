@@ -28,7 +28,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -480,16 +480,17 @@ class BasePatcher(ABC):
 
     def _resolve_safe(
         self, filepath: str, op: "OperationType"
-    ) -> tuple[Optional[str], Optional["PatchResult"]]:
+    ) -> Union[str, "PatchResult"]:
         """
         Resolve ``filepath`` against ``self.workspace_root`` with traversal
-        protection. Returns ``(absolute_path, None)`` on success or
-        ``(None, PatchResult)`` carrying an error to propagate.
+        protection. Returns the resolved absolute path on success, or a
+        ``PatchResult`` carrying an error to propagate. Callers should
+        ``isinstance``-check the return to narrow the union.
         """
         try:
-            return _safe_resolve(self.workspace_root, filepath), None
+            return _safe_resolve(self.workspace_root, filepath)
         except ValueError as exc:
-            return None, PatchResult(
+            return PatchResult(
                 success=False,
                 file=filepath,
                 operation=op,
@@ -560,9 +561,9 @@ class TextPatcher(BasePatcher):
         self.workspace_root = os.path.abspath(workspace_root)
 
     async def create_file(self, filepath: str, content: str) -> PatchResult:
-        full_path, _err = self._resolve_safe(filepath, OperationType.CREATE_FILE)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.CREATE_FILE)
+        if isinstance(full_path, PatchResult):
+            return full_path
 
         # Idempotency: if the file already exists with byte-identical content,
         # treat as a successful no-op so a crash-then-resume of the same patch
@@ -627,9 +628,9 @@ class TextPatcher(BasePatcher):
         self, filepath: str, search: str, replace: str,
         *, count: str = "unique",
     ) -> PatchResult:
-        full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             if not search.strip():
                 logger.info(
@@ -661,8 +662,8 @@ class TextPatcher(BasePatcher):
             )
 
         # Exact match search — count occurrences
-        count = original.count(search)
-        if count == 0:
+        n_matches = original.count(search)
+        if n_matches == 0:
             # Idempotency: if the replacement text is already present in
             # the file (and the search text is gone), this REPLACE_BLOCK
             # was already applied — likely by an earlier run of the same
@@ -736,8 +737,8 @@ class TextPatcher(BasePatcher):
             # uniform ``\\s*\\d+\\|\\s?`` prefix, strip it and retry.
             stripped_search = _strip_line_number_prefixes(search)
             if stripped_search is not None and stripped_search != search:
-                count = original.count(stripped_search)
-                if count == 1:
+                n_matches = original.count(stripped_search)
+                if n_matches == 1:
                     modified = original.replace(stripped_search, replace, 1)
                     lines_changed = _count_diff_lines(original, modified)
                     try:
@@ -765,7 +766,7 @@ class TextPatcher(BasePatcher):
                             success=False, file=filepath,
                             operation=OperationType.REPLACE_BLOCK, error=str(exc),
                         )
-                if count == 0:
+                if n_matches == 0:
                     # Try whitespace-tolerant on the stripped search too.
                     ws_matches_stripped = _whitespace_tolerant_match(
                         original, stripped_search,
@@ -825,10 +826,10 @@ class TextPatcher(BasePatcher):
                     f"Current file content (around closest match):\n{suggestion}"
                 ),
             )
-        if count > 1:
+        if n_matches > 1:
             if policy == "all":
                 modified = original.replace(search, replace)
-                replaced_n = count
+                replaced_n = n_matches
             elif policy == "first":
                 modified = original.replace(search, replace, 1)
                 replaced_n = 1
@@ -838,7 +839,7 @@ class TextPatcher(BasePatcher):
                     file=filepath,
                     operation=OperationType.REPLACE_BLOCK,
                     error=(
-                        f"Search block matched {count} times in {filepath}. "
+                        f"Search block matched {n_matches} times in {filepath}. "
                         f"Must be unique. To replace every occurrence add "
                         f"`count: all` to the REPLACE_BLOCK; to replace only "
                         f"the first add `count: first`."
@@ -887,9 +888,9 @@ class TextPatcher(BasePatcher):
     async def delete_block(
         self, filepath: str, search: str, *, count: str = "unique",
     ) -> PatchResult:
-        full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -914,8 +915,8 @@ class TextPatcher(BasePatcher):
                 ),
             )
 
-        count = original.count(search)
-        if count == 0:
+        n_matches = original.count(search)
+        if n_matches == 0:
             # Idempotency: DELETE_BLOCK's post-condition is exactly "this
             # text is not in the file". If it's already gone, we are
             # done — a resume of a partially-applied patch batch picks
@@ -932,10 +933,10 @@ class TextPatcher(BasePatcher):
                 lines_changed=0,
                 no_op=True,
             )
-        if count > 1:
+        if n_matches > 1:
             if policy == "all":
                 modified = original.replace(search, "")
-                removed_n = count
+                removed_n = n_matches
             elif policy == "first":
                 modified = original.replace(search, "", 1)
                 removed_n = 1
@@ -945,7 +946,7 @@ class TextPatcher(BasePatcher):
                     file=filepath,
                     operation=OperationType.DELETE_BLOCK,
                     error=(
-                        f"Delete block matched {count} times in {filepath}. "
+                        f"Delete block matched {n_matches} times in {filepath}. "
                         f"Must be unique. To delete every occurrence add "
                         f"`count: all` to the DELETE_BLOCK; to delete only "
                         f"the first add `count: first`."
@@ -994,9 +995,9 @@ class TextPatcher(BasePatcher):
     async def insert_at_block(
         self, filepath: str, anchor: str, placement: Placement, content: str
     ) -> PatchResult:
-        full_path, _err = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -1200,9 +1201,9 @@ class TreeSitterPatcher(BasePatcher):
             return await text_patcher.replace_block(
                 filepath, search, replace, count=count,
             )
-        full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             # Common LLM mistake: emit REPLACE_BLOCK with an empty search
             # against a file that doesn't exist yet, when CREATE_FILE was
@@ -1299,9 +1300,9 @@ class TreeSitterPatcher(BasePatcher):
         if (count or "unique").strip().lower() != "unique":
             text_patcher = TextPatcher(self.workspace_root)
             return await text_patcher.delete_block(filepath, search, count=count)
-        full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -1370,9 +1371,9 @@ class TreeSitterPatcher(BasePatcher):
         before or after it, using tree-sitter to identify block boundaries
         rather than fragile line numbers or substring matching.
         """
-        full_path, _err = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
-        if _err is not None:
-            return _err
+        full_path = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
+        if isinstance(full_path, PatchResult):
+            return full_path
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -1625,7 +1626,7 @@ def _strip_line_number_prefixes(search: str) -> Optional[str]:
     # window emits ``  N| line`` for consecutive N — coincidental matches
     # in arbitrary content rarely have that shape.
     try:
-        nums = [int(m.group(0).strip().rstrip("|").strip()) for m in matches]
+        nums = [int(m.group(0).strip().rstrip("|").strip()) for m in matches if m]
     except (AttributeError, ValueError):
         return None
     if len(nums) >= 2:

@@ -437,7 +437,7 @@ def _parse_json_response(response: Any) -> dict[str, Any]:
     propagate as a non-retryable error. Audit §4.3.
     """
     try:
-        return response.json()  # type: ignore[no-any-return]
+        return response.json()
     except Exception as exc:
         # Forge a 502 (Bad Gateway) so the existing 5xx retry path
         # picks this up — a transient proxy error page mid-stream
@@ -2580,7 +2580,7 @@ def _find_closest_match(target: str, candidates: set[str]) -> Optional[str]:
         jaccard = intersection / union if union > 0 else 0.0
 
         # 3. Shared substring bonus (sliding window of length 3)
-        substring_score = 0
+        substring_score = 0.0
         window = 3
         target_substrings = {target_lower[i:i+window] for i in range(max(0, len(target_lower) - window + 1))}
         candidate_substrings = {candidate_lower[i:i+window] for i in range(max(0, len(candidate_lower) - window + 1))}

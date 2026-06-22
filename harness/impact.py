@@ -247,7 +247,7 @@ class DependencyGraph:
             return False
 
         try:
-            ts_lang = get_language(grammar_name)  # type: ignore[arg-type]
+            ts_lang = get_language(grammar_name)
             parser = tree_sitter.Parser()
             parser.language = ts_lang
             tree = parser.parse(source.encode("utf-8"))
@@ -862,7 +862,138 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
         if "mysql" in compose_blob or "mariadb" in compose_blob:
             tags.add("mysql")
 
+    # Architecture-spec augmentation — purely additive. In a greenfield
+    # ``--new-build`` run the workspace was just reset, so manifest files
+    # don't exist yet and the planner gets none of the stack-specific
+    # guidance (style guides, the web-app file-manifest contract, etc.).
+    # The architecture step writes ``docs/SPEC_ARCHITECTURE.md`` BEFORE
+    # patching starts, so we can mine it for stack hints to seed the
+    # workspace_tags set the planner sees on its first turn. Augmentation
+    # never strips tags; it only adds. The keyword scan is intentionally
+    # conservative (anchored framework names) so a brownfield workspace
+    # with a flask spec that mentions "we are not building a React app"
+    # doesn't accidentally gain a `react` tag.
+    tags.update(_augment_tags_from_architecture_spec(workspace_path))
+
     return tags
+
+
+# Bare-name → (canonical_tag, transitive_tags) map used when the
+# architect explicitly declares a stack in ``workspace_layout.roots[].stack``.
+# The value is a one-word framework name, so the keyword scan's
+# context-word requirement (which exists to avoid false positives in
+# free prose) doesn't apply. Frontend frameworks pull html/css/node
+# because the web-app file-manifest contract in graph.py:1049 keys off
+# "html"; backend frameworks pull their language tag so the planner
+# loads the right style guide.
+_BARE_STACK_TAG_MAP: dict[str, tuple[str, ...]] = {
+    "react":       ("react", "html", "css", "node"),
+    "next":        ("react", "html", "css", "node"),
+    "nextjs":      ("react", "html", "css", "node"),
+    "vue":         ("vue", "html", "css", "node"),
+    "vuejs":       ("vue", "html", "css", "node"),
+    "nuxt":        ("vue", "html", "css", "node"),
+    "nuxtjs":      ("vue", "html", "css", "node"),
+    "angular":     ("angular", "html", "css", "node", "typescript"),
+    "svelte":      ("html", "css", "node"),
+    "sveltekit":   ("html", "css", "node"),
+    "fastapi":     ("fastapi", "python"),
+    "django":      ("django", "python"),
+    "flask":       ("python",),
+    "express":     ("express", "node"),
+    "expressjs":   ("express", "node"),
+    "nest":        ("nest", "node", "typescript"),
+    "nestjs":      ("nest", "node", "typescript"),
+    "fastify":     ("fastify", "node"),
+    "spring":      ("spring", "java"),
+    "springboot":  ("spring", "java"),
+    "spring-boot": ("spring", "java"),
+    "postgres":    ("postgres",),
+    "postgresql":  ("postgres",),
+    "redis":       ("redis",),
+    "mysql":       ("mysql",),
+    "mariadb":     ("mysql",),
+    "typescript":  ("typescript",),
+}
+
+
+# Free-text keyword scan patterns. Anchored on framework name PLUS a
+# context word (or a version number) so passing mentions like
+# "React-style hooks" or "vue of the system" don't trigger false tags.
+# Each entry pairs a regex with the bare framework name to look up in
+# :data:`_BARE_STACK_TAG_MAP` — keeping the tag mapping single-sourced.
+_SPEC_STACK_KEYWORDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Frontend frameworks.
+    (re.compile(r"\breact\s*(?:1[0-9]|2[0-9]|spa|frontend|app|router|native|ts|typescript)\b", re.IGNORECASE), "react"),
+    (re.compile(r"\bnext\.?js\b", re.IGNORECASE), "nextjs"),
+    (re.compile(r"\bvue\s*(?:[2-9]|spa|frontend|app|router|js)\b", re.IGNORECASE), "vue"),
+    (re.compile(r"\bnuxt(?:\.?js)?\b", re.IGNORECASE), "nuxt"),
+    (re.compile(r"\bangular\s*(?:1[0-9]|2[0-9]|frontend|spa|app|router|cli)\b", re.IGNORECASE), "angular"),
+    (re.compile(r"\bsveltekit\b", re.IGNORECASE), "sveltekit"),
+    # Backend frameworks. Most are unambiguous on their own.
+    (re.compile(r"\bfastapi\b", re.IGNORECASE), "fastapi"),
+    (re.compile(r"\bdjango\b", re.IGNORECASE), "django"),
+    (re.compile(r"\bflask\b", re.IGNORECASE), "flask"),
+    (re.compile(r"\bexpress\.?js\b", re.IGNORECASE), "express"),
+    (re.compile(r"\bnest\.?js\b", re.IGNORECASE), "nestjs"),
+    (re.compile(r"\bfastify\b", re.IGNORECASE), "fastify"),
+    (re.compile(r"\bspring\s*boot\b", re.IGNORECASE), "spring-boot"),
+    # Databases.
+    (re.compile(r"\bpostgres(?:ql)?\b|\bpgvector\b", re.IGNORECASE), "postgres"),
+    (re.compile(r"\bredis\b", re.IGNORECASE), "redis"),
+    (re.compile(r"\bmy\s*sql\b|\bmariadb\b", re.IGNORECASE), "mysql"),
+    # TypeScript — explicit spec callouts; frontend keywords above
+    # already imply typescript transitively for Angular.
+    (re.compile(r"\btypescript\b|\bts\s*config\b", re.IGNORECASE), "typescript"),
+)
+
+
+def _augment_tags_from_architecture_spec(workspace_path: str) -> set[str]:
+    """Read ``docs/SPEC_ARCHITECTURE.md`` and derive supplementary stack
+    tags from its ``workspace_layout`` block and free-text framework
+    mentions. Returns an empty set when the spec doesn't exist, can't be
+    read, or yields no recognisable hints. Never raises.
+
+    Priority order:
+      1. ``workspace_layout.roots[].stack`` values (deterministic — the
+         architect explicitly declared the stack for each source root;
+         looked up bare in :data:`_BARE_STACK_TAG_MAP`).
+      2. Keyword scan over the full document (best-effort; conservative
+         patterns avoid false positives on passing mentions).
+    """
+    spec_path = os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
+    try:
+        with open(spec_path, encoding="utf-8", errors="replace") as f:
+            spec_md = f.read(512 * 1024)
+    except OSError:
+        return set()
+    if not spec_md.strip():
+        return set()
+
+    augmented: set[str] = set()
+
+    # Step 1: workspace_layout.roots[].stack. parse_layout returns a
+    # populated result when either the block exists or it can be derived
+    # from the file inventory's top-level path components. The stack
+    # field is only filled in the former case — derivation produces
+    # empty stack strings, which we skip.
+    try:
+        from harness.architecture_inventory import parse_layout
+        layout_result = parse_layout(spec_md)
+        for root in layout_result.roots:
+            stack = (root.stack or "").strip().lower()
+            if not stack:
+                continue
+            augmented.update(_BARE_STACK_TAG_MAP.get(stack, ()))
+    except Exception:  # noqa: BLE001 — best-effort, the keyword pass below catches anything missed
+        pass
+
+    # Step 2: keyword scan over the full document.
+    for pattern, bare_name in _SPEC_STACK_KEYWORDS:
+        if pattern.search(spec_md):
+            augmented.update(_BARE_STACK_TAG_MAP.get(bare_name, ()))
+
+    return augmented
 
 
 # ---------------------------------------------------------------------------

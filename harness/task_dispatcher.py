@@ -64,7 +64,7 @@ class TaskDispatcher:
 
     async def run_task(
         self, task: Union[str, List[str]]
-    ) -> subprocess.CompletedProcess:
+    ) -> subprocess.CompletedProcess[bytes]:
         """Run a single task asynchronously.
 
         Args:
@@ -127,7 +127,7 @@ class TaskDispatcher:
 
     async def run_parallel(
         self, tasks: List[Union[str, List[str]]], max_concurrent: int = 3
-    ) -> List[subprocess.CompletedProcess]:
+    ) -> List[subprocess.CompletedProcess[bytes]]:
         """Run multiple tasks concurrently with a bounded parallelism.
 
         Args:
@@ -141,7 +141,7 @@ class TaskDispatcher:
 
         async def _run_with_semaphore(
             task: Union[str, List[str]],
-        ) -> subprocess.CompletedProcess:
+        ) -> subprocess.CompletedProcess[bytes]:
             async with semaphore:
                 return await self.run_task(task)
 
@@ -150,9 +150,9 @@ class TaskDispatcher:
         )
 
         # Re-raise first encountered TaskError to preserve behaviour, while collecting successes.
-        exceptions = []
+        exceptions: list[tuple[int, BaseException]] = []
         for i, r in enumerate(results):
-            if isinstance(r, Exception):
+            if isinstance(r, BaseException):
                 # Keep the original traceback by wrapping
                 exceptions.append((i, r))
         if exceptions:
@@ -161,11 +161,11 @@ class TaskDispatcher:
             raise TaskError(
                 f"Task {first_idx} failed: {first_exc}"
             ) from first_exc
-        return results
+        return [r for r in results if isinstance(r, subprocess.CompletedProcess)]
 
     def run_task_sync(
         self, task: Union[str, List[str]]
-    ) -> subprocess.CompletedProcess:
+    ) -> subprocess.CompletedProcess[bytes]:
         """Synchronous wrapper for :meth:`run_task`.
 
         Suitable for simple scripts or situations where an event loop does not

@@ -283,7 +283,7 @@ class TfidfBackend(IndexBackend):
 
     name = "tfidf"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._idf: dict[str, float] = {}
         self._vocab: dict[str, int] = {}
 
@@ -790,14 +790,17 @@ def query_top_chunks(
         if meta is None:
             return []
         backend_name, idf_json = meta
+        backend: IndexBackend
         if backend_name == "tfidf":
-            backend = TfidfBackend()
-            backend.load_idf(idf_json or "")
+            tfidf_backend = TfidfBackend()
+            tfidf_backend.load_idf(idf_json or "")
+            backend = tfidf_backend
         elif backend_name == "openai_embeddings":
-            backend = OpenAIEmbeddingsBackend(cfg)
-            if not backend.available:
+            openai_backend = OpenAIEmbeddingsBackend(cfg)
+            if not openai_backend.available:
                 logger.debug("[repo_index] openai backend unavailable for query.")
                 return []
+            backend = openai_backend
         else:
             return []
         try:

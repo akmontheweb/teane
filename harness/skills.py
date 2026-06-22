@@ -589,11 +589,12 @@ Use <<<CREATE_FILE>>> blocks to create the documentation file."""
 
 class SkillRegistry:
     _instance: Optional["SkillRegistry"] = None
+    _skills: dict[str, SkillBase]
 
     def __new__(cls) -> "SkillRegistry":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._skills: dict[str, SkillBase] = {}
+            cls._instance._skills = {}
         return cls._instance
 
     def register(self, skill: SkillBase) -> None:

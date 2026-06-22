@@ -1,4 +1,4 @@
-# AI Agent Harness — Architecture Specification
+# Teane — Architecture Specification
 
 *Refreshed from current codebase state. Companion to `SPEC_REQUIREMENTS.md`.*
 
@@ -6,12 +6,12 @@
 
 ## 1. System Context (C4 Level 1)
 
-AI Agent Harness sits between the developer and their codebase, acting as an autonomous engineering agent. It accepts natural language prompts, generates code patches, verifies them via sandboxed builds, and applies them to the workspace — all under budget and security guardrails.
+Teane sits between the developer and their codebase, acting as an autonomous engineering agent. It accepts natural language prompts, generates code patches, verifies them via sandboxed builds, and applies them to the workspace — all under budget and security guardrails.
 
 ```
 ┌──────────────┐     ┌─────────────────────────────────────┐     ┌──────────────┐
 │              │     │                                     │     │              │
-│  Developer   │────▶│       AI Agent Harness              │────▶│   Git Repo   │
+│  Developer   │────▶│                Teane                │────▶│   Git Repo   │
 │  (CLI/IDE)   │     │  (LangGraph Agent + Sandbox)        │     │  (Workspace) │
 │              │◀────│                                     │◀────│              │
 └──────────────┘     └──────────────┬──────────────────────┘     └──────────────┘

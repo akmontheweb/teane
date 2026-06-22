@@ -5,8 +5,43 @@ import asyncio
 from harness.graph import (
     apply_memory_cleanse,
     _format_diagnostics_for_repair,
+    _repair_budget_warning,
     route_after_security_scan,
 )
+
+
+class TestRepairBudgetWarning:
+    """Audit #19 — soft warnings on the last two repair iterations."""
+
+    def test_silent_with_slack(self):
+        assert _repair_budget_warning(total_repairs=1, cap=8) is None
+        assert _repair_budget_warning(total_repairs=5, cap=8) is None
+
+    def test_medium_warning_at_two_remaining(self):
+        msg = _repair_budget_warning(total_repairs=6, cap=8)
+        assert msg is not None
+        assert "2 repair iterations remain" in msg
+
+    def test_hard_warning_at_one_remaining(self):
+        msg = _repair_budget_warning(total_repairs=7, cap=8)
+        assert msg is not None
+        assert "LAST repair iteration" in msg
+
+    def test_silent_past_cap(self):
+        # Past the cap the router has already moved to HITL; no point
+        # warning a model that won't be called.
+        assert _repair_budget_warning(total_repairs=8, cap=8) is None
+        assert _repair_budget_warning(total_repairs=99, cap=8) is None
+
+    def test_zero_cap_is_silent(self):
+        # Edge case — operator disabled the throttle. Don't crash, don't warn.
+        assert _repair_budget_warning(total_repairs=3, cap=0) is None
+
+    def test_small_cap_still_warns_on_last_two(self):
+        # With cap=2 the LLM gets warned on both attempts.
+        assert _repair_budget_warning(total_repairs=0, cap=2) is not None
+        assert _repair_budget_warning(total_repairs=1, cap=2) is not None
+        assert _repair_budget_warning(total_repairs=2, cap=2) is None
 
 
 class TestApplyMemoryCleanse:
@@ -407,6 +442,48 @@ class TestRouteAfterSecurityScan:
         )
         # Findings exist + low attempts → repair_node regardless of flag.
         assert route_after_security_scan(state) == "repair_node"
+
+    # Audit #18 — pre-exit verify
+    def test_pre_exit_verify_routes_to_compiler_when_mutations_pending(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # Clean scan + opt-in flag + pending mutations → re-verify.
+        state = self._clean_state(
+            pre_exit_verify=True,
+            pending_mutations=["server/app.py"],
+        )
+        assert route_after_security_scan(state) == "compiler_node"
+
+    def test_pre_exit_verify_off_keeps_normal_terminal_route(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # Pending mutations exist but flag is off — defaults still hold.
+        state = self._clean_state(
+            pre_exit_verify=False,
+            pending_mutations=["server/app.py"],
+        )
+        assert route_after_security_scan(state) == "installation_doc_node"
+
+    def test_pre_exit_verify_skipped_when_no_mutations(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # Flag is on but nothing changed since last green compile.
+        state = self._clean_state(
+            pre_exit_verify=True,
+            pending_mutations=[],
+        )
+        assert route_after_security_scan(state) == "installation_doc_node"
+
+    def test_pre_exit_verify_one_shot_cap(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # Cap consumed → don't loop even if mutations are still flagged.
+        state = self._clean_state(
+            pre_exit_verify=True,
+            pending_mutations=["server/app.py"],
+            loop_counter={"security": 0, "final_verify": 1},
+        )
+        assert route_after_security_scan(state) == "installation_doc_node"
 
 
 class _PatchingResponse:

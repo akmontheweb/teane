@@ -212,8 +212,10 @@ class GccClangParser(BaseLanguageParser):
         for fix in fixits:
             if not isinstance(fix, dict):
                 continue
-            start = fix.get("start") if isinstance(fix.get("start"), dict) else {}
-            nxt = fix.get("next") if isinstance(fix.get("next"), dict) else {}
+            start_val = fix.get("start")
+            start: dict[str, Any] = start_val if isinstance(start_val, dict) else {}
+            nxt_val = fix.get("next")
+            nxt: dict[str, Any] = nxt_val if isinstance(nxt_val, dict) else {}
             if "string" not in fix:
                 continue
             return FixSuggestion(
@@ -952,10 +954,10 @@ def detect_and_parse(
     # Try file extension detection
     if file_path:
         ext = os.path.splitext(file_path)[1].lower()
-        parser_cls = _EXTENSION_PARSER_MAP.get(ext)
-        if parser_cls is not None:
+        ext_parser_cls = _EXTENSION_PARSER_MAP.get(ext)
+        if ext_parser_cls is not None:
             logger.debug("[parser_registry] Using extension-based parser for '%s'.", ext)
-            return parser_cls.parse_diagnostics(raw_output)
+            return ext_parser_cls.parse_diagnostics(raw_output)
 
     # Fall back to generic parser
     logger.debug("[parser_registry] No specific parser detected. Using GenericParser.")

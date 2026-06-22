@@ -367,10 +367,10 @@ def parse_layout(spec_md: str) -> LayoutParseResult:
     if inv.ok and inv.files:
         derived_paths: list[str] = []
         seen: set[str] = set()
-        for entry in inv.files:
-            if "/" not in entry.path:
+        for fentry in inv.files:
+            if "/" not in fentry.path:
                 continue  # root-level file, not a directory
-            first = entry.path.split("/", 1)[0]
+            first = fentry.path.split("/", 1)[0]
             if not first or first.startswith(".") or first in seen:
                 continue
             seen.add(first)

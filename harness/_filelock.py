@@ -38,21 +38,21 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import IO
+from typing import IO, Any
 
 
 logger = logging.getLogger(__name__)
 
 
 try:
-    import fcntl  # type: ignore[import-not-found]
+    import fcntl  # type: ignore[import-not-found, unused-ignore]
     _HAVE_FCNTL = True
 except ImportError:  # Windows
     fcntl = None  # type: ignore[assignment]
     _HAVE_FCNTL = False
 
 try:
-    import msvcrt  # type: ignore[import-not-found]
+    import msvcrt  # type: ignore[import-not-found, unused-ignore]
     _HAVE_MSVCRT = True
 except ImportError:  # POSIX
     msvcrt = None  # type: ignore[assignment]
@@ -63,18 +63,18 @@ except ImportError:  # POSIX
 LOCKING_AVAILABLE = _HAVE_FCNTL or _HAVE_MSVCRT
 
 
-def _msvcrt_lock(fh: IO, mode: int) -> None:
+def _msvcrt_lock(fh: IO[Any], mode: int) -> None:
     """Lock byte 0 of the file via msvcrt, preserving the file pointer."""
     fd = fh.fileno()
     pos = os.lseek(fd, 0, os.SEEK_CUR)
     try:
         os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, mode, 1)
+        msvcrt.locking(fd, mode, 1)  # type: ignore[attr-defined, unused-ignore]
     finally:
         os.lseek(fd, pos, os.SEEK_SET)
 
 
-def lock_exclusive_nonblocking(fh: IO) -> None:
+def lock_exclusive_nonblocking(fh: IO[Any]) -> None:
     """Acquire an exclusive whole-file lock; raise BlockingIOError if held.
 
     Mirrors ``fcntl.flock(fh, LOCK_EX | LOCK_NB)``.
@@ -84,7 +84,7 @@ def lock_exclusive_nonblocking(fh: IO) -> None:
         return
     if _HAVE_MSVCRT:
         try:
-            _msvcrt_lock(fh, msvcrt.LK_NBLCK)
+            _msvcrt_lock(fh, msvcrt.LK_NBLCK)  # type: ignore[attr-defined, unused-ignore]
         except OSError as exc:
             # msvcrt raises OSError(EACCES) when the lock is held; the
             # POSIX call sites expect BlockingIOError.
@@ -93,7 +93,7 @@ def lock_exclusive_nonblocking(fh: IO) -> None:
     raise OSError("no file-locking backend available on this platform")
 
 
-def lock_exclusive_blocking(fh: IO, *, timeout_seconds: float = 30.0) -> None:
+def lock_exclusive_blocking(fh: IO[Any], *, timeout_seconds: float = 30.0) -> None:
     """Acquire an exclusive whole-file lock, blocking until acquired.
 
     Mirrors ``fcntl.flock(fh, LOCK_EX)``. On Windows ``msvcrt.locking``
@@ -109,7 +109,7 @@ def lock_exclusive_blocking(fh: IO, *, timeout_seconds: float = 30.0) -> None:
         last_exc: OSError | None = None
         while time.monotonic() < deadline:
             try:
-                _msvcrt_lock(fh, msvcrt.LK_LOCK)
+                _msvcrt_lock(fh, msvcrt.LK_LOCK)  # type: ignore[attr-defined, unused-ignore]
                 return
             except OSError as exc:
                 last_exc = exc
@@ -122,7 +122,7 @@ def lock_exclusive_blocking(fh: IO, *, timeout_seconds: float = 30.0) -> None:
     raise OSError("no file-locking backend available on this platform")
 
 
-def unlock(fh: IO) -> None:
+def unlock(fh: IO[Any]) -> None:
     """Release the lock on ``fh``. Best-effort; swallows OSError to match
     the POSIX call sites that tolerate "already-released" races on shutdown.
     """
@@ -134,7 +134,7 @@ def unlock(fh: IO) -> None:
         return
     if _HAVE_MSVCRT:
         try:
-            _msvcrt_lock(fh, msvcrt.LK_UNLCK)
+            _msvcrt_lock(fh, msvcrt.LK_UNLCK)  # type: ignore[attr-defined, unused-ignore]
         except OSError:
             pass
         return

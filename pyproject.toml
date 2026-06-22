@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "teane"
 version = "1.0.0"
-description = "Production-grade, model-agnostic AI Agent Harness with LangGraph orchestration, sandboxed builds, and bulletproof persistence."
+description = "Production-grade, model-agnostic AI agent harness with LangGraph orchestration, sandboxed builds, and bulletproof persistence."
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
-    { name = "AI Agent Harness Team" }
+    { name = "Teane Team" }
 ]
 dependencies = [
     "langgraph>=0.4.0",

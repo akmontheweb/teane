@@ -43,6 +43,20 @@ _TRACKED_FAILURE_EVENTS = frozenset({
     "hitl_gate_blocked",
 })
 
+# Per-tool call events. Emitted from the tool-dispatch sites in graph.py
+# (_patching_tool_loop for read_file, _run_tool_loop for skills/MCP).
+# A failed call emits ``tool_call_failed`` only — it is NOT also counted
+# as ``tool_call_succeeded``. Aggregation increments tool_call_count for
+# both event types so the denominator stays "all attempts".
+_TOOL_CALL_SUCCEEDED_EVENT = "tool_call_succeeded"
+_TOOL_CALL_FAILED_EVENT = "tool_call_failed"
+
+# Emitted by graph._build_and_emit_system_prompt on every session bootstrap.
+# Used to track prompt bloat (audit #8 — target <60 lines, currently much
+# higher). Aggregation keeps only the most recent value per session because
+# the system prompt is anchored at messages[0] and never mutated after.
+_SYSTEM_PROMPT_BUILT_EVENT = "system_prompt_built"
+
 # Default sliding window used by the recent-burn-rate calculation. Ten
 # minutes is short enough to see a runaway session in near-real-time but
 # long enough to smooth across the spiky per-call cost pattern.
@@ -70,11 +84,41 @@ class SessionMetrics:
     tokens_out: int = 0
     cached_tokens: int = 0
     error_counts: dict[str, int] = field(default_factory=dict)
+    tool_call_count: dict[str, int] = field(default_factory=dict)
+    tool_error_count: dict[str, int] = field(default_factory=dict)
+    system_prompt_chars: int = 0
+    system_prompt_lines: int = 0
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
     recent_burn_rate_usd_per_min: float = 0.0
     recent_window_minutes: int = _DEFAULT_WINDOW_MINUTES
     log_files: list[str] = field(default_factory=list)
+
+    def cache_hit_rate(self) -> float:
+        """Ratio of cached input tokens over total input tokens consumed.
+
+        ``cached_tokens / (cached_tokens + tokens_in)``. Returns 0.0 when no
+        input tokens have been observed yet. The checklist target is >0.80;
+        sustained values below 0.50 usually mean a prefix is breaking.
+        """
+        denom = self.cached_tokens + self.tokens_in
+        if denom <= 0:
+            return 0.0
+        return self.cached_tokens / denom
+
+    def tool_error_rate(self, name: str) -> float:
+        """Per-tool failure rate: ``failures / attempts``.
+
+        Returns 0.0 when the tool was never invoked in this session.
+        """
+        calls = self.tool_call_count.get(name, 0)
+        if calls <= 0:
+            return 0.0
+        return self.tool_error_count.get(name, 0) / calls
+
+    def tool_error_rates(self) -> dict[str, float]:
+        """Per-tool failure rate for every tool seen this session."""
+        return {name: self.tool_error_rate(name) for name in self.tool_call_count}
 
     def to_jsonable(self) -> dict[str, Any]:
         """Render the dataclass to a JSON-serialisable dict."""
@@ -85,7 +129,13 @@ class SessionMetrics:
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "cached_tokens": self.cached_tokens,
+            "cache_hit_rate": round(self.cache_hit_rate(), 6),
             "error_counts": dict(self.error_counts),
+            "tool_call_count": dict(self.tool_call_count),
+            "tool_error_count": dict(self.tool_error_count),
+            "tool_error_rates": {k: round(v, 6) for k, v in self.tool_error_rates().items()},
+            "system_prompt_chars": self.system_prompt_chars,
+            "system_prompt_lines": self.system_prompt_lines,
             "first_ts": self.first_ts.isoformat() if self.first_ts else None,
             "last_ts": self.last_ts.isoformat() if self.last_ts else None,
             "recent_burn_rate_usd_per_min": round(self.recent_burn_rate_usd_per_min, 6),
@@ -166,7 +216,7 @@ def _sorted_session_log_files(session_id: str, log_dir: str) -> list[str]:
     primary = os.path.join(expanded, f"{session_id}.jsonl")
     rotated = sorted(
         glob.glob(os.path.join(expanded, f"{session_id}.jsonl.*")),
-        key=lambda p: int(_ROTATION_SUFFIX_RE.search(p).group(1)) if _ROTATION_SUFFIX_RE.search(p) else 0,
+        key=lambda p: int(m.group(1)) if (m := _ROTATION_SUFFIX_RE.search(p)) else 0,
         reverse=True,
     )
     # Per-PID variants (e.g. <id>.<pid>.jsonl and their rotated backups).
@@ -269,6 +319,34 @@ def aggregate_session(
                 ts = _parse_ts(rec.get("ts"))
                 if ts is not None:
                     _update_ts_range(metrics, ts)
+            elif event == _TOOL_CALL_SUCCEEDED_EVENT:
+                tool_name = str(rec.get("tool_name") or "unknown")
+                metrics.tool_call_count[tool_name] = (
+                    metrics.tool_call_count.get(tool_name, 0) + 1
+                )
+                ts = _parse_ts(rec.get("ts"))
+                if ts is not None:
+                    _update_ts_range(metrics, ts)
+            elif event == _TOOL_CALL_FAILED_EVENT:
+                tool_name = str(rec.get("tool_name") or "unknown")
+                metrics.tool_call_count[tool_name] = (
+                    metrics.tool_call_count.get(tool_name, 0) + 1
+                )
+                metrics.tool_error_count[tool_name] = (
+                    metrics.tool_error_count.get(tool_name, 0) + 1
+                )
+                ts = _parse_ts(rec.get("ts"))
+                if ts is not None:
+                    _update_ts_range(metrics, ts)
+            elif event == _SYSTEM_PROMPT_BUILT_EVENT:
+                # Most-recent-wins: the prompt is built once per session
+                # bootstrap; if a session resumes the latest value reflects
+                # the current state.
+                metrics.system_prompt_chars = _coerce_int(rec.get("chars"))
+                metrics.system_prompt_lines = _coerce_int(rec.get("lines"))
+                ts = _parse_ts(rec.get("ts"))
+                if ts is not None:
+                    _update_ts_range(metrics, ts)
 
     metrics.recent_burn_rate_usd_per_min = _compute_burn_rate(
         window_records,
@@ -365,6 +443,15 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
     errs = ", ".join(
         f"{k}={v}" for k, v in sorted(metrics.error_counts.items())
     ) or "none"
+    tools = ", ".join(
+        f"{name}={metrics.tool_call_count[name]}"
+        + (
+            f" ({metrics.tool_error_rate(name) * 100:.0f}% err)"
+            if metrics.tool_error_count.get(name, 0) > 0
+            else ""
+        )
+        for name in sorted(metrics.tool_call_count)
+    ) or "none"
 
     lines = [
         "=" * 60,
@@ -373,8 +460,10 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
         f"  Total LLM calls:     {metrics.llm_call_count}",
         f"  Total cost:          ${metrics.total_cost_usd:.4f}",
         f"  Tokens (in/out):     {metrics.tokens_in:,} / {metrics.tokens_out:,}",
-        f"  Cached tokens:       {metrics.cached_tokens:,}",
+        f"  Cached tokens:       {metrics.cached_tokens:,} ({metrics.cache_hit_rate() * 100:.1f}% hit rate)",
+        f"  System prompt:       {metrics.system_prompt_lines} lines / {metrics.system_prompt_chars:,} chars",
         f"  Errors:              {errs}",
+        f"  Tool calls:          {tools}",
         f"  Wall-clock span:     {span}",
         f"  Burn rate ({metrics.recent_window_minutes}m): ${metrics.recent_burn_rate_usd_per_min:.4f}/min",
         f"  Budget (hard cap):   ${hard_cap_usd:.2f} — ${remaining:.4f} remaining",
@@ -439,6 +528,10 @@ def format_prometheus(metrics_list: list[SessionMetrics], hard_cap_usd: float) -
     tokens_out_samples: list[str] = []
     burn_samples: list[str] = []
     proj_samples: list[str] = []
+    cache_hit_samples: list[str] = []
+    tool_call_samples: list[str] = []
+    tool_error_samples: list[str] = []
+    tool_error_rate_samples: list[str] = []
 
     for m in metrics_list:
         sid = _prometheus_label_value(m.session_id)
@@ -453,6 +546,20 @@ def format_prometheus(metrics_list: list[SessionMetrics], hard_cap_usd: float) -
         burn_samples.append(
             f'harness_burn_rate_usd_per_min{{session_id="{sid}"}} {m.recent_burn_rate_usd_per_min:.6f}'
         )
+        cache_hit_samples.append(
+            f'harness_session_cache_hit_rate{{session_id="{sid}"}} {m.cache_hit_rate():.6f}'
+        )
+        for tool_name in sorted(m.tool_call_count):
+            tool_label = _prometheus_label_value(tool_name)
+            tool_call_samples.append(
+                f'harness_tool_calls_total{{session_id="{sid}",tool="{tool_label}"}} {m.tool_call_count[tool_name]}'
+            )
+            tool_error_samples.append(
+                f'harness_tool_errors_total{{session_id="{sid}",tool="{tool_label}"}} {m.tool_error_count.get(tool_name, 0)}'
+            )
+            tool_error_rate_samples.append(
+                f'harness_tool_error_rate{{session_id="{sid}",tool="{tool_label}"}} {m.tool_error_rate(tool_name):.6f}'
+            )
         proj = project_exhaustion(m, hard_cap_usd)
         if proj is not None:
             proj_samples.append(
@@ -488,6 +595,50 @@ def format_prometheus(metrics_list: list[SessionMetrics], hard_cap_usd: float) -
         "gauge",
         "Estimated minutes until the configured hard-cap is reached at the current burn rate.",
         proj_samples,
+    )
+    _emit(
+        "harness_session_cache_hit_rate",
+        "gauge",
+        "Ratio of cached input tokens over total input tokens for the session (target >0.80).",
+        cache_hit_samples,
+    )
+    _emit(
+        "harness_tool_calls_total",
+        "gauge",
+        "Total tool invocations per (session, tool) — includes both successes and failures.",
+        tool_call_samples,
+    )
+    _emit(
+        "harness_tool_errors_total",
+        "gauge",
+        "Total failed tool invocations per (session, tool).",
+        tool_error_samples,
+    )
+    _emit(
+        "harness_tool_error_rate",
+        "gauge",
+        "Per-tool failure rate (errors / attempts) for the session (target <0.10).",
+        tool_error_rate_samples,
+    )
+    prompt_size_samples = [
+        f'harness_system_prompt_lines{{session_id="{_prometheus_label_value(m.session_id)}"}} {m.system_prompt_lines}'
+        for m in metrics_list
+    ]
+    prompt_chars_samples = [
+        f'harness_system_prompt_chars{{session_id="{_prometheus_label_value(m.session_id)}"}} {m.system_prompt_chars}'
+        for m in metrics_list
+    ]
+    _emit(
+        "harness_system_prompt_lines",
+        "gauge",
+        "Line count of the system prompt as built at session bootstrap (audit #8 target <60).",
+        prompt_size_samples,
+    )
+    _emit(
+        "harness_system_prompt_chars",
+        "gauge",
+        "Character count of the system prompt as built at session bootstrap.",
+        prompt_chars_samples,
     )
     lines.append("# HELP harness_budget_hard_cap_usd Configured hard-cap budget in USD.")
     lines.append("# TYPE harness_budget_hard_cap_usd gauge")

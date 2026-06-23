@@ -624,7 +624,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # support function/tool calling receive the PATCH_TOOLS schema in
     # their chat_completion call instead of (or alongside) the text DSL.
     "patcher": frozenset({
-        "enforce_read_before_edit", "use_structured_tools",
+        "enforce_read_before_edit", "root_files", "use_structured_tools",
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
     "compiler": frozenset({"run_prod_import_smoke_check", "advisory_exit_codes"}),
@@ -739,6 +739,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "debug.dump_max_files": (int,),
     "debug.dump_repair_prompts": (bool,),  # deprecated alias for dump_llm_calls
     "patcher.enforce_read_before_edit": (bool,),
+    "patcher.root_files": (list,),
     "patcher.use_structured_tools": (bool,),
     "compiler.run_prod_import_smoke_check": (bool,),
     "change_requests.reverse_engineer_budget_usd": (int, float),

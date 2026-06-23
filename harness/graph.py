@@ -337,7 +337,10 @@ def create_initial_state(
 # Files that conventionally live at workspace root and are exempt from the
 # "all source under <root>/" enforcement when a source root is detected.
 # patching_node / repair_node / test_generation_node compose the patcher
-# allowlist as [<source_root>/, tests/, test/, __tests__/, *_ROOT_ALLOWLIST_FILES].
+# Built-in default root-level files the patcher is allowed to modify.
+# This matches patcher.root_files in config/config.json. The operator can override
+# the list in config.json; for full dynamic configuration support, thread config
+# through _build_patcher_allowlist (future enhancement).
 _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     "setup.py", "setup.cfg", "pyproject.toml",
     "conftest.py", "manage.py", "__init__.py",

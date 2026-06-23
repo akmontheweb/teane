@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dep-manifest-coherence"
+version = "0.0.1"
+requires-python = ">=3.10"
+
+# BUG: the Makefile's `test:` target invokes `python3 -m pytest -q` but pytest
+# is not listed under [project.optional-dependencies].dev — `pip install -e
+# '.[dev]'` therefore does NOT make pytest available. This is the exact
+# failure mode teane's system prompt warns about under "Dependency Manifest
+# Coherence". Teane should add pytest to the dev extras.
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["widgets*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

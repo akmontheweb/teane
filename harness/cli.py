@@ -4122,6 +4122,40 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     build_command = resolve_build_command(args.build_cmd, config, workspace_path)
 
+    # --- Change-request mode validation (before resource allocation) ---
+    # Validate BEFORE initializing checkpointer/gateway/MCP, so early returns
+    # don't leave resources hanging and causing cleanup exceptions.
+    new_build_active = bool(getattr(args, "new_build", False))
+    cr_dir_abs = _resolve_change_requests_dir(
+        workspace_path, config.get("change_requests_dir"),
+    )
+    pending_change_requests = _list_pending_change_request_files(cr_dir_abs)
+    if not new_build_active and not pending_change_requests:
+        print(file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print(
+            "Existing-project run requires at least one change request",
+            file=sys.stderr,
+        )
+        print("=" * 72, file=sys.stderr)
+        print(
+            "The harness needs at least one `.txt` file under:\n\n"
+            f"  {cr_dir_abs}\n\n"
+            "describing the bug to fix or feature to add. Each file becomes\n"
+            "a numbered Change Request (CR-N) that flows through the\n"
+            "gatekeeper review and is archived after the session terminates.\n\n"
+            "To proceed:\n"
+            "  1. Create the folder if it does not exist.\n"
+            "  2. Add one or more `.txt` files describing the changes.\n"
+            "  3. Re-run `teane run`.\n\n"
+            "If you are starting a fresh build, pass --new-build true\n"
+            "instead — that flow uses `product_spec_dir` and skips this\n"
+            "check.\n",
+            file=sys.stderr,
+        )
+        print("=" * 72, file=sys.stderr)
+        return 1
+
     # Extract persistence settings
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
@@ -4215,51 +4249,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
     set_command_validator(create_command_validator_from_config(config))
 
-    # --- Change-request mode detection (existing-project delta path) ---
-    # The harness routes an existing project's bug-fix / feature-add work
-    # through the gatekeeper pipeline (PR-2+) by reading `.txt` files from
-    # `change_requests_dir`. The hard rule is: when --new-build false the
-    # folder MUST contain at least one .txt file. This replaces the old
-    # implicit "use the existing product_spec" path with a file-driven
-    # workflow that gives every run a checked-in audit trail.
-    #
-    # When --new-build true (greenfield), the change_requests/ folder is
-    # ignored — greenfield uses product_spec_dir as before.
-    new_build_active = bool(getattr(args, "new_build", False))
-    cr_dir_abs = _resolve_change_requests_dir(
-        workspace_path, config.get("change_requests_dir"),
-    )
-    pending_change_requests = _list_pending_change_request_files(cr_dir_abs)
+    # Determine change-request mode (validation already passed above)
     change_request_mode = bool(pending_change_requests) and not new_build_active
-    if not new_build_active and not pending_change_requests:
-        print(file=sys.stderr)
-        print("=" * 72, file=sys.stderr)
-        print(
-            "Existing-project run requires at least one change request",
-            file=sys.stderr,
-        )
-        print("=" * 72, file=sys.stderr)
-        print(
-            "The harness needs at least one `.txt` file under:\n\n"
-            f"  {cr_dir_abs}\n\n"
-            "describing the bug to fix or feature to add. Each file becomes\n"
-            "a numbered Change Request (CR-N) that flows through the\n"
-            "gatekeeper review and is archived after the session terminates.\n\n"
-            "To proceed:\n"
-            "  1. Create the folder if it does not exist.\n"
-            "  2. Add one or more `.txt` files describing the changes.\n"
-            "  3. Re-run `teane run`.\n\n"
-            "If you are starting a fresh build, pass --new-build true\n"
-            "instead — that flow uses `product_spec_dir` and skips this\n"
-            "check.\n",
-            file=sys.stderr,
-        )
-        print("=" * 72, file=sys.stderr)
-        logger.error(
-            "[change_requests] --new-build false but no .txt files at %s",
-            cr_dir_abs,
-        )
-        return 1
     archive_target_dir = (
         os.path.join(cr_dir_abs, "applied", session_id) if change_request_mode else ""
     )

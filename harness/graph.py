@@ -361,6 +361,12 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
     "tsconfig.json", "tsconfig.base.json",
     ".npmrc", ".nvmrc", ".node-version",
+    # Container deployment — Dockerfile and docker-compose files must be
+    # in the allowlist for deployment discovery and synthesis to work.
+    # The deployment phase may generate or modify these, and repair nodes
+    # may need to adjust them for build fixes.
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "Caddyfile",
 })
 
 

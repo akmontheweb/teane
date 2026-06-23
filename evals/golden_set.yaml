@@ -1,0 +1,167 @@
+# Golden-set tasks for the teane eval harness.
+#
+# WHAT THESE ARE: 10 grounded synthetic tasks, each anchored to either a
+# documented teane capability (per docs/SPEC_REQUIREMENTS.md FR-001..FR-064)
+# or a real bug class reproduced from teane's own git fix history
+# (`git log --oneline | grep -E '^fix\('`). They exercise the full happy
+# path the harness claims to handle: polyglot greenfield builds, brownfield
+# change-request mode, repair loop on broken builds, and the documented
+# dep-manifest-coherence rule.
+#
+# WHAT THESE ARE NOT: literal historical user prompts. Those would live in
+# per-installation `~/.harness/logs/*.jsonl` files, which the runner can't
+# see across machines. As real prompts accumulate in your installation,
+# replace these with curated examples — that's the long-term goal. Treat
+# this file as the bootstrap, not the destination.
+#
+# COVERAGE MATRIX (which FR / capability each task exercises):
+#   py_cli_hello                  FR-005 (patch generation), FR-006 (sandbox build)
+#   py_flask_microservice         FR-005, polyglot Python web stack
+#   node_express_micro            FR-003 (model-agnostic), polyglot Node/Express
+#   go_http_server                polyglot Go stack, build_command auto-detect
+#   fix_off_by_one                FR-005 (REPLACE_BLOCK precision)
+#   add_logging                   FR-005 (incremental edit, no over-reach)
+#   fix_missing_error_handling    Repair loop, error-handling code-review
+#   add_pagination                Change-request mode (FR brownfield path)
+#   fix_import_cycle              FR-008 (cross-model repair escalation)
+#   dep_manifest_coherence        System-prompt rule (manifest coherence)
+#
+# RUN COST: each task runs the full harness end-to-end. Greenfield builds
+# burn ~$0.50–$2 of LLM calls; brownfield fixes are cheaper ($0.10–$0.50).
+# Full sweep budget: $5–$20 depending on model choice. Single-run numbers
+# are noisy — see evals/README.md for the multi-run averaging follow-up.
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # Greenfield builds — exercises the natural-language → working-code path.
+  # No fixture_dir: the harness builds against an empty workspace.
+  # ---------------------------------------------------------------------------
+  - name: py_cli_hello
+    description: |
+      Create a Python CLI named `hello.py` at the workspace root that prints
+      "hello, world" when invoked with no arguments and "hello, <NAME>" when
+      invoked with a single positional argument. Use argparse. Add a Makefile
+      with `build:` (installs pytest) and `test:` (runs pytest). Add a single
+      pytest test in `tests/test_hello.py` that invokes the CLI via subprocess
+      and asserts both behaviours.
+    new_build: true
+    timeout_s: 600
+    success_check: "python3 -m pytest -q"
+
+  - name: py_flask_microservice
+    description: |
+      Create a Flask microservice at the workspace root with two endpoints:
+      `GET /health` returning JSON {"status": "ok"} and `POST /echo` echoing
+      the request JSON body in the response under an "echo" key. Add a
+      pyproject.toml declaring flask and pytest under runtime + test deps,
+      a Makefile with build/test targets, and pytest tests under tests/ that
+      use Flask's test client to verify both endpoints. Module layout: source
+      under `app/` (e.g. `app/__init__.py`, `app/routes.py`).
+    new_build: true
+    timeout_s: 900
+    success_check: "python3 -m pytest -q"
+
+  - name: node_express_micro
+    description: |
+      Create a Node/Express microservice at the workspace root with two
+      endpoints: `GET /health` returning JSON {status: "ok"} and `POST /echo`
+      echoing the request body under an "echo" key. Add a package.json with
+      express + jest + supertest as deps, a Makefile with build/test targets,
+      and jest tests under `__tests__/` that use supertest to verify both
+      endpoints. Source under `src/`.
+    new_build: true
+    timeout_s: 900
+    success_check: "npm test --silent"
+
+  - name: go_http_server
+    description: |
+      Create a Go HTTP server at the workspace root with two endpoints:
+      `GET /healthz` returning the literal text "ok" and `GET /version`
+      returning the text "v0.1.0". Use only the standard library. Add a
+      go.mod, a Makefile with build/test targets, and a Go test file that
+      uses net/http/httptest to verify both endpoints.
+    new_build: true
+    timeout_s: 600
+    success_check: "go test ./..."
+
+  # ---------------------------------------------------------------------------
+  # Brownfield repairs — exercise REPLACE_BLOCK precision, incremental edits,
+  # and the repair loop. Each fixture starts with a failing test (or a build
+  # that won't run) and a clear bug.
+  # ---------------------------------------------------------------------------
+  - name: fix_off_by_one
+    description: |
+      The file `buggy.py` contains an off-by-one error in `sum_to(n)` — it
+      currently returns sum(range(n)) instead of sum(range(n + 1)). Fix the
+      bug. Do not modify the existing test.
+    fixture_dir: fixtures/fix_off_by_one
+    new_build: false
+    timeout_s: 300
+    success_check: "python3 -m pytest -q"
+
+  - name: add_logging
+    description: |
+      Add a structured INFO log line to `service.handle_request` that records
+      the keys present in the incoming payload. Use the standard library
+      `logging` module — no new dependencies. The existing test must
+      continue to pass; the new behaviour is verified by a second test
+      (`test_handle_request_logs_keys`) which is already present and asserts
+      that calling handle_request emits exactly one INFO record on the
+      `service` logger.
+    fixture_dir: fixtures/add_logging
+    new_build: false
+    timeout_s: 300
+    success_check: "python3 -m pytest -q"
+
+  - name: fix_missing_error_handling
+    description: |
+      The Flask route `POST /echo` in `app/routes.py` crashes with a 500 when
+      the request body is missing or not valid JSON — it should respond with
+      `{"error": "json body required"}` and HTTP 400 instead. Fix the
+      handler. Do not modify the existing tests.
+    fixture_dir: fixtures/fix_missing_error_handling
+    new_build: false
+    timeout_s: 600
+    success_check: "python3 -m pytest -q"
+
+  - name: add_pagination
+    description: |
+      The endpoint `GET /items` in `app/routes.py` returns the full in-memory
+      ITEMS list. Add `?limit` and `?offset` query parameters (defaults:
+      limit=10, offset=0). Out-of-range values must be clamped to sensible
+      bounds (limit ≥ 1, offset ≥ 0). The existing test
+      `test_items_returns_all` should be updated to reflect the new default
+      page size of 10, and three new tests already exist that verify limit,
+      offset, and clamping behaviour.
+    fixture_dir: fixtures/add_pagination
+    new_build: false
+    timeout_s: 600
+    success_check: "python3 -m pytest -q"
+
+  - name: fix_import_cycle
+    description: |
+      Modules `a.py` and `b.py` import each other at module scope, which
+      raises `ImportError: cannot import name 'B' from partially initialized
+      module 'b'` when pytest collects the package. Break the cycle —
+      either by moving the shared symbol into a third module, deferring one
+      import into the function that needs it, or restructuring the
+      responsibilities. Existing tests must pass.
+    fixture_dir: fixtures/fix_import_cycle
+    new_build: false
+    timeout_s: 600
+    success_check: "python3 -m pytest -q"
+
+  - name: dep_manifest_coherence
+    description: |
+      The Makefile's `build:` target runs `python3 -m pip install -e .` and
+      `test:` runs `python3 -m pytest -q`, but the project's pyproject.toml
+      omits pytest from `[project.optional-dependencies].dev`. The first
+      build will succeed but `make test` will fail with "No module named
+      pytest". Add pytest (and pytest's typical companion `pytest-asyncio`
+      if any test uses async fixtures) to the dev extras so `pip install
+      -e '.[dev]'` makes the test runner available. Existing tests must pass
+      after the manifest is corrected.
+    fixture_dir: fixtures/dep_manifest_coherence
+    new_build: false
+    timeout_s: 600
+    success_check: "python3 -m pip install -e '.[dev]' >/dev/null 2>&1 && python3 -m pytest -q"

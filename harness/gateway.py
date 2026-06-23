@@ -1624,6 +1624,30 @@ class GatewayConfig:
     # to fall back to the legacy string-form system payload — single-flag
     # rollback if any provider rejects the cache directives.
     prompt_cache_enabled: bool = True
+    # Four cheap, opt-out LLM-judgment calls added on top of the deterministic
+    # routers / autofix dispatcher. Each is on by default with an individual
+    # kill switch, wired from the ``llm_judgment`` section of config.json:
+    #   hitl_escalation_summary  — one-paragraph operator briefing emitted by
+    #     human_intervention_node when a loop-stuck tripwire fires (replaces
+    #     the bare trigger string).
+    #   patcher_rejection_diagnosis — diagnoses why prior patches were
+    #     rejected (allowlist miss vs stale context vs wrong file) and
+    #     prepends actionable advice to the next repair prompt.
+    #   preflight_autofix_judgment — on the first MISSING_DEP / DEP_RESOLUTION
+    #     iteration, classifies each unique missing symbol as
+    #     "manifest-fixable" vs "sandbox/toolchain mismatch" so futile
+    #     autofix cycles are skipped and HITL is reached one round sooner.
+    #   discovery_saturation_check — after each discovery round past the
+    #     first, asks "given current answers + workspace evidence, is this
+    #     section saturated?" and short-circuits the interview if yes.
+    # All four reuse the repair role (cheap model + thinking-mode policy).
+    # Disable any single one by setting llm_judgment.<name>: false; disable
+    # the whole set by omitting the section and the repair_primary model
+    # (the helper short-circuits when no model is routed).
+    llm_judgment_hitl_escalation_summary: bool = True
+    llm_judgment_patcher_rejection_diagnosis: bool = True
+    llm_judgment_preflight_autofix: bool = True
+    llm_judgment_discovery_saturation: bool = True
 
 
 # Filename pattern for universal LLM dumps written by Gateway._dump_llm_call_to_disk.
@@ -2831,6 +2855,26 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         max_tokens_per_role=max_tokens_per_role,
         prompt_cache_enabled=bool(
             llm_dispatch.get("prompt_cache_enabled", True)
+        ),
+        llm_judgment_hitl_escalation_summary=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "hitl_escalation_summary", True,
+            )
+        ),
+        llm_judgment_patcher_rejection_diagnosis=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "patcher_rejection_diagnosis", True,
+            )
+        ),
+        llm_judgment_preflight_autofix=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "preflight_autofix_judgment", True,
+            )
+        ),
+        llm_judgment_discovery_saturation=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "discovery_saturation_check", True,
+            )
         ),
     )
     return Gateway(gateway_config)

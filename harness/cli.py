@@ -2197,6 +2197,12 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         ("q", "Abandon session and execute Git rollback"),
     ]
 
+    # LLM-judgment escalation summary (#1). human_intervention_node attaches
+    # this for loop-stuck triggers (repair_loop_limit, persistent_build_failure)
+    # to replace the bare trigger string with a one-paragraph briefing.
+    # Empty when the kill switch is off, no gateway, or the call failed.
+    escalation_summary = str(node_state.get("hitl_escalation_summary", "") or "").strip()
+
     while True:
         print()
         print("=" * 80)
@@ -2205,6 +2211,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print(f"  Exit Code: {exit_code}")
         print(f"  Modified Files: {len(modified_files)}")
         print("=" * 80)
+        if escalation_summary:
+            print()
+            print("WHY THE LOOP STOPPED (LLM diagnosis):")
+            print(escalation_summary)
         print()
         print("CRITICAL INFORMATION:")
         print(error_text)

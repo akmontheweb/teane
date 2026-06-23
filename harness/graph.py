@@ -1503,6 +1503,156 @@ def get_gateway_config() -> Optional[Any]:
     return _gateway_config
 
 
+async def _maybe_discovery_saturation_check(
+    *,
+    gate: str,
+    question_count: int,
+    complete: bool,
+    discovery_data: dict[str, Any],
+    messages: list[dict[str, Any]],
+    budget: float,
+) -> tuple[bool, float]:
+    """LLM-judgment discovery saturation check (#3).
+
+    Asks a cheap LLM whether the just-completed discovery round has
+    saturated the section — i.e. the prior answers + workspace evidence
+    already cover the spec well enough that another round of follow-ups
+    would burn tokens without changing the outcome. Returns
+    ``(override_complete, new_budget)``. Caller treats the override as
+    "set complete=True and zero out critical_remaining" when True.
+
+    Fail-open: returns ``(complete, budget)`` unchanged when the call
+    can't or shouldn't run (disabled, no gateway, before second round,
+    already complete, budget too low, or any dispatch failure). The
+    deterministic interview cap (``max_discovery_iterations``) keeps the
+    loop bounded regardless.
+    """
+    if complete:
+        return True, budget
+    # Only fire from the SECOND round onward — round 1 always emits the
+    # initial questionnaire and there's nothing yet to be saturated.
+    if question_count < 1:
+        return complete, budget
+    gw = get_gateway()
+    if gw is None or not str(getattr(gw.config, "repair_primary", "") or "").strip():
+        return complete, budget
+    if not bool(getattr(gw.config, "llm_judgment_discovery_saturation", True)):
+        return complete, budget
+    if budget < 0.01:
+        return complete, budget
+
+    modules = discovery_data.get("modules") if isinstance(discovery_data, dict) else None
+    pending_lines: list[str] = []
+    for m in (modules or []):
+        for q in (m.get("questions") or []):
+            pending_lines.append(
+                f"  - [{m.get('name', '?')}] {str(q.get('text', ''))[:140]} "
+                f"(critical={bool(q.get('critical'))}, "
+                f"suggested={str(q.get('suggested_answer', ''))[:100]})"
+            )
+    pending_block = "\n".join(pending_lines[:30]) or "(none)"
+
+    prompt = (
+        f"You are deciding whether the {gate} discovery phase is SATURATED "
+        "— that is, whether the operator's prior answers and the "
+        "deterministic workspace evidence already give us enough to write "
+        "the spec without another round of follow-up questions. "
+        "Saturated = YES only when:\n"
+        "  - No CRITICAL pending question would change the spec materially.\n"
+        "  - The remaining non-critical questions are either redundant with "
+        "answers already given or fully resolved by workspace evidence "
+        "shown in the conversation above.\n"
+        "Default to NO when uncertain — wasting a round is cheap; "
+        "skipping a real follow-up is not.\n\n"
+        "Respond with STRICT JSON ONLY (no prose, no markdown, no code "
+        'fences): {"saturated": true|false, "reason": "<one short sentence>"}\n\n'
+        f"Round just completed: {question_count + 1}\n"
+        f"Pending questions this round:\n{pending_block}\n"
+    )
+
+    try:
+        from harness.gateway import NodeRole
+        check_messages = list(messages) + [{"role": "user", "content": prompt}]
+        response, new_budget = await gw.dispatch(
+            messages=check_messages,
+            role=NodeRole.REPAIR,
+            budget_remaining_usd=budget,
+        )
+        raw = (response.content or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        parsed: Any = json.loads(raw) if raw else {}
+        if not isinstance(parsed, dict):
+            return complete, new_budget
+        verdict = bool(parsed.get("saturated", False))
+        reason = str(parsed.get("reason", ""))[:200]
+        if verdict:
+            logger.info(
+                "[judgment:discovery_saturation/%s] Round %d declared "
+                "saturated; skipping further rounds. Reason: %s",
+                gate.lower(), question_count + 1, reason,
+            )
+        return verdict, new_budget
+    except Exception as exc:  # noqa: BLE001 — judgment must never break the loop
+        logger.warning(
+            "[judgment:discovery_saturation/%s] Check failed (%s); "
+            "falling back to existing complete=%s.",
+            gate.lower(), exc, complete,
+        )
+        return complete, budget
+
+
+async def _maybe_judgment_llm(
+    *,
+    prompt: str,
+    budget_remaining_usd: float,
+    purpose: str,
+    enabled: bool,
+) -> tuple[Optional[str], float]:
+    """Cheap one-shot LLM-judgment call shared by the four kill-switched
+    judgment additions (HITL escalation summary, patcher rejection
+    diagnosis, pre-flight autofix classification, discovery saturation).
+
+    Reuses the repair role (cheap model + thinking-mode policy already
+    configured) so no new model slot is required. The helper is fail-open
+    by design: it returns ``(None, budget_unchanged)`` whenever the call
+    can't or shouldn't run (disabled by config, no gateway, no repair
+    model routed, budget too low, or the dispatch raises) so callers can
+    fall back to their existing deterministic behaviour without a guard
+    around every call site.
+
+    A $0.01 floor is enforced on top of the gateway's hard guardrail —
+    judgment calls are cheap (~$0.001) but a 0-budget call would still
+    raise inside ``Gateway.dispatch``.
+    """
+    if not enabled:
+        return None, budget_remaining_usd
+    gw = get_gateway()
+    if gw is None or not str(getattr(gw.config, "repair_primary", "") or "").strip():
+        return None, budget_remaining_usd
+    if budget_remaining_usd < 0.01:
+        return None, budget_remaining_usd
+    try:
+        from harness.gateway import NodeRole
+        messages = [{"role": "user", "content": prompt}]
+        response, new_budget = await gw.dispatch(
+            messages=messages,
+            role=NodeRole.REPAIR,
+            budget_remaining_usd=budget_remaining_usd,
+        )
+        content = (response.content or "").strip()
+        if not content:
+            return None, new_budget
+        return content, new_budget
+    except Exception as exc:  # noqa: BLE001 — judgment must never break the loop
+        logger.warning(
+            "[judgment:%s] LLM call failed (%s); falling back to deterministic path.",
+            purpose, exc,
+        )
+        return None, budget_remaining_usd
+
+
 # ---------------------------------------------------------------------------
 # 3. Memory Cleanse Utility (Module 4)
 # ---------------------------------------------------------------------------
@@ -4300,6 +4450,149 @@ def _format_prior_patch_failures(failures: list[Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_patcher_rejection_diagnosis_prompt(
+    *,
+    rejections: list[Any],
+    patch_failures: list[Any],
+    allowed_paths: list[str],
+    modified_files: list[str],
+) -> str:
+    """Compose the prompt for the patcher-rejection diagnosis call (#4).
+
+    Pass the raw rejection records, the patch-failure records, the
+    currently allowed roots, and the modified-files inventory. The
+    helper trims each section so the prompt stays inside the cheap
+    model's working window. Returns the prompt string; the caller
+    dispatches via :func:`_maybe_judgment_llm`.
+    """
+    rej_paths = sorted(
+        {str(r.get("file", "")) for r in (rejections or []) if r.get("file")}
+    )
+    rej_block = "\n".join(f"  - {p}" for p in rej_paths[:15]) or "  (none)"
+
+    pf_lines: list[str] = []
+    for pf in (patch_failures or [])[:8]:
+        if not isinstance(pf, dict):
+            continue
+        op = str(pf.get("operation", "?"))
+        fp = str(pf.get("file", "?"))
+        reason = str(pf.get("reason", "") or pf.get("error", ""))[:240]
+        pf_lines.append(f"  - {op} on {fp} :: {reason}")
+    pf_block = "\n".join(pf_lines) or "  (none)"
+
+    allowed_block = (
+        "\n".join(f"  - {p}" for p in allowed_paths[:20])
+        if allowed_paths else "  (unconstrained)"
+    )
+    inv_shown = modified_files[:25]
+    inv_block = (
+        "\n".join(f"  - {p}" for p in inv_shown)
+        + (f"\n  - (+{len(modified_files) - len(inv_shown)} more)"
+           if len(modified_files) > len(inv_shown) else "")
+        if modified_files else "  (none)"
+    )
+
+    return (
+        "You are diagnosing why a code-patcher rejected the previous "
+        "repair attempt's hunks. For each failure listed below, classify "
+        "it into exactly one of these categories:\n"
+        "  ALLOWLIST_MISS  — patch targeted a path outside the allowed roots\n"
+        "  STALE_CONTEXT   — REPLACE_BLOCK search lines don't match disk "
+        "(file changed or model guessed)\n"
+        "  WRONG_FILE      — patch targets a file that does not exist or "
+        "the right code lives elsewhere\n"
+        "  FORMAT_ERROR    — malformed block (missing markers, bad header)\n\n"
+        "Then emit ONE corrective instruction per distinct category — at "
+        "most 4 short imperative sentences total. Reference the actual "
+        "file names. Concrete advice ('move app/server.py under src/' or "
+        "'emit READ_FILE for routes.py first; the file has 38 lines now') "
+        "beats generic advice ('be more careful'). Do NOT restate the "
+        "category labels in your reply; just give the directives.\n\n"
+        "## Allowlist rejections (paths the patcher refused)\n"
+        f"{rej_block}\n\n"
+        "## Other patch failures (operation :: reason)\n"
+        f"{pf_block}\n\n"
+        "## Currently allowed roots\n"
+        f"{allowed_block}\n\n"
+        "## Files already in the workspace (do NOT CREATE_FILE these)\n"
+        f"{inv_block}\n"
+    )
+
+
+def _build_preflight_autofix_prompt(
+    *, symbols: list[str], build_command: str, sandbox_image: str,
+) -> str:
+    """Compose the prompt for the pre-flight autofix classifier (#2).
+
+    The classifier gets the list of unique missing symbols plus the build
+    command and the sandbox image so it can reason about whether each
+    symbol can plausibly be installed via the build's package manager.
+    The expected response shape is a strict JSON object so the parser
+    can read it deterministically without LLM-shape gymnastics.
+    """
+    return (
+        "You are classifying missing-dependency error symbols so the "
+        "harness can skip futile autofix attempts. For EACH symbol below, "
+        "decide whether it is:\n"
+        "  MANIFEST_FIXABLE — a library/package that the build's package "
+        "manager (pip / npm / cargo / go mod / maven / gradle) could "
+        "install if appended to the workspace manifest. Examples: "
+        "'requests', 'pytest-asyncio', 'lodash', '@types/node'.\n"
+        "  TOOLCHAIN_MISMATCH — a system binary, language runtime, or "
+        "package manager itself that the sandbox image lacks. No edit to "
+        "requirements.txt / package.json can fix it; the sandbox image "
+        "or build_command must change. Examples: 'pip', 'npm', 'node', "
+        "'cargo', 'go', 'docker', 'make', 'gcc', 'java'.\n\n"
+        "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
+        "fences. Shape:\n"
+        '{"classifications": {"<symbol>": "MANIFEST_FIXABLE" | "TOOLCHAIN_MISMATCH", ...}}\n\n'
+        f"Build command: {build_command or '(unknown)'}\n"
+        f"Sandbox image: {sandbox_image or '(default)'}\n"
+        "Symbols to classify:\n"
+        + "\n".join(f"  - {s}" for s in symbols)
+        + "\n"
+    )
+
+
+def _parse_preflight_verdict(
+    raw: str, symbols: list[str],
+) -> list[str]:
+    """Parse the strict-JSON response from the pre-flight classifier (#2).
+
+    Returns the list of symbols the LLM tagged TOOLCHAIN_MISMATCH, in the
+    same order they appeared in ``symbols``. Returns the empty list on
+    any parse failure or when no symbol is non-fixable — the caller's
+    deterministic autofix path then runs as usual.
+    """
+    if not raw:
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        logger.debug(
+            "[judgment:preflight_autofix] Non-JSON verdict; skipping (raw=%r).",
+            text[:200],
+        )
+        return []
+    classifications = parsed.get("classifications") if isinstance(parsed, dict) else None
+    if not isinstance(classifications, dict):
+        return []
+    non_fixable: list[str] = []
+    sym_set = {s.lower() for s in symbols}
+    for sym, verdict in classifications.items():
+        if not isinstance(sym, str) or not isinstance(verdict, str):
+            continue
+        if sym.lower() not in sym_set:
+            continue
+        if verdict.strip().upper() == "TOOLCHAIN_MISMATCH":
+            non_fixable.append(sym)
+    return non_fixable
+
+
 def _workspace_has_source_files(workspace_path: str) -> bool:
     """True when the workspace contains at least one source file under a
     non-ignored directory. Used by the router to decide whether 'no tests
@@ -5019,6 +5312,75 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             len(raw_errors) - len(errors), len(errors),
         )
 
+    # LLM-judgment pre-flight autofix classifier (#2). On the FIRST repair
+    # iteration, when the diagnostics carry MISSING_DEP or
+    # DEP_RESOLUTION_CONFLICT, ask a cheap LLM whether each unique missing
+    # symbol is "manifest-fixable" (autofix can add it) or
+    # "toolchain-mismatch" (system binary / interpreter / package manager
+    # the sandbox image lacks — only an image swap can fix it). When ANY
+    # symbol is toolchain-mismatch we set env_misconfig and short-circuit
+    # back to compiler_node; the existing route_after_compiler env_misconfig
+    # branch then sends to HITL on the next pass. Saves the two compile
+    # cycles the deterministic same-symbol tripwire (at N=3) currently
+    # burns before reaching the same conclusion.
+    gateway = get_gateway()
+    if (
+        gateway is not None
+        and loop_counter.get("total_repairs", 0) == 1
+        and bool(getattr(
+            gateway.config, "llm_judgment_preflight_autofix", True,
+        ))
+    ):
+        dep_symbols = sorted({
+            str(e.get("missing_symbol", "") or "").strip()
+            for e in errors
+            if str(e.get("error_code", "")).upper() in {
+                "MISSING_DEP", "DEP_RESOLUTION_CONFLICT",
+            }
+            and str(e.get("missing_symbol", "") or "").strip()
+        })
+        if dep_symbols:
+            preflight_prompt = _build_preflight_autofix_prompt(
+                symbols=dep_symbols,
+                build_command=str(state.get("build_command", "") or ""),
+                sandbox_image=str(
+                    (state.get("sandbox_config") or {}).get("docker_image", "")
+                    or ""
+                ),
+            )
+            verdict, new_budget = await _maybe_judgment_llm(
+                prompt=preflight_prompt,
+                budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
+                purpose="preflight_autofix_judgment",
+                enabled=True,
+            )
+            if verdict:
+                state = cast(AgentState, dict(state))
+                state["budget_remaining_usd"] = new_budget
+                non_fixable = _parse_preflight_verdict(verdict, dep_symbols)
+                if non_fixable:
+                    sym = non_fixable[0]
+                    logger.warning(
+                        "[repair_node] Pre-flight classifier marked '%s' as "
+                        "toolchain-mismatch (non-fixable from inside the "
+                        "loop). Short-circuiting to HITL on the next router "
+                        "pass instead of running autofix on a dead end.",
+                        sym,
+                    )
+                    short_circuit_state = dict(state.get("node_state", {}) or {})
+                    short_circuit_state["current_node"] = "repair"
+                    short_circuit_state["env_misconfig"] = True
+                    short_circuit_state["env_misconfig_symbol"] = sym
+                    short_circuit_state["preflight_autofix_verdict"] = {
+                        "non_fixable": non_fixable,
+                        "all_classified": dep_symbols,
+                    }
+                    return {
+                        "node_state": short_circuit_state,
+                        "loop_counter": loop_counter,
+                        "budget_remaining_usd": new_budget,
+                    }
+
     # --- Deterministic autofix pass (R1+R2+R3+R4+R5+R6) ---
     # Try to resolve diagnostics with compiler-suggested fixes,
     # missing-import insertion, known-safe security autofixes, or
@@ -5194,6 +5556,51 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # repair LLM otherwise has no way to know its patches keep being thrown
     # away by the path filter.
     prior_rejections = state.get("node_state", {}).get("allowlist_rejections") or []
+    prior_patch_failures = state.get("node_state", {}).get("patch_failures") or []
+
+    # LLM-judgment patcher-rejection diagnosis (#4). When the previous
+    # attempt produced any rejections, run a cheap classifier+adviser call
+    # so the repair LLM sees actionable guidance ABOVE the raw rejection
+    # dumps. The classifier sorts each failure into a category (allowlist
+    # miss / stale context / wrong file / format error) and emits one
+    # corrective instruction per category. Without this the loop just
+    # re-reads "your patches were rejected" round after round and tends
+    # to re-emit the same broken hunk.
+    if prior_rejections or prior_patch_failures:
+        diag_prompt = _build_patcher_rejection_diagnosis_prompt(
+            rejections=prior_rejections,
+            patch_failures=prior_patch_failures,
+            allowed_paths=state.get("node_state", {}).get("allowed_paths") or [],
+            modified_files=sorted(
+                {p for p in (state.get("modified_files") or []) if p}
+            ),
+        )
+        diagnosis, new_budget = await _maybe_judgment_llm(
+            prompt=diag_prompt,
+            budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
+            purpose="patcher_rejection_diagnosis",
+            enabled=bool(getattr(
+                gateway.config,
+                "llm_judgment_patcher_rejection_diagnosis",
+                True,
+            )),
+        )
+        if diagnosis:
+            state = cast(AgentState, dict(state))
+            state["budget_remaining_usd"] = new_budget
+            error_summary += (
+                "\n## Patcher-rejection diagnosis (LLM advisory)\n"
+                "An auxiliary judgment LLM read the rejected patches from "
+                "your previous attempt and classified each failure. Treat "
+                "the following as a directive for THIS round — applying it "
+                "correctly is what unblocks the loop:\n\n"
+                f"{diagnosis}\n"
+            )
+            logger.info(
+                "[repair_node] Patcher-rejection diagnosis attached (%d chars).",
+                len(diagnosis),
+            )
+
     if prior_rejections:
         prior_allowed = state.get("node_state", {}).get("allowed_paths") or []
         prior_rejected_paths: list[str] = sorted({str(r.get("file", "")) for r in prior_rejections if r.get("file")})
@@ -5212,9 +5619,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # patcher's "Search block not found ... Closest match: <bytes>" suggestion
     # is the single most useful signal the LLM has to correct a bad patch.
     # Without this the loop just retries the same broken search block.
-    error_summary += _format_prior_patch_failures(
-        state.get("node_state", {}).get("patch_failures") or []
-    )
+    error_summary += _format_prior_patch_failures(prior_patch_failures)
 
     # Workspace inventory: the single biggest cause of stuck repair loops is
     # the LLM CREATE_FILE-ing files that already exist (from the initial
@@ -5843,6 +6248,35 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     state_dict["node_state"]["hitl_active"] = True
     state_dict["node_state"]["hitl_awaiting_input"] = True
 
+    # LLM-judgment kill-switched escalation summary (#1). For loop-stuck
+    # triggers — repair limit, persistent failure, or no-progress
+    # tripwires — generate a one-paragraph operator briefing that
+    # explains why the loop couldn't fix it and what to try manually.
+    # The bare trigger string ("repair_loop_limit") tells the operator
+    # the cap was hit; this tells them what the loop was actually doing
+    # and why it failed. Triggers with already-precise messages
+    # (budget_exhausted, env_misconfig:<symbol>) skip the call.
+    summary_eligible = trigger_reason in {
+        "repair_loop_limit", "persistent_build_failure",
+    }
+    if summary_eligible and gw is not None:
+        prompt = _build_hitl_escalation_summary_prompt(state, trigger_reason)
+        summary, new_budget = await _maybe_judgment_llm(
+            prompt=prompt,
+            budget_remaining_usd=budget_remaining,
+            purpose="hitl_escalation_summary",
+            enabled=bool(getattr(
+                gw.config, "llm_judgment_hitl_escalation_summary", True,
+            )),
+        )
+        state_dict["budget_remaining_usd"] = new_budget
+        if summary:
+            state_dict["node_state"]["hitl_escalation_summary"] = summary
+            logger.info(
+                "[human_intervention_node] LLM escalation summary attached (%d chars).",
+                len(summary),
+            )
+
     # Delegate to the CLI layer's interactive menu loop.
     # This blocks on stdin until the developer makes a choice.
     from harness.cli import hitl_menu_loop
@@ -5851,6 +6285,79 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
 
     # Extract the node_state back — hitl_menu_loop returns a full state dict
     return updated_state
+
+
+def _build_hitl_escalation_summary_prompt(
+    state: AgentState, trigger_reason: str,
+) -> str:
+    """Compose a compact prompt for the HITL escalation summary call (#1).
+
+    Pulls the latest compiler errors, the last patcher rejections /
+    patch failures, the modified-files inventory, and the loop counters
+    so the LLM sees the same evidence the operator would have to dig out
+    of the logs. Bounded so the prompt stays in the cheap-model budget.
+    """
+    node_state = state.get("node_state", {}) or {}
+    loop_counter = state.get("loop_counter", {}) or {}
+    errors = state.get("compiler_errors", []) or []
+    rejections = node_state.get("allowlist_rejections") or []
+    patch_failures = node_state.get("patch_failures") or []
+    last_build_output = str(node_state.get("last_build_output", "") or "")
+    modified_files = sorted({p for p in (state.get("modified_files") or []) if p})
+
+    err_lines: list[str] = []
+    for err in errors[:8]:
+        err_lines.append(
+            f"- {err.get('error_code', '?')} {err.get('file', '?')}:"
+            f"{err.get('line', 0)} — "
+            f"{str(err.get('message', ''))[:200]}"
+        )
+    err_block = "\n".join(err_lines) if err_lines else "(no structured diagnostics)"
+
+    rej_paths = sorted({str(r.get("file", "")) for r in rejections if r.get("file")})
+    rej_block = (
+        ", ".join(rej_paths[:10]) if rej_paths else "(none)"
+    )
+
+    pf_lines: list[str] = []
+    for pf in patch_failures[:5]:
+        if isinstance(pf, dict):
+            pf_lines.append(
+                f"- {pf.get('operation', '?')} on {pf.get('file', '?')}: "
+                f"{str(pf.get('reason', '') or pf.get('error', ''))[:160]}"
+            )
+    pf_block = "\n".join(pf_lines) if pf_lines else "(none)"
+
+    inv_block = (
+        ", ".join(modified_files[:15])
+        + (f" (+{len(modified_files) - 15} more)" if len(modified_files) > 15 else "")
+        if modified_files else "(none)"
+    )
+
+    return (
+        "You are summarising why the harness's build → repair loop has stopped "
+        "making progress and is handing off to a human operator. Produce ONE "
+        "short paragraph (4–6 sentences, no markdown headers, no bullet "
+        "lists) that:\n"
+        "  1. Names the root cause in concrete terms (which file/symbol/dep, "
+        "not just 'tests fail').\n"
+        "  2. States why the repair loop could not fix it (e.g. patcher kept "
+        "rejecting the path, autofix ran out, same symptom recurred).\n"
+        "  3. Recommends the single most likely manual fix.\n"
+        "Be specific: cite filenames, missing symbols, or rejected paths from "
+        "the evidence below. Do NOT paraphrase the trigger reason; the "
+        "operator already sees it.\n\n"
+        f"Trigger: {trigger_reason}\n"
+        f"Repair iterations spent: {loop_counter.get('total_repairs', 0)}\n"
+        f"Consecutive zero-patch rounds: {loop_counter.get('consecutive_zero_patch_rounds', 0)}\n"
+        f"Build exit code: {state.get('exit_code', -1)}\n\n"
+        f"Recent compiler errors:\n{err_block}\n\n"
+        f"Recently rejected patch paths (allowlist): {rej_block}\n\n"
+        f"Recent patcher rejections (other):\n{pf_block}\n\n"
+        f"Workspace files touched this session: {inv_block}\n\n"
+        f"Tail of last build output (truncated):\n"
+        f"{last_build_output[-1200:] if last_build_output else '(empty)'}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6987,6 +7494,19 @@ JSON. No markdown, no explanation, no code blocks."""
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
 
+        # LLM-judgment saturation check (#3). After at least one prior
+        # round, ask whether further questions would meaningfully refine
+        # the spec. When yes, override complete=True so route_after_discovery
+        # advances to write_spec_node without another interview pass.
+        complete, budget = await _maybe_discovery_saturation_check(
+            gate="REQUIREMENTS",
+            question_count=question_count,
+            complete=complete,
+            discovery_data=discovery_data,
+            messages=messages,
+            budget=budget,
+        )
+
         logger.info("[reqs_disc] Round %d: %d questions across %d modules (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_questions, len(modules), critical_count, complete, budget)
 
@@ -7144,6 +7664,17 @@ JSON. No markdown, no explanation, no code blocks."""
         critical_count = sum(1 for m in modules for q in m.get("questions", []) if q.get("critical"))
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
+
+        # LLM-judgment saturation check (#3). See requirements_discovery_node
+        # for the rationale; same helper, scoped to ARCHITECTURE.
+        complete, budget = await _maybe_discovery_saturation_check(
+            gate="ARCHITECTURE",
+            question_count=question_count,
+            complete=complete,
+            discovery_data=discovery_data,
+            messages=messages,
+            budget=budget,
+        )
 
         logger.info("[arch_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_q, critical_count, complete, budget)
@@ -7347,6 +7878,21 @@ JSON. No markdown, no explanation, no code blocks.""" + telemetry_block + resolv
         critical_count = sum(1 for m in modules for q in m.get("questions", []) if q.get("critical"))
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data, sort_keys=True)})
+
+        # LLM-judgment saturation check (#3). See requirements_discovery_node
+        # for the rationale; same helper, scoped to DEPLOYMENT. Especially
+        # high-leverage here because deployment_discovery already grounds
+        # suggested_answers in workspace telemetry — when the scan answers
+        # everything, the saturation check converts that signal into a
+        # round-skip instead of another follow-up pass.
+        complete, budget = await _maybe_discovery_saturation_check(
+            gate="DEPLOYMENT",
+            question_count=question_count,
+            complete=complete,
+            discovery_data=discovery_data,
+            messages=messages,
+            budget=budget,
+        )
 
         logger.info("[deploy_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
                      question_count + 1, total_q, critical_count, complete, budget)

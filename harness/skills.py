@@ -247,38 +247,13 @@ class SubAgentSkill(SkillBase):
 # ---------------------------------------------------------------------------
 
 _DOCGEN_SYSTEM_PROMPTS = {
-    "arch_doc": """You are a Principal Software Architect. Generate a comprehensive Architecture Decision Record (ADR) for the project.
-
-Scan the directory structure and codebase below. Produce a document with these sections:
-
-## Architecture Decision Record
-
-### 1. System Context (C4 Level 1)
-- What does this system do? Who are its users?
-- External systems it interacts with.
-
-### 2. Container Diagram (C4 Level 2)
-- Major deployable units (web app, API server, database, cache, message queue)
-- Communication protocols between them.
-
-### 3. Component Diagram (C4 Level 3)
-- Key modules/packages and their responsibilities
-- Data flow between components
-- Dependency relationships
-
-### 4. Technology Stack
-- Languages, frameworks, databases, infrastructure
-- Version requirements
-
-### 5. Key Design Decisions
-- Why specific patterns were chosen (or should be chosen)
-- Trade-offs considered
-
-### 6. Data Model Overview
-- Core entities and their relationships
-- Storage strategy
-
-Output as a well-formatted Markdown document. Use the file structure provided to infer the architecture.""",
+    # arch_doc and requirements are externalized to
+    # harness/skills/docgen/{arch_doc,requirements_doc}.md and resolved via
+    # ``_get_docgen_prompt`` below. The keys remain present (empty string)
+    # so ``_DOCGEN_SYSTEM_PROMPTS["readme"]`` lookups don't surprise callers
+    # that still iterate the dict, but the values here are unused for these
+    # two types — the file on disk is the source of truth.
+    "arch_doc": "",
 
     "functional_spec": """You are a Senior Technical Writer and Systems Analyst. Generate a Functional Specification document from the codebase.
 
@@ -312,38 +287,7 @@ For each module/package found in the codebase:
 
 Output as a structured Markdown document.""",
 
-    "requirements": """You are a Business Analyst and Requirements Engineer. Generate a Requirements Specification document.
-
-## Requirements Specification
-
-### 1. Executive Summary
-- Project purpose and business value
-
-### 2. Functional Requirements (FR)
-For each feature found in the codebase or described in the task:
-- **FR-XXX**: Title
-  - Description
-  - Priority (Must Have / Should Have / Could Have)
-  - Acceptance Criteria (Given/When/Then format)
-
-### 3. Non-Functional Requirements (NFR)
-- **NFR-001**: Performance (response time, throughput)
-- **NFR-002**: Security (authentication, authorization, data protection)
-- **NFR-003**: Reliability (uptime, error rates)
-- **NFR-004**: Scalability (horizontal/vertical scaling targets)
-
-### 4. Traceability Matrix
-| Requirement | Module/File | Status |
-|---|---|---|
-| FR-001 | src/auth/login.py | Implemented |
-| FR-002 | src/api/users.py | Partial |
-
-### 5. Constraints & Assumptions
-- Technical constraints
-- Business constraints
-- Assumptions made during analysis
-
-Output as a structured Markdown document.""",
+    "requirements": "",
 
     "api_doc": """You are an API Documentation Specialist. Generate comprehensive API reference documentation.
 
@@ -429,6 +373,28 @@ Output as a single README.md formatted document."""
 }
 
 
+# Doc types whose system prompt lives in harness/skills/docgen/*.md instead
+# of the inline dict above. Mapping is (doc_type → filename stem).
+_DOCGEN_EXTERNAL_PROMPTS = {
+    "arch_doc": "arch_doc",
+    "requirements": "requirements_doc",
+}
+
+
+def _get_docgen_prompt(doc_type: str) -> str:
+    """Resolve the system prompt for a docgen doc_type.
+
+    Externalized types (arch_doc, requirements) load from disk so the
+    prompt can be edited without touching code. Other types fall back to
+    the inline ``_DOCGEN_SYSTEM_PROMPTS`` dict; an unknown type falls all
+    the way back to the readme prompt (matches prior behavior).
+    """
+    if doc_type in _DOCGEN_EXTERNAL_PROMPTS:
+        from harness import docgen_prompts
+        return docgen_prompts.load(_DOCGEN_EXTERNAL_PROMPTS[doc_type])
+    return _DOCGEN_SYSTEM_PROMPTS.get(doc_type, _DOCGEN_SYSTEM_PROMPTS["readme"])
+
+
 class DocGenSkill(SubAgentSkill):
     """
     Specialized sub-agent for generating project documentation.
@@ -445,7 +411,7 @@ class DocGenSkill(SubAgentSkill):
         model_override: str = "",
         max_iterations: int = 2,
     ):
-        prompt = _DOCGEN_SYSTEM_PROMPTS.get(doc_type, _DOCGEN_SYSTEM_PROMPTS["readme"])
+        prompt = _get_docgen_prompt(doc_type)
         schema = SkillSchema(
             name=f"{doc_type}_generator",
             description=f"Generate a {doc_type} document for the project.",
@@ -510,8 +476,7 @@ async def generate_documentation(
     if gateway is None:
         return {"success": False, "error": "No gateway configured. Cannot generate documentation."}
 
-    prompt_key = doc_type
-    system_prompt = _DOCGEN_SYSTEM_PROMPTS.get(prompt_key, _DOCGEN_SYSTEM_PROMPTS["readme"])
+    system_prompt = _get_docgen_prompt(doc_type)
 
     # Build directory snapshot for context
     tree = await _build_dir_snapshot(workspace_path)

@@ -66,6 +66,14 @@ harness = [
     "static/fonts/*",
     "static/*.ico",
     "static/*.png",
+    # Framework skills and docgen system prompts loaded by path at
+    # runtime via harness/graph.py:_load_skills_markdown and
+    # harness/docgen_prompts.py. Without these globs, a wheel install
+    # would silently skip them — discovery would produce an empty
+    # interview screen.
+    "skills/*.md",
+    "skills/docgen/*.md",
+    "style_guides/*.md",
 ]
 
 [tool.ruff]

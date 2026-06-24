@@ -1667,6 +1667,14 @@ class GatewayConfig:
     llm_judgment_patcher_rejection_diagnosis: bool = True
     llm_judgment_preflight_autofix: bool = True
     llm_judgment_discovery_saturation: bool = True
+    # Sixth touchpoint (added alongside the saturation check): on each
+    # discovery follow-up round, picks the 3-5 sectors most worth
+    # re-auditing this round and splices them into the prompt's
+    # ``{FOCUS_SECTORS_BLOCK}`` slot. Saturation decides whether to keep
+    # going; focus decides what to ask about next. Off by setting
+    # llm_judgment.discovery_followup_focus=false — the follow-up prompt
+    # then asks across every sector exactly as before.
+    llm_judgment_discovery_followup_focus: bool = True
     # Fifth judgment touchpoint: one-sentence summary prefacing the
     # deterministic access-hint paragraph printed at exit by
     # installation_doc_node. Adds context the deterministic renderer
@@ -2921,6 +2929,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         llm_judgment_discovery_saturation=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(
                 "discovery_saturation_check", True,
+            )
+        ),
+        llm_judgment_discovery_followup_focus=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "discovery_followup_focus", True,
             )
         ),
         llm_judgment_app_usage_guide=bool(

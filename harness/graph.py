@@ -1779,6 +1779,189 @@ async def _maybe_discovery_saturation_check(
         return complete, budget
 
 
+# Sector taxonomies that mirror the headings inside
+# ``harness/skills/docgen/{requirements,architecture}_discovery.md``. Kept
+# in code (rather than re-parsed from the markdown each round) because the
+# focus helper validates the LLM's response against this exact set: if the
+# .md file's sector names ever drift, these tuples are the single place to
+# update. Anyone editing the .md MUST update the tuple, and vice versa —
+# the test pack guards both directions.
+_REQUIREMENTS_SECTORS: tuple[str, ...] = (
+    "USER ROLES & PERSONAS",
+    "EPICS & USER STORIES",
+    "INPUT VALIDATION & PAYLOAD FORMAT",
+    "EDGE CASES & BOUNDARY CONDITIONS",
+    "ERROR HANDLING & RETRY BEHAVIOR",
+    "SECURITY CONTROLS & THREAT MODEL",
+    "ABUSE & MISUSE CASES",
+    "CONCURRENCY & MULTI-USER SEMANTICS",
+    "BUSINESS LOGIC & STATE MACHINES",
+    "COMPLIANCE & DATA CLASSIFICATION",
+    "OBSERVABILITY & SUCCESS METRICS",
+    "DATA RETENTION & LIFECYCLE",
+    "HIDDEN ASSUMPTIONS & ENVIRONMENT",
+)
+
+_ARCHITECTURE_SECTORS: tuple[str, ...] = (
+    "DATA MODEL & OWNERSHIP",
+    "COMPONENT INTERFACES & CONTRACTS",
+    "TRUST BOUNDARIES & SECURITY ZONES",
+    "EXTERNAL DEPENDENCIES & RATE LIMITS",
+    "STORAGE TOPOLOGY",
+    "SECRETS & CONFIGURATION MANAGEMENT",
+    "DEPLOYMENT TOPOLOGY",
+    "SCALING & PERFORMANCE BUDGETS",
+    "FAILURE DOMAINS & RESILIENCE PATTERNS",
+    "OBSERVABILITY & ALERTING",
+    "CI/CD & RELEASE STRATEGY",
+    "DATA LIFECYCLE",
+)
+
+
+_FOCUS_MIN = 3
+_FOCUS_MAX = 5
+
+
+def _render_focus_block(focus: list[str]) -> str:
+    """Render the focused-sector instruction block spliced into the
+    follow-up prompt's ``{FOCUS_SECTORS_BLOCK}`` placeholder. Empty list
+    → empty string so the prompt flows as if focus never ran.
+    """
+    if not focus:
+        return ""
+    bullets = "\n".join(f"- {name}" for name in focus)
+    return (
+        "## Focus this round\n\n"
+        "Based on prior-round answers, concentrate this round's audit on "
+        "the following sectors first:\n"
+        f"{bullets}\n\n"
+        "Re-audit the remaining sectors only if you spot a critical gap "
+        "while answering the focused ones. Asking 1-2 sharp questions per "
+        "focused sector beats asking a generic question in every sector.\n"
+    )
+
+
+async def _maybe_discovery_followup_focus(
+    *,
+    gate: str,
+    question_count: int,
+    sectors: tuple[str, ...],
+    messages: list[dict[str, Any]],
+    budget: float,
+) -> tuple[Optional[list[str]], float]:
+    """LLM-judgment follow-up focus picker (#6).
+
+    Asks a cheap LLM which 3-5 sectors most warrant re-auditing in this
+    follow-up round, given the conversation so far. Returns ``(focus_list,
+    new_budget)``. Caller renders the focus list into the follow-up prompt
+    via ``_render_focus_block`` and substitutes ``{FOCUS_SECTORS_BLOCK}``.
+
+    Fail-open: returns ``(None, budget)`` whenever the call can't or
+    shouldn't run (disabled by config, no gateway, no repair model routed,
+    first round, budget too low, or dispatch / parse failure). Caller
+    treats ``None`` as "render the empty block and proceed unfocused".
+
+    Args:
+        gate: ``"REQUIREMENTS"`` or ``"ARCHITECTURE"`` — for logging only.
+        question_count: Rounds completed BEFORE this one. Focus runs only
+            from the second round onward (question_count >= 1).
+        sectors: The canonical sector list for this gate. Returned focus
+            entries are validated against this set; unknowns are dropped.
+        messages: Conversation history (includes prior-round answers).
+        budget: Remaining session budget in USD.
+    """
+    if question_count < 1:
+        return None, budget
+    gw = get_gateway()
+    if gw is None or not str(getattr(gw.config, "repair_primary", "") or "").strip():
+        return None, budget
+    if not bool(getattr(gw.config, "llm_judgment_discovery_followup_focus", True)):
+        return None, budget
+    if budget < 0.01:
+        return None, budget
+
+    sector_list = "\n".join(f"- {name}" for name in sectors)
+    prompt = (
+        f"You are picking which {gate} sectors most need follow-up "
+        f"in the next discovery round.\n\n"
+        f"Sectors:\n{sector_list}\n\n"
+        f"Pick the {_FOCUS_MIN}-{_FOCUS_MAX} sectors with the BIGGEST "
+        "remaining gap based on the conversation above. Prefer sectors "
+        "where:\n"
+        "  - The operator's prior answers were vague, contradictory, or "
+        "marked as guesses.\n"
+        "  - A critical question went unanswered or was deferred.\n"
+        "  - Downstream gates (security, data, scaling) materially "
+        "depend on this sector and it is still soft.\n\n"
+        "Respond with STRICT JSON ONLY (no prose, no markdown, no code "
+        f'fences): {{"focus": ["<SECTOR NAME>", ...]}}\n\n'
+        f"Use the EXACT names from the sector list above. Max "
+        f"{_FOCUS_MAX} entries. If every sector is equally soft, pick "
+        f"the {_FOCUS_MIN} that block downstream gates the hardest.\n"
+    )
+
+    # Track the post-dispatch budget out here so the exception path can
+    # return the spend that actually happened rather than the pre-call
+    # budget. The judgment call is cheap (~$0.001) but ignoring it leaks
+    # token accounting; the existing saturation_check helper does swallow
+    # it — I'm not matching that quirk here.
+    new_budget = budget
+    try:
+        from harness.gateway import NodeRole
+        check_messages = list(messages) + [{"role": "user", "content": prompt}]
+        response, new_budget = await gw.dispatch(
+            messages=check_messages,
+            role=NodeRole.REPAIR,
+            budget_remaining_usd=budget,
+        )
+        raw = (response.content or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        parsed: Any = json.loads(raw) if raw else {}
+        if not isinstance(parsed, dict):
+            return None, new_budget
+        raw_focus = parsed.get("focus")
+        if not isinstance(raw_focus, list):
+            return None, new_budget
+
+        known = set(sectors)
+        validated: list[str] = []
+        for item in raw_focus:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip()
+            if normalized in known and normalized not in validated:
+                validated.append(normalized)
+            if len(validated) >= _FOCUS_MAX:
+                break
+
+        if len(validated) < _FOCUS_MIN:
+            # Under the floor → don't risk a too-narrow follow-up.
+            # Falling back to the full unfocused prompt is safer than
+            # asking 1-2 questions in an LLM-chosen tiny subset.
+            logger.info(
+                "[judgment:discovery_followup_focus/%s] LLM picked only "
+                "%d valid sector(s) (below floor=%d); falling back to "
+                "unfocused follow-up.",
+                gate.lower(), len(validated), _FOCUS_MIN,
+            )
+            return None, new_budget
+
+        logger.info(
+            "[judgment:discovery_followup_focus/%s] Round %d focus: %s",
+            gate.lower(), question_count + 1, validated,
+        )
+        return validated, new_budget
+    except Exception as exc:  # noqa: BLE001 — judgment must never break the loop
+        logger.warning(
+            "[judgment:discovery_followup_focus/%s] Picker failed (%s); "
+            "falling back to unfocused follow-up.",
+            gate.lower(), exc,
+        )
+        return None, new_budget
+
+
 async def _maybe_judgment_llm(
     *,
     prompt: str,
@@ -7921,95 +8104,34 @@ async def requirements_discovery_node(state: AgentState) -> dict[str, Any]:
     # Determine if this is the first pass or a follow-up
     is_followup = question_count > 0
 
+    # Prompt body lives in harness/skills/docgen/*.md so it can be iterated
+    # (sectors added, threat-model coverage tightened) without touching code.
+    # Per-project overrides at {workspace_path}/skills/docgen/*.md win.
+    from harness import docgen_prompts
+    workspace_for_overrides = state.get("workspace_path") or None
+    current_budget_for_focus = state.get("budget_remaining_usd", 0.0)
+    focus_sectors: Optional[list[str]] = None
     if is_followup:
-        prompt = f"""You are a Lead Systems Auditor. This is a FOLLOW-UP round (#{question_count + 1}).
-Review the conversation above where the user answered your previous questions.
-Your task:
-1. Cross-reference the user's answers against all 8 sectors below.
-2. Identify any REMAINING unknowns, gaps, or contradictions.
-3. For each critical gap, generate a targeted follow-up question.
-4. If ALL sectors are fully resolved across all 8 areas, output: {{"complete": true}}
-
-Output JSON:
-{{
-  "modules": [
-    {{"name": "INPUT VALIDATION", "questions": [
-      {{"id": "Q1.1", "text": "...", "critical": true/false, "suggested_answer": "..."}}
-    ]}},
-    ...
-  ],
-  "complete": false,
-  "summary": "Brief status of what's resolved vs remaining"
-}}
-
-Every question MUST include a "suggested_answer" — your best, most-probable
-answer given the conversation context, project files, and prior responses.
-Keep it short (1 line, concrete, actionable). The interview presents it to
-the operator as a default they can press Enter to accept; a vague placeholder
-defeats the purpose. If you genuinely have no signal, use the conservative
-industry default for that sector and say so.
-Return ONLY valid JSON. No markdown or explanation."""
-
+        # LLM-judgment #6: ask which 3-5 sectors most need re-auditing
+        # this round and splice them in. Disabled / failed → None → empty
+        # block → behaves exactly like the pre-focus follow-up.
+        focus_sectors, current_budget_for_focus = await _maybe_discovery_followup_focus(
+            gate="REQUIREMENTS",
+            question_count=question_count,
+            sectors=_REQUIREMENTS_SECTORS,
+            messages=messages,
+            budget=current_budget_for_focus,
+        )
+        prompt = docgen_prompts.load(
+            "requirements_discovery_followup", workspace_for_overrides
+        ).replace("{ROUND_NUMBER}", str(question_count + 1))
+        prompt = prompt.replace(
+            "{FOCUS_SECTORS_BLOCK}", _render_focus_block(focus_sectors or []),
+        )
     else:
-        prompt = """You are a Lead Systems Auditor. Perform EXHAUSTIVE requirements discovery across ALL 8 sectors below.
-For each sector, ask every question needed to eliminate unknowns. Be extremely thorough.
-
-## Required Sectors
-
-### 1. INPUT DATA VALIDATION
-- Data types, value ranges, required vs optional fields, format constraints, nesting limits, encoding rules.
-
-### 2. PAYLOAD FORMATTING
-- JSON schema/XML/binary format, field naming conventions, pagination structure, error envelope format, versioning.
-
-### 3. ERROR HANDLING BEHAVIORS
-- HTTP status codes per scenario, retry logic (exponential backoff, max retries), circuit breaker thresholds, graceful degradation, dead-letter queues.
-
-### 4. MULTI-USER EDGE CASES
-- Concurrency model (optimistic/pessimistic locking), race conditions, idempotency requirements, distributed transaction boundaries, eventual consistency windows.
-
-### 5. SECURITY CONTROLS
-- Authentication method (JWT, OAuth2, API keys), token storage/rotation, RBAC/permission model, CORS policy, rate limiting, input sanitization, CSRF protection.
-
-### 6. STRICT BUSINESS LOGIC RULES
-- State machines and transitions, invariants that must hold, validation constraints, business rule precedence, conflict resolution.
-
-### 7. DATA RETENTION BOUNDARIES
-- TTLs for cached data, archival policies, GDPR/compliance requirements, audit log retention, backup schedules.
-
-### 8. HIDDEN ASSUMPTIONS
-- Platform requirements (OS, architecture), network topology assumptions, timezone/locale handling, third-party service availability, expected load profiles.
-
-Output the EXACT JSON shape below — the key must be literally "modules"
-(not "sectors", not "questions", not the section titles above). The harness
-parses this shape strictly; any other top-level key yields zero questions
-and the operator sees an empty interview screen.
-
-{
-  "modules": [
-    {"name": "INPUT VALIDATION", "questions": [
-      {"id": "Q1.1", "text": "...", "critical": true, "suggested_answer": "..."},
-      {"id": "Q1.2", "text": "...", "critical": false, "suggested_answer": "..."}
-    ]},
-    {"name": "PAYLOAD FORMATTING", "questions": [...]},
-    {"name": "ERROR HANDLING BEHAVIORS", "questions": [...]},
-    {"name": "MULTI-USER EDGE CASES", "questions": [...]},
-    {"name": "SECURITY CONTROLS", "questions": [...]},
-    {"name": "STRICT BUSINESS LOGIC RULES", "questions": [...]},
-    {"name": "DATA RETENTION BOUNDARIES", "questions": [...]},
-    {"name": "HIDDEN ASSUMPTIONS", "questions": [...]}
-  ],
-  "complete": false,
-  "summary": "Brief status of what's covered vs still unknown"
-}
-
-Mark critical items with "critical": true. Every question MUST include
-"suggested_answer" — your best, most-probable answer given the conversation
-context, project files, and sector intent. Keep it short (1 line, concrete,
-actionable). The interview presents it as a default the operator can press
-Enter to accept; a vague placeholder defeats the purpose. If you have no
-signal, use the conservative industry default and say so. Return ONLY valid
-JSON. No markdown, no explanation, no code blocks."""
+        prompt = docgen_prompts.load(
+            "requirements_discovery", workspace_for_overrides
+        )
 
     # Delta-mode preamble: when change_request_mode is active, prepend the
     # CR-N attribution rules and the "ask delta-shaped questions only"
@@ -8020,7 +8142,11 @@ JSON. No markdown, no explanation, no code blocks."""
 
     from harness.gateway import NodeRole
 
-    current_budget = state.get("budget_remaining_usd", 0.0)
+    # current_budget_for_focus already reflects whatever the focus picker
+    # spent on its sub-call (a few cents at most). Carry that forward
+    # so the planning dispatch isn't handed a stale "as if focus never
+    # ran" budget.
+    current_budget = current_budget_for_focus
     if current_budget <= 0:
         logger.warning("[reqs_disc] Budget exhausted ($%.4f); skipping discovery.", current_budget)
         return {
@@ -8121,85 +8247,28 @@ async def architecture_discovery_node(state: AgentState) -> dict[str, Any]:
     question_count = state.get("node_state", {}).get("discovery_question_count", 0)
     is_followup = question_count > 0
 
+    from harness import docgen_prompts
+    workspace_for_overrides = state.get("workspace_path") or None
+    current_budget_for_focus = state.get("budget_remaining_usd", 0.0)
+    focus_sectors: Optional[list[str]] = None
     if is_followup:
-        prompt = f"""You are a Principal Infrastructure Architect. FOLLOW-UP round #{question_count + 1}.
-Review the conversation above. Cross-reference answers. Find remaining gaps.
-If all 8 architectural sectors are fully resolved, output {{"complete": true}} and nothing else.
-
-Otherwise, output the EXACT JSON shape below — top-level key MUST be
-literally "modules". The harness parses this shape strictly; any other
-top-level key yields zero questions and the operator sees an empty
-interview screen.
-
-{{
-  "modules": [
-    {{"name": "STORAGE TOPOLOGY", "questions": [
-      {{"id": "A1.1", "text": "...", "critical": true, "suggested_answer": "..."}}
-    ]}}
-  ],
-  "complete": false,
-  "summary": "Brief status of what's resolved vs remaining"
-}}
-
-Every question MUST include "suggested_answer" — your best, most-probable
-answer given the conversation context, project files, and prior responses.
-Keep it short (1 line, concrete, actionable). The interview presents it as
-a default the operator can press Enter to accept; a vague placeholder
-defeats the purpose. If you have no signal, use the conservative industry
-default and say so. Return ONLY valid JSON. No markdown, no explanation, no
-code fences."""
-
+        focus_sectors, current_budget_for_focus = await _maybe_discovery_followup_focus(
+            gate="ARCHITECTURE",
+            question_count=question_count,
+            sectors=_ARCHITECTURE_SECTORS,
+            messages=messages,
+            budget=current_budget_for_focus,
+        )
+        prompt = docgen_prompts.load(
+            "architecture_discovery_followup", workspace_for_overrides
+        ).replace("{ROUND_NUMBER}", str(question_count + 1))
+        prompt = prompt.replace(
+            "{FOCUS_SECTORS_BLOCK}", _render_focus_block(focus_sectors or []),
+        )
     else:
-        prompt = """You are a Principal Infrastructure Architect. Perform EXHAUSTIVE architecture discovery across ALL 8 sectors.
-
-## Required Sectors
-
-### 1. DATABASE SCHEMA DEFINITIONS
-- Tables, columns, primary keys, foreign keys, unique constraints, indexes (B-tree/hash/GIN), partitioning strategy, replication (master-slave/multi-master), connection pooling.
-
-### 2. MICROSERVICE COMMUNICATION
-- Protocol per service boundary (REST, WebSocket, gRPC, GraphQL, message queue), serialization format, service discovery, load balancing, circuit breaking, retry/backoff.
-
-### 3. EXTERNAL API RATE-LIMITING
-- Provider rate limits per API, token bucket/sliding window algorithm, throttling tiers, quota management, retry-after handling.
-
-### 4. CONTAINER VOLUME STORAGE
-- Named volumes vs bind mounts, persistent storage paths per service, backup strategy, tmpfs requirements for ephemeral data, NFS/EFS for shared state.
-
-### 5. ENVIRONMENTAL SECRECY
-- Secrets manager (HashiCorp Vault, AWS Secrets Manager, Doppler), env var injection, .env file handling, CI/CD secret masking, rotation policy.
-
-### 6. SCALING PARAMETERS
-- Horizontal vs vertical scaling, auto-scaling triggers (CPU > 70%, memory, request queue depth), min/max replicas, cold start mitigation.
-
-### 7. OBSERVABILITY
-- Structured logging format (JSON), log aggregation, metrics (Prometheus/Datadog), distributed tracing (OpenTelemetry), alerting thresholds, health check endpoints.
-
-### 8. CI/CD PIPELINE HOOKS
-- Build triggers (push, PR, tag), deployment gates (approval, test pass), rollback strategy, canary/blue-green deployment, environment promotion path.
-
-Output the EXACT JSON shape below — the top-level key MUST be literally
-"modules" (not "sectors", not "components"). Any other key yields zero
-questions and the operator sees an empty interview screen.
-
-{
-  "modules": [
-    {"name": "STORAGE TOPOLOGY", "questions": [
-      {"id": "A1.1", "text": "...", "critical": true, "suggested_answer": "..."}
-    ]},
-    ... one entry per architectural sector above ...
-  ],
-  "complete": false,
-  "summary": "Brief status of what's resolved vs remaining"
-}
-
-Mark critical items with "critical": true. Every question MUST include
-"suggested_answer" — your best, most-probable answer given the conversation
-context, project files, and sector intent. Keep it short (1 line, concrete,
-actionable). The interview presents it as a default the operator can press
-Enter to accept; a vague placeholder defeats the purpose. If you have no
-signal, use the conservative industry default and say so. Return ONLY valid
-JSON. No markdown, no explanation, no code blocks."""
+        prompt = docgen_prompts.load(
+            "architecture_discovery", workspace_for_overrides
+        )
     # Delta-mode preamble — see ``_build_change_request_preamble``. In
     # delta mode the LLM is told to short-circuit (modules=[], complete=
     # true) when no CR is architecture-significant, so light fixes don't
@@ -8209,7 +8278,7 @@ JSON. No markdown, no explanation, no code blocks."""
 
     from harness.gateway import NodeRole
 
-    current_budget = state.get("budget_remaining_usd", 0.0)
+    current_budget = current_budget_for_focus
     if current_budget <= 0:
         logger.warning("[arch_disc] Budget exhausted ($%.4f); skipping discovery.", current_budget)
         return {

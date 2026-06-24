@@ -1648,6 +1648,14 @@ class GatewayConfig:
     llm_judgment_patcher_rejection_diagnosis: bool = True
     llm_judgment_preflight_autofix: bool = True
     llm_judgment_discovery_saturation: bool = True
+    # Fifth judgment touchpoint: one-sentence summary prefacing the
+    # deterministic access-hint paragraph printed at exit by
+    # installation_doc_node. Adds context the deterministic renderer
+    # can't ("This is a Next.js storefront with a Stripe checkout flow
+    # — open http://localhost:3000 and sign in as admin@example.com")
+    # on top of the always-emitted URL/CLI hints. Off by setting
+    # llm_judgment.app_usage_guide=false.
+    llm_judgment_app_usage_guide: bool = True
 
 
 # Filename pattern for universal LLM dumps written by Gateway._dump_llm_call_to_disk.
@@ -2874,6 +2882,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         llm_judgment_discovery_saturation=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(
                 "discovery_saturation_check", True,
+            )
+        ),
+        llm_judgment_app_usage_guide=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "app_usage_guide", True,
             )
         ),
     )

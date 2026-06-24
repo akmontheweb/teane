@@ -1530,6 +1530,178 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Post-deploy "how to use it" hint renderer
+# ---------------------------------------------------------------------------
+
+# Image-name prefixes that map to a database / cache / search engine. Order
+# matters: longest-match first so 'postgres-arm' doesn't match a generic
+# 'post*' prefix. Values are (kind, cli_command_template) where the template
+# uses {host} and {port} placeholders.
+_DB_IMAGE_PREFIXES: tuple[tuple[str, str, str], ...] = (
+    ("postgres",   "PostgreSQL",  "psql -h {host} -p {port} -U postgres"),
+    ("mariadb",    "MariaDB",     "mysql -h {host} -P {port} -u root -p"),
+    ("mysql",      "MySQL",       "mysql -h {host} -P {port} -u root -p"),
+    ("mongo",      "MongoDB",     'mongosh "mongodb://{host}:{port}"'),
+    ("redis",      "Redis",       "redis-cli -h {host} -p {port}"),
+    ("memcached",  "Memcached",   "telnet {host} {port}   # or use a memcached client"),
+    ("elastic",    "Elasticsearch", "curl http://{host}:{port}/_cluster/health"),
+    ("opensearch", "OpenSearch",  "curl http://{host}:{port}/_cluster/health"),
+    ("cassandra",  "Cassandra",   "cqlsh {host} {port}"),
+    ("clickhouse", "ClickHouse",  "clickhouse-client --host {host} --port {port}"),
+    ("rabbitmq",   "RabbitMQ",    "open http://{host}:{port}   # management UI"),
+    ("kafka",      "Kafka",       "kafka-console-consumer --bootstrap-server {host}:{port} --topic <topic>"),
+    ("minio",      "MinIO",       "open http://{host}:{port}   # console / S3-compatible API"),
+    ("neo4j",      "Neo4j",       "open http://{host}:{port}   # browser console"),
+)
+
+
+def _classify_service_image(image: str) -> Optional[tuple[str, str]]:
+    """Return ``(human_kind, cli_template)`` when *image* looks like one of
+    the known data-plane images (databases, queues, search). Returns
+    ``None`` for app-server images (those get rendered as a web/API URL
+    instead). Match is case-insensitive against the image's leaf name."""
+    if not image:
+        return None
+    leaf = image.split("/")[-1].split(":")[0].lower()
+    for prefix, kind, tmpl in _DB_IMAGE_PREFIXES:
+        if leaf.startswith(prefix):
+            return kind, tmpl
+    return None
+
+
+def _parse_first_published_port(ports: list[Any]) -> Optional[tuple[str, str]]:
+    """Pull ``(host_port, container_port)`` out of the first compose-style
+    port mapping. Accepts ``"8000:8000"``, ``"127.0.0.1:8000:8000"``,
+    bare ``"8000"`` (host_port == container_port), or an int. Returns
+    ``None`` when the entry is malformed or empty.
+    """
+    if not ports:
+        return None
+    raw = ports[0]
+    if isinstance(raw, int):
+        s = str(raw)
+        return s, s
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) == 1:
+        return parts[0], parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    # "ip:host:container" form — middle is host, last is container.
+    return parts[-2], parts[-1]
+
+
+def render_access_hints(
+    *,
+    blueprint: Optional[dict[str, Any]],
+    healthy: Optional[list[str]] = None,
+    base_host: str = "localhost",
+) -> str:
+    """Render a deterministic "your app is running, here's how to use it"
+    paragraph from a deployment blueprint.
+
+    The renderer is deterministic and token-free — it classifies each
+    healthy service by image (db / cache / queue / app) and emits the
+    right form of hint: a URL for web/API services, a CLI invocation
+    for known data-plane images, and a constant operations footer
+    (logs / stop / restart).
+
+    Returns an empty string when there is nothing useful to render
+    (blueprint missing or empty, no services with published ports).
+    """
+    if not isinstance(blueprint, dict):
+        return ""
+    services: dict[str, Any] = blueprint.get("services") or {}
+    if not isinstance(services, dict) or not services:
+        return ""
+
+    healthy_set: set[str] = set(healthy or [])
+    proxy_name = blueprint.get("proxy_service") or None
+
+    # Pre-pass: does the proxy actually publish a host port? When yes,
+    # backend services that also publish ports are best labelled
+    # "Service" (debug URL) because users hit the proxy URL for normal
+    # use. When no, every backend's published port is a primary entry,
+    # so label them "Web/API". Computed up front so the per-service
+    # loop order doesn't affect labelling (alphabetical iteration would
+    # otherwise hit backend services BEFORE the proxy and tag them
+    # wrong).
+    proxy_publishes = False
+    if proxy_name and isinstance(services.get(proxy_name), dict):
+        _p_ports = services[proxy_name].get("ports") or []
+        if isinstance(_p_ports, list):
+            proxy_publishes = _parse_first_published_port(_p_ports) is not None
+    backend_label = "Service" if proxy_publishes else "Web/API"
+
+    # Iterate in a stable order so logs/tests are reproducible. Healthy
+    # services are surfaced first; unhealthy / unknown statuses still
+    # appear (best-effort) but after the green ones.
+    ordered = sorted(
+        services.items(),
+        key=lambda kv: (0 if kv[0] in healthy_set else 1, kv[0]),
+    )
+
+    url_lines: list[str] = []
+    cli_lines: list[str] = []
+
+    for name, svc in ordered:
+        if not isinstance(svc, dict):
+            continue
+        image = str(svc.get("base_image", "") or "")
+        ports = svc.get("ports") or []
+        port_pair = _parse_first_published_port(ports if isinstance(ports, list) else [])
+
+        # Proxy: render once as the primary entry point if it has a
+        # published port. Suppress the per-backend URL noise since users
+        # hit the app via the proxy.
+        if proxy_name and name == proxy_name:
+            if port_pair:
+                host_port, _container = port_pair
+                url_lines.insert(0, f"  • App URL:       http://{base_host}:{host_port}   (via {name})")
+            continue
+
+        classified = _classify_service_image(image)
+        if classified is not None and port_pair:
+            kind, tmpl = classified
+            host_port, _container = port_pair
+            cli_lines.append(
+                f"  • {kind:<14} {tmpl.format(host=base_host, port=host_port)}"
+            )
+            continue
+
+        if port_pair:
+            host_port, _container = port_pair
+            url_lines.append(
+                f"  • {backend_label:<14} http://{base_host}:{host_port}   ({name})"
+            )
+
+    if not url_lines and not cli_lines:
+        return ""
+
+    out: list[str] = []
+    border = "─" * 64
+    out.append(border)
+    out.append(" Your app is running. Here's how to use it:")
+    out.append("")
+    out.extend(url_lines)
+    if cli_lines:
+        if url_lines:
+            out.append("")
+        out.extend(cli_lines)
+    out.append("")
+    out.append(" Operations:")
+    out.append("  • View logs:     docker-compose logs -f")
+    out.append("  • Stop stack:    docker-compose down")
+    out.append("  • Restart:       docker-compose restart")
+    out.append(border)
+    return "\n".join(out)
+
+
 def _emit_deployment_outcome(**fields: Any) -> None:
     """Single-line telemetry emit at every ``deployment_node`` terminal
     return path. Without this, a session log shows the four Phase 1-3

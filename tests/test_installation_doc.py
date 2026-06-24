@@ -373,8 +373,14 @@ class TestInstallationDocNode:
             "node_state": {},
         }
         result = asyncio.run(installation_doc_node(state))
-        # Empty dict → state unchanged → END edge still fires.
-        assert result == {}
+        # Synth failure must NOT propagate: the node still returns a
+        # well-formed state delta and the END edge fires. The result no
+        # longer needs to be literally empty (the access-hint emitter
+        # always returns at least node_state + budget) — what matters is
+        # there's no installation_doc_path (synth failed) and no
+        # exception surfaced.
+        assert "installation_doc_path" not in result
+        assert result["node_state"]["current_node"] == "installation_doc"
 
 
 # ---------------------------------------------------------------------------
@@ -456,3 +462,187 @@ class TestRouteAfterDeployment:
         }
         out = route_after_deployment(state)
         assert out == "repair_node"
+
+
+# ---------------------------------------------------------------------------
+# 5. End-of-run application usage guide
+# ---------------------------------------------------------------------------
+
+
+class TestRenderAccessHints:
+    """Pure unit tests for the deterministic hint renderer in
+    harness.deploy.render_access_hints. The renderer takes a deployment
+    blueprint and emits the multi-line paragraph printed at exit."""
+
+    def test_returns_empty_when_blueprint_missing(self):
+        from harness.deploy import render_access_hints
+        assert render_access_hints(blueprint=None) == ""
+        assert render_access_hints(blueprint={}) == ""
+        assert render_access_hints(blueprint={"services": {}}) == ""
+
+    def test_returns_empty_when_no_service_publishes_a_port(self):
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "worker": {"base_image": "python:3.12", "ports": []},
+            },
+            "proxy_service": None,
+        }
+        # Background worker with no published port → nothing to print.
+        assert render_access_hints(blueprint=blueprint) == ""
+
+    def test_renders_proxy_as_primary_entry_point(self):
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "caddy": {"base_image": "caddy:2-alpine", "ports": ["80:80"]},
+                "api":   {"base_image": "node:20", "ports": ["3001:3001"]},
+            },
+            "proxy_service": "caddy",
+        }
+        out = render_access_hints(blueprint=blueprint, healthy=["caddy", "api"])
+        # Proxy line first, app URL points at host port 80.
+        assert "App URL:" in out
+        assert "http://localhost:80" in out
+        # The backend gets a "Service" debug label because the proxy is
+        # the primary entry, not "Web/API".
+        assert "Service" in out and "http://localhost:3001" in out
+        assert "Web/API" not in out
+        # Universal operations footer is always present.
+        assert "docker-compose logs -f" in out
+        assert "docker-compose down" in out
+
+    def test_renders_web_or_api_when_no_proxy(self):
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "api": {"base_image": "python:3.12-slim", "ports": ["8080:8080"]},
+            },
+            "proxy_service": None,
+        }
+        out = render_access_hints(blueprint=blueprint, healthy=["api"])
+        assert "Web/API" in out
+        assert "http://localhost:8080" in out
+        # No proxy → no "App URL: (via ...)" line.
+        assert "via" not in out
+
+    def test_renders_database_cli_hints(self):
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "postgres": {"base_image": "postgres:16", "ports": ["5432:5432"]},
+                "redis":    {"base_image": "redis:7-alpine", "ports": ["6379:6379"]},
+                "mongo":    {"base_image": "mongo:7", "ports": ["27017:27017"]},
+            },
+            "proxy_service": None,
+        }
+        out = render_access_hints(blueprint=blueprint)
+        # Each known data-plane image gets its CLI hint.
+        assert "psql -h localhost -p 5432 -U postgres" in out
+        assert "redis-cli -h localhost -p 6379" in out
+        assert 'mongosh "mongodb://localhost:27017"' in out
+
+    def test_handles_compose_port_with_bind_address(self):
+        # Compose lets you publish on a specific interface:
+        # "127.0.0.1:8000:8000". Renderer must extract host_port=8000.
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "api": {"base_image": "python:3.12", "ports": ["127.0.0.1:8000:8000"]},
+            },
+            "proxy_service": None,
+        }
+        out = render_access_hints(blueprint=blueprint)
+        assert "http://localhost:8000" in out
+
+    def test_handles_bare_port_string(self):
+        # Compose allows "8000" as shorthand for "8000:8000".
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "api": {"base_image": "python:3.12", "ports": ["8000"]},
+            },
+            "proxy_service": None,
+        }
+        out = render_access_hints(blueprint=blueprint)
+        assert "http://localhost:8000" in out
+
+    def test_skips_malformed_services(self):
+        # A service whose entry isn't a dict shouldn't break the render.
+        from harness.deploy import render_access_hints
+        blueprint = {
+            "services": {
+                "ok":     {"base_image": "python:3.12", "ports": ["8000:8000"]},
+                "broken": "not-a-dict",
+            },
+            "proxy_service": None,
+        }
+        out = render_access_hints(blueprint=blueprint)
+        assert "http://localhost:8000" in out
+
+
+class TestApplicationUsageGuideEmit:
+    """Integration: installation_doc_node should print the access-hint
+    paragraph at exit when a deployment ran, or a single 'see
+    INSTALLATION.md' pointer line when there's no blueprint."""
+
+    def test_no_deploy_fallback_points_at_installation_md(
+        self, tmp_path, capsys, stub_gateway,
+    ):
+        (tmp_path / "requirements.txt").write_text("fastapi==0.111.0\n")
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "SPEC_ARCHITECTURE.md").write_text("### 7. Build & Run\n- make run\n")
+        stub_gateway("# Installation\n\n## 1. Prerequisites\nPython 3.11\n")
+        state = {
+            "workspace_path": str(tmp_path),
+            "spec_architecture_path": str(docs / "SPEC_ARCHITECTURE.md"),
+            "install_doc": True,
+            "node_state": {},  # no deployment dict → no blueprint
+            "budget_remaining_usd": 1.0,
+        }
+        asyncio.run(installation_doc_node(state))
+        captured = capsys.readouterr().out
+        # No deploy → no access-hint paragraph; just the pointer line.
+        assert "Setup instructions written to" in captured
+        assert "INSTALLATION.md" in captured
+        # The access-hint banner must NOT appear (no blueprint).
+        assert "Your app is running" not in captured
+
+    def test_deploy_success_prints_access_paragraph(
+        self, tmp_path, capsys, stub_gateway,
+    ):
+        (tmp_path / "requirements.txt").write_text("fastapi==0.111.0\n")
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "SPEC_ARCHITECTURE.md").write_text("### 7. Build & Run\n- make run\n")
+        stub_gateway("# Installation\n\n## 1. Prerequisites\nPython 3.11\n")
+        blueprint = {
+            "services": {
+                "api":      {"base_image": "python:3.12-slim", "ports": ["8000:8000"]},
+                "postgres": {"base_image": "postgres:16", "ports": ["5432:5432"]},
+            },
+            "proxy_service": None,
+        }
+        state = {
+            "workspace_path": str(tmp_path),
+            "spec_architecture_path": str(docs / "SPEC_ARCHITECTURE.md"),
+            "install_doc": True,
+            "node_state": {
+                "deployment": {
+                    "success": True, "blueprint": blueprint,
+                    "healthy": ["api", "postgres"],
+                },
+            },
+            "budget_remaining_usd": 1.0,
+        }
+        asyncio.run(installation_doc_node(state))
+        captured = capsys.readouterr().out
+        # The access-hint banner appears, with the API URL and Postgres CLI.
+        assert "Your app is running" in captured
+        assert "http://localhost:8000" in captured
+        assert "psql -h localhost -p 5432" in captured
+        # Footer commands always shown.
+        assert "docker-compose logs -f" in captured
+        # The pointer line still mentions INSTALLATION.md for full docs.
+        assert "INSTALLATION.md" in captured

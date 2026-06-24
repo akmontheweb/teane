@@ -8915,12 +8915,149 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             "[installation_doc] Synthesis failed; INSTALLATION.md not written: %s",
             exc,
         )
-        return {}
+        install_path = None
 
-    return {
-        "installation_doc_path": install_path,
+    # End-of-run "application usage guide" — prints a visible paragraph
+    # to stdout so the operator doesn't have to open INSTALLATION.md to
+    # learn what to do next. Always renders the deterministic backbone
+    # (URLs from blueprint published ports + CLI commands for known
+    # data-plane images); the LLM polish prepends a one-sentence app
+    # summary when configured. Falls back to a single "see
+    # INSTALLATION.md" pointer when there is no blueprint (no deploy or
+    # --deploy-dev=false).
+    new_budget = await _emit_application_usage_guide(
+        state=state,
+        blueprint=blueprint,
+        install_path=install_path,
+        budget=state.get("budget_remaining_usd", 0.0),
+    )
+
+    out: dict[str, Any] = {
         "node_state": {"current_node": "installation_doc"},
+        "budget_remaining_usd": new_budget,
     }
+    if install_path:
+        out["installation_doc_path"] = install_path
+    return out
+
+
+async def _emit_application_usage_guide(
+    *,
+    state: AgentState,
+    blueprint: Optional[dict[str, Any]],
+    install_path: Optional[str],
+    budget: float,
+) -> float:
+    """Print the end-of-run application usage guide to stdout.
+
+    Returns the (possibly-updated) ``budget_remaining_usd`` so the
+    caller can thread it back into state. Pure stdout side-effect plus
+    one optional cheap LLM call for the summary polish.
+    """
+    from harness.deploy import render_access_hints
+
+    # When deployment_node populated a blueprint (any non-skipped path),
+    # render the full access-hint paragraph. The healthy list lives next
+    # to the blueprint on node_state.deployment.
+    deployment_state = (state.get("node_state") or {}).get("deployment") or {}
+    healthy_services: list[str] = []
+    if isinstance(deployment_state, dict):
+        h = deployment_state.get("healthy") or []
+        if isinstance(h, list):
+            healthy_services = [str(x) for x in h if isinstance(x, str)]
+
+    hints = render_access_hints(
+        blueprint=blueprint, healthy=healthy_services,
+    )
+
+    if not hints:
+        # No-deploy / no-blueprint fallback: a single pointer line so
+        # greenfield runs without --deploy-dev still get something
+        # visible, instead of an unannounced silent exit.
+        if install_path:
+            print()
+            print(
+                "Setup instructions written to "
+                f"{install_path} — follow them to run the app."
+            )
+        return budget
+
+    # LLM polish (#5 judgment touchpoint). One-sentence summary
+    # prepended to the deterministic hints; entirely optional and
+    # kill-switched via config.llm_judgment.app_usage_guide.
+    summary = ""
+    gw = get_gateway()
+    if gw is not None and bool(getattr(
+        gw.config, "llm_judgment_app_usage_guide", True,
+    )):
+        prompt = _build_app_usage_summary_prompt(
+            blueprint=blueprint,
+            healthy=healthy_services,
+            workspace_path=state.get("workspace_path", ""),
+        )
+        polish, budget = await _maybe_judgment_llm(
+            prompt=prompt,
+            budget_remaining_usd=budget,
+            purpose="app_usage_guide",
+            enabled=True,
+        )
+        if polish:
+            # Trim to one sentence at most — the LLM occasionally
+            # wanders. Take everything up to the first sentence
+            # terminator that's followed by whitespace or end-of-string.
+            first_sentence = re.split(
+                r"(?<=[.!?])\s+", polish.strip(), maxsplit=1,
+            )[0].strip()
+            if first_sentence:
+                summary = first_sentence
+
+    print()
+    if summary:
+        print(f" {summary}")
+        print()
+    print(hints)
+    if install_path:
+        print(f" Full setup guide: {install_path}")
+    return budget
+
+
+def _build_app_usage_summary_prompt(
+    *,
+    blueprint: Optional[dict[str, Any]],
+    healthy: list[str],
+    workspace_path: str,
+) -> str:
+    """One-sentence summary prompt for the app_usage_guide judgment
+    call. Compact on purpose — the LLM gets the blueprint shape plus a
+    couple of evidence anchors so it doesn't have to guess what the
+    app is."""
+    services_block = "(none)"
+    if isinstance(blueprint, dict):
+        svcs = blueprint.get("services") or {}
+        if isinstance(svcs, dict) and svcs:
+            services_block = "\n".join(
+                f"  - {name}: image={str(svc.get('base_image', '?'))}, "
+                f"ports={svc.get('ports') or []}"
+                for name, svc in sorted(svcs.items())
+                if isinstance(svc, dict)
+            )
+    healthy_block = ", ".join(sorted(healthy)) if healthy else "(unknown)"
+    return (
+        "Compose ONE short sentence (max ~20 words, no markdown, no "
+        "lists) telling the operator WHAT the application that was "
+        "just deployed actually is. Use the deployment blueprint below "
+        "as the source of truth. Good examples:\n"
+        "  - \"A React storefront with a Node/Express API and a "
+        "PostgreSQL database.\"\n"
+        "  - \"A Flask-based REST API backed by Redis cache and "
+        "MongoDB.\"\n"
+        "Bad examples (too vague): \"A web application.\" / "
+        "\"A containerized stack.\"\n"
+        "Reply with the sentence and NOTHING else.\n\n"
+        f"Workspace: {workspace_path}\n"
+        f"Healthy services: {healthy_block}\n"
+        f"Services:\n{services_block}\n"
+    )
 
 
 # ---------------------------------------------------------------------------

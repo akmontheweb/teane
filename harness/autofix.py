@@ -190,7 +190,18 @@ async def apply_autofixes(
 
 
 async def _apply_block(patcher: TextPatcher, block: PatchBlock) -> PatchResult:
-    """Dispatch a PatchBlock through the TextPatcher by operation type."""
+    """Dispatch a PatchBlock through the TextPatcher by operation type.
+
+    Mirror of :py:meth:`HybridPatcher.apply_patch`. Must stay in sync
+    with the operation enum — when a new ``OperationType`` is added,
+    BOTH dispatchers need a new branch. The 2026-06-25 security-gate
+    HITL loop was caused by this drifting: ``INSERT_AT_LINE`` /
+    ``REPLACE_LINE_RANGE`` were added to the enum (and to the Layer-2
+    YAML rule table that emits them) but the autofix dispatcher
+    never got the matching branches — every Layer-2 patch returned
+    ``success=False, error="unknown operation: …"`` and the security
+    finding survived to escalate to the operator.
+    """
     if block.operation == OperationType.CREATE_FILE:
         return await patcher.create_file(block.file, block.content)
     if block.operation == OperationType.REPLACE_BLOCK:
@@ -200,6 +211,16 @@ async def _apply_block(patcher: TextPatcher, block: PatchBlock) -> PatchResult:
     if block.operation == OperationType.INSERT_AT_BLOCK:
         return await patcher.insert_at_block(
             block.file, block.anchor, block.placement, block.content,
+        )
+    if block.operation == OperationType.INSERT_AT_LINE:
+        return await patcher.insert_at_line(
+            block.file, block.line, block.content,
+            expected_file_hash=block.expected_file_hash,
+        )
+    if block.operation == OperationType.REPLACE_LINE_RANGE:
+        return await patcher.replace_line_range(
+            block.file, block.line, block.end_line, block.content,
+            expected_file_hash=block.expected_file_hash,
         )
     return PatchResult(
         success=False,

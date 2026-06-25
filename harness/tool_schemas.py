@@ -309,6 +309,41 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
             placement=placement,
             content=str(args.get("content", "")),
         )
+    # Line-coordinate ops. PATCH_TOOLS does not yet expose tool
+    # definitions for these — Layer-2 rule-table autofixes and Layer-1
+    # semgrep ``extra.fix`` patches are constructed directly from
+    # PatchBlock and never round-trip through tool calls. The dispatch
+    # branches are added so that if/when tool definitions are added,
+    # the translator already round-trips correctly and isn't a silent
+    # drop. The same class of dispatch-missing-ops bug burned us in
+    # ``autofix._apply_block`` (2026-06-25 security HITL loop) — this
+    # is the parallel preventive fix.
+    if name == "insert_at_line":
+        try:
+            line_no = int(args.get("line", 0) or 0)
+        except (TypeError, ValueError):
+            line_no = 0
+        return PatchBlock(
+            operation=OperationType.INSERT_AT_LINE,
+            file=str(args.get("file_path", "")).strip(),
+            line=line_no,
+            content=str(args.get("content", "")),
+            expected_file_hash=str(args.get("expected_file_hash", "") or "").strip().lower(),
+        )
+    if name == "replace_line_range":
+        try:
+            start_line = int(args.get("line", 0) or 0)
+            end_line = int(args.get("end_line", 0) or 0)
+        except (TypeError, ValueError):
+            start_line = end_line = 0
+        return PatchBlock(
+            operation=OperationType.REPLACE_LINE_RANGE,
+            file=str(args.get("file_path", "")).strip(),
+            line=start_line,
+            end_line=end_line,
+            content=str(args.get("content", "")),
+            expected_file_hash=str(args.get("expected_file_hash", "") or "").strip().lower(),
+        )
     # read_file is host-resolved, not a patch.
     return None
 

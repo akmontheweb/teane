@@ -104,6 +104,10 @@ class AgentState(TypedDict, total=False):
     allow_network: bool
     build_command: str
     budget_remaining_usd: float
+    # Snapshot of the session budget cap at boot. Used by HITL display
+    # surfaces (cli.hitl_menu_loop) to show ``$remaining / $cap``
+    # without hard-coding $2.00. Read-only after create_initial_state.
+    budget_initial_usd: float
     session_id: str
     exit_code: int
     node_state: dict[str, Any]
@@ -386,6 +390,7 @@ def create_initial_state(
         allow_network=allow_network,
         build_command=build_command,
         budget_remaining_usd=budget_usd,
+        budget_initial_usd=budget_usd,
         session_id=session_id,
         exit_code=-1,
         node_state={},
@@ -6975,6 +6980,59 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         }
 
 
+def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
+    """Return a human-readable label for *why* the run is at HITL.
+
+    Routers that escalate to HITL via a conditional edge
+    (``security_scan_node``, ``route_after_patching``,
+    ``route_after_compiler``) cannot mutate state, so they cannot set
+    ``hitl_trigger`` themselves. This helper inspects the same loop
+    counters and node_state flags the routers consulted and returns
+    the most specific label that fits.
+
+    Ordering matters — most-specific first. ``persistent_build_failure``
+    stays last as the catch-all when ``exit_code != 0`` and nothing
+    more precise matched; otherwise it would shadow the security /
+    zero-patch / no-progress signals that all coexist with exit_code != 0.
+
+    Returns ``"unknown"`` only when the state genuinely carries no
+    distinguishing signal (e.g. an operator-driven manual HITL from a
+    debugger).
+    """
+    from harness.no_progress import tripped as _np_tripped_inf
+
+    loop_counter = state.get("loop_counter", {}) or {}
+    node_state = state.get("node_state", {}) or {}
+    budget_remaining = float(state.get("budget_remaining_usd", 0.0) or 0.0)
+
+    sec_cfg_raw = state.get("security_scan_config", {}) or {}
+    sec_cfg = sec_cfg_raw if isinstance(sec_cfg_raw, dict) else {}
+    max_sec_attempts = int(sec_cfg.get("max_security_fix_attempts", 2))
+    sec_attempts = int(loop_counter.get("security", 0) or 0)
+    consecutive_zero = int(
+        loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
+    )
+
+    if node_state.get("env_misconfig"):
+        sym = node_state.get("env_misconfig_symbol", "")
+        return f"env_misconfig:{sym}" if sym else "env_misconfig"
+    if budget_remaining <= 0.0:
+        return "budget_exhausted"
+    if _np_tripped_inf(loop_counter):
+        return "no_progress_failsafe"
+    if sec_attempts >= max_sec_attempts and max_sec_attempts > 0:
+        return f"security_fix_limit:{sec_attempts}/{max_sec_attempts}"
+    if consecutive_zero >= 2:
+        return f"zero_patch_loop:{consecutive_zero}"
+    if int(loop_counter.get("total_repairs", 0) or 0) >= max_repair:
+        return "repair_loop_limit"
+    exit_code_raw = state.get("exit_code", -1)
+    exit_code = int(exit_code_raw) if exit_code_raw is not None else -1
+    if exit_code != 0:
+        return "persistent_build_failure"
+    return "unknown"
+
+
 async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     """
     Node 5: The Breakpoint.
@@ -6998,8 +7056,10 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     """
     logger.info("[human_intervention_node] Triggering HITL breakpoint...")
 
-    # Determine why we were invoked
-    loop_counter = state.get("loop_counter", {})
+    # Determine why we were invoked. Trigger inference reads
+    # loop_counter / node_state itself via _infer_hitl_trigger;
+    # this function only needs budget_remaining for the LLM
+    # escalation summary's budget arithmetic below.
     budget_remaining = state.get("budget_remaining_usd", 0.0)
 
     # Same source of truth as route_after_compiler — the operator's
@@ -7012,16 +7072,7 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
         int(getattr(gw.config, "max_patch_repair_iterations", 5))
         if gw is not None else 3
     )
-    trigger_reason = "unknown"
-    if state.get("node_state", {}).get("env_misconfig"):
-        sym = state.get("node_state", {}).get("env_misconfig_symbol", "")
-        trigger_reason = f"env_misconfig:{sym}" if sym else "env_misconfig"
-    elif budget_remaining <= 0.0:
-        trigger_reason = "budget_exhausted"
-    elif loop_counter.get("total_repairs", 0) >= max_repair:
-        trigger_reason = "repair_loop_limit"
-    elif state.get("exit_code", -1) != 0:
-        trigger_reason = "persistent_build_failure"
+    trigger_reason = _infer_hitl_trigger(state, max_repair=max_repair)
 
     # Inject trigger reason into state so the menu can display it
     state_dict: dict[str, Any] = dict(state)

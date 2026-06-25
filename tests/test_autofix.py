@@ -397,6 +397,77 @@ class TestApplyAutofixes:
         assert "debug=False" in text
 
     @pytest.mark.asyncio
+    async def test_layer2_insert_at_line_actually_lands(self, tmp_path):
+        """Regression test for the 2026-06-25 security-gate HITL loop.
+
+        The Layer-2 YAML rule for ``missing-user`` emits an
+        ``INSERT_AT_LINE`` PatchBlock, but ``_apply_block`` never had
+        a branch for that op — so the autofix ran, the block was
+        produced, and the dispatcher returned
+        ``success=False, error="unknown operation"``. Every security
+        scan loop ended at the LLM repair stage and eventually
+        escalated to HITL even though the deterministic fix was
+        ready and correct.
+
+        This test produces a real semgrep-shaped diagnostic for
+        ``missing-user``, runs it through ``apply_autofixes``, and
+        asserts (a) the autofix is reported applied and (b) the
+        ``USER`` directive actually exists in the file on disk.
+        """
+        dockerfile = tmp_path / "Dockerfile"
+        _write(
+            str(dockerfile),
+            "FROM alpine:3.18\n"
+            "COPY app /app\n"
+            "RUN apk add --no-cache curl\n"
+            "EXPOSE 8080\n"
+            "CMD [\"./app\"]\n",
+        )
+        diag = {
+            "file": str(dockerfile),
+            "line": 5,
+            "error_code": "SEMGREP:dockerfile.security.missing-user.missing-user",
+            "message": "Missing USER directive",
+        }
+        unhandled, applied = await apply_autofixes([diag], str(tmp_path))
+        assert unhandled == [], f"Layer-2 patch did not apply: {unhandled}"
+        assert len(applied) == 1
+        assert applied[0].fix_kind == "security"
+        with open(dockerfile) as fh:
+            text = fh.read()
+        assert "USER 1000:1000" in text
+        # And the new USER landed BEFORE the CMD line.
+        assert text.index("USER 1000:1000") < text.index("CMD")
+
+    @pytest.mark.asyncio
+    async def test_layer1_replace_line_range_actually_lands(self, tmp_path):
+        """Mirror of the INSERT_AT_LINE regression test for Layer 1's
+        ``REPLACE_LINE_RANGE`` op (scanner-suggested ``extra.fix``).
+        Same dispatcher bug, same impact — the patch is produced and
+        then silently dropped by ``_apply_block``."""
+        target = tmp_path / "Dockerfile"
+        _write(
+            str(target),
+            "FROM python:3.11\n"
+            "RUN pip install flask==1.0\n"
+            "CMD [\"python\", \"-m\", \"flask\", \"run\"]\n",
+        )
+        diag = {
+            "file": str(target),
+            "line": 2,
+            "end_line": 2,
+            "error_code": "SEMGREP:dockerfile.security.pinned-dep-via-pip-install",
+            "message": "Pin Flask to a patched version",
+            "fix": "RUN pip install flask==3.0.3",
+        }
+        _, applied = await apply_autofixes([diag], str(tmp_path))
+        assert len(applied) == 1
+        with open(target) as fh:
+            text = fh.read()
+        assert "flask==3.0.3" in text
+        assert "flask==1.0" not in text
+
+    @pytest.mark.asyncio
     async def test_mixed_only_fix_resolvable(self, tmp_path):
         # One resolvable + one ambiguous diagnostic → applied has the
         # B201, unhandled has the unknown one.

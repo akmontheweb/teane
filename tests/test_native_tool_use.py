@@ -512,6 +512,54 @@ def test_tool_calls_to_patch_blocks_partitions_reads_and_patches():
     assert reads[0]["input"]["file_path"] == "a.py"
 
 
+def test_tool_call_to_patch_block_handles_insert_at_line():
+    """Forward-compat dispatch — PATCH_TOOLS does not yet expose
+    ``insert_at_line`` as a tool, but the translator must round-trip
+    it cleanly when added so we never repeat the autofix._apply_block
+    silent-drop bug from 2026-06-25."""
+    from harness.patcher import OperationType
+    from harness.tool_schemas import tool_call_to_patch_block
+
+    block = tool_call_to_patch_block({
+        "name": "insert_at_line",
+        "id": "x",
+        "input": {
+            "file_path": "Dockerfile",
+            "line": 5,
+            "content": "USER 1000:1000",
+            "expected_file_hash": "deadbeef",
+        },
+    })
+    assert block is not None
+    assert block.operation == OperationType.INSERT_AT_LINE
+    assert block.file == "Dockerfile"
+    assert block.line == 5
+    assert block.content == "USER 1000:1000"
+    assert block.expected_file_hash == "deadbeef"
+
+
+def test_tool_call_to_patch_block_handles_replace_line_range():
+    from harness.patcher import OperationType
+    from harness.tool_schemas import tool_call_to_patch_block
+
+    block = tool_call_to_patch_block({
+        "name": "replace_line_range",
+        "id": "y",
+        "input": {
+            "file_path": "Dockerfile",
+            "line": 2,
+            "end_line": 4,
+            "content": "RUN pip install flask==3.0.3",
+        },
+    })
+    assert block is not None
+    assert block.operation == OperationType.REPLACE_LINE_RANGE
+    assert block.file == "Dockerfile"
+    assert block.line == 2
+    assert block.end_line == 4
+    assert "flask==3.0.3" in block.content
+
+
 # ---------------------------------------------------------------------------
 # 6. apply_patch_blocks end-to-end (uses the same pipeline as text DSL)
 # ---------------------------------------------------------------------------

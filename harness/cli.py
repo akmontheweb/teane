@@ -2187,6 +2187,12 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     node_state = state.get("node_state", {})
     trigger = node_state.get("hitl_trigger", "unknown")
     budget_remaining = state.get("budget_remaining_usd", 0.0)
+    # Show ``$remaining / $cap`` using the real session cap snapshot
+    # (set by create_initial_state) rather than the previously
+    # hardcoded $2.00 — the latter was misleading for runs configured
+    # with a higher hard_cap_usd in .harness_config.json. Falls back
+    # to $2.00 only for legacy states that don't carry the field.
+    budget_initial = float(state.get("budget_initial_usd", 2.00) or 2.00)
     loop_counter = state.get("loop_counter", {})
     errors = state.get("compiler_errors", [])
     exit_code = state.get("exit_code", -1)
@@ -2240,7 +2246,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print()
         print("=" * 80)
         print(f"[HUMAN-IN-THE-LOOP INTERVENTION] Trigger: {trigger}")
-        print(f"  Budget: ${budget_remaining:.4f} / $2.00 | Loop Counter: {loop_counter.get('total_repairs', 0)}")
+        print(f"  Budget: ${budget_remaining:.4f} / ${budget_initial:.2f} | Loop Counter: {loop_counter.get('total_repairs', 0)}")
         print(f"  Exit Code: {exit_code}")
         print(f"  Modified Files: {len(modified_files)}")
         print("=" * 80)

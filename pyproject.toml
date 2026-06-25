@@ -25,6 +25,14 @@ dependencies = [
     "httpx>=0.28.0",
     "uuid7>=0.1.0",
     "typing-extensions>=4.12.0",
+    # Loader for harness/security_fix_rules.yaml — the Layer-2 rule
+    # table that catches absence-based scanner findings (e.g.
+    # dockerfile.security.missing-user) the scanner ships no autofix
+    # template for. The loader is degrade-graceful: if pyyaml ever
+    # disappears the loader returns an empty rule set and Layer 2
+    # short-circuits to the LLM repair loop. The dep is small, stable,
+    # and ubiquitous; not worth the maintenance overhead of a parser.
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -74,6 +82,11 @@ harness = [
     "skills/*.md",
     "skills/docgen/*.md",
     "style_guides/*.md",
+    # Layer-2 security autofix rule table — operator-editable YAML,
+    # loaded by harness/security_fix_rules.py at runtime via filesystem
+    # path resolution. Must ship in the wheel or the loader silently
+    # finds an empty rule set.
+    "security_fix_rules.yaml",
 ]
 
 [tool.ruff]

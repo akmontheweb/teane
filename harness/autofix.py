@@ -1360,28 +1360,32 @@ def _fix_semgrep(
     diag: dict[str, Any],
     workspace_path: str,
 ) -> Optional[PatchBlock]:
-    """Layer 1 of the security autofix: consume the scanner-suggested fix.
+    """Two-layer semgrep autofix dispatcher.
 
-    Semgrep's JSON output ships an ``extra.rendered_fix`` (or
-    ``extra.fix``) string for any rule whose author shipped an autofix
-    template. The exact byte range to overwrite lives at
-    ``start.line``/``end.line``. ``harness/security.py`` propagates both
-    into the diagnostic as ``diag["fix"]`` and ``diag["end_line"]``;
-    this helper turns the pair into a REPLACE_LINE_RANGE PatchBlock and
-    pins it to the current file's sha256 so a sibling patch in the same
-    round mutating the file first causes a clean rejection instead of a
-    silent wrong-line overwrite.
+    Layer 1 — scanner-suggested fix. Semgrep's JSON ships an
+    ``extra.rendered_fix`` (or ``extra.fix``) string for any rule whose
+    author wrote an autofix template, plus a ``start.line``/
+    ``end.line`` range. ``harness.security`` propagates those into the
+    diagnostic; here we translate the pair into a
+    ``REPLACE_LINE_RANGE`` PatchBlock pinned to the current file's
+    sha256. Layer 1 is preferred when present because the fix is
+    authored by the rule itself.
 
-    When the diagnostic carries no fix metadata (most absence-based
-    rules — "missing-user", "missing-healthcheck" — historically did not
-    ship autofixes), we return ``None`` and the LLM repair loop sees the
-    diagnostic as before. The hardcoded rule-table extension (Layer 2)
-    that covers those is a separate follow-up.
+    Layer 2 — local rule table. For absence-based rules whose authors
+    never shipped an autofix template (``missing-user``,
+    ``missing-workdir``, ``missing-healthcheck``, …),
+    ``harness.security_fix_rules`` looks up the rule_id in
+    ``harness/security_fix_rules.yaml`` (with per-workspace overrides)
+    and emits an ``INSERT_AT_LINE`` patch with the deterministic fix.
 
-    ``rule_id`` is unused — kept for parity with the other dispatchers
-    and so a future per-rule branching layer has a hook.
+    Either layer's miss returns ``None`` so the diagnostic continues to
+    the LLM repair loop — never blocks a finding from being fixed.
+
+    ``rule_id`` is kept for parity with the other fix dispatchers; the
+    rule-table lookup uses the diag's ``error_code`` instead so it can
+    handle the scanner-specific normalisation in one place.
     """
-    del rule_id  # parity with other fix dispatchers; not used yet
+    del rule_id  # rule-table lookup re-extracts from diag.error_code
     file = str(diag.get("file", "") or "")
     if not file:
         return None
@@ -1392,32 +1396,39 @@ def _fix_semgrep(
     if not os.path.isfile(file_abs):
         return None
 
+    # --- Layer 1 — scanner-suggested fix --------------------------------
     fix = diag.get("fix")
-    if not isinstance(fix, str) or not fix:
-        return None
+    if isinstance(fix, str) and fix:
+        try:
+            start_line = int(diag.get("line", 0) or 0)
+            end_line = int(diag.get("end_line", 0) or 0)
+        except (TypeError, ValueError):
+            start_line = end_line = 0
+        if start_line >= 1 and end_line >= start_line:
+            from harness.patcher import sha256_file_bytes
+            file_hash = sha256_file_bytes(file_abs) or ""
+            return PatchBlock(
+                operation=OperationType.REPLACE_LINE_RANGE,
+                file=rel_file,
+                line=start_line,
+                end_line=end_line,
+                content=fix.rstrip("\n"),
+                expected_file_hash=file_hash,
+            )
+
+    # --- Layer 2 — local rule table -------------------------------------
     try:
-        start_line = int(diag.get("line", 0) or 0)
-        end_line = int(diag.get("end_line", 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    if start_line < 1 or end_line < start_line:
-        return None
+        from harness.security_fix_rules import try_rule_table_fix
+        layer2 = try_rule_table_fix(diag, workspace_path, scanner="SEMGREP")
+        if layer2 is not None:
+            return layer2
+    except Exception as exc:  # noqa: BLE001 — rule table must not break autofix
+        logger.warning(
+            "[autofix] Layer-2 rule lookup raised %r — falling through to LLM.",
+            exc,
+        )
 
-    # Pin to the current on-disk hash so a sibling patch can't cause a
-    # silent wrong-line edit. The patcher's drift guard fail-closes:
-    # the LLM (or the next compile cycle) sees a clean rejection and
-    # the diagnostic re-extracts with fresh coordinates.
-    from harness.patcher import sha256_file_bytes
-    file_hash = sha256_file_bytes(file_abs) or ""
-
-    return PatchBlock(
-        operation=OperationType.REPLACE_LINE_RANGE,
-        file=rel_file,
-        line=start_line,
-        end_line=end_line,
-        content=fix.rstrip("\n"),
-        expected_file_hash=file_hash,
-    )
+    return None
 
 
 _SECURITY_FIX_TABLE: dict[str, Any] = {

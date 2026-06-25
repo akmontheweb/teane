@@ -1,0 +1,93 @@
+# Layer-2 security autofix rule table.
+#
+# Catches scanner findings that ship NO autofix template (semgrep
+# ``extra.rendered_fix`` is empty) but have a well-known, deterministic
+# fix. Without this table, every such finding ends up in the LLM repair
+# loop and frequently thrashes because absence-based findings give the
+# LLM no anchor string to bolt onto.
+#
+# Operators may add or override rules at runtime by dropping a
+# ``security_fix_rules.yaml`` at the workspace root with the same
+# schema. Per-workspace rules win on (scanner, rule) collision.
+#
+# Schema:
+#
+#   - scanner:           Uppercase scanner ID. Today only SEMGREP is
+#                        wired through autofix.py; other scanners can
+#                        opt in later by adding their own dispatcher.
+#     rule:              Exact rule_id the scanner emits. Matched
+#                        case-insensitively for resilience.
+#     description:       One-line human note logged when the rule fires.
+#     operation:         "insert_at_line" is the only supported op
+#                        today — it covers every absence-based finding
+#                        and reuses the line-coordinate primitive
+#                        added in patcher.py.
+#     content:           Lines to insert (string; multi-line is fine).
+#     before_regex:      Python regex. The patcher inserts the content
+#                        on the line BEFORE the first match.
+#     fallback:          "at_end" | "at_start" | "none". Used when
+#                        ``before_regex`` finds no match. ``none``
+#                        returns no patch — the LLM repair loop takes
+#                        over. Default is ``none`` if omitted.
+#     idempotency_regex: Python regex. When any line of the file
+#                        matches, the rule is considered already
+#                        satisfied and no patch is emitted. Lets the
+#                        operator share one rule across files that
+#                        may already have the fix in place.
+
+rules:
+
+  - scanner: SEMGREP
+    rule: dockerfile.security.missing-user.missing-user
+    description: >
+      Insert a non-root USER instruction before the final CMD or
+      ENTRYPOINT so the container does not run as root. Uses UID/GID
+      1000:1000 — the convention for the first non-root user on most
+      base images. Operators who need a specific UID can override the
+      rule at their workspace root.
+    operation: insert_at_line
+    content: "USER 1000:1000"
+    before_regex: '^(CMD|ENTRYPOINT)\b'
+    fallback: at_end
+    idempotency_regex: '^USER\s+\S+'
+
+  - scanner: SEMGREP
+    rule: dockerfile.security.last-user-is-root.last-user-is-root
+    description: >
+      The Dockerfile ends with ``USER root`` (or no USER instruction
+      at all after the last switch). Append a final USER 1000:1000 so
+      the container's runtime user is non-root.
+    operation: insert_at_line
+    content: "USER 1000:1000"
+    before_regex: '^(CMD|ENTRYPOINT)\b'
+    fallback: at_end
+    idempotency_regex: '^USER\s+(?!root\b)\S+'
+
+  - scanner: SEMGREP
+    rule: dockerfile.audit.missing-workdir.missing-workdir
+    description: >
+      No WORKDIR set — the build defaults to ``/`` which leaks
+      filesystem layout into RUN commands and breaks relative COPY
+      destinations. Insert WORKDIR /app before the first COPY / RUN /
+      ADD instruction.
+    operation: insert_at_line
+    content: "WORKDIR /app"
+    before_regex: '^(COPY|RUN|ADD)\b'
+    fallback: none
+    idempotency_regex: '^WORKDIR\s+\S+'
+
+  - scanner: SEMGREP
+    rule: dockerfile.audit.missing-healthcheck.missing-healthcheck
+    description: >
+      No HEALTHCHECK declared — orchestrators (compose, swarm, k8s)
+      cannot reason about liveness. Append a generic HEALTHCHECK that
+      most stacks can live with as a starting point; operators tighten
+      the command per service. Inserted at end so it does not
+      interfere with the COPY/RUN order in the build.
+    operation: insert_at_line
+    content: |-
+      HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+        CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
+    before_regex: '^(CMD|ENTRYPOINT)\b'
+    fallback: at_end
+    idempotency_regex: '^HEALTHCHECK\b'

@@ -151,17 +151,19 @@ def test_fix_semgrep_emits_replace_line_range_with_hash(tmp_path):
     assert patch.expected_file_hash == expected_hash
 
 
-def test_fix_semgrep_returns_none_when_no_fix(tmp_path):
-    _seed(tmp_path, "Dockerfile", "FROM alpine\nCMD x\n")
+def test_fix_semgrep_returns_none_when_no_fix_and_no_layer2_rule(tmp_path):
+    # Diagnostic has no scanner-suggested fix AND the rule isn't in
+    # Layer 2's YAML table — Layer 1 misses, Layer 2 misses, the
+    # diagnostic flows to the LLM repair loop unchanged.
+    _seed(tmp_path, "app.py", "import os\nos.system('rm -rf /')\n")
     diag = {
-        "error_code": "SEMGREP:dockerfile.security.missing-user.missing-user",
-        "file": os.path.join(str(tmp_path), "Dockerfile"),
+        "error_code": "SEMGREP:python.lang.audit.no-autofix-for-this-one",
+        "file": os.path.join(str(tmp_path), "app.py"),
         "line": 2,
         "end_line": 2,
-        # No "fix" key — absence-based rule with no autofix template.
+        # No "fix" key, and no matching rule in security_fix_rules.yaml.
     }
-    # Caller passes through to LLM repair loop.
-    assert _fix_semgrep("missing-user", diag, str(tmp_path)) is None
+    assert _fix_semgrep("no-autofix-for-this-one", diag, str(tmp_path)) is None
 
 
 def test_fix_semgrep_returns_none_when_file_missing(tmp_path):

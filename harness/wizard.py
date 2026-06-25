@@ -64,25 +64,29 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
     from harness.cli import ConfigError, load_raw_config
     from harness.hitl import get_channel
 
+    # `teane run` is gone — the operator must have typed `teane build`,
+    # `teane patch`, or `teane deploy`. The wizard adapts to whichever it
+    # was (passed through args.command by the dispatcher).
+    invoked_cmd = getattr(args, "command", "build") or "build"
     channel = get_channel()
     if not channel.is_interactive():
         print(
-            "\nInteractive setup required: `teane run` was invoked with no\n"
-            "--workspace or --prompt, but stdin is not a terminal (or auto-approve\n"
-            "is set). Either run from a TTY, or pass --workspace and --prompt\n"
-            "explicitly.",
+            f"\nInteractive setup required: `teane {invoked_cmd}` was invoked\n"
+            "with no --workspace or --prompt, but stdin is not a terminal (or\n"
+            "auto-approve is set). Either run from a TTY, or pass --workspace\n"
+            "and --prompt explicitly.",
             file=sys.stderr,
         )
         raise SystemExit(2)
 
     print()
     print("=" * 72)
-    print("teane run — interactive setup")
+    print(f"teane {invoked_cmd} — interactive setup")
     print("=" * 72)
     print(
-        "You ran `teane run` without any flags. The wizard will walk you\n"
-        "through the minimum settings needed to start a run. None of your\n"
-        "answers will be persisted — every bare `teane run` re-asks.\n"
+        f"You ran `teane {invoked_cmd}` without any flags. The wizard will\n"
+        "walk you through the minimum settings needed to start. None of your\n"
+        f"answers will be persisted — every bare `teane {invoked_cmd}` re-asks.\n"
     )
 
     # Config is loaded once and reused for the API-key check and for the
@@ -118,22 +122,49 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
         workspace = _ask_workspace(channel)
         prompt = _ask_prompt(channel)
         git_mode = _ask_git(channel)
-        new_build = _ask_new_build(channel)
+        # The build/patch/deploy commands each pin new_build themselves —
+        # build always resets, patch never resets, deploy never resets.
+        # When the operator invoked the wizard via `teane build`, suggest
+        # checking the workspace shape so they know what they're about to
+        # wipe; when invoked via `teane patch`, no extra prompt.
+        new_build = (invoked_cmd == "build")
         discover = _ask_discover(channel)
 
         _print_summary(workspace, prompt, git_mode, new_build, discover)
-        if channel.confirm("Run with these settings?", default=True):
+        if channel.confirm(f"Run `teane {invoked_cmd}` with these settings?", default=True):
             break
         print("\nLet's go through the choices again.\n")
+
+    # Workspace-shape heuristic: warn the operator if the command they
+    # picked doesn't match what's on disk. They can still proceed.
+    try:
+        existing = [
+            n for n in os.listdir(workspace)
+            if n not in (".git", "product_spec") and not n.startswith(".")
+        ]
+        if invoked_cmd == "build" and existing:
+            print(
+                "\n[warn] You picked `build` but the workspace has "
+                f"{len(existing)} entries beyond product_spec/ and .git/. "
+                "Build will WIPE them on confirmation. Consider "
+                "`teane patch` if you meant to make an incremental change."
+            )
+        elif invoked_cmd == "patch" and not existing:
+            print(
+                "\n[warn] You picked `patch` but the workspace appears "
+                "empty (no source files outside product_spec/). "
+                "Consider `teane build` for a greenfield generation."
+            )
+    except OSError:
+        pass
 
     args.workspace = workspace
     args.prompt = prompt
     args.git = git_mode
     args.new_build = new_build
     args.spec_discovery = discover
-    # If the operator picks --new-build via the wizard, they've already
-    # given explicit consent — skip the secondary --yes prompt that
-    # cmd_run would otherwise show.
+    # cmd_build pins assume_yes to operator's -y flag; the wizard path is
+    # already an explicit consent so skip the secondary prompt.
     if new_build:
         args.assume_yes = True
     return "run"

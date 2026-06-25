@@ -172,17 +172,30 @@ def db(tmp_path):
     ws = str(ws_dir)
     app = story_state.app_name_for_workspace(ws)
     conn = story_state.open_story_db()
+    # v4 requires every story to belong to a feature. Seed a single
+    # ``test`` feature so the inline create_stories calls below don't
+    # have to declare one each time. Stories that don't set a feature
+    # via _wrap below pick this up by default.
+    story_state.ensure_feature(conn, app, "test", name="Test feature")
     yield conn, ws, app
     conn.close()
+
+
+def _wrap(items: list[dict]) -> list[dict]:
+    """Inject ``feature='test'`` into items that didn't specify one.
+    Mirrors the test-only wrapper in test_story_state.py."""
+    for item in items:
+        item.setdefault("feature", "test")
+    return items
 
 
 class TestNextStoryInBatchDepGuard:
     def test_dependent_story_is_deferred_when_dep_planned(self, db):
         conn, ws, app = db
-        story_state.create_stories(conn, app, [
+        story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
             {"title": "B", "depends_on": ["STORY-1"]},
-        ])
+        ]))
         # Put them in one batch with STORY-1 first (topo-correct).
         bid = story_state.start_batch(
             conn, app, "sess-1", ["STORY-1", "STORY-2"],
@@ -194,10 +207,10 @@ class TestNextStoryInBatchDepGuard:
 
     def test_dependent_story_returns_after_dep_done(self, db):
         conn, ws, app = db
-        story_state.create_stories(conn, app, [
+        story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
             {"title": "B", "depends_on": ["STORY-1"]},
-        ])
+        ]))
         bid = story_state.start_batch(
             conn, app, "sess-1", ["STORY-1", "STORY-2"],
         )
@@ -212,11 +225,11 @@ class TestNextStoryInBatchDepGuard:
         session) and STORY-3 is independent, the loop should defer
         STORY-2 and pick STORY-3 — preserving forward progress."""
         conn, ws, app = db
-        story_state.create_stories(conn, app, [
+        story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
             {"title": "B", "depends_on": ["STORY-1"]},
             {"title": "C"},
-        ])
+        ]))
         bid = story_state.start_batch(
             conn, app, "sess-1", ["STORY-1", "STORY-2", "STORY-3"],
         )
@@ -238,10 +251,10 @@ class TestNextStoryInBatchDepGuard:
         by this guard — the cross-batch contract was already enforced
         by batch_planner_node."""
         conn, ws, app = db
-        story_state.create_stories(conn, app, [
+        story_state.create_stories(conn, app, _wrap([
             {"title": "Earlier"},
             {"title": "Current", "depends_on": ["STORY-1"]},
-        ])
+        ]))
         # First batch contains STORY-1 alone; STORY-1 done.
         story_state.start_batch(conn, app, "sess-1", ["STORY-1"])
         story_state.mark_done(conn, app, "STORY-1")

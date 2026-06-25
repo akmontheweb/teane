@@ -6,7 +6,7 @@ The discovery nodes in ``harness.graph`` (``requirements_discovery_node``,
 ``harness.skills`` (``_DOCGEN_SYSTEM_PROMPTS``) used to ship as inline
 Python triple-quoted strings. That made the prompts hard to iterate on without
 touching code, and the same checklist had to be duplicated whenever a new
-sector (epics, abuse cases, threat model, failure modes) needed to be
+sector (features, abuse cases, threat model, failure modes) needed to be
 captured.
 
 This module externalizes those prompts as markdown files under

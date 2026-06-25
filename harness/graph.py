@@ -73,6 +73,18 @@ class MessageDict(TypedDict, total=False):
     tool_call_id: Optional[str]
 
 
+# ---------------------------------------------------------------------------
+# Flow — which top-level command spawned this graph run. Set by the CLI
+# layer (`cmd_build` / `cmd_patch` / `cmd_deploy`); stored in AgentState so
+# resume can route back to the right entry edge after a crash. The legacy
+# `teane run` command is gone; tests and direct callers default to BUILD.
+# ---------------------------------------------------------------------------
+FLOW_BUILD = "build"
+FLOW_PATCH = "patch"
+FLOW_DEPLOY = "deploy"
+_VALID_FLOWS = frozenset({FLOW_BUILD, FLOW_PATCH, FLOW_DEPLOY})
+
+
 class AgentState(TypedDict, total=False):
     """
     The complete LangGraph agent state.
@@ -306,6 +318,19 @@ class AgentState(TypedDict, total=False):
     # ``route_after_compiler``).
     story_batch_size: int
     story_repair_cap: int
+    # Top-level command flow that spawned this run. One of "build" / "patch"
+    # / "deploy" (see FLOW_* constants). `route_after_start` consults this
+    # field FIRST — it determines the entry edge so the deploy command can
+    # short-circuit straight to the deployment chain without touching the
+    # discovery / patching nodes, and the patch command can route through
+    # `reverse_spec_node` when `--generate-specs` was resolved active. Read
+    # by resume so a crashed flow continues at the right edge.
+    flow: str
+    # Whether the patch flow should reverse-engineer SPEC_REQUIREMENTS.md /
+    # SPEC_ARCHITECTURE.md from the existing codebase before reconciling.
+    # Set by `cmd_patch` after resolving the `--generate-specs` tri-state.
+    # Inert (False) on every other flow.
+    generate_specs: bool
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -333,6 +358,8 @@ def create_initial_state(
     commit_on_story: bool = False,
     story_batch_size: int = 5,
     story_repair_cap: int = 3,
+    flow: str = FLOW_BUILD,
+    generate_specs: bool = False,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -418,6 +445,8 @@ def create_initial_state(
         commit_on_story=bool(commit_on_story),
         story_batch_size=int(story_batch_size),
         story_repair_cap=int(story_repair_cap),
+        flow=flow if flow in _VALID_FLOWS else FLOW_BUILD,
+        generate_specs=bool(generate_specs),
     )
 
 
@@ -1793,7 +1822,7 @@ async def _maybe_discovery_saturation_check(
 # the test pack guards both directions.
 _REQUIREMENTS_SECTORS: tuple[str, ...] = (
     "USER ROLES & PERSONAS",
-    "EPICS & USER STORIES",
+    "FEATURES & USER STORIES",
     "INPUT VALIDATION & PAYLOAD FORMAT",
     "EDGE CASES & BOUNDARY CONDITIONS",
     "ERROR HANDLING & RETRY BEHAVIOR",
@@ -8142,16 +8171,32 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
                 # Each bridged story corresponds to one CR — tag it as a
                 # CR-kind row stamped with that CR's id so traceability
                 # can answer "which stories did CR-2 produce?".
+                #
+                # Every story needs a feature_id under the v4 schema, so
+                # seed the synthetic ``change-request`` feature lazily
+                # (idempotent — one row per workspace, created on first
+                # CR bridge).
                 created_keys: list[str] = []
+                cr_feature_seeded = False
                 for rec in records:
                     ref = f"CR-{rec['cr_id']}"
                     if ref in existing_refs:
                         continue
+                    if not cr_feature_seeded:
+                        _sst.ensure_feature(
+                            conn, app_name, _sst.CR_FEATURE_KEY,
+                            name="Change requests",
+                            description=(
+                                "Stories auto-bridged from change-request "
+                                "text files ingested via teane patch."
+                            ),
+                        )
+                        cr_feature_seeded = True
                     keys = _sst.create_stories(
                         conn, app_name,
                         [{
                             "title": rec.get("original_name", ref),
-                            "epic": "change-request",
+                            "feature": _sst.CR_FEATURE_KEY,
                             "description": f"Auto-bridged from {ref}.",
                             # Acceptance criteria for CR-derived stories is a
                             # single line — the operator can refine via the
@@ -8370,26 +8415,439 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     )
 
 
+async def reverse_spec_node(state: AgentState) -> dict[str, Any]:
+    """Reverse-engineer SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md drafts
+    from an existing codebase.
+
+    Only fires when ``flow=patch`` and ``generate_specs`` resolved active
+    (see ``route_after_start``). Runs a deterministic workspace-telemetry
+    scan, reads any ``product_spec/*.txt`` files, then synthesises an
+    operator-facing starting draft via the planning LLM. The draft is
+    appended to ``messages`` as a system note so the downstream
+    ``requirements_discovery_node`` / ``architecture_discovery_node``
+    interview chain seeds its questions from the draft instead of
+    starting from zero.
+
+    The draft is NOT written to disk here — ``spec_review_node`` and
+    ``write_spec_node`` own the eventual persistence after the operator
+    has approved the refined version.
+    """
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        logger.warning("[reverse_spec] No workspace_path on state — skipping.")
+        return {}
+
+    from harness.deploy import scan_workspace_telemetry
+
+    try:
+        telemetry = scan_workspace_telemetry(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully
+        logger.warning(
+            "[reverse_spec] workspace telemetry scan failed: %s — "
+            "synthesising spec draft from product_spec/ alone.", exc,
+        )
+        telemetry = {"app_name": os.path.basename(workspace_path.rstrip(os.sep))}
+
+    # product_spec/*.txt is the operator's narrative starting point. When
+    # the folder is missing or empty we fall through to telemetry only.
+    product_spec_text = ""
+    try:
+        spec_dir = os.path.join(workspace_path, "product_spec")
+        if os.path.isdir(spec_dir):
+            chunks: list[str] = []
+            for name in sorted(os.listdir(spec_dir)):
+                if not name.endswith(".txt"):
+                    continue
+                path = os.path.join(spec_dir, name)
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    chunks.append(f"# === {name} ===\n{fh.read().rstrip()}")
+            product_spec_text = "\n\n".join(chunks)
+    except OSError as exc:
+        logger.info(
+            "[reverse_spec] product_spec/ scan skipped: %s "
+            "(telemetry-only synthesis).", exc,
+        )
+
+    gateway = get_gateway()
+    if gateway is None:
+        logger.error("[reverse_spec] No gateway configured.")
+        return {"node_state": {"error": "no gateway"}}
+
+    from harness.gateway import NodeRole
+
+    try:
+        telemetry_json = json.dumps(telemetry, indent=2, default=str)
+    except (TypeError, ValueError) as exc:
+        logger.warning("[reverse_spec] telemetry JSON encode failed: %s", exc)
+        telemetry_json = str(telemetry)
+
+    prompt = (
+        "You are reverse-engineering a project specification from an "
+        "existing codebase. Produce TWO markdown documents in one reply, "
+        "delimited by the markers `<SPEC_REQUIREMENTS>` and "
+        "`<SPEC_ARCHITECTURE>` (one each, no nesting):\n\n"
+        "  - SPEC_REQUIREMENTS.md: the WHAT — user stories, functional + "
+        "non-functional requirements, observable behaviour, public API "
+        "surface, success criteria.\n"
+        "  - SPEC_ARCHITECTURE.md: the HOW — workspace layout, modules, "
+        "data flow, external dependencies, build / run commands, "
+        "deployment topology when discernible.\n\n"
+        "Ground every claim in what the code already does. When a "
+        "section can't be derived from the codebase, write a single "
+        "`(unspecified — needs operator review)` placeholder rather "
+        "than inventing detail. The drafts will be fed into a "
+        "human-in-the-loop discovery + review loop that refines them, "
+        "so a thin honest draft beats a thick speculative one.\n\n"
+        "## Workspace telemetry (deterministic scan)\n\n"
+        f"```json\n{telemetry_json}\n```\n\n"
+        "## Operator-supplied narrative (product_spec/*.txt)\n\n"
+        f"{product_spec_text or '(none provided)'}\n\n"
+        "Emit only the two delimited markdown documents in your reply."
+    )
+
+    budget = state.get("budget_remaining_usd", 0.0)
+    response, new_budget = await gateway.dispatch(
+        messages=[
+            {"role": "system", "content":
+                "Reverse-engineer specs from a codebase. Be honest about gaps."},
+            {"role": "user", "content": prompt},
+        ],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=budget,
+    )
+
+    draft = (response.content or "").strip()
+    if not draft:
+        logger.warning("[reverse_spec] Empty draft from LLM — falling through.")
+        return {"budget_remaining_usd": new_budget}
+
+    # The draft rides into the messages so requirements_discovery_node
+    # picks it up as starting context. We add it as a user message
+    # (rather than mutating the cached system prompt) so the discovery
+    # node sees it as a normal turn in the conversation.
+    messages = list(state.get("messages", []))
+    messages.append({
+        "role": "user",
+        "content": (
+            "[reverse-engineered spec draft — refine and approve via the "
+            "discovery + review loop, do not treat as final]\n\n" + draft
+        ),
+    })
+
+    logger.info(
+        "[reverse_spec] Synthesised %d-char draft from telemetry "
+        "(%d product_spec chars). Remaining budget: $%.4f",
+        len(draft), len(product_spec_text), new_budget,
+    )
+
+    return {
+        "messages": messages,
+        "budget_remaining_usd": new_budget,
+    }
+
+
+async def story_reopen_node(state: AgentState) -> dict[str, Any]:
+    """Re-classify existing DONE stories after a patch-flow spec revision.
+
+    Fires in agile-patch when SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md
+    have been revised this run (via ``--spec-discovery`` or
+    ``--generate-specs``) and at least one DONE story already exists in
+    ``state.db`` for the workspace. LLM-judged pass produces one verdict
+    per story:
+
+      - ``unaffected``: leave DONE (acceptance criteria still hold).
+      - ``reopen``: acceptance criteria drifted → flip to ``reopened``
+        so the story loop runs the story again.
+      - ``new``: an entirely new story the spec now requires; appended
+        to the planner queue (the decomposition node's augment mode
+        picks it up on the next pass).
+
+    Verdicts are written into ``node_state.story_reopen_verdicts`` for
+    operator review and the actual DB transitions are committed before
+    the node returns.
+    """
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        return {}
+
+    from harness import story_state
+
+    try:
+        app = story_state.app_name_for_workspace(workspace_path)
+    except ValueError as exc:
+        logger.warning("[story_reopen] invalid workspace: %s", exc)
+        return {}
+
+    db_path = story_state.state_db_path()
+    if not os.path.isfile(db_path):
+        return {}
+    try:
+        conn = story_state.open_story_db(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[story_reopen] open_story_db failed: %s", exc)
+        return {}
+
+    try:
+        existing = [
+            s for s in story_state.list_stories(conn, app)
+            if s.get("status") == "done"
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[story_reopen] list_stories failed: %s", exc)
+        conn.close()
+        return {}
+
+    if not existing:
+        conn.close()
+        logger.info("[story_reopen] no DONE stories; skipping verdict pass.")
+        return {}
+
+    spec_req_path = os.path.join(workspace_path, "docs", "SPEC_REQUIREMENTS.md")
+    spec_arch_path = os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
+    try:
+        spec_req = open(spec_req_path, "r", encoding="utf-8").read() if os.path.isfile(spec_req_path) else ""
+        spec_arch = open(spec_arch_path, "r", encoding="utf-8").read() if os.path.isfile(spec_arch_path) else ""
+    except OSError as exc:
+        logger.warning("[story_reopen] spec read failed: %s", exc)
+        conn.close()
+        return {}
+
+    gateway = get_gateway()
+    if gateway is None:
+        logger.error("[story_reopen] No gateway configured.")
+        conn.close()
+        return {}
+
+    from harness.gateway import NodeRole
+
+    stories_payload = [
+        {
+            "story_key": s.get("story_key"),
+            "title": s.get("title", ""),
+            "acceptance_criteria": s.get("acceptance_criteria") or [],
+        }
+        for s in existing
+    ]
+
+    prompt = (
+        "The project spec was just revised in a patch run. For each "
+        "story below, judge whether its acceptance criteria still hold "
+        "under the NEW spec. Reply with strict JSON of the form\n\n"
+        '  {"verdicts": [{"story_key": "STORY-3", "verdict": '
+        '"unaffected"|"reopen", "reason": "..."}]}\n\n'
+        "`unaffected` = the story\'s criteria are still correct under "
+        "the new spec; leave DONE.\n"
+        "`reopen` = at least one acceptance criterion drifted under "
+        "the new spec; the story must run again. Use `reason` to name "
+        "the criterion that drifted.\n\n"
+        "## New SPEC_REQUIREMENTS.md\n\n"
+        f"{spec_req}\n\n## New SPEC_ARCHITECTURE.md\n\n{spec_arch}\n\n"
+        "## DONE stories\n\n"
+        f"```json\n{json.dumps(stories_payload, indent=2)}\n```\n\n"
+        "Be conservative: only mark `reopen` when you can point at the "
+        "specific criterion that drifted. Marking everything `reopen` "
+        "wastes the operator's tokens."
+    )
+
+    budget = state.get("budget_remaining_usd", 0.0)
+    try:
+        response, new_budget = await gateway.dispatch(
+            messages=[
+                {"role": "system", "content":
+                    "You are classifying whether existing stories still match a revised spec."},
+                {"role": "user", "content": prompt},
+            ],
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=budget,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[story_reopen] dispatch failed: %s", exc)
+        conn.close()
+        return {"budget_remaining_usd": budget}
+
+    raw = (response.content or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[-1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0].strip()
+
+    verdicts: list[dict[str, Any]] = []
+    try:
+        data = json.loads(raw)
+        verdicts = data.get("verdicts", []) if isinstance(data, dict) else []
+    except json.JSONDecodeError as exc:
+        logger.warning("[story_reopen] verdict JSON parse failed: %s", exc)
+
+    reopened: list[str] = []
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        key = v.get("story_key")
+        verdict = v.get("verdict")
+        if verdict == "reopen" and isinstance(key, str):
+            try:
+                changed = story_state.mark_reopened(conn, app, key)
+                if changed:
+                    reopened.append(key)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[story_reopen] mark_reopened(%s) failed: %s", key, exc,
+                )
+
+    conn.close()
+    logger.info(
+        "[story_reopen] verdicts=%d reopened=%s remaining_budget=$%.4f",
+        len(verdicts), reopened, new_budget,
+    )
+
+    node_state = dict(state.get("node_state", {}))
+    node_state["story_reopen_verdicts"] = verdicts
+    node_state["story_reopen_reopened"] = reopened
+    return {
+        "node_state": node_state,
+        "budget_remaining_usd": new_budget,
+    }
+
+
+async def patch_reconcile_node(state: AgentState) -> dict[str, Any]:
+    """Append the ``patch`` reconcile preamble to the conversation, then
+    hand off to ``planning_node``.
+
+    Only fires when ``flow=patch`` and no ``change_requests/*.txt`` are
+    present and ``generate_specs`` was not resolved active — i.e. the
+    operator wants an incremental change against an existing codebase
+    that already has approved specs. The preamble pins the planner to
+    "reconcile what's drifted; leave conformant code untouched" rather
+    than re-emitting a from-scratch implementation blueprint.
+
+    Reads SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md from ``docs/`` if
+    they exist (fall-through is graceful — the user prompt + telemetry
+    is still enough for the planner to do something useful).
+    """
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        return {}
+
+    spec_excerpts: list[str] = []
+    for name, label in (
+        ("SPEC_REQUIREMENTS.md", "## Current SPEC_REQUIREMENTS.md"),
+        ("SPEC_ARCHITECTURE.md", "## Current SPEC_ARCHITECTURE.md"),
+    ):
+        path = os.path.join(workspace_path, "docs", name)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    spec_excerpts.append(f"{label}\n\n{fh.read().rstrip()}")
+            except OSError as exc:
+                logger.info(
+                    "[patch_reconcile] failed to read %s: %s", path, exc,
+                )
+
+    # Lightweight tree summary so the planner sees what already exists.
+    # Capped at a depth + entry count so a sprawling workspace doesn't
+    # blow the system prompt.
+    tree_lines: list[str] = []
+    try:
+        from harness.deploy import scan_workspace_telemetry
+        telemetry = scan_workspace_telemetry(workspace_path)
+        src_dirs = telemetry.get("source_dirs") or []
+        manifests = telemetry.get("manifests_found") or {}
+        if src_dirs:
+            tree_lines.append("Top-level source directories: " + ", ".join(src_dirs[:10]))
+        if manifests:
+            for lang, files in list(manifests.items())[:6]:
+                tree_lines.append(f"{lang}: {', '.join(files[:4])}")
+    except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
+        logger.info("[patch_reconcile] telemetry skipped: %s", exc)
+
+    tree_block = "\n".join(tree_lines) if tree_lines else "(workspace telemetry unavailable)"
+    spec_block = "\n\n".join(spec_excerpts) if spec_excerpts else "(no SPEC_* docs found in docs/)"
+
+    preamble = (
+        "## Patch-mode reconcile preamble\n\n"
+        "An existing implementation lives at the workspace root. The "
+        "approved spec documents below describe the intended behaviour. "
+        "Reconcile the implementation against the spec and the user's "
+        "request: change only what has drifted, what the user is asking "
+        "for, or what the spec now requires. Leave conformant code "
+        "untouched. Justify each modification in your plan.\n\n"
+        "## Workspace shape\n\n"
+        f"{tree_block}\n\n"
+        f"{spec_block}\n"
+    )
+
+    messages = list(state.get("messages", []))
+    messages.append({"role": "user", "content": preamble})
+    logger.info(
+        "[patch_reconcile] Reconcile preamble appended "
+        "(%d spec chars, %d tree lines).",
+        sum(len(x) for x in spec_excerpts), len(tree_lines),
+    )
+    return {"messages": messages}
+
+
 def route_after_start(state: AgentState) -> Literal[
-    "requirements_discovery_node", "patching_node", "ingest_change_requests_node",
+    "requirements_discovery_node",
+    "patching_node",
+    "ingest_change_requests_node",
+    "reverse_spec_node",
+    "patch_reconcile_node",
+    "deployment_discovery_node",
+    "generate_deployment_spec_node",
 ]:
     """START edge router. Module-level so tests can call it directly.
 
     Precedence:
-      1. ``change_request_mode`` → ingest_change_requests_node (a populated
+      1. ``flow == "deploy"`` → straight into the deployment chain. With
+         ``cd_discovery=True`` enter at deployment_discovery_node so the
+         LLM-driven interview synthesises DEPLOYMENT_BLUEPRINT.md; else
+         skip straight to generate_deployment_spec_node which builds
+         the blueprint from workspace telemetry alone.
+      2. ``flow == "patch"`` with ``generate_specs`` resolved active →
+         reverse_spec_node first, then through the discovery / spec_review
+         pipeline as usual.
+      3. ``change_request_mode`` → ingest_change_requests_node (a populated
          change_requests/ folder always overrides skip_discovery so a
-         misconfigured run still goes through the gatekeeper pipeline once
-         PR-2 lands the delta routing).
-      2. ``skip_discovery`` → patching_node (the bare existing-project path
-         from before change-request mode existed).
-      3. Default → requirements_discovery_node (greenfield discovery).
+         misconfigured run still goes through the gatekeeper pipeline).
+      4. ``flow == "patch"`` without CRs and without generate_specs →
+         patch_reconcile_node injects the "reconcile against existing
+         tree" preamble before handing off to planning_node.
+      5. ``skip_discovery`` → patching_node (the bare existing-project path
+         from before change-request mode existed; legacy callers / tests).
+      6. Default → requirements_discovery_node (greenfield discovery).
     """
+    flow = state.get("flow", FLOW_BUILD)
+    if flow == FLOW_DEPLOY:
+        if state.get("cd_discovery", False):
+            logger.info(
+                "[router] flow=deploy + cd_discovery. "
+                "Routing START → deployment_discovery_node."
+            )
+            return "deployment_discovery_node"
+        logger.info(
+            "[router] flow=deploy. Routing START → generate_deployment_spec_node "
+            "(telemetry-only blueprint)."
+        )
+        return "generate_deployment_spec_node"
+    if flow == FLOW_PATCH and state.get("generate_specs", False):
+        logger.info(
+            "[router] flow=patch + generate_specs. "
+            "Routing START → reverse_spec_node."
+        )
+        return "reverse_spec_node"
     if state.get("change_request_mode", False):
         logger.info(
             "[router] change_request_mode active. "
             "Routing START → ingest_change_requests_node."
         )
         return "ingest_change_requests_node"
+    if flow == FLOW_PATCH:
+        logger.info(
+            "[router] flow=patch (no CRs, no generate_specs). "
+            "Routing START → patch_reconcile_node."
+        )
+        return "patch_reconcile_node"
     if state.get("skip_discovery", False):
         logger.info("[router] spec discovery skipped. Routing START → patching_node.")
         return "patching_node"
@@ -10171,6 +10629,17 @@ def route_after_gatekeeper(state: AgentState) -> str:
         # going straight into monolithic patching. The decomposition node
         # then routes back through the STORIES gatekeeper.
         if state.get("decomposition_enabled", False):
+            # PATCH flow on an agile-managed workspace with at least one
+            # DONE story: re-classify those DONE stories against the
+            # revised spec FIRST (story_reopen_node), then let the
+            # decomposition node propose any new stories (augment mode).
+            # Build flow and first-pass patch (no existing stories) skip
+            # straight to decomposition.
+            if (
+                state.get("flow") == FLOW_PATCH
+                and _workspace_has_done_stories(state)
+            ):
+                return "story_reopen_node"
             return "decomposition_node"
         return "patching_node"
     elif gate == "STORIES":
@@ -10179,6 +10648,35 @@ def route_after_gatekeeper(state: AgentState) -> str:
         return "deployment_node"
 
     return "__end__"
+
+
+def _workspace_has_done_stories(state: AgentState) -> bool:
+    """Return True when the global state DB has at least one DONE story
+    for this workspace. Best-effort: degrades to False on any error so
+    the router falls back to today's behavior.
+    """
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path:
+        return False
+    try:
+        from harness import story_state
+        app = story_state.app_name_for_workspace(workspace_path)
+        db = story_state.state_db_path()
+        if not os.path.isfile(db):
+            return False
+        import sqlite3
+        conn = sqlite3.connect(db)
+        try:
+            cur = conn.execute(
+                "SELECT 1 FROM stories WHERE workspace = ? "
+                "AND status = 'done' LIMIT 1",
+                (app,),
+            )
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — router must never raise
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -10732,6 +11230,9 @@ def build_graph() -> Any:
     )
 
     # Register exhaustive discovery nodes
+    graph.add_node("reverse_spec_node", reverse_spec_node)
+    graph.add_node("patch_reconcile_node", patch_reconcile_node)
+    graph.add_node("story_reopen_node", story_reopen_node)
     graph.add_node("requirements_discovery_node", requirements_discovery_node)
     graph.add_node("architecture_discovery_node", architecture_discovery_node)
     graph.add_node("write_spec_node", write_spec_node)
@@ -10812,8 +11313,28 @@ def build_graph() -> Any:
             "requirements_discovery_node": "requirements_discovery_node",
             "patching_node": "patching_node",
             "ingest_change_requests_node": "ingest_change_requests_node",
+            # flow=patch + generate_specs → reverse-engineer specs from
+            # the existing codebase, then funnel into the regular
+            # requirements/architecture discovery + review chain.
+            "reverse_spec_node": "reverse_spec_node",
+            "patch_reconcile_node": "patch_reconcile_node",
+            # flow=deploy entry edges: skip discovery / planning / patching
+            # entirely and enter the deployment chain directly.
+            "deployment_discovery_node": "deployment_discovery_node",
+            "generate_deployment_spec_node": "generate_deployment_spec_node",
         },
     )
+
+    # reverse_spec_node feeds its synthesised drafts into the standard
+    # requirements/architecture discovery chain so spec_review_node still
+    # vets them and the operator HITL gates still fire.
+    graph.add_edge("reverse_spec_node", "requirements_discovery_node")
+
+    # patch_reconcile_node appends the reconcile preamble + spec excerpts
+    # to messages, then hands off to planning_node for the actual blueprint
+    # generation. The planner produces a plan that respects "only change
+    # what's drifted", and the rest of the standard build chain follows.
+    graph.add_edge("patch_reconcile_node", "planning_node")
 
     # ingest_change_requests_node hands off to the one-shot reverse-
     # engineer pass (no-op when SPEC_ARCHITECTURE.md already exists),
@@ -10894,9 +11415,19 @@ def build_graph() -> Any:
             # Story-mode targets — inert when decomposition_enabled=False.
             "decomposition_node": "decomposition_node",
             "batch_planner_node": "batch_planner_node",
+            # PATCH flow + agile + existing DONE stories: classify the
+            # existing stories against the revised spec FIRST, then fall
+            # through to decomposition_node in augment mode.
+            "story_reopen_node": "story_reopen_node",
             "__end__": END,
         },
     )
+
+    # story_reopen_node always hands off to decomposition_node next: any
+    # `reopen` verdicts flipped DONE → REOPENED in the DB, and the
+    # decomposition pass picks up brand-new stories from the revised spec
+    # in augment mode.
+    graph.add_edge("story_reopen_node", "decomposition_node")
 
     # =====================================================================
     # Story-mode pipeline (Agile decomposition + per-batch verification).
@@ -11422,6 +11953,8 @@ async def run_graph(
     repo_memory_config: Optional[dict[str, Any]] = None,
     repo_index_config: Optional[dict[str, Any]] = None,
     llm_dispatch_config: Optional[dict[str, Any]] = None,
+    flow: str = FLOW_BUILD,
+    generate_specs: bool = False,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -11474,6 +12007,8 @@ async def run_graph(
         commit_on_story=commit_on_story,
         story_batch_size=story_batch_size,
         story_repair_cap=story_repair_cap,
+        flow=flow,
+        generate_specs=generate_specs,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node

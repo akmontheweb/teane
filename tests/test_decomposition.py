@@ -98,11 +98,14 @@ def _build_state(workspace: str, budget: float = 2.00) -> dict[str, Any]:
 
 def _valid_payload() -> str:
     return json.dumps({
-        "epics": [{"name": "core", "description": "MVP"}],
+        "features": [
+            {"feature_key": "core", "name": "Core TODOs",
+             "description": "MVP create/list."}
+        ],
         "stories": [
             {
                 "story_key": "STORY-1",
-                "epic": "core",
+                "feature": "core",
                 "title": "Create a TODO",
                 "description": "POST /todos creates an item.",
                 "acceptance_criteria": [
@@ -114,7 +117,7 @@ def _valid_payload() -> str:
             },
             {
                 "story_key": "STORY-2",
-                "epic": "core",
+                "feature": "core",
                 "title": "List TODOs",
                 "description": "GET /todos returns the list.",
                 "acceptance_criteria": ["GET /todos returns JSON array"],
@@ -126,16 +129,62 @@ def _valid_payload() -> str:
     })
 
 
+def _seed_story(workspace_app: str, title: str, **extra) -> str:
+    """Test helper: create the ``test`` feature if missing, then insert
+    a single story under it. Returns the assigned story_key."""
+    conn = story_state.open_story_db()
+    try:
+        story_state.ensure_feature(
+            conn, workspace_app, "test", name="Test feature",
+            description="Seed for tests.",
+        )
+        keys = story_state.create_stories(
+            conn, workspace_app,
+            [{
+                "title": title,
+                "feature": extra.pop("feature", "test"),
+                "acceptance_criteria": extra.pop(
+                    "acceptance_criteria", ["x"],
+                ),
+                "depends_on": extra.pop("depends_on", []),
+                "scope_files": extra.pop("scope_files", []),
+                **extra,
+            }],
+        )
+    finally:
+        conn.close()
+    return keys[0]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
+def _payload_with_one_feature(stories: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap a story list in the minimal valid features+stories envelope.
+
+    Every story gets ``feature: "core"`` if it doesn't already specify
+    one, and the response declares a single ``core`` feature. Used by
+    validator tests that focus on story-level rules rather than the
+    feature-validation logic.
+    """
+    for s in stories:
+        s.setdefault("feature", "core")
+    return {
+        "features": [{"feature_key": "core", "name": "Core"}],
+        "stories": stories,
+    }
+
+
 def test_validate_accepts_minimal_valid_payload():
     payload = json.loads(_valid_payload())
-    cleaned = decomposition._validate_stories_payload(payload)
-    assert len(cleaned) == 2
-    assert cleaned[0]["title"] == "Create a TODO"
-    assert cleaned[1]["depends_on"] == ["STORY-1"]
+    features, stories = decomposition._validate_stories_payload(payload)
+    assert len(features) == 1
+    assert features[0]["feature_key"] == "core"
+    assert len(stories) == 2
+    assert stories[0]["title"] == "Create a TODO"
+    assert stories[0]["feature"] == "core"
+    assert stories[1]["depends_on"] == ["STORY-1"]
 
 
 def test_validate_rejects_non_dict():
@@ -144,57 +193,97 @@ def test_validate_rejects_non_dict():
 
 
 def test_validate_rejects_empty_stories():
+    payload = {
+        "features": [{"feature_key": "core", "name": "Core"}],
+        "stories": [],
+    }
     with pytest.raises(ValueError, match="non-empty"):
-        decomposition._validate_stories_payload({"stories": []})
+        decomposition._validate_stories_payload(payload)
+
+
+def test_validate_rejects_missing_features():
+    """v4 schema makes features mandatory in initial decomposition."""
+    payload = {"stories": [{
+        "story_key": "STORY-1", "feature": "core",
+        "title": "t", "acceptance_criteria": ["x"],
+    }]}
+    with pytest.raises(ValueError, match="features"):
+        decomposition._validate_stories_payload(payload)
+
+
+def test_validate_rejects_story_referencing_undeclared_feature():
+    payload = {
+        "features": [{"feature_key": "core", "name": "Core"}],
+        "stories": [{
+            "story_key": "STORY-1", "feature": "ghost",
+            "title": "t", "acceptance_criteria": ["x"],
+        }],
+    }
+    with pytest.raises(ValueError, match="ghost"):
+        decomposition._validate_stories_payload(payload)
+
+
+def test_validate_rejects_orphan_feature():
+    """Every declared feature must own at least one story."""
+    payload = {
+        "features": [
+            {"feature_key": "core", "name": "Core"},
+            {"feature_key": "orphan", "name": "Nobody"},
+        ],
+        "stories": [{
+            "story_key": "STORY-1", "feature": "core",
+            "title": "t", "acceptance_criteria": ["x"],
+        }],
+    }
+    with pytest.raises(ValueError, match="orphan"):
+        decomposition._validate_stories_payload(payload)
 
 
 def test_validate_rejects_over_cap():
-    payload = {
-        "stories": [
-            {
-                "story_key": f"STORY-{i}",
-                "title": f"t{i}",
-                "acceptance_criteria": ["x"],
-            }
-            for i in range(1, decomposition.MAX_STORIES_PER_PASS + 2)
-        ]
-    }
+    payload = _payload_with_one_feature([
+        {
+            "story_key": f"STORY-{i}",
+            "title": f"t{i}",
+            "acceptance_criteria": ["x"],
+        }
+        for i in range(1, decomposition.MAX_STORIES_PER_PASS + 2)
+    ])
     with pytest.raises(ValueError, match="too many"):
         decomposition._validate_stories_payload(payload)
 
 
 def test_validate_rejects_bad_story_key():
-    payload = {"stories": [{
+    payload = _payload_with_one_feature([{
         "story_key": "ABC-1", "title": "t", "acceptance_criteria": ["x"]
-    }]}
+    }])
     with pytest.raises(ValueError, match="invalid story_key"):
         decomposition._validate_stories_payload(payload)
 
 
 def test_validate_rejects_missing_acceptance():
-    payload = {"stories": [{
+    payload = _payload_with_one_feature([{
         "story_key": "STORY-1", "title": "t", "acceptance_criteria": []
-    }]}
+    }])
     with pytest.raises(ValueError, match="acceptance"):
         decomposition._validate_stories_payload(payload)
 
 
 def test_validate_rejects_forward_dependency():
-    payload = {"stories": [
+    payload = _payload_with_one_feature([
         {"story_key": "STORY-1", "title": "a",
          "acceptance_criteria": ["x"], "depends_on": ["STORY-2"]},
         {"story_key": "STORY-2", "title": "b",
          "acceptance_criteria": ["y"]},
-    ]}
+    ])
     with pytest.raises(ValueError, match="not declared earlier"):
         decomposition._validate_stories_payload(payload)
 
 
 def test_validate_rejects_duplicate_keys():
-    payload = {"stories": [
+    payload = _payload_with_one_feature([
         {"story_key": "STORY-1", "title": "a", "acceptance_criteria": ["x"]},
         {"story_key": "STORY-1", "title": "b", "acceptance_criteria": ["y"]},
-    ]}
+    ])
     with pytest.raises(ValueError, match="duplicate"):
         decomposition._validate_stories_payload(payload)
 
@@ -328,3 +417,261 @@ def test_decomposition_node_dispatch_exception(workspace: str):
     out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
     assert out["node_state"]["error"].startswith("dispatch_failed")
     assert "upstream 503" in out["node_state"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Augment mode — delta-only decomposition on workspaces with existing stories
+# ---------------------------------------------------------------------------
+
+def test_augment_prompt_includes_existing_stories():
+    p = decomposition._build_decomposition_augment_prompt(
+        existing_features=[
+            {"feature_key": "auth", "name": "Auth"},
+        ],
+        existing_stories=[
+            {"story_key": "STORY-1", "status": "done",
+             "feature_key": "auth",
+             "title": "Login", "acceptance_criteria": ["POST /login returns 200"]},
+            {"story_key": "STORY-2", "status": "in_progress",
+             "feature_key": "auth",
+             "title": "Logout", "acceptance_criteria": ["POST /logout returns 204"]},
+        ],
+        spec_requirements="req", spec_architecture="arch",
+        workspace_path="/tmp/ws",
+    )
+    assert "STORY-1" in p and "STORY-2" in p
+    assert "[done]" in p and "[in_progress]" in p
+    assert "Login" in p
+    assert "augment mode" in p.lower()
+    assert "auth" in p
+
+
+def test_augment_prompt_handles_empty_existing():
+    p = decomposition._build_decomposition_augment_prompt(
+        existing_features=[], existing_stories=[],
+        spec_requirements="req",
+        spec_architecture="arch", workspace_path="/tmp/ws",
+    )
+    assert "_(none)_" in p
+
+
+def test_augment_validator_accepts_empty_stories():
+    """No new stories AND no new features = valid no-op answer."""
+    features, stories = decomposition._validate_augment_payload(
+        {"features": [], "stories": []},
+    )
+    assert features == [] and stories == []
+    features, stories = decomposition._validate_augment_payload(
+        {"features": [], "stories": [], "summary": "no-op"},
+    )
+    assert features == [] and stories == []
+
+
+def test_augment_validator_accepts_story_new_placeholders():
+    features, stories = decomposition._validate_augment_payload({
+        "features": [{"feature_key": "metrics", "name": "Metrics"}],
+        "stories": [{
+            "story_key": "STORY-NEW-1", "feature": "metrics",
+            "title": "Add metrics endpoint",
+            "acceptance_criteria": ["GET /metrics returns 200"],
+            "depends_on": [], "scope_files": ["src/metrics.py"],
+        }],
+    })
+    assert len(stories) == 1
+    assert stories[0]["title"] == "Add metrics endpoint"
+    assert stories[0]["feature"] == "metrics"
+    assert features[0]["feature_key"] == "metrics"
+
+
+def test_augment_validator_accepts_story_referencing_existing_feature():
+    """Augment mode lets stories reference features already on file."""
+    features, stories = decomposition._validate_augment_payload(
+        {
+            "features": [],
+            "stories": [{
+                "story_key": "STORY-NEW-1", "feature": "auth",
+                "title": "Add MFA",
+                "acceptance_criteria": ["MFA enrolment works"],
+                "depends_on": [], "scope_files": [],
+            }],
+        },
+        existing_feature_keys={"auth"},
+    )
+    assert features == []
+    assert stories[0]["feature"] == "auth"
+
+
+def test_augment_validator_rejects_cross_response_forward_dep():
+    """Depends-on can only reference placeholders earlier in the same response."""
+    with pytest.raises(ValueError, match="depends_on"):
+        decomposition._validate_augment_payload({
+            "features": [{"feature_key": "x", "name": "X"}],
+            "stories": [{
+                "story_key": "STORY-NEW-1", "feature": "x", "title": "x",
+                "acceptance_criteria": ["x"],
+                "depends_on": ["STORY-NEW-2"],  # forward reference
+                "scope_files": [],
+            }],
+        })
+
+
+def test_decomposition_node_augment_mode_appends_new_story(workspace: str):
+    """Workspace already has STORY-1 from a prior agile run. New
+    decomposition pass detects the existing row and runs in augment
+    mode, appending only the genuinely new story (STORY-2)."""
+    from harness.graph import set_gateway
+
+    # Seed an existing feature + story in the DB for this workspace.
+    app = story_state.app_name_for_workspace(workspace)
+    _seed_story(app, "Original feature",
+                acceptance_criteria=["GET /orig returns 200"])
+
+    _write_spec(workspace, "Revised: adds a /new endpoint")
+    augment_response = json.dumps({
+        "features": [],
+        "stories": [{
+            "story_key": "STORY-NEW-1",
+            "feature": "test",
+            "title": "Add /new endpoint",
+            "acceptance_criteria": ["GET /new returns 200"],
+            "depends_on": [],
+            "scope_files": ["src/new.py"],
+        }],
+        "summary": "one new story",
+    })
+    gw = _FakeGateway([augment_response])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    # Augment mode marker surfaced in node_state
+    assert out["node_state"]["augment_mode"] is True
+    assert out["node_state"]["augment_existing_count"] == 1
+    assert out["node_state"]["story_count"] == 1
+
+    # DB now has both the original AND the new story; the DB allocator
+    # assigned the placeholder key to the next-available STORY-N.
+    conn = story_state.open_story_db()
+    try:
+        rows = story_state.list_stories(conn, app)
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    titles = sorted(r["title"] for r in rows)
+    assert titles == ["Add /new endpoint", "Original feature"]
+
+    # Augment prompt actually went to the LLM
+    sent_prompt = gw.calls[0]["messages"][1]["content"]
+    assert "augment mode" in sent_prompt.lower()
+    assert "Original feature" in sent_prompt
+
+
+def test_decomposition_node_augment_mode_handles_no_new_stories(workspace: str):
+    """LLM returns an empty stories+features list = 'existing set
+    already covers everything'. Node skips the DB insert and returns
+    cleanly."""
+    from harness.graph import set_gateway
+
+    app = story_state.app_name_for_workspace(workspace)
+    _seed_story(app, "Already covers it")
+
+    _write_spec(workspace)
+    gw = _FakeGateway([json.dumps({
+        "features": [], "stories": [], "summary": "no-op",
+    })])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["augment_mode"] is True
+    assert out["node_state"]["story_count"] == 0
+    assert out["node_state"]["story_keys"] == []
+    assert out["node_state"]["augment_existing_count"] == 1
+
+    # DB still has just the one pre-existing story.
+    conn = story_state.open_story_db()
+    try:
+        rows = story_state.list_stories(conn, app)
+    finally:
+        conn.close()
+    assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Routing — story_reopen_node insertion in route_after_gatekeeper
+# ---------------------------------------------------------------------------
+
+def test_route_after_gatekeeper_patch_agile_with_done_stories_goes_to_reopen(workspace: str):
+    """ARCHITECTURE gate approval in PATCH flow with an existing DONE
+    story routes through story_reopen_node BEFORE decomposition."""
+    from harness.graph import (
+        route_after_gatekeeper, AgentState, FLOW_PATCH,
+    )
+
+    # Seed a DONE story in the DB
+    app = story_state.app_name_for_workspace(workspace)
+    key = _seed_story(
+        app, "Login",
+        acceptance_criteria=["POST /login returns 200"],
+    )
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_done(conn, app, key)
+    finally:
+        conn.close()
+
+    state = AgentState(
+        flow=FLOW_PATCH,
+        workspace_path=workspace,
+        decomposition_enabled=True,
+        current_gate="ARCHITECTURE",
+        node_state={"gatekeeper_action": "approve"},
+    )
+    assert route_after_gatekeeper(state) == "story_reopen_node"
+
+
+def test_route_after_gatekeeper_build_agile_skips_reopen(workspace: str):
+    """BUILD flow never routes through story_reopen_node even when
+    DONE stories exist (build always starts fresh-ish)."""
+    from harness.graph import (
+        route_after_gatekeeper, AgentState, FLOW_BUILD,
+    )
+
+    app = story_state.app_name_for_workspace(workspace)
+    key = _seed_story(app, "Whatever")
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_done(conn, app, key)
+    finally:
+        conn.close()
+
+    state = AgentState(
+        flow=FLOW_BUILD,
+        workspace_path=workspace,
+        decomposition_enabled=True,
+        current_gate="ARCHITECTURE",
+        node_state={"gatekeeper_action": "approve"},
+    )
+    assert route_after_gatekeeper(state) == "decomposition_node"
+
+
+def test_route_after_gatekeeper_patch_agile_no_done_skips_reopen(workspace: str):
+    """PATCH flow with planned-but-not-DONE stories does NOT trigger reopen."""
+    from harness.graph import (
+        route_after_gatekeeper, AgentState, FLOW_PATCH,
+    )
+
+    app = story_state.app_name_for_workspace(workspace)
+    _seed_story(
+        app, "Planned-only", acceptance_criteria=["x"],
+    )
+    # No mark_done — story stays in 'planned' state.
+
+    state = AgentState(
+        flow=FLOW_PATCH,
+        workspace_path=workspace,
+        decomposition_enabled=True,
+        current_gate="ARCHITECTURE",
+        node_state={"gatekeeper_action": "approve"},
+    )
+    assert route_after_gatekeeper(state) == "decomposition_node"

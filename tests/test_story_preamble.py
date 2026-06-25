@@ -18,9 +18,12 @@ def workspace(tmp_path: Path) -> str:
     app = story_state.app_name_for_workspace(ws)
     conn = story_state.open_story_db()
     try:
+        story_state.create_features(conn, app, [
+            {"feature_key": "auth", "name": "Auth"},
+        ])
         story_state.create_stories(conn, app, [{
             "title": "Add /register endpoint",
-            "epic": "auth",
+            "feature": "auth",
             "description": "POST /register creates a user.",
             "acceptance_criteria": [
                 "POST /register with valid payload returns 201",
@@ -30,6 +33,7 @@ def workspace(tmp_path: Path) -> str:
             "external_ref": None,
         }, {
             "title": "CR-bridged story",
+            "feature": "auth",
             "acceptance_criteria": ["Some criterion"],
             "external_ref": "CR-7",
         }])

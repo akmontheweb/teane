@@ -106,7 +106,7 @@ def test_first_round_skips_focus(install_gateway):
 def test_disabled_by_config_skips_dispatch(install_gateway):
     from harness.graph import _maybe_discovery_followup_focus, _REQUIREMENTS_SECTORS
     gw = install_gateway(
-        '{"focus": ["USER ROLES & PERSONAS","EPICS & USER STORIES","INPUT VALIDATION & PAYLOAD FORMAT"]}',
+        '{"focus": ["USER ROLES & PERSONAS","FEATURES & USER STORIES","INPUT VALIDATION & PAYLOAD FORMAT"]}',
         followup_focus_enabled=False,
     )
 

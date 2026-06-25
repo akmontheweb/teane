@@ -492,6 +492,17 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # for them. Empty / absent section keeps today's full-questionnaire
     # behaviour. See load_deployment_defaults() in this file.
     "deployment_defaults",
+    # Top-level Agile-mode default. When true (and the operator does not
+    # pass --agile explicitly), build/patch engage story decomposition +
+    # per-story TDD. Defaults to false. See agile_defaults below for the
+    # per-knob tuning that used to live as --story-* CLI flags.
+    "agile",
+    # Agile-mode tuning knobs. Replaces the --story-batch-size /
+    # --commit-on-story / --story-repair-cap CLI flags which were
+    # removed when `teane run` was split into `teane build`/`patch`.
+    # Resolution precedence: hard-coded default < this section. Only
+    # consulted when agile mode is engaged.
+    "agile_defaults",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -729,6 +740,14 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "requirement", "architecture", "repair", "deployment",
         "layout_divergence",
     }),
+    # Agile tuning knobs. batch_size = max stories per dependency batch;
+    # commit_on_story = git-commit after each green story; repair_cap =
+    # max repair iterations before a story is parked as blocked. Only
+    # consulted when agile mode is engaged. CLI flags were removed when
+    # `teane run` was split into build/patch/deploy.
+    "agile_defaults": frozenset({
+        "batch_size", "commit_on_story", "repair_cap",
+    }),
 }
 
 
@@ -909,6 +928,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "deployment_defaults.storage": (dict,),
     "deployment_defaults.secrets": (dict,),
     "deployment_defaults.infra_sync": (dict,),
+    "agile": (bool,),
+    "agile_defaults.batch_size": (int,),
+    "agile_defaults.commit_on_story": (bool,),
+    "agile_defaults.repair_cap": (int,),
 }
 
 # model_routing fields that must reference an entry in `models` when
@@ -4913,6 +4936,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
             repo_memory_config=config.get("memory", {}),
             repo_index_config=config.get("repo_index", {}),
             llm_dispatch_config=config.get("llm_dispatch", {}),
+            # Which top-level command spawned this run. cmd_build /
+            # cmd_patch / cmd_deploy each pin args.flow before delegating
+            # here; legacy callers (tests, direct cmd_run invocations)
+            # default to "build".
+            flow=getattr(args, "flow", "build"),
+            # In flow=patch, controls whether the reverse-spec node fires
+            # before the planner. Resolved by cmd_patch from the
+            # --generate-specs tri-state. False on every other flow.
+            generate_specs=getattr(args, "generate_specs", False),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -5037,6 +5069,144 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
 
     return 0 if exit_code == 0 else 1
+
+
+def _resolve_agile_args(args: argparse.Namespace, *, config: dict[str, Any], workspace_path: str, flow: str) -> None:
+    """Resolve the `--agile` tri-state on build/patch and seed the legacy
+    `decomposition_enabled` / `story_*` args that ``cmd_run`` reads.
+
+    Resolution precedence:
+      build: CLI flag > config["agile"] > False.
+      patch: CLI flag > workspace_is_agile_managed(...) > config["agile"] > False.
+
+    The agile_defaults block in config.json supplies the per-knob tuning
+    (batch_size, commit_on_story, repair_cap) — moved out of the CLI when
+    the three --story-* flags were removed.
+    """
+    cli_val = getattr(args, "agile", None)
+    if cli_val is None:
+        if flow == "patch":
+            try:
+                from harness.story_state import workspace_is_agile_managed
+                detected = workspace_is_agile_managed(workspace_path)
+            except Exception:  # noqa: BLE001
+                detected = False
+            if detected:
+                cli_val = True
+                logger.info("[cli] agile workspace detected (.teane/state.db non-empty).")
+        if cli_val is None:
+            cli_val = bool(config.get("agile", False))
+
+    args.decomposition_enabled = bool(cli_val)
+    defaults = config.get("agile_defaults") or {}
+    args.story_batch_size = int(defaults.get("batch_size", 5))
+    args.commit_on_story = bool(defaults.get("commit_on_story", False))
+    args.story_repair_cap = int(defaults.get("repair_cap", 3))
+
+
+def _resolve_generate_specs(args: argparse.Namespace, *, workspace_path: str) -> Optional[int]:
+    """Resolve --generate-specs tri-state on patch. Sets args.generate_specs.
+
+    Returns 2 (CLI error exit code) when the operator passed
+    --generate-specs=false AND a spec file is missing, so the caller can
+    fail-fast before any LLM call.
+    """
+    val = getattr(args, "generate_specs", None)
+    spec_req = os.path.join(workspace_path, "docs", "SPEC_REQUIREMENTS.md")
+    spec_arch = os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
+    missing = [p for p in (spec_req, spec_arch) if not os.path.isfile(p)]
+
+    if val is None:
+        args.generate_specs = bool(missing)
+        if args.generate_specs:
+            logger.info("[cli] spec docs missing — auto-enabling reverse-spec generation.")
+        return None
+    if val is False and missing:
+        print(
+            "error: SPEC docs are missing but --generate-specs=false was "
+            f"passed. Missing: {', '.join(os.path.basename(m) for m in missing)}. "
+            "Pass --generate-specs true to reverse-engineer them from the "
+            "codebase, or place the .md files under docs/ first.",
+            file=sys.stderr,
+        )
+        return 2
+    args.generate_specs = bool(val)
+    if val is True:
+        logger.info("[cli] --generate-specs=true: regenerating spec drafts.")
+    return None
+
+
+async def cmd_build(args: argparse.Namespace) -> int:
+    """`teane build` — destructive greenfield.
+
+    Pins args.new_build=True (workspace reset always runs), args.flow="build",
+    args.deploy_dev=False (deploy is its own command now), then delegates to
+    cmd_run. The destructive-confirmation prompt + -y modifier come along
+    from cmd_run's existing logic.
+    """
+    args.flow = "build"
+    args.new_build = True
+    args.deploy_dev = False
+    args.install_doc = True  # build always writes initial INSTALLATION.md
+    args.generate_specs = False
+    # Resolve --agile from CLI/config; load config first so we can read it.
+    workspace_path = os.path.abspath(getattr(args, "workspace", None) or os.getcwd())
+    try:
+        config = _strip_comments(load_raw_config())
+    except Exception:  # noqa: BLE001 — cmd_run will re-load + error properly
+        config = {}
+    _resolve_agile_args(args, config=config, workspace_path=workspace_path, flow="build")
+    return await cmd_run(args)
+
+
+async def cmd_patch(args: argparse.Namespace) -> int:
+    """`teane patch` — brownfield reconcile.
+
+    Resolves --generate-specs (auto/true/false) and --agile (auto/true/false),
+    pins args.flow="patch" and args.new_build=False, then delegates to
+    cmd_run.
+    """
+    args.flow = "patch"
+    args.new_build = False
+    args.deploy_dev = False
+    args.assume_yes = False  # patch never resets, -y is irrelevant
+    workspace_path = os.path.abspath(getattr(args, "workspace", None) or os.getcwd())
+    try:
+        config = _strip_comments(load_raw_config())
+    except Exception:  # noqa: BLE001
+        config = {}
+    err = _resolve_generate_specs(args, workspace_path=workspace_path)
+    if err is not None:
+        return err
+    _resolve_agile_args(args, config=config, workspace_path=workspace_path, flow="patch")
+    return await cmd_run(args)
+
+
+async def cmd_deploy(args: argparse.Namespace) -> int:
+    """`teane deploy` — artifacts + dev container + sign-off.
+
+    Pins args.flow="deploy" and args.deploy_dev=True so cmd_run's existing
+    deployment edges fire. install_doc is True so INSTALLATION.md is
+    updated with the deployed port surface at the end.
+    """
+    args.flow = "deploy"
+    args.new_build = False
+    args.deploy_dev = True
+    args.install_doc = True
+    args.assume_yes = False
+    args.spec_discovery = False
+    args.generate_specs = False
+    args.decomposition_enabled = False
+    args.commit_on_story = False
+    args.story_batch_size = 5
+    args.story_repair_cap = 3
+    # Deploy-specific HITL gates: only --hitl-deployment is exposed; the
+    # build/patch gates are pinned to false here so cmd_run's resolver
+    # doesn't surprise an operator who never sees them on the CLI.
+    for dest in ("hitl_requirement", "hitl_architecture", "hitl_repair", "hitl_layout_divergence"):
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+    return await cmd_run(args)
 
 
 async def cmd_resume(args: argparse.Namespace) -> int:
@@ -7201,7 +7371,7 @@ def cmd_pre_flight(args: argparse.Namespace) -> int:
     # restored the real platform predicates after the probe pass.
     header_platform = platform_override
 
-    if getattr(args, "json", False):
+    if getattr(args, "json_dump", False):
         sys.stdout.write(
             _preflight.render_json(results, platform_name=header_platform) + "\n"
         )
@@ -7463,8 +7633,8 @@ async def cmd_metrics(args: argparse.Namespace) -> int:
         return 1
 
     # Output routing. Human (default) → stdout. JSON / Prometheus go to
-    # the configured metrics_dir unless --output overrides.
-    if args.json:
+    # the configured metrics_dir unless --output-path overrides.
+    if getattr(args, "json_dump", False):
         if args.session_id:
             body = json.dumps(metrics_list[0].to_jsonable(), indent=2) + "\n"
             default_name = f"{args.session_id}.json"
@@ -7474,13 +7644,13 @@ async def cmd_metrics(args: argparse.Namespace) -> int:
                 indent=2,
             ) + "\n"
             default_name = "sessions.json"
-        _emit_output(body, default_name, metrics_dir, args.output, write_atomic)
+        _emit_output(body, default_name, metrics_dir, getattr(args, "output_path", None), write_atomic)
     elif args.prometheus:
         body = format_prometheus(metrics_list, hard_cap_usd=hard_cap_usd)
         default_name = (
             f"{args.session_id}.prom" if args.session_id else "all.prom"
         )
-        _emit_output(body, default_name, metrics_dir, args.output, write_atomic)
+        _emit_output(body, default_name, metrics_dir, getattr(args, "output_path", None), write_atomic)
     else:
         # Human-readable: always to stdout.
         if args.session_id:
@@ -7570,62 +7740,110 @@ def build_parser() -> argparse.ArgumentParser:
             f"Expected true|false (or yes|no, 1|0), got {value!r}"
         )
 
-    # --- `teane run` ---
-    run_parser = subparsers.add_parser("run", help="Execute the agent graph on a workspace")
-    # --workspace and --prompt are NOT required at the argparse level so that
-    # `teane run` with no flags can drop the user into the interactive
-    # setup wizard (harness.wizard.run_setup_wizard). The handler enforces
-    # "both or neither" — passing only one still errors out the same way.
-    run_parser.add_argument(
-        "--workspace", "-w",
-        default=None,
-        help="Absolute or relative path to the target repository root.",
-    )
-    run_parser.add_argument(
-        "--prompt", "-p",
-        default=None,
-        help="The engineering task description (e.g., 'Refactor the auth module to use JWT').",
-    )
-    run_parser.add_argument(
-        "--build-cmd",
-        default=None,
-        help="Override the build command (e.g., 'make build'). Falls back to config or 'make build'.",
-    )
-    run_parser.add_argument(
-        "--session-id",
-        default=None,
-        help="Human-readable session identifier. Auto-generated UUIDv4 if not provided.",
-    )
-    run_parser.add_argument(
-        "--thread-id",
-        default=None,
-        help="LangGraph thread ID for checkpoint lookups. Defaults to session-id.",
-    )
-    # --allow-network defaults to TRUE so the sandbox can pip/npm-install
-    # without an extra flag. Pass --allow-network false to block outbound
-    # traffic explicitly (e.g. when scanning untrusted spec input).
-    run_parser.add_argument(
-        "--allow-network",
-        type=_bool_choice,
-        default=True,
-        metavar="true|false",
-        dest="allow_network",
+    # ------------------------------------------------------------------
+    # `teane build` / `teane patch` / `teane deploy` parsers share most
+    # of their surface (workspace, prompt, verbose, allow-network, git,
+    # HITL gates...). _add_runlike_common emits the shared block; the
+    # caller then adds command-specific flags. The legacy `teane run`
+    # subcommand has been removed — operators pick build/patch/deploy
+    # based on intent.
+    # ------------------------------------------------------------------
+    def _add_runlike_common(p: argparse.ArgumentParser, *, want_prompt: bool = True) -> None:
+        p.add_argument(
+            "--workspace", "-w",
+            default=None,
+            help="Absolute or relative path to the target repository root.",
+        )
+        if want_prompt:
+            p.add_argument(
+                "--prompt", "-p",
+                default=None,
+                help="The engineering task description.",
+            )
+        p.add_argument(
+            "--verbose", "-v",
+            action="store_true",
+            default=False,
+            help="Enable debug-level logging.",
+        )
+        p.add_argument(
+            "--allow-network",
+            type=_bool_choice,
+            default=True,
+            metavar="true|false",
+            dest="allow_network",
+            help=(
+                "Permit outbound network traffic in the sandbox. Defaults "
+                "to true; pass --allow-network false to block."
+            ),
+        )
+        p.add_argument(
+            "--git",
+            type=_bool_choice,
+            default=False,
+            metavar="true|false",
+            help=(
+                "Enable GitGuardian stash/patch-branch/rollback. True "
+                "requires the workspace to be a git repo. Defaults to false."
+            ),
+        )
+        p.add_argument(
+            "--build-cmd",
+            default=None,
+            help="Override the build command (e.g., 'make build').",
+        )
+        p.add_argument(
+            "--session-id",
+            default=None,
+            help="Human-readable session identifier. UUIDv4 if omitted.",
+        )
+        p.add_argument(
+            "--thread-id",
+            default=None,
+            help="LangGraph thread ID for checkpoint lookups. Defaults to session-id.",
+        )
+        p.add_argument(
+            "--force-lock",
+            action="store_true",
+            default=False,
+            dest="force_lock",
+            help=(
+                "Bypass the workspace session lock. Use ONLY for stale-lock "
+                "recovery after a crash; concurrent runs corrupt patches."
+            ),
+        )
+
+    # HITL gates shared by build / patch (deploy adds only --hitl-deployment).
+    def _add_hitl_buildpatch(p: argparse.ArgumentParser) -> None:
+        for flag, dest, help_text in (
+            ("--hitl-requirement", "hitl_requirement",
+             "Prompt the operator at the REQUIREMENTS gate. "
+             "Falls back to config.json hitl.requirement, then to true."),
+            ("--hitl-architecture", "hitl_architecture",
+             "Prompt the operator at the ARCHITECTURE gate. "
+             "Falls back to config.json hitl.architecture, then to true."),
+            ("--hitl-repair", "hitl_repair",
+             "Prompt at the repair-loop HITL menu when iteration limits trip. "
+             "Falls back to config.json hitl.repair, then to true."),
+            ("--hitl-layout-divergence", "hitl_layout_divergence",
+             "Prompt when the on-disk layout drifts from SPEC_ARCHITECTURE.md "
+             "workspace_layout. Falls back to config.json hitl.layout_divergence."),
+        ):
+            p.add_argument(
+                flag, type=_bool_choice, default=None,
+                metavar="true|false", dest=dest, help=help_text,
+            )
+
+    # --- `teane build` (greenfield, destructive) ---
+    build_parser = subparsers.add_parser(
+        "build",
         help=(
-            "Permit outbound network traffic in the sandbox. Defaults to "
-            "true; pass --allow-network false to block."
+            "Greenfield build: wipe the workspace (preserving product_spec/ "
+            "and .git/), then generate code from the spec."
         ),
     )
-    run_parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable debug-level logging.",
-    )
-    # --spec-discovery true|false. When true, both the requirements
-    # discovery interview AND the architecture discovery interview run
-    # before the patcher. False (default) skips the discovery chain
-    # entirely and routes straight to the patcher.
-    run_parser.add_argument(
+    _add_runlike_common(build_parser)
+    build_parser.add_argument(
         "--spec-discovery",
         type=_bool_choice,
         default=False,
@@ -7633,265 +7851,149 @@ def build_parser() -> argparse.ArgumentParser:
         dest="spec_discovery",
         help=(
             "When true, run BOTH the requirements and architecture "
-            "discovery interviews before code generation. Recommended for "
-            "greenfield projects. Defaults to false (skip both interviews)."
+            "discovery interviews before code generation. Defaults to false."
         ),
     )
-    # --deploy-dev true|false. When true, the harness continues past the
-    # security scan into the deployment phase: either runs
-    # deployment_discovery_node (when --cd-discovery is true) or skips it
-    # (when --cd-discovery is false), then deploys to the dev environment
-    # via `docker compose up`. Default false stops right after the
-    # security scan.
-    run_parser.add_argument(
-        "--deploy-dev",
-        type=_bool_choice,
-        default=False,
-        metavar="true|false",
-        dest="deploy_dev",
-        help=(
-            "When true, continue past the security scan into deployment "
-            "(with or without LLM-driven discovery, controlled by "
-            "--cd-discovery), then `docker compose up`. Defaults to false."
-        ),
-    )
-    # --cd-discovery true|false. When true and --deploy-dev is also true,
-    # runs deployment_discovery_node to synthesise DEPLOYMENT_BLUEPRINT.md
-    # before deploying. When false, the deployment step skips the LLM
-    # interview and synthesises the blueprint from workspace telemetry
-    # alone. When --deploy-dev is false this flag has no observable effect.
-    run_parser.add_argument(
+    build_parser.add_argument(
         "--cd-discovery",
         type=_bool_choice,
         default=False,
         metavar="true|false",
         dest="cd_discovery",
         help=(
-            "Container-deployment discovery. When true (and --deploy-dev "
-            "is true), synthesise DEPLOYMENT_BLUEPRINT.md from the "
-            "codebase before deploying. When false, the deployment step "
-            "skips the LLM interview and synthesises the blueprint from "
-            "workspace telemetry alone. Defaults to false."
+            "Run deployment discovery and write docs/DEPLOYMENT_DISCOVERY.md. "
+            "Build does NOT deploy — that's `teane deploy`. Defaults to false."
         ),
     )
-    # --install-doc true|false. When true, the harness runs
-    # installation_doc_node at the end of a successful build, synthesising
-    # INSTALLATION.md from workspace telemetry + manifests + the Build & Run
-    # section of SPEC_ARCHITECTURE.md (+ the deployment blueprint when
-    # --deploy-dev was also used). Defaults to the value of --new-build:
-    # on for greenfield app generation, off for incremental change-request
-    # runs where the installation steps don't materially change.
-    run_parser.add_argument(
-        "--install-doc",
+    build_parser.add_argument(
+        "--agile",
         type=_bool_choice,
         default=None,
         metavar="true|false",
-        dest="install_doc",
+        dest="agile",
         help=(
-            "Synthesise INSTALLATION.md at the end of a successful build. "
-            "Defaults to the value of --new-build (on for greenfield, off "
-            "for change-request runs)."
+            "Engage Agile-style story decomposition + per-story TDD. "
+            "Falls back to config.json's top-level `agile` key, then to false. "
+            "Per-knob tuning (batch_size, commit_on_story, repair_cap) lives "
+            "in config.json's agile_defaults block."
         ),
     )
-    # Story-mode flags (Agile decomposition + per-story TDD). Default OFF
-    # so today's monolithic flow is unchanged for everyone who doesn't
-    # opt in. Set --stories true to have decomposition_node split the
-    # approved SPEC_REQUIREMENTS.md into vertical-slice stories and run
-    # them one-at-a-time through the existing patch / compile / review
-    # chain. Per-story progress lives in <workspace>/.teane/state.db;
-    # docs/STORIES.md + docs/TRACEABILITY.md are regenerated views.
-    run_parser.add_argument(
-        "--stories",
-        type=_bool_choice,
-        default=False,
-        metavar="true|false",
-        dest="decomposition_enabled",
-        help=(
-            "Enable Agile-style story decomposition + per-story TDD. "
-            "When true, the approved SPEC_REQUIREMENTS.md is split into "
-            "vertical-slice stories (acceptance criteria first, then "
-            "code, then optional commit) instead of one monolithic "
-            "patching pass. Defaults to false (today's flow)."
-        ),
-    )
-    run_parser.add_argument(
-        "--story-batch-size",
-        type=int,
-        default=5,
-        metavar="N",
-        dest="story_batch_size",
-        help=(
-            "Max stories the planner picks per dependency-ordered batch. "
-            "Only meaningful when --stories=true. Defaults to 5."
-        ),
-    )
-    run_parser.add_argument(
-        "--commit-on-story",
-        type=_bool_choice,
-        default=False,
-        metavar="true|false",
-        dest="commit_on_story",
-        help=(
-            "When true (and --stories=true), `git commit` after each "
-            "green story with `<STORY-N>: <title>` and record the SHA "
-            "in .teane/state.db. No-op when the workspace isn't a git "
-            "repo. Defaults to false."
-        ),
-    )
-    run_parser.add_argument(
-        "--story-repair-cap",
-        type=int,
-        default=3,
-        metavar="N",
-        dest="story_repair_cap",
-        help=(
-            "Max repair iterations before a story is parked as `blocked` "
-            "(a defect is recorded; the batch continues to the next "
-            "story). Only meaningful when --stories=true. Defaults to 3."
-        ),
-    )
-    # P1.7: workspace-lock override. When another live `teane run` holds
-    # the workspace's session lock, the new run normally refuses to start.
-    # Pass this flag to take the lock anyway — meant for the recovery case
-    # where a previous process crashed without releasing it.
-    run_parser.add_argument(
-        "--force-lock",
-        action="store_true",
-        default=False,
-        dest="force_lock",
-        help=(
-            "Bypass the workspace session lock. Use ONLY when the previous "
-            "teane run process crashed and the .harness_session.lock file "
-            "is stale; running two live sessions concurrently against one "
-            "workspace will corrupt each other's patches."
-        ),
-    )
-    # --new-build true|false. When true, the harness deletes every file
-    # / dir at workspace root except product_spec/ and .git/, commits
-    # the cleanup on the base branch (master or main), and deletes
-    # every orphaned agent/patch-* branch — see _perform_new_build_reset.
-    # Pairs with --yes to skip the interactive confirmation prompt.
-    run_parser.add_argument(
-        "--new-build",
-        dest="new_build",
-        type=_bool_choice,
-        default=False,
-        metavar="true|false",
-        help=(
-            "When true, treat this as a brand-new app: delete every file "
-            "and directory at the workspace root EXCEPT `product_spec/` and "
-            "`.git/`, commit the deletions on the base branch (master / "
-            "main), and remove every orphaned `agent/patch-*` branch in the "
-            "repo. The harness prints a preview and asks for confirmation "
-            "before deleting anything; pass --yes alongside to skip the "
-            "prompt for automation. Defaults to false (steady-state)."
-        ),
-    )
-    # --yes is a confirmation MODIFIER for --new-build, not a standalone
-    # flag. cmd_run rejects --yes when --new-build is false (or omitted).
-    run_parser.add_argument(
+    build_parser.add_argument(
         "--yes", "-y",
         action="store_true",
         default=False,
         dest="assume_yes",
         help=(
-            "Skip the --new-build true confirmation prompt. ONLY valid "
-            "when --new-build is true; passing --yes alone is an error."
+            "Skip the workspace-reset confirmation prompt. Build is always "
+            "destructive; use -y in CI or when you're sure."
         ),
     )
-    # --git true|false. Default FALSE — GitGuardian (stash, patch branch,
-    # rollback) is OFF unless the operator opts in. Pass --git true to
-    # restore the protection for git-tracked workspaces. Security
-    # scanners (gitleaks, etc.) still run either way.
-    run_parser.add_argument(
-        "--git",
+    _add_hitl_buildpatch(build_parser)
+
+    # --- `teane patch` (brownfield, planner-reconciles) ---
+    patch_parser = subparsers.add_parser(
+        "patch",
+        help=(
+            "Incremental patch: read the existing code + specs + any "
+            "change_requests/*.txt, reconcile against the spec."
+        ),
+    )
+    _add_runlike_common(patch_parser)
+    patch_parser.add_argument(
+        "--spec-discovery",
         type=_bool_choice,
         default=False,
         metavar="true|false",
+        dest="spec_discovery",
         help=(
-            "Enable GitGuardian stash/patch-branch/rollback for the "
-            "workspace. True requires the workspace to be a git repo; "
-            "false skips every git-aware step. Defaults to false. "
-            "Security scanners (gitleaks, etc.) still run either way."
+            "When true, re-run the requirements + architecture discovery "
+            "interviews to revise the specs before patching. Defaults to false."
         ),
     )
-    # ----- HITL gate switches (true => prompt, false => auto-approve) -----
-    # Each flag's effective value is resolved in three tiers (see
-    # _resolve_hitl_flags): (1) the CLI flag when explicitly passed;
-    # (2) the matching value in config.json's `hitl` section; (3) True.
-    # The argparse default is the `None` SENTINEL — argparse can't
-    # distinguish "operator omitted" from "operator passed false" with a
-    # plain bool default, so we leave it null here and let the resolver
-    # fall through to the next tier when None.
-    run_parser.add_argument(
-        "--hitl-requirement",
+    patch_parser.add_argument(
+        "--generate-specs",
         type=_bool_choice,
         default=None,
         metavar="true|false",
-        dest="hitl_requirement",
+        dest="generate_specs",
         help=(
-            "When true, prompt the operator at the requirements gate "
-            "(both the pre-graph interactive review and the in-graph "
-            "REQUIREMENTS gatekeeper). Falls back to config.json's "
-            "hitl.requirement, then to true."
+            "Reverse-engineer SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md "
+            "from the existing codebase. Default (unset) = auto: generate "
+            "only when both spec files are missing. true = always "
+            "regenerate (overwrites after review). false = error if specs "
+            "are missing."
         ),
     )
-    run_parser.add_argument(
-        "--hitl-architecture",
+    patch_parser.add_argument(
+        "--agile",
         type=_bool_choice,
         default=None,
         metavar="true|false",
-        dest="hitl_architecture",
+        dest="agile",
         help=(
-            "When true, prompt the operator at the ARCHITECTURE "
-            "gatekeeper. Falls back to config.json's hitl.architecture, "
-            "then to true."
+            "Engage Agile-style story decomposition + per-story TDD. "
+            "Default (unset) = auto-detect from .teane/state.db (non-empty "
+            "→ agile). true = force agile (decomposes into first story set "
+            "on a flat workspace). false = force flat (logs a gap-marker "
+            "row in state.db on agile workspaces)."
         ),
     )
-    run_parser.add_argument(
-        "--hitl-repair",
+    patch_parser.add_argument(
+        "--cd-discovery",
         type=_bool_choice,
-        default=None,
+        default=False,
         metavar="true|false",
-        dest="hitl_repair",
+        dest="cd_discovery",
         help=(
-            "When true, fire the repair-loop HITL menu when iteration "
-            "limits trip. Falls back to config.json's hitl.repair, "
-            "then to true."
+            "Run deployment discovery and write docs/DEPLOYMENT_DISCOVERY.md. "
+            "Patch does NOT deploy — that's `teane deploy`. Defaults to false."
         ),
     )
-    run_parser.add_argument(
+    patch_parser.add_argument(
+        "--install-doc",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="install_doc",
+        help=(
+            "Update INSTALLATION.md at the end of a successful patch. "
+            "Defaults to false (incremental changes rarely affect install "
+            "steps)."
+        ),
+    )
+    _add_hitl_buildpatch(patch_parser)
+
+    # --- `teane deploy` (artifacts + dev container + sign-off) ---
+    deploy_parser = subparsers.add_parser(
+        "deploy",
+        help=(
+            "Synthesize deployment artifacts (Dockerfile + compose), bring "
+            "up the dev environment, run health checks, update install docs."
+        ),
+    )
+    _add_runlike_common(deploy_parser)
+    deploy_parser.add_argument(
+        "--cd-discovery",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="cd_discovery",
+        help=(
+            "Run the LLM-driven deployment discovery interview before "
+            "synthesizing DEPLOYMENT_BLUEPRINT.md. When false (default), "
+            "the blueprint is synthesized from workspace telemetry alone."
+        ),
+    )
+    deploy_parser.add_argument(
         "--hitl-deployment",
         type=_bool_choice,
         default=None,
         metavar="true|false",
         dest="hitl_deployment",
         help=(
-            "When true, prompt the operator at the DEPLOYMENT gatekeeper "
-            "before the dev deploy fires. Falls back to config.json's "
-            "hitl.deployment, then to true."
-        ),
-    )
-    # --hitl-layout-divergence true|false. When the spec-driven patcher
-    # allowlist (built from SPEC_ARCHITECTURE.md's workspace_layout block)
-    # finds substantial source files in top-level dirs the spec didn't
-    # declare, the harness can either log-and-continue or pause for
-    # operator reconciliation. Resolved the same three-tier way as the
-    # other --hitl-* flags. Log + observability event fire either way;
-    # only the interactive gate is gated by this flag.
-    run_parser.add_argument(
-        "--hitl-layout-divergence",
-        type=_bool_choice,
-        default=None,
-        metavar="true|false",
-        dest="hitl_layout_divergence",
-        help=(
-            "When true, prompt the operator when the on-disk top-level "
-            "layout drifts from SPEC_ARCHITECTURE.md's workspace_layout "
-            "block by ≥3 source files (or ≥15%% of workspace source) in "
-            "an unspec'd directory. Falls back to config.json's "
-            "hitl.layout_divergence, then to true. The "
-            "spec_layout_divergence observability event fires regardless."
+            "Prompt the operator at the DEPLOYMENT gate before the dev "
+            "deploy fires. Falls back to config.json hitl.deployment, "
+            "then to true."
         ),
     )
 
@@ -8013,9 +8115,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plain text output for CI / log capture.",
     )
     pre_flight_parser.add_argument(
-        "--json",
-        action="store_true",
+        "--json-dump",
+        type=_bool_choice,
         default=False,
+        metavar="true|false",
+        dest="json_dump",
         help="Machine-readable JSON output.",
     )
 
@@ -8055,20 +8159,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Roll-up table across every session in the log dir.",
     )
     metrics_parser.add_argument(
-        "--json",
-        action="store_true",
+        "--json-dump",
+        type=_bool_choice,
         default=False,
-        help="Write machine-readable JSON to <metrics_dir>/ (or stdout with --output -).",
+        metavar="true|false",
+        dest="json_dump",
+        help="Write machine-readable JSON to <metrics_dir>/ (or stdout with --output-path -).",
     )
     metrics_parser.add_argument(
         "--prometheus",
         action="store_true",
         default=False,
-        help="Write Prometheus text-exposition output to <metrics_dir>/ (or stdout with --output -).",
+        help="Write Prometheus text-exposition output to <metrics_dir>/ (or stdout with --output-path -).",
     )
     metrics_parser.add_argument(
-        "--output",
+        "--output-path",
         default=None,
+        dest="output_path",
         help="Override the destination path. Use '-' to emit to stdout.",
     )
     metrics_parser.add_argument(
@@ -8179,63 +8286,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # --- `teane schedule` (#13) ---
-    schedule_parser = subparsers.add_parser(
-        "schedule",
-        help="Cron-driven background daemon — runs configured jobs on a recurring schedule.",
-    )
-    schedule_subparsers = schedule_parser.add_subparsers(
-        dest="schedule_action", help="Schedule action",
-    )
-    schedule_run_parser = schedule_subparsers.add_parser(
-        "run", help="Start the daemon (foreground).",
-    )
-    schedule_run_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
-    )
-    schedule_list_parser = schedule_subparsers.add_parser(
-        "list", help="Print configured jobs with their schedules + next/last run times.",
-    )
-    schedule_list_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
-    )
-    schedule_validate_parser = schedule_subparsers.add_parser(
-        "validate", help="Parse the schedule section and report any issues.",
-    )
-    schedule_validate_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
-    )
-    schedule_once_parser = schedule_subparsers.add_parser(
-        "once", help="Run a single named job immediately, regardless of its schedule.",
-    )
-    schedule_once_parser.add_argument("name", help="Job name (from schedule.jobs[].name)")
-    schedule_once_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
-    )
-    schedule_history_parser = schedule_subparsers.add_parser(
-        "history", help="Show recent job execution history (read from the SQLite store).",
-    )
-    schedule_history_parser.add_argument(
-        "--job", default=None,
-        help="Restrict to a single job name.",
-    )
-    schedule_history_parser.add_argument(
-        "--limit", type=int, default=20,
-        help="Max rows to show per job (default 20).",
-    )
-    schedule_history_parser.add_argument(
-        "--workspace", "-w", "-r",
-        default=None,
-        help="Workspace path (for config discovery). Defaults to current directory.",
-    )
+    # `teane schedule` was removed from the CLI. The ScheduleDaemon module
+    # (harness/schedule.py) and its config section are preserved so the
+    # web dashboard can drive scheduled runs in a future iteration. Don't
+    # re-register a parser here.
 
     # --- `teane chat` (#8) ---
     chat_parser = subparsers.add_parser(
@@ -8440,8 +8494,12 @@ def main() -> int:
         logging.getLogger("harness").setLevel(logging.DEBUG)
 
     try:
-        if args.command == "run":
-            return asyncio.run(cmd_run(args))
+        if args.command == "build":
+            return asyncio.run(cmd_build(args))
+        elif args.command == "patch":
+            return asyncio.run(cmd_patch(args))
+        elif args.command == "deploy":
+            return asyncio.run(cmd_deploy(args))
         elif args.command == "resume":
             return asyncio.run(cmd_resume(args))
         elif args.command == "status":
@@ -8469,20 +8527,8 @@ def main() -> int:
                 return cmd_web_stop(args)
             parser.parse_args([args.command, "--help"])
             return 1
-        elif args.command == "schedule":
-            action = getattr(args, "schedule_action", None)
-            if action == "run":
-                return asyncio.run(cmd_schedule_run(args))
-            if action == "list":
-                return cmd_schedule_list(args)
-            if action == "validate":
-                return cmd_schedule_validate(args)
-            if action == "once":
-                return asyncio.run(cmd_schedule_once(args))
-            if action == "history":
-                return cmd_schedule_history(args)
-            parser.parse_args([args.command, "--help"])
-            return 1
+        # `teane schedule` was removed from the CLI surface — the daemon
+        # module remains importable for web-driven invocation later.
         elif args.command == "index":
             action = getattr(args, "index_action", None)
             if action == "build":

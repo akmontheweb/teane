@@ -605,10 +605,18 @@ class TestPurgeStateDb:
         app_target = app_name_for_workspace(str(ws_target))
         app_other = app_name_for_workspace(str(ws_other))
 
+        from harness.story_state import ensure_feature
         conn = open_story_db()
         try:
-            create_stories(conn, app_target, [{"title": "T1"}, {"title": "T2"}])
-            create_stories(conn, app_other, [{"title": "O1"}])
+            ensure_feature(conn, app_target, "test", name="test")
+            ensure_feature(conn, app_other, "test", name="test")
+            create_stories(conn, app_target, [
+                {"title": "T1", "feature": "test"},
+                {"title": "T2", "feature": "test"},
+            ])
+            create_stories(conn, app_other, [
+                {"title": "O1", "feature": "test"},
+            ])
         finally:
             conn.close()
 
@@ -630,9 +638,11 @@ class TestPurgeStateDb:
         ws = tmp_path / "ws"
         ws.mkdir()
         app = app_name_for_workspace(str(ws))
+        from harness.story_state import ensure_feature
         conn = open_story_db()
         try:
-            create_stories(conn, app, [{"title": "first"}])
+            ensure_feature(conn, app, "test", name="test")
+            create_stories(conn, app, [{"title": "first", "feature": "test"}])
         finally:
             conn.close()
 
@@ -652,12 +662,14 @@ class TestPurgeStateDb:
             open_story_db, purge_state_db, record_commit, record_defect,
             start_batch,
         )
+        from harness.story_state import ensure_feature
         ws = tmp_path / "counts-ws"
         ws.mkdir()
         app = app_name_for_workspace(str(ws))
         conn = open_story_db()
         try:
-            create_stories(conn, app, [{"title": "T"}])
+            ensure_feature(conn, app, "test", name="test")
+            create_stories(conn, app, [{"title": "T", "feature": "test"}])
             bid = start_batch(conn, app, "sess-1", ["STORY-1"])
             link_file(conn, app, "STORY-1", "a.py", "code", batch_id=bid)
             record_defect(
@@ -787,10 +799,19 @@ class TestNewBuildResetWipesStateDb:
         ws_other = tmp_path / "untouched"
         ws_other.mkdir()
         app_other = app_name_for_workspace(str(ws_other))
+        from harness.story_state import ensure_feature
         conn = open_story_db()
         try:
-            create_stories(conn, app_target, [{"title": "prior session"}])
-            create_stories(conn, app_other, [{"title": "leave me alone"}])
+            ensure_feature(conn, app_target, "test", name="test")
+            ensure_feature(conn, app_other, "test", name="test")
+            create_stories(
+                conn, app_target,
+                [{"title": "prior session", "feature": "test"}],
+            )
+            create_stories(
+                conn, app_other,
+                [{"title": "leave me alone", "feature": "test"}],
+            )
         finally:
             conn.close()
 
@@ -817,9 +838,11 @@ class TestNewBuildResetWipesStateDb:
         # No `_init_repo` — _perform_new_build_reset's git-mode branch
         # returns early after the state.db purge step.
         app = app_name_for_workspace(str(ws))
+        from harness.story_state import ensure_feature
         conn = open_story_db()
         try:
-            create_stories(conn, app, [{"title": "prior"}])
+            ensure_feature(conn, app, "test", name="test")
+            create_stories(conn, app, [{"title": "prior", "feature": "test"}])
         finally:
             conn.close()
 

@@ -388,9 +388,9 @@ class TestRenderJSON:
 
 class TestCLIIntegration:
     def test_pre_flight_cli_json_quick(self):
-        """`python -m harness.cli pre-flight --json --quick` produces parseable JSON."""
+        """`python -m harness.cli pre-flight --json-dump true --quick` produces parseable JSON."""
         result = subprocess.run(
-            [sys.executable, "-m", "harness.cli", "pre-flight", "--json", "--quick"],
+            [sys.executable, "-m", "harness.cli", "pre-flight", "--json-dump", "true", "--quick"],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=30, check=False,

@@ -40,8 +40,8 @@
     "_node_throttle_comment": "Per-loop iteration ceilings \u2014 prevent runaway loops. max_patch_repair_iterations caps how many times the repair loop can retry a failing build (defaults to 3 \u2192 routes to HITL after the third miss). max_doc_review_cycles / max_code_review_cycles cap the adversarial doc-reviewer / code-reviewer revision rounds. max_discovery_iterations caps the requirements/architecture interview loop. max_end_of_session_regression_cycles caps the final regression repair loop after security_scan passes but before deployment (Phase G). end_of_session_repair_diagnostic_cap / end_of_session_repair_inventory_cap raise the per-file context limits in repair prompts at the end-of-session regression to give the LLM enough surface to spot shared-utility cascade fixes (Phase J); end_of_session_force_reasoning_model jumps straight to the reasoning model on the first EoS repair attempt instead of burning cheap-model rounds.",
     "node_throttle": {
         "max_code_review_cycles": 2,
-        "max_discovery_iterations": 2,
-        "max_doc_review_cycles": 2,
+        "max_discovery_iterations": 1,
+        "max_doc_review_cycles": 1,
         "max_patch_repair_iterations": 3,
         "max_end_of_session_regression_cycles": 3,
         "end_of_session_repair_diagnostic_cap": 30,
@@ -432,5 +432,13 @@
             "_legacy_compat_mode_comment": "Relaxes shape and naming checks so the harness can co-exist with a pre-existing legacy compose stack. Boolean: true | false. Default false; flip to true only when adopting the harness on an already-running deployment.",
             "legacy_compat_mode": false
         }
+    },
+    "_agile_comment": "Top-level Agile-mode default. When true (and the operator did not pass --agile on the command line), `teane build` and `teane patch` engage story decomposition + per-story TDD. `teane patch` additionally auto-detects agile from a non-empty .teane/state.db in the workspace regardless of this flag. Defaults to false (today's monolithic patching flow).",
+    "agile": false,
+    "_agile_defaults_comment": "Agile-mode tuning knobs. Replaces the legacy --story-batch-size / --commit-on-story / --story-repair-cap CLI flags. batch_size = max stories the planner picks per dependency-ordered batch. commit_on_story = `git commit` after each green story with `<STORY-N>: <title>` (no-op on non-git workspaces). repair_cap = max repair iterations before a story is parked as `blocked` and the batch advances. Only consulted when agile mode is engaged.",
+    "agile_defaults": {
+        "batch_size": 5,
+        "commit_on_story": false,
+        "repair_cap": 3
     }
 }

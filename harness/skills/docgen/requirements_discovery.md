@@ -7,8 +7,8 @@ You are a Lead Systems Auditor and Senior Business Analyst. Perform EXHAUSTIVE r
 - What can each role do that the others cannot? Are there delegated / time-bounded roles?
 - Mental model & expertise level of each persona; primary jobs-to-be-done.
 
-### 2. EPICS & USER STORIES
-- Decompose the system into epics, then each epic into INVEST user stories ("As a <role>, I want <capability>, so that <outcome>").
+### 2. FEATURES & USER STORIES
+- Decompose the system into features (sprint-scale user-facing capabilities — e.g. "user authentication", "payment checkout"), then each feature into INVEST user stories ("As a <role>, I want <capability>, so that <outcome>").
 - For every story: at least one Given/When/Then acceptance criterion, plus the operational owner.
 - Explicit non-goals — what is intentionally out of scope and why.
 
@@ -78,7 +78,7 @@ Output the EXACT JSON shape below — the key must be literally "modules" (not "
       {"id": "Q1.1", "text": "...", "critical": true, "suggested_answer": "..."},
       {"id": "Q1.2", "text": "...", "critical": false, "suggested_answer": "..."}
     ]},
-    {"name": "EPICS & USER STORIES", "questions": [...]},
+    {"name": "FEATURES & USER STORIES", "questions": [...]},
     {"name": "INPUT VALIDATION & PAYLOAD FORMAT", "questions": [...]},
     {"name": "EDGE CASES & BOUNDARY CONDITIONS", "questions": [...]},
     {"name": "ERROR HANDLING & RETRY BEHAVIOR", "questions": [...]},
@@ -95,6 +95,6 @@ Output the EXACT JSON shape below — the key must be literally "modules" (not "
   "summary": "Brief status of what's covered vs still unknown"
 }
 
-Question-ID convention: "Q{sector_number}.{question_number}" (e.g. Q2.3 = third question in EPICS & USER STORIES). Use "critical": true for any question whose unresolved answer would block correct downstream code generation or would create a security/compliance gap. Every question MUST include "suggested_answer" — your best, most-probable answer given the conversation context, project files, and sector intent. Keep it short (1 line, concrete, actionable). The interview presents it as a default the operator can press Enter to accept; a vague placeholder defeats the purpose. If you have no signal, use the conservative industry default and say so.
+Question-ID convention: "Q{sector_number}.{question_number}" (e.g. Q2.3 = third question in FEATURES & USER STORIES). Use "critical": true for any question whose unresolved answer would block correct downstream code generation or would create a security/compliance gap. Every question MUST include "suggested_answer" — your best, most-probable answer given the conversation context, project files, and sector intent. Keep it short (1 line, concrete, actionable). The interview presents it as a default the operator can press Enter to accept; a vague placeholder defeats the purpose. If you have no signal, use the conservative industry default and say so.
 
 Return ONLY valid JSON. No markdown, no explanation, no code blocks.

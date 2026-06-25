@@ -6291,14 +6291,14 @@ class TestCLI:
         # unless the operator opts in explicitly.
         from harness.cli import build_parser
         parser = build_parser()
-        args = parser.parse_args(["run", "--workspace", ".", "--prompt", "t"])
+        args = parser.parse_args(["build", "--workspace", ".", "--prompt", "t"])
         assert args.spec_discovery is False
 
     def test_spec_discovery_true_enables_discovery(self):
         from harness.cli import build_parser
         parser = build_parser()
         args = parser.parse_args(
-            ["run", "--workspace", ".", "--prompt", "t", "--spec-discovery", "true"],
+            ["build", "--workspace", ".", "--prompt", "t", "--spec-discovery", "true"],
         )
         assert args.spec_discovery is True
 
@@ -6310,7 +6310,7 @@ class TestCLI:
         parser = build_parser()
         with _pytest.raises(SystemExit):
             parser.parse_args(
-                ["run", "--workspace", ".", "--prompt", "t", "--skip-discovery"],
+                ["build", "--workspace", ".", "--prompt", "t", "--skip-discovery"],
             )
 
     def test_validate_config_strict_raises_on_typo(self):

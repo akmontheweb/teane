@@ -63,6 +63,11 @@ def _seed_batch(
     app = story_state.app_name_for_workspace(workspace)
     conn = story_state.open_story_db()
     try:
+        # v4: every story needs a feature. Auto-seed a single ``test``
+        # feature and default unset stories to it.
+        story_state.ensure_feature(conn, app, "test", name="Test feature")
+        for s in stories:
+            s.setdefault("feature", "test")
         keys = story_state.create_stories(conn, app, stories)
         bid = story_state.start_batch(conn, app, session_id, keys)
     finally:

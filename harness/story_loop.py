@@ -65,16 +65,26 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
     Reads ``state['stories_db_path']`` (set by ``decomposition_node``)
     or falls back to ``state['workspace_path']``'s default location.
 
+    **Feature-first invariant** (v4 schema, 2026-06-25): a batch never
+    spans features. The planner picks the next feature (by feature_id
+    ascending) that has at least one ready story and takes up to
+    ``story_batch_size`` of THAT feature's ready stories. Small
+    features land in one batch; larger features (more than
+    story_batch_size stories) span multiple batches, all tagged with
+    the same ``feature_id``.
+
     Behavior:
 
     - If every story is already ``done`` → ``batch_planned=False``,
       ``all_complete=True``. The router uses this to fall through to
       the security-scan / installation-doc tail of the graph.
     - If some stories are still ``planned`` but blocked (a dependency
-      is ``blocked``/``in_progress``/missing) → returns no batch and
-      logs the stall so the operator sees why nothing fired.
+      is ``blocked``/``in_progress``/missing across every feature) →
+      returns no batch and logs the stall so the operator sees why
+      nothing fired.
     - Otherwise creates a batch with up to ``story_batch_size``
-      independent stories and sets ``current_batch_id``.
+      independent stories from the first feature with ready work,
+      and sets ``current_batch_id``.
 
     Does NOT mark stories ``in_progress`` — that's ``story_loop_node``'s
     job, called once per story as it picks them up.
@@ -154,18 +164,74 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
                 },
             }
 
-        picked = ready[:batch_size]
+        # Feature-first slicing: walk features in id-ascending order
+        # and grab the first one that owns at least one ready story.
+        # Within that feature we take up to story_batch_size ready
+        # stories, preserving their list order (already insertion-sorted
+        # by list_stories' ORDER BY s.id).
+        features = story_state.list_features(conn, workspace)
+        feature_order: list[Optional[int]] = [int(f["id"]) for f in features]
+        # Add `None` (unassigned) at the end as a defensive fallback —
+        # create_stories rejects feature-less inserts, but a corrupted
+        # row or a forced ON DELETE SET NULL could leave a story with
+        # feature_id=None. We don't want such stories to be invisible.
+        if any(r.get("feature_id") is None for r in ready):
+            feature_order.append(None)
+
+        picked: list[dict[str, Any]] = []
+        picked_feature_id: Optional[int] = None
+        picked_feature_label: Optional[str] = None
+        for fid in feature_order:
+            slice_ready = [
+                r for r in ready
+                if (None if r.get("feature_id") is None else int(r["feature_id"])) == fid
+            ]
+            if not slice_ready:
+                continue
+            picked = slice_ready[:batch_size]
+            picked_feature_id = fid
+            if fid is None:
+                picked_feature_label = "(unassigned)"
+            else:
+                picked_feature_label = (
+                    picked[0].get("feature_key") or f"feature#{fid}"
+                )
+            break
+
+        if not picked:
+            # Belt-and-braces: ``ready`` is non-empty but no feature
+            # matched. Should be unreachable — every ready story has
+            # a feature_id (from create_stories) or hits the None
+            # fallback above. Treat as a stall rather than crash.
+            logger.error(
+                "[batch_planner] %d ready stories but none matched any "
+                "feature slice — likely a corrupted DB row.", len(ready),
+            )
+            return {
+                "current_batch_id": 0,
+                "node_state": {
+                    "current_node": "batch_planner",
+                    "batch_planned": False,
+                    "all_complete": False,
+                    "stalled": True,
+                    "reason": "feature_slice_empty",
+                },
+            }
+
         picked_keys = [s["story_key"] for s in picked]
         batch_id = story_state.start_batch(
             conn, workspace, session_id, picked_keys,
             build_kind=batch_build_kind, cr_ids=batch_cr_ids,
+            feature_id=picked_feature_id,
         )
     finally:
         conn.close()
 
     logger.info(
-        "[batch_planner] batch %d planned with %d stories: %s",
-        batch_id, len(picked_keys), ", ".join(picked_keys),
+        "[batch_planner] batch %d planned with %d stories "
+        "from feature %s: %s",
+        batch_id, len(picked_keys),
+        picked_feature_label, ", ".join(picked_keys),
     )
     return {
         "current_batch_id": batch_id,
@@ -178,6 +244,8 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
             "batch_id": batch_id,
             "story_keys": picked_keys,
             "batch_size": len(picked_keys),
+            "feature_id": picked_feature_id,
+            "feature_key": picked_feature_label,
         },
     }
 

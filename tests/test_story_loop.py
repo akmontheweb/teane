@@ -22,9 +22,19 @@ def _app(workspace: str) -> str:
 
 
 def _seed_stories(workspace: str, items: list[dict[str, Any]]) -> None:
+    """Seed stories under a default ``test`` feature unless each item
+    already specifies a ``feature`` key. Auto-creates any referenced
+    feature_keys on the fly so test bodies don't have to."""
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
+        # Collect every feature_key referenced (defaulting to "test").
+        feature_keys: set[str] = set()
+        for item in items:
+            item.setdefault("feature", "test")
+            feature_keys.add(item["feature"])
+        for fkey in sorted(feature_keys):
+            story_state.ensure_feature(conn, app, fkey, name=fkey)
         story_state.create_stories(conn, app, items)
     finally:
         conn.close()
@@ -119,6 +129,92 @@ def test_batch_planner_writes_batch_row(workspace: str):
     finally:
         conn.close()
     assert row == ("sess-1", "running")
+
+
+# ---------------------------------------------------------------------------
+# Feature-first slicing — the v4 contract
+# ---------------------------------------------------------------------------
+
+def test_batch_planner_never_crosses_feature_boundary(workspace: str):
+    """A batch contains stories from exactly ONE feature, even when
+    other features have ready stories that would fit under the batch
+    size cap."""
+    _seed_stories(workspace, [
+        # Feature 'auth' first (lower feature.id).
+        {"title": "auth-1", "feature": "auth"},
+        {"title": "auth-2", "feature": "auth"},
+        # Feature 'billing' second — should NOT be mixed into the same batch.
+        {"title": "billing-1", "feature": "billing"},
+        {"title": "billing-2", "feature": "billing"},
+    ])
+    out = story_loop.batch_planner_node(
+        _state(workspace, story_batch_size=10),
+    )
+    assert out["node_state"]["batch_planned"] is True
+    keys = out["node_state"]["story_keys"]
+    # Only the auth feature's two stories — billing waits its turn.
+    assert set(keys) == {"STORY-1", "STORY-2"}
+    assert out["node_state"]["feature_key"] == "auth"
+    # The batches row carries the feature_id.
+    conn = story_state.open_story_db()
+    try:
+        row = conn.execute(
+            "SELECT feature_id FROM batches WHERE id = ?",
+            (out["current_batch_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] is not None
+
+
+def test_batch_planner_splits_large_feature_across_batches(workspace: str):
+    """A feature with more stories than ``story_batch_size`` lands in
+    multiple batches — all tagged with the same feature_id."""
+    _seed_stories(workspace, [
+        {"title": f"big-{i}", "feature": "big"} for i in range(7)
+    ])
+    out1 = story_loop.batch_planner_node(
+        _state(workspace, story_batch_size=3),
+    )
+    assert len(out1["node_state"]["story_keys"]) == 3
+    fid1 = out1["node_state"]["feature_id"]
+    # Mark the first batch's stories done so the next planner pass
+    # advances to the remaining feature stories.
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        for k in out1["node_state"]["story_keys"]:
+            story_state.mark_done(conn, app, k)
+    finally:
+        conn.close()
+    out2 = story_loop.batch_planner_node(
+        _state(workspace, story_batch_size=3),
+    )
+    # Still the same feature — never mixed with anything else.
+    assert out2["node_state"]["feature_id"] == fid1
+    assert len(out2["node_state"]["story_keys"]) == 3
+
+
+def test_batch_planner_advances_to_next_feature_when_first_done(workspace: str):
+    """After feature A's stories are all done, the next batch picks
+    feature B's stories."""
+    _seed_stories(workspace, [
+        {"title": "auth-1", "feature": "auth"},
+        {"title": "billing-1", "feature": "billing"},
+    ])
+    # First batch: feature auth.
+    out1 = story_loop.batch_planner_node(_state(workspace))
+    assert out1["node_state"]["feature_key"] == "auth"
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_done(conn, app, "STORY-1")
+    finally:
+        conn.close()
+    # Second batch: feature billing now picks up.
+    out2 = story_loop.batch_planner_node(_state(workspace))
+    assert out2["node_state"]["feature_key"] == "billing"
+    assert out2["node_state"]["story_keys"] == ["STORY-2"]
 
 
 # ---------------------------------------------------------------------------

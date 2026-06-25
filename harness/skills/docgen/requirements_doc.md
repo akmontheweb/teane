@@ -4,7 +4,7 @@ Downstream code generation, automated test suite design, and security reviews wi
 ### CRITICAL EXECUTION RULES:
 1. NEVER use placeholders, generic text, or lazy shortcuts (e.g., "TBD", "etc.", "appropriate security measures").
 2. If the input Product Specification leaves a variable, threshold, or requirement unspecified, you MUST inject a strict, conservative industry standard default, explicitly marking it as an assumption ([ASM-XX]) so a reviewer can easily audit it.
-3. Be exhaustive. Fully expand all sections. If an epic contains 5 distinct user workflows, document all 5 distinct user stories. Do not truncate.
+3. Be exhaustive. Fully expand all sections. If a feature contains 5 distinct user workflows, document all 5 distinct user stories. Do not truncate.
 ---
 ## Requirements Specification
 
@@ -21,9 +21,9 @@ For each distinct human or machine actor:
 - **RBAC/ABAC Privileges:** Explicit list of granted vs. explicitly denied actions.
 - **Delegation & Temporal Rules:** Rules for impersonation, session lifespans, or time-bounded access.
 
-### 3. Epics & User Stories (The User View)
-Decompose the system into major functional epics. For each epic, list its user stories adhering strictly to the INVEST criteria:
-- **EPIC-XX: [Epic Title]**
+### 3. Features & User Stories (The User View)
+Decompose the system into major functional features. For each feature, list its user stories adhering strictly to the INVEST criteria:
+- **FEAT-XX: [Feature Title]**
   - **US-XX-YY:** "As a `<role>`, I want `<capability>`, so that `<outcome>`."
     - **User Acceptance Criteria:** High-level business validation rules.
     - **MOSCOW Priority:** Must Have / Should Have / Could Have / Won't Have

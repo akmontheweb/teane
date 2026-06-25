@@ -37,8 +37,10 @@ def _seed_one_story(
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
+        story_state.ensure_feature(conn, app, "test", name="Test feature")
         keys = story_state.create_stories(conn, app, [{
             "title": title,
+            "feature": "test",
             "acceptance_criteria": (
                 acceptance if acceptance is not None else _DEFAULT_AC
             ),

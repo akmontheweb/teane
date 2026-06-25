@@ -19,44 +19,67 @@ from harness import story_state
 def _parse_run_args(extra: list[str]) -> Any:
     from harness.cli import build_parser
     parser = build_parser()
-    return parser.parse_args(["run", "-p", "do a thing", *extra])
+    # `teane run` is gone; the agile-mode flag now lives on `teane build`
+    # and `teane patch`. The story-tuning flags (--story-batch-size,
+    # --commit-on-story, --story-repair-cap) were dropped from the CLI
+    # and migrated to config.json's agile_defaults block.
+    return parser.parse_args(["build", "-w", "/tmp/x", "-p", "do a thing", *extra])
 
 
-def test_run_parser_exposes_stories_flag():
-    args = _parse_run_args(["--stories", "true"])
-    assert getattr(args, "decomposition_enabled") is True
+def test_build_parser_exposes_agile_flag():
+    args = _parse_run_args(["--agile", "true"])
+    assert args.agile is True
 
 
-def test_run_parser_defaults_stories_off():
-    """Default OFF — opt-in. Today's monolithic flow stays for everyone
-    who doesn't ask for the new behavior."""
+def test_build_parser_agile_defaults_to_none_sentinel():
+    """Default is the None sentinel — the cmd_build handler resolves it
+    against config["agile"] (and for `patch`, against the workspace's
+    .teane/state.db) before passing it through to the graph."""
     args = _parse_run_args([])
-    assert getattr(args, "decomposition_enabled") is False
+    assert args.agile is None
 
 
-def test_run_parser_accepts_batch_size():
-    args = _parse_run_args(["--story-batch-size", "10"])
-    assert args.story_batch_size == 10
+def test_build_parser_rejects_legacy_stories_flag():
+    """`--stories` is gone — argparse must surface the rename loudly so
+    operators with scripts using the old flag notice."""
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        _parse_run_args(["--stories", "true"])
 
 
-def test_run_parser_accepts_commit_on_story():
-    args = _parse_run_args(["--commit-on-story", "true"])
+def test_build_parser_rejects_legacy_story_tuning_flags():
+    """The three per-knob flags moved into config.json's agile_defaults
+    block. Argparse must reject the old CLI forms."""
+    import pytest as _pytest
+    for flag in ("--story-batch-size", "--commit-on-story", "--story-repair-cap"):
+        with _pytest.raises(SystemExit):
+            _parse_run_args([flag, "5"])
+
+
+def test_resolve_agile_args_pulls_defaults_from_config():
+    """_resolve_agile_args reads agile_defaults from config.json and pins
+    them onto the args namespace so cmd_run threads them into the graph."""
+    from harness.cli import _resolve_agile_args
+    import argparse as _argparse
+    args = _argparse.Namespace(agile=True)
+    _resolve_agile_args(args, config={
+        "agile_defaults": {"batch_size": 9, "commit_on_story": True, "repair_cap": 6},
+    }, workspace_path="/tmp/x", flow="build")
+    assert args.decomposition_enabled is True
+    assert args.story_batch_size == 9
     assert args.commit_on_story is True
+    assert args.story_repair_cap == 6
 
 
-def test_run_parser_accepts_story_repair_cap():
-    args = _parse_run_args(["--story-repair-cap", "5"])
-    assert args.story_repair_cap == 5
-
-
-def test_run_parser_default_repair_cap_is_3():
-    args = _parse_run_args([])
-    assert args.story_repair_cap == 3
-
-
-def test_run_parser_default_batch_size_is_5():
-    args = _parse_run_args([])
+def test_resolve_agile_args_falls_back_to_hard_defaults():
+    """When agile_defaults is absent, fall through to (5, False, 3)."""
+    from harness.cli import _resolve_agile_args
+    import argparse as _argparse
+    args = _argparse.Namespace(agile=True)
+    _resolve_agile_args(args, config={}, workspace_path="/tmp/x", flow="build")
     assert args.story_batch_size == 5
+    assert args.commit_on_story is False
+    assert args.story_repair_cap == 3
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +170,7 @@ def test_cr_bridge_creates_one_story_per_cr_when_decomp_enabled(cr_workspace: st
     assert len(stories) == 2
     refs = {s["external_ref"] for s in stories}
     assert refs == {"CR-1", "CR-2"}
-    assert all(s["epic"] == "change-request" for s in stories)
+    assert all(s["feature_key"] == story_state.CR_FEATURE_KEY for s in stories)
     # Each story is tagged as a CR-kind row stamped with its CR id.
     assert all(s["build_kind"] == story_state.BUILD_KIND_CR for s in stories)
     cr_ids_seen = {s["cr_ids"][0] for s in stories if s["cr_ids"]}

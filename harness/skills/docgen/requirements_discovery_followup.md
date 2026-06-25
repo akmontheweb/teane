@@ -11,7 +11,7 @@ Review the conversation above where the operator answered your previous question
 ## Sectors to re-audit
 
 1. USER ROLES & PERSONAS — role boundaries, delegation, expiry.
-2. EPICS & USER STORIES — INVEST stories with Given/When/Then acceptance criteria; explicit non-goals.
+2. FEATURES & USER STORIES — INVEST stories with Given/When/Then acceptance criteria; explicit non-goals.
 3. INPUT VALIDATION & PAYLOAD FORMAT — types, ranges, schema versioning.
 4. EDGE CASES & BOUNDARY CONDITIONS — boundary values, empty/null/large collections, Unicode, time-zone/DST.
 5. ERROR HANDLING & RETRY BEHAVIOR — error envelope, retry policy, circuit-breaker, DLQ.
@@ -30,7 +30,7 @@ When the discovery is NOT complete, output the EXACT JSON shape below — top-le
 
 {
   "modules": [
-    {"name": "EPICS & USER STORIES", "questions": [
+    {"name": "FEATURES & USER STORIES", "questions": [
       {"id": "Q2.7", "text": "...", "critical": true, "suggested_answer": "..."}
     ]}
   ],

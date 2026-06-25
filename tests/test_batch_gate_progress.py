@@ -179,7 +179,10 @@ class TestBatchCommitClearsProgress:
         app = story_state.app_name_for_workspace(workspace)
         conn = story_state.open_story_db()
         try:
-            story_state.create_stories(conn, app, [{"title": "S1"}])
+            story_state.ensure_feature(conn, app, "test", name="Test feature")
+            story_state.create_stories(
+                conn, app, [{"title": "S1", "feature": "test"}],
+            )
             bid = story_state.start_batch(conn, app, "sess-1", ["STORY-1"])
         finally:
             conn.close()

@@ -46,9 +46,26 @@ from typing import Any, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Bump when adding columns. Add a ``_migrate_to_vN`` function and
 register it in ``_MIGRATIONS`` below. Forward-only.
+
+v4 (feature-first decomposition):
+- New ``features`` table — every story now belongs to exactly one
+  feature. The decomposition LLM emits ``features`` (mandatory) +
+  ``stories`` (each carrying a ``feature`` key ref) instead of the
+  previous optional ``epics`` grouping.
+- ``stories.feature_id`` FK replaces the old free-text ``stories.epic``
+  column. The ``idx_stories_epic`` index is gone; ``idx_stories_feature``
+  takes its place.
+- ``batches.feature_id`` records which feature a batch belongs to.
+  Invariant: a batch never spans features. Small features land in one
+  batch; large features may need multiple batches (all tagged with the
+  same feature_id), but no batch ever mixes stories from two features.
+- The v3→v4 migration drops the legacy tables outright (clean slate).
+  Operators upgrading from v3 lose prior story/batch history — which
+  is acceptable per the v4 product decision; the decomposition shape
+  changed enough that the old rows can't be meaningfully reinterpreted.
 
 v3 (multi-workspace global DB + CR tagging):
 - ``stories``, ``batches``, ``defects``, ``test_runs``, ``file_links``,
@@ -70,6 +87,11 @@ v2 (per-batch verification pipeline, historical — applied to a v1 DB):
 - ``batches.committed_sha`` — git SHA of the BATCH-N commit, when
   git-commit-on-batch is enabled.
 """
+
+CR_FEATURE_KEY = "change-request"
+"""Synthetic feature_key used by the CR-bridge in graph.py for
+change-request-derived stories that don't fit into a planner-emitted
+feature. One row per workspace, created lazily on first CR bridge."""
 
 BUILD_KIND_GREENFIELD = "greenfield"
 BUILD_KIND_CR = "cr"
@@ -97,11 +119,22 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    feature_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace, feature_key)
+);
+CREATE INDEX IF NOT EXISTS idx_features_workspace ON features(workspace);
+
 CREATE TABLE IF NOT EXISTS stories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace TEXT NOT NULL,
     story_key TEXT NOT NULL,
-    epic TEXT,
+    feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL,
     title TEXT NOT NULL,
     description TEXT,
     acceptance_criteria TEXT NOT NULL DEFAULT '[]',  -- JSON list[str]
@@ -118,7 +151,7 @@ CREATE TABLE IF NOT EXISTS stories (
 );
 CREATE INDEX IF NOT EXISTS idx_stories_workspace ON stories(workspace);
 CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(workspace, status);
-CREATE INDEX IF NOT EXISTS idx_stories_epic ON stories(workspace, epic);
+CREATE INDEX IF NOT EXISTS idx_stories_feature ON stories(workspace, feature_id);
 CREATE INDEX IF NOT EXISTS idx_stories_build_kind
     ON stories(workspace, build_kind);
 
@@ -126,6 +159,7 @@ CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL,
     started_at TEXT NOT NULL,
     completed_at TEXT,
     status TEXT NOT NULL DEFAULT 'running',
@@ -134,6 +168,7 @@ CREATE TABLE IF NOT EXISTS batches (
     cr_ids TEXT                                       -- JSON list[int] | NULL
 );
 CREATE INDEX IF NOT EXISTS idx_batches_workspace ON batches(workspace);
+CREATE INDEX IF NOT EXISTS idx_batches_feature ON batches(workspace, feature_id);
 CREATE INDEX IF NOT EXISTS idx_batches_build_kind
     ON batches(workspace, build_kind);
 
@@ -290,11 +325,45 @@ def _write_schema_version(conn: sqlite3.Connection, version: int) -> None:
     )
 
 
-_MIGRATIONS: list[tuple[int, Any]] = []
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Clean-slate migration: drop legacy story/batch tables so the v4
+    schema can recreate them with the feature-first shape.
+
+    The product decision (2026-06-25) was that v3 history doesn't carry
+    forward — the decomposition shape changed enough that old rows can't
+    be meaningfully reinterpreted, so existing DBs reset rather than
+    migrate row-by-row. Foreign-key cascades from ``stories.id`` /
+    ``batches.id`` clear ``batch_stories``, ``file_links``,
+    ``commits``, ``test_runs``, and ``defects`` automatically; we drop
+    them explicitly anyway to keep the post-migration state obvious.
+
+    No-op on a fresh DB (no ``epic`` column on ``stories``) — the
+    surrounding ``open_story_db`` already ran ``_SCHEMA_SQL`` to create
+    the v4 tables; there's nothing to drop.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(stories)").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    if not any(c[1] == "epic" for c in cols):
+        return
+    for table in (
+        "commits", "test_runs", "file_links", "defects",
+        "batch_stories", "batches", "stories", "features",
+    ):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.executescript(_SCHEMA_SQL)
+    conn.commit()
+
+
+_MIGRATIONS: list[tuple[int, Any]] = [
+    (4, _migrate_v3_to_v4),
+]
 """(target_version, callable(conn) -> None). Append-only; never rewrite
 history. v1 → v2 and v2 → v3 only existed for per-workspace DBs that
 v3 explicitly ignores — fresh global DBs land at SCHEMA_VERSION
-straight from ``_SCHEMA_SQL`` with no migration steps."""
+straight from ``_SCHEMA_SQL`` with no migration steps. v3 → v4 is the
+feature-first reset described in ``_migrate_v3_to_v4``."""
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -325,7 +394,7 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
     a clear summary.
     """
     counts: dict[str, int] = {
-        "stories": 0, "batches": 0, "defects": 0,
+        "features": 0, "stories": 0, "batches": 0, "defects": 0,
         "test_runs": 0, "file_links": 0, "commits": 0,
     }
     try:
@@ -374,7 +443,7 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
                 # table without a workspace column of its own).
                 if table in counts:
                     counts[table] = cur.rowcount or 0
-            for table in ("batches", "stories"):
+            for table in ("batches", "stories", "features"):
                 cur = conn.execute(
                     f"DELETE FROM {table} WHERE workspace = ?", (app,),
                 )
@@ -397,6 +466,38 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
             counts["test_runs"], counts["file_links"], counts["commits"],
         )
     return counts
+
+
+def workspace_is_agile_managed(workspace_path: str) -> bool:
+    """Return True when ``workspace_path`` has at least one row in the
+    ``stories`` table of the global state DB — i.e. a prior ``teane
+    build`` (or ``patch``) engaged Agile mode on this workspace.
+
+    Used by ``cmd_patch`` as the default for the ``--agile`` tri-state
+    flag. Soft-fails to False on any error (missing DB, locked file,
+    invalid workspace path) — the operator can always force agile mode
+    with ``--agile true`` regardless.
+    """
+    try:
+        app = app_name_for_workspace(workspace_path)
+    except ValueError:
+        return False
+    db = state_db_path()
+    if not os.path.isfile(db):
+        return False
+    try:
+        conn = sqlite3.connect(db)
+    except sqlite3.DatabaseError:
+        return False
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM stories WHERE workspace = ? LIMIT 1", (app,),
+        )
+        return cur.fetchone() is not None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
 
 
 def open_story_db(workspace_path: Optional[str] = None) -> sqlite3.Connection:
@@ -430,6 +531,126 @@ def open_story_db(workspace_path: Optional[str] = None) -> sqlite3.Connection:
             pass
         raise
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Feature CRUD
+# ---------------------------------------------------------------------------
+
+def _row_to_feature(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "feature_key": row[1],
+        "name": row[2],
+        "description": row[3],
+        "created_at": row[4],
+    }
+
+
+_FEATURE_COLS = "id, feature_key, name, description, created_at"
+
+
+def create_features(
+    conn: sqlite3.Connection,
+    workspace: str,
+    items: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Insert features and return the assigned feature_keys in order.
+
+    Each item supports: ``feature_key`` (required, must be unique within
+    ``workspace`` — typically a short slug like ``"auth"`` or
+    ``"billing"``), ``name`` (required, human-readable label),
+    ``description`` (optional). Idempotent on duplicate ``feature_key``
+    — the existing row is left untouched and its key is returned, so
+    callers can safely re-run decomposition without tripping a UNIQUE
+    violation.
+    """
+    created: list[str] = []
+    now = _utcnow_iso()
+    for item in items:
+        feature_key = (item.get("feature_key") or "").strip()
+        if not feature_key:
+            raise ValueError("feature requires 'feature_key'")
+        name = (item.get("name") or "").strip()
+        if not name:
+            raise ValueError(
+                f"feature {feature_key!r} requires a non-empty 'name'"
+            )
+        conn.execute(
+            "INSERT INTO features(workspace, feature_key, name, "
+            "description, created_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(workspace, feature_key) DO NOTHING",
+            (workspace, feature_key, name, item.get("description"), now),
+        )
+        created.append(feature_key)
+    conn.commit()
+    return created
+
+
+def list_features(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """All features for ``workspace`` ordered by insertion."""
+    rows = conn.execute(
+        f"SELECT {_FEATURE_COLS} FROM features WHERE workspace = ? "
+        "ORDER BY id",
+        (workspace,),
+    ).fetchall()
+    return [_row_to_feature(r) for r in rows]
+
+
+def get_feature_by_key(
+    conn: sqlite3.Connection, workspace: str, feature_key: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        f"SELECT {_FEATURE_COLS} FROM features "
+        "WHERE workspace = ? AND feature_key = ?",
+        (workspace, feature_key),
+    ).fetchone()
+    return _row_to_feature(row) if row else None
+
+
+def get_feature(
+    conn: sqlite3.Connection, workspace: str, feature_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        f"SELECT {_FEATURE_COLS} FROM features "
+        "WHERE workspace = ? AND id = ?",
+        (workspace, int(feature_id)),
+    ).fetchone()
+    return _row_to_feature(row) if row else None
+
+
+def ensure_feature(
+    conn: sqlite3.Connection,
+    workspace: str,
+    feature_key: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> int:
+    """Return the feature_id for ``feature_key`` in ``workspace``,
+    creating the row lazily if it doesn't exist. Used by the CR-bridge
+    in graph.py so the synthetic ``change-request`` feature gets seeded
+    the first time a workspace ingests a CR.
+    """
+    existing = get_feature_by_key(conn, workspace, feature_key)
+    if existing is not None:
+        return int(existing["id"])
+    create_features(
+        conn, workspace,
+        [{
+            "feature_key": feature_key,
+            "name": name or feature_key,
+            "description": description,
+        }],
+    )
+    again = get_feature_by_key(conn, workspace, feature_key)
+    if again is None:
+        raise RuntimeError(
+            f"ensure_feature: failed to materialise feature {feature_key!r}"
+        )
+    return int(again["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +691,13 @@ def create_stories(
 ) -> list[str]:
     """Insert decomposition-LLM output. Returns assigned story_keys in order.
 
-    Each item supports: ``title`` (required), ``epic``, ``description``,
-    ``acceptance_criteria`` (list[str]), ``depends_on`` (list[story_key]),
-    ``scope_files`` (list[str]), ``external_ref``. Story keys are
-    assigned sequentially within ``workspace`` — caller does not specify
-    them.
+    Each item supports: ``title`` (required), ``feature`` (required —
+    feature_key ref to a row in the ``features`` table; the feature must
+    already exist via ``create_features`` or ``ensure_feature``),
+    ``description``, ``acceptance_criteria`` (list[str]), ``depends_on``
+    (list[story_key]), ``scope_files`` (list[str]), ``external_ref``.
+    Story keys are assigned sequentially within ``workspace`` — caller
+    does not specify them.
 
     ``build_kind`` is ``greenfield`` (default — initial build) or ``cr``
     (a change-request increment on top of an existing build).
@@ -488,14 +711,32 @@ def create_stories(
         cr_ids_json = _serialise_cr_ids(cr_ids)
     created: list[str] = []
     now = _utcnow_iso()
+    feature_id_cache: dict[str, int] = {}
     for item in items:
         if not item.get("title"):
             raise ValueError("story requires 'title'")
+        feature_key = (item.get("feature") or "").strip()
+        if not feature_key:
+            raise ValueError(
+                f"story {item.get('title')!r} requires a 'feature' key — "
+                "v4 schema makes feature mandatory; create the feature "
+                "first via create_features() or ensure_feature()."
+            )
+        if feature_key not in feature_id_cache:
+            row = get_feature_by_key(conn, workspace, feature_key)
+            if row is None:
+                raise ValueError(
+                    f"story {item.get('title')!r} references feature "
+                    f"{feature_key!r} which has not been created. Call "
+                    "create_features() with this feature_key first."
+                )
+            feature_id_cache[feature_key] = int(row["id"])
+        feature_id = feature_id_cache[feature_key]
         key = _next_story_key(conn, workspace)
         conn.execute(
             """
             INSERT INTO stories(
-                workspace, story_key, epic, title, description,
+                workspace, story_key, feature_id, title, description,
                 acceptance_criteria, depends_on, scope_files,
                 status, external_ref, build_kind, cr_ids, created_at
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
@@ -503,7 +744,7 @@ def create_stories(
             (
                 workspace,
                 key,
-                item.get("epic"),
+                feature_id,
                 item["title"],
                 item.get("description"),
                 json.dumps(list(item.get("acceptance_criteria") or [])),
@@ -521,31 +762,43 @@ def create_stories(
 
 
 def _row_to_story(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    """Hydrate a stories row joined with features on feature_id.
+
+    The SELECT must use ``_STORY_COLS`` (which joins ``features`` via
+    ``stories.feature_id``) so columns line up. ``feature_key`` and
+    ``feature_name`` may be None for CR-bridge stories that pre-date
+    the synthetic feature seed (defensive — current code never inserts
+    a story with NULL feature_id, but the FK uses ON DELETE SET NULL).
+    """
     return {
         "id": row[0],
         "story_key": row[1],
-        "epic": row[2],
-        "title": row[3],
-        "description": row[4],
-        "acceptance_criteria": json.loads(row[5] or "[]"),
-        "depends_on": json.loads(row[6] or "[]"),
-        "scope_files": json.loads(row[7] or "[]"),
-        "status": row[8],
-        "external_ref": row[9],
-        "build_kind": row[10] or BUILD_KIND_GREENFIELD,
-        "cr_ids": json.loads(row[11]) if row[11] else [],
-        "created_at": row[12],
-        "started_at": row[13],
-        "completed_at": row[14],
+        "feature_id": row[2],
+        "feature_key": row[3],
+        "feature_name": row[4],
+        "title": row[5],
+        "description": row[6],
+        "acceptance_criteria": json.loads(row[7] or "[]"),
+        "depends_on": json.loads(row[8] or "[]"),
+        "scope_files": json.loads(row[9] or "[]"),
+        "status": row[10],
+        "external_ref": row[11],
+        "build_kind": row[12] or BUILD_KIND_GREENFIELD,
+        "cr_ids": json.loads(row[13]) if row[13] else [],
+        "created_at": row[14],
+        "started_at": row[15],
+        "completed_at": row[16],
     }
 
 
 _STORY_COLS = (
-    "id, story_key, epic, title, description, "
-    "acceptance_criteria, depends_on, scope_files, status, external_ref, "
-    "build_kind, cr_ids, "
-    "created_at, started_at, completed_at"
+    "s.id, s.story_key, s.feature_id, f.feature_key, f.name, "
+    "s.title, s.description, "
+    "s.acceptance_criteria, s.depends_on, s.scope_files, s.status, "
+    "s.external_ref, s.build_kind, s.cr_ids, "
+    "s.created_at, s.started_at, s.completed_at"
 )
+_STORY_FROM = "stories s LEFT JOIN features f ON s.feature_id = f.id"
 
 
 def _validate_build_kind(build_kind: str) -> str:
@@ -568,19 +821,27 @@ def list_stories(
     workspace: str,
     *,
     status: Optional[str] = None,
+    feature_id: Optional[int] = None,
 ) -> list[dict[str, Any]]:
-    if status is None:
-        rows = conn.execute(
-            f"SELECT {_STORY_COLS} FROM stories WHERE workspace = ? "
-            "ORDER BY id",
-            (workspace,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT {_STORY_COLS} FROM stories "
-            "WHERE workspace = ? AND status = ? ORDER BY id",
-            (workspace, status),
-        ).fetchall()
+    """Return stories for ``workspace`` joined with their feature rows.
+
+    Optionally filter by ``status`` (e.g. ``"planned"``, ``"done"``)
+    and/or ``feature_id`` (constrain to a single feature — used by the
+    batch planner to pick stories from one feature at a time).
+    """
+    where = ["s.workspace = ?"]
+    params: list[Any] = [workspace]
+    if status is not None:
+        where.append("s.status = ?")
+        params.append(status)
+    if feature_id is not None:
+        where.append("s.feature_id = ?")
+        params.append(int(feature_id))
+    sql = (
+        f"SELECT {_STORY_COLS} FROM {_STORY_FROM} "
+        f"WHERE {' AND '.join(where)} ORDER BY s.id"
+    )
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [_row_to_story(r) for r in rows]
 
 
@@ -588,8 +849,8 @@ def get_story(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> Optional[dict[str, Any]]:
     row = conn.execute(
-        f"SELECT {_STORY_COLS} FROM stories "
-        "WHERE workspace = ? AND story_key = ?",
+        f"SELECT {_STORY_COLS} FROM {_STORY_FROM} "
+        "WHERE s.workspace = ? AND s.story_key = ?",
         (workspace, story_key),
     ).fetchone()
     return _row_to_story(row) if row else None
@@ -644,6 +905,24 @@ def mark_done(
     conn.commit()
 
 
+def mark_reopened(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> int:
+    """Flip a DONE story back to ``reopened`` so the story loop picks it up
+    again. Used by ``story_reopen_node`` when a patch-flow spec revision
+    invalidates a previously-shipped story's acceptance criteria.
+
+    Returns affected rowcount (0 = vanished story or already non-DONE).
+    """
+    cur = conn.execute(
+        "UPDATE stories SET status = 'reopened', completed_at = NULL "
+        "WHERE workspace = ? AND story_key = ? AND status = 'done'",
+        (workspace, story_key),
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
 def mark_blocked(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> None:
@@ -667,12 +946,18 @@ def start_batch(
     *,
     build_kind: str = BUILD_KIND_GREENFIELD,
     cr_ids: Optional[Iterable[int]] = None,
+    feature_id: Optional[int] = None,
 ) -> int:
     """Open a new batch row and seed its ``batch_stories`` membership.
 
     ``build_kind`` (``greenfield`` or ``cr``) and ``cr_ids`` (JSON list
     of int CR ids ingested in this run) tag the batch as an
     incremental change-request layer or as part of the initial build.
+
+    ``feature_id`` ties the batch to its owning feature row. A batch
+    never spans features (enforced by ``batch_planner_node``), so the
+    column is non-NULL in normal operation; left optional only for
+    test fixtures that bypass the planner.
     """
     build_kind = _validate_build_kind(build_kind)
     cr_ids_json = (
@@ -681,9 +966,14 @@ def start_batch(
     )
     cur = conn.execute(
         "INSERT INTO batches"
-        "(workspace, session_id, started_at, status, build_kind, cr_ids) "
-        "VALUES(?, ?, ?, 'running', ?, ?)",
-        (workspace, session_id, _utcnow_iso(), build_kind, cr_ids_json),
+        "(workspace, session_id, feature_id, started_at, status, "
+        "build_kind, cr_ids) "
+        "VALUES(?, ?, ?, ?, 'running', ?, ?)",
+        (
+            workspace, session_id,
+            None if feature_id is None else int(feature_id),
+            _utcnow_iso(), build_kind, cr_ids_json,
+        ),
     )
     batch_id = cur.lastrowid
     if batch_id is None:
@@ -1058,16 +1348,29 @@ def _render_stories_md(stories: list[dict[str, Any]]) -> str:
         lines.append("")
         return "\n".join(lines)
 
-    by_epic: dict[str, list[dict[str, Any]]] = {}
+    # Group by feature, preserving first-seen order so the doc reads
+    # in the same order decomposition produced (stories are returned
+    # in insertion order by list_stories, which inherits feature order
+    # since features are created before stories in decomposition_node).
+    by_feature: dict[str, list[dict[str, Any]]] = {}
+    feature_labels: dict[str, str] = {}
     for s in stories:
-        by_epic.setdefault(s.get("epic") or "(no epic)", []).append(s)
+        fkey = s.get("feature_key") or "(unassigned)"
+        if fkey not in by_feature:
+            by_feature[fkey] = []
+            feature_labels[fkey] = s.get("feature_name") or fkey
+        by_feature[fkey].append(s)
 
-    for epic in sorted(by_epic):
-        lines.append(f"## {epic}")
+    for fkey, fstories in by_feature.items():
+        heading = feature_labels.get(fkey, fkey)
+        if heading != fkey:
+            lines.append(f"## {heading} ({fkey})")
+        else:
+            lines.append(f"## {heading}")
         lines.append("")
         lines.append("| Key | Status | Title | Depends on | External |")
         lines.append("| --- | --- | --- | --- | --- |")
-        for s in by_epic[epic]:
+        for s in fstories:
             deps = ", ".join(s["depends_on"]) or "—"
             ext = s.get("external_ref") or "—"
             lines.append(
@@ -1075,7 +1378,7 @@ def _render_stories_md(stories: list[dict[str, Any]]) -> str:
                 f"{s['title']} | {deps} | {ext} |"
             )
         lines.append("")
-        for s in by_epic[epic]:
+        for s in fstories:
             lines.append(f"### {s['story_key']} — {s['title']}")
             lines.append("")
             if s.get("description"):

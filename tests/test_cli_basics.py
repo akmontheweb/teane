@@ -582,26 +582,34 @@ class TestBuildParser:
         assert parser is not None
         assert hasattr(parser, "parse_args")
 
-    def test_parser_has_run_subcommand(self):
+    def test_parser_has_build_patch_deploy_subcommands(self):
+        # `teane run` was split into `teane build`, `teane patch`,
+        # `teane deploy` — assert all three are reachable.
         parser = build_parser()
-        try:
-            parser.parse_args(["run", "--help"])
-        except SystemExit:
-            pass  # --help exits, expected
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices:
+                assert {"build", "patch", "deploy"}.issubset(set(action.choices.keys()))
+                assert "run" not in action.choices, "legacy run subcommand still present"
+                return
+        raise AssertionError("subparsers action not found")
 
-    def test_deploy_dev_defaults_false(self):
-        # Default is opt-in: omit the flag and the harness will stop after
-        # a clean security scan instead of rolling forward into deployment.
+    def test_legacy_deploy_dev_flag_gone(self):
+        # `--deploy-dev` no longer exists on any subcommand; deployment is
+        # its own top-level command now.
+        import pytest as _pytest
         parser = build_parser()
-        args = parser.parse_args(["run", "-w", "/tmp/x", "-p", "do x"])
-        assert args.deploy_dev is False
+        with _pytest.raises(SystemExit):
+            parser.parse_args(["build", "-w", "/tmp/x", "-p", "do x", "--deploy-dev", "true"])
 
-    def test_deploy_dev_true(self):
+    def test_deploy_subcommand_parses(self):
         parser = build_parser()
-        args = parser.parse_args(
-            ["run", "-w", "/tmp/x", "-p", "do x", "--deploy-dev", "true"]
-        )
-        assert args.deploy_dev is True
+        args = parser.parse_args([
+            "deploy", "-w", "/tmp/x", "-p", "no sidecars",
+            "--cd-discovery", "true", "--hitl-deployment", "false",
+        ])
+        assert args.command == "deploy"
+        assert args.cd_discovery is True
+        assert args.hitl_deployment is False
 
     def test_old_dev_deployment_flag_rejected(self):
         # The legacy --dev-deployment / --dev_deployment forms are gone;
@@ -611,11 +619,11 @@ class TestBuildParser:
         parser = build_parser()
         with _pytest.raises(SystemExit):
             parser.parse_args(
-                ["run", "-w", "/tmp/x", "-p", "do x", "--dev-deployment"],
+                ["build", "-w", "/tmp/x", "-p", "do x", "--dev-deployment"],
             )
         with _pytest.raises(SystemExit):
             parser.parse_args(
-                ["run", "-w", "/tmp/x", "-p", "do x", "--dev_deployment"],
+                ["build", "-w", "/tmp/x", "-p", "do x", "--dev_deployment"],
             )
 
     def test_workspace_dash_r_short_alias_removed(self):
@@ -625,7 +633,7 @@ class TestBuildParser:
         import pytest as _pytest
         parser = build_parser()
         with _pytest.raises(SystemExit):
-            parser.parse_args(["run", "-r", "/tmp/x", "-p", "do x"])
+            parser.parse_args(["build", "-r", "/tmp/x", "-p", "do x"])
 
 
 # ---------------------------------------------------------------------------
@@ -919,37 +927,34 @@ class TestDispatchWithContinuation:
 # ---------------------------------------------------------------------------
 
 class TestRunParserSurface:
-    """Locks down the simplified run-parser surface so the next round of
-    refactoring can spot accidental regressions. Covers all four new
-    HITL toggles, --spec-discovery, --cd-discovery, --deploy-dev, the
-    --new-build / --yes pairing, the two default flips (--allow-network
-    true, --git false), and explicit rejection of every removed/renamed
-    flag."""
+    """Locks down the parser surface for build/patch/deploy so the next
+    round of refactoring can spot accidental regressions. Covers the
+    HITL toggles, --spec-discovery, --cd-discovery, the default flips
+    (--allow-network true, --git false), and explicit rejection of
+    every removed/renamed flag."""
 
     @staticmethod
     def _args(*extra):
         from harness.cli import build_parser
         return build_parser().parse_args(
-            ["run", "-w", "/tmp/x", "-p", "do x", *extra],
+            ["build", "-w", "/tmp/x", "-p", "do x", *extra],
         )
 
     def test_all_hitl_flags_default_to_none_sentinel(self):
         # argparse default is now the None sentinel — `_resolve_hitl_flags`
         # uses None to mean "operator did not pass the flag", which is the
         # signal to fall through to config.json's hitl.* block (and then
-        # the in-code True default).
+        # the in-code True default). --hitl-deployment is only on `deploy`.
         a = self._args()
         assert a.hitl_requirement is None
         assert a.hitl_architecture is None
         assert a.hitl_repair is None
-        assert a.hitl_deployment is None
         assert a.hitl_layout_divergence is None
 
     def test_discovery_toggles_default_false(self):
         a = self._args()
         assert a.spec_discovery is False
         assert a.cd_discovery is False
-        assert a.deploy_dev is False
 
     def test_allow_network_defaults_true_git_defaults_false(self):
         # Two default-flips relative to the legacy surface — locked
@@ -959,13 +964,13 @@ class TestRunParserSurface:
         assert a.git is False
 
     def test_hitl_flag_accepts_true(self):
-        a = self._args("--hitl-requirement", "true", "--hitl-deployment", "true")
+        a = self._args("--hitl-requirement", "true", "--hitl-repair", "true")
         assert a.hitl_requirement is True
-        assert a.hitl_deployment is True
+        assert a.hitl_repair is True
         # The other two stay at the None sentinel (not passed → defer
         # to the resolver).
         assert a.hitl_architecture is None
-        assert a.hitl_repair is None
+        assert a.hitl_layout_divergence is None
 
     def test_bool_flag_accepts_yes_and_no(self):
         # `_bool_choice` is the shared parser type; assert it
@@ -975,12 +980,12 @@ class TestRunParserSurface:
             "--hitl-requirement", "yes",
             "--hitl-architecture", "no",
             "--cd-discovery", "1",
-            "--deploy-dev", "off",
+            "--allow-network", "off",
         )
         assert a.hitl_requirement is True
         assert a.hitl_architecture is False
         assert a.cd_discovery is True
-        assert a.deploy_dev is False
+        assert a.allow_network is False
 
     def test_bool_flag_rejects_garbage(self):
         import pytest as _pytest

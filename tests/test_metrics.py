@@ -596,7 +596,7 @@ class TestCmdMetrics:
         })
 
         args = build_parser().parse_args([
-            "metrics", "--session-id", "sess", "--json", "-r", str(ws),
+            "metrics", "--session-id", "sess", "--json-dump", "true", "-r", str(ws),
         ])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0
@@ -640,7 +640,7 @@ class TestCmdMetrics:
 
         args = build_parser().parse_args([
             "metrics", "--session-id", "stdoutsess", "--prometheus",
-            "--output", "-", "-r", str(ws),
+            "--output-path", "-", "-r", str(ws),
         ])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0

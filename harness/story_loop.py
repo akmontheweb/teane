@@ -239,6 +239,11 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
         "current_batch_id": batch_id,
         "current_story_id": "",
         "story_scope_files": [],
+        # Phase E.3 cursor-advance fix: a fresh batch starts with no
+        # patched stories so `_next_story_in_batch` is free to pick any
+        # ready story by sequence. Without this reset, leftover keys
+        # from the previous batch would silently skip ready stories.
+        "batch_patched_story_keys": [],
         "node_state": {
             "current_node": "batch_planner",
             "batch_planned": True,
@@ -260,9 +265,11 @@ def _next_story_in_batch(
     conn,
     workspace: str,
     batch_id: int,
+    already_patched: Optional[set[str]] = None,
 ) -> dict[str, Any] | None:
     """Return the next batch story that isn't ``done``/``blocked`` AND
-    whose intra-batch dependencies are all already ``done``.
+    whose intra-batch dependencies are all already ``done`` AND whose
+    patching turn hasn't already run in the current batch.
 
     Ordering rules (highest priority first):
 
@@ -283,7 +290,16 @@ def _next_story_in_batch(
        for the current batch_id) are NOT enforced here; those are
        guaranteed ``done`` by ``batch_planner_node`` before the
        batch was even created.
+    4. Phase E.3 cursor-advance: skip any story whose key is in
+       ``already_patched``. Without this, an ``in_progress`` story
+       whose patching turn just ran would sort first under rule (1)
+       and be re-picked forever — patching never marks a story
+       ``done`` in the per-batch model (batch_commit_node does that
+       at end-of-batch), so the "in-progress means mid-repair on
+       resume" assumption behind rule (1) breaks down within a single
+       run through the batch.
     """
+    already_patched = already_patched or set()
     rows = conn.execute(
         "SELECT s.story_key FROM batch_stories bs "
         "JOIN stories s ON s.id = bs.story_id "
@@ -293,6 +309,8 @@ def _next_story_in_batch(
     ).fetchall()
     batch_keys = {key for (key,) in rows}
     for (key,) in rows:
+        if key in already_patched:
+            continue
         s = story_state.get_story(conn, workspace, key)
         if s is None:
             continue
@@ -362,6 +380,15 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
     # `_next_story_in_batch` so the now-done story isn't re-picked.
     loop_counter = dict(state.get("loop_counter", {}) or {})
     cur_story_id = state.get("current_story_id") or ""
+    # Phase E.3 cursor-advance: the story whose patching turn just ran
+    # must be remembered so `_next_story_in_batch` doesn't pick it again
+    # next iteration. We carry this in state as ``batch_patched_story_keys``
+    # rather than a DB column because (a) it's per-run-through-the-batch
+    # bookkeeping (resume should re-patch in_progress stories), and
+    # (b) it composes with the existing batch_commit_node reset.
+    patched_keys = list(state.get("batch_patched_story_keys") or [])
+    if cur_story_id and cur_story_id not in patched_keys:
+        patched_keys.append(cur_story_id)
     auto_completed_key: Optional[str] = None
     auto_completed_rounds = 0
     if cur_story_id:
@@ -399,7 +426,9 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                 auto_completed_key, auto_completed_rounds,
                 int(state.get("story_zero_patch_cap") or STORY_ZERO_PATCH_CAP),
             )
-        nxt = _next_story_in_batch(conn, workspace, batch_id)
+        nxt = _next_story_in_batch(
+            conn, workspace, batch_id, already_patched=set(patched_keys),
+        )
         if nxt is None:
             # Batch fully resolved (every story done or blocked).
             blocked_count = conn.execute(
@@ -418,13 +447,15 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             # for the final batch state and writes it atomically via
             # seal_batch_atomically.
             logger.info(
-                "[story_loop] batch %d ready for verification (%d blocked stories).",
-                batch_id, blocked_count,
+                "[story_loop] batch %d ready for verification "
+                "(%d blocked, %d patched this pass).",
+                batch_id, blocked_count, len(patched_keys),
             )
             return {
                 "current_story_id": "",
                 "story_scope_files": [],
                 "loop_counter": loop_counter,
+                "batch_patched_story_keys": patched_keys,
                 "node_state": {
                     "current_node": "story_loop",
                     "batch_complete": True,
@@ -432,6 +463,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                     "blocked_count": blocked_count,
                     "auto_completed_story": auto_completed_key,
                     "auto_completed_zero_rounds": auto_completed_rounds,
+                    "patched_in_batch": list(patched_keys),
                 },
             }
 
@@ -456,6 +488,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                 "current_story_id": "",
                 "story_scope_files": [],
                 "loop_counter": loop_counter,
+                "batch_patched_story_keys": patched_keys,
                 "node_state": {
                     "current_node": "story_loop",
                     "batch_complete": True,
@@ -465,6 +498,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                     "story_key": nxt["story_key"],
                     "auto_completed_story": auto_completed_key,
                     "auto_completed_zero_rounds": auto_completed_rounds,
+                    "patched_in_batch": list(patched_keys),
                 },
             }
     finally:
@@ -483,6 +517,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
         "story_scope_files": list(nxt["scope_files"] or []),
         "story_modified_baseline": baseline,
         "loop_counter": loop_counter,
+        "batch_patched_story_keys": patched_keys,
         "node_state": {
             "current_node": "story_loop",
             "batch_complete": False,
@@ -491,6 +526,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             "acceptance_criteria": nxt["acceptance_criteria"],
             "auto_completed_story": auto_completed_key,
             "auto_completed_zero_rounds": auto_completed_rounds,
+            "patched_in_batch": list(patched_keys),
         },
     }
 
@@ -958,6 +994,12 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         "story_modified_baseline": [],
         "batch_modified_files": [],
         "batch_gate_progress": next_bgp,
+        # Phase E.3 cursor-advance fix: clear the patched-keys cursor so
+        # the next batch (if any) starts clean. batch_planner_node also
+        # resets this when it plans the next batch — keeping the reset
+        # here too means inspection tools (dashboard, traceability) see
+        # a clean state even if no next batch ever runs.
+        "batch_patched_story_keys": [],
         "loop_counter": loop_counter,
         "node_state": {
             "current_node": "batch_commit",

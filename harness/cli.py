@@ -1706,6 +1706,20 @@ def resolve_build_command(
 # (which install a fake channel and expect prompts to fire) still work.
 _HITL_FLAGS: dict[str, bool] = {}
 
+# Per-gate refine cap (2026-06-26 loop-audit hardening). The operator can
+# pick "refine" at each HITL gate (REQUIREMENTS / ARCHITECTURE / STORIES /
+# DEPLOYMENT) to send the spec back for re-generation; each refine reruns
+# the discovery + spec-writer + reviewer chain at ~$0.10–0.30 a pass.
+# ``discovery_question_count`` (the inner discovery cap, default 10) is
+# RESET on every entry to spec_review_node (graph.py:10937), so without a
+# per-gate refine cap the operator can drive an unbounded loop simply by
+# pressing "e" each time — the only brake is the session budget. This cap
+# bounds the per-gate refines; once reached, the gatekeeper refuses
+# further refines and asks the operator to approve / manual-edit /
+# suspend instead. Generous default (5) so it never bites a normal
+# review cycle but does catch a hung loop.
+MAX_GATEKEEPER_REFINES = 5
+
 # The five HITL gates the resolver knows about. Tuples of
 # (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
 # and the config-tree validation stay aligned. New gates added here
@@ -1990,6 +2004,30 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             }
 
         elif choice == "e":
+            # ``attempt`` is the per-gate visit counter (initial review
+            # plus one per refine return). After MAX_GATEKEEPER_REFINES
+            # refines the operator has burned 5 spec-regeneration passes
+            # at this gate; refuse a further refine and force them to
+            # approve, manual-edit, or suspend. Without this brake the
+            # inner discovery cap (max_discovery_iterations) is
+            # circumvented because spec_review_node resets the question
+            # counter on every entry.
+            refines_used = max(0, attempt - 1)
+            if refines_used >= MAX_GATEKEEPER_REFINES:
+                print()
+                print(f"[{gate_label}] You've used {refines_used} refine(s) "
+                      f"(cap: {MAX_GATEKEEPER_REFINES}). Further refines are "
+                      f"disabled to prevent runaway spec-regeneration cost.")
+                print("Choose [a] approve, [m] manual edit, or [s] suspend.")
+                print()
+                logger.warning(
+                    "[gatekeeper] %s refine cap reached (used %d/%d). "
+                    "Refusing further refines this session — operator must "
+                    "approve, manual-edit, or suspend.",
+                    gate_label, refines_used, MAX_GATEKEEPER_REFINES,
+                )
+                continue
+
             from harness.hitl import get_channel as _get_channel
             notes = _get_channel().notes(f"[Refine:{gate_label}] Enter additional notes/feedback")
 
@@ -2006,7 +2044,11 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             loop_counter["compiler"] = 0
             loop_counter["total_repairs"] = 0
 
-            logger.info("[gatekeeper] %s refine requested: %d chars of feedback.", gate_label, len(notes))
+            logger.info(
+                "[gatekeeper] %s refine requested: %d chars of feedback "
+                "(%d/%d refines used).",
+                gate_label, len(notes), refines_used + 1, MAX_GATEKEEPER_REFINES,
+            )
             return {
                 "messages": messages,
                 "loop_counter": loop_counter,

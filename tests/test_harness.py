@@ -3159,6 +3159,166 @@ class TestGatekeeperPromptIsLabeled:
         assert "coding" in labels["a"].lower() or "patch" in labels["a"].lower()
 
 
+class TestGatekeeperRefineCap:
+    """The gatekeeper has a per-gate refine cap (MAX_GATEKEEPER_REFINES)
+    to prevent the operator from driving an unbounded loop by repeatedly
+    picking "refine" at a HITL gate. Each refine reruns the discovery +
+    spec-writer + reviewer chain at ~$0.10–0.30 a pass; without this
+    cap the inner ``max_discovery_iterations`` brake is circumvented
+    because ``spec_review_node`` resets the question counter on every
+    entry (graph.py:10937).
+
+    These tests pin the interactive path (no auto-approve) and exercise
+    the cap by pre-loading the per-gate attempt counter.
+    """
+
+    @staticmethod
+    def _seed_spec(tmpdir: str, filename: str = "SPEC_REQUIREMENTS.md") -> str:
+        docs = os.path.join(tmpdir, "docs")
+        os.makedirs(docs, exist_ok=True)
+        path = os.path.join(docs, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# spec\n")
+        return path
+
+    @staticmethod
+    def _channel_with_answers(answers: list[str]):
+        """A HITL channel stub that returns successive answers from the
+        ``answers`` list, recording prompt + notes calls so the test
+        can assert what fired."""
+        iter_answers = iter(answers)
+        captured: dict[str, list] = {"prompts": [], "notes": []}
+
+        class _Channel:
+            def prompt(self, message, options, *, default=None,
+                       option_labels=None, **kwargs):
+                captured["prompts"].append(message)
+                try:
+                    return next(iter_answers)
+                except StopIteration as exc:
+                    raise AssertionError(
+                        "channel.prompt() called more times than the "
+                        "test seeded answers — refine cap likely not "
+                        "stopping the loop"
+                    ) from exc
+
+            def notes(self, *args, **kwargs):
+                captured["notes"].append(args)
+                return "feedback content"
+
+            def confirm(self, *a, **kw):
+                return False
+
+            def wait_for_manual_edit(self, *a, **kw):
+                return None
+
+        return _Channel(), captured
+
+    def test_refine_below_cap_returns_refine(self, monkeypatch):
+        from harness.cli import (
+            human_gatekeeper_node, MAX_GATEKEEPER_REFINES,
+        )
+        from harness.hitl import set_channel, reset_channel
+
+        monkeypatch.setattr(
+            "harness.cli._gatekeeper_auto_approves",
+            lambda gate_name=None: False,
+        )
+        # refines_used = 2 < cap (5) → refine should still be accepted.
+        channel, captured = self._channel_with_answers(["e"])
+        set_channel(channel)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir)
+                out = human_gatekeeper_node({
+                    "current_gate": "REQUIREMENTS",
+                    "workspace_path": tmpdir,
+                    "spec_requirements_path": spec,
+                    "messages": [],
+                    "loop_counter": {"gate_requirements": 2},
+                })
+        finally:
+            reset_channel()
+        assert out["node_state"]["gatekeeper_action"] == "refine"
+        assert len(captured["notes"]) == 1, "notes() should have fired"
+        assert MAX_GATEKEEPER_REFINES >= 3  # sanity: cap leaves room here
+
+    def test_refine_at_cap_is_refused_and_loops_to_menu(self, monkeypatch):
+        """When the operator has burned MAX_GATEKEEPER_REFINES refines,
+        a further "e" pick must NOT trigger a refine — the menu loops
+        and the operator must approve / manual-edit / suspend instead."""
+        from harness.cli import (
+            human_gatekeeper_node, MAX_GATEKEEPER_REFINES,
+        )
+        from harness.hitl import set_channel, reset_channel
+
+        monkeypatch.setattr(
+            "harness.cli._gatekeeper_auto_approves",
+            lambda gate_name=None: False,
+        )
+        # Pre-load attempts so refines_used = MAX_GATEKEEPER_REFINES.
+        # Sequence: operator picks "e" (refused, back to menu) then "a".
+        channel, captured = self._channel_with_answers(["e", "a"])
+        set_channel(channel)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir)
+                out = human_gatekeeper_node({
+                    "current_gate": "REQUIREMENTS",
+                    "workspace_path": tmpdir,
+                    "spec_requirements_path": spec,
+                    "messages": [],
+                    "loop_counter": {
+                        "gate_requirements": MAX_GATEKEEPER_REFINES,
+                    },
+                })
+        finally:
+            reset_channel()
+        assert out["node_state"]["gatekeeper_action"] == "approve"
+        # notes() must NOT have fired — the "e" pick was refused before
+        # it could collect feedback.
+        assert captured["notes"] == [], (
+            f"refine cap did not stop the refine flow: notes() called "
+            f"with {captured['notes']}"
+        )
+        # The menu prompt fired twice: once for "e" (rejected) and once
+        # for the follow-up "a".
+        assert len(captured["prompts"]) == 2
+
+    def test_refine_cap_is_per_gate(self, monkeypatch):
+        """The cap is keyed by gate (REQUIREMENTS / ARCHITECTURE / etc.).
+        Hitting it on one gate does NOT bleed into another."""
+        from harness.cli import (
+            human_gatekeeper_node, MAX_GATEKEEPER_REFINES,
+        )
+        from harness.hitl import set_channel, reset_channel
+
+        monkeypatch.setattr(
+            "harness.cli._gatekeeper_auto_approves",
+            lambda gate_name=None: False,
+        )
+        # REQUIREMENTS attempt counter is exhausted; ARCHITECTURE's is fresh.
+        channel, captured = self._channel_with_answers(["e"])
+        set_channel(channel)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec = self._seed_spec(tmpdir, "SPEC_ARCHITECTURE.md")
+                out = human_gatekeeper_node({
+                    "current_gate": "ARCHITECTURE",
+                    "workspace_path": tmpdir,
+                    "spec_architecture_path": spec,
+                    "messages": [],
+                    "loop_counter": {
+                        "gate_requirements": MAX_GATEKEEPER_REFINES,
+                        # gate_architecture omitted — fresh counter.
+                    },
+                })
+        finally:
+            reset_channel()
+        assert out["node_state"]["gatekeeper_action"] == "refine"
+        assert len(captured["notes"]) == 1
+
+
 def test_interactive_review_loop_prompt_uses_labeled_options(monkeypatch, tmp_path):
     """``interactive_review_loop`` is the second HITL prompt operators
     see (between requirements synthesis and the gatekeeper). It used

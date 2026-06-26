@@ -1232,25 +1232,28 @@ class TestRouterHardCeiling:
         state = self._make_state(attempts=2, max_attempts=2)
         assert route_after_security_scan(state) == "human_intervention_node"
 
-    def test_at_hard_ceiling_routes_to_end(self):
+    def test_at_hard_ceiling_routes_to_hitl(self):
         from harness.graph import route_after_security_scan
         # Default ceiling = 3 * max_attempts = 6. At 6/2 the auto-resume
-        # loop is provably non-productive; terminate.
+        # loop is provably non-productive; escalate to HITL (2026-06-26
+        # loop-audit hardening: previously routed to __end__, which killed
+        # the session before the operator could rescue the work).
         state = self._make_state(attempts=6, max_attempts=2)
-        assert route_after_security_scan(state) == "__end__"
+        assert route_after_security_scan(state) == "human_intervention_node"
 
-    def test_past_hard_ceiling_routes_to_end(self):
+    def test_past_hard_ceiling_routes_to_hitl(self):
         from harness.graph import route_after_security_scan
         state = self._make_state(attempts=9, max_attempts=2)
-        assert route_after_security_scan(state) == "__end__"
+        assert route_after_security_scan(state) == "human_intervention_node"
 
     def test_explicit_hard_ceiling_override(self):
         from harness.graph import route_after_security_scan
         # Operator can lower the ceiling to catch the loop sooner.
+        # Same hardening applies: escalate to HITL rather than terminate.
         state = self._make_state(
             attempts=3, max_attempts=2, hard_ceiling=3,
         )
-        assert route_after_security_scan(state) == "__end__"
+        assert route_after_security_scan(state) == "human_intervention_node"
 
     def test_ceiling_does_not_fire_when_no_findings(self):
         from harness.graph import route_after_security_scan

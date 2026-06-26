@@ -332,6 +332,21 @@ class AgentState(TypedDict, total=False):
     # gate where the crash actually happened. ``batch_commit_node``
     # pops the batch's entry as part of its state reset.
     batch_gate_progress: dict[str, dict[str, bool]]
+    # Story keys whose patching turn has already run in the CURRENT
+    # batch (Phase E.3 cursor-advance fix). Without this, ``story_loop_node``
+    # re-picks the same story every cycle because (a) ``_next_story_in_batch``
+    # orders in_progress rows before planned rows so a once-patched story
+    # always sorts first, and (b) nothing in the per-batch flow marks the
+    # story ``done`` between patching turns (story_complete_node is
+    # per-story-mode only; batch_commit_node fires at end-of-batch). The
+    # router would then bounce patching ⇄ story_loop on STORY-1 until the
+    # global ``consecutive_zero_patch_rounds`` tripwire escalated to HITL —
+    # a session-burning loop. ``batch_planner_node`` initialises this to
+    # ``[]`` for each new batch; ``story_loop_node`` appends
+    # ``current_story_id`` on every entry; ``_next_story_in_batch`` skips
+    # any story whose key is in the list. Reset to ``[]`` by
+    # ``batch_commit_node`` so the next batch starts clean.
+    batch_patched_story_keys: list[str]
     # Opt-in: when True (sourced from ``agile_defaults.commit_on_story`` in
     # config.json — there is no longer a CLI flag for this knob),
     # story_complete_node runs `git add . && git commit -m "<STORY-N>:
@@ -483,6 +498,7 @@ def create_initial_state(
         story_modified_baseline=[],
         batch_modified_files=[],
         batch_gate_progress={},
+        batch_patched_story_keys=[],
         commit_on_story=bool(commit_on_story),
         story_batch_size=int(story_batch_size),
         story_repair_cap=int(story_repair_cap),
@@ -11934,18 +11950,23 @@ def route_after_security_scan(state: AgentState) -> Literal[
     # Security findings exist — first check the HARD ceiling. Past this
     # point the HITL ping-pong is thrashing (most often: the LLM keeps
     # proposing a patch the spec-driven allowlist rejects, e.g. edits
-    # into ``docs/SPEC_ARCHITECTURE.md``). Terminate the run rather than
-    # keep looping. The build is incomplete — exit will be non-zero.
+    # into ``docs/SPEC_ARCHITECTURE.md``). Route to HITL rather than
+    # ``__end__`` so the operator can still rescue the work: ack the
+    # finding manually, fix it themselves, or suspend & resume. The
+    # earlier "terminate the run" behavior killed local edits in flight
+    # because the LangGraph session was unrecoverable without a fresh
+    # resume cycle. The HITL menu surfaces "ceiling reached" so the
+    # operator sees they're at the wall and not in a normal loop.
     if sec_attempts >= hard_ceiling:
         logger.error(
             "[router] Security HITL ping-pong hard ceiling reached "
             "(attempts=%d, ceiling=%d). %d finding(s) survived %d HITL "
-            "resume(s) without being fixed. Terminating without deployment — "
-            "operator must inspect findings manually.",
+            "resume(s) without being fixed. Escalating to HITL — operator "
+            "must inspect findings manually, ack/suppress, or suspend.",
             sec_attempts, hard_ceiling, len(compiler_errors),
             sec_attempts - max_sec_attempts,
         )
-        return "__end__"
+        return "human_intervention_node"
 
     # Security findings exist — check soft attempt limit (route to HITL)
     if sec_attempts >= max_sec_attempts:

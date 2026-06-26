@@ -391,8 +391,15 @@ def test_story_loop_auto_completes_story_at_zero_patch_cap(workspace: str):
 
 
 def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
-    """Below the cap, the story stays in_progress and is re-selected
-    (the in_progress story always wins the ORDER BY)."""
+    """Below the per-story zero-patch cap, the story is NOT auto-completed
+    (it stays in_progress in the DB), but the cursor still advances to the
+    next story in the batch. The cursor-advance is driven by
+    ``batch_patched_story_keys`` (Phase E.3 fix) — the previous story's
+    patching turn already ran, so picking it again would just re-patch the
+    same code without making progress. The per-story zero-patch cap is now
+    defensive: it would only fire if state were carried across runs (e.g.,
+    via checkpoint resume) such that the same story re-entered story_loop
+    with a non-empty rounds counter."""
     _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
     planned = story_loop.batch_planner_node(_state(workspace))
     batch_id = planned["current_batch_id"]
@@ -415,19 +422,100 @@ def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
         },
     ))
 
-    assert out["current_story_id"] == "STORY-1"
+    # Phase E.3 cursor-advance: STORY-1 is recorded as patched and STORY-2
+    # is picked next; STORY-1 is NOT re-selected even though it's still
+    # in_progress in the DB.
+    assert out["current_story_id"] == "STORY-2"
     assert out["node_state"].get("auto_completed_story") is None
-    # Counter survives unchanged.
+    assert "STORY-1" in out["batch_patched_story_keys"]
+    # Counter survives unchanged — auto-complete didn't fire.
     assert out["loop_counter"]["story_zero_patch_rounds"]["STORY-1"] == (
         story_loop.STORY_ZERO_PATCH_CAP - 1
     )
 
+    # STORY-1 is still in_progress in the DB; batch_commit_node will seal
+    # it as ``done`` after the per-batch verification chain runs.
     conn = story_state.open_story_db()
     try:
         s = story_state.get_story(conn, app, "STORY-1")
     finally:
         conn.close()
     assert s["status"] == "in_progress"
+
+
+def test_story_loop_advances_cursor_after_patching_turn(workspace: str):
+    """Regression for the 2026-06-26 session-burning bug. Before the fix,
+    ``story_loop_node ⇄ patching_node`` could loop on the same story
+    forever because ``_next_story_in_batch`` ordered in_progress rows
+    first and nothing marked the just-patched story ``done`` between
+    iterations. The only guard was a global zero-patch tripwire that
+    fired only after the patcher gave up — a session-burning failure
+    mode (~$18 + 80 min lost in the incident).
+
+    Contract under test: when ``story_loop_node`` re-enters with a
+    ``current_story_id`` set (i.e., patching just ran on it), the cursor
+    advances to the next ready story in the batch, never re-selecting the
+    same one — regardless of whether the previous patching turn applied
+    patches, returned zero, or failed mid-flight."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}, {"title": "C"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    # First story_loop entry — picks STORY-1.
+    out1 = story_loop.story_loop_node(
+        _state(workspace, current_batch_id=batch_id)
+    )
+    assert out1["current_story_id"] == "STORY-1"
+    assert out1["batch_patched_story_keys"] == []
+
+    # Simulate the LangGraph channel layer: the next call sees
+    # current_story_id="STORY-1" (patching_node didn't change it) and
+    # batch_patched_story_keys is still empty until story_loop_node runs.
+    # The patching_node turn is a no-op for this test — we only care that
+    # story_loop_node advances the cursor on re-entry.
+    out2 = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-1",
+        batch_patched_story_keys=[],
+    ))
+    assert out2["current_story_id"] == "STORY-2"
+    assert out2["batch_patched_story_keys"] == ["STORY-1"]
+
+    # Third entry — STORY-2 just patched; STORY-3 is next.
+    out3 = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-2",
+        batch_patched_story_keys=["STORY-1"],
+    ))
+    assert out3["current_story_id"] == "STORY-3"
+    assert sorted(out3["batch_patched_story_keys"]) == [
+        "STORY-1", "STORY-2",
+    ]
+
+    # Fourth entry — STORY-3 patched, no stories left → batch_complete.
+    out4 = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-3",
+        batch_patched_story_keys=["STORY-1", "STORY-2"],
+    ))
+    assert out4["current_story_id"] == ""
+    assert out4["node_state"]["batch_complete"] is True
+    assert sorted(out4["batch_patched_story_keys"]) == [
+        "STORY-1", "STORY-2", "STORY-3",
+    ]
+
+
+def test_batch_planner_resets_patched_keys_for_new_batch(workspace: str):
+    """A new batch must start with an empty ``batch_patched_story_keys``
+    so the cursor is free to pick any ready story by sequence. Without
+    this reset, leftover keys from the previous batch would silently
+    skip ready stories."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    out = story_loop.batch_planner_node(_state(workspace))
+    assert out["batch_patched_story_keys"] == []
 
 
 def test_story_loop_auto_complete_respects_cap_override(workspace: str):

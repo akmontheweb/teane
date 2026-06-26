@@ -295,6 +295,22 @@ def test_render_preamble_unknown_consumer_falls_back_to_patcher():
     assert "ARCH_GAP" in out
 
 
+def test_render_preamble_security_consumer_emphasises_consistency():
+    """The security consumer should frame fixes as "stay within the
+    resolved stack" — auth strategy, ORM, contract path stay fixed."""
+    out = arch_summary.render_arch_preamble(_VALID_SUMMARY, consumer="security")
+    lower = out.lower()
+    assert "consistent" in lower
+    assert "auth" in lower
+    # Must NOT carry the patcher's NO_PROGRESS instruction — that
+    # would conflict with the autofix → repair → re-scan loop the
+    # security gate already manages.
+    assert "ARCH_GAP" not in out
+    # The endpoint map still surfaces so the LLM knows where its
+    # changes will land.
+    assert "EP-001" in out
+
+
 def test_render_preamble_falls_back_to_legacy_frontend_object():
     """Pre-rename summaries (where ``frontend`` was the object, not the
     enum) must still render — the schema split landed mid-flight and

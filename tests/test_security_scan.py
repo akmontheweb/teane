@@ -833,6 +833,151 @@ class TestSecurityScanNode:
         assert result["node_state"]["security_scan"]["passed"] is True
         assert result["node_state"]["security_scan"]["scanners_clean"] == ["gitleaks"]
 
+    # -----------------------------------------------------------------
+    # Architecture-summary handoff (§11 jsonc) into the repair LLM
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_arch_summary_preamble_injected_before_findings(
+        self, workspace, monkeypatch,
+    ):
+        """When state carries a §11 summary AND there are blocking
+        findings, the messages array must contain an architecture
+        preamble (system role) immediately BEFORE the findings
+        breadcrumb. The repair LLM should read the resolved stack
+        before the findings list."""
+        from harness import security as sec
+
+        async def bandit_with_high(*a, **k):
+            return ScannerOutcome(
+                scanner="bandit", status=ScannerStatus.FOUND,
+                findings=[SecurityFinding(
+                    scanner="bandit", rule_id="B201", severity="high",
+                    file="app.py", line=42, message="Flask debug=True",
+                    cwe="CWE-94", confidence="high",
+                )],
+            )
+
+        async def empty(name):
+            return ScannerOutcome(scanner=name, status=ScannerStatus.OK)
+
+        monkeypatch.setattr(sec, "run_gitleaks_scan", lambda *a, **k: empty("gitleaks"))
+        monkeypatch.setattr(sec, "run_bandit_scan",   bandit_with_high)
+        monkeypatch.setattr(sec, "run_semgrep_scan",  lambda *a, **k: empty("semgrep"))
+        monkeypatch.setattr(sec, "run_trivy_scan",    lambda *a, **k: empty("trivy"))
+
+        arch = {
+            "schema_version": 1,
+            "backend_language": "python_fastapi",
+            "frontend": "none",
+            "db_engine": "postgres",
+            "auth_strategy": "jwt",
+            "backend": {"endpoints": [{
+                "id": "EP-001", "method": "POST", "path": "/api/v1/login",
+                "rsd_story_ids": ["STORY-1"],
+            }]},
+            "contract": {"openapi_spec_path": "contracts/openapi.json"},
+        }
+
+        result = await sec.security_scan_node({
+            "workspace_path": workspace,
+            "security_scan_config": {"enabled": True},
+            "messages": [],
+            "arch_summary": arch,
+        })
+
+        assert result["node_state"]["security_scan"]["passed"] is False
+        # System messages added by the node, in order.
+        added = [m for m in result["messages"] if m["role"] == "system"]
+        assert len(added) >= 2, "expected arch preamble + findings breadcrumb"
+        # Penultimate is the arch preamble; last is the findings.
+        arch_msg = added[-2]["content"]
+        findings_msg = added[-1]["content"]
+        assert "Architecture summary" in arch_msg
+        assert "EP-001" in arch_msg
+        assert "Security Scan" in findings_msg
+        assert "BANDIT" in findings_msg or "bandit" in findings_msg
+        # Resolved summary echoed back into state so a downstream
+        # patching_node turn doesn't re-load from disk.
+        assert result["arch_summary"]["schema_version"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_arch_preamble_when_summary_absent(
+        self, workspace, monkeypatch,
+    ):
+        """No state.arch_summary AND no SPEC_ARCHITECTURE.md on disk
+        → the findings breadcrumb stands alone (pre-existing
+        behaviour, no regression)."""
+        from harness import security as sec
+
+        async def bandit_with_high(*a, **k):
+            return ScannerOutcome(
+                scanner="bandit", status=ScannerStatus.FOUND,
+                findings=[SecurityFinding(
+                    scanner="bandit", rule_id="B201", severity="high",
+                    file="app.py", line=42, message="Flask debug=True",
+                )],
+            )
+
+        async def empty(name):
+            return ScannerOutcome(scanner=name, status=ScannerStatus.OK)
+
+        monkeypatch.setattr(sec, "run_gitleaks_scan", lambda *a, **k: empty("gitleaks"))
+        monkeypatch.setattr(sec, "run_bandit_scan",   bandit_with_high)
+        monkeypatch.setattr(sec, "run_semgrep_scan",  lambda *a, **k: empty("semgrep"))
+        monkeypatch.setattr(sec, "run_trivy_scan",    lambda *a, **k: empty("trivy"))
+
+        result = await sec.security_scan_node({
+            "workspace_path": workspace,
+            "security_scan_config": {"enabled": True},
+            "messages": [],
+        })
+
+        added = [m for m in result["messages"] if m["role"] == "system"]
+        # Exactly one system message — the findings breadcrumb. No
+        # arch preamble means none of the system messages should
+        # mention the canonical heading.
+        joined = "\n".join(m["content"] for m in added)
+        assert "Architecture summary" not in joined
+        assert "Security Scan" in joined
+        # Resolved summary in the return delta is the empty dict —
+        # caching contract: "we looked, there's nothing".
+        assert result["arch_summary"] == {}
+
+    @pytest.mark.asyncio
+    async def test_no_arch_preamble_on_clean_pass(
+        self, workspace, monkeypatch,
+    ):
+        """Even with state.arch_summary set, a clean scan must NOT
+        inject an arch preamble — there's no LLM hand-off on the
+        clean path."""
+        from harness import security as sec
+
+        async def empty(name):
+            return ScannerOutcome(scanner=name, status=ScannerStatus.OK)
+
+        monkeypatch.setattr(sec, "run_gitleaks_scan", lambda *a, **k: empty("gitleaks"))
+        monkeypatch.setattr(sec, "run_bandit_scan",   lambda *a, **k: empty("bandit"))
+        monkeypatch.setattr(sec, "run_semgrep_scan",  lambda *a, **k: empty("semgrep"))
+        monkeypatch.setattr(sec, "run_trivy_scan",    lambda *a, **k: empty("trivy"))
+
+        arch = {
+            "schema_version": 1,
+            "backend_language": "python_fastapi",
+            "frontend": "none",
+            "backend": {"endpoints": []},
+            "contract": {"openapi_spec_path": "contracts/openapi.json"},
+        }
+        result = await sec.security_scan_node({
+            "workspace_path": workspace,
+            "security_scan_config": {"enabled": True},
+            "messages": [],
+            "arch_summary": arch,
+        })
+        assert result["node_state"]["security_scan"]["passed"] is True
+        # Clean path returns only node_state — no messages mutation.
+        assert "messages" not in result
+
 
 # ---------------------------------------------------------------------------
 # exclude_paths: scanners must skip docs/ by default so the spec-driven

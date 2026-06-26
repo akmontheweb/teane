@@ -192,6 +192,18 @@ _CONSUMER_GUIDANCE: dict[str, str] = {
         "render test. Schema names map directly to the request / "
         "response classes the patcher generated."
     ),
+    "security": (
+        "Security fixes must STAY CONSISTENT with the resolved "
+        "stack below. Do NOT swap in a different secrets store, "
+        "auth library, ORM, or contract path — the architecture "
+        "doc has already decided those. Pull credentials from the "
+        "declared config source (env / Pydantic Settings / Spring "
+        "@Value), use the declared auth strategy for any new "
+        "guards, and reference the same schema names listed in the "
+        "endpoint map. Findings against files outside this map are "
+        "still real bugs — fix them in place; just do not "
+        "re-architect."
+    ),
 }
 
 

@@ -2094,6 +2094,21 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
     messages = list(state.get("messages", []))
     if autofix_message is not None:
         messages.append(autofix_message)
+    # Architecture-summary preamble — tells the repair LLM to fix
+    # the findings *within* the resolved stack (auth strategy, DB
+    # driver, contract path, schema names) instead of inventing a
+    # different secrets store or ORM. Empty string when the arch
+    # doc has no §11 block; in that case the security breadcrumb
+    # below stands alone, matching pre-existing behaviour.
+    from harness.graph import _build_arch_summary_preamble
+    # state is dict[str, Any] here, but the helper only does .get()
+    # on it (workspace_path / arch_summary) so an explicit AgentState
+    # cast would be decorative — pass through verbatim.
+    arch_preamble, resolved_arch = _build_arch_summary_preamble(
+        state, consumer="security",  # type: ignore[arg-type]
+    )
+    if arch_preamble:
+        messages.append({"role": "system", "content": arch_preamble})
     messages.append({"role": "system", "content": "\n".join(status_lines)})
 
     return {
@@ -2101,6 +2116,11 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         "loop_counter": loop_counter,
         "messages": messages,
         "modified_files": autofix_modified_files,
+        # Pass the resolved summary through so a downstream
+        # patching_node turn skips the disk read if it was lazy-loaded
+        # here. Empty dict = no §11 block on disk (same caching
+        # contract as patching_node's return delta).
+        "arch_summary": resolved_arch,
         "node_state": {
             "security_scan": {
                 "passed": False,

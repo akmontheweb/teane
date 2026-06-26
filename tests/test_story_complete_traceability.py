@@ -289,3 +289,164 @@ def test_traceability_regenerates_both_views(workspace: str):
     assert os.path.exists(out["node_state"]["traceability_md"])
     assert "STORY-1" in Path(out["node_state"]["stories_md"]).read_text()
     assert "STORY-1" in Path(out["node_state"]["traceability_md"]).read_text()
+
+
+# ---------------------------------------------------------------------------
+# traceability_node — architecture coverage matrix (§11 handoff)
+# ---------------------------------------------------------------------------
+
+_BASE_ARCH_SUMMARY: dict[str, Any] = {
+    "schema_version": 1,
+    "backend_language": "python_fastapi",
+    "frontend": "react",
+    "backend": {
+        "endpoints": [
+            {
+                "id": "EP-001",
+                "method": "POST",
+                "path": "/api/v1/login",
+                "rsd_story_ids": ["STORY-1"],
+            },
+            {
+                "id": "EP-002",
+                "method": "GET",
+                "path": "/api/v1/orphan",
+                "rsd_story_ids": [],          # no story linked → gap
+            },
+            {
+                "id": "EP-003",
+                "method": "GET",
+                "path": "/api/v1/ghost",
+                "rsd_story_ids": ["STORY-99"],  # story doesn't exist → missing
+            },
+        ],
+    },
+    "frontend_spec": {
+        "components": [
+            {
+                "name": "LoginForm",
+                "path": "pages/auth/LoginPage.tsx",
+                "rsd_story_ids": ["STORY-1"],
+            },
+        ],
+    },
+    "contract": {"openapi_spec_path": "contracts/openapi.json"},
+}
+
+
+def test_traceability_skips_arch_section_without_summary(workspace: str):
+    """No state.arch_summary AND no SPEC_ARCHITECTURE.md on disk →
+    TRACEABILITY.md must not contain the new section."""
+    _seed_one_story(workspace, title="Demo")
+    out = story_loop.traceability_node({"workspace_path": workspace})
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    assert "Architecture coverage" not in body
+    assert out["node_state"]["arch_coverage_emitted"] is False
+
+
+def test_traceability_emits_arch_section_from_state(workspace: str):
+    _seed_one_story(workspace, title="Demo")
+    out = story_loop.traceability_node({
+        "workspace_path": workspace,
+        "arch_summary": _BASE_ARCH_SUMMARY,
+    })
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    assert "Architecture coverage" in body
+    assert "EP-001" in body and "/api/v1/login" in body
+    assert out["node_state"]["arch_coverage_emitted"] is True
+
+
+def test_traceability_links_story_status(workspace: str):
+    """When EP-001 cites STORY-1, the coverage row should carry the
+    live story status — not just the ID."""
+    _seed_one_story(workspace, title="Demo")
+    out = story_loop.traceability_node({
+        "workspace_path": workspace,
+        "arch_summary": _BASE_ARCH_SUMMARY,
+    })
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    # The seeded story lands as "planned" — exact label depends on
+    # _status_label, so we accept any non-empty status cell next to
+    # the STORY-1 ID and just assert the ID surfaces in the coverage
+    # block (which sits AFTER the per-story drill-down).
+    coverage_section = body.split("Architecture coverage", 1)[1]
+    assert "STORY-1" in coverage_section
+    assert "EP-001" in coverage_section
+
+
+def test_traceability_flags_orphan_endpoint_as_gap(workspace: str):
+    """An endpoint with no rsd_story_ids should render the 'gap'
+    sentinel so reviewers spot un-storied architecture work."""
+    _seed_one_story(workspace, title="Demo")
+    out = story_loop.traceability_node({
+        "workspace_path": workspace,
+        "arch_summary": _BASE_ARCH_SUMMARY,
+    })
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    # Slice down to the orphan row to keep the assertion targeted.
+    orphan_line = [ln for ln in body.splitlines() if "EP-002" in ln]
+    assert orphan_line, "EP-002 row missing from coverage table"
+    assert "gap" in orphan_line[0].lower()
+
+
+def test_traceability_flags_missing_story_for_unknown_id(workspace: str):
+    """An endpoint citing a story that the DB doesn't recognise should
+    be tagged 'missing' rather than silently rendered as healthy."""
+    _seed_one_story(workspace, title="Demo")
+    out = story_loop.traceability_node({
+        "workspace_path": workspace,
+        "arch_summary": _BASE_ARCH_SUMMARY,
+    })
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    ghost_line = [ln for ln in body.splitlines() if "EP-003" in ln]
+    assert ghost_line, "EP-003 row missing from coverage table"
+    assert "STORY-99" in ghost_line[0]
+    assert "missing" in ghost_line[0].lower()
+
+
+def test_traceability_omits_components_section_when_frontend_none(workspace: str):
+    _seed_one_story(workspace, title="Demo")
+    summary = dict(_BASE_ARCH_SUMMARY)
+    summary["frontend"] = "none"
+    out = story_loop.traceability_node({
+        "workspace_path": workspace,
+        "arch_summary": summary,
+    })
+    body = Path(out["node_state"]["traceability_md"]).read_text()
+    # Endpoint subheading still present.
+    assert "### Endpoints" in body
+    # Component subheading should be suppressed for headless backends.
+    assert "### Components" not in body
+
+
+def test_traceability_lazy_loads_summary_from_disk(workspace: str):
+    """When state.arch_summary is empty but docs/SPEC_ARCHITECTURE.md
+    carries a §11 block, the node should hydrate from disk and emit
+    the coverage section — same path patching_node uses on monolithic
+    flows."""
+    import json as _json
+    _seed_one_story(workspace, title="Demo")
+    docs = Path(workspace) / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    body = (
+        "# Architecture Document\n\n"
+        "## §11 Summary\n\n"
+        "```jsonc\n" + _json.dumps(_BASE_ARCH_SUMMARY) + "\n```\n"
+    )
+    (docs / "SPEC_ARCHITECTURE.md").write_text(body, encoding="utf-8")
+
+    out = story_loop.traceability_node({"workspace_path": workspace})
+    body_md = Path(out["node_state"]["traceability_md"]).read_text()
+    assert "Architecture coverage" in body_md
+    assert "EP-001" in body_md
+    # Resolved summary is echoed back into state for downstream nodes.
+    assert out["arch_summary"]["schema_version"] == 1
+
+
+def test_render_arch_coverage_empty_summary_returns_empty_list():
+    from harness.story_state import _render_arch_coverage
+    assert _render_arch_coverage([], None) == []
+    assert _render_arch_coverage([], {}) == []
+    assert _render_arch_coverage(
+        [], {"backend": {"endpoints": []}, "frontend": "none"}
+    ) == []

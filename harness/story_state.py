@@ -1394,11 +1394,131 @@ def _render_stories_md(stories: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _render_arch_coverage(
+    stories: list[dict[str, Any]],
+    arch_summary: Optional[dict[str, Any]],
+) -> list[str]:
+    """Render the "Architecture coverage" section appended to
+    ``docs/TRACEABILITY.md``.
+
+    Cross-references each §11 endpoint and component back to the
+    story / stories that cite it (via ``rsd_story_ids``), surfacing
+    the live story status next to the architectural artifact. A row
+    with no matching story is flagged as a **gap** — the
+    architecture defined the endpoint / component but no story
+    captures the work.
+
+    Returns an empty list (so the caller can ``extend`` without a
+    conditional) when:
+      - ``arch_summary`` is ``None`` or not a dict
+      - the summary has neither endpoints nor components
+
+    The story status carried into the table is the live DB status —
+    a row reading ``STORY-3 (in_progress)`` flags incomplete work
+    against a resolved arch decision better than the per-story drill-
+    down does on its own.
+    """
+    if not arch_summary or not isinstance(arch_summary, dict):
+        return []
+
+    backend = arch_summary.get("backend") or {}
+    endpoints = backend.get("endpoints") or []
+    frontend = arch_summary.get("frontend") or "none"
+    spec = arch_summary.get("frontend_spec")
+    if not isinstance(spec, dict):
+        legacy = arch_summary.get("frontend")
+        spec = legacy if isinstance(legacy, dict) else {}
+    components = spec.get("components") or []
+
+    if not endpoints and not components:
+        return []
+
+    status_by_key: dict[str, str] = {
+        s["story_key"]: s.get("status", "?") for s in stories
+    }
+
+    def _stories_cell(ids: list[str]) -> tuple[str, str]:
+        """Return (story_cell, status_cell) — '—' when the architecture
+        artifact has no story link at all, ``GAP`` when it lists IDs
+        that the DB doesn't recognise (story removed / never created)."""
+        if not ids:
+            return "— (gap)", "—"
+        bits: list[str] = []
+        statuses: list[str] = []
+        for sid in ids:
+            if not isinstance(sid, str):
+                continue
+            if sid in status_by_key:
+                bits.append(sid)
+                statuses.append(_status_label(status_by_key[sid]))
+            else:
+                bits.append(f"{sid} (missing)")
+                statuses.append("—")
+        if not bits:
+            return "— (gap)", "—"
+        return ", ".join(bits), ", ".join(statuses)
+
+    lines: list[str] = [
+        "## Architecture coverage",
+        "",
+        "_Cross-references `docs/SPEC_ARCHITECTURE.md` §11 against the "
+        "stories table. A `gap` row is an arch artifact with no "
+        "story implementing it._",
+        "",
+    ]
+
+    if endpoints:
+        lines.extend([
+            "### Endpoints",
+            "",
+            "| EP | Method | Path | Stories | Status |",
+            "| --- | --- | --- | --- | --- |",
+        ])
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            ids: list[str] = []
+            for key in ("rsd_story_ids", "rsd_feature_ids"):
+                # Only story IDs map to the stories table; FEAT-N rolls
+                # up its constituent stories. We surface STORY-N when
+                # present and skip FEAT-N here to keep the cell tight.
+                if key == "rsd_story_ids":
+                    ids.extend(ep.get(key) or [])
+            stories_cell, status_cell = _stories_cell(ids)
+            lines.append(
+                f"| {ep.get('id', '?')} | {(ep.get('method') or '').upper()} | "
+                f"`{ep.get('path', '')}` | {stories_cell} | {status_cell} |"
+            )
+        lines.append("")
+
+    if components and frontend != "none":
+        lines.extend([
+            "### Components",
+            "",
+            "| Component | Path | Stories | Status |",
+            "| --- | --- | --- | --- |",
+        ])
+        for cp in components:
+            if not isinstance(cp, dict):
+                continue
+            ids = list(cp.get("rsd_story_ids") or [])
+            stories_cell, status_cell = _stories_cell(ids)
+            lines.append(
+                f"| {cp.get('name', '?')} | `{cp.get('path', '')}` | "
+                f"{stories_cell} | {status_cell} |"
+            )
+        lines.append("")
+
+    return lines
+
+
 def _render_traceability_md(
     stories: list[dict[str, Any]],
     files_by_story: dict[str, list[tuple[str, str]]],
     defects_by_story: dict[str, list[dict[str, Any]]],
     commits_by_story: dict[str, list[dict[str, Any]]],
+    *,
+    arch_summary: Optional[dict[str, Any]] = None,
 ) -> str:
     lines = [
         "# Traceability matrix",
@@ -1453,6 +1573,11 @@ def _render_traceability_md(
             for c in commits:
                 lines.append(f"- `{c['sha'][:7]}` — {c['message']}")
             lines.append("")
+    # Architecture coverage matrix, appended only when SPEC_ARCHITECTURE.md's
+    # §11 summary is available. Bytes-identical TRACEABILITY.md output when
+    # no summary is passed in — keeps backward compatibility with projects
+    # that don't ship a machine-readable arch doc.
+    lines.extend(_render_arch_coverage(stories, arch_summary))
     return "\n".join(lines)
 
 
@@ -1505,7 +1630,10 @@ def _collect_view_inputs(
 
 
 def regenerate_markdown_views(
-    conn: sqlite3.Connection, workspace_path: str,
+    conn: sqlite3.Connection,
+    workspace_path: str,
+    *,
+    arch_summary: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str]:
     """Rebuild ``docs/STORIES.md`` and ``docs/TRACEABILITY.md`` from the DB.
 
@@ -1514,6 +1642,14 @@ def regenerate_markdown_views(
     own slice. Returns ``(stories_path, traceability_path)``. The agent
     calls this after every batch — the markdown files are derived
     state, never a write surface for the LLM.
+
+    When ``arch_summary`` is supplied (the parsed §11 jsonc block from
+    ``docs/SPEC_ARCHITECTURE.md``), TRACEABILITY.md picks up an
+    "Architecture coverage" section that cross-references each
+    endpoint and component against the stories table. The kwarg is
+    optional and defaults to ``None`` so existing call sites
+    (decomposition mid-run regenerations) keep their pre-existing
+    output byte-for-byte until a caller explicitly opts in.
     """
     workspace = app_name_for_workspace(workspace_path)
     stories, files_by_story, defects_by_story, commits_by_story = (
@@ -1521,7 +1657,8 @@ def regenerate_markdown_views(
     )
     stories_md = _render_stories_md(stories)
     trace_md = _render_traceability_md(
-        stories, files_by_story, defects_by_story, commits_by_story
+        stories, files_by_story, defects_by_story, commits_by_story,
+        arch_summary=arch_summary,
     )
 
     docs_dir = os.path.join(os.path.expanduser(workspace_path), "docs")

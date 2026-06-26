@@ -988,7 +988,15 @@ def route_after_batch_commit(state: dict[str, Any]) -> str:
 def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
     """Regenerate ``docs/STORIES.md`` and ``docs/TRACEABILITY.md`` from
     the DB. Idempotent; safe to call at any time. Fires at the end of
-    every batch and at the very end of the run."""
+    every batch and at the very end of the run.
+
+    When ``state["arch_summary"]`` is populated (by ``decomposition_node``
+    on agile flows, or lazy-loaded by ``patching_node`` on monolithic
+    ones), TRACEABILITY.md picks up an "Architecture coverage"
+    section that surfaces gaps between the §11 endpoint / component
+    map and the stories implementing them. Empty / missing summary
+    keeps the byte-identical pre-existing output.
+    """
     workspace_path = state.get("workspace_path") or ""
     if not workspace_path:
         return {
@@ -998,23 +1006,37 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
                 "reason": "no_workspace",
             },
         }
+
+    arch_summary_dict = state.get("arch_summary") or {}
+    if not arch_summary_dict:
+        # Lazy load — covers the case where this node fires before
+        # patching_node ever did (e.g. an immediate traceability
+        # regeneration after decomposition on a budget-exhausted
+        # session).
+        from harness.arch_summary import load_arch_summary
+        arch_summary_dict = load_arch_summary(workspace_path) or {}
+
     conn = story_state.open_story_db()
     try:
         stories_md, trace_md = story_state.regenerate_markdown_views(
             conn, workspace_path,
+            arch_summary=arch_summary_dict or None,
         )
     finally:
         conn.close()
     logger.info(
-        "[traceability] regenerated %s and %s",
+        "[traceability] regenerated %s and %s%s",
         os.path.relpath(stories_md, workspace_path),
         os.path.relpath(trace_md, workspace_path),
+        " (with arch coverage)" if arch_summary_dict else "",
     )
     return {
+        "arch_summary": arch_summary_dict,
         "node_state": {
             "current_node": "traceability",
             "skipped": False,
             "stories_md": stories_md,
             "traceability_md": trace_md,
+            "arch_coverage_emitted": bool(arch_summary_dict),
         },
     }

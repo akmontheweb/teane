@@ -796,7 +796,7 @@ def _compute_is_active(exit_code: Any, current_node: str, updated_fmt: str) -> b
     # touched in 24h, treat as inactive (silently abandoned).
     if not current_node and updated_fmt and updated_fmt != "(unknown)":
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
             # updated_fmt is local-formatted "YYYY-MM-DD HH:MM:SS"; parse
             # back without a tz, compare to local now. Cheap heuristic —
             # exact age is unimportant, the cutoff is "long enough that

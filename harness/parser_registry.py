@@ -12,13 +12,12 @@ to register and look up diagnostic parsers at runtime.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Optional
 
-from harness.sandbox import BaseLanguageParser, DiagnosticObject, FixSuggestion
+from harness.sandbox import BaseLanguageParser, DiagnosticObject
 
 logger = logging.getLogger(__name__)
 

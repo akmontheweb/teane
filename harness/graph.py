@@ -291,6 +291,20 @@ class AgentState(TypedDict, total=False):
     story_defects_open: int
     stories_db_path: str
     story_scope_files: list[str]
+    # Structured architecture summary parsed from
+    # ``docs/SPEC_ARCHITECTURE.md`` §11 (the fenced ``jsonc`` block the
+    # ``arch_doc_generator`` skill emits). Populated lazily — first by
+    # ``decomposition_node`` when it runs (agile mode), and otherwise by
+    # ``patching_node`` on its first turn after the arch doc exists.
+    # Consumers (patching preamble, batch planner, traceability) read
+    # the resolved endpoints / components / contract paths from here so
+    # they do not re-derive them on every node call. Empty dict = either
+    # the arch doc has no §11 block, the schema_version is unrecognised,
+    # or the file is absent — every consumer must tolerate this and
+    # fall back to the prose handoff in ``messages[0]``.
+    # MUST be declared here — LangGraph drops unregistered channel keys
+    # silently (see the discovery_questions warning above).
+    arch_summary: dict[str, Any]
     # Snapshot of ``modified_files`` taken when story_loop_node picked the
     # current story. story_complete_node diffs against this to attribute
     # only newly-touched files to the active STORY-N row in file_links.
@@ -463,6 +477,7 @@ def create_initial_state(
         story_defects_open=0,
         stories_db_path=stories_db_path,
         story_scope_files=[],
+        arch_summary={},
         story_modified_baseline=[],
         batch_modified_files=[],
         batch_gate_progress={},
@@ -3456,9 +3471,16 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         # STORY-N marker contract. No-op (empty string) when no story
         # is active — monolithic flow (--no-stories) is byte-identical.
         story_preamble = _build_story_preamble(state, "patching")
+        # Architecture-summary handoff: render endpoint / component /
+        # contract tables from docs/SPEC_ARCHITECTURE.md §11 so the
+        # patcher does not re-derive paths and schema names on every
+        # turn. Empty string when the arch doc has no §11 block —
+        # patching falls back to the prose document the system prompt
+        # already carries.
+        arch_preamble, resolved_arch_summary = _build_arch_summary_preamble(state)
 
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + arch_preamble + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -9366,6 +9388,35 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
         f"{rules}\n\n"
         "---\n\n"
     )
+
+
+def _build_arch_summary_preamble(state: AgentState) -> tuple[str, dict[str, Any]]:
+    """Return ``(preamble_text, resolved_summary)`` for the patching loop.
+
+    Reads ``state["arch_summary"]`` if present; otherwise lazy-loads
+    from ``<workspace>/docs/SPEC_ARCHITECTURE.md`` (monolithic / non-
+    decomposition flows skip ``decomposition_node`` entirely, so the
+    summary never gets populated by that path). The resolved summary
+    is returned alongside the preamble so the caller can stash it
+    back onto state as part of its delta — a one-time cost per
+    patching session.
+
+    Returns ``("", {})`` when the arch doc has no §11 jsonc block,
+    schema_version is unrecognised, or the file is missing. Callers
+    MUST treat this as "fall back to the prose handoff" and never
+    branch on the structured fields being present.
+    """
+    summary = state.get("arch_summary") or {}
+    if not summary:
+        from harness.arch_summary import load_arch_summary
+        loaded = load_arch_summary(state.get("workspace_path") or "")
+        summary = loaded or {}
+
+    if not summary:
+        return "", {}
+
+    from harness.arch_summary import render_arch_preamble
+    return render_arch_preamble(summary), summary
 
 
 async def reverse_spec_node(state: AgentState) -> dict[str, Any]:

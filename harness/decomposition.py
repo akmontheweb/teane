@@ -562,6 +562,14 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         }
     spec_arch = _read_text(os.path.join(workspace, "docs", "SPEC_ARCHITECTURE.md"))
 
+    # Parse the §11 machine-readable summary the arch_doc skill embeds
+    # in SPEC_ARCHITECTURE.md. Lazy + lenient — None on any failure,
+    # which means downstream nodes fall back to prose-only handoff.
+    # Stored on AgentState so patching_node and the batch planner don't
+    # each re-read the file.
+    from harness.arch_summary import load_arch_summary
+    arch_summary = load_arch_summary(workspace) or {}
+
     gateway = get_gateway()
     if gateway is None:
         logger.error("[decomposition] No gateway configured.")
@@ -725,6 +733,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         )
         return {
             "stories_db_path": db_path,
+            "arch_summary": arch_summary,
             "current_gate": "STORIES",
             "budget_remaining_usd": budget,
             "node_state": {
@@ -768,6 +777,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "stories_db_path": db_path,
+        "arch_summary": arch_summary,
         "current_gate": "STORIES",
         "budget_remaining_usd": budget,
         "node_state": {

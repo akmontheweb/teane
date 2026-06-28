@@ -663,7 +663,7 @@ _NODE_CONFIG_SUFFIXES: tuple[str, ...] = (
     ".config.js", ".config.cjs", ".config.mjs", ".config.ts", ".config.json",
 )
 _NODE_CONFIG_PREFIXES: tuple[str, ...] = (
-    ".eslintrc", ".prettierrc", ".babelrc",
+    ".eslintrc", ".prettierrc", ".babelrc", "tsconfig",
 )
 
 
@@ -675,6 +675,9 @@ def _is_node_config_file(name: str) -> bool:
         postcss, playwright, rollup, webpack, etc.
       - ``.eslintrc*`` / ``.prettierrc*`` / ``.babelrc*`` — each ships in
         bare, ``.json``, ``.js``, ``.cjs``, and ``.yaml`` forms.
+      - ``tsconfig*`` — Vite/Next/Angular/Nx scaffolds emit several
+        variants alongside the base file (``tsconfig.app.json``,
+        ``tsconfig.node.json``, ``tsconfig.build.json``, etc.).
     """
     if any(name.endswith(suffix) for suffix in _NODE_CONFIG_SUFFIXES):
         return True

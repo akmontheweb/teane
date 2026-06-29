@@ -26,11 +26,12 @@ from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-# Events that count as "this session burned money/tokens". Currently only
-# llm_call, but the list is here so a future provider that emits a
-# differently-named event (e.g. embedding_call) can be added with one
-# line.
-_COST_EVENTS = frozenset({"llm_call"})
+# Events that count as "this session burned money/tokens". ``llm_call``
+# is the chat-completion path; ``embedding_call`` is the /v1/embeddings
+# path used by the opt-in semantic retrieval index in repo_index.py.
+# Both carry ``cost_usd``, ``tokens_in``, ``tokens_out`` (always 0 for
+# embeddings), so the aggregator below treats them identically.
+_COST_EVENTS = frozenset({"llm_call", "embedding_call"})
 
 # Events that count as "something went wrong worth surfacing in the
 # metrics view". Their per-session counts land in

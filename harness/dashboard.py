@@ -585,8 +585,14 @@ def _parse_session_log(session_id: str, path: str) -> SessionSummary:
                 if first_event is None:
                     first_event = event
                 last_event = event
-                # Lightweight accumulation across the full log.
-                if event.get("event") == "llm_call":
+                # Lightweight accumulation across the full log. ``llm_call``
+                # is the chat-completion path; ``embedding_call`` is the
+                # opt-in /v1/embeddings path from repo_index.py — both
+                # carry cost_usd / tokens_in and must sum into the same
+                # session totals so this view matches `teane metrics` and
+                # the end-of-run summary.
+                evt_name = event.get("event")
+                if evt_name == "llm_call" or evt_name == "embedding_call":
                     summary.llm_calls += 1
                     summary.total_cost_usd += float(event.get("cost_usd", 0.0) or 0.0)
                     summary.total_input_tokens += int(event.get("tokens_in", 0) or 0)
@@ -821,7 +827,8 @@ def cost_burn_series(cfg: DashboardConfig) -> dict[str, Any]:
     rows: list[tuple[str, float]] = []
     for s in sessions:
         for evt in session_events(s.log_path, max_events=5000):
-            if evt.get("event") == "llm_call":
+            evt_name = evt.get("event")
+            if evt_name == "llm_call" or evt_name == "embedding_call":
                 ts = str(evt.get("timestamp") or "")
                 cost = float(evt.get("cost_usd", 0.0) or 0.0)
                 if ts:

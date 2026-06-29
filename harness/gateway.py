@@ -2689,6 +2689,64 @@ class Gateway:
 
         return tracker
 
+    def track_embedding_call(
+        self,
+        model_key: str,
+        prompt_tokens: int,
+    ) -> float:
+        """Account a ``/v1/embeddings`` call into the session tracker.
+
+        Embeddings bypass ``dispatch`` (the call shape is different —
+        no chat history, no role, no tool use), so without this helper
+        their spend is invisible to every cost surface. We mirror the
+        accounting tail of ``dispatch``: look up the model rate, build
+        a ``TokenUsage``, aggregate into ``session_tracker`` (so the
+        end-of-run summary and ``teane status`` see it), and emit an
+        ``embedding_call`` observability event (so the JSONL replay
+        in metrics.py / dashboard.py picks it up too).
+
+        Returns the cost in USD. If the model isn't in the registry
+        the call accounts at $0 and logs a warning rather than raising
+        — embeddings must never break the index build.
+        """
+        spec = _MODEL_REGISTRY.get(model_key)
+        if spec is None:
+            logger.warning(
+                "[gateway] No price spec for embedding model '%s' — "
+                "accounting at $0. Add an entry to model_prices.json or "
+                "register via config.models to track cost.",
+                model_key,
+            )
+            cost = 0.0
+        else:
+            cost = (prompt_tokens / 1_000_000.0) * float(spec.input_cost_per_1m)
+
+        usage = TokenUsage(
+            input_tokens=int(prompt_tokens),
+            output_tokens=0,
+            model_name=model_key,
+            cost_usd=cost,
+        )
+        # role=None — embeddings aren't a graph node; we still want the
+        # totals and per_model rollups but not a per_stage bucket.
+        self.aggregate_tokens(self.session_tracker, usage, role=None)
+
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "embedding_call",
+                model=model_key,
+                tokens_in=int(prompt_tokens),
+                tokens_out=0,
+                cached_tokens=0,
+                cache_creation_tokens=0,
+                cost_usd=cost,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block work
+            pass
+
+        return cost
+
 
 # ---------------------------------------------------------------------------
 # 13. Gateway Factory from Config

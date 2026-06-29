@@ -368,6 +368,28 @@ class TfidfBackend(IndexBackend):
 # 5. OpenAI embeddings backend (opt-in)
 # ---------------------------------------------------------------------------
 
+def _track_embedding_usage(response_json: dict, openai_model: str) -> None:
+    """Account a successful /v1/embeddings response into the Gateway's
+    session tracker so end-of-run / status / metrics / dashboard all see
+    the cost. Best-effort: if the singleton isn't injected (e.g., a test
+    fixture or a cold ``teane index`` invocation that ran before the
+    gateway was wired in) or the response is malformed, silently no-op.
+    The index build must NEVER fail because we couldn't account it.
+    """
+    try:
+        usage = response_json.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        if prompt_tokens <= 0:
+            return
+        from harness.graph import get_gateway
+        gw = get_gateway()
+        if gw is None:
+            return
+        gw.track_embedding_call(f"openai:{openai_model}", prompt_tokens)
+    except Exception as exc:  # noqa: BLE001 — accounting is best-effort
+        logger.debug("[repo_index] Embedding cost tracking skipped: %s", exc)
+
+
 class OpenAIEmbeddingsBackend(IndexBackend):
     """Calls ``/v1/embeddings`` with batches of chunk contents. Vectors
     are dense 1536-float lists for ``text-embedding-3-small``. Cosine
@@ -469,6 +491,7 @@ class OpenAIEmbeddingsBackend(IndexBackend):
                 assert response is not None
                 data = response.json()
                 items = data.get("data", []) or []
+                _track_embedding_usage(data, self.cfg.openai_model)
                 # Bind each API embedding to its ORIGINAL batch position.
                 # If the API returned fewer items than inputs (shouldn't
                 # happen but defend), trailing positions stay blank.
@@ -497,7 +520,9 @@ class OpenAIEmbeddingsBackend(IndexBackend):
         ) as client:
             response = client.post("/embeddings", json=payload)
             response.raise_for_status()
-            embedding = response.json().get("data", [{}])[0].get("embedding", [])
+            data = response.json()
+            _track_embedding_usage(data, self.cfg.openai_model)
+            embedding = data.get("data", [{}])[0].get("embedding", [])
         return json.dumps(embedding, ensure_ascii=False)
 
     def cosine(self, a_json: str, b_json: str) -> float:

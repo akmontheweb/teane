@@ -121,6 +121,36 @@
     "supports_cache": true,
     "supports_tools": true
   },
+  "openai:text-embedding-3-small": {
+    "provider": "openai",
+    "model_id": "text-embedding-3-small",
+    "context_window": 8191,
+    "input_cost_per_1m": 0.02,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_cache": false,
+    "supports_tools": false
+  },
+  "openai:text-embedding-3-large": {
+    "provider": "openai",
+    "model_id": "text-embedding-3-large",
+    "context_window": 8191,
+    "input_cost_per_1m": 0.13,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_cache": false,
+    "supports_tools": false
+  },
+  "openai:text-embedding-ada-002": {
+    "provider": "openai",
+    "model_id": "text-embedding-ada-002",
+    "context_window": 8191,
+    "input_cost_per_1m": 0.10,
+    "output_cost_per_1m": 0.0,
+    "api_base_url": "https://api.openai.com/v1",
+    "supports_cache": false,
+    "supports_tools": false
+  },
   "deepseek:deepseek-chat": {
     "provider": "deepseek",
     "model_id": "deepseek-chat",

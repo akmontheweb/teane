@@ -2601,6 +2601,231 @@ def _refresh_session_config_into_state(state: dict[str, Any]) -> None:
         )
 
 
+def _build_outside_harness_actions(
+    state: dict[str, Any], trigger: str,
+) -> list[str]:
+    """Per-trigger checklist of concrete steps the operator should take
+    OUTSIDE the harness to unblock the run before resuming.
+
+    The escalation summary diagnoses what went wrong; this list
+    prescribes what to actually do about it. Strings are concrete
+    actions (file paths, config keys, commands) — not generic advice
+    like "investigate the error". Returned in priority order: try the
+    first item first.
+
+    Designed to be evidence-driven: when the state carries a missing
+    symbol / rejected path / specific file, the action mentions it by
+    name. Falls back to general guidance only when no specific signal
+    is present.
+    """
+    node_state = state.get("node_state", {}) or {}
+    workspace_path = state.get("workspace_path", os.getcwd())
+    build_command = str(state.get("build_command", "") or "")
+    sandbox_cfg = state.get("sandbox_config", {}) or {}
+    docker_image = str(sandbox_cfg.get("docker_image", "") or "")
+    errors = state.get("compiler_errors", []) or []
+    rejections = node_state.get("allowlist_rejections") or []
+    patch_failures = node_state.get("patch_failures") or []
+    modified_files = state.get("modified_files", []) or []
+
+    actions: list[str] = []
+
+    # ---- env_misconfig:<symbol> --------------------------------------
+    # Highest-precision trigger — we know exactly what's missing.
+    if trigger.startswith("env_misconfig"):
+        symbol = ""
+        if ":" in trigger:
+            symbol = trigger.split(":", 1)[1].strip()
+        symbol = symbol or str(node_state.get("env_misconfig_symbol", ""))
+        if symbol:
+            actions.append(
+                f"Install the missing tool/package `{symbol}` into the build "
+                f"sandbox. Easiest path: edit `config/config.json` → "
+                f"`sandbox.docker_image` to a base image that ships "
+                f"`{symbol}` (e.g. `python:3.12-slim` for pip tools, "
+                f"`node:20-slim` for npm-side tooling)."
+            )
+            actions.append(
+                f"Or bake `{symbol}` into your own builder image and point "
+                f"`sandbox.docker_image` at it."
+            )
+            actions.append(
+                f"Alternative: prepend an install step to `build_command` "
+                f"in `config/config.json` so the sandbox installs `{symbol}` "
+                f"before the build runs (e.g. `pip install {symbol} && "
+                f"{build_command or '<your build cmd>'}`)."
+            )
+        else:
+            actions.append(
+                "The build sandbox is missing a required tool. Check the "
+                "tail of the last build output above for the exact name, "
+                "then either change `sandbox.docker_image` in "
+                "`config/config.json` to an image that ships it, or "
+                "prepend an install step to `build_command`."
+            )
+
+    # ---- budget exhausted / preflight --------------------------------
+    elif trigger in {"budget_exhausted", "budget_preflight"}:
+        actions.append(
+            "Increase `token_budget.hard_cap_usd` in `config/config.json` "
+            "(or just press `[b]` to add $2.00 to this session)."
+        )
+        actions.append(
+            "If you're burning budget on retries, switch the expensive "
+            "roles to a cheaper model in `config/config.json` → "
+            "`model_assignments` (e.g. point `repair_primary` at "
+            "`deepseek-v4-flash` instead of `deepseek-v4-pro`)."
+        )
+
+    # ---- llm_silent --------------------------------------------------
+    elif trigger == "llm_silent":
+        actions.append(
+            "Provider returned no content. Check your API key env vars "
+            "(`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`) "
+            "are exported in this shell and not expired."
+        )
+        actions.append(
+            "Check the provider's status page; if degraded, switch the "
+            "affected role in `config/config.json` → `model_assignments` "
+            "to a different provider for now."
+        )
+        actions.append(
+            "Confirm the model id in `gateway.models` actually exists "
+            "(typos like `claude-3-5-sonnet` vs `claude-sonnet-3-5` "
+            "produce silent empty responses on some providers)."
+        )
+
+    # ---- security_fix_limit:<n>/<m> ----------------------------------
+    elif trigger.startswith("security_fix_limit"):
+        actions.append(
+            "Open the security findings the scanner kept flagging "
+            "(look at `compiler_errors` above — entries tagged "
+            "`SECURITY:` or `BANDIT:`) and decide if any are false "
+            "positives in YOUR context."
+        )
+        actions.append(
+            "For false positives, add the rule id to "
+            "`config/config.json` → `security_scan.suppressed_rules` "
+            "or `# nosec B<NNN>` / `# noqa: S<NNN>` inline in the "
+            "offending file, then `[r]` Resume."
+        )
+        actions.append(
+            "For real findings the LLM can't fix, manually rewrite the "
+            "vulnerable code in your IDE, then `[m]` Pause for manual "
+            "edits → Enter when done."
+        )
+
+    # ---- zero_patch_loop:<n> -----------------------------------------
+    elif trigger.startswith("zero_patch_loop"):
+        actions.append(
+            "The repair LLM emitted zero patches for several rounds — "
+            "it doesn't know what to change. Open the workspace at "
+            f"`{workspace_path}` and read the failing file(s) listed "
+            "in CRITICAL INFORMATION above; if the diagnostic is "
+            "ambiguous (e.g. `KeyError` with no line number), the LLM "
+            "can't recover without your help."
+        )
+        actions.append(
+            "Pick the most likely fix yourself in your IDE — even a "
+            "minimal change that converts the failure into a more "
+            "specific error is enough. Then `[m]` Pause for manual "
+            "edits → Enter when done."
+        )
+        actions.append(
+            "If you'd rather steer the LLM than touch code, choose "
+            "`[e]` and inject a sentence like 'the missing import is "
+            "X in file Y' — the next repair turn will see it as a "
+            "user hint."
+        )
+
+    # ---- repair_loop_limit / persistent_build_failure ----------------
+    # The two most generic triggers — derive specifics from state.
+    elif trigger in {"repair_loop_limit", "persistent_build_failure",
+                     "no_progress_failsafe"}:
+        # Patcher allowlist rejections are the single most operator-fixable
+        # cause — the LLM kept trying to write to paths the harness banned.
+        if rejections:
+            rej_paths = sorted({
+                str(r.get("file", "")) for r in rejections if r.get("file")
+            })[:5]
+            actions.append(
+                "The patcher's path allowlist rejected: "
+                f"{', '.join(rej_paths) or '(see logs)'}. Decide if "
+                "those paths SHOULD be writable for this project — if "
+                "yes, add their roots to `config/config.json` → "
+                "`patcher.root_files` (matches by basename) or "
+                "`patcher.allowed_paths` (prefix match)."
+            )
+        # READ_FILE failures / missing-context patterns — surface specific files.
+        if errors:
+            files_with_errors = sorted({
+                str(e.get("file", "")) for e in errors[:8] if e.get("file")
+            })[:5]
+            if files_with_errors:
+                actions.append(
+                    "Open these files in your IDE and read the "
+                    f"diagnostics top-to-bottom: {', '.join(files_with_errors)}. "
+                    "Look for an obvious fix the LLM kept missing "
+                    "(wrong import path, stale field name after a refactor, "
+                    "etc.)."
+                )
+        # Patch-application failures (search-block misses) — the LLM's mental
+        # model of the file is stale; manual edits or [m] resume helps.
+        if patch_failures:
+            actions.append(
+                "The patcher kept failing to apply patches (likely "
+                "REPLACE_BLOCK search misses). Make the fix manually "
+                "in your IDE then `[m]` Pause → Enter, which clears "
+                "the LLM's stale state and re-runs the compiler."
+            )
+        # Build-command shape mismatch (e.g. wrong Python version, missing
+        # system lib in the docker image) — operator must change config.
+        if docker_image:
+            actions.append(
+                "If the failure is environmental (e.g. wrong Python "
+                f"version, missing system library), edit `sandbox.docker_image` "
+                f"in `config/config.json` (currently `{docker_image}`) to "
+                "an image that has the needed runtime, then `[r]` Resume."
+            )
+        if not actions:
+            # Catch-all when no specific signal is present.
+            actions.append(
+                f"Open the workspace at `{workspace_path}` and inspect "
+                "the diagnostics above. If you can spot the fix, make "
+                "it in your IDE then `[m]` Pause → Enter. Otherwise "
+                "`[e]` inject a hint that steers the next repair turn."
+            )
+
+    # ---- unknown / catch-all -----------------------------------------
+    else:
+        actions.append(
+            f"Inspect the workspace at `{workspace_path}` and the "
+            "diagnostics above. Manual fix in your IDE → `[m]` Pause → "
+            "Enter to resume. To redirect the LLM instead, `[e]` and "
+            "inject a hint."
+        )
+
+    # Universal tail — applies to every trigger.
+    actions.append(
+        "Once you've made the change, come back here and choose: "
+        "`[r]` Resume (if you only edited config/docker_image), "
+        "`[m]` Pause for manual edits → Enter (if you edited files in "
+        "the workspace), `[e]` Inject hint (to steer the next repair "
+        "turn), or `[s]` Save & Quit (resume later with `teane resume "
+        f"--session-id {state.get('session_id', '<id>')}`)."
+    )
+
+    # Modified-files context — useful when the operator is about to
+    # edit and wants to know what's already changed in this session.
+    if modified_files and len(modified_files) <= 30:
+        actions.append(
+            "Files already modified this session (don't conflict with "
+            "your manual edit): " + ", ".join(modified_files[:30])
+        )
+
+    return actions
+
+
 def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     """
     Interactive stdin menu for the human_intervention_node.
@@ -2673,6 +2898,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     # Empty when the kill switch is off, no gateway, or the call failed.
     escalation_summary = str(node_state.get("hitl_escalation_summary", "") or "").strip()
 
+    # Per-trigger checklist of what the operator should do OUTSIDE the
+    # harness before resuming. Diagnoses (escalation_summary) tell the
+    # operator what broke; this tells them what to actually do.
+    outside_actions = _build_outside_harness_actions(state, trigger)
+
     while True:
         print()
         print("=" * 80)
@@ -2688,6 +2918,22 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print()
         print("CRITICAL INFORMATION:")
         print(error_text)
+        if outside_actions:
+            print()
+            print("-" * 80)
+            print("FIX OUTSIDE THE HARNESS, THEN RESUME:")
+            print("(the LLM can't make these changes itself — you need to)")
+            print("-" * 80)
+            for i, action in enumerate(outside_actions, 1):
+                # Indent wrapped lines so the bullet stays readable in
+                # narrow terminals. textwrap keeps long sentences from
+                # running off the side of the screen.
+                import textwrap as _textwrap
+                wrapped = _textwrap.fill(
+                    action, width=78, initial_indent=f"  {i}. ",
+                    subsequent_indent="     ",
+                )
+                print(wrapped)
         print()
         print("Options:")
         for key, label in menu_options:

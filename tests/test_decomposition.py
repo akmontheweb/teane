@@ -108,6 +108,7 @@ def _valid_payload() -> str:
                 "feature": "core",
                 "title": "Create a TODO",
                 "description": "POST /todos creates an item.",
+                "requirement_keys": ["FR-001"],
                 "acceptance_criteria": [
                     "POST /todos with title returns 201",
                     "Created item appears in GET /todos",
@@ -120,6 +121,7 @@ def _valid_payload() -> str:
                 "feature": "core",
                 "title": "List TODOs",
                 "description": "GET /todos returns the list.",
+                "requirement_keys": ["FR-002"],
                 "acceptance_criteria": ["GET /todos returns JSON array"],
                 "depends_on": ["STORY-1"],
                 "scope_files": ["src/todos/list.py"],
@@ -164,12 +166,15 @@ def _payload_with_one_feature(stories: list[dict[str, Any]]) -> dict[str, Any]:
     """Wrap a story list in the minimal valid features+stories envelope.
 
     Every story gets ``feature: "core"`` if it doesn't already specify
-    one, and the response declares a single ``core`` feature. Used by
-    validator tests that focus on story-level rules rather than the
-    feature-validation logic.
+    one, plus a default ``requirement_keys: ["FR-001"]`` if it doesn't
+    already specify one (v5 contract: every story must cite ≥1 req
+    key). Validator tests that exercise the req_keys rule itself
+    override the field. Used by validator tests that focus on
+    story-level rules rather than the feature-validation logic.
     """
     for s in stories:
         s.setdefault("feature", "core")
+        s.setdefault("requirement_keys", ["FR-001"])
     return {
         "features": [{"feature_key": "core", "name": "Core"}],
         "stories": stories,
@@ -217,6 +222,7 @@ def test_validate_rejects_story_referencing_undeclared_feature():
         "stories": [{
             "story_key": "STORY-1", "feature": "ghost",
             "title": "t", "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-001"],
         }],
     }
     with pytest.raises(ValueError, match="ghost"):
@@ -233,6 +239,7 @@ def test_validate_rejects_orphan_feature():
         "stories": [{
             "story_key": "STORY-1", "feature": "core",
             "title": "t", "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-001"],
         }],
     }
     with pytest.raises(ValueError, match="orphan"):
@@ -473,6 +480,7 @@ def test_augment_validator_accepts_story_new_placeholders():
         "stories": [{
             "story_key": "STORY-NEW-1", "feature": "metrics",
             "title": "Add metrics endpoint",
+            "requirement_keys": ["FR-010"],
             "acceptance_criteria": ["GET /metrics returns 200"],
             "depends_on": [], "scope_files": ["src/metrics.py"],
         }],
@@ -491,6 +499,7 @@ def test_augment_validator_accepts_story_referencing_existing_feature():
             "stories": [{
                 "story_key": "STORY-NEW-1", "feature": "auth",
                 "title": "Add MFA",
+                "requirement_keys": ["FR-010"],
                 "acceptance_criteria": ["MFA enrolment works"],
                 "depends_on": [], "scope_files": [],
             }],
@@ -508,6 +517,7 @@ def test_augment_validator_rejects_cross_response_forward_dep():
             "features": [{"feature_key": "x", "name": "X"}],
             "stories": [{
                 "story_key": "STORY-NEW-1", "feature": "x", "title": "x",
+                "requirement_keys": ["FR-001"],
                 "acceptance_criteria": ["x"],
                 "depends_on": ["STORY-NEW-2"],  # forward reference
                 "scope_files": [],
@@ -533,6 +543,7 @@ def test_decomposition_node_augment_mode_appends_new_story(workspace: str):
             "story_key": "STORY-NEW-1",
             "feature": "test",
             "title": "Add /new endpoint",
+            "requirement_keys": ["FR-001"],
             "acceptance_criteria": ["GET /new returns 200"],
             "depends_on": [],
             "scope_files": ["src/new.py"],
@@ -675,3 +686,186 @@ def test_route_after_gatekeeper_patch_agile_no_done_skips_reopen(workspace: str)
         node_state={"gatekeeper_action": "approve"},
     )
     assert route_after_gatekeeper(state) == "decomposition_node"
+
+
+# ---------------------------------------------------------------------------
+# v5 requirement_keys validation
+# ---------------------------------------------------------------------------
+
+class TestRequirementKeysValidation:
+    """Phase 2 contract: every story must cite >=1 valid req_key.
+
+    Shape checks (missing / non-list / empty) fire regardless of
+    whether ``known_req_keys`` is passed; cross-validation (key
+    exists in the spec) only fires when the caller threads the
+    known-set in. decomposition_node always does — these tests
+    exercise both modes.
+    """
+
+    def test_missing_requirement_keys_rejected(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+        }])
+        del payload["stories"][0]["requirement_keys"]
+        with pytest.raises(ValueError, match="requirement_keys"):
+            decomposition._validate_stories_payload(payload)
+
+    def test_empty_requirement_keys_rejected(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+        }])
+        payload["stories"][0]["requirement_keys"] = []
+        with pytest.raises(ValueError, match="at least one"):
+            decomposition._validate_stories_payload(payload)
+
+    def test_non_list_requirement_keys_rejected(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+        }])
+        payload["stories"][0]["requirement_keys"] = "FR-001"  # str not list
+        with pytest.raises(ValueError, match="requirement_keys"):
+            decomposition._validate_stories_payload(payload)
+
+    def test_unknown_key_rejected_with_alternative_listing(self):
+        """When known_req_keys is provided, an unknown key fails with
+        a message that lists valid alternatives so the operator sees
+        the universe of choices without re-opening the spec."""
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-099"],
+        }])
+        with pytest.raises(ValueError) as excinfo:
+            decomposition._validate_stories_payload(
+                payload, known_req_keys={"FR-001", "FR-002", "FR-003"},
+            )
+        msg = str(excinfo.value)
+        assert "FR-099" in msg
+        assert "FR-001" in msg
+        assert "FR-003" in msg
+
+    def test_known_key_accepted(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-001"],
+        }])
+        features, stories = decomposition._validate_stories_payload(
+            payload, known_req_keys={"FR-001"},
+        )
+        assert stories[0]["requirement_keys"] == ["FR-001"]
+
+    def test_known_keys_capped_at_40_in_error_message(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-9999"],
+        }])
+        known = {f"FR-{i:04d}" for i in range(100)}
+        with pytest.raises(ValueError) as excinfo:
+            decomposition._validate_stories_payload(
+                payload, known_req_keys=known,
+            )
+        msg = str(excinfo.value)
+        assert "first 40" in msg
+        # Sort puts FR-0000 first; FR-0099 lives past index 39 so is excluded.
+        assert "FR-0000" in msg
+        assert "FR-0099" not in msg
+
+    def test_augment_validator_enforces_requirement_keys(self):
+        with pytest.raises(ValueError, match="requirement_keys"):
+            decomposition._validate_augment_payload({
+                "features": [{"feature_key": "x", "name": "X"}],
+                "stories": [{
+                    "story_key": "STORY-NEW-1", "feature": "x", "title": "t",
+                    "acceptance_criteria": ["x"],
+                    "depends_on": [], "scope_files": [],
+                }],
+            })
+
+
+# ---------------------------------------------------------------------------
+# v5 requirements ingest (parse SPEC_REQUIREMENTS.md -> requirements table)
+# ---------------------------------------------------------------------------
+
+class TestRequirementsIngest:
+    """Phase 2 helper: ``_ingest_requirements`` UPSERTs spec rows into
+    the requirements table before decomposition asks the LLM to cite
+    requirement_keys."""
+
+    SPEC = (
+        "# Spec\n\n"
+        "### FR-001: Login\n"
+        "User can log in.\n\n"
+        "### FR-002: Logout\n"
+        "User can log out.\n\n"
+        "#### NFR-SEC-001: Token hashing\n"
+        "Tokens MUST be hashed.\n\n"
+        "### US-03-02: Reset screen\n"
+        "User sees a reset confirmation page.\n"
+    )
+
+    def test_ingest_inserts_fr_nfr_us(self, workspace: str):
+        app = story_state.app_name_for_workspace(workspace)
+        parsed, upserted = decomposition._ingest_requirements(
+            workspace, app, self.SPEC,
+        )
+        assert parsed == 4
+        assert upserted == 4
+        conn = story_state.open_story_db()
+        try:
+            keys = {r["req_key"] for r in story_state.list_requirements(conn, app)}
+        finally:
+            conn.close()
+        assert keys == {"FR-001", "FR-002", "NFR-SEC-001", "US-03-02"}
+
+    def test_ingest_idempotent_on_rerun(self, workspace: str):
+        app = story_state.app_name_for_workspace(workspace)
+        decomposition._ingest_requirements(workspace, app, self.SPEC)
+        decomposition._ingest_requirements(workspace, app, self.SPEC)
+        conn = story_state.open_story_db()
+        try:
+            rows = story_state.list_requirements(conn, app)
+        finally:
+            conn.close()
+        assert len(rows) == 4
+
+    def test_ingest_upserts_changed_title(self, workspace: str):
+        app = story_state.app_name_for_workspace(workspace)
+        decomposition._ingest_requirements(workspace, app, self.SPEC)
+        revised = self.SPEC.replace(
+            "### FR-001: Login", "### FR-001: Login (revised)",
+        )
+        decomposition._ingest_requirements(workspace, app, revised)
+        conn = story_state.open_story_db()
+        try:
+            row = story_state.get_requirement_by_key(conn, app, "FR-001")
+        finally:
+            conn.close()
+        assert row["title"] == "Login (revised)"
+
+    def test_ingest_captures_source_line(self, workspace: str):
+        app = story_state.app_name_for_workspace(workspace)
+        decomposition._ingest_requirements(workspace, app, self.SPEC)
+        conn = story_state.open_story_db()
+        try:
+            row = story_state.get_requirement_by_key(conn, app, "FR-001")
+        finally:
+            conn.close()
+        # 1-indexed line of "### FR-001: Login" within SPEC
+        assert row["source_line"] == 3
+
+    def test_ingest_empty_spec_is_noop(self, workspace: str):
+        app = story_state.app_name_for_workspace(workspace)
+        parsed, upserted = decomposition._ingest_requirements(workspace, app, "")
+        assert parsed == 0 and upserted == 0
+        conn = story_state.open_story_db()
+        try:
+            assert story_state.list_requirements(conn, app) == []
+        finally:
+            conn.close()
+
+

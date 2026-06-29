@@ -23,14 +23,21 @@ class TestComposeProdSmokeInstallStep:
         (tmp_path / "requirements.txt").write_text("fastapi\n")
         step = _compose_prod_smoke_install_step(str(tmp_path))
         assert step is not None
-        assert "uv pip install --system -r requirements.txt" in step
-        assert "uv pip install --system pytest" in step
+        # Install lands in the writable /tmp venv, not /usr/local/dist-packages.
+        assert "uv venv" in step
+        assert "/tmp/teane-venv/bin/activate" in step
+        assert "uv pip install -r requirements.txt" in step
+        assert "uv pip install pytest" in step
+        # `--system` on `uv pip install` would route writes to /usr/local —
+        # non-root sandboxes can't write there. (`uv venv --system-site-
+        # packages` is fine — it only widens import resolution, not writes.)
+        assert "uv pip install --system" not in step
 
     def test_root_pyproject_takes_precedence_over_requirements(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text('[project]\nname="x"\n')
         (tmp_path / "requirements.txt").write_text("fastapi\n")
         step = _compose_prod_smoke_install_step(str(tmp_path))
-        assert "uv pip install --system -e ." in step
+        assert "uv pip install -e ." in step
         # Root requirements should NOT also be installed when pyproject is present.
         assert "-r requirements.txt" not in step
 
@@ -44,7 +51,7 @@ class TestComposeProdSmokeInstallStep:
         (tmp_path / "client" / "package.json").write_text("{}")
         step = _compose_prod_smoke_install_step(str(tmp_path))
         assert step is not None
-        assert "uv pip install --system -r server/requirements.txt" in step
+        assert "uv pip install -r server/requirements.txt" in step
         # Skipped subdirs (client/) must not be probed for Python deps.
         assert "client/" not in step
 
@@ -53,7 +60,7 @@ class TestComposeProdSmokeInstallStep:
         srv.mkdir()
         (srv / "pyproject.toml").write_text('[project]\nname="b"\n')
         step = _compose_prod_smoke_install_step(str(tmp_path))
-        assert "uv pip install --system -e backend" in step
+        assert "uv pip install -e backend" in step
 
     def test_includes_dev_requirements_alongside(self, tmp_path):
         srv = tmp_path / "server"

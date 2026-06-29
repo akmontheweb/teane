@@ -217,3 +217,31 @@ def test_cr_bridge_skipped_when_decomp_disabled(cr_workspace: str):
             assert story_state.list_stories(conn, app) == []
         finally:
             conn.close()
+
+
+def test_cr_bridge_creates_synthetic_cr_requirements_and_links(
+    cr_workspace: str,
+):
+    """v5 traceability: each CR-bridged story must satisfy a
+    synthetic ``CR-N`` requirement so the audit gate treats CR work
+    uniformly with spec work (no ``OR build_kind='cr'`` special case
+    needed in the SQL audit)."""
+    from harness.graph import ingest_change_requests_node
+    state = _ingest_state(cr_workspace, decomposition_enabled=True)
+    asyncio.run(ingest_change_requests_node(state))
+
+    app = story_state.app_name_for_workspace(cr_workspace)
+    conn = story_state.open_story_db()
+    try:
+        # Two CRs ingested → two synthetic requirements created.
+        reqs = story_state.list_requirements(conn, app, kind="cr_synthetic")
+        req_keys = {r["req_key"] for r in reqs}
+        assert req_keys == {"CR-1", "CR-2"}
+        # Audit must show zero untraced requirements — every CR-N
+        # requirement is satisfied by its bridged story.
+        untraced = story_state.requirements_without_satisfying_story(
+            conn, app,
+        )
+        assert untraced == []
+    finally:
+        conn.close()

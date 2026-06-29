@@ -43,6 +43,14 @@ class NodeRole(Enum):
     HUMAN_INTERVENTION = "human_intervention"
     DOC_REVIEWER = "doc_reviewer"
     CODE_REVIEWER = "code_reviewer"
+    # Auxiliary judgment calls (patcher-rejection diagnosis, HITL
+    # escalation summary, autofix classification). They reuse the cheap
+    # repair model but ship a tiny prompt with no shared system message,
+    # so binding them to REPAIR's cache-drift key flips the recorded
+    # prefix hash back and forth every call and forces auto-cache
+    # misses on the real repair-loop dispatch. Distinct role → distinct
+    # ``(session, role)`` drift bucket.
+    JUDGMENT = "judgment"
 
 
 class EmptyLLMResponseError(RuntimeError):
@@ -57,6 +65,13 @@ class BudgetTooLowError(RuntimeError):
     """Raised by the gateway's pre-flight budget estimate when the projected
     cost of a single call already exceeds the remaining budget. Stops the
     advisory hard-cap from being silently overspent by a single big call.
+    """
+
+
+class _SkipDriftDetection(Exception):
+    """Internal control-flow signal: bail out of the prefix-drift block
+    without logging a warning. Used to skip drift tracking for roles
+    (JUDGMENT) whose prompts are intentionally one-shot.
     """
 
 
@@ -2041,6 +2056,13 @@ class Gateway:
             return self.config.patching_primary
         elif role == NodeRole.REPAIR:
             return self.config.repair_primary
+        elif role == NodeRole.JUDGMENT:
+            # Auxiliary judgment calls (HITL summary, patcher-rejection
+            # diagnosis, autofix classification) reuse the cheap repair
+            # model — they're one-shot adviser calls, not part of the
+            # repair loop itself. Distinct role keeps the gateway's
+            # cache-drift bucket separate.
+            return self.config.repair_primary
         elif role == NodeRole.DOC_REVIEWER:
             # No silent fallback: empty means reviewer is not configured. The
             # caller (spec_review_node) must check this and skip the call.
@@ -2058,6 +2080,10 @@ class Gateway:
             return self.config.patching_mode.lower() == "thinking" or self.config.patching_mode.lower() == "thinking_max"
         elif role == NodeRole.REPAIR:
             return self.config.repair_mode.lower() == "thinking" or self.config.repair_mode.lower() == "thinking_max"
+        elif role == NodeRole.JUDGMENT:
+            # Adviser calls are cheap and short; thinking mode would
+            # multiply their cost without changing the answer. Always off.
+            return False
         elif role == NodeRole.DOC_REVIEWER:
             return self.config.doc_reviewer_mode.lower() in ("thinking", "thinking_max")
         elif role == NodeRole.CODE_REVIEWER:
@@ -2304,6 +2330,12 @@ class Gateway:
         # (system prompt + immutable preamble). When the hash changes,
         # OpenAI/DeepSeek auto-caches miss silently — surface it as an
         # observability event so we can chase the leak.
+        #
+        # JUDGMENT calls (HITL summary, patcher-rejection diagnosis,
+        # autofix classifier) intentionally ship one-shot user-only
+        # prompts that vary by purpose, so prefix drift is the norm and
+        # tracking it just produces noise warnings. Skip the whole
+        # detector for that role.
         try:
             from harness.observability import get_active_session_id, emit_event
             _sid = get_active_session_id() or "unknown"
@@ -2311,6 +2343,8 @@ class Gateway:
             _sid = "unknown"
             emit_event = None  # type: ignore[assignment]
         try:
+            if role == NodeRole.JUDGMENT:
+                raise _SkipDriftDetection
             _prefix_hash = hash_stable_prefix(
                 messages, n_stable=2, tools=effective_tools,
             )
@@ -2365,6 +2399,8 @@ class Gateway:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        except _SkipDriftDetection:
+            pass  # JUDGMENT role intentionally skips drift tracking.
         except Exception as exc:  # noqa: BLE001 — drift telemetry must never block dispatch
             logger.debug("[gateway] prefix drift check skipped: %s", exc)
 

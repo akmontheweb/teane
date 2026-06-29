@@ -1613,6 +1613,9 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         entries = sorted(os.listdir(workspace_path))
     except OSError:
         return None
+    # Lazy import — `harness.graph` imports `harness.cli` at module load,
+    # so importing graph at cli's top level would deadlock the bootstrap.
+    from harness.graph import _uv_venv_prefix
     # Pass 1: backend-first (Python > Java). The smoke check imports
     # production Python modules, so a workspace with backend code gets
     # that path first.
@@ -1627,11 +1630,14 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         # > Maven > Gradle. uv pip install is a drop-in for pip install
         # (same manifest semantics) but 10-30× faster on cold caches and
         # uses the harness-managed /cache/uv volume across runs. uv is
-        # pre-baked into the sandbox builder image.
+        # pre-baked into the sandbox builder image. Each install command
+        # is prefixed with `_uv_venv_prefix()` so it writes to a user-
+        # writable venv instead of /usr/local/lib/python3.11/dist-packages
+        # — non-root sandbox users can't write there.
         if os.path.isfile(os.path.join(full, "pyproject.toml")):
-            return f"cd {entry} && uv pip install --system -e . && python3 -m pytest -q"
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e . && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "requirements.txt")):
-            return f"cd {entry} && uv pip install --system -r requirements.txt && python3 -m pytest -q"
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
         if os.path.isfile(os.path.join(full, "gradlew")):
@@ -1686,6 +1692,8 @@ def _detect_default_build_command(
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
+    # Lazy import — see _detect_subdir_build_command for the rationale.
+    from harness.graph import _uv_venv_prefix
 
     def has(name: str) -> bool:
         return os.path.exists(os.path.join(workspace_path, name))
@@ -1700,9 +1708,9 @@ def _detect_default_build_command(
     # 10-30× faster on cold caches, hits the harness-managed /cache/uv
     # volume across runs. uv is pre-baked into the sandbox builder image.
     if has("pyproject.toml"):
-        return "uv pip install --system -e . && python3 -m pytest -q"
+        return f"{_uv_venv_prefix()} && uv pip install -e . && python3 -m pytest -q"
     if has("requirements.txt"):
-        return "uv pip install --system -r requirements.txt && python3 -m pytest -q"
+        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt && python3 -m pytest -q"
     # Java — Maven first, then Gradle (wrapper if present).
     if has("pom.xml"):
         return "mvn -B test"
@@ -1735,7 +1743,7 @@ def _detect_default_build_command(
     # unnecessary. The legacy substring is kept in the fallback below
     # only for the (rare) case where the harness runs outside the
     # builder image and the operator hasn't pre-installed pytest.
-    fallback = "uv pip install --system pytest && python3 -m pytest -q"
+    fallback = f"{_uv_venv_prefix()} && uv pip install pytest && python3 -m pytest -q"
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):

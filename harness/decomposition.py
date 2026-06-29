@@ -57,6 +57,57 @@ def _read_text(path: str) -> str:
         return ""
 
 
+SPEC_REQUIREMENTS_RELPATH = os.path.join("docs", "SPEC_REQUIREMENTS.md")
+
+
+def _ingest_requirements(
+    workspace: str,
+    app_name: str,
+    spec_text: str,
+) -> tuple[int, int]:
+    """Parse ``docs/SPEC_REQUIREMENTS.md`` and UPSERT rows into the
+    ``requirements`` table.
+
+    Runs once per ``decomposition_node`` invocation (greenfield AND
+    augment) so the requirements table reflects the latest spec
+    before the decomposition LLM is asked to cite ``requirement_keys``.
+    Soft-fails on errors — the validator below will surface "unknown
+    requirement key" if the table is empty when it shouldn't be.
+
+    Returns ``(parsed, inserted_or_updated)`` so the caller can log
+    a one-line summary.
+    """
+    from harness import story_state
+    from harness.req_ids import parse_spec_requirements
+
+    parsed = parse_spec_requirements(spec_text)
+    if not parsed:
+        return (0, 0)
+    items = [
+        {
+            "req_key": p.req_key,
+            "kind": p.kind,
+            "title": p.title,
+            "body": p.body or None,
+            "source_path": SPEC_REQUIREMENTS_RELPATH,
+            "source_line": p.source_line,
+        }
+        for p in parsed
+    ]
+    try:
+        conn = story_state.open_story_db()
+        try:
+            story_state.create_requirements(conn, app_name, items)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — soft-fail; validator will catch
+        logger.warning(
+            "[decomposition] requirements_ingest skipped: %s", exc,
+        )
+        return (len(parsed), 0)
+    return (len(parsed), len(items))
+
+
 def _build_decomposition_prompt(
     spec_requirements: str,
     spec_architecture: str,
@@ -131,6 +182,7 @@ no commentary:
       "feature": "auth",
       "title": "User can register",
       "description": "1-2 sentence summary of intent.",
+      "requirement_keys": ["FR-007", "FR-008"],
       "acceptance_criteria": [
         "POST /register with valid payload returns 201",
         "Duplicate email returns 409"
@@ -158,6 +210,13 @@ no commentary:
   the ``features`` block.
 - Every feature MUST own at least one story.
 - Every story MUST have at least one acceptance_criteria entry.
+- Every story MUST cite at least one ``requirement_keys`` entry that
+  is a requirement identifier (``FR-NNN``, ``NFR-XXX-NNN``, or
+  ``US-NN-NN``) declared in ``docs/SPEC_REQUIREMENTS.md``. Stories
+  that cite unknown identifiers are rejected with the full list of
+  valid keys, so prefer to map every story back to the spec it
+  implements. A story that implements pure scaffolding without a
+  spec requirement is itself a sign the decomposition is wrong.
 - ``depends_on`` may only reference story_keys that appear earlier
   in the same response. Cross-feature dependencies are allowed and
   the batch planner will honour them.
@@ -270,6 +329,7 @@ Output STRICT JSON in this exact shape — no markdown, no code fence:
       "feature": "new-cap",
       "title": "1-line title",
       "description": "1-2 sentence summary of intent.",
+      "requirement_keys": ["FR-007"],
       "acceptance_criteria": ["..."],
       "depends_on": [],
       "scope_files": ["src/..."]
@@ -282,6 +342,10 @@ Constraints:
 - AT MOST {MAX_STORIES_PER_PASS} new stories per pass.
 - AT MOST {MAX_FEATURES_PER_PASS} new features per pass.
 - Every new story MUST have at least one acceptance criterion.
+- Every new story MUST cite at least one ``requirement_keys`` entry
+  declared in ``docs/SPEC_REQUIREMENTS.md`` (``FR-NNN`` /
+  ``NFR-XXX-NNN`` / ``US-NN-NN``). Unknown keys are rejected with
+  the full list of valid choices.
 - Every new story's ``feature`` field MUST reference either an
   existing feature_key (from the list above) or a NEW feature_key
   declared in the ``features`` block of THIS response.
@@ -342,6 +406,55 @@ def _validate_features_payload(
     return cleaned
 
 
+def _validate_story_requirement_keys(
+    story_key: str,
+    raw: Any,
+    known_req_keys: Optional[set[str]],
+) -> list[str]:
+    """Validate one story's ``requirement_keys`` and return the cleaned
+    list, or raise ValueError with a precise message.
+
+    Enforces:
+      - ``requirement_keys`` is a non-empty list of strings.
+      - When ``known_req_keys`` is provided, every cited key must
+        appear in it. The error message lists up to 40 valid keys
+        (sorted) so the operator immediately sees the universe of
+        valid choices without re-opening the spec.
+
+    ``known_req_keys=None`` means the validator only checks shape
+    (used by unit tests that don't seed a DB). Production callers
+    in ``decomposition_node`` always pass a real set.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"{story_key} must cite at least one 'requirement_keys' entry "
+            "(an FR-NNN / NFR-XXX-NNN / US-NN-NN identifier from "
+            "docs/SPEC_REQUIREMENTS.md)"
+        )
+    keys = [str(x).strip() for x in raw if str(x).strip()]
+    if not keys:
+        raise ValueError(
+            f"{story_key} 'requirement_keys' must contain non-empty strings"
+        )
+    if known_req_keys is None:
+        return keys
+    unknown = [k for k in keys if k not in known_req_keys]
+    if unknown:
+        sample = sorted(known_req_keys)[:40]
+        more = (
+            f" (showing first 40 of {len(known_req_keys)})"
+            if len(known_req_keys) > 40 else ""
+        )
+        raise ValueError(
+            f"{story_key} cites unknown requirement_keys "
+            f"{sorted(set(unknown))}. Known req_keys in this workspace"
+            f"{more}: {sample}. Update docs/SPEC_REQUIREMENTS.md to add "
+            "the missing requirement(s), or revise the story to cite "
+            "an existing one."
+        )
+    return keys
+
+
 def _validate_stories_against_features(
     stories: list[dict[str, Any]],
     declared_feature_keys: set[str],
@@ -378,13 +491,16 @@ def _validate_augment_payload(
     data: Any,
     *,
     existing_feature_keys: Optional[set[str]] = None,
+    known_req_keys: Optional[set[str]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Augment-mode validator: same shape as _validate_stories_payload
     but tolerates an empty stories list as a legitimate "no new work"
     answer. Allows STORY-NEW-N placeholder keys in addition to STORY-N.
 
     Returns ``(features, stories)``. Both may be empty in the no-op
-    answer.
+    answer. ``known_req_keys`` (when provided) cross-validates each
+    story's ``requirement_keys`` against the spec — see
+    :func:`_validate_story_requirement_keys`.
     """
     if not isinstance(data, dict):
         raise ValueError(f"top-level must be JSON object, got {type(data).__name__}")
@@ -416,6 +532,9 @@ def _validate_augment_payload(
         ac = s.get("acceptance_criteria") or []
         if not isinstance(ac, list) or not ac:
             raise ValueError(f"{key} must have at least one acceptance criterion")
+        req_keys = _validate_story_requirement_keys(
+            key, s.get("requirement_keys"), known_req_keys,
+        )
         deps = s.get("depends_on") or []
         if not isinstance(deps, list):
             raise ValueError(f"{key} depends_on must be a list")
@@ -434,6 +553,7 @@ def _validate_augment_payload(
             "feature": feature or None,
             "description": s.get("description") or None,
             "acceptance_criteria": [str(x) for x in ac],
+            "requirement_keys": req_keys,
             "depends_on": [str(x) for x in deps],
             "scope_files": [str(x) for x in scope],
             "external_ref": s.get("external_ref") or None,
@@ -448,12 +568,16 @@ def _validate_augment_payload(
 
 def _validate_stories_payload(
     data: Any,
+    *,
+    known_req_keys: Optional[set[str]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Sanity-check the LLM's JSON. Returns ``(features, stories)``.
 
     Raises ValueError with a precise message on shape violations so
     the caller can surface it to the operator instead of writing a
-    corrupt batch into the DB.
+    corrupt batch into the DB. ``known_req_keys`` (when provided)
+    cross-validates each story's ``requirement_keys`` against the
+    spec — see :func:`_validate_story_requirement_keys`.
     """
     if not isinstance(data, dict):
         raise ValueError(f"top-level must be JSON object, got {type(data).__name__}")
@@ -484,6 +608,9 @@ def _validate_stories_payload(
         ac = s.get("acceptance_criteria") or []
         if not isinstance(ac, list) or not ac:
             raise ValueError(f"{key} must have at least one acceptance criterion")
+        req_keys = _validate_story_requirement_keys(
+            key, s.get("requirement_keys"), known_req_keys,
+        )
         deps = s.get("depends_on") or []
         if not isinstance(deps, list):
             raise ValueError(f"{key} depends_on must be a list")
@@ -501,6 +628,7 @@ def _validate_stories_payload(
             "feature": feature or None,
             "description": s.get("description") or None,
             "acceptance_criteria": [str(x) for x in ac],
+            "requirement_keys": req_keys,
             "depends_on": [str(x) for x in deps],
             "scope_files": [str(x) for x in scope],
             "external_ref": s.get("external_ref") or None,
@@ -603,8 +731,25 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     # story_reopen_node first to flip drifted DONE stories to REOPENED;
     # this pass picks up brand-new stories the revised spec demands.
     app_name = story_state.app_name_for_workspace(workspace)
+
+    # v5 requirements ingest. Parses FR/NFR/US headings from the spec
+    # and UPSERTs the ``requirements`` table BEFORE the augment peek so
+    # the augment prompt (and the validator) see the current set of
+    # valid requirement_keys. Soft-fail; the validator below will
+    # surface "unknown requirement key" if the table is empty when a
+    # story tries to cite one.
+    parsed_count, upserted_count = _ingest_requirements(
+        workspace, app_name, spec_req,
+    )
+    if parsed_count:
+        logger.info(
+            "[decomposition] requirements_ingest: %d parsed, %d upserted",
+            parsed_count, upserted_count,
+        )
+
     augment_existing: list[dict[str, Any]] = []
     augment_existing_features: list[dict[str, Any]] = []
+    known_req_keys: set[str] = set()
     # The peek-then-write pattern opens TWO sqlite connections to the
     # same file (this one and the writer below). That's safe because:
     # (a) the state.db has WAL enabled so readers/writers don't block
@@ -619,12 +764,20 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         try:
             augment_existing = story_state.list_stories(_peek_conn, app_name)
             augment_existing_features = story_state.list_features(_peek_conn, app_name)
+            # Snapshot the requirement universe so the validator can
+            # reject stories citing unknown req_keys with a precise
+            # error listing valid alternatives.
+            known_req_keys = {
+                r["req_key"]
+                for r in story_state.list_requirements(_peek_conn, app_name)
+            }
         finally:
             _peek_conn.close()
     except Exception as exc:  # noqa: BLE001 — fall back to from-scratch
         logger.info("[decomposition] augment-mode peek skipped: %s", exc)
         augment_existing = []
         augment_existing_features = []
+        known_req_keys = set()
 
     augment_mode = bool(augment_existing)
     if augment_mode:
@@ -685,10 +838,14 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 if f.get("feature_key")
             }
             features_cleaned, cleaned = _validate_augment_payload(
-                data, existing_feature_keys=existing_keys,
+                data,
+                existing_feature_keys=existing_keys,
+                known_req_keys=known_req_keys or None,
             )
         else:
-            features_cleaned, cleaned = _validate_stories_payload(data)
+            features_cleaned, cleaned = _validate_stories_payload(
+                data, known_req_keys=known_req_keys or None,
+            )
     except ValueError as exc:
         logger.error("[decomposition] payload validation failed: %s", exc)
         return {
@@ -763,6 +920,34 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             conn, app_name, cleaned,
             build_kind=build_kind, cr_ids=cr_ids,
         )
+        # v5: each cleaned story carries a validated ``requirement_keys``
+        # list (Phase 2 contract). Write the story_satisfies_req edges
+        # now that both sides exist in the DB. create_stories returns
+        # keys in the same order as the input list, so a zip stays
+        # aligned even though create_stories' public signature returns
+        # list[str] (keeping it that way avoided churn across ~15 call
+        # sites — see the plan's Phase 1 notes).
+        for story_key, story_item in zip(created_keys, cleaned):
+            req_keys = story_item.get("requirement_keys") or []
+            if not req_keys:
+                continue
+            row = story_state.get_story(conn, app_name, story_key)
+            if row is None:
+                logger.warning(
+                    "[decomposition] story %s vanished before req-link write",
+                    story_key,
+                )
+                continue
+            try:
+                story_state.link_story_to_requirements(
+                    conn, app_name, row["id"], req_keys,
+                )
+            except ValueError as exc:
+                # Validator should have caught this; defensive log only.
+                logger.error(
+                    "[decomposition] req-link skipped for %s: %s",
+                    story_key, exc,
+                )
         stories_md, _ = story_state.regenerate_markdown_views(conn, workspace)
     finally:
         conn.close()

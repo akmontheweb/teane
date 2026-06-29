@@ -2318,13 +2318,17 @@ async def _maybe_judgment_llm(
     judgment additions (HITL escalation summary, patcher rejection
     diagnosis, pre-flight autofix classification, discovery saturation).
 
-    Reuses the repair role (cheap model + thinking-mode policy already
-    configured) so no new model slot is required. The helper is fail-open
-    by design: it returns ``(None, budget_unchanged)`` whenever the call
-    can't or shouldn't run (disabled by config, no gateway, no repair
-    model routed, budget too low, or the dispatch raises) so callers can
-    fall back to their existing deterministic behaviour without a guard
-    around every call site.
+    Dispatches under ``NodeRole.JUDGMENT`` — same cheap model as REPAIR
+    but a distinct cache-drift bucket. These calls ship tiny user-only
+    prompts (no shared system message), so binding them to REPAIR would
+    flip the gateway's prefix-hash record back and forth every iteration
+    and force auto-cache misses on the real repair-loop dispatch.
+
+    Fail-open by design: returns ``(None, budget_unchanged)`` whenever
+    the call can't or shouldn't run (disabled by config, no gateway, no
+    repair model routed, budget too low, or the dispatch raises) so
+    callers fall back to their existing deterministic behaviour without
+    a guard around every call site.
 
     A $0.01 floor is enforced on top of the gateway's hard guardrail —
     judgment calls are cheap (~$0.001) but a 0-budget call would still
@@ -2342,7 +2346,7 @@ async def _maybe_judgment_llm(
         messages = [{"role": "user", "content": prompt}]
         response, new_budget = await gw.dispatch(
             messages=messages,
-            role=NodeRole.REPAIR,
+            role=NodeRole.JUDGMENT,
             budget_remaining_usd=budget_remaining_usd,
         )
         content = (response.content or "").strip()
@@ -4769,6 +4773,72 @@ _INSTALL_STEP_SUBDIR_SKIP = frozenset({
 })
 
 
+# Shared install-time venv path inside the sandbox container. Lives under
+# /tmp so it's writable by non-root sandbox users — `uv pip install --system`
+# targets /usr/local/lib/python3.11/dist-packages, which a non-root user
+# can't write to, so wheel installs fail with `Permission denied (os error
+# 13)` before the smoke check / pytest ever runs. `--system-site-packages`
+# keeps the builder image's pre-baked deps visible for imports while still
+# routing all new writes into the writable venv.
+_PROD_SMOKE_VENV_PATH = "/tmp/teane-venv"
+
+
+# Substrings that mark a line as the real error rather than install-
+# progress chatter. Used by the prod-smoke fallback diagnostic to lift
+# error lines to the head of the message so the HITL summariser's per-
+# error truncation doesn't drop them.
+_SMOKE_SALIENT_MARKERS: tuple[str, ...] = (
+    "error:", "ERROR", "Error:", "Permission denied", "Caused by:",
+    "FAIL:", "Traceback", "fatal:", "ModuleNotFoundError",
+    "ImportError",
+)
+
+
+def _surface_salient_errors(raw_output: str) -> str:
+    """Return a diagnostic message that puts error-marker lines first,
+    then a trailing slice of the raw output for context.
+
+    Pure-text helper, no I/O. When the raw output starts with progress
+    chatter (uv's "Downloading … (N MiB)" / "Downloaded …" / "Prepared
+    N packages …") and the real failure appears further down, naively
+    slicing ``raw_output[-4000:]`` keeps the failure inside the window
+    but pushes it past the per-diagnostic head truncation the HITL
+    summariser applies. Lifting marker lines to the head guarantees
+    the LLM sees the real cause regardless of where the truncation
+    boundary lands.
+    """
+    if not raw_output:
+        return ""
+    salient: list[str] = []
+    for line in raw_output.splitlines():
+        if any(m in line for m in _SMOKE_SALIENT_MARKERS):
+            salient.append(line)
+    if not salient:
+        return raw_output[-4000:]
+    # Cap salient at 20 lines so a runaway error stream can't crowd out
+    # the trailing context entirely.
+    head = "\n".join(salient[:20])
+    tail = raw_output[-2000:]
+    return f"{head}\n--- (build output tail) ---\n{tail}"
+
+
+def _uv_venv_prefix() -> str:
+    """Shell prefix that creates (idempotent) and activates the sandbox
+    venv so subsequent ``uv pip install`` and ``python3`` calls in the
+    same chained command target a user-writable location.
+
+    Emitted as a single chain element so callers can ``&&``-prepend it to
+    an existing install/pytest command. The venv is rebuilt on every fresh
+    sandbox container (``/tmp`` is ephemeral); within a container the
+    ``test -d`` guard makes re-activation a no-op.
+    """
+    return (
+        f"(test -d {_PROD_SMOKE_VENV_PATH}/bin "
+        f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH}) "
+        f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate"
+    )
+
+
 def _compose_prod_smoke_install_step(workspace_path: str) -> Optional[str]:
     """Build a comprehensive install step for the prod-import smoke check
     by sniffing **all** Python manifests in the workspace (root + first-
@@ -4798,9 +4868,9 @@ def _compose_prod_smoke_install_step(workspace_path: str) -> Optional[str]:
 
     # Root-level Python manifest takes precedence — single-project repo.
     if has_file("pyproject.toml"):
-        install_cmds.append("uv pip install --system -e .")
+        install_cmds.append("uv pip install -e .")
     elif has_file("requirements.txt"):
-        install_cmds.append("uv pip install --system -r requirements.txt")
+        install_cmds.append("uv pip install -r requirements.txt")
 
     # Plus any Python manifest one level deep (monorepo: server/ + client/).
     # Skipped subdirs match the cli.py subdir-detection skip set so we don't
@@ -4820,16 +4890,16 @@ def _compose_prod_smoke_install_step(workspace_path: str) -> Optional[str]:
         sub_pyproject = os.path.join(full, "pyproject.toml")
         sub_req = os.path.join(full, "requirements.txt")
         if os.path.isfile(sub_pyproject):
-            install_cmds.append(f"uv pip install --system -e {entry}")
+            install_cmds.append(f"uv pip install -e {entry}")
         elif os.path.isfile(sub_req):
             install_cmds.append(
-                f"uv pip install --system -r {entry}/requirements.txt"
+                f"uv pip install -r {entry}/requirements.txt"
             )
         # Optional dev requirements alongside.
         sub_req_dev = os.path.join(full, "requirements-dev.txt")
         if os.path.isfile(sub_req_dev):
             install_cmds.append(
-                f"uv pip install --system -r {entry}/requirements-dev.txt"
+                f"uv pip install -r {entry}/requirements-dev.txt"
             )
 
     if not install_cmds:
@@ -4837,8 +4907,11 @@ def _compose_prod_smoke_install_step(workspace_path: str) -> Optional[str]:
 
     # pytest itself — pre-baked in the builder image but harmless to
     # re-state, and required if the harness runs outside the builder image.
-    install_cmds.append("uv pip install --system pytest")
-    return " && ".join(install_cmds)
+    install_cmds.append("uv pip install pytest")
+    # Prepend the venv prefix so every `uv pip install` writes to the
+    # user-writable /tmp venv instead of /usr/local/lib/python3.11/dist-
+    # packages (non-root sandboxes can't write there → Permission denied).
+    return " && ".join([_uv_venv_prefix(), *install_cmds])
 
 
 # A top-level module is considered a project module (not a missing third-
@@ -5088,9 +5161,17 @@ async def _run_prod_import_smoke_check(
         # cut them off at literally the word "Caused" in session
         # db6bfcbe. 4000 leaves room for the full cause chain plus a
         # handful of "Downloaded" progress lines for context.
+        #
+        # Salient lines first: the HITL summariser truncates each
+        # diagnostic's message and only the leading portion reaches the
+        # LLM. If the raw tail starts with install-progress chatter
+        # ("Downloading pydantic-core (2.0MiB)") the real error line
+        # ("error: Failed to install …  Permission denied") gets buried
+        # past the truncation boundary — surface ERROR markers up front
+        # so the first 1500 chars hit the LLM's prompt.
         diagnostics.append({
             "error_code": "PROD_IMPORT_SMOKE",
-            "message": (result.raw_output or "")[-4000:],
+            "message": _surface_salient_errors(result.raw_output or ""),
             "file": "<prod-import-smoke>",
             "line": 0,
             "column": 0,
@@ -9740,6 +9821,18 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
                             ),
                         )
                         cr_feature_seeded = True
+                    # v5 traceability uniformity: every story (CR-derived
+                    # or spec-derived) MUST link to at least one
+                    # requirements row. Seed a synthetic ``CR-N``
+                    # requirement so the audit gate can join CR work
+                    # the same way it joins spec work, without an
+                    # ``OR build_kind='cr'`` special case.
+                    req_id = _sst.ensure_requirement(
+                        conn, app_name, ref,
+                        kind="cr_synthetic",
+                        title=rec.get("original_name", ref),
+                        body=f"Synthetic requirement for change request {ref}.",
+                    )
                     keys = _sst.create_stories(
                         conn, app_name,
                         [{
@@ -9760,6 +9853,22 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
                         cr_ids=[int(rec["cr_id"])],
                     )
                     created_keys.extend(keys)
+                    # Link this bridged story to its synthetic CR
+                    # requirement. Lookup-by-key (rather than
+                    # threading the id through create_stories) keeps
+                    # the public signature unchanged — same trade-off
+                    # decomposition_node makes for spec-derived stories.
+                    for key in keys:
+                        row = _sst.get_story(conn, app_name, key)
+                        if row is not None:
+                            _sst.link_story_to_requirements(
+                                conn, app_name, row["id"], [ref],
+                            )
+                    # Suppress an unused-variable warning while still
+                    # documenting the contract: req_id exists so the
+                    # synthetic row is materialised here even if the
+                    # link below silently no-ops.
+                    del req_id
                 if created_keys:
                     _sst.regenerate_markdown_views(conn, workspace)
                     logger.info(

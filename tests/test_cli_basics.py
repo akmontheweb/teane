@@ -536,7 +536,9 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        assert detected.startswith("cd server &&")
+        # `cd server &&` may now appear after the leading venv-prefix
+        # bootstrap — check it's a chain element, not the leading token.
+        assert " && cd server &&" in detected
         # uv pip install is the canonical installer (see makefile_python.md);
         # plain `pip install` is no longer emitted by the detector.
         assert "uv pip install" in detected
@@ -551,7 +553,7 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        assert detected.startswith("cd backend &&")
+        assert " && cd backend &&" in detected
         assert "uv pip install" in detected
         assert "-e ." in detected
 
@@ -566,7 +568,9 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        assert not detected.startswith("cd ")
+        # Root manifest skips the subdir cd-prefix; the venv bootstrap
+        # still leads, but `cd server` must not appear anywhere.
+        assert "cd server" not in detected
         assert "uv pip install" in detected
         assert "-r requirements.txt" in detected
 
@@ -626,9 +630,9 @@ class TestGreenfieldBrownfieldSplit:
         # MUST install the project's actual deps from server/requirements.txt
         # so the prod-smoke check + the real build both succeed. The subdir
         # detector picks the `cd server && uv pip install -r requirements.txt
-        # && pytest` form.
+        # && pytest` form (now prefixed with the venv bootstrap).
         assert detected is not None
-        assert detected.startswith("cd server &&")
+        assert " && cd server &&" in detected
         assert "uv pip install" in detected
         assert "-r requirements.txt" in detected
         assert "pytest" in detected
@@ -770,7 +774,7 @@ class TestFrontendOnlyMonorepoFallback:
         (tmp_path / "client").mkdir()
         (tmp_path / "client" / "package.json").write_text(json.dumps({"name": "c"}))
         detected = _detect_default_build_command(str(tmp_path))
-        assert detected.startswith("cd server &&")
+        assert " && cd server &&" in detected
         assert "uv pip install" in detected
 
     def test_frontend_only_picks_first_node_subdir_alphabetically(self, tmp_path):

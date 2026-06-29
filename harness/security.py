@@ -469,6 +469,14 @@ class CommandValidator:
         "docker", "docker-compose", "podman",
         "test", "[",
         "true", "false",
+        # ``cd`` is a shell builtin used by planner-emitted build commands
+        # for monorepo / non-flat layouts (``cd server && pytest``).
+        # Allowlisting adds no real attack surface — the docker sandbox is
+        # the actual isolation boundary, and ``cd`` cannot touch files
+        # outside the working tree. Blocking it forced repair LLMs into
+        # an unfixable loop (the global validator config is unreachable
+        # via the per-workspace patcher allowlist).
+        "cd",
     }
 
     # Default blocklist: dangerous or network-exposing patterns

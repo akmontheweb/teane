@@ -709,6 +709,48 @@ def _read_spec_layout(workspace_path: str) -> Any:
     return parse_layout(spec_md)
 
 
+def _read_config_root_files() -> list[str]:
+    """Return the operator-configured ``patcher.root_files`` list from
+    config.json (deduped, str-only). Defaults to ``[]`` on any
+    error.
+
+    The static :data:`_ROOT_ALLOWLIST_FILES` set is the harness's
+    built-in baseline. ``config.json`` ``patcher.root_files`` is
+    documented as "merged with dynamically scanned entries (...) to
+    form the final allowlist", but historically only ``CommandValidator``
+    /``SecurityScanPolicy`` consumed it — the spec-driven and
+    filesystem-fallback allowlist builders only saw the built-in
+    static set. This helper closes that gap: operators who widen
+    ``patcher.root_files`` (commit 0b75d0e added Java / modern Python
+    /Node tooling) now see those entries in both allowlist tiers.
+
+    Read is best-effort; any config error falls back to ``[]`` so the
+    patcher still works on a malformed config (the static set keeps
+    real builds running).
+    """
+    try:
+        from harness.cli import _strip_comments, load_raw_config
+        cfg = _strip_comments(load_raw_config())
+    except Exception:  # noqa: BLE001 — config absence must not break the patcher
+        return []
+    patcher_cfg = cfg.get("patcher") if isinstance(cfg, dict) else None
+    if not isinstance(patcher_cfg, dict):
+        return []
+    raw = patcher_cfg.get("root_files")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        stripped = entry.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            out.append(stripped)
+    return out
+
+
 def _read_extra_allowlist_globs() -> list[str]:
     """Return operator-supplied extra allowlist entries from config.json
     (Phase 3(d)). Defaults to ``[]`` when absent.
@@ -827,6 +869,15 @@ def _spec_driven_allowlist(workspace_path: str, layout: Any) -> list[str]:
         *_ROOT_ALLOWLIST_FILES,
         *[f for f in layout.root_files if f not in _ROOT_ALLOWLIST_FILES],
     ]
+    # Operator-widened config.json patcher.root_files. Without this
+    # merge, additions to config.json (commit 0b75d0e widened root_files
+    # for Java / Python / Node toolchains) never reached the spec-driven
+    # allowlist — the LLM's first patch to a config-listed file like
+    # ``compose.yml`` or ``.env.local`` was rejected even though the
+    # operator had explicitly opted it in.
+    for entry in _read_config_root_files():
+        if entry not in allowlist:
+            allowlist.append(entry)
     extra = _resolve_layout_divergence(workspace_path, layout)
     for entry in extra:
         if entry not in allowlist:
@@ -1032,6 +1083,13 @@ def _filesystem_allowlist(workspace_path: str) -> Optional[list[str]]:
             *_ROOT_ALLOWLIST_FILES,
         ]
 
+    # Operator-widened config.json patcher.root_files (same merge as the
+    # spec-driven tier). Greenfield projects skip this branch entirely
+    # via the ``return None`` above; we land here for both source-rooted
+    # workspaces (the ``if roots:`` branch) and stale-fallback workspaces.
+    for entry in _read_config_root_files():
+        if entry not in allowlist:
+            allowlist.append(entry)
     _append_runtime_root_entries(workspace_path, allowlist)
     return allowlist
 
@@ -4284,6 +4342,50 @@ def _is_pip_resolution_conflict(raw_output: str, build_command: str) -> bool:
     return any(p.search(tail) for p in _PIP_RESOLUTION_CONFLICT_PATTERNS)
 
 
+_COMMAND_BLOCKED_RULE_PATTERN = re.compile(
+    r"\bMatched Rule:\s*(?P<rule>whitelist_missing:[\w\-\.]+|blocked_pattern:[^\s]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_command_blocked_by_security(raw_output: str) -> Optional[str]:
+    """When the sandbox's CommandValidator refused the build command,
+    return the matched validator rule (e.g. ``whitelist_missing:cd`` or
+    ``blocked_pattern:\\bsudo\\b``). Returns ``None`` when the build
+    output isn't a security-validator block.
+
+    The CommandValidator's exception (raised in
+    :meth:`harness.sandbox.SandboxRunner.run` before any subprocess is
+    spawned) is stringified into ``BuildResult.raw_output`` as::
+
+        [SECURITY BLOCKED]: Command 'cd' is not in the allowed commands
+          Command: cd server && uv pip install ...
+          Matched Rule: whitelist_missing:cd
+          Tip: Configure 'security.allowed_commands' ... in .harness_config.json
+
+    This detector keys off the ``Matched Rule:`` token so we don't false-
+    positive on user app code that happens to print the string
+    ``[SECURITY BLOCKED]`` in its own logs.
+
+    A blocked command is NOT something the repair LLM can fix from
+    inside the workspace — the CommandValidator's config lives in the
+    GLOBAL ``~/.harness/...`` config and the patcher allowlist refuses
+    to write there. Without short-circuiting, repair burns its full
+    iteration budget rejecting patches at the allowlist and the
+    operator gets a misleading HITL summary built from later (different)
+    failure modes once the build command happens to slip through (e.g.
+    the prod-import smoke check, which composes a separate command).
+    """
+    if not raw_output:
+        return None
+    if "[SECURITY BLOCKED]" not in raw_output:
+        return None
+    match = _COMMAND_BLOCKED_RULE_PATTERN.search(raw_output)
+    if match is None:
+        return None
+    return match.group("rule")
+
+
 def _is_no_tests_collected(exit_code: int, raw_output: str, build_command: str) -> bool:
     """True when the build's failure is pytest's exit-5 'no tests collected'
     rather than an actual test/compile failure.
@@ -4979,10 +5081,16 @@ async def _run_prod_import_smoke_check(
         )
     if not diagnostics:
         # Fall back to a single coarse diagnostic carrying the tail of
-        # the output so the LLM has something to work with.
+        # the output so the LLM has something to work with. The tail
+        # size must be big enough to keep the toolchain's chained
+        # "Caused by:" stack — uv truncates its own wheel-install
+        # failures across 3–5 nested causes, and capping at 1500 chars
+        # cut them off at literally the word "Caused" in session
+        # db6bfcbe. 4000 leaves room for the full cause chain plus a
+        # handful of "Downloaded" progress lines for context.
         diagnostics.append({
             "error_code": "PROD_IMPORT_SMOKE",
-            "message": (result.raw_output or "")[-1500:],
+            "message": (result.raw_output or "")[-4000:],
             "file": "<prod-import-smoke>",
             "line": 0,
             "column": 0,
@@ -6593,6 +6701,24 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         loop_counter["missing_dep_consecutive_same"] = 0
         loop_counter["missing_dep_last_symbol"] = ""
 
+    # Sandbox CommandValidator block — the build command itself was
+    # refused before any subprocess ran. The validator config (allowed_
+    # commands / blocked_patterns) lives in the GLOBAL config; the patcher
+    # allowlist cannot write to it, so repair_node would burn its full
+    # iteration budget producing rejected patches. Detected from the raw
+    # output (the exception text is what BuildResult carries) and surfaced
+    # via node_state so route_after_compiler can short-circuit to HITL.
+    cmd_blocked_rule: Optional[str] = None
+    if exit_code != 0:
+        cmd_blocked_rule = _is_command_blocked_by_security(raw_log)
+        if cmd_blocked_rule:
+            logger.warning(
+                "[compiler_node] Build command blocked by security validator "
+                "(rule=%s). The validator config is global, not workspace-"
+                "scoped — repair loop cannot reach it. Short-circuiting to HITL.",
+                cmd_blocked_rule,
+            )
+
     # Build the return dictionary by MERGING into the existing node_state,
     # not replacing it. Cross-iteration signals like patch_failures (the
     # patcher's "Current file content around closest match" window),
@@ -6608,6 +6734,29 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     if env_misconfig_symbol and not env_misconfig_is_repairable:
         node_state["env_misconfig"] = True
         node_state["env_misconfig_symbol"] = env_misconfig_symbol
+    if cmd_blocked_rule:
+        node_state["build_command_blocked"] = True
+        node_state["build_command_blocked_rule"] = cmd_blocked_rule
+
+    # First-failure snapshot. Without this the HITL escalation summary
+    # only sees the FINAL round's build output — which lies to the
+    # operator when the failure mode changes mid-session. Session
+    # db6bfcbe ran rounds 1–3 with the build command blocked by the
+    # security validator; round 4's repair happened to take a different
+    # code path that surfaced a downstream uv install failure, and the
+    # summariser (seeing only the uv tail) hallucinated a pinned dep
+    # that didn't exist. Frozen on the first non-zero-exit round so
+    # later iterations don't overwrite it; the most-recent output is
+    # still available via ``last_build_output``.
+    if exit_code != 0 and not node_state.get("first_failure_build_output"):
+        node_state["first_failure_build_output"] = raw_log
+        node_state["first_failure_build_command"] = build_cmd
+        node_state["first_failure_round"] = int(
+            loop_counter.get("total_repairs", 0) or 0
+        )
+        node_state["first_failure_compiler_errors"] = [
+            dict(e) for e in (compiler_errors or [])[:8]
+        ]
 
     # Pytest exit-5 (no tests collected) is NOT a build failure — the test
     # runner just had nothing to run. Surface as a distinct condition so the
@@ -8213,10 +8362,17 @@ def _build_hitl_escalation_summary_prompt(
 
     err_lines: list[str] = []
     for err in errors[:8]:
+        # Per-error message cap. The previous 200-char cap silently
+        # truncated chained "Caused by:" stacks (uv, cargo, gradle) at
+        # the FIRST cause — in session db6bfcbe it cut the uv wheel-
+        # install failure at literally the word "Caused", so the
+        # summariser hallucinated a different root cause. 1500 is wide
+        # enough to keep the full toolchain stack while still bounding
+        # the prompt at 8 * 1500 = 12k for the eight-error worst case.
         err_lines.append(
             f"- {err.get('error_code', '?')} {err.get('file', '?')}:"
             f"{err.get('line', 0)} — "
-            f"{str(err.get('message', ''))[:200]}"
+            f"{str(err.get('message', ''))[:1500]}"
         )
     err_block = "\n".join(err_lines) if err_lines else "(no structured diagnostics)"
 
@@ -8240,6 +8396,42 @@ def _build_hitl_escalation_summary_prompt(
         if modified_files else "(none)"
     )
 
+    # First-failure context. When the build's failure mode changes
+    # across repair rounds (e.g. round 1 = build command refused by the
+    # security validator → round 4 = downstream uv install failure),
+    # showing the summariser ONLY the most recent tail produces wrong
+    # post-mortems. Pulled from compiler_node's snapshot frozen on the
+    # first non-zero-exit round; skipped when it duplicates the most
+    # recent output (no failure-mode shift). See session db6bfcbe.
+    first_output = str(node_state.get("first_failure_build_output", "") or "")
+    first_cmd = str(node_state.get("first_failure_build_command", "") or "")
+    first_round = node_state.get("first_failure_round")
+    first_errors = node_state.get("first_failure_compiler_errors") or []
+    first_block: str = ""
+    if first_output and first_output != last_build_output:
+        first_err_lines: list[str] = []
+        for err in first_errors[:5]:
+            if isinstance(err, dict):
+                first_err_lines.append(
+                    f"- {err.get('error_code', '?')} {err.get('file', '?')}:"
+                    f"{err.get('line', 0)} — "
+                    f"{str(err.get('message', ''))[:200]}"
+                )
+        first_err_block = (
+            "\n".join(first_err_lines)
+            if first_err_lines else "(no structured diagnostics)"
+        )
+        first_block = (
+            "\nFIRST-ROUND failure (round "
+            f"{first_round if first_round is not None else '?'}; "
+            "may differ from the recent tail above if the failure mode "
+            "shifted mid-session):\n"
+            f"  Build command: {first_cmd or '(unknown)'}\n"
+            f"  Diagnostics:\n{first_err_block}\n"
+            f"  Tail of first build output:\n"
+            f"{first_output[-800:]}\n"
+        )
+
     return (
         "You are summarising why the harness's build → repair loop has stopped "
         "making progress and is handing off to a human operator. Produce ONE "
@@ -8252,7 +8444,10 @@ def _build_hitl_escalation_summary_prompt(
         "  3. Recommends the single most likely manual fix.\n"
         "Be specific: cite filenames, missing symbols, or rejected paths from "
         "the evidence below. Do NOT paraphrase the trigger reason; the "
-        "operator already sees it.\n\n"
+        "operator already sees it. When the FIRST-ROUND failure differs from "
+        "the recent tail, the FIRST-ROUND error is almost always the real "
+        "root cause — later rounds just expose downstream symptoms once the "
+        "original problem is bypassed or papered over.\n\n"
         f"Trigger: {trigger_reason}\n"
         f"Repair iterations spent: {loop_counter.get('total_repairs', 0)}\n"
         f"Consecutive zero-patch rounds: {loop_counter.get('consecutive_zero_patch_rounds', 0)}\n"
@@ -8262,23 +8457,24 @@ def _build_hitl_escalation_summary_prompt(
         f"Recent patcher rejections (other):\n{pf_block}\n\n"
         f"Workspace files touched this session: {inv_block}\n\n"
         f"Tail of last build output (truncated):\n"
-        f"{last_build_output[-1200:] if last_build_output else '(empty)'}\n"
+        f"{last_build_output[-4000:] if last_build_output else '(empty)'}"
+        f"{first_block}"
     )
-    # Phase 2.1 — decision-point logging. The 1200-char tail is a hard
-    # truncation that hides the FIRST stack frames of multi-stage builds
-    # (webpack's initial import resolution error, javac's first
-    # cannot-find-symbol, etc.) when the log is long. Emit a structured
-    # event so post-mortems can tell whether the truncation chopped the
-    # signal vs. genuinely had nothing important earlier in the log.
-    if last_build_output and len(last_build_output) > 1200:
+    # Phase 2.1 — decision-point logging. The tail truncation hides the
+    # FIRST stack frames of multi-stage builds (webpack's initial import
+    # resolution error, javac's first cannot-find-symbol, etc.) when the
+    # log is long. Emit a structured event so post-mortems can tell
+    # whether the truncation chopped the signal vs. genuinely had
+    # nothing important earlier in the log.
+    if last_build_output and len(last_build_output) > 4000:
         try:
             from harness.observability import emit_event as _emit_drop
             _emit_drop(
                 "dropped_from_prompt",
                 site="hitl_summary_build_log_truncation",
-                dropped_count=len(last_build_output) - 1200,
-                kept_count=1200,
-                reason="hitl_summary_keeps_last_1200_chars",
+                dropped_count=len(last_build_output) - 4000,
+                kept_count=4000,
+                reason="hitl_summary_keeps_last_4000_chars",
                 full_log_size=len(last_build_output),
             )
         except Exception:  # noqa: BLE001
@@ -8826,6 +9022,23 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         logger.warning(
             "[router] Sandbox env misconfig (missing '%s'). Skipping repair loop, routing to HITL.",
             symbol,
+        )
+        return _transition("human_intervention_node")
+
+    # Sandbox CommandValidator refused the build command (e.g. ``cd`` or
+    # ``bash`` not in security.allowed_commands). The validator's config is
+    # global (~/.harness/...) and the patcher allowlist cannot write
+    # there — three rounds of repair would burn the budget producing
+    # patches that get rejected at the allowlist (session db6bfcbe).
+    # Route straight to HITL with the matched rule so the operator can
+    # adjust the policy and resume.
+    if state.get("node_state", {}).get("build_command_blocked"):
+        rule = state.get("node_state", {}).get("build_command_blocked_rule", "")
+        logger.warning(
+            "[router] Build command blocked by sandbox security validator "
+            "(rule=%s). Repair loop cannot reach the global validator config. "
+            "Routing to HITL.",
+            rule,
         )
         return _transition("human_intervention_node")
 

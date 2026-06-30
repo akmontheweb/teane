@@ -855,6 +855,74 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
         assert "add(1, 2) returns 3" in joined
 
     @pytest.mark.asyncio
+    async def test_batch_preamble_renders_when_current_story_cleared(
+        self, tmp_path, stub_sandbox, stub_gateway, monkeypatch,
+    ):
+        """Phase 7 BUG #2 regression: story_loop_node clears
+        current_story_id="" before routing into batch verification.
+        Without the batch-scope fallback, test_generation would emit
+        RULE 5 but no preamble, leaving the LLM with no AC keys to
+        cite. The fallback must render ACs from every story patched
+        in the current batch."""
+        from harness import story_state
+        ws = tmp_path / "batch-preamble-ws"
+        ws.mkdir()
+        (ws / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (ws / "calc.py").write_text("def add(a, b): return a + b\n")
+        db = tmp_path / "state.db"
+        monkeypatch.setenv("TEANE_STATE_DB", str(db))
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "core", name="Core")
+            story_state.create_stories(conn, app, [
+                {
+                    "title": "Add",
+                    "feature": "core",
+                    "acceptance_criteria": ["add(1, 2) returns 3"],
+                },
+                {
+                    "title": "Subtract",
+                    "feature": "core",
+                    "acceptance_criteria": ["sub(2, 1) returns 1"],
+                },
+            ])
+        finally:
+            conn.close()
+
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "# @verifies: STORY-1.AC-1, STORY-2.AC-1\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(ws),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+            # Mid-verification state: story_loop already cleared this.
+            "current_story_id": "",
+            "current_batch_id": 1,
+            "batch_patched_story_keys": ["STORY-1", "STORY-2"],
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
+        # Batch preamble must list BOTH stories' AC keys so the LLM
+        # has real keys to cite in the @verifies marker.
+        assert "Batch Scope:" in joined
+        assert "STORY-1.AC-1" in joined
+        assert "STORY-2.AC-1" in joined
+        assert "add(1, 2) returns 3" in joined
+        assert "sub(2, 1) returns 1" in joined
+
+    @pytest.mark.asyncio
     async def test_preamble_empty_when_no_current_story(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):

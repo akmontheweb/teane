@@ -385,6 +385,13 @@ class AgentState(TypedDict, total=False):
     # Set by `cmd_patch` after resolving the `--generate-specs` tri-state.
     # Inert (False) on every other flow.
     generate_specs: bool
+    # Merged ``.harness_config.json`` contents (operator config + bundled
+    # defaults). Populated by ``create_initial_state`` from the ``config``
+    # kwarg the CLI hands in. Nodes that need operator-tunable knobs read
+    # them via ``state["harness_config"]`` rather than re-loading the file.
+    # The v5 end-of-session audit reads ``harness_config["traceability"]
+    # ["enforce"]`` (default True) — see ``installation_doc_node``.
+    harness_config: dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -504,6 +511,13 @@ def create_initial_state(
         story_repair_cap=int(story_repair_cap),
         flow=flow if flow in _VALID_FLOWS else FLOW_BUILD,
         generate_specs=bool(generate_specs),
+        # Make the merged config dict visible to downstream nodes.
+        # Operators tune ``traceability.enforce`` (Phase 6 audit gate),
+        # ``security.*``, ``test_generation.*`` etc. via this dict.
+        # Always present (empty dict when no config was passed) so
+        # readers can ``.get("section", {}).get("key", default)`` without
+        # None-checks.
+        harness_config=dict(config or {}),
     )
 
 
@@ -8298,6 +8312,14 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
         loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
     )
 
+    # v5 Phase 7 BUG #6: the end-of-session traceability gate
+    # (installation_doc_node) sets node_state.traceability_blocked +
+    # exit_code=1 when the audit fails. Must take precedence over
+    # the generic persistent_build_failure catch-all so HITL UX and
+    # outside-actions can route to the coverage-gap branch instead
+    # of the "open failing files in your IDE" branch.
+    if node_state.get("traceability_blocked"):
+        return "traceability_block"
     if node_state.get("env_misconfig"):
         sym = node_state.get("env_misconfig_symbol", "")
         return f"env_misconfig:{sym}" if sym else "env_misconfig"
@@ -10090,6 +10112,86 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
         f"{rules}\n\n"
         "---\n\n"
     )
+
+
+def _build_batch_scope_preamble(state: AgentState) -> str:
+    """Multi-story preamble for the per-batch verification phase.
+
+    ``story_loop_node`` clears ``current_story_id=""`` when a batch is
+    fully patched and hands control to the verification chain
+    (``speculative → test_generation → lintgate → compiler →
+    code_review``). At that point :func:`_build_story_preamble`
+    returns empty — but the test-generation LLM still gets RULE 5
+    requiring it to cite AC keys via ``# @verifies:`` markers. With
+    no preamble, the LLM has no AC keys to cite and fabricates them;
+    the marker gate then loops until ``max_iterations`` and
+    eventually escalates to HITL.
+
+    This helper renders a "Batch Scope" block listing every story
+    just patched in the current batch alongside its acceptance
+    criteria (with stable ``STORY-N.AC-N`` keys). The test-gen LLM
+    can then cite real keys; the marker gate validates them; the
+    link writer persists ``test_verifies_ac`` edges to real ACs.
+
+    Returns ``""`` when there's no active batch context — either
+    monolithic / non-agile mode, or a single-story phase where
+    :func:`_build_story_preamble` already rendered the per-story
+    preamble (callers should prefer the single-story form when
+    ``current_story_id`` is set; this helper is the fallback).
+    """
+    if state.get("current_story_id"):
+        # Single story is active — caller should use _build_story_preamble.
+        return ""
+    patched_keys = list(state.get("batch_patched_story_keys") or [])
+    if not patched_keys:
+        return ""
+    workspace = state.get("workspace_path") or ""
+    if not workspace:
+        return ""
+    try:
+        from harness import story_state as _sst
+        app_name = _sst.app_name_for_workspace(workspace)
+        conn = _sst.open_story_db()
+        try:
+            stories: list[dict[str, Any]] = []
+            for key in patched_keys:
+                row = _sst.get_story(conn, app_name, key)
+                if row is None:
+                    continue
+                acs = _sst.list_acceptance_criteria(conn, app_name, row["id"])
+                stories.append({"row": row, "acs": acs})
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not stories:
+        return ""
+
+    lines: list[str] = [
+        f"## Batch Scope: {len(stories)} story / stories patched in this batch",
+        "",
+        "The patcher just landed the stories below as a unit. Generate "
+        "tests that verify their acceptance criteria. Cite the AC keys "
+        "EXACTLY as shown below in your ``@verifies:`` markers — every "
+        "test file MUST cite at least one of these keys.",
+        "",
+    ]
+    for s in stories:
+        row = s["row"]
+        title = row.get("title", "")
+        lines.append(f"### {row['story_key']} — {title}")
+        lines.append("")
+        if s["acs"]:
+            lines.append("**Acceptance criteria:**")
+            lines.append("")
+            for ac in s["acs"]:
+                lines.append(f"  - {ac['ac_key']}: {ac['text']}")
+        else:
+            lines.append("  _(no acceptance criteria recorded — skip this story)_")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _build_arch_summary_preamble(

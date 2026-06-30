@@ -1398,13 +1398,21 @@ def get_planned_stories(
     conn: sqlite3.Connection, workspace: str,
 ) -> list[dict[str, Any]]:
     """Stories ready to be picked. Honors depends_on — a story whose
-    deps are not all 'done' is not returned even if status='planned'."""
-    all_planned = list_stories(conn, workspace, status="planned")
+    deps are not all 'done' is not returned even if status='planned'.
+
+    Also returns ``reopened`` rows so ``story_reopen_node``'s output
+    actually gets re-planned by the batch planner. ``reopened`` is
+    a distinct status from ``planned`` so the operator can see (in
+    STORIES.md and via ``teane status``) which stories were flipped
+    back by a spec-drift verdict vs. which never shipped at all.
+    """
+    rows = list_stories(conn, workspace, status="planned")
+    rows.extend(list_stories(conn, workspace, status="reopened"))
     done_keys = {
         s["story_key"] for s in list_stories(conn, workspace, status="done")
     }
     ready: list[dict[str, Any]] = []
-    for s in all_planned:
+    for s in rows:
         deps = s["depends_on"]
         if all(d in done_keys for d in deps):
             ready.append(s)
@@ -1425,7 +1433,7 @@ def mark_in_progress(
     cur = conn.execute(
         "UPDATE stories SET status = 'in_progress', started_at = ? "
         "WHERE workspace = ? AND story_key = ? "
-        "AND status IN ('planned', 'in_progress')",
+        "AND status IN ('planned', 'in_progress', 'reopened')",
         (_utcnow_iso(), workspace, story_key),
     )
     conn.commit()

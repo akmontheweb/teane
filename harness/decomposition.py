@@ -832,6 +832,13 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     try:
+        # Always pass the snapshot through — even an EMPTY set must
+        # be threaded so the validator's cross-check fires and rejects
+        # bogus req_keys against a workspace whose spec has no FR/NFR/US
+        # headings yet. ``set() or None`` would collapse to None and
+        # silently drop the validator into shape-only mode, leaving
+        # the audit to "pass" vacuously (Phase 7 BUG #5). ``None`` is
+        # reserved for unit tests that explicitly want shape-only.
         if augment_mode:
             existing_keys = {
                 f.get("feature_key") for f in augment_existing_features
@@ -840,11 +847,11 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             features_cleaned, cleaned = _validate_augment_payload(
                 data,
                 existing_feature_keys=existing_keys,
-                known_req_keys=known_req_keys or None,
+                known_req_keys=known_req_keys,
             )
         else:
             features_cleaned, cleaned = _validate_stories_payload(
-                data, known_req_keys=known_req_keys or None,
+                data, known_req_keys=known_req_keys,
             )
     except ValueError as exc:
         logger.error("[decomposition] payload validation failed: %s", exc)

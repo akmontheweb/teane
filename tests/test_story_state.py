@@ -386,6 +386,37 @@ def test_get_planned_stories_returns_parallel_independent(conn, app):
     assert ready == ["STORY-1", "STORY-2"]
 
 
+def test_get_planned_stories_includes_reopened(conn, app):
+    """Phase 7 BUG #4 regression: story_reopen_node flips drifted
+    DONE stories to 'reopened'. The planner MUST pick those up or
+    the reopen mechanism is silently no-op."""
+    from harness.story_state import mark_reopened
+    _create_stories(conn, app, [
+        {"title": "Login"}, {"title": "Logout"},
+    ])
+    mark_done(conn, app, "STORY-1")
+    mark_done(conn, app, "STORY-2")
+    # Spec drifted — story_reopen_node flips STORY-1.
+    assert mark_reopened(conn, app, "STORY-1") == 1
+    ready = [s["story_key"] for s in get_planned_stories(conn, app)]
+    assert "STORY-1" in ready
+    assert "STORY-2" not in ready  # still done
+
+
+def test_mark_in_progress_accepts_reopened(conn, app):
+    """Phase 7 BUG #4 regression: mark_in_progress must transition
+    'reopened' rows too, not just ('planned', 'in_progress')."""
+    from harness.story_state import mark_reopened
+    _create_stories(conn, app, [{"title": "A"}])
+    mark_done(conn, app, "STORY-1")
+    mark_reopened(conn, app, "STORY-1")
+    # Planner picks it up and tries to mark it in_progress.
+    moved = mark_in_progress(conn, app, "STORY-1")
+    assert moved == 1
+    s = get_story(conn, app, "STORY-1")
+    assert s["status"] == "in_progress"
+
+
 # ---------------------------------------------------------------------------
 # Batches
 # ---------------------------------------------------------------------------

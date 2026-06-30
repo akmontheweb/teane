@@ -82,7 +82,21 @@ def _clear_gateway():
     set_gateway.__globals__["_gateway_config"] = prior_c
 
 
-def _write_spec(workspace: str, body: str = "Build a TODO API.") -> None:
+_DEFAULT_SPEC_BODY = (
+    "# Build a TODO API\n\n"
+    "### FR-001: Create a TODO\n"
+    "POST /todos creates an item.\n\n"
+    "### FR-002: List TODOs\n"
+    "GET /todos returns the list.\n"
+)
+
+
+def _write_spec(workspace: str, body: str = _DEFAULT_SPEC_BODY) -> None:
+    """Write a SPEC_REQUIREMENTS.md whose FR-NNN headings match the
+    requirement_keys used in the canonical ``_valid_payload`` /
+    augment fixtures. Without these headings the v5 requirements
+    ingest leaves the table empty and the validator rejects the
+    fixtures' bogus keys (post-BUG #5 — pre-fix it silently passed)."""
     docs = os.path.join(workspace, "docs")
     os.makedirs(docs, exist_ok=True)
     Path(os.path.join(docs, "SPEC_REQUIREMENTS.md")).write_text(body)
@@ -536,7 +550,13 @@ def test_decomposition_node_augment_mode_appends_new_story(workspace: str):
     _seed_story(app, "Original feature",
                 acceptance_criteria=["GET /orig returns 200"])
 
-    _write_spec(workspace, "Revised: adds a /new endpoint")
+    # Spec must declare FR-001 so the v5 ingest seeds the requirements
+    # table; otherwise the validator rejects the augment-stories'
+    # requirement_keys cite as "unknown" (BUG #5 contract).
+    _write_spec(
+        workspace,
+        "# Spec\n\n### FR-001: New endpoint\nGET /new returns 200.\n",
+    )
     augment_response = json.dumps({
         "features": [],
         "stories": [{
@@ -701,6 +721,24 @@ class TestRequirementKeysValidation:
     known-set in. decomposition_node always does — these tests
     exercise both modes.
     """
+
+    def test_empty_known_set_still_rejects_bogus_key(self):
+        """Phase 7 BUG #5 regression: an empty set of known req_keys
+        must STILL cause unknown-key validation to fire. Pre-fix,
+        ``known_req_keys or None`` collapsed an empty set to None,
+        dropping the validator into shape-only mode and accepting any
+        string — so a workspace whose spec had no FR/NFR/US headings
+        silently let bogus keys through and the end-of-session audit
+        passed vacuously."""
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-1", "title": "t",
+            "acceptance_criteria": ["x"],
+            "requirement_keys": ["FR-001"],  # bogus — empty known set
+        }])
+        with pytest.raises(ValueError, match="unknown requirement_keys"):
+            decomposition._validate_stories_payload(
+                payload, known_req_keys=set(),
+            )
 
     def test_missing_requirement_keys_rejected(self):
         payload = _payload_with_one_feature([{

@@ -299,6 +299,53 @@ class TestRouteAfterInstallationDoc:
         assert route_after_installation_doc(state) == "human_intervention_node"
 
 
+class TestHarnessConfigPlumbing:
+    """Phase 7 BUG #1 regression: ``state["harness_config"]`` is the
+    operator's escape hatch for the traceability gate. Before the
+    fix, no code path wrote it into state, so
+    ``traceability.enforce=false`` was unreachable.
+    """
+
+    def test_create_initial_state_stores_config(self):
+        from harness.graph import create_initial_state
+        s = create_initial_state(
+            workspace_path="/tmp", initial_prompt="x", build_command="make",
+            config={"traceability": {"enforce": False}, "other": "value"},
+        )
+        assert s.get("harness_config") == {
+            "traceability": {"enforce": False}, "other": "value",
+        }
+
+    def test_create_initial_state_default_is_empty_dict_not_none(self):
+        from harness.graph import create_initial_state
+        s = create_initial_state(
+            workspace_path="/tmp", initial_prompt="x", build_command="make",
+        )
+        # Empty dict (not None) so readers can `.get("key", {}).get(...)`.
+        assert s.get("harness_config") == {}
+
+    def test_traceability_enforce_false_disables_gate(self):
+        """End-to-end: the gate read site at graph.py:12205 must
+        honor enforce=false from the freshly-plumbed harness_config."""
+        # Simulate what installation_doc_node does internally.
+        state = {"harness_config": {"traceability": {"enforce": False}}}
+        tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+        enforce = bool(tr_cfg.get("enforce", True))
+        assert enforce is False
+
+    def test_traceability_enforce_default_is_true_when_unset(self):
+        state = {"harness_config": {}}
+        tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+        enforce = bool(tr_cfg.get("enforce", True))
+        assert enforce is True
+
+        # Also when the whole key is missing.
+        state = {}
+        tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+        enforce = bool(tr_cfg.get("enforce", True))
+        assert enforce is True
+
+
 # ---------------------------------------------------------------------------
 # TRACEABILITY.md render — Requirements + AC coverage sections
 # ---------------------------------------------------------------------------

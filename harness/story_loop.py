@@ -126,9 +126,14 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
                 },
             }
 
-        planned_left = [s for s in all_stories if s["status"] == "planned"]
+        # ``reopened`` rows count too — story_reopen_node flips drifted
+        # DONE stories to that status and the planner needs to pick
+        # them back up.
+        planned_left = [
+            s for s in all_stories if s["status"] in ("planned", "reopened")
+        ]
         if not planned_left:
-            logger.info("[batch_planner] All stories accounted for; no planned left.")
+            logger.info("[batch_planner] All stories accounted for; no planned or reopened left.")
             done_count = sum(1 for s in all_stories if s["status"] == "done")
             return {
                 "current_batch_id": 0,
@@ -314,7 +319,7 @@ def _next_story_in_batch(
         s = story_state.get_story(conn, workspace, key)
         if s is None:
             continue
-        if s["status"] not in ("planned", "in_progress"):
+        if s["status"] not in ("planned", "in_progress", "reopened"):
             continue
         # Defensive intra-batch dep check.
         deps = list(s.get("depends_on") or [])

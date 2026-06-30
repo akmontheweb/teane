@@ -722,6 +722,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # CR in their docstrings. No-op (empty string) outside CR mode.
     from harness.graph import (
         _build_arch_summary_preamble,
+        _build_batch_scope_preamble,
         _build_change_request_preamble,
         _build_story_preamble,
     )
@@ -743,9 +744,18 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # there. patching_node already injects this preamble for code-
     # gen; mirroring it here makes RULE 5's "use AC keys from the
     # story preamble" instruction verifiable (Phase 3 oversight).
+    #
+    # Phase 7 BUG #2 fix: in the per-batch verification phase,
+    # ``current_story_id`` is empty (story_loop cleared it before
+    # routing to verification), so _build_story_preamble returns
+    # "". Fall through to _build_batch_scope_preamble which lists
+    # every story patched this batch and its AC keys — the LLM
+    # needs at least one set of valid keys to satisfy RULE 5.
     story_preamble = _build_story_preamble(
         cast("AgentState", state), "tests",
     )
+    if not story_preamble and agile:
+        story_preamble = _build_batch_scope_preamble(cast("AgentState", state))
     user_prompt = (
         _build_change_request_preamble(cast("AgentState", state), "tests")
         + arch_preamble

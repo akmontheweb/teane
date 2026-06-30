@@ -180,3 +180,64 @@ class TestUnknownTrigger:
         actions = _build_outside_harness_actions(state, "unknown")
         text = "\n".join(actions)
         assert "/tmp/ws" in text
+
+
+class TestPhase7TraceabilityAndNonToolchainSymbols:
+    """Phase 7 BUG #6 regressions: traceability_block trigger surfaces
+    coverage-gap advice (not 'open failing files'); non-toolchain
+    env_misconfig symbols get sensible advice (not 'install the
+    missing package `test_generation_max_iterations`')."""
+
+    def test_traceability_block_lists_audit_advice(self):
+        state = _base_state()
+        actions = _build_outside_harness_actions(state, "traceability_block")
+        text = "\n".join(actions)
+        assert "TRACEABILITY BLOCK" in text
+        assert "requirement_keys" in text
+        assert "@verifies" in text
+        # Emergency bypass must be mentioned.
+        assert "traceability.enforce" in text
+        # Must NOT advise "open failing files in IDE".
+        assert "open failing files" not in text.lower()
+
+    def test_env_misconfig_max_iterations_does_not_suggest_pip_install(self):
+        state = _base_state(node_state={"env_misconfig_symbol": "test_generation_max_iterations"})
+        actions = _build_outside_harness_actions(
+            state, "env_misconfig:test_generation_max_iterations",
+        )
+        text = "\n".join(actions)
+        # Must NOT tell the operator to pip install a counter name.
+        assert "Install the missing tool/package" not in text
+        assert "pip install test_generation_max_iterations" not in text
+        # Must mention max_iterations as the config knob.
+        assert "max_iterations" in text
+
+    def test_env_misconfig_llm_api_key_suggests_env_var(self):
+        state = _base_state(node_state={"env_misconfig_symbol": "llm_api_key"})
+        actions = _build_outside_harness_actions(
+            state, "env_misconfig:llm_api_key",
+        )
+        text = "\n".join(actions)
+        assert "ANTHROPIC_API_KEY" in text or "OPENAI_API_KEY" in text
+        assert "Install the missing tool/package" not in text
+
+    def test_env_misconfig_no_source_files_suggests_workspace_inspection(self):
+        state = _base_state(node_state={"env_misconfig_symbol": "no_source_files"})
+        actions = _build_outside_harness_actions(
+            state, "env_misconfig:no_source_files",
+        )
+        text = "\n".join(actions)
+        assert "source" in text.lower()
+        assert "Install the missing tool/package" not in text
+
+    def test_env_misconfig_real_package_still_suggests_install(self):
+        """Real package names (pytest, jest, mvn) should still get
+        the install-package advice. Non-toolchain branch must not
+        cannibalize the legitimate cases."""
+        state = _base_state(node_state={"env_misconfig_symbol": "pytest"})
+        actions = _build_outside_harness_actions(
+            state, "env_misconfig:pytest",
+        )
+        text = "\n".join(actions)
+        assert "Install the missing tool/package" in text
+        assert "pytest" in text

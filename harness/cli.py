@@ -2638,14 +2638,90 @@ def _build_outside_harness_actions(
 
     actions: list[str] = []
 
+    # Symbols that test_generation_node emits via _synth_diag when the
+    # node itself fails (max iterations, missing API key, no source
+    # files). They are NOT pip/npm packages, so the toolchain branch
+    # below would emit nonsense like "install the missing tool/package
+    # `test_generation_max_iterations`". Branch separately.
+    _NON_TOOLCHAIN_ENV_SYMBOLS = {
+        "test_generation_max_iterations",
+        "llm_api_key",
+        "no_source_files",
+    }
+
+    # ---- traceability_block (v5 Phase 7 BUG #6) ---------------------
+    # End-of-session audit found untraced FRs or untested ACs.
+    # `compiler_errors` will be empty — the gate is a coverage gap,
+    # not a build failure. The report text was printed to stdout right
+    # before HITL fired; point the operator at it.
+    if trigger == "traceability_block":
+        actions.append(
+            "The v5 traceability gate flagged a coverage gap. Scroll up "
+            "in your terminal to the `==== TRACEABILITY BLOCK ====` "
+            "banner — it lists the untraced requirements and untested "
+            "acceptance criteria by ID."
+        )
+        actions.append(
+            "Untraced requirement: add a story (via `teane patch --agile "
+            "true`) that cites the FR-NNN / NFR-XXX-NNN / US-NN-NN key "
+            "in its `requirement_keys`, OR revise "
+            "`docs/SPEC_REQUIREMENTS.md` to remove the orphan requirement."
+        )
+        actions.append(
+            "Untested acceptance criterion: write a test that carries a "
+            "`# @verifies: STORY-N.AC-N` marker for the listed AC key, "
+            "or run another `teane patch --agile true` so test-gen "
+            "covers it. Re-run `teane audit -w <workspace>` to verify."
+        )
+        actions.append(
+            "Emergency bypass: set `traceability.enforce = false` in "
+            "`.harness_config.json` and re-run. This is NOT recommended "
+            "for ship-ready code — the audit exists to surface dropped "
+            "requirements before they reach prod."
+        )
+
     # ---- env_misconfig:<symbol> --------------------------------------
     # Highest-precision trigger — we know exactly what's missing.
-    if trigger.startswith("env_misconfig"):
+    elif trigger.startswith("env_misconfig"):
         symbol = ""
         if ":" in trigger:
             symbol = trigger.split(":", 1)[1].strip()
         symbol = symbol or str(node_state.get("env_misconfig_symbol", ""))
-        if symbol:
+        if symbol in _NON_TOOLCHAIN_ENV_SYMBOLS:
+            if symbol == "test_generation_max_iterations":
+                actions.append(
+                    "The test-generation node hit its max_iterations cap "
+                    "(default 2) trying to land valid tests. Inspect the "
+                    "last attempt under `tests/` — the LLM may have made "
+                    "the same mistake twice. Fix it by hand or raise "
+                    "`test_generation.max_iterations` in `config/config.json`."
+                )
+                actions.append(
+                    "Common cause: the @verifies marker contract is "
+                    "demanding AC keys the LLM doesn't see in its prompt "
+                    "context. Check `docs/STORIES.md` for the active "
+                    "story's AC keys and confirm they appear in the "
+                    "test files under review."
+                )
+            elif symbol == "llm_api_key":
+                actions.append(
+                    "No LLM gateway available — the test-generation node "
+                    "could not dispatch an LLM call. Set the appropriate "
+                    "API key env var (`ANTHROPIC_API_KEY`, "
+                    "`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) in this shell "
+                    "and re-run, or set `gateway.disable=true` in "
+                    "`config/config.json` to skip test generation."
+                )
+            elif symbol == "no_source_files":
+                actions.append(
+                    "Test generation found zero candidate source files. "
+                    "Verify the workspace's source tree (e.g. `src/`, "
+                    "`app/`, `lib/`) actually contains files matching "
+                    "the configured `_SOURCE_EXTENSIONS`. If the patcher "
+                    "ran but wrote into an unexpected location, inspect "
+                    "the recent diff with `git status` / `git diff`."
+                )
+        elif symbol:
             actions.append(
                 f"Install the missing tool/package `{symbol}` into the build "
                 f"sandbox. Easiest path: edit `config/config.json` → "
@@ -8737,13 +8813,15 @@ def build_parser() -> argparse.ArgumentParser:
     patch_parser.add_argument(
         "--install-doc",
         type=_bool_choice,
-        default=False,
+        default=None,
         metavar="true|false",
         dest="install_doc",
         help=(
             "Update INSTALLATION.md at the end of a successful patch. "
-            "Defaults to false (incremental changes rarely affect install "
-            "steps)."
+            "Defaults: agile patches auto-enable so the end-of-session "
+            "traceability audit runs; non-agile patches default to false "
+            "(incremental changes rarely affect install steps). Pass "
+            "true/false explicitly to override either default."
         ),
     )
     _add_hitl_buildpatch(patch_parser)

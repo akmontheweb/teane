@@ -144,3 +144,33 @@ def test_specific_security_label_wins_over_persistent_build_failure():
         max_repair=3,
     )
     assert out == "security_fix_limit:2/2"
+
+
+def test_traceability_block_wins_over_persistent_build_failure():
+    """Phase 7 BUG #6 regression: when installation_doc_node sets
+    traceability_blocked + exit_code=1, the trigger MUST be
+    ``traceability_block``, not ``persistent_build_failure`` — the
+    HITL UX needs to route to coverage-gap advice, not
+    open-failing-files advice."""
+    out = _infer_hitl_trigger(
+        _state(
+            exit_code=1,
+            node_state={"traceability_blocked": True},
+        ),
+        max_repair=3,
+    )
+    assert out == "traceability_block"
+
+
+def test_traceability_block_when_combined_with_other_signals():
+    """If traceability AND other signals coexist, traceability wins —
+    it's the most specific reason the run is at HITL."""
+    out = _infer_hitl_trigger(
+        _state(
+            exit_code=1,
+            node_state={"traceability_blocked": True},
+            loop_counter={"total_repairs": 99},
+        ),
+        max_repair=3,
+    )
+    assert out == "traceability_block"

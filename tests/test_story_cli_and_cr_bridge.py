@@ -133,6 +133,31 @@ def test_cmd_patch_agile_forces_install_doc_true(tmp_path, monkeypatch):
     assert captured["args"].install_doc is False
 
 
+def test_cmd_patch_install_doc_default_is_none_through_argparse(tmp_path):
+    """Regression for the original Phase 6c BUG: when --install-doc was
+    omitted on the actual CLI, argparse defaulted to False (not None),
+    which silently skipped the agile→install_doc=True upgrade in
+    cmd_patch. This test drives the real parser, NOT a hand-rolled
+    Namespace, so the bug would resurface immediately if anyone
+    flipped the default back to False.
+    """
+    from harness.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["patch", "-w", str(tmp_path), "-p", "do x"])
+    # MUST be None — Phase 6c relies on this for the cmd_patch upgrade.
+    assert args.install_doc is None
+
+    # Explicit values still survive.
+    args = parser.parse_args(
+        ["patch", "-w", str(tmp_path), "-p", "do x", "--install-doc", "true"],
+    )
+    assert args.install_doc is True
+    args = parser.parse_args(
+        ["patch", "-w", str(tmp_path), "-p", "do x", "--install-doc", "false"],
+    )
+    assert args.install_doc is False
+
+
 # ---------------------------------------------------------------------------
 # create_initial_state — accepts the new kwargs
 # ---------------------------------------------------------------------------

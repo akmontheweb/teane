@@ -4825,6 +4825,11 @@ def _sync_kill_mcp_subprocesses() -> None:
     """
     import os as _os
     import signal as _signal
+    if not hasattr(_os, "killpg"):
+        # Windows has no process groups; the async drain path uses
+        # taskkill /T /F via _platform.kill_process_tree. There's no
+        # synchronous equivalent here, so just bail.
+        return
     for pool in list(_mcp_pool_registry):
         clients = getattr(pool, "clients", None) or {}
         for client in clients.values():

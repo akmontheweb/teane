@@ -342,14 +342,27 @@ def _render_spec_file(spec: SpecFile) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _chromium_cache_dirs() -> list[str]:
+    # Playwright caches under ~/.cache/ms-playwright on Linux/macOS and
+    # under %LOCALAPPDATA%\ms-playwright on Windows. Probe both so a
+    # prior install on the current host is detected on either platform.
+    dirs = [os.path.expanduser("~/.cache/ms-playwright")]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        dirs.append(os.path.join(local_appdata, "ms-playwright"))
+    return dirs
+
+
 def _chromium_cache_present() -> bool:
-    base = os.path.expanduser("~/.cache/ms-playwright")
-    if not os.path.isdir(base):
-        return False
-    try:
-        return any(name.startswith("chromium-") for name in os.listdir(base))
-    except OSError:
-        return False
+    for base in _chromium_cache_dirs():
+        if not os.path.isdir(base):
+            continue
+        try:
+            if any(name.startswith("chromium-") for name in os.listdir(base)):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def ensure_chromium_installed(
@@ -369,10 +382,13 @@ def ensure_chromium_installed(
     if not force and _chromium_cache_present():
         logger.info("[playwright_gen] chromium already installed; skipping")
         return True
-    cmd = ["npx", "playwright", "install", "chromium"]
-    if shutil.which("npx") is None and runner is None:
+    # Resolve npx so the .cmd/.exe shim is picked up on Windows —
+    # subprocess.run without shell=True won't append the suffix itself.
+    npx = shutil.which("npx")
+    if npx is None and runner is None:
         logger.error("[playwright_gen] npx not found on PATH; install Node.js / Playwright manually")
         return False
+    cmd = [npx or "npx", "playwright", "install", "chromium"]
     runner = runner or _default_runner
     try:
         rc = runner(cmd)

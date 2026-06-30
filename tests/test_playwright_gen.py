@@ -225,6 +225,11 @@ def test_ensure_chromium_skips_when_cache_present(monkeypatch, tmp_path) -> None
 
 def test_ensure_chromium_invokes_runner_when_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))  # no cache dir
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    # Pin shutil.which so the assertion doesn't depend on whether the
+    # host has Node installed. The resolved path is what the fix passes
+    # to subprocess.run so the .cmd/.exe shim is found on Windows.
+    monkeypatch.setattr("harness.playwright_gen.shutil.which", lambda name: "/fake/bin/npx" if name == "npx" else None)
     called: list[list[str]] = []
 
     def fake_runner(cmd):
@@ -232,7 +237,7 @@ def test_ensure_chromium_invokes_runner_when_missing(monkeypatch, tmp_path) -> N
         return 0
 
     assert ensure_chromium_installed(runner=fake_runner) is True
-    assert called == [["npx", "playwright", "install", "chromium"]]
+    assert called == [["/fake/bin/npx", "playwright", "install", "chromium"]]
 
 
 def test_ensure_chromium_reports_runner_failure(monkeypatch, tmp_path) -> None:

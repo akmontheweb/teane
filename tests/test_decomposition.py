@@ -996,3 +996,127 @@ class TestRequirementsIngest:
             conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Agile-vs-waterfall vocabulary branching in the planner prompt.
+#
+# Regression guard for a HITL where the planner prompt hardcoded
+# waterfall identifiers (FR-NNN / NFR-XXX-NNN / US-NN-NN) even on agile
+# workspaces, causing the LLM to invent TEST-NNN keys when the spec
+# actually used EPIC/FEAT/STORY/STORY-NFR. The fix routes the actual
+# ``known_req_keys`` snapshot into the prompt so the LLM sees ground
+# truth instead of a vocabulary hint that may not match.
+# ---------------------------------------------------------------------------
+
+
+def test_format_guidance_agile_workspace_embeds_safe_keys_only():
+    agile_keys = {
+        "EPIC-001", "FEAT-001", "FEAT-002",
+        "STORY-001", "STORY-002", "STORY-NFR-001",
+    }
+    example, constraint = decomposition._format_requirement_keys_guidance(
+        agile_keys
+    )
+    # Example uses a real agile key the LLM can copy.
+    assert "EPIC-001" in example
+    assert "FR-" not in example and "NFR-" not in example and "US-" not in example
+    # Constraint embeds the workspace's actual identifier list.
+    for key in agile_keys:
+        assert f"``{key}``" in constraint
+    # No waterfall vocabulary leaks through.
+    assert "FR-NNN" not in constraint
+    assert "NFR-XXX-NNN" not in constraint
+    assert "US-NN-NN" not in constraint
+
+
+def test_format_guidance_waterfall_workspace_embeds_iso_keys_only():
+    wf_keys = {"FR-001", "FR-002", "NFR-SEC-001", "US-03-02"}
+    example, constraint = decomposition._format_requirement_keys_guidance(
+        wf_keys
+    )
+    assert "FR-001" in example
+    assert "EPIC-" not in example and "FEAT-" not in example
+    for key in wf_keys:
+        assert f"``{key}``" in constraint
+    # No agile vocabulary leaks through.
+    assert "EPIC-NNN" not in constraint
+    assert "FEAT-NNN" not in constraint
+    assert "STORY-NFR-NNN" not in constraint
+
+
+def test_format_guidance_empty_falls_back_to_generic_pointer():
+    """When the requirements ingest produced no headings (empty spec,
+    parser miss), the prompt must still be valid — fall back to a
+    generic pointer at SPEC_REQUIREMENTS.md rather than dictating
+    either vocabulary."""
+    for empty in (None, set()):
+        example, constraint = decomposition._format_requirement_keys_guidance(
+            empty
+        )
+        assert "<one valid req_key>" in example
+        assert "docs/SPEC_REQUIREMENTS.md" in constraint
+        # No hardcoded family hint in either direction.
+        assert "FR-NNN" not in constraint and "EPIC-NNN" not in constraint
+
+
+def test_format_guidance_caps_embedded_list_for_large_workspaces():
+    """Token-budget guard: very large specs cap the embedded list. The
+    validator still knows every key, so this is purely a prompt-size
+    safeguard."""
+    big = {f"FR-{i:03d}" for i in range(200)}
+    _, constraint = decomposition._format_requirement_keys_guidance(big)
+    embedded_count = constraint.count("``FR-")
+    assert embedded_count <= decomposition._REQ_KEY_LIST_CAP
+    assert "the validator knows all of them" in constraint
+
+
+def test_build_decomposition_prompt_no_fr_leak_on_agile_workspace():
+    """End-to-end: the full planner prompt rendered for an agile
+    workspace must not contain the literal waterfall family hint
+    anywhere — neither in the example block nor in the constraints."""
+    agile_keys = {"EPIC-001", "FEAT-001", "STORY-001", "STORY-NFR-001"}
+    prompt = decomposition._build_decomposition_prompt(
+        "## EPIC-001: Auth\n", "", "/tmp/ws", known_req_keys=agile_keys,
+    )
+    assert "FR-007" not in prompt
+    assert "FR-008" not in prompt
+    assert "FR-NNN" not in prompt
+    assert "NFR-XXX-NNN" not in prompt
+    assert "US-NN-NN" not in prompt
+    # And the agile vocabulary IS present.
+    assert "EPIC-001" in prompt
+
+
+def test_build_decomposition_augment_prompt_no_fr_leak_on_agile_workspace():
+    agile_keys = {"EPIC-001", "STORY-001", "STORY-NFR-001"}
+    prompt = decomposition._build_decomposition_augment_prompt(
+        existing_features=[{"feature_key": "auth", "name": "Auth"}],
+        existing_stories=[{
+            "story_key": "STORY-1", "feature_key": "auth",
+            "title": "Login", "status": "done", "acceptance_criteria": [],
+        }],
+        spec_requirements="## EPIC-001: Auth\n",
+        spec_architecture="",
+        workspace_path="/tmp/ws",
+        known_req_keys=agile_keys,
+    )
+    assert "FR-007" not in prompt
+    assert "FR-NNN" not in prompt
+    assert "STORY-001" in prompt
+
+
+def test_validator_error_no_longer_hardcodes_waterfall_hint():
+    """The 'must cite at least one' error used to embed FR-NNN /
+    NFR-XXX-NNN / US-NN-NN — wrong on agile workspaces. The full known
+    set is reported by the separate 'unknown key' branch; this branch
+    just needs to point at the spec."""
+    with pytest.raises(ValueError) as exc_info:
+        decomposition._validate_story_requirement_keys(
+            "STORY-1", raw=[], known_req_keys={"EPIC-001"},
+        )
+    msg = str(exc_info.value)
+    assert "FR-NNN" not in msg
+    assert "NFR-XXX-NNN" not in msg
+    assert "US-NN-NN" not in msg
+    assert "docs/SPEC_REQUIREMENTS.md" in msg
+
+

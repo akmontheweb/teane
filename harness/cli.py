@@ -2691,12 +2691,22 @@ def _build_outside_harness_actions(
             "banner — it lists the untraced requirements and untested "
             "acceptance criteria by ID."
         )
-        actions.append(
-            "Untraced requirement: add a story (via `teane patch --agile "
-            "true`) that cites the FR-NNN / NFR-XXX-NNN / US-NN-NN key "
-            "in its `requirement_keys`, OR revise "
-            "`docs/SPEC_REQUIREMENTS.md` to remove the orphan requirement."
-        )
+        if state.get("decomposition_enabled"):
+            actions.append(
+                "Untraced requirement: add a story (via `teane patch "
+                "--agile true`) that cites the EPIC-NNN / FEAT-NNN / "
+                "STORY-NNN / STORY-NFR-NNN key in its `requirement_keys`, "
+                "OR revise `docs/SPEC_REQUIREMENTS.md` to remove the "
+                "orphan requirement."
+            )
+        else:
+            actions.append(
+                "Untraced requirement: add a story (via `teane patch "
+                "--agile true`) that cites the FR-NNN / NFR-XXX-NNN / "
+                "US-NN-NN key in its `requirement_keys`, OR revise "
+                "`docs/SPEC_REQUIREMENTS.md` to remove the orphan "
+                "requirement."
+            )
         actions.append(
             "Untested acceptance criterion: write a test that carries a "
             "`# @verifies: STORY-N.AC-N` marker for the listed AC key, "

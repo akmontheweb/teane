@@ -108,16 +108,90 @@ def _ingest_requirements(
     return (len(parsed), len(items))
 
 
+_REQ_KEY_LIST_CAP = 80
+"""Max number of valid identifiers embedded in a planner prompt. The full
+universe is always available to the validator (which echoes it back in
+its rejection message), so capping here is purely a token-budget guard
+for very large specs — 80 keys covers every workspace we've seen and
+keeps the prompt deterministic instead of unbounded."""
+
+
+def _format_requirement_keys_guidance(
+    known_req_keys: Optional[set[str]],
+) -> tuple[str, str]:
+    """Render the example-token + constraint-paragraph pair the decomposition
+    prompts splice into their JSON shape and Constraints sections.
+
+    Returns ``(example_json, constraint_block)`` — the first is the inner
+    payload for the ``requirement_keys`` example field (already quoted,
+    comma-separated, no enclosing brackets), the second is the markdown
+    bullet that goes under "## Constraints".
+
+    When ``known_req_keys`` is non-empty, both halves reference the
+    workspace's actual identifier list — agile workspaces get
+    ``EPIC/FEAT/STORY/STORY-NFR`` keys, waterfall workspaces get
+    ``FR/NFR/US`` keys, and the LLM doesn't have to second-guess the
+    family from spec text. When empty (requirements ingest produced no
+    headings), falls back to generic guidance that points the LLM at
+    the spec without dictating either vocabulary.
+    """
+    if not known_req_keys:
+        return (
+            '"<one valid req_key>", "<another>"',
+            (
+                "- Every story MUST cite at least one ``requirement_keys`` "
+                "entry declared as a heading in ``docs/SPEC_REQUIREMENTS.md``. "
+                "Stories citing unknown identifiers are rejected with the "
+                "full list of valid keys, so prefer to map every story back "
+                "to the spec it implements. A story that implements pure "
+                "scaffolding without a spec requirement is itself a sign "
+                "the decomposition is wrong."
+            ),
+        )
+
+    sorted_keys = sorted(known_req_keys)
+    sample = sorted_keys[:2] if len(sorted_keys) >= 2 else sorted_keys
+    example_json = ", ".join(f'"{k}"' for k in sample)
+    embedded = sorted_keys[:_REQ_KEY_LIST_CAP]
+    embedded_str = ", ".join(f"``{k}``" for k in embedded)
+    truncated_note = (
+        f" (showing first {_REQ_KEY_LIST_CAP} of {len(sorted_keys)} — "
+        "the validator knows all of them)"
+        if len(sorted_keys) > _REQ_KEY_LIST_CAP else ""
+    )
+    constraint_block = (
+        "- Every story MUST cite at least one ``requirement_keys`` entry "
+        "drawn from this workspace's actual spec identifiers"
+        f"{truncated_note}: {embedded_str}. Do NOT invent identifiers in "
+        "any other namespace — stories citing unknown keys are rejected. "
+        "A story that implements pure scaffolding without a matching spec "
+        "requirement is itself a sign the decomposition is wrong."
+    )
+    return (example_json, constraint_block)
+
+
 def _build_decomposition_prompt(
     spec_requirements: str,
     spec_architecture: str,
     workspace_path: str,
+    known_req_keys: Optional[set[str]] = None,
 ) -> str:
     """Compose the planner prompt. The LLM returns JSON; the body of
-    this function is the contract every decomposition LLM must follow."""
+    this function is the contract every decomposition LLM must follow.
+
+    ``known_req_keys`` is the set of valid requirement identifiers
+    harvested from ``docs/SPEC_REQUIREMENTS.md`` in this workspace.
+    When non-empty, the prompt embeds the list verbatim and the
+    example block samples from it — so an agile workspace
+    (``EPIC/FEAT/STORY/STORY-NFR``) and a waterfall workspace
+    (``FR/NFR/US``) get the right vocabulary without hardcoding either
+    family. Empty means the requirements ingest didn't produce any
+    headings; we fall back to generic guidance pointing at the spec."""
     spec_block = "## SPEC_REQUIREMENTS.md\n\n" + (spec_requirements or "_(empty)_")
     if spec_architecture:
         spec_block += "\n\n## SPEC_ARCHITECTURE.md\n\n" + spec_architecture
+
+    req_example, req_constraint = _format_requirement_keys_guidance(known_req_keys)
 
     return f"""You are an Agile delivery planner. Decompose the approved
 specification below into a list of **features**, and within each feature
@@ -182,7 +256,7 @@ no commentary:
       "feature": "auth",
       "title": "User can register",
       "description": "1-2 sentence summary of intent.",
-      "requirement_keys": ["FR-007", "FR-008"],
+      "requirement_keys": [{req_example}],
       "acceptance_criteria": [
         "POST /register with valid payload returns 201",
         "Duplicate email returns 409"
@@ -210,13 +284,7 @@ no commentary:
   the ``features`` block.
 - Every feature MUST own at least one story.
 - Every story MUST have at least one acceptance_criteria entry.
-- Every story MUST cite at least one ``requirement_keys`` entry that
-  is a requirement identifier (``FR-NNN``, ``NFR-XXX-NNN``, or
-  ``US-NN-NN``) declared in ``docs/SPEC_REQUIREMENTS.md``. Stories
-  that cite unknown identifiers are rejected with the full list of
-  valid keys, so prefer to map every story back to the spec it
-  implements. A story that implements pure scaffolding without a
-  spec requirement is itself a sign the decomposition is wrong.
+{req_constraint}
 - ``depends_on`` may reference any other story_key declared in this
   same response (forward or backward — the validator topologically
   resolves the graph, only true cycles are rejected). Cross-feature
@@ -234,6 +302,7 @@ def _build_decomposition_augment_prompt(
     spec_requirements: str,
     spec_architecture: str,
     workspace_path: str,
+    known_req_keys: Optional[set[str]] = None,
 ) -> str:
     """Compose the delta-only planner prompt for agile-patch augmentation.
 
@@ -248,7 +317,13 @@ def _build_decomposition_augment_prompt(
     Stories may reference either an existing feature_key (showing the
     LLM the list below) or a brand-new feature defined in this same
     response.
+
+    ``known_req_keys`` is the snapshot of valid identifiers in this
+    workspace's spec — embedded so the LLM cites the right vocabulary
+    family (agile vs waterfall) without a hardcoded hint. See
+    :func:`_build_decomposition_prompt` for the same contract.
     """
+    req_example, req_constraint = _format_requirement_keys_guidance(known_req_keys)
     features_block_lines: list[str] = []
     for f in existing_features:
         features_block_lines.append(
@@ -330,7 +405,7 @@ Output STRICT JSON in this exact shape — no markdown, no code fence:
       "feature": "new-cap",
       "title": "1-line title",
       "description": "1-2 sentence summary of intent.",
-      "requirement_keys": ["FR-007"],
+      "requirement_keys": [{req_example}],
       "acceptance_criteria": ["..."],
       "depends_on": [],
       "scope_files": ["src/..."]
@@ -343,10 +418,7 @@ Constraints:
 - AT MOST {MAX_STORIES_PER_PASS} new stories per pass.
 - AT MOST {MAX_FEATURES_PER_PASS} new features per pass.
 - Every new story MUST have at least one acceptance criterion.
-- Every new story MUST cite at least one ``requirement_keys`` entry
-  declared in ``docs/SPEC_REQUIREMENTS.md`` (``FR-NNN`` /
-  ``NFR-XXX-NNN`` / ``US-NN-NN``). Unknown keys are rejected with
-  the full list of valid choices.
+{req_constraint}
 - Every new story's ``feature`` field MUST reference either an
   existing feature_key (from the list above) or a NEW feature_key
   declared in the ``features`` block of THIS response.
@@ -429,8 +501,7 @@ def _validate_story_requirement_keys(
     if not isinstance(raw, list) or not raw:
         raise ValueError(
             f"{story_key} must cite at least one 'requirement_keys' entry "
-            "(an FR-NNN / NFR-XXX-NNN / US-NN-NN identifier from "
-            "docs/SPEC_REQUIREMENTS.md)"
+            "declared as a heading in docs/SPEC_REQUIREMENTS.md"
         )
     keys = [str(x).strip() for x in raw if str(x).strip()]
     if not keys:
@@ -906,9 +977,13 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         prompt = _build_decomposition_augment_prompt(
             augment_existing_features, augment_existing,
             spec_req, spec_arch, workspace,
+            known_req_keys=known_req_keys,
         )
     else:
-        prompt = _build_decomposition_prompt(spec_req, spec_arch, workspace)
+        prompt = _build_decomposition_prompt(
+            spec_req, spec_arch, workspace,
+            known_req_keys=known_req_keys,
+        )
     system_msg = state.get("messages", [{}])[0] if state.get("messages") else {}
     call_messages = [system_msg, {"role": "user", "content": prompt}]
 

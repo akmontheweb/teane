@@ -200,6 +200,34 @@ class TestPhase7TraceabilityAndNonToolchainSymbols:
         # Must NOT advise "open failing files in IDE".
         assert "open failing files" not in text.lower()
 
+    def test_traceability_block_waterfall_workspace_uses_iso_vocabulary(self):
+        """No decomposition_enabled flag → waterfall path. Remediation
+        hint should cite the FR / NFR / US family, not the agile one."""
+        state = _base_state()
+        actions = _build_outside_harness_actions(state, "traceability_block")
+        text = "\n".join(actions)
+        assert "FR-NNN" in text
+        assert "EPIC-NNN" not in text and "FEAT-NNN" not in text
+
+    def test_traceability_block_agile_workspace_uses_safe_vocabulary(self):
+        """decomposition_enabled=True → agile path. Remediation hint
+        must surface EPIC/FEAT/STORY vocabulary, not waterfall FRs.
+        This is the regression guard for the HITL where the operator
+        was told to cite FR-NNN keys in an agile workspace whose spec
+        only contained EPIC/FEAT/STORY identifiers."""
+        state = _base_state(decomposition_enabled=True)
+        actions = _build_outside_harness_actions(state, "traceability_block")
+        text = "\n".join(actions)
+        assert "EPIC-NNN" in text
+        assert "FEAT-NNN" in text
+        assert "STORY-NNN" in text
+        # The waterfall remediation prose is "FR-NNN / NFR-XXX-NNN /
+        # US-NN-NN" — checking for the full pattern avoids a false
+        # positive on "STORY-NFR-NNN" which legitimately contains the
+        # "FR-NNN" substring.
+        assert "FR-NNN / NFR-XXX-NNN" not in text
+        assert "US-NN-NN" not in text
+
     def test_env_misconfig_max_iterations_does_not_suggest_pip_install(self):
         state = _base_state(node_state={"env_misconfig_symbol": "test_generation_max_iterations"})
         actions = _build_outside_harness_actions(

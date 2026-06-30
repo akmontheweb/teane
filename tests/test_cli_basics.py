@@ -543,7 +543,12 @@ class TestDetectSubdirBuildCommand:
         # plain `pip install` is no longer emitted by the detector.
         assert "uv pip install" in detected
         assert "-r requirements.txt" in detected
-        assert "pytest -q" in detected
+        # Canonical pytest invocation (see harness.cli._PYTEST_RUN) is the
+        # verbose form so the repair LLM and reflection judge see
+        # traceback values, not bare ``AssertionError``. Match on the
+        # part operators are most likely to inspect.
+        assert "python3 -m pytest" in detected
+        assert "--showlocals" in detected
 
     def test_subdir_pyproject_preferred_over_requirements(self, tmp_path):
         from harness.cli import _detect_default_build_command

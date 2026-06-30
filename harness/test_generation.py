@@ -56,8 +56,16 @@ logger = logging.getLogger(__name__)
 # Makefile / build_command upstream of this node — we never bake those.
 # Java uses Maven's local repository cache via the /cache volume; ``mvn test``
 # is the canonical invocation.
+def _python_test_command() -> str:
+    """Pull the canonical pytest invocation from cli so the test-generation
+    runner stays in sync with the main build-command builder. Same import
+    pattern as compiler_node's mid-session command-upgrade matcher."""
+    from harness.cli import _PYTEST_RUN
+    return _PYTEST_RUN
+
+
 _STACK_TEST_COMMANDS: dict[str, str] = {
-    "python": "python3 -m pytest -q",
+    "python": _python_test_command(),
     "node": "npx --no-install jest --silent",
     "javascript": "npx --no-install jest --silent",
     "typescript": "npx --no-install jest --silent",

@@ -4779,7 +4779,8 @@ class TestMakefileBuildTargetDetection:
         # manifest-based command directly. uv pip install replaces plain
         # pip — same semantics, much faster, persistent cache volume.
         from harness.graph import _uv_venv_prefix
-        assert cmd == f"{_uv_venv_prefix()} && uv pip install -e . && python3 -m pytest -q"
+        from harness.cli import _PYTEST_RUN
+        assert cmd == f"{_uv_venv_prefix()} && uv pip install -e . && {_PYTEST_RUN}"
 
     def test_makefile_with_build_target_still_returns_make_build(self, tmp_path):
         from harness.cli import _detect_default_build_command
@@ -6766,12 +6767,12 @@ class TestCLI:
         # and wedges the repair loop (the LLM keeps editing manifests
         # the build_command never consults). Installer is `uv pip install`
         # now (see harness/skills/makefile_python.md).
-        from harness.cli import _detect_default_build_command
+        from harness.cli import _detect_default_build_command, _PYTEST_RUN
         from harness.graph import _uv_venv_prefix
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "main.py").write_text("print('hi')\n")
             assert _detect_default_build_command(tmpdir) == (
-                f"{_uv_venv_prefix()} && uv pip install pytest && python3 -m pytest -q"
+                f"{_uv_venv_prefix()} && uv pip install pytest && {_PYTEST_RUN}"
             )
 
     def test_detect_build_command_no_hints_returns_none(self):

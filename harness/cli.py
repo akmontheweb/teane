@@ -1541,6 +1541,21 @@ def _makefile_has_target(workspace_path: str, target: str) -> bool:
     return False
 
 
+# Canonical pytest invocation used by every build-command builder. Chosen
+# so test failures carry enough context for the repair LLM (and the
+# reflection judge) to ground without an exploration round. ``--tb=long``
+# emits the full traceback instead of pytest's default ``auto`` (which
+# collapses non-leaf frames); ``--showlocals`` prints the values of local
+# variables at each frame — essential for compound assertions like
+# ``assert any(c["ticker"] == "GOOGL" for c in results)`` where the
+# assert-rewriter can't decompose the generator. ``-vv`` shows one test
+# name per line so the per-failure parser can attribute frames correctly.
+# The previous ``-q`` was capturing dots-only output that left the judge
+# repeatedly emitting "insufficient data — investigate <file>" because
+# the captured ``AssertionError`` had no traceback values.
+_PYTEST_RUN = "python3 -m pytest -vv --tb=long --showlocals"
+
+
 _SUBDIR_BUILD_SKIP = frozenset({
     "node_modules", "__pycache__", ".git", "build", "dist", "venv", ".venv",
     "env", "target", "out", "docs", "product_spec", "change_requests",
@@ -1643,14 +1658,14 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
                 if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
                 else ""
             )
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e .{dev_step} && python3 -m pytest -q"
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
         if os.path.isfile(os.path.join(full, "requirements.txt")):
             dev_step = (
                 " && uv pip install -r requirements-dev.txt"
                 if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
                 else ""
             )
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt{dev_step} && python3 -m pytest -q"
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt{dev_step} && {_PYTEST_RUN}"
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
         if os.path.isfile(os.path.join(full, "gradlew")):
@@ -1722,10 +1737,10 @@ def _detect_default_build_command(
     # volume across runs. uv is pre-baked into the sandbox builder image.
     if has("pyproject.toml"):
         dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
-        return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && python3 -m pytest -q"
+        return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
     if has("requirements.txt"):
         dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
-        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && python3 -m pytest -q"
+        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && {_PYTEST_RUN}"
     # Java — Maven first, then Gradle (wrapper if present).
     if has("pom.xml"):
         return "mvn -B test"
@@ -1758,7 +1773,7 @@ def _detect_default_build_command(
     # unnecessary. The legacy substring is kept in the fallback below
     # only for the (rare) case where the harness runs outside the
     # builder image and the operator hasn't pre-installed pytest.
-    fallback = f"{_uv_venv_prefix()} && uv pip install pytest && python3 -m pytest -q"
+    fallback = f"{_uv_venv_prefix()} && uv pip install pytest && {_PYTEST_RUN}"
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):
@@ -1816,7 +1831,7 @@ def resolve_build_command(
     seed = (
         "mvn -B test"
         if backend == "Java"
-        else "python3 -m pip install pytest && python3 -m pytest -q"
+        else f"python3 -m pip install pytest && {_PYTEST_RUN}"
     )
     logger.info(
         "[cli] Workspace has no build markers yet; seeding build command "

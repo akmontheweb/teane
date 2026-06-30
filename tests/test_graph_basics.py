@@ -782,7 +782,9 @@ class TestRepairReflection:
 
     def test_grounding_rejects_insufficient_data_escape(self):
         """Fix C — the explicit 'insufficient data' escape hatch (from
-        fix A) is deliberately ungrounded and must NOT be injected."""
+        fix A) is ungrounded ONLY when the recommendation is also
+        empty/vague. With a non-empty recommendation that DOES ground,
+        the partial verdict is still actionable; see the next test."""
         from harness.graph import _reflection_grounds_in_diagnostics
         v = {
             "real_blocker": (
@@ -797,6 +799,29 @@ class TestRepairReflection:
         }]
         assert _reflection_grounds_in_diagnostics(v, errs) is False
 
+    def test_grounding_accepts_recommendation_when_blocker_is_escape(self):
+        """Observed in session cf3fcd27: the judge hedged on the blocker
+        line ('insufficient data — investigate test_api.py') but produced
+        a concrete recommendation naming services/edgar.py — which IS in
+        the failing set. The injection must still fire and use the
+        recommendation as the lead, otherwise the SRS keeps winning the
+        repair LLM's attention."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {
+            "real_blocker": (
+                "insufficient data — investigate test_api.py's data flow"
+            ),
+            "recommendation": (
+                "Mock the service function that triggers the RuntimeError "
+                "at services/edgar.py:48 in tests."
+            ),
+        }
+        errs = [{
+            "file": "server/services/edgar.py", "line": 48,
+            "error_code": "RuntimeError", "message": "real http call",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is True
+
     def test_grounding_falls_open_when_no_file_info(self):
         """Fix C — when compiler_errors carry no file info at all (e.g.
         synthetic markers like '<harness:...>'), the helper falls open
@@ -809,6 +834,469 @@ class TestRepairReflection:
             "error_code": "BUILD_COMMAND_BLOCKED", "message": "blocked",
         }]
         assert _reflection_grounds_in_diagnostics(v, errs) is True
+
+    def test_verdict_named_files_returns_intersection(self):
+        """The judge-ignored gate (Fix #3) needs the paths — not a bool —
+        of files that BOTH appear in the verdict text AND are in the
+        current failing set, so it can later check whether the repair
+        round touched them. Full path AND basename mentions both count."""
+        from harness.graph import _verdict_named_files
+        v = {
+            "real_blocker": (
+                "RuntimeError at services/edgar.py:39 — real EDGAR HTTP"
+            ),
+            "recommendation": "mock fetch_company_index from edgar.py",
+        }
+        errs = [
+            {"file": "server/services/edgar.py", "line": 39,
+             "error_code": "RuntimeError", "message": "boom"},
+            {"file": "server/tests/conftest.py", "line": 1,
+             "error_code": "X", "message": "y"},
+        ]
+        named = _verdict_named_files(v, errs)
+        # basename "edgar.py" matches server/services/edgar.py
+        assert named == ["server/services/edgar.py"]
+
+    def test_verdict_named_files_skips_insufficient_data(self):
+        from harness.graph import _verdict_named_files
+        v = {
+            "real_blocker": "insufficient data — investigate filings.py",
+            "recommendation": "",
+        }
+        errs = [{"file": "server/services/filings.py", "line": 1,
+                 "error_code": "X", "message": "y"}]
+        assert _verdict_named_files(v, errs) == []
+
+    def test_verdict_named_files_uses_recommendation_when_blocker_is_escape(self):
+        """Recommendation fallback: when blocker is 'insufficient data'
+        but recommendation names a file in the failing set, return it."""
+        from harness.graph import _verdict_named_files
+        v = {
+            "real_blocker": "insufficient data — investigate test_api.py",
+            "recommendation": (
+                "Mock fetch_company_index at services/edgar.py:48."
+            ),
+        }
+        errs = [{"file": "server/services/edgar.py", "line": 48,
+                 "error_code": "RuntimeError", "message": "boom"}]
+        assert _verdict_named_files(v, errs) == ["server/services/edgar.py"]
+
+    def test_verdict_named_files_no_intersection_returns_empty(self):
+        from harness.graph import _verdict_named_files
+        v = {"real_blocker": "bug in foo.py somewhere", "recommendation": ""}
+        errs = [{"file": "server/services/edgar.py", "line": 39,
+                 "error_code": "X", "message": "y"}]
+        assert _verdict_named_files(v, errs) == []
+
+    def test_patches_touched_judge_files_suffix_match(self):
+        """A judge that named ``services/edgar.py`` and a patch that
+        touched ``server/services/edgar.py`` (different prefix) must
+        count as compliance — the harness and the repair LLM frequently
+        disagree on workspace-relative roots."""
+        from harness.graph import _patches_touched_judge_files
+
+        class _R:
+            def __init__(self, file, success=True, no_op=False):
+                self.file = file
+                self.success = success
+                self.no_op = no_op
+
+        assert _patches_touched_judge_files(
+            [_R("server/services/edgar.py")],
+            ["services/edgar.py"],
+        ) is True
+
+    def test_patches_touched_judge_files_basename_match(self):
+        from harness.graph import _patches_touched_judge_files
+
+        class _R:
+            def __init__(self, file, success=True, no_op=False):
+                self.file = file
+                self.success = success
+                self.no_op = no_op
+
+        assert _patches_touched_judge_files(
+            [_R("apps/backend/services/edgar.py")],
+            ["server/services/edgar.py"],
+        ) is True
+
+    def test_patches_touched_judge_files_ignores_no_ops(self):
+        """Idempotency no-ops do NOT count as touching the file. Without
+        this, a DELETE_BLOCK on an already-empty file masks a real
+        distraction."""
+        from harness.graph import _patches_touched_judge_files
+
+        class _R:
+            def __init__(self, file, success=True, no_op=False):
+                self.file = file
+                self.success = success
+                self.no_op = no_op
+
+        assert _patches_touched_judge_files(
+            [_R("server/services/edgar.py", no_op=True)],
+            ["services/edgar.py"],
+        ) is False
+
+    def test_patches_touched_judge_files_unrelated_patches(self):
+        from harness.graph import _patches_touched_judge_files
+
+        class _R:
+            def __init__(self, file, success=True, no_op=False):
+                self.file = file
+                self.success = success
+                self.no_op = no_op
+
+        assert _patches_touched_judge_files(
+            [_R("server/tests/test_api.py"), _R("client/src/App.tsx")],
+            ["server/services/edgar.py"],
+        ) is False
+
+    def test_patches_touched_judge_files_empty_named_is_no_op(self):
+        """When the judge named no files the gate has nothing to enforce
+        — caller should treat that as 'fall open'."""
+        from harness.graph import _patches_touched_judge_files
+
+        class _R:
+            def __init__(self, file, success=True, no_op=False):
+                self.file = file
+                self.success = success
+                self.no_op = no_op
+
+        assert _patches_touched_judge_files(
+            [_R("anything.py")], [],
+        ) is True
+
+    def test_shared_root_cause_fanout_above_threshold(self):
+        """Fix #3 — the same error_code across 3+ files is a shared root
+        cause; the banner should call this out so the LLM patches all of
+        them in one response instead of one per round."""
+        from harness.graph import _shared_root_cause_fanout
+        errs = [
+            {"error_code": "RuntimeError", "file": "tests/test_a.py",
+             "message": "edgar guard"},
+            {"error_code": "RuntimeError", "file": "tests/test_b.py",
+             "message": "edgar guard"},
+            {"error_code": "RuntimeError", "file": "tests/test_c.py",
+             "message": "edgar guard"},
+            {"error_code": "AssertionError", "file": "tests/test_z.py",
+             "message": "unrelated"},
+        ]
+        result = _shared_root_cause_fanout(errs)
+        assert len(result) == 1
+        code, files = result[0]
+        assert code == "RuntimeError"
+        assert files == [
+            "tests/test_a.py", "tests/test_b.py", "tests/test_c.py",
+        ]
+
+    def test_shared_root_cause_fanout_below_threshold_silent(self):
+        """Two files sharing a code does not justify a fan-out directive."""
+        from harness.graph import _shared_root_cause_fanout
+        errs = [
+            {"error_code": "RuntimeError", "file": "tests/test_a.py",
+             "message": "boom"},
+            {"error_code": "RuntimeError", "file": "tests/test_b.py",
+             "message": "boom"},
+        ]
+        assert _shared_root_cause_fanout(errs) == []
+
+    def test_shared_root_cause_fanout_ignores_synthetic_markers(self):
+        """Synthetic file markers like '<harness:security-validator>' must
+        not contribute to fan-out — they're not real files the LLM can
+        patch."""
+        from harness.graph import _shared_root_cause_fanout
+        errs = [
+            {"error_code": "X", "file": "<harness:scan>", "message": "y"},
+            {"error_code": "X", "file": "<harness:scan>", "message": "y"},
+            {"error_code": "X", "file": "<harness:scan>", "message": "y"},
+            {"error_code": "X", "file": "real.py", "message": "z"},
+        ]
+        assert _shared_root_cause_fanout(errs) == []
+
+    def test_shared_root_cause_fanout_dedupes_per_file(self):
+        """If the SAME file has multiple errors with the same code, that
+        still counts as ONE file for the fan-out threshold."""
+        from harness.graph import _shared_root_cause_fanout
+        errs = [
+            {"error_code": "RuntimeError", "file": "tests/test_a.py",
+             "message": "1"},
+            {"error_code": "RuntimeError", "file": "tests/test_a.py",
+             "message": "2"},
+            {"error_code": "RuntimeError", "file": "tests/test_a.py",
+             "message": "3"},
+        ]
+        assert _shared_root_cause_fanout(errs) == []
+
+
+class TestRawCountProgress:
+    """Phase 1.1 follow-up — when many failing tests share one
+    fingerprint (e.g. 10 tests all hitting one EDGAR-mock guard), fixing
+    them one-at-a-time leaves the fingerprint *set* unchanged while the
+    raw *count* shrinks. Crediting raw-count shrinkage as progress
+    prevents the no_progress gate from firing on real wins."""
+
+    def test_count_shrinkage_credits_progress_even_when_fps_set_unchanged(self):
+        """Both fingerprint sets are the same singleton — but the raw
+        count dropped 10 → 9. That's real progress."""
+        prior_fps = {"RuntimeError::real edgar http call"}
+        current_fps = {"RuntimeError::real edgar http call"}
+        prior_count, current_count = 10, 9
+        fps_shrank = bool(prior_fps - current_fps)
+        count_shrank = (
+            prior_count > 0
+            and current_count > 0
+            and current_count < prior_count
+        )
+        assert fps_shrank is False
+        assert count_shrank is True
+        assert (fps_shrank or count_shrank) is True
+
+    def test_count_static_is_not_progress(self):
+        """No fingerprint shrinkage AND no count shrinkage → no progress."""
+        prior_fps = {"RuntimeError::x"}
+        current_fps = {"RuntimeError::x"}
+        prior_count, current_count = 4, 4
+        fps_shrank = bool(prior_fps - current_fps)
+        count_shrank = (
+            prior_count > 0
+            and current_count > 0
+            and current_count < prior_count
+        )
+        assert (fps_shrank or count_shrank) is False
+
+    def test_count_growth_is_not_progress(self):
+        """A round that LEAVES MORE diagnostics than it started with is a
+        regression — must not credit progress."""
+        prior_count, current_count = 4, 7
+        count_shrank = (
+            prior_count > 0
+            and current_count > 0
+            and current_count < prior_count
+        )
+        assert count_shrank is False
+
+    def test_count_to_zero_not_credited_here(self):
+        """current_count == 0 means the build is now green — that's the
+        loop's terminator, not progress credit. Guard ensures we don't
+        flap the no_progress counter on a successful end-of-loop transition."""
+        prior_count, current_count = 4, 0
+        count_shrank = (
+            prior_count > 0
+            and current_count > 0
+            and current_count < prior_count
+        )
+        assert count_shrank is False
+
+
+class TestConftestChainCollection:
+    """Fix #3 — pytest loads every ``conftest.py`` on the path from the
+    rootdir down to a failing test. When the workspace has overlapping
+    test trees (``tests/conftest.py`` AND ``server/tests/conftest.py``),
+    the repair LLM otherwise has no way to know which one is in scope.
+    The chain helper surfaces the exact load order."""
+
+    def test_single_conftest_at_test_directory(self, tmp_path):
+        from harness.graph import _conftest_chain_for_test
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "conftest.py").write_text("# fixtures")
+        chain = _conftest_chain_for_test(
+            str(tmp_path), "tests/test_x.py",
+        )
+        assert chain == ["tests/conftest.py"]
+
+    def test_workspace_root_conftest_picked_up(self, tmp_path):
+        from harness.graph import _conftest_chain_for_test
+        (tmp_path / "conftest.py").write_text("# rootmost")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "conftest.py").write_text("# nested")
+        chain = _conftest_chain_for_test(
+            str(tmp_path), "tests/test_x.py",
+        )
+        # Pytest precedence: root first, leaf last.
+        assert chain == ["conftest.py", "tests/conftest.py"]
+
+    def test_nested_chain_includes_every_ancestor_conftest(self, tmp_path):
+        from harness.graph import _conftest_chain_for_test
+        for sub in ("", "server", "server/tests"):
+            d = tmp_path / sub if sub else tmp_path
+            d.mkdir(exist_ok=True)
+            (d / "conftest.py").write_text(f"# at {sub or '<root>'}")
+        chain = _conftest_chain_for_test(
+            str(tmp_path), "server/tests/test_y.py",
+        )
+        assert chain == [
+            "conftest.py", "server/conftest.py", "server/tests/conftest.py",
+        ]
+
+    def test_missing_intermediate_conftest_skipped(self, tmp_path):
+        """No ``conftest.py`` directly under ``server/`` — pytest just
+        skips that level; the chain reflects what actually loads."""
+        from harness.graph import _conftest_chain_for_test
+        (tmp_path / "conftest.py").write_text("# root")
+        (tmp_path / "server" / "tests").mkdir(parents=True)
+        (tmp_path / "server" / "tests" / "conftest.py").write_text("# leaf")
+        chain = _conftest_chain_for_test(
+            str(tmp_path), "server/tests/test_y.py",
+        )
+        # No conftest.py exists under server/ — only the two that do.
+        assert chain == ["conftest.py", "server/tests/conftest.py"]
+
+    def test_no_conftests_returns_empty(self, tmp_path):
+        from harness.graph import _conftest_chain_for_test
+        assert _conftest_chain_for_test(
+            str(tmp_path), "tests/test_x.py",
+        ) == []
+
+    def test_collect_distinct_chains_per_failing_test(self, tmp_path):
+        """Two test trees with independent conftests should both appear.
+        This is exactly the cf3fcd27 scenario — ``tests/conftest.py``
+        AND ``server/tests/conftest.py`` were both alive and the LLM
+        had no signal about which to patch."""
+        from harness.graph import _collect_conftests_for_failing_tests
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "conftest.py").write_text("# tree A")
+        (tmp_path / "server" / "tests").mkdir(parents=True)
+        (tmp_path / "server" / "tests" / "conftest.py").write_text("# tree B")
+        errors = [
+            {"file": "tests/test_a.py", "error_code": "AssertionError",
+             "message": "boom"},
+            {"file": "server/tests/test_b.py", "error_code": "AssertionError",
+             "message": "boom"},
+        ]
+        chains = _collect_conftests_for_failing_tests(
+            str(tmp_path), errors,
+        )
+        # Two distinct chains, one per tree.
+        assert len(chains) == 2
+        rep_paths = {test for test, _ in chains}
+        assert rep_paths == {"tests/test_a.py", "server/tests/test_b.py"}
+
+    def test_collect_dedupes_within_chain(self, tmp_path):
+        """Two failing tests sharing the same chain → one entry only."""
+        from harness.graph import _collect_conftests_for_failing_tests
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "conftest.py").write_text("# shared")
+        errors = [
+            {"file": "tests/test_a.py", "error_code": "X", "message": "y"},
+            {"file": "tests/test_b.py", "error_code": "X", "message": "y"},
+        ]
+        chains = _collect_conftests_for_failing_tests(
+            str(tmp_path), errors,
+        )
+        assert len(chains) == 1
+
+    def test_collect_skips_synthetic_markers(self, tmp_path):
+        from harness.graph import _collect_conftests_for_failing_tests
+        errors = [
+            {"file": "<harness:security>", "error_code": "X", "message": "y"},
+        ]
+        assert _collect_conftests_for_failing_tests(
+            str(tmp_path), errors,
+        ) == []
+
+
+class TestFirstPartyImportPrefetch:
+    """Fix #2 — prefetch the first-party modules a failing test imports
+    so the repair LLM has them in-prompt instead of burning a round on
+    a READ_FILE for each one. Matches how Claude Code reads
+    transitively before patching."""
+
+    def test_extracts_from_import(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "server" / "services").mkdir(parents=True)
+        (tmp_path / "server" / "services" / "search.py").write_text("# src")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_search.py").write_text(
+            "from server.services.search import search_companies\n"
+        )
+        imports = _first_party_imports_for(
+            str(tmp_path), "tests/test_search.py",
+        )
+        assert "server/services/search.py" in imports
+
+    def test_extracts_plain_import(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "__init__.py").write_text("")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text("import server\n")
+        imports = _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        )
+        assert "server/__init__.py" in imports
+
+    def test_skips_stdlib_imports(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "import os\nfrom json import loads\nfrom datetime import date\n"
+        )
+        assert _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        ) == []
+
+    def test_skips_third_party_imports(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "import pytest\n"
+            "from unittest.mock import AsyncMock\n"
+            "from fastapi.testclient import TestClient\n"
+        )
+        assert _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        ) == []
+
+    def test_skips_nonexistent_first_party(self, tmp_path):
+        """An import that LOOKS first-party but resolves to no file in
+        the workspace is dropped — we never speculate about paths the
+        LLM can't actually read."""
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "from app.services.search import x\n"
+        )
+        # No app/ directory exists.
+        assert _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        ) == []
+
+    def test_prefers_module_file_over_package_init(self, tmp_path):
+        """When both ``server/services/search.py`` AND
+        ``server/services/search/__init__.py`` could match, prefer the
+        .py file — that's where the actual code lives in the common
+        case."""
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "server" / "services").mkdir(parents=True)
+        (tmp_path / "server" / "services" / "search.py").write_text("# code")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "from server.services.search import x\n"
+        )
+        imports = _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        )
+        assert imports == ["server/services/search.py"]
+
+    def test_deduplicates(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        (tmp_path / "server" / "services").mkdir(parents=True)
+        (tmp_path / "server" / "services" / "search.py").write_text("# code")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text(
+            "from server.services.search import a\n"
+            "from server.services.search import b\n"
+        )
+        imports = _first_party_imports_for(
+            str(tmp_path), "tests/test_x.py",
+        )
+        assert imports == ["server/services/search.py"]
+
+    def test_missing_test_file_returns_empty(self, tmp_path):
+        from harness.graph import _first_party_imports_for
+        assert _first_party_imports_for(
+            str(tmp_path), "tests/does_not_exist.py",
+        ) == []
 
 
 class TestDecisionPointLogging:

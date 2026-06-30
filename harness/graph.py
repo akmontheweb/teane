@@ -126,6 +126,16 @@ class AgentState(TypedDict, total=False):
     # resolve on its own" (e.g. a TS2769 overload mismatch deferred for
     # 3 rounds, then HITL).
     prior_diag_fingerprints: list[str]
+    # Raw count of error-severity diagnostics from the CURRENT and PREVIOUS
+    # compiler runs. Rotated alongside the fingerprint sets and used by
+    # repair_node's no_progress gate as a second signal: when many tests
+    # share the same root cause they collapse to ONE fingerprint, so the
+    # fingerprint set can stay the same size while the raw count drops
+    # (10 → 9 → 8 …). Crediting raw-count shrinkage as progress prevents
+    # the no_progress counter from firing on real wins that the
+    # fingerprint set can't see.
+    last_diag_count: int
+    prior_diag_count: int
     # Error codes the LLM explicitly requested to promote into top-N on
     # the NEXT repair iteration (Phase 1.2 escape hatch). Populated by
     # repair_node when it parses ``<<<PROMOTE_DEFERRED>>>`` blocks from
@@ -5904,6 +5914,276 @@ def _collect_workspace_file_content(
     return out
 
 
+_PY_IMPORT_FROM_RE = re.compile(
+    r"^\s*from\s+([a-zA-Z_][\w.]*)\s+import\b",
+    re.MULTILINE,
+)
+_PY_IMPORT_RE = re.compile(
+    r"^\s*import\s+([a-zA-Z_][\w.]*(?:\s*,\s*[a-zA-Z_][\w.]*)*)",
+    re.MULTILINE,
+)
+
+
+def _first_party_imports_for(
+    workspace_path: str, test_rel_path: str, *, max_depth: int = 2,
+) -> list[str]:
+    """Parse the test file's ``import`` / ``from X import Y`` statements
+    and return the WORKSPACE-RELATIVE paths of first-party modules the
+    test depends on.
+
+    "First-party" = the import target resolves to a file under
+    ``workspace_path``. Third-party packages (``pytest``,
+    ``unittest.mock``, ``httpx``, …) are skipped because they live in
+    site-packages, not the workspace.
+
+    ``max_depth`` controls how deep into ``server.services.search`` we
+    walk while looking for a matching source file:
+      - depth=1 → ``server/services/search.py`` only
+      - depth=2 → also try ``server/services/search/__init__.py`` etc.
+
+    Used by the prefetch pass (Fix #2): the repair LLM otherwise burns
+    rounds emitting READ_FILE for the modules it knows it needs to see.
+    Pre-attaching them removes that round-trip entirely — same shape
+    Claude Code achieves implicitly via Read tool calls.
+
+    Returns workspace-relative paths in declaration order, deduped.
+    Empty list when the test file can't be read or contains no
+    first-party imports.
+    """
+    if not workspace_path or not test_rel_path:
+        return []
+    abs_test = os.path.join(workspace_path, test_rel_path)
+    try:
+        with open(abs_test, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return []
+    modules: list[str] = []
+    for m in _PY_IMPORT_FROM_RE.finditer(src):
+        modules.append(m.group(1))
+    for m in _PY_IMPORT_RE.finditer(src):
+        for name in m.group(1).split(","):
+            name = name.strip().split(" as ")[0].strip()
+            if name:
+                modules.append(name)
+    out: list[str] = []
+    seen: set[str] = set()
+    for mod in modules:
+        if mod.split(".")[0] in _STDLIB_TOPLEVEL:
+            continue  # cheap stdlib filter — see frozenset below
+        rel_candidates: list[str] = []
+        parts = mod.split(".")
+        # Walk shortest-first so ``server.services.search`` resolves to
+        # ``server/services/search.py`` before ``server/services/__init__.py``
+        # (the more-specific target is what the test actually depends on).
+        for depth in range(len(parts), 0, -1):
+            base = "/".join(parts[:depth])
+            rel_candidates.append(base + ".py")
+            rel_candidates.append(base + "/__init__.py")
+        if max_depth < len(parts):
+            rel_candidates = rel_candidates[: 2 * max_depth]
+        for rel in rel_candidates:
+            if rel in seen:
+                continue
+            abs_path = os.path.join(workspace_path, rel)
+            if os.path.isfile(abs_path):
+                seen.add(rel)
+                out.append(rel)
+                break  # one hit per imported module — the most specific
+    return out
+
+
+# Conservative stdlib + common-third-party top-level packages. The list is
+# deliberately not exhaustive — anything we DON'T list and that resolves
+# to a real file under workspace_path is treated as first-party. False
+# negatives just mean the LLM has to READ_FILE the module itself; false
+# positives (a project module named "json" or "os") are vastly less
+# common and the prefetch only adds context, never overrides anything.
+_STDLIB_TOPLEVEL: frozenset[str] = frozenset({
+    "abc", "argparse", "ast", "asyncio", "base64", "bisect", "builtins",
+    "calendar", "collections", "concurrent", "contextlib", "copy", "csv",
+    "ctypes", "datetime", "decimal", "difflib", "dis", "email", "enum",
+    "errno", "fnmatch", "fractions", "functools", "gc", "glob", "gzip",
+    "hashlib", "heapq", "hmac", "html", "http", "importlib", "inspect",
+    "io", "ipaddress", "itertools", "json", "linecache", "locale", "logging",
+    "math", "mimetypes", "multiprocessing", "numbers", "operator", "os",
+    "pathlib", "pickle", "pkgutil", "platform", "plistlib", "posix",
+    "pprint", "queue", "random", "re", "secrets", "select", "shelve",
+    "shutil", "signal", "smtplib", "socket", "sqlite3", "ssl", "stat",
+    "string", "struct", "subprocess", "sys", "sysconfig", "tempfile",
+    "textwrap", "threading", "time", "timeit", "token", "tokenize",
+    "traceback", "types", "typing", "unicodedata", "unittest", "urllib",
+    "uuid", "warnings", "weakref", "xml", "zipfile", "zoneinfo",
+    # Common third-party we never want to prefetch as "first-party":
+    "pytest", "pytest_asyncio", "httpx", "requests", "fastapi", "starlette",
+    "pydantic", "sqlalchemy", "redis", "fakeredis", "aiohttp", "anyio",
+    "trio", "uvicorn", "click", "typer", "rich", "yaml", "toml",
+    "numpy", "pandas", "torch", "tensorflow", "sklearn", "scipy",
+    "matplotlib", "plotly", "boto3", "botocore", "google", "openai",
+    "anthropic", "langchain", "langgraph", "langsmith", "tiktoken",
+    "psycopg2", "asyncpg", "alembic", "marshmallow", "attrs",
+    "celery", "kombu", "amqp", "billiard",
+})
+
+
+def _conftest_chain_for_test(
+    workspace_path: str, test_rel_path: str,
+) -> list[str]:
+    """Return the chain of ``conftest.py`` paths that pytest would apply
+    to the test at ``test_rel_path``, in pytest's precedence order
+    (workspace-root first, leaf last). Honours the rule that pytest only
+    picks up a ``conftest.py`` from a directory on the path from the
+    rootdir down to the test file.
+
+    Output paths are workspace-relative. Skips any directory above
+    ``workspace_path`` (we don't claim to know where pytest's rootdir is
+    set when it's above the workspace).
+
+    Used by :func:`_collect_conftests_for_failing_tests` to surface the
+    correct conftest tree to the repair LLM — workspaces with
+    overlapping trees (e.g. ``tests/conftest.py`` AND
+    ``server/tests/conftest.py``) otherwise produce repair attempts on
+    the wrong file because the LLM has no way to know which one pytest
+    is actually loading.
+    """
+    if not test_rel_path or not workspace_path:
+        return []
+    rel = test_rel_path.replace("\\", "/").lstrip("./")
+    if rel.startswith("/"):
+        rel = rel.lstrip("/")
+    parts = [p for p in rel.split("/") if p]
+    if not parts:
+        return []
+    # Strip the filename — pytest looks at DIRECTORIES, not files.
+    parts = parts[:-1]
+    chain: list[str] = []
+    # Workspace-root conftest, then each ancestor down to the test's dir.
+    candidates: list[str] = ["conftest.py"]
+    for i in range(1, len(parts) + 1):
+        candidates.append("/".join(parts[:i]) + "/conftest.py")
+    for rel_candidate in candidates:
+        abs_path = os.path.join(workspace_path, rel_candidate)
+        if os.path.isfile(abs_path):
+            chain.append(rel_candidate)
+    return chain
+
+
+def _collect_conftests_for_failing_tests(
+    workspace_path: str,
+    compiler_errors: list[DiagnosticObjectDict],
+    *,
+    max_unique: int = 6,
+) -> list[tuple[str, list[str]]]:
+    """For every distinct failing-test path in ``compiler_errors``, return
+    ``(test_rel_path, conftest_chain)`` so the prompt can show which
+    conftest tree pytest is loading for each failing test.
+
+    Multiple failing tests may share the same chain — only the FIRST
+    occurrence of each unique chain is returned (the caller wants a
+    representative example per chain, not a row per failing test).
+    Capped at ``max_unique`` to bound token cost; large failure sets
+    rarely span more than 2-3 distinct chains anyway.
+
+    Returns ``[]`` when there are no test failures with file info.
+    Synthetic markers (``<harness:...>``) are skipped.
+    """
+    if not compiler_errors:
+        return []
+    out: list[tuple[str, list[str]]] = []
+    seen_chains: set[tuple[str, ...]] = set()
+    for err in compiler_errors:
+        f = str(err.get("file", "") or "").strip()
+        if not f or f.startswith("<"):
+            continue
+        rel = f
+        # Normalise absolute paths back to workspace-relative when possible.
+        if os.path.isabs(rel):
+            try:
+                rel = os.path.relpath(rel, workspace_path)
+            except ValueError:
+                continue
+        if rel.startswith(".."):
+            continue
+        chain = _conftest_chain_for_test(workspace_path, rel)
+        if not chain:
+            continue
+        key = tuple(chain)
+        if key in seen_chains:
+            continue
+        seen_chains.add(key)
+        out.append((rel, chain))
+        if len(out) >= max_unique:
+            break
+    return out
+
+
+def _format_conftest_chains_for_repair(
+    workspace_path: str,
+    chains: list[tuple[str, list[str]]],
+    *,
+    max_lines_per_file: int = 120,
+    record_hashes_into: Optional[dict[str, str]] = None,
+) -> str:
+    """Render the conftest chains as a Markdown block for the repair
+    prompt. Empty string when ``chains`` is empty so callers can
+    concatenate unconditionally.
+
+    Each chain is shown in pytest precedence order (root first → leaf
+    last). When multiple distinct chains exist (two test trees with
+    independent conftests, as in session cf3fcd27's
+    ``tests/conftest.py`` + ``server/tests/conftest.py`` split), the
+    block explicitly calls out the split so the LLM stops patching the
+    wrong one. The content for each conftest is line-numbered and
+    truncated at ``max_lines_per_file`` so large fixtures don't blow the
+    token budget — the LLM can READ_FILE for the rest if it needs to.
+    """
+    if not chains:
+        return ""
+    parts: list[str] = ["\n## Active conftest.py files for failing tests"]
+    if len(chains) >= 2:
+        parts.append(
+            "**Multiple distinct conftest chains** — the failing tests live "
+            "under separate test trees with independent fixture sets. "
+            "Patching the wrong tree is a no-op for the failing test. Match "
+            "your patch's file path against the chain shown for the test "
+            "you're fixing."
+        )
+    parts.append(
+        "Pytest loads every ``conftest.py`` on the path from the rootdir "
+        "down to the failing test, root first. Anything in a LATER "
+        "conftest can override an EARLIER one. The chain below is the "
+        "fixture surface area for each failing test."
+    )
+    for test_rel, chain in chains:
+        parts.append(f"\n### Chain for `{test_rel}`")
+        parts.append(
+            "Precedence order (load order — first is rootmost):\n"
+            + "\n".join(f"  {i+1}. `{c}`" for i, c in enumerate(chain))
+        )
+        for conftest_rel in chain:
+            abs_path = os.path.join(workspace_path, conftest_rel)
+            rendered, file_hash = _render_file_with_line_numbers_and_hash(
+                abs_path,
+            )
+            if rendered is None:
+                continue
+            if record_hashes_into is not None and file_hash is not None:
+                record_hashes_into[conftest_rel] = file_hash
+            # Cap lines to keep large fixture modules from dominating.
+            rendered_lines = rendered.splitlines()
+            truncated = ""
+            if len(rendered_lines) > max_lines_per_file:
+                rendered = "\n".join(rendered_lines[:max_lines_per_file])
+                truncated = (
+                    f"\n  ... ({len(rendered_lines) - max_lines_per_file} "
+                    "more lines elided — emit READ_FILE if you need them)"
+                )
+            parts.append(
+                f"\n#### `{conftest_rel}`\n```\n{rendered}{truncated}\n```"
+            )
+    return "\n".join(parts) + "\n"
+
+
 def _format_prior_patch_failures(failures: list[Any]) -> str:
     """Format prior-attempt patch failures into a Markdown block for the
     repair LLM prompt. Empty string when there are no failures so callers
@@ -6276,10 +6556,20 @@ def _reflection_grounds_in_diagnostics(
     recommendation = (verdict.get("recommendation") or "").strip().lower()
     if not blocker:
         return False
-    # Honour the fix-A escape hatch — don't inject "I don't know."
+    # Honour the fix-A escape hatch — but ONLY when the recommendation is
+    # also vague. Observed in session cf3fcd27: the judge wrote
+    # "insufficient data — investigate <file>" in real_blocker AND
+    # "Mock the service function that triggers the RuntimeError at
+    # services/edgar.py:48" in recommendation — i.e. it hedged on the
+    # blocker line but knew the fix. Treating that as ungrounded buries
+    # the actionable half of the verdict. We now ignore the blocker text
+    # in that case and ground purely against the recommendation.
     if "insufficient data" in blocker:
-        return False
-    haystack = blocker + " " + recommendation
+        haystack = recommendation
+        if not recommendation:
+            return False
+    else:
+        haystack = blocker + " " + recommendation
     files_seen: set[str] = set()
     for err in compiler_errors:
         f = str(err.get("file", "") or "").strip()
@@ -6295,6 +6585,111 @@ def _reflection_grounds_in_diagnostics(
         # diagnostics that lack file info; injection MAY still help).
         return True
     return any(name in haystack for name in files_seen)
+
+
+def _verdict_named_files(
+    verdict: dict[str, str],
+    compiler_errors: list[dict[str, Any]],
+) -> list[str]:
+    """Return the relative paths of files that BOTH appear in the judge's
+    real_blocker/recommendation text AND are present in the current
+    ``compiler_errors`` failing set.
+
+    Used by the judge-ignored gate (Fix #3): after the repair LLM applies
+    patches, we check whether any of these files were modified. If the judge
+    named ``services/edgar.py`` and the LLM patched ``test_api.py`` instead,
+    the round is a structural distraction regardless of what the next
+    reflection verdict ends up saying.
+
+    Returns full relative paths (not basenames) so the touched-files check
+    can match on path-suffix. Empty list when nothing matches — caller must
+    treat that as "no enforcement this round."
+    """
+    blocker = (verdict.get("real_blocker") or "").lower()
+    recommendation = (verdict.get("recommendation") or "").lower()
+    if not blocker:
+        return []
+    # Same recommendation-fallback as _reflection_grounds_in_diagnostics:
+    # an "insufficient data" blocker with a concrete recommendation is
+    # still actionable — pull file names from the recommendation alone.
+    if "insufficient data" in blocker:
+        if not recommendation:
+            return []
+        haystack = recommendation
+    else:
+        haystack = blocker + " " + recommendation
+    matched: list[str] = []
+    seen: set[str] = set()
+    for err in compiler_errors:
+        f = str(err.get("file", "") or "").strip()
+        if not f or f.startswith("<"):
+            continue
+        if f in seen:
+            continue
+        basename = os.path.basename(f).lower()
+        if f.lower() in haystack or (basename and basename in haystack):
+            matched.append(f)
+            seen.add(f)
+    return matched
+
+
+def _shared_root_cause_fanout(
+    compiler_errors: list[dict[str, Any]],
+    *,
+    threshold: int = 3,
+) -> list[tuple[str, list[str]]]:
+    """Group current failing diagnostics by ``error_code`` and return any
+    (code, files) pairs where the same code appears across ≥ ``threshold``
+    distinct files.
+
+    Used by the JUDGE'S VERDICT banner (Fix #3): when one root cause spans
+    many test files (e.g. 10 tests all hitting an EDGAR mock guard with
+    the same RuntimeError), the LLM otherwise patches one per round and
+    the no_progress gate fires on partial wins. The banner adds a
+    "patch ALL of them in one response" directive sourced from this list.
+
+    Returns ``[]`` when no code clears the threshold — the directive is
+    silent and the banner reads identically to the single-site case.
+    """
+    files_by_code: dict[str, set[str]] = {}
+    for err in compiler_errors:
+        code = str(err.get("error_code", "") or "").strip()
+        f = str(err.get("file", "") or "").strip()
+        if not code or not f or f.startswith("<"):
+            continue
+        files_by_code.setdefault(code, set()).add(f)
+    return [
+        (code, sorted(files))
+        for code, files in files_by_code.items()
+        if len(files) >= threshold
+    ]
+
+
+def _patches_touched_judge_files(
+    patch_results: list[Any], judge_named: list[str],
+) -> bool:
+    """True iff at least one *successful* patch touched a file the judge
+    named (suffix / basename match — LLMs and the harness use slightly
+    different path roots, e.g. ``services/edgar.py`` vs
+    ``server/services/edgar.py``)."""
+    if not judge_named:
+        return True  # nothing to enforce
+    judge_norm = [(p, os.path.basename(p)) for p in judge_named]
+    for r in patch_results:
+        if not getattr(r, "success", False):
+            continue
+        if getattr(r, "no_op", False):
+            continue  # idempotency no-ops don't count as touching
+        f = str(getattr(r, "file", "") or "")
+        if not f:
+            continue
+        f_base = os.path.basename(f)
+        for j, j_base in judge_norm:
+            if f == j or f.endswith("/" + j) or j.endswith("/" + f):
+                return True
+            if f_base and j_base and f_base == j_base:
+                return True
+    return False
 
 
 def _parse_repair_reflection_verdict(
@@ -6653,7 +7048,10 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         re_detected = _detect_default_build_command(
             workspace, is_greenfield=True,
         )
-        tail = " && python3 -m pytest -q"
+        # Source of truth lives in harness/cli.py — single import avoids
+        # the two sides drifting if the canonical pytest invocation changes.
+        from harness.cli import _PYTEST_RUN as _CLI_PYTEST_RUN
+        tail = f" && {_CLI_PYTEST_RUN}"
         if (
             re_detected
             and re_detected != build_cmd
@@ -7105,6 +7503,14 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         "last_diag_fingerprints": (
             _fingerprint_diagnostics(compiler_errors) if exit_code != 0 else []
         ),
+        "prior_diag_count": int(state.get("last_diag_count") or 0),
+        "last_diag_count": (
+            sum(
+                1 for e in compiler_errors
+                if str(e.get("severity", "error")).lower() != "warning"
+            )
+            if exit_code != 0 else 0
+        ),
     }
 
     # Persist the adapted command so repair_node / patching_node prompts
@@ -7208,8 +7614,25 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # to compare against — credit it neutrally (don't tick no_progress).
     prior_fps_set = set(state.get("prior_diag_fingerprints") or [])
     current_fps_set = set(state.get("last_diag_fingerprints") or [])
+    prior_diag_count = int(state.get("prior_diag_count") or 0)
+    current_diag_count = int(state.get("last_diag_count") or 0)
     is_first_iteration = loop_counter["total_repairs"] == 1
-    prior_round_made_progress = bool(prior_fps_set - current_fps_set)
+    fps_shrank = bool(prior_fps_set - current_fps_set)
+    # Raw-count shrinkage is the secondary signal — when many tests share
+    # one fingerprint (e.g. 10 tests all hitting the same EDGAR-mock
+    # guard collapse to ONE ``RuntimeError::Real EDGAR HTTP call …``
+    # fingerprint), fixing tests one-at-a-time leaves the set the same
+    # size but reduces the raw count by 1. Without this signal the
+    # no_progress gate fires on a loop that's actually making real
+    # progress. Only counts as progress when there WAS a prior count to
+    # compare against (current_diag_count==0 means success — handled
+    # separately by the loop terminator).
+    count_shrank = (
+        prior_diag_count > 0
+        and current_diag_count > 0
+        and current_diag_count < prior_diag_count
+    )
+    prior_round_made_progress = fps_shrank or count_shrank
     if is_first_iteration:
         prior_round_made_progress = True  # neutral; nothing to evaluate yet
     if not prior_round_made_progress:
@@ -7218,9 +7641,11 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         )
         logger.info(
             "[repair_node] Prior repair did not shrink failing fingerprints "
-            "(prior=%d, current=%d, shared=%d). no_progress_repairs=%d.",
+            "OR raw count (fps prior=%d/current=%d shared=%d; count "
+            "prior=%d/current=%d). no_progress_repairs=%d.",
             len(prior_fps_set), len(current_fps_set),
             len(prior_fps_set & current_fps_set),
+            prior_diag_count, current_diag_count,
             loop_counter["no_progress_repairs"],
         )
     else:
@@ -7228,11 +7653,16 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # Matches the spirit of consecutive_zero_patch_rounds: a stretch
         # of progress earns back the budget.
         if loop_counter.get("no_progress_repairs", 0) > 0:
+            _signal = (
+                "fingerprint set" if fps_shrank else "raw diagnostic count"
+            )
             logger.info(
-                "[repair_node] Prior repair shrank failing fingerprints "
-                "(prior=%d → current=%d). Resetting no_progress_repairs "
-                "from %d to 0.",
+                "[repair_node] Prior repair shrank %s (fps prior=%d → "
+                "current=%d; count prior=%d → current=%d). Resetting "
+                "no_progress_repairs from %d to 0.",
+                _signal,
                 len(prior_fps_set), len(current_fps_set),
+                prior_diag_count, current_diag_count,
                 loop_counter["no_progress_repairs"],
             )
         loop_counter["no_progress_repairs"] = 0
@@ -7586,7 +8016,34 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # failing test/file and would not realise a shared util
             # the CR amended is the root cause.
             cr_extra = _cr_impact_augment(state, diag_files)
-            files_for_preflight = list(diag_files) + cr_extra
+            # Fix #2 — first-party-import prefetch. For every failing
+            # test file, parse its imports and pre-attach the workspace
+            # modules it depends on (recursively bounded by depth=2).
+            # The repair LLM otherwise emits a READ_FILE block on every
+            # round to see the same module-under-test; with prefetch,
+            # the content is already in the prompt and the round
+            # converges in one dispatch. Caps the extra files at 6 so
+            # token cost stays bounded; the LLM can READ_FILE for the
+            # tail if it really needs it.
+            import_prefetch: list[str] = []
+            _seen_imp: set[str] = set(diag_files) | set(cr_extra)
+            for _diag_file in diag_files:
+                if len(import_prefetch) >= 6:
+                    break
+                if not _diag_file.endswith(".py"):
+                    continue
+                for _imp_rel in _first_party_imports_for(
+                    workspace_path, _diag_file,
+                ):
+                    if _imp_rel in _seen_imp:
+                        continue
+                    _seen_imp.add(_imp_rel)
+                    import_prefetch.append(_imp_rel)
+                    if len(import_prefetch) >= 6:
+                        break
+            files_for_preflight = (
+                list(diag_files) + cr_extra + import_prefetch
+            )
             preflight_pairs = _collect_workspace_file_content(
                 workspace_path, files_for_preflight,
                 max_files=diag_cap,
@@ -7605,6 +8062,24 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "you write."
                 ),
             )
+    # Workspace-aware conftest chain (Fix #3). When tests fail, surface
+    # the EXACT chain of ``conftest.py`` files pytest is loading for
+    # each failing test, with content inlined. The repair LLM otherwise
+    # has no way to tell which conftest is in scope when a workspace
+    # has overlapping test trees (e.g. ``tests/conftest.py`` AND
+    # ``server/tests/conftest.py``) and ends up patching the wrong one.
+    # Runs every iteration so a conftest the LLM patched mid-session is
+    # re-rendered with the new bytes — feeds the patcher's drift
+    # detector via ``files_seen_by_llm`` so subsequent patches against
+    # the updated conftest match.
+    _conftest_chains = _collect_conftests_for_failing_tests(
+        workspace_path, errors,
+    )
+    if _conftest_chains:
+        error_summary += _format_conftest_chains_for_repair(
+            workspace_path, _conftest_chains,
+            record_hashes_into=files_seen_by_llm,
+        )
     # Fix #3: if any file has accumulated ≥ 2 consecutive REPLACE_BLOCK
     # misses, force the LLM out of the pattern with an explicit "use a
     # different operation" directive before the diagnostics.
@@ -8061,6 +8536,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # actual bug was in a regex — see post-mortem on session
         # cf3fcd27). Skip the injection in that case rather than letting
         # noise become authoritative.
+        #
+        # SRS-trim (Fix #1+#2): when the verdict is DISTRACTION/REGRESSION
+        # we ALSO rebuild ``messages`` from scratch — drop the giant SRS
+        # at messages[0] (180k+ chars on real sessions) plus the iter-1..N-1
+        # chatter, and lead the dispatch with the judge's banner. The
+        # SRS-driven repair LLM was reading the spec and patching
+        # cosmetics; with the SRS gone the verdict is the only authority
+        # left in front of the model.
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
@@ -8069,17 +8552,127 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 reflection_verdict, state.get("compiler_errors", []) or []
             )
         ):
-            reflection_msg = (
-                f"[Reflection — verdict: {reflection_verdict['verdict']}] "
-                f"The previous repair iteration did not address the "
-                f"highest-priority error. Real blocker: "
-                f"{reflection_verdict['real_blocker']}"
+            judge_named_files = _verdict_named_files(
+                reflection_verdict, state.get("compiler_errors", []) or []
             )
+            ignored_last_round = bool(
+                loop_counter.get("judge_ignored_last_round")
+            )
+            ignored_files_prev = list(
+                loop_counter.get("judge_named_files_last_round") or []
+            )
+            ignored_touched_prev = list(
+                loop_counter.get("judge_round_touched_files") or []
+            )
+            reflection_banner_lines = [
+                "=== JUDGE'S VERDICT — READ THIS FIRST AND OBEY ===",
+                f"Verdict: {reflection_verdict['verdict']}",
+                f"Real blocker: {reflection_verdict['real_blocker']}",
+            ]
             if reflection_verdict["recommendation"]:
-                reflection_msg += (
-                    f" Recommendation: {reflection_verdict['recommendation']}"
+                reflection_banner_lines.append(
+                    f"REQUIRED ACTION: {reflection_verdict['recommendation']}"
                 )
-            messages.append(MessageDict(role="system", content=reflection_msg))
+            if judge_named_files:
+                reflection_banner_lines.append(
+                    "YOUR PATCHES THIS ROUND MUST MODIFY at least one of: "
+                    + ", ".join(judge_named_files)
+                )
+            # Fan-out directive (Fix #3): see ``_shared_root_cause_fanout``.
+            # Logic lives in the helper so it can be unit-tested without
+            # standing up a full repair_node fixture.
+            _shared_root_causes = _shared_root_cause_fanout(
+                state.get("compiler_errors", []) or [],
+            )
+            if _shared_root_causes:
+                _code, _files_list = _shared_root_causes[0]
+                _display_files = _files_list[:8]
+                _extra = max(0, len(_files_list) - len(_display_files))
+                _files_str = ", ".join(_display_files)
+                if _extra:
+                    _files_str += f" (+{_extra} more)"
+                reflection_banner_lines.append(
+                    f"FAN-OUT: error code {_code} appears across "
+                    f"{len(_files_list)} files: {_files_str}. They share "
+                    "ONE root cause. Emit patches for ALL of them in this "
+                    "single response — patching one per round is treated "
+                    "as no progress and will terminate the loop."
+                )
+            reflection_msg = "\n".join(reflection_banner_lines)
+            if ignored_last_round and ignored_files_prev:
+                touched_str = (
+                    ", ".join(ignored_touched_prev[:6])
+                    if ignored_touched_prev else "(none)"
+                )
+                reflection_msg = (
+                    "=== YOU IGNORED THE JUDGE LAST ROUND ===\n"
+                    f"The judge named {', '.join(ignored_files_prev)} as the "
+                    f"blocker. Your patches instead touched: {touched_str}. "
+                    "Cosmetic mock-target renames and unrelated tweaks will "
+                    "cause this loop to terminate. Patch the named file(s) "
+                    "this round — no exceptions.\n\n"
+                    + reflection_msg
+                )
+            # Build the focused dispatch list. Skip messages[0] (the SRS),
+            # keep small autofix system notes, keep the last assistant turn
+            # so the model sees its own previous patch attempt as delta
+            # context. apply_repair_iteration_cleanse already ran for
+            # iter ≥ 2, so ``messages`` is mostly minimal — we just need to
+            # also drop the SRS itself, which it deliberately preserves.
+            _focused: list[MessageDict] = [
+                MessageDict(role="system", content=reflection_msg),
+                MessageDict(role="system", content=(
+                    "You are the repair LLM. Your only job this turn is to "
+                    "fix the failing diagnostic the judge named above. The "
+                    "spec/SRS has been intentionally trimmed for this turn "
+                    "so it does not compete for your attention. Emit "
+                    "patches in the block DSL only — no prose."
+                )),
+            ]
+            _last_assistant_msg: Optional[MessageDict] = None
+            for _m in reversed(messages):
+                if _m.get("role") == "assistant":
+                    _last_assistant_msg = _m
+                    break
+            if _last_assistant_msg is not None:
+                _focused.append(_last_assistant_msg)
+            # Preserve any non-SRS system messages already accumulated this
+            # turn (autofix note, budget_warning). Skip messages[0] which
+            # is the SRS and any system messages that look like full
+            # planning prompts (>8000 chars heuristic — the SRS and the
+            # original planning user message both exceed this; reflection
+            # / autofix / status notes do not).
+            for _idx, _m in enumerate(messages):
+                if _idx == 0:
+                    continue  # the SRS
+                if _m.get("role") != "system":
+                    continue
+                content = str(_m.get("content", "") or "")
+                if len(content) > 8000:
+                    continue  # likely a planning blob
+                _focused.append(_m)
+            _before = len(messages)
+            messages = _focused
+            logger.info(
+                "[repair_node] %s verdict — rebuilt repair messages: %d → %d "
+                "(dropped SRS + chatter; led with judge banner; judge_files=%s, "
+                "ignored_prior=%s).",
+                reflection_verdict["verdict"], _before, len(messages),
+                judge_named_files or "(none)", ignored_last_round,
+            )
+            try:
+                from harness.observability import emit_event as _emit_lead
+                _emit_lead(
+                    "repair_reflection_promoted_to_lead",
+                    verdict=reflection_verdict["verdict"],
+                    judge_named_files=judge_named_files,
+                    ignored_prior_round=ignored_last_round,
+                    ignored_files_prev=ignored_files_prev,
+                    messages_before=_before,
+                    messages_after=len(messages),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
         elif (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
@@ -8452,6 +9045,69 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             )
         else:
             loop_counter["consecutive_zero_patch_rounds"] = 0
+
+        # Judge-ignored gate (Fix #3). When the reflection verdict named
+        # specific files as the real blocker, check that the round's
+        # patches actually touched at least one of them. If not, the
+        # round is a structural distraction even if the next reflection
+        # verdict somehow comes back PROGRESS — record it so the NEXT
+        # round's reflection banner can lead with "YOU IGNORED THE JUDGE"
+        # and force the repair LLM back onto the blocker. Match by path
+        # suffix / basename so judge-named ``services/edgar.py`` and
+        # touched ``server/services/edgar.py`` both count.
+        if (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+        ):
+            _judge_named_now = _verdict_named_files(
+                reflection_verdict, state.get("compiler_errors", []) or []
+            )
+            if _judge_named_now:
+                _touched_judge_files = _patches_touched_judge_files(
+                    patch_results, _judge_named_now,
+                )
+                if not _touched_judge_files:
+                    loop_counter["judge_ignored_last_round"] = True
+                    loop_counter["judge_named_files_last_round"] = _judge_named_now
+                    loop_counter["judge_round_touched_files"] = sorted({
+                        r.file for r in patch_results
+                        if getattr(r, "success", False)
+                        and not getattr(r, "no_op", False)
+                        and r.file
+                    })
+                    logger.warning(
+                        "[repair_node] Judge-ignored: round %d patched %s "
+                        "but judge named %s. Next round's banner will "
+                        "escalate.",
+                        loop_counter.get("total_repairs", 0),
+                        loop_counter["judge_round_touched_files"] or "(none)",
+                        _judge_named_now,
+                    )
+                    try:
+                        from harness.observability import emit_event as _emit_ji
+                        _emit_ji(
+                            "repair_judge_ignored",
+                            iteration=loop_counter.get("total_repairs", 0),
+                            judge_named_files=_judge_named_now,
+                            touched_files=loop_counter[
+                                "judge_round_touched_files"
+                            ],
+                            verdict=reflection_verdict["verdict"],
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                else:
+                    # Clear stale flags — this round complied with the judge.
+                    loop_counter.pop("judge_ignored_last_round", None)
+                    loop_counter.pop("judge_named_files_last_round", None)
+                    loop_counter.pop("judge_round_touched_files", None)
+        else:
+            # PROGRESS verdict or no verdict — clear any stale flags so the
+            # next round doesn't get a phantom "you ignored the judge"
+            # banner from an earlier failure that's since been addressed.
+            loop_counter.pop("judge_ignored_last_round", None)
+            loop_counter.pop("judge_named_files_last_round", None)
+            loop_counter.pop("judge_round_touched_files", None)
 
         # Per-file REPLACE_BLOCK miss tracker (fix #3). Bump for each
         # failed REPLACE_BLOCK, clear for any file with a successful

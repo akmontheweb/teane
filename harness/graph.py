@@ -13119,15 +13119,36 @@ def route_after_deployment(state: AgentState) -> Literal[
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_hitl(state: AgentState) -> Literal["compiler_node", "__end__"]:
+def route_after_hitl(state: AgentState) -> Literal[
+    "compiler_node", "decomposition_node", "traceability_node", "__end__"
+]:
     """
-    After human intervention, always route back to compiler_node for re-validation.
+    After human intervention, route back to the node that triggered the
+    escalation so the developer's fix is re-evaluated by the right phase.
+
+    Default is ``compiler_node`` — that handles the loop/repair/env-misconfig
+    family that dominates real escalations. The exceptions branch on the
+    ``hitl_trigger`` label that ``human_intervention_node`` stamps via
+    ``_infer_hitl_trigger`` so pre-code escalations don't get routed into
+    a build of an empty workspace.
+
     Exceptions:
         - Developer chose to abandon ([q]) → END with git rollback
         - Developer chose to suspend ([s]) → END without rollback
+        - Trigger was decomposition_{validation_failed,missing} →
+          ``decomposition_node`` (compiler_node would find no source
+          files and bounce straight back to HITL — surfaced by the
+          FinancialResearch run where the depends_on-cycle HITL was
+          resumed and the resulting pytest exit=5 re-escalated 3
+          seconds later).
+        - Trigger was traceability_block → ``traceability_node``
+          (the build is already green; re-running the compiler would
+          just exit 0 → END while the coverage gap is still open).
 
     Note: Memory cleanse for HITL resolution is handled inside
-    compiler_node when exit_code == 0 after the re-validation build passes.
+    compiler_node when exit_code == 0 after the re-validation build
+    passes. For the decomposition/traceability re-entry paths the
+    cleanse fires the next time the build completes successfully.
     """
     node_state: dict[str, Any] = state.get("node_state", {})
     if node_state.get("hitl_suspend", False):
@@ -13136,7 +13157,28 @@ def route_after_hitl(state: AgentState) -> Literal["compiler_node", "__end__"]:
     if node_state.get("hitl_abandon", False):
         logger.info("[router] HITL: Developer chose to abandon. Routing to END.")
         return "__end__"
-    logger.info("[router] HITL resolved. Routing to compiler_node for re-validation.")
+
+    trigger = str(node_state.get("hitl_trigger", "") or "")
+    if trigger in ("decomposition_validation_failed", "decomposition_missing"):
+        logger.info(
+            "[router] HITL resolved (trigger=%s). Routing to decomposition_node "
+            "for re-validation — compiler_node would find no source files.",
+            trigger,
+        )
+        return "decomposition_node"
+    if trigger == "traceability_block":
+        logger.info(
+            "[router] HITL resolved (trigger=%s). Routing to traceability_node "
+            "— the build was already green when the gate failed.",
+            trigger,
+        )
+        return "traceability_node"
+
+    logger.info(
+        "[router] HITL resolved (trigger=%s). Routing to compiler_node "
+        "for re-validation.",
+        trigger or "unknown",
+    )
     return "compiler_node"
 
 
@@ -13797,12 +13839,18 @@ def build_graph() -> Any:
         },
     )
 
-    # After HITL resolution, go back to compiler (or END if abandoned)
+    # After HITL resolution, go back to the upstream phase (compiler /
+    # decomposition / traceability) so the developer's fix is re-evaluated
+    # by the right node. Compiler is the default; decomposition and
+    # traceability are taken when hitl_trigger says the escalation came
+    # from a pre-code phase. END is reached only on suspend/abandon.
     graph.add_conditional_edges(
         "human_intervention_node",
         route_after_hitl,
         {
             "compiler_node": "compiler_node",
+            "decomposition_node": "decomposition_node",
+            "traceability_node": "traceability_node",
             "__end__": END,
         },
     )

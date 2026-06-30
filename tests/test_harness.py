@@ -3859,6 +3859,46 @@ class TestAgentState:
             state["node_state"] = {"hitl_abandon": True}
             assert route_after_hitl(state) == "__end__"
 
+    def test_route_after_hitl_decomposition_failed_returns_to_decomposition(self):
+        # HITL fired from decomposition_node (depends_on cycle, JSON
+        # decode, etc.). Resuming straight to compiler_node would build
+        # an empty workspace and bounce back to HITL; route should send
+        # the dev's fix back through decomposition_node first.
+        from harness.graph import route_after_hitl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["node_state"] = {"hitl_trigger": "decomposition_validation_failed"}
+            assert route_after_hitl(state) == "decomposition_node"
+
+    def test_route_after_hitl_decomposition_missing_returns_to_decomposition(self):
+        from harness.graph import route_after_hitl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["node_state"] = {"hitl_trigger": "decomposition_missing"}
+            assert route_after_hitl(state) == "decomposition_node"
+
+    def test_route_after_hitl_traceability_block_returns_to_traceability(self):
+        # HITL fired from the end-of-session traceability gate. Build is
+        # already green; routing to compiler_node would exit 0 and END
+        # while the coverage gap stays open.
+        from harness.graph import route_after_hitl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["node_state"] = {"hitl_trigger": "traceability_block"}
+            assert route_after_hitl(state) == "traceability_node"
+
+    def test_route_after_hitl_suspend_overrides_trigger(self):
+        # Suspend / abandon must beat the trigger-based reroute — the
+        # developer asked to exit, not to retry the upstream phase.
+        from harness.graph import route_after_hitl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["node_state"] = {
+                "hitl_suspend": True,
+                "hitl_trigger": "decomposition_validation_failed",
+            }
+            assert route_after_hitl(state) == "__end__"
+
     @pytest.mark.asyncio
     async def test_rewind_suspended_checkpoint_re_enters_loop(self):
         # Regression: Save & Quit ([s]) routes the graph to __end__ with

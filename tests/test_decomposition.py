@@ -460,6 +460,66 @@ def test_decomposition_node_validation_failure(workspace: str):
     assert out["node_state"]["error"].startswith("validation")
 
 
+def _cyclic_payload() -> str:
+    """Same shape as _valid_payload but with a STORY-1 ↔ STORY-2 cycle."""
+    p = json.loads(_valid_payload())
+    p["stories"][0]["depends_on"] = ["STORY-2"]
+    p["stories"][1]["depends_on"] = ["STORY-1"]
+    return json.dumps(p)
+
+
+def test_decomposition_node_cycle_auto_repairs(workspace: str):
+    """Cycle in the first response → 1-shot repair → commit succeeds."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_cyclic_payload(), _valid_payload()])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["current_gate"] == "STORIES"
+    assert out["node_state"]["decomposition_complete"] is True
+    assert out["node_state"]["story_count"] == 2
+    # Two LLM calls: original + one repair attempt
+    assert len(gw.calls) == 2
+    # Repair prompt must reference the cycle path
+    repair_msg = gw.calls[1]["messages"][-1]["content"]
+    assert "depends_on cycle detected" in repair_msg
+    assert "STORY-1" in repair_msg and "STORY-2" in repair_msg
+
+
+def test_decomposition_node_cycle_repair_failure_routes_to_hitl(workspace: str):
+    """Repair attempt still cyclic → HITL with both errors in message."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_cyclic_payload(), _cyclic_payload()])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    err = out["node_state"]["error"]
+    assert err.startswith("validation:")
+    assert "repair_failed" in err
+    assert len(gw.calls) == 2
+
+
+def test_decomposition_node_cycle_repair_skipped_when_budget_zero(workspace: str):
+    """Budget exhausted after the first call → no repair attempted."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    # First call drains budget to 0.0 — repair branch must skip.
+    gw = _FakeGateway([_cyclic_payload()], budget_after=0.0)
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    assert out["node_state"]["error"].startswith("validation:")
+    assert "repair_failed" not in out["node_state"]["error"]
+    assert len(gw.calls) == 1
+
+
 def test_decomposition_node_dispatch_exception(workspace: str):
     from harness.graph import set_gateway
     _write_spec(workspace)

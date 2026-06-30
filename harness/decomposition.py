@@ -749,6 +749,34 @@ def strip_json_fence(content: str) -> str:
     return strip_code_fences(content)
 
 
+def _build_cycle_repair_prompt(raw_json: str, cycle_msg: str) -> str:
+    """Targeted one-shot repair prompt for `depends_on` cycles.
+
+    Feeds the planner its own prior payload + the exact cycle path and
+    asks it to drop the minimum edges. Kept narrow on purpose: removing
+    deps is a local, low-risk edit; broader "fix the payload" prompts
+    have historically drifted into renaming stories or dropping
+    acceptance criteria, which then fails downstream traceability.
+    """
+    return (
+        "Your previous decomposition response contained a circular "
+        "`depends_on` dependency that makes the plan unschedulable:\n\n"
+        f"  {cycle_msg}\n\n"
+        "Fix the payload by removing the minimum number of `depends_on` "
+        "edges needed to break the cycle. Prefer dropping the edge that "
+        "is semantically weakest (e.g. if STORY-A is genuinely a "
+        "prerequisite for STORY-B, then the reverse edge B → A is the "
+        "one to drop). Do NOT remove or rename any stories, features, "
+        "acceptance_criteria, requirement_keys, or scope_files. Edit "
+        "ONLY the `depends_on` arrays.\n\n"
+        "Return the COMPLETE corrected payload as a single JSON object "
+        "with exactly the same shape as before. JSON only — no "
+        "commentary, no code fences.\n\n"
+        "Previous payload:\n"
+        f"{raw_json}"
+    )
+
+
 async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     """Decompose the approved spec into stories, persist them, regenerate views.
 
@@ -921,48 +949,108 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             "budget_remaining_usd": budget,
         }
 
-    try:
-        # Always pass the snapshot through — even an EMPTY set must
-        # be threaded so the validator's cross-check fires and rejects
-        # bogus req_keys against a workspace whose spec has no FR/NFR/US
-        # headings yet. ``set() or None`` would collapse to None and
-        # silently drop the validator into shape-only mode, leaving
-        # the audit to "pass" vacuously (Phase 7 BUG #5). ``None`` is
-        # reserved for unit tests that explicitly want shape-only.
+    # Always pass the snapshot through — even an EMPTY set must
+    # be threaded so the validator's cross-check fires and rejects
+    # bogus req_keys against a workspace whose spec has no FR/NFR/US
+    # headings yet. ``set() or None`` would collapse to None and
+    # silently drop the validator into shape-only mode, leaving
+    # the audit to "pass" vacuously (Phase 7 BUG #5). ``None`` is
+    # reserved for unit tests that explicitly want shape-only.
+    existing_keys: set[str] = set()
+    if augment_mode:
+        existing_keys = {
+            f.get("feature_key") for f in augment_existing_features
+            if f.get("feature_key")
+        }
+
+    def _run_validator(payload: dict[str, Any]) -> tuple[list[dict], list[dict]]:
         if augment_mode:
-            existing_keys = {
-                f.get("feature_key") for f in augment_existing_features
-                if f.get("feature_key")
-            }
-            features_cleaned, cleaned = _validate_augment_payload(
-                data,
+            return _validate_augment_payload(
+                payload,
                 existing_feature_keys=existing_keys,
                 known_req_keys=known_req_keys,
             )
-        else:
-            features_cleaned, cleaned = _validate_stories_payload(
-                data, known_req_keys=known_req_keys,
-            )
+        return _validate_stories_payload(
+            payload, known_req_keys=known_req_keys,
+        )
+
+    try:
+        features_cleaned, cleaned = _run_validator(data)
     except ValueError as exc:
-        logger.error("[decomposition] payload validation failed: %s", exc)
-        # Failure must NOT advertise itself as a successful completion —
-        # the prior shape ({decomposition_complete: True, current_gate:
-        # "STORIES"}) caused the gatekeeper to show an empty STORIES gate,
-        # the developer to approve it, the planner to find no stories and
-        # report ``all_complete=True``, and the rest of the pipeline to
-        # generate code with zero traceability to the spec. Route to HITL
-        # with a clear error instead.
-        return {
-            "exit_code": 1,
-            "node_state": {
-                "current_node": "decomposition",
-                "decomposition_complete": False,
-                "decomposition_failed": True,
-                "error": f"validation: {exc}",
-                "story_count": 0,
-            },
-            "budget_remaining_usd": budget,
-        }
+        # Cycle errors are amenable to a single targeted repair pass —
+        # feed the prior payload back with the cycle path and ask for
+        # the minimum edge removal. Other validation errors (unknown
+        # req_keys, malformed shape) are structural; a re-prompt
+        # historically does not help, so they continue to HITL.
+        cycle_err = str(exc).startswith("depends_on cycle detected:")
+        if cycle_err and budget > 0:
+            logger.warning(
+                "[decomposition] %s — attempting 1-shot auto-repair "
+                "(budget=$%.4f).",
+                exc, budget,
+            )
+            repair_prompt = _build_cycle_repair_prompt(raw, str(exc))
+            repair_messages = [
+                system_msg, {"role": "user", "content": repair_prompt},
+            ]
+            try:
+                response, budget = await gateway.dispatch(
+                    messages=repair_messages,
+                    role=NodeRole.PLANNING,
+                    budget_remaining_usd=budget,
+                )
+                repaired_raw = strip_json_fence(
+                    getattr(response, "content", "") or ""
+                )
+                data = json.loads(repaired_raw)
+                features_cleaned, cleaned = _run_validator(data)
+                raw = repaired_raw
+                logger.info(
+                    "[decomposition] cycle auto-repair succeeded; "
+                    "budget_remaining=$%.4f.", budget,
+                )
+            except Exception as repair_exc:  # noqa: BLE001
+                logger.error(
+                    "[decomposition] cycle auto-repair failed: %s",
+                    repair_exc,
+                )
+                return {
+                    "exit_code": 1,
+                    "node_state": {
+                        "current_node": "decomposition",
+                        "decomposition_complete": False,
+                        "decomposition_failed": True,
+                        "error": (
+                            f"validation: {exc}; "
+                            f"repair_failed: {repair_exc}"
+                        ),
+                        "story_count": 0,
+                    },
+                    "budget_remaining_usd": budget,
+                }
+        else:
+            logger.error(
+                "[decomposition] payload validation failed: %s", exc,
+            )
+            # Failure must NOT advertise itself as a successful
+            # completion — the prior shape ({decomposition_complete:
+            # True, current_gate: "STORIES"}) caused the gatekeeper to
+            # show an empty STORIES gate, the developer to approve it,
+            # the planner to find no stories and report
+            # ``all_complete=True``, and the rest of the pipeline to
+            # generate code with zero traceability to the spec. Route
+            # to HITL with a clear error instead.
+            return {
+                "exit_code": 1,
+                "node_state": {
+                    "current_node": "decomposition",
+                    "decomposition_complete": False,
+                    "decomposition_failed": True,
+                    "error": f"validation: {exc}",
+                    "story_count": 0,
+                },
+                "budget_remaining_usd": budget,
+            }
 
     db_path = story_state.state_db_path()
     # app_name was already resolved during the augment-mode peek above.

@@ -4846,10 +4846,18 @@ def _uv_venv_prefix() -> str:
     an existing install/pytest command. The venv is rebuilt on every fresh
     sandbox container (``/tmp`` is ephemeral); within a container the
     ``test -d`` guard makes re-activation a no-op.
+
+    Note: no subshell parens here. In bash ``&&`` and ``||`` are equal-
+    precedence and left-associative, so ``test -d X || uv venv X && …``
+    parses identically to ``(test -d X || uv venv X) && …``. The earlier
+    parenthesised form was rejected by the sandbox security validator
+    (it read ``(test`` as the command name and matched
+    ``whitelist_missing:(test``); the unparenthesised form has the same
+    semantics and parses cleanly.
     """
     return (
-        f"(test -d {_PROD_SMOKE_VENV_PATH}/bin "
-        f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH}) "
+        f"test -d {_PROD_SMOKE_VENV_PATH}/bin "
+        f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH} "
         f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate"
     )
 
@@ -5096,6 +5104,37 @@ async def _run_prod_import_smoke_check(
             len(modules),
         )
         return []
+    # Sandbox CommandValidator refused the smoke command (e.g. ``(test``
+    # was rejected before the prefix-stripping fix landed). Repair LLM
+    # cannot reach the validator config, so surface a tagged diagnostic
+    # the caller can promote into ``build_command_blocked`` on node_state.
+    # Without this short-circuit the smoke check falls through to the
+    # coarse PROD_IMPORT_SMOKE catch-all, and the router dispatches to
+    # repair_node — burning iterations on a problem the LLM cannot fix.
+    blocked_rule = _is_command_blocked_by_security(result.raw_output or "")
+    if blocked_rule:
+        logger.warning(
+            "[prod-smoke] Smoke install command blocked by sandbox security "
+            "validator (rule=%s). Surfacing as BUILD_COMMAND_BLOCKED.",
+            blocked_rule,
+        )
+        return [{
+            "error_code": "BUILD_COMMAND_BLOCKED",
+            "message": (
+                f"The composed prod-smoke install command was rejected by "
+                f"the sandbox security validator (matched rule: "
+                f"{blocked_rule}). This is a harness-internal config "
+                f"issue, not user code — the repair LLM cannot fix it "
+                f"because the validator config lives outside the "
+                f"workspace allowlist."
+            ),
+            "file": "<harness:security-validator>",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "semantic_context": "",
+            "matched_rule": blocked_rule,
+        }]
     # Parse FAIL: lines from the output. The smoke script prints them
     # one per line right after the FAILURES header.
     diagnostics: list[dict[str, Any]] = []
@@ -6615,6 +6654,21 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "could not be imported cleanly. Fix the import "
                 "errors above before pytest is attempted."
             )
+            # Promote a smoke-emitted BUILD_COMMAND_BLOCKED diag onto
+            # node_state so route_after_compiler short-circuits to HITL
+            # instead of dispatching repair on a harness-internal failure.
+            for diag in smoke_errors:
+                if diag.get("error_code") == "BUILD_COMMAND_BLOCKED":
+                    short_circuit_state["build_command_blocked"] = True
+                    short_circuit_state["build_command_blocked_rule"] = (
+                        diag.get("matched_rule", "")
+                    )
+                    short_circuit_state["last_build_output"] = (
+                        "Sandbox security validator rejected the composed "
+                        "install command. This is harness-internal config, "
+                        "not user code — routing to HITL."
+                    )
+                    break
             return {
                 "exit_code": 1,
                 "compiler_errors": smoke_errors,
@@ -8321,6 +8375,10 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     # of the "open failing files in your IDE" branch.
     if node_state.get("traceability_blocked"):
         return "traceability_block"
+    if node_state.get("decomposition_failed"):
+        return "decomposition_validation_failed"
+    if node_state.get("decomposition_missing"):
+        return "decomposition_missing"
     if node_state.get("env_misconfig"):
         sym = node_state.get("env_misconfig_symbol", "")
         return f"env_misconfig:{sym}" if sym else "env_misconfig"
@@ -13403,13 +13461,42 @@ def build_graph() -> Any:
     #                       └─ {compiler_node | security_scan_node}
     #   traceability_node  → security_scan_node (rejoins existing tail)
     # =====================================================================
-    graph.add_edge("decomposition_node", "human_gatekeeper_node")
+    def route_after_decomposition(state: AgentState) -> Literal[
+        "human_gatekeeper_node", "human_intervention_node"
+    ]:
+        """Failure routing for ``decomposition_node``.
+
+        Validation / dispatch / JSON-decode failures set
+        ``node_state.decomposition_failed`` so the pipeline can divert to
+        HITL instead of presenting an empty STORIES gate (which the
+        gatekeeper would happily let the developer "approve", and the
+        batch planner would then see an empty DB and report
+        ``all_complete=True`` — generating code with zero traceability).
+        """
+        ns = state.get("node_state", {}) or {}
+        if ns.get("decomposition_failed"):
+            logger.warning(
+                "[router] decomposition_node failed (%s); routing to HITL.",
+                ns.get("error", "unknown"),
+            )
+            return "human_intervention_node"
+        return "human_gatekeeper_node"
+
+    graph.add_conditional_edges(
+        "decomposition_node",
+        route_after_decomposition,
+        {
+            "human_gatekeeper_node": "human_gatekeeper_node",
+            "human_intervention_node": "human_intervention_node",
+        },
+    )
     graph.add_conditional_edges(
         "batch_planner_node",
         _route_after_batch_planner,
         {
             "story_loop_node": "story_loop_node",
             "traceability_node": "traceability_node",
+            "human_intervention_node": "human_intervention_node",
         },
     )
     graph.add_conditional_edges(

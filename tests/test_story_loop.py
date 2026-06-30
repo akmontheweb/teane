@@ -54,12 +54,15 @@ def _state(workspace: str, **extra: Any) -> dict[str, Any]:
 # batch_planner_node
 # ---------------------------------------------------------------------------
 
-def test_batch_planner_with_no_stories_reports_all_complete(workspace: str):
+def test_batch_planner_with_no_stories_routes_to_hitl(workspace: str):
+    """An empty story DB is failure, not completion — the pipeline must
+    not silently progress when decomposition produced no stories."""
     out = story_loop.batch_planner_node(_state(workspace))
     assert out["current_batch_id"] == 0
     assert out["node_state"]["batch_planned"] is False
-    assert out["node_state"]["all_complete"] is True
-    assert out["node_state"]["reason"] == "no_stories"
+    assert out["node_state"]["all_complete"] is False
+    assert out["node_state"]["decomposition_missing"] is True
+    assert out["exit_code"] == 1
 
 
 def test_batch_planner_creates_batch_for_independent_stories(workspace: str):
@@ -599,6 +602,13 @@ def test_route_after_batch_planner_falls_through_when_all_complete():
 def test_route_after_batch_planner_falls_through_on_stall():
     state = {"node_state": {"batch_planned": False, "stalled": True}}
     assert story_loop.route_after_batch_planner(state) == "traceability_node"
+
+
+def test_route_after_batch_planner_diverts_to_hitl_on_decomposition_missing():
+    state = {"node_state": {"batch_planned": False, "decomposition_missing": True}}
+    assert (
+        story_loop.route_after_batch_planner(state) == "human_intervention_node"
+    )
 
 
 def test_route_after_story_loop_proceeds_to_patching_when_story_picked():

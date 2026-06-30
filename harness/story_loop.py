@@ -115,14 +115,29 @@ def batch_planner_node(state: dict[str, Any]) -> dict[str, Any]:
     try:
         all_stories = story_state.list_stories(conn, workspace)
         if not all_stories:
-            logger.warning("[batch_planner] No stories in DB; nothing to plan.")
+            # An empty story DB is NEVER "all done" — it is failure.
+            # Earlier shape (``all_complete: True, reason: "no_stories"``)
+            # let the router fall through to ``traceability_node`` and
+            # the pipeline proceeded to generate code with zero stories
+            # backing it (a silent ``decomposition_node`` failure used
+            # to land here too, before Bug 2 was fixed). The router now
+            # diverts to HITL so the operator can see why no stories
+            # were produced.
+            logger.error(
+                "[batch_planner] No stories in DB; nothing to plan. "
+                "This is a failure path — decomposition likely never "
+                "ran (non-agile flow misrouted) or its output failed "
+                "validation. Routing to HITL."
+            )
             return {
                 "current_batch_id": 0,
+                "exit_code": 1,
                 "node_state": {
                     "current_node": "batch_planner",
                     "batch_planned": False,
-                    "all_complete": True,
-                    "reason": "no_stories",
+                    "all_complete": False,
+                    "decomposition_missing": True,
+                    "error": "no stories in DB — decomposition produced none",
                 },
             }
 
@@ -544,12 +559,15 @@ def route_after_batch_planner(state: dict[str, Any]) -> str:
     """After ``batch_planner_node``:
 
     - batch was created → ``story_loop_node`` (start the loop)
+    - empty story DB (decomposition missing/failed) → ``human_intervention_node``
     - all stories already done → ``traceability_node`` (write final view)
     - stall (deps unmet) → ``traceability_node`` (flush state, exit)
     """
     ns = state.get("node_state", {})
     if ns.get("batch_planned"):
         return "story_loop_node"
+    if ns.get("decomposition_missing"):
+        return "human_intervention_node"
     return "traceability_node"
 
 

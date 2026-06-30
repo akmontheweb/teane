@@ -603,6 +603,46 @@ async def test_apply_patch_blocks_rejects_outside_allowlist(tmp_path):
     assert modified == []
 
 
+@pytest.mark.asyncio
+async def test_apply_patch_blocks_refuses_harness_config_at_root(tmp_path):
+    """``.harness_config.json`` is harness-internal — patches to it must
+    fail with a precise diagnostic (not the generic allowlist message)
+    so the repair LLM stops proposing them."""
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": ".harness_config.json",
+            "content": "{}",
+        },
+    }])
+    results, _ = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=None,
+    )
+    assert len(results) == 1
+    assert not results[0].success
+    assert "harness-internal" in (results[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_blocks_refuses_harness_config_in_subdir(tmp_path):
+    """A subdir copy like ``tests/.harness_config.json`` is dead weight
+    (the runtime only reads the root file). Reject too."""
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": "tests/.harness_config.json",
+            "content": "{}",
+        },
+    }])
+    results, _ = await apply_patch_blocks(
+        blocks, str(tmp_path), [],
+        allowed_paths=["tests/"],  # subdir IS in allowlist
+    )
+    assert len(results) == 1
+    assert not results[0].success
+    assert "harness-internal" in (results[0].error or "")
+
+
 # ---------------------------------------------------------------------------
 # 7. Adapter shape sanity
 # ---------------------------------------------------------------------------

@@ -2339,10 +2339,50 @@ async def apply_patch_blocks(
     results: list[PatchResult] = []
     blocks_to_apply: list[PatchBlock] = []
 
+    # Harness-internal files the LLM must NEVER touch, regardless of what
+    # the skill allowlist permits. Subdir copies (e.g.
+    # ``tests/.harness_config.json``) are also dead weight — the runtime
+    # only reads the root file — so reject them too with a precise
+    # diagnostic that explains the file is harness-internal rather than
+    # workspace code. Without this, the LLM keeps proposing patches to
+    # this file when the only signal it gets from the validator is
+    # ``Add it to security.allowed_commands in .harness_config.json``.
+    _HARNESS_INTERNAL_BASENAMES: frozenset[str] = frozenset({
+        ".harness_config.json",
+    })
+    harness_internal_blocks: list[PatchBlock] = []
+    other_blocks: list[PatchBlock] = []
+    for block in blocks:
+        basename = os.path.basename(block.file)
+        if basename in _HARNESS_INTERNAL_BASENAMES:
+            harness_internal_blocks.append(block)
+        else:
+            other_blocks.append(block)
+    for block in harness_internal_blocks:
+        results.append(PatchResult(
+            success=False,
+            file=block.file,
+            operation=block.operation,
+            error=(
+                f"refusing to patch harness-internal file {block.file!r}: "
+                "this is the harness's own configuration (validator "
+                "allowlist, model routing, etc.) and lives outside the "
+                "workspace's code. Subdirectory copies of this file are "
+                "never read at runtime. If the harness's behaviour needs "
+                "to change to unblock the build (e.g. an allowed_commands "
+                "entry), surface that requirement in the build output and "
+                "let the operator adjust the global config — do NOT "
+                "propose patches to this file."
+            ),
+        ))
+        logger.warning(
+            "[patcher] Refused harness-internal patch to %s", block.file
+        )
+
     if allowed_paths is not None:
         from harness.trust import is_path_allowed
         allowed_list = list(allowed_paths)
-        for block in blocks:
+        for block in other_blocks:
             if is_path_allowed(block.file, workspace_root, allowed_list):
                 blocks_to_apply.append(block)
             else:
@@ -2359,7 +2399,7 @@ async def apply_patch_blocks(
                     "[patcher] Skill allowlist rejected patch to %s", block.file
                 )
     else:
-        blocks_to_apply = list(blocks)
+        blocks_to_apply = list(other_blocks)
 
     # B5 — read-before-edit + drift detection. Both run against the same
     # files_seen_by_llm dict the host maintains in node_state. Drift detection

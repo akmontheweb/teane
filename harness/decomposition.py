@@ -217,9 +217,10 @@ no commentary:
   valid keys, so prefer to map every story back to the spec it
   implements. A story that implements pure scaffolding without a
   spec requirement is itself a sign the decomposition is wrong.
-- ``depends_on`` may only reference story_keys that appear earlier
-  in the same response. Cross-feature dependencies are allowed and
-  the batch planner will honour them.
+- ``depends_on`` may reference any other story_key declared in this
+  same response (forward or backward — the validator topologically
+  resolves the graph, only true cycles are rejected). Cross-feature
+  dependencies are allowed; the batch planner honours them at runtime.
 
 Specification follows:
 
@@ -455,6 +456,84 @@ def _validate_story_requirement_keys(
     return keys
 
 
+def _check_depends_on_acyclic(
+    story_keys: list[str],
+    deps_per_story: list[list[str]],
+    *,
+    valid_targets: set[str],
+    response_label: str,
+) -> None:
+    """Validate ``depends_on`` references full-set membership + acyclicity.
+
+    Replaces the old strict "declared earlier in the array" check, which
+    rejected LLM responses that happened to emit a forward reference
+    (e.g. STORY-8 depends_on STORY-15 when STORY-15 hadn't appeared yet
+    in the payload). LLMs routinely group stories by feature, not by
+    topological order — and as long as the dependency graph is acyclic
+    there is no semantic problem: ``get_planned_stories`` already gates
+    each story on its deps being ``done`` at runtime, so a forward
+    reference in the payload becomes a backward reference at runtime.
+
+    Cycles remain a hard error: a dependency cycle would leave every
+    story in the cycle blocked forever (each waiting on the others to
+    finish), so the validator must reject them up front.
+    """
+    if len(story_keys) != len(deps_per_story):
+        raise AssertionError("story_keys and deps_per_story must align 1:1")
+
+    # 1) Membership check: every dep target must be a valid key.
+    for key, deps in zip(story_keys, deps_per_story):
+        for d in deps:
+            if d not in valid_targets:
+                raise ValueError(
+                    f"{key} depends_on {d!r} which is not declared in "
+                    f"{response_label}"
+                )
+
+    # 2) Cycle detection: iterative DFS with 3-color marking. Only edges
+    #    INTO this-response keys participate; deps targeting any external
+    #    set (valid_targets - this_response_keys) can never form a cycle
+    #    with this batch.
+    this_response_keys = set(story_keys)
+    by_key = {k: i for i, k in enumerate(story_keys)}
+    adj: list[list[int]] = [[] for _ in story_keys]
+    for i, deps in enumerate(deps_per_story):
+        for d in deps:
+            if d in this_response_keys:
+                adj[i].append(by_key[d])
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = [WHITE] * len(story_keys)
+    for start in range(len(story_keys)):
+        if color[start] != WHITE:
+            continue
+        stack: list[tuple[int, int]] = [(start, 0)]
+        path: list[int] = []
+        color[start] = GRAY
+        path.append(start)
+        while stack:
+            node, idx = stack[-1]
+            if idx < len(adj[node]):
+                stack[-1] = (node, idx + 1)
+                nxt = adj[node][idx]
+                if color[nxt] == GRAY:
+                    cycle_start = path.index(nxt)
+                    cycle_keys = [story_keys[n] for n in path[cycle_start:]] + [
+                        story_keys[nxt]
+                    ]
+                    raise ValueError(
+                        "depends_on cycle detected: "
+                        + " → ".join(cycle_keys)
+                    )
+                if color[nxt] == WHITE:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append((nxt, 0))
+            else:
+                color[node] = BLACK
+                path.pop()
+                stack.pop()
+
+
 def _validate_stories_against_features(
     stories: list[dict[str, Any]],
     declared_feature_keys: set[str],
@@ -517,6 +596,8 @@ def _validate_augment_payload(
         )
     seen_keys: set[str] = set()
     cleaned: list[dict[str, Any]] = []
+    story_keys_in_order: list[str] = []
+    deps_in_order: list[list[str]] = []
     for i, s in enumerate(stories, start=1):
         if not isinstance(s, dict):
             raise ValueError(f"story #{i} must be an object")
@@ -538,26 +619,28 @@ def _validate_augment_payload(
         deps = s.get("depends_on") or []
         if not isinstance(deps, list):
             raise ValueError(f"{key} depends_on must be a list")
-        for d in deps:
-            if d not in seen_keys:
-                raise ValueError(
-                    f"{key} depends_on '{d}' which is not declared earlier "
-                    "in this augment response"
-                )
         scope = s.get("scope_files") or []
         if not isinstance(scope, list):
             raise ValueError(f"{key} scope_files must be a list")
         feature = (s.get("feature") or "").strip()
+        deps_str = [str(x) for x in deps]
+        story_keys_in_order.append(key)
+        deps_in_order.append(deps_str)
         cleaned.append({
             "title": title.strip(),
             "feature": feature or None,
             "description": s.get("description") or None,
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
-            "depends_on": [str(x) for x in deps],
+            "depends_on": deps_str,
             "scope_files": [str(x) for x in scope],
             "external_ref": s.get("external_ref") or None,
         })
+    _check_depends_on_acyclic(
+        story_keys_in_order, deps_in_order,
+        valid_targets=seen_keys,
+        response_label="this augment response",
+    )
     _validate_stories_against_features(
         cleaned,
         {f["feature_key"] for f in features_cleaned},
@@ -593,6 +676,8 @@ def _validate_stories_payload(
 
     seen_keys: set[str] = set()
     cleaned: list[dict[str, Any]] = []
+    story_keys_in_order: list[str] = []
+    deps_in_order: list[list[str]] = []
     for i, s in enumerate(stories, start=1):
         if not isinstance(s, dict):
             raise ValueError(f"story #{i} must be an object")
@@ -614,25 +699,28 @@ def _validate_stories_payload(
         deps = s.get("depends_on") or []
         if not isinstance(deps, list):
             raise ValueError(f"{key} depends_on must be a list")
-        for d in deps:
-            if d not in seen_keys:
-                raise ValueError(
-                    f"{key} depends_on '{d}' which is not declared earlier"
-                )
         scope = s.get("scope_files") or []
         if not isinstance(scope, list):
             raise ValueError(f"{key} scope_files must be a list")
         feature = (s.get("feature") or "").strip()
+        deps_str = [str(x) for x in deps]
+        story_keys_in_order.append(key)
+        deps_in_order.append(deps_str)
         cleaned.append({
             "title": title.strip(),
             "feature": feature or None,
             "description": s.get("description") or None,
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
-            "depends_on": [str(x) for x in deps],
+            "depends_on": deps_str,
             "scope_files": [str(x) for x in scope],
             "external_ref": s.get("external_ref") or None,
         })
+    _check_depends_on_acyclic(
+        story_keys_in_order, deps_in_order,
+        valid_targets=seen_keys,
+        response_label="this response",
+    )
     _validate_stories_against_features(
         cleaned, {f["feature_key"] for f in features_cleaned},
     )
@@ -805,10 +893,11 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.exception("[decomposition] gateway dispatch failed: %s", exc)
         return {
-            "current_gate": "STORIES",
+            "exit_code": 1,
             "node_state": {
                 "current_node": "decomposition",
-                "decomposition_complete": True,
+                "decomposition_complete": False,
+                "decomposition_failed": True,
                 "error": f"dispatch_failed: {exc}",
                 "story_count": 0,
             },
@@ -821,10 +910,11 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         logger.error("[decomposition] LLM returned invalid JSON: %s", exc)
         return {
-            "current_gate": "STORIES",
+            "exit_code": 1,
             "node_state": {
                 "current_node": "decomposition",
-                "decomposition_complete": True,
+                "decomposition_complete": False,
+                "decomposition_failed": True,
                 "error": f"invalid_json: {exc}",
                 "story_count": 0,
             },
@@ -855,11 +945,19 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             )
     except ValueError as exc:
         logger.error("[decomposition] payload validation failed: %s", exc)
+        # Failure must NOT advertise itself as a successful completion —
+        # the prior shape ({decomposition_complete: True, current_gate:
+        # "STORIES"}) caused the gatekeeper to show an empty STORIES gate,
+        # the developer to approve it, the planner to find no stories and
+        # report ``all_complete=True``, and the rest of the pipeline to
+        # generate code with zero traceability to the spec. Route to HITL
+        # with a clear error instead.
         return {
-            "current_gate": "STORIES",
+            "exit_code": 1,
             "node_state": {
                 "current_node": "decomposition",
-                "decomposition_complete": True,
+                "decomposition_complete": False,
+                "decomposition_failed": True,
                 "error": f"validation: {exc}",
                 "story_count": 0,
             },

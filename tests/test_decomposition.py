@@ -289,15 +289,44 @@ def test_validate_rejects_missing_acceptance():
         decomposition._validate_stories_payload(payload)
 
 
-def test_validate_rejects_forward_dependency():
+def test_validate_accepts_forward_dependency():
+    """LLMs commonly emit stories in feature-grouping order, not topological
+    order. A forward depends_on is acyclic and therefore safe; the validator
+    must accept it (the runtime planner gates on deps being 'done')."""
     payload = _payload_with_one_feature([
-        {"story_key": "STORY-1", "title": "a",
+        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
          "acceptance_criteria": ["x"], "depends_on": ["STORY-2"]},
-        {"story_key": "STORY-2", "title": "b",
+        {"story_key": "STORY-2", "title": "b", "requirement_keys": ["FR-001"],
          "acceptance_criteria": ["y"]},
     ])
-    with pytest.raises(ValueError, match="not declared earlier"):
-        decomposition._validate_stories_payload(payload)
+    _, stories = decomposition._validate_stories_payload(
+        payload, known_req_keys={"FR-001"},
+    )
+    assert stories[0]["depends_on"] == ["STORY-2"]
+
+
+def test_validate_rejects_unknown_dependency_target():
+    payload = _payload_with_one_feature([
+        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["x"], "depends_on": ["STORY-99"]},
+    ])
+    with pytest.raises(ValueError, match="STORY-99"):
+        decomposition._validate_stories_payload(
+            payload, known_req_keys={"FR-001"},
+        )
+
+
+def test_validate_rejects_dependency_cycle():
+    payload = _payload_with_one_feature([
+        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["x"], "depends_on": ["STORY-2"]},
+        {"story_key": "STORY-2", "title": "b", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["y"], "depends_on": ["STORY-1"]},
+    ])
+    with pytest.raises(ValueError, match="cycle"):
+        decomposition._validate_stories_payload(
+            payload, known_req_keys={"FR-001"},
+        )
 
 
 def test_validate_rejects_duplicate_keys():

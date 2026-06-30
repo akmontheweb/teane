@@ -625,7 +625,21 @@ class CommandValidator:
             tokens = part.split()
             if not tokens:
                 continue
-            base_cmd = os.path.basename(tokens[0])  # Strip path if present
+            # Strip subshell / group / negation prefixes that bash treats
+            # as syntax, not as a command name. Without this, a build line
+            # like ``(test -d X || uv venv X) && pip install …`` was
+            # rejected as ``whitelist_missing:(test`` — the validator saw
+            # the literal ``(test`` token because of the subshell paren.
+            # We also strip a trailing ``)`` from the same token so a
+            # one-command subshell ``(true)`` resolves to ``true``.
+            first = tokens[0].lstrip("(!{").rstrip(")}")
+            if not first:
+                # Token was entirely syntax (e.g. an opening ``(`` by
+                # itself, which can legitimately occur as its own word).
+                # Nothing actionable for the whitelist; move on to the
+                # next split part.
+                continue
+            base_cmd = os.path.basename(first)  # Strip path if present
 
             # Skip common shell builtins and operators.
             #

@@ -144,6 +144,28 @@ class TestCommandValidator:
         # (if whitelist is enforced)
         assert validator is not None
 
+    def test_validate_strips_leading_subshell_paren(self):
+        """A leading ``(`` (bash subshell) must not be mis-read as part
+        of the command name. Reproduces the FinancialResearch failure
+        where ``(test -d /tmp/venv || uv venv …) && pip install``
+        was rejected as ``whitelist_missing:(test``."""
+        validator = CommandValidator()
+        # ``test`` and ``uv`` are in DEFAULT_ALLOWED_COMMANDS; verify
+        # that the subshell wrapping doesn't trip whitelist parsing.
+        cmd = (
+            "(test -d /tmp/venv || uv venv /tmp/venv) && "
+            ". /tmp/venv/bin/activate && uv pip install pytest"
+        )
+        result = validator.validate(cmd)
+        assert result.allowed, f"unexpectedly blocked: {result.reason}"
+
+    def test_validate_strips_trailing_close_paren_on_single_token(self):
+        """A single-command subshell ``(true)`` must resolve to ``true``."""
+        validator = CommandValidator()
+        validator.add_allowed_command("true")
+        result = validator.validate("(true) && echo ok")
+        assert result.allowed, f"unexpectedly blocked: {result.reason}"
+
 
 class TestCommandValidationResult:
     """Test CommandValidationResult dataclass."""

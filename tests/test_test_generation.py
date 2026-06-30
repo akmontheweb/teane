@@ -12,6 +12,8 @@ from harness.test_generation import (
     _PRIMARY_STACK_PRIORITY,
     _STACK_TEST_COMMANDS,
     _is_test_file,
+    _parse_verifies_marker,
+    _persist_verifies_links,
     _pick_primary_stack,
     _stack_test_command,
     _inside_workspace,
@@ -280,11 +282,18 @@ class TestHappyPath:
             "    return a // b\n"
         )
 
-        # Stub the LLM to return one CREATE_FILE block for a test file
+        # Stub the LLM to return one CREATE_FILE block for a test file.
+        # v5 Phase 3 contract: every generated test MUST carry a
+        # `# @verifies: STORY-N.AC-N` marker. This canned response
+        # includes one so the marker gate passes; the ac_key references
+        # an AC that doesn't exist in this test's state.db, which
+        # produces a "dropped unknown ac_key" log but doesn't fail the
+        # gate (Phase 3 warn-and-drop).
         gw = stub_gateway(
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calculator.py\n"
             "content:\n"
+            "# @verifies: STORY-1.AC-1\n"
             "from calculator import divide\n"
             "def test_divide():\n"
             "    assert divide(10, 2) == 5\n"
@@ -363,6 +372,7 @@ class TestFailurePath:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_foo.py\n"
             "content:\n"
+            "# @verifies: STORY-1.AC-1\n"
             "from foo import foo\n"
             "def test_foo(): assert foo() == 2  # wrong on purpose\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -478,3 +488,196 @@ class TestRepairFraming:
             "repair_node must use the TEST_FAILURE framing for these diagnostics"
         )
         assert "Do NOT add mocks" in joined or "do not add mocks" in joined.lower()
+
+
+# ---------------------------------------------------------------------------
+# v5 @verifies marker — parser + gate + link writer
+# ---------------------------------------------------------------------------
+
+class TestVerifiesMarkerParser:
+    """Unit tests for _parse_verifies_marker. Permissive on whitespace,
+    strict on key shape (STORY-N.AC-N anchored)."""
+
+    def test_python_comment_style(self):
+        assert _parse_verifies_marker(
+            "# @verifies: STORY-3.AC-2\nimport pytest"
+        ) == ["STORY-3.AC-2"]
+
+    def test_js_java_comment_style(self):
+        assert _parse_verifies_marker(
+            "// @verifies: STORY-1.AC-1\nimport foo;"
+        ) == ["STORY-1.AC-1"]
+
+    def test_multi_ac_comma_separated(self):
+        assert _parse_verifies_marker(
+            "// @verifies: STORY-1.AC-1, STORY-1.AC-2, STORY-2.AC-3\n"
+        ) == ["STORY-1.AC-1", "STORY-1.AC-2", "STORY-2.AC-3"]
+
+    def test_permissive_whitespace(self):
+        assert _parse_verifies_marker(
+            "#  @verifies:   STORY-5.AC-7\n"
+        ) == ["STORY-5.AC-7"]
+
+    def test_missing_marker_returns_empty(self):
+        assert _parse_verifies_marker(
+            "import pytest\ndef test_foo(): pass\n"
+        ) == []
+
+    def test_malformed_key_filtered_out(self):
+        # NOT-A-KEY doesn't match STORY-N.AC-N; the cleaning step drops it.
+        assert _parse_verifies_marker("# @verifies: NOT-A-KEY\n") == []
+
+    def test_mixed_valid_and_invalid_keeps_valid(self):
+        assert _parse_verifies_marker(
+            "# @verifies: STORY-1.AC-1, BOGUS, STORY-2.AC-3\n"
+        ) == ["STORY-1.AC-1", "STORY-2.AC-3"]
+
+    def test_marker_buried_past_scan_window_ignored(self):
+        body = "\n".join(
+            ["# preamble"] * 60 + ["# @verifies: STORY-1.AC-1"]
+        )
+        assert _parse_verifies_marker(body) == []
+
+    def test_empty_body_returns_empty(self):
+        assert _parse_verifies_marker("") == []
+
+
+class TestVerifiesGate:
+    """Integration tests for the markerless-test gate inside
+    test_generation_node."""
+
+    @pytest.mark.asyncio
+    async def test_markerless_test_routes_to_repair(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """A generated test without a `@verifies:` marker is rejected
+        before the sandbox runs; the resulting compiler_errors route
+        the flow to repair_node via the existing TEST_FAILURE path."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calculator.py").write_text("def divide(a, b): return a // b\n")
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "from calculator import divide\n"
+            "def test_divide(): assert divide(10, 2) == 5\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        # If the sandbox ran, the test would pass — gate must intercept first.
+        stub_sandbox(0, "1 passed in 0.01s")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calculator.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+
+        assert result["compiler_errors"], "marker gate must populate compiler_errors"
+        codes = [d["error_code"] for d in result["compiler_errors"]]
+        assert all(c.startswith("TEST_FAILURE:missing_verifies_marker") for c in codes)
+        assert result["node_state"]["test_generation"]["status"] == "missing_verifies_marker"
+        assert route_after_test_generation(result) == "repair_node"
+
+    @pytest.mark.asyncio
+    async def test_malformed_marker_treated_as_missing(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "f.py").write_text("def f(): return 1\n")
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_f.py\n"
+            "content:\n"
+            "# @verifies: NOT-A-VALID-KEY\n"
+            "from f import f\n"
+            "def test_f(): assert f() == 1\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["f.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+
+        assert result["node_state"]["test_generation"]["status"] == "missing_verifies_marker"
+        assert route_after_test_generation(result) == "repair_node"
+
+
+class TestVerifiesLinkPersistence:
+    """_persist_verifies_links writes (test_path, ac_key) edges into
+    the test_verifies_ac table after the sandbox passes."""
+
+    def test_empty_input_no_op(self, tmp_path):
+        assert _persist_verifies_links(str(tmp_path), {}) == (0, 0)
+
+    def test_inserts_known_ac_keys_and_drops_unknown(self, tmp_path):
+        from harness import story_state
+        # Seed: one feature + one story + one AC on a fresh state.db
+        # scoped to this tmp_path's basename (which is what
+        # app_name_for_workspace derives).
+        ws = tmp_path / "verify-link-ws"
+        ws.mkdir()
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "f", name="F")
+            keys = story_state.create_stories(conn, app, [{
+                "title": "S", "feature": "f",
+                "acceptance_criteria": ["only AC"],
+            }])
+            sid = story_state.get_story(conn, app, keys[0])["id"]
+            ac = story_state.list_acceptance_criteria(conn, app, sid)[0]
+            known_ac_key = ac["ac_key"]
+        finally:
+            conn.close()
+
+        inserted, dropped = _persist_verifies_links(
+            str(ws),
+            {
+                "tests/test_real.py": [known_ac_key, "STORY-99.AC-99"],
+                "tests/test_other.py": [known_ac_key],
+            },
+        )
+        assert inserted == 2  # one per file pointing at the known AC
+        assert dropped == 1  # the STORY-99 key
+
+        # Round-trip: link rows present
+        conn = story_state.open_story_db()
+        try:
+            rows = conn.execute(
+                "SELECT test_path FROM test_verifies_ac "
+                "WHERE workspace = ? ORDER BY test_path", (app,),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert [r[0] for r in rows] == [
+            "tests/test_other.py", "tests/test_real.py",
+        ]
+
+    def test_idempotent_on_rerun(self, tmp_path):
+        from harness import story_state
+        ws = tmp_path / "idempotent-ws"
+        ws.mkdir()
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "f", name="F")
+            keys = story_state.create_stories(conn, app, [{
+                "title": "S", "feature": "f",
+                "acceptance_criteria": ["AC"],
+            }])
+            sid = story_state.get_story(conn, app, keys[0])["id"]
+            ac_key = story_state.list_acceptance_criteria(conn, app, sid)[0]["ac_key"]
+        finally:
+            conn.close()
+        # First call: 1 insert
+        a, _ = _persist_verifies_links(str(ws), {"tests/t.py": [ac_key]})
+        # Second call: composite PK → no new insert
+        b, _ = _persist_verifies_links(str(ws), {"tests/t.py": [ac_key]})
+        assert a == 1 and b == 0

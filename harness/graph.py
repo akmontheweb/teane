@@ -10006,6 +10006,7 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
 
     workspace = state.get("workspace_path") or ""
     story = None
+    ac_rows: list[dict] = []
     if workspace:
         try:
             from harness import story_state as _sst
@@ -10013,6 +10014,15 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
             conn = _sst.open_story_db()
             try:
                 story = _sst.get_story(conn, app_name, story_key)
+                # v5: fetch the AC rows separately so the preamble can
+                # render each criterion with its stable ac_key. The
+                # test-gen @verifies marker contract references these
+                # keys verbatim (e.g. ``# @verifies: STORY-3.AC-2``),
+                # so the LLM must see them in the source material.
+                if story is not None:
+                    ac_rows = _sst.list_acceptance_criteria(
+                        conn, app_name, story["id"],
+                    )
             finally:
                 conn.close()
         except Exception:  # noqa: BLE001
@@ -10024,7 +10034,17 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     scope = state.get("story_scope_files") or story.get("scope_files") or []
     external = story.get("external_ref") or ""
 
-    ac_block = "\n".join(f"  - {c}" for c in ac) if ac else "  - (none recorded)"
+    # Prefer the row-with-keys rendering when ac_rows came back; fall
+    # back to plain bullets when the side-table is empty (legacy data
+    # or a peek-failure path) so the preamble stays useful.
+    if ac_rows:
+        ac_block = "\n".join(
+            f"  - {r['ac_key']}: {r['text']}" for r in ac_rows
+        )
+    else:
+        ac_block = (
+            "\n".join(f"  - {c}" for c in ac) if ac else "  - (none recorded)"
+        )
     scope_block = (
         "\n".join(f"  - {p}" for p in scope) if scope else
         "  - (unscoped — touch only what the acceptance criteria require)"

@@ -934,16 +934,21 @@ def test_docs_page_highlights_docs_nav_item(tmp_path):
 
 def test_status_summarises_today_succeeded_and_failed(tmp_path):
     cfg = _make_cfg(tmp_path)
+    # Use offset 0 for every timestamp: this test runs in CI at all
+    # hours, so any non-zero offset risks crossing UTC midnight and
+    # putting "today's" fixture sessions into yesterday's bucket
+    # (the Status page filters today by UTC date). The test asserts
+    # only on session count + status tags, not durations.
     # One succeeded today
     _write_session_log(cfg.log_dir, "ok", [
-        {"event": "session_start", "timestamp": _utc_iso(60), "workspace_path": "/w"},
-        {"event": "llm_call", "timestamp": _utc_iso(60), "cost_usd": 0.05, "tokens_in": 10, "tokens_out": 5},
-        {"event": "session_end", "timestamp": _utc_iso(55), "exit_code": 0},
+        {"event": "session_start", "timestamp": _utc_iso(0), "workspace_path": "/w"},
+        {"event": "llm_call", "timestamp": _utc_iso(0), "cost_usd": 0.05, "tokens_in": 10, "tokens_out": 5},
+        {"event": "session_end", "timestamp": _utc_iso(0), "exit_code": 0},
     ])
     # One failed today
     _write_session_log(cfg.log_dir, "bad", [
-        {"event": "session_start", "timestamp": _utc_iso(40), "workspace_path": "/w"},
-        {"event": "session_end", "timestamp": _utc_iso(35), "exit_code": 1},
+        {"event": "session_start", "timestamp": _utc_iso(0), "workspace_path": "/w"},
+        {"event": "session_end", "timestamp": _utc_iso(0), "exit_code": 1},
     ])
     _, _, body = dispatch(cfg, "/status")
     assert "Today" in body

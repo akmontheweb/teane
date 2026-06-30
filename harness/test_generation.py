@@ -255,6 +255,135 @@ def _inside_workspace(file_rel: str, workspace_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# v5 @verifies marker parser
+# ---------------------------------------------------------------------------
+
+# Permissive regex: leading whitespace + comment lead (``#`` for Python, ``//``
+# for JS/TS/Java) + optional spaces + ``@verifies:`` + AC key list. Case-
+# sensitive on keys (matches the spec/decomposition convention).
+# Captures the AC key list (everything after the colon up to end of line),
+# split + stripped by ``_parse_verifies_marker``.
+_VERIFIES_RE = re.compile(
+    r"^\s*(?:#|//)\s*@verifies:\s*(?P<keys>.+?)\s*$",
+    re.MULTILINE,
+)
+
+# Allowed AC key shape — STORY-N.AC-N. Anchors avoid matching substrings
+# embedded in noise (e.g. ``foo-STORY-1.AC-2`` would not match).
+_AC_KEY_RE = re.compile(r"^STORY-\d+\.AC-\d+$")
+
+# How many lines we scan from the top of the file. The convention is that
+# the marker lives at the top (after module docstring / imports); a marker
+# buried at line 800 is almost certainly not what the LLM meant. 50 covers
+# any reasonable preamble depth (docstring + imports + a class header).
+_VERIFIES_SCAN_LINES = 50
+
+
+def _persist_verifies_links(
+    workspace_path: str,
+    marker_keys_by_file: dict[str, list[str]],
+) -> tuple[int, int]:
+    """Insert ``test_verifies_ac`` edges for every (test_path, ac_key)
+    pair the marker parser surfaced.
+
+    Returns ``(links_inserted, unknown_keys_dropped)``. Unknown ``ac_key``s
+    (the LLM cited an AC that isn't in the workspace's
+    ``acceptance_criteria`` table) are logged and dropped — Phase 4's
+    audit gate will still flag uncovered ACs, so the failure mode is
+    "missing coverage" not "silently wrong link". Soft-fails on DB
+    errors: a broken state.db must not block a passing test run.
+    """
+    if not marker_keys_by_file:
+        return (0, 0)
+    try:
+        from harness import story_state
+        app_name = story_state.app_name_for_workspace(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[test_generation_node] @verifies persist skipped (workspace=%r): %s",
+            workspace_path, exc,
+        )
+        return (0, 0)
+    inserted = 0
+    dropped = 0
+    try:
+        conn = story_state.open_story_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[test_generation_node] @verifies persist skipped (open_story_db "
+            "failed): %s", exc,
+        )
+        return (0, 0)
+    try:
+        # Resolve every cited ac_key to its row id in one batch SELECT
+        # so the per-link inserts don't N+1 the DB.
+        all_keys = sorted({
+            k for keys in marker_keys_by_file.values() for k in keys
+        })
+        ac_rows: dict[str, int] = {}
+        if all_keys:
+            placeholders = ",".join(["?"] * len(all_keys))
+            for row in conn.execute(
+                f"SELECT ac_key, id FROM acceptance_criteria "
+                f"WHERE workspace = ? AND ac_key IN ({placeholders})",
+                (app_name, *all_keys),
+            ):
+                ac_rows[row[0]] = int(row[1])
+        for test_path, keys in marker_keys_by_file.items():
+            for key in keys:
+                ac_id = ac_rows.get(key)
+                if ac_id is None:
+                    logger.warning(
+                        "[test_generation_node] @verifies marker in %r cites "
+                        "unknown ac_key %r; dropping link (Phase 4 audit "
+                        "will still flag uncovered ACs).",
+                        test_path, key,
+                    )
+                    dropped += 1
+                    continue
+                if story_state.link_test_to_ac(
+                    conn, app_name, test_path, ac_id,
+                ):
+                    inserted += 1
+    finally:
+        conn.close()
+    return (inserted, dropped)
+
+
+def _parse_verifies_marker(body: str) -> list[str]:
+    """Return the AC key list from the first ``@verifies:`` marker in
+    ``body``'s first :data:`_VERIFIES_SCAN_LINES` lines.
+
+    Returns ``[]`` when:
+      - no marker found in the scan window
+      - marker found but the key list is empty
+      - marker found but no element matches the ``STORY-N.AC-N`` shape
+
+    The shape filter is lenient on whitespace and trailing commas but
+    strict on the key form — a malformed key fails the gate the same
+    way a missing marker does, so the LLM's repair pass sees a single
+    "missing or malformed marker" failure mode rather than a separate
+    "key didn't match the regex" mode.
+    """
+    if not body:
+        return []
+    # Limit the haystack to the scan window so a buried marker far
+    # below imports / setup doesn't satisfy the gate.
+    lines = body.splitlines()
+    head = "\n".join(lines[: _VERIFIES_SCAN_LINES])
+    match = _VERIFIES_RE.search(head)
+    if not match:
+        return []
+    raw = match.group("keys") or ""
+    candidates = [c.strip() for c in raw.split(",")]
+    keys: list[str] = []
+    for c in candidates:
+        if c and _AC_KEY_RE.match(c):
+            keys.append(c)
+    return keys
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
@@ -289,6 +418,18 @@ RULES — absolute:
      values, error branches). Skip cases that would require mocking external
      services.
   4. Match the stack-canonical layout and naming convention.
+  5. EVERY generated test file MUST carry a `@verifies` marker at the top
+     of the file (after the module docstring / imports, within the first
+     50 non-blank lines) naming the acceptance criteria the file's tests
+     verify. Use the language-appropriate comment style:
+       - Python:    # @verifies: STORY-3.AC-2
+       - JS / TS:   // @verifies: STORY-3.AC-2
+       - Java:      // @verifies: STORY-3.AC-2
+     Comma-separate multiple ACs (e.g. `# @verifies: STORY-3.AC-1, STORY-3.AC-2`).
+     Use the AC keys exactly as they appear in the story preamble's
+     "Acceptance criteria" block. A file with no marker — or a marker
+     that uses an AC key absent from the preamble — is rejected and
+     the test-gen pass is routed back to repair.
 
 Generate test patches NOW. Only the blocks above. No other text."""
 
@@ -623,6 +764,81 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         ),
     })
 
+    # --- v5 @verifies marker gate ---
+    # Every generated test file MUST carry a `# @verifies: STORY-N.AC-N`
+    # marker (Phase 3 contract). Files that don't are short-circuited
+    # into the existing repair pipeline via a TEST_FAILURE diagnostic
+    # — the LLM's next iteration sees the diagnostic and adds the
+    # marker. We parse markers here (in-memory, no DB) so the gate
+    # fires before the sandbox run; the actual ``test_verifies_ac``
+    # write happens AFTER the sandbox passes (a failing test that
+    # claims to verify an AC shouldn't carry the link).
+    marker_keys_by_file: dict[str, list[str]] = {}
+    marker_missing: list[str] = []
+    for rel in generated_tests:
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError as exc:
+            logger.warning(
+                "[test_generation_node] Could not re-read generated test %r "
+                "for marker parse: %s — treating as marker-missing.",
+                rel, exc,
+            )
+            marker_missing.append(rel)
+            continue
+        keys = _parse_verifies_marker(body)
+        if not keys:
+            marker_missing.append(rel)
+        else:
+            marker_keys_by_file[rel] = keys
+
+    if marker_missing:
+        diags = [
+            _synth_diag(
+                file=rel,
+                message=(
+                    f"Generated test {rel!r} is missing a `@verifies:` marker. "
+                    "Every generated test file MUST declare which acceptance "
+                    "criteria it verifies, using a comment at the top of the "
+                    "file (within the first 50 lines): "
+                    "`# @verifies: STORY-N.AC-N` (Python) or "
+                    "`// @verifies: STORY-N.AC-N` (JS/TS/Java). Comma-separate "
+                    "multiple ACs. Use AC keys exactly as they appear in the "
+                    "story preamble's `### Acceptance criteria` block."
+                ),
+                error_code="TEST_FAILURE:missing_verifies_marker",
+            )
+            for rel in marker_missing
+        ]
+        logger.warning(
+            "[test_generation_node] %d/%d generated test file(s) missing "
+            "@verifies marker; routing to repair: %s",
+            len(marker_missing), len(generated_tests),
+            ", ".join(marker_missing),
+        )
+        return {
+            "messages": messages,
+            "modified_files": new_modified,
+            "generated_tests": list(state.get("generated_tests", [])) + generated_tests,
+            "exit_code": 1,
+            "compiler_errors": diags,
+            "token_tracker": token_tracker,
+            "budget_remaining_usd": new_budget,
+            "loop_counter": loop_counter,
+            "node_state": {
+                **(state.get("node_state") or {}),
+                "current_node": "test_generation",
+                "test_generation": {
+                    "status": "missing_verifies_marker",
+                    "primary_stack": primary,
+                    "tests_generated": len(generated_tests),
+                    "markerless_count": len(marker_missing),
+                },
+            },
+        }
+
     # --- Skip deterministic run when no tests landed ---
     if not generated_tests:
         logger.info(
@@ -739,6 +955,22 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "[test_generation_node] Tests passed (%d test file(s) executed).",
             len(generated_tests),
         )
+        # v5 link writer — for every test that parsed a marker AND
+        # passed the sandbox run, persist (test_path, ac_key) edges
+        # into ``test_verifies_ac`` so the audit gate can join AC
+        # coverage. Unknown ac_keys are warned-and-dropped here
+        # (Phase 3 soft mode); the audit gate in Phase 4 still
+        # surfaces them as "untested AC" if no other test claims to
+        # verify them, so the data loss is bounded.
+        link_count, drop_count = _persist_verifies_links(
+            workspace_path, marker_keys_by_file,
+        )
+        if link_count or drop_count:
+            logger.info(
+                "[test_generation_node] @verifies links persisted: %d "
+                "edge(s) inserted, %d unknown ac_key(s) dropped.",
+                link_count, drop_count,
+            )
         return {
             "messages": messages,
             "modified_files": new_modified,
@@ -757,6 +989,8 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                     "primary_stack": primary,
                     "tests_generated": len(generated_tests),
                     "test_command": test_cmd,
+                    "verifies_links_inserted": link_count,
+                    "verifies_links_dropped": drop_count,
                 },
             },
         }

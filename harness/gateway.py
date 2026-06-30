@@ -120,6 +120,15 @@ class LLMResponse:
     # only the schema exists; provider wiring is gated behind
     # ``GatewayConfig.use_structured_tools`` and added in a follow-up.
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Reasoning-model chain-of-thought. Populated when the provider
+    # surfaces internal reasoning tokens separately from final ``content``
+    # (OpenAI-compat: ``message.reasoning_content`` or ``message.thinking``;
+    # Anthropic: ``type="thinking"`` content blocks). These tokens are
+    # billed in ``usage.output_tokens`` even though they don't appear in
+    # ``content`` — without this field they show up as "tokens charged
+    # but no visible response", which makes debugging silently-thinking
+    # models impossible. Default empty string for non-reasoning models.
+    reasoning_content: str = ""
 
 
 @dataclass
@@ -574,6 +583,34 @@ def _normalize_messages_for_openai_tools(
     return out
 
 
+def _extract_openai_compat_reasoning(message: dict[str, Any]) -> str:
+    """Pull a reasoning-model's hidden chain-of-thought out of an
+    OpenAI-compat chat-completions response message.
+
+    Different reasoning models surface CoT under different keys on the
+    same wire shape:
+      - ``message.reasoning_content``: DeepSeek-Reasoner family, some
+        OpenAI-compat self-hosts.
+      - ``message.thinking``: Qwen3-thinking / DeepSeek-R1 over Ollama,
+        some vLLM deployments.
+      - ``message.reasoning``: OpenAI o-series via the legacy
+        chat-completions shim (newer Responses API uses a different shape
+        and goes through a different code path).
+
+    All variants live under ``choices[0].message`` and are billed in
+    ``completion_tokens`` even when ``content`` is empty. Returns the
+    first non-empty string found, or ``""`` if the model didn't surface
+    reasoning. Provider-agnostic — same helper for every OpenAI-shape
+    backend so adding a new reasoning model is a price-catalogue edit,
+    not a code change.
+    """
+    for key in ("reasoning_content", "thinking", "reasoning"):
+        val = message.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
 def _parse_openai_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     """Translate an OpenAI-compat ``message.tool_calls`` list into the
     harness's canonical ``[{name, input, id}, ...]`` shape.
@@ -675,6 +712,7 @@ class DeepSeekProvider(BaseLLM):
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {}) or {}
         content = message.get("content") or ""
+        reasoning_content = _extract_openai_compat_reasoning(message)
         finish_reason = choice.get("finish_reason", "stop")
         tool_calls = _parse_openai_tool_calls(message)
 
@@ -685,6 +723,7 @@ class DeepSeekProvider(BaseLLM):
             finish_reason=finish_reason,
             raw_response=data,
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -872,14 +911,27 @@ class AnthropicProvider(BaseLLM):
         # Anthropic returns content as a list of typed blocks. Extract
         # the text parts AND the tool_use blocks separately — the model
         # can emit both in the same turn ("I'll start by reading the
-        # file" + a tool_use call).
+        # file" + a tool_use call). Extended-thinking turns also surface
+        # ``type=thinking`` (visible CoT) and ``type=redacted_thinking``
+        # (opaque safety-classifier output) blocks; collect them into
+        # ``reasoning_content`` so they parallel the OpenAI-shape
+        # ``reasoning_content`` field instead of being silently dropped.
         content_blocks = data.get("content", [])
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         for block in content_blocks:
             btype = block.get("type")
             if btype == "text":
                 text_parts.append(block.get("text", ""))
+            elif btype == "thinking":
+                thought = block.get("thinking") or block.get("text") or ""
+                if thought:
+                    reasoning_parts.append(thought)
+            elif btype == "redacted_thinking":
+                # Opaque ciphertext — we can't read it, but mark its
+                # presence so debug dumps don't claim no reasoning happened.
+                reasoning_parts.append("[redacted_thinking: opaque block from provider]")
             elif btype == "tool_use":
                 tool_calls.append({
                     "name": block.get("name", ""),
@@ -887,6 +939,7 @@ class AnthropicProvider(BaseLLM):
                     "id": block.get("id", ""),
                 })
         content = "\n".join(text_parts)
+        reasoning_content = "\n".join(reasoning_parts)
 
         finish_reason = data.get("stop_reason", "stop")
 
@@ -897,6 +950,7 @@ class AnthropicProvider(BaseLLM):
             finish_reason=finish_reason,
             raw_response=data,
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -976,6 +1030,7 @@ class OpenAIProvider(BaseLLM):
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {}) or {}
         content = message.get("content") or ""
+        reasoning_content = _extract_openai_compat_reasoning(message)
         finish_reason = choice.get("finish_reason", "stop")
         tool_calls = _parse_openai_tool_calls(message)
 
@@ -986,6 +1041,7 @@ class OpenAIProvider(BaseLLM):
             finish_reason=finish_reason,
             raw_response=data,
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -1059,6 +1115,7 @@ class OllamaProvider(BaseLLM):
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {}) or {}
         content = message.get("content") or ""
+        reasoning_content = _extract_openai_compat_reasoning(message)
         finish_reason = choice.get("finish_reason", "stop")
         tool_calls = _parse_openai_tool_calls(message)
 
@@ -1069,6 +1126,7 @@ class OllamaProvider(BaseLLM):
             finish_reason=finish_reason,
             raw_response=data,
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -2014,6 +2072,15 @@ class Gateway:
         response_text = response.content if isinstance(response.content, str) else str(response.content)
         sections.append(
             f"\n---\n## response  ({len(response_text)} chars)\n---\n{response_text}\n"
+        )
+        # Reasoning-model chain-of-thought — invisible in `content` but
+        # billed in `usage.output_tokens`. Without this section a 3000-token
+        # response that looks like a 50-char stub on the wire is impossible
+        # to debug. Always emit the section header so the dump shape is
+        # stable; the body is empty for non-reasoning models.
+        reasoning_text = getattr(response, "reasoning_content", "") or ""
+        sections.append(
+            f"\n---\n## reasoning_content  ({len(reasoning_text)} chars)\n---\n{reasoning_text}\n"
         )
 
         with open(path, "w", encoding="utf-8") as f:

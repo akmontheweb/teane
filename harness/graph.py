@@ -7914,9 +7914,11 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         _REPAIR_FORMAT_REMINDER = _build_change_request_preamble(
             state, "patching"
         ) + """[CRITICAL FORMAT INSTRUCTION]
-You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
+You MUST respond using ONLY the block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
-as one or more patch blocks.
+as one or more blocks.
+
+Patch blocks (emit these to fix the build):
 
 <<<REPLACE_BLOCK>>>
 file: path/to/file.ext
@@ -7931,6 +7933,19 @@ file: path/to/file.ext
 content:
 <complete file contents>
 <<<END_CREATE_FILE>>>
+
+File-read block (use SPARINGLY — strictly budgeted):
+
+<<<READ_FILE>>>
+file: path/to/file.ext
+<<<END_READ_FILE>>>
+
+READ_FILE budget: at most 2 READ_FILE rounds per repair iteration. The
+harness resolves your reads and re-dispatches without consuming an
+iteration — but only twice. A third READ_FILE WILL BE STRIPPED and you
+will be forced to emit patches with whatever context you have. So read
+only files you genuinely need to see and have not been shown; everything
+else, patch directly.
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your fix patches NOW. Only the blocks above. No other text."""
@@ -8000,6 +8015,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # READ_FILE_MAX_RESOLVES so the LLM can't loop forever asking for
         # files instead of patching.
         from harness.patcher import (
+            parse_patch_blocks,
             parse_read_blocks as _parse_read_blocks,
             strip_read_blocks as _strip_read_blocks,
         )
@@ -8025,9 +8041,56 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 len(read_reqs), [r[0] for r in read_reqs],
             )
             response, new_budget = await _dispatch_repair(messages, new_budget)
-        # If the LLM is still emitting READ_FILE after the cap, ignore them
-        # (strip below) and let the rest of the response apply. The cap log
-        # above is the operator's signal that the loop got chatty.
+
+        # Forced-patch escape valve: if the post-cap response is STILL a
+        # READ_FILE-only emission with no parseable patches, the model is
+        # spiralling — it would otherwise get its READ_FILE stripped and
+        # land 0 patches, tripping consecutive_zero. Spend one more
+        # dispatch with an explicit "no more READ_FILE, patch now" prompt
+        # so the model is forced to commit. Without this, a model that
+        # correctly diagnosed the fix (recorded in reasoning_content) but
+        # kept asking for files burns a full repair iteration on nothing.
+        post_cap_reads = _parse_read_blocks(response.content)
+        if post_cap_reads:
+            stripped_preview = _strip_read_blocks(response.content)
+            if not parse_patch_blocks(stripped_preview):
+                logger.info(
+                    "[repair_node] READ_FILE cap hit and post-cap response "
+                    "carries %d more READ_FILE block(s) with no patches "
+                    "(%s). Issuing forced-patch retry.",
+                    len(post_cap_reads),
+                    [r[0] for r in post_cap_reads],
+                )
+                messages.append(MessageDict(
+                    role="assistant", content=response.content,
+                ))
+                messages.append(MessageDict(
+                    role="user",
+                    content=(
+                        "[Forced-patch] Your READ_FILE budget for this "
+                        "repair iteration is exhausted. The harness will "
+                        "IGNORE any further READ_FILE blocks. Based on "
+                        "the files you have already been shown above, "
+                        "emit your best-guess patches NOW using "
+                        "REPLACE_BLOCK / CREATE_FILE / DELETE_BLOCK / "
+                        "INSERT_AT_BLOCK only. If you are uncertain, "
+                        "favour the narrowest plausible fix — a "
+                        "near-miss patch is more useful than zero "
+                        "patches. No prose, no READ_FILE, no markdown."
+                    ),
+                ))
+                response, new_budget = await _dispatch_repair(messages, new_budget)
+                try:
+                    from harness.observability import emit_event
+                    emit_event(
+                        "repair_forced_patch_retry",
+                        unresolved_read_files=[r[0] for r in post_cap_reads],
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+        # If the LLM is still emitting READ_FILE after the forced retry,
+        # ignore them (strip below) and let the rest of the response apply.
 
         # Update token tracker (per-stage attribution: repair). Reflects
         # the FINAL response after any READ_FILE resolutions.

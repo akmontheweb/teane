@@ -1074,6 +1074,43 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
         os.path.relpath(trace_md, workspace_path),
         " (with arch coverage)" if arch_summary_dict else "",
     )
+
+    # v5 soft batch warnings — run the SQL audit at end-of-batch and
+    # log gaps so the operator notices early, but DO NOT block.
+    # End-of-session enforcement lives in installation_doc_node where
+    # ``traceability.enforce`` (default true) can route to HITL.
+    # Batches that hit a gap continue running so the audit doesn't
+    # stall mid-feature; the operator sees the warning in the log and
+    # the freshly-regenerated TRACEABILITY.md.
+    audit_summary: dict[str, Any] = {}
+    try:
+        from harness.traceability import audit_workspace
+        report = audit_workspace(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[traceability] batch audit skipped: %s", exc)
+        report = None
+    if report is not None:
+        audit_summary = {
+            "total_reqs": report.total_reqs,
+            "traced_reqs": report.traced_reqs,
+            "untraced_count": len(report.untraced),
+            "total_acs": report.total_acs,
+            "verified_acs": report.verified_acs,
+            "untested_count": len(report.untested_acs),
+        }
+        if report.has_failures():
+            logger.warning(
+                "[traceability] batch gaps — reqs %d/%d (%.0f%%), "
+                "ACs %d/%d (%.0f%%); untraced=%d, untested=%d. "
+                "Soft warning at end-of-batch; end-of-session will "
+                "block unless traceability.enforce=false.",
+                report.traced_reqs, report.total_reqs,
+                report.req_coverage_pct,
+                report.verified_acs, report.total_acs,
+                report.ac_coverage_pct,
+                len(report.untraced), len(report.untested_acs),
+            )
+
     return {
         "arch_summary": arch_summary_dict,
         "node_state": {
@@ -1082,5 +1119,6 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
             "stories_md": stories_md,
             "traceability_md": trace_md,
             "arch_coverage_emitted": bool(arch_summary_dict),
+            "audit_summary": audit_summary,
         },
     }

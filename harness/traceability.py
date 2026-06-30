@@ -1,113 +1,139 @@
-"""
-FR-XXX traceability audit.
+"""SQL-backed requirement and acceptance-criterion traceability audit.
 
-After codegen completes, scans ``docs/SPEC_REQUIREMENTS.md`` for every
-``FR-NNN`` and ``US-NNN-NN`` identifier and verifies each appears
-somewhere in the workspace's source or test tree. IDs with zero
-mentions are reported as **un-traced** — likely a story or functional
-requirement that codegen silently dropped.
+Phase 4 of the schema-v5 traceability plan: replaces the legacy
+text-grep audit that walked the workspace looking for ``FR-NNN``
+tokens in source/test/doc files. With the v5 schema, requirements
+and acceptance criteria are first-class rows in ``state.db`` linked
+to stories (``story_satisfies_req``) and tests
+(``test_verifies_ac``), so the audit collapses to two SQL queries:
 
-This catches the failure mode where:
+  1. Requirements with no satisfying story — the planner forgot
+     to cover the spec requirement (or rejected it without operator
+     consent).
+  2. Acceptance criteria with no verifying test — the test
+     generator didn't emit a ``@verifies`` marker for this AC, so
+     it ships uncovered by automated checks.
 
-  1. The requirements doc enumerates 14 functional requirements.
-  2. Codegen produces 11 modules implementing 9 of them.
-  3. The build passes, tests pass.
-  4. Nobody notices that FR-007 ("Email password reset") was never
-     implemented until a user reports it from prod.
+The audit returns a :class:`TraceabilityReport` carrying both gap
+sets plus per-bucket coverage percentages. Render via
+:func:`format_report` for the end-of-session console block.
 
-It is **advisory** — does not block the run, just emits a structured
-report. Wiring it as a blocking gate is a future improvement; the
-caller decides what to do with the warnings.
-
-Coverage rules:
-
-  - An ID is "traced" if its literal token (``FR-007`` or ``US-03-02``)
-    appears in ANY of: a source comment, a docstring, a test name, or
-    a markdown file other than the spec itself.
-  - Case is preserved (FR is upper-case in the spec by convention).
-  - Source-tree scan honours ``_NEVER_SOURCE_DIRS`` so node_modules,
-    .venv, dist, etc. are skipped.
+Configuration toggle: the end-of-session caller can disable
+hard-blocking via ``traceability.enforce = false`` in
+``cli.json`` / ``.harness_config.json``; that switch is read in
+``harness/graph.py``, not here — this module is a pure query layer.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-_NEVER_SOURCE_DIRS: frozenset[str] = frozenset({
-    "node_modules", "__pycache__", "dist", "build", "target", "out",
-    ".git", ".tox", ".venv", "venv",
-    "coverage", "htmlcov", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".harness", ".teane",
-})
-
-# Source extensions we scan for ID references. Code, test, and docs only —
-# binary files are skipped.
-_SOURCE_EXTS: tuple[str, ...] = (
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".java",
-    ".md", ".rst", ".txt", ".sql", ".yaml", ".yml", ".toml",
-)
-
-# Default IDs to audit. FR-001 .. FR-999 and US-01-02 style.
-_FR_ID_RE = re.compile(r"\bFR-\d{1,4}\b")
-_US_ID_RE = re.compile(r"\bUS-\d{1,3}-\d{1,3}\b")
-_NFR_ID_RE = re.compile(r"\bNFR-[A-Z]+-\d{1,4}\b")
-
-# Cap on the number of files we scan to keep this O(workspace_size) but
-# bounded. A 5000-file workspace at ~50KB/file would dominate the run
-# otherwise; truncating to 2000 source files covers every realistic case.
-_SCAN_FILE_CAP = 2000
-
-
 @dataclass(frozen=True)
 class UntracedRequirement:
-    """A requirement ID found in the spec but not anywhere else.
+    """A requirement row with no satisfying story.
 
     Attributes:
         req_id: The literal identifier (``FR-007``, ``US-03-02``,
-            ``NFR-SEC-001``).
-        kind: ``"fr"``, ``"us"``, or ``"nfr"`` — for downstream
-            grouping in the report.
+            ``NFR-SEC-001``, ``CR-7``).
+        kind: One of ``fr``, ``us``, ``nfr``, ``cr_synthetic`` —
+            mirrors ``requirements.kind`` and lets the report
+            group findings by family.
     """
     req_id: str
     kind: str
 
 
 @dataclass(frozen=True)
-class TraceabilityReport:
-    """Aggregate result of one traceability audit pass.
+class UntestedCriterion:
+    """An acceptance criterion with no verifying test.
 
     Attributes:
-        spec_path: Workspace-relative path of the spec that was scanned.
-        total_ids: How many distinct requirement IDs the spec declared.
-        traced_ids: Subset whose literal token appears in at least one
-            source/test/doc file outside the spec.
-        untraced: List of :class:`UntracedRequirement` records — these
-            are the audit findings the report should surface.
+        ac_key: The criterion identifier (``STORY-3.AC-2``) — the
+            same string the test-gen ``@verifies:`` marker is
+            expected to cite.
+        story_key: The owning story (``STORY-3``).
+        text: The criterion's text body, capped at 200 chars in
+            the report so the console block stays readable.
+    """
+    ac_key: str
+    story_key: str
+    text: str
+
+
+@dataclass(frozen=True)
+class TraceabilityReport:
+    """Aggregate result of one SQL traceability audit pass.
+
+    Attributes:
+        spec_path: Workspace-relative path of the spec the
+            requirements_ingest parsed (informational; the audit
+            itself queries the DB, not the file).
+        total_reqs: Count of ``requirements`` rows for this workspace.
+        traced_reqs: Subset that has at least one row in
+            ``story_satisfies_req`` (i.e. at least one story
+            satisfies the requirement).
+        untraced: List of :class:`UntracedRequirement` records —
+            the requirement-side gaps to surface to the operator.
+        total_acs: Count of ``acceptance_criteria`` rows for this
+            workspace.
+        verified_acs: Subset with at least one row in
+            ``test_verifies_ac`` (a generated test claims to verify
+            this AC and that test passed its sandbox run).
+        untested_acs: List of :class:`UntestedCriterion` records —
+            the AC-side gaps.
     """
     spec_path: str
-    total_ids: int
-    traced_ids: int
+    total_reqs: int
+    traced_reqs: int
     untraced: list[UntracedRequirement]
+    total_acs: int = 0
+    verified_acs: int = 0
+    untested_acs: list[UntestedCriterion] = field(default_factory=list)
 
     @property
-    def coverage_pct(self) -> float:
-        """Percentage of declared IDs that have at least one trace.
-
-        Returns ``100.0`` when the spec declared zero IDs — vacuously
-        complete; the operator's spec doesn't use the FR convention or
-        the doc is empty.
-        """
-        if self.total_ids == 0:
+    def req_coverage_pct(self) -> float:
+        """Percentage of declared requirements with at least one
+        satisfying story. ``100.0`` when no requirements exist
+        (vacuously complete — pre-v5 workspace or empty spec)."""
+        if self.total_reqs == 0:
             return 100.0
-        return 100.0 * self.traced_ids / self.total_ids
+        return 100.0 * self.traced_reqs / self.total_reqs
+
+    @property
+    def ac_coverage_pct(self) -> float:
+        """Percentage of acceptance criteria with at least one
+        verifying test. ``100.0`` when no ACs exist."""
+        if self.total_acs == 0:
+            return 100.0
+        return 100.0 * self.verified_acs / self.total_acs
+
+    # Backward-compat alias for the pre-v5 single coverage metric.
+    # Old call sites that referenced ``coverage_pct`` (and the
+    # ``total_ids`` / ``traced_ids`` fields) get the requirement-
+    # coverage view, which is the closest 1:1 match for what the
+    # text-grep audit measured.
+    @property
+    def coverage_pct(self) -> float:
+        return self.req_coverage_pct
+
+    @property
+    def total_ids(self) -> int:
+        return self.total_reqs
+
+    @property
+    def traced_ids(self) -> int:
+        return self.traced_reqs
+
+    def has_failures(self) -> bool:
+        """True when either gap set is non-empty. The end-of-session
+        gate uses this to decide whether to block."""
+        return bool(self.untraced or self.untested_acs)
 
 
 def audit_workspace(
@@ -115,169 +141,147 @@ def audit_workspace(
     *,
     spec_relpath: str = "docs/SPEC_REQUIREMENTS.md",
 ) -> Optional[TraceabilityReport]:
-    """Audit a workspace for requirement-ID traceability.
+    """Run the SQL traceability audit for ``workspace_path``.
 
     Args:
-        workspace_path: Project root.
-        spec_relpath: Relative path of the requirements spec to scan.
-            Defaults to the conventional ``docs/SPEC_REQUIREMENTS.md``.
+        workspace_path: Project root. The workspace's basename is
+            used to scope ``state.db`` rows (the standard teane
+            convention — see ``story_state.app_name_for_workspace``).
+        spec_relpath: Recorded in the report for display; the
+            audit itself joins on the ``requirements`` table and
+            does NOT re-read the spec file.
 
     Returns:
-        A :class:`TraceabilityReport`, or ``None`` when the spec file
-        doesn't exist (no audit applicable). Empty workspaces and specs
-        that declare zero IDs return a report with ``total_ids=0`` and
-        ``coverage_pct=100.0``.
+        A :class:`TraceabilityReport`, or ``None`` when the
+        workspace path is invalid or the audit could not open the
+        state DB. An empty workspace (no requirements, no ACs)
+        returns a report with both ``has_failures()`` and the gap
+        lists empty — vacuously clean.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
-    spec_abs = os.path.join(workspace_path, spec_relpath)
-    if not os.path.isfile(spec_abs):
-        logger.debug("[traceability] No spec at %s; skipping audit.", spec_abs)
+    try:
+        from harness import story_state
+        app_name = story_state.app_name_for_workspace(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[traceability] audit skipped (workspace=%r): %s",
+                       workspace_path, exc)
         return None
 
-    declared = _extract_declared_ids(spec_abs)
-    if not declared:
-        return TraceabilityReport(
-            spec_path=spec_relpath,
-            total_ids=0,
-            traced_ids=0,
-            untraced=[],
+    try:
+        conn = story_state.open_story_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[traceability] audit skipped (open_story_db failed): %s", exc,
         )
+        return None
+    try:
+        all_reqs = story_state.list_requirements(conn, app_name)
+        untraced_rows = story_state.requirements_without_satisfying_story(
+            conn, app_name,
+        )
+        untraced = [
+            UntracedRequirement(req_id=r["req_key"], kind=r["kind"])
+            for r in untraced_rows
+        ]
+        total_acs = conn.execute(
+            "SELECT COUNT(*) FROM acceptance_criteria WHERE workspace = ?",
+            (app_name,),
+        ).fetchone()[0]
+        untested_rows = story_state.acs_without_verifying_test(conn, app_name)
+        untested = [
+            UntestedCriterion(
+                ac_key=r["ac_key"],
+                story_key=r["story_key"],
+                text=(r["text"] or "")[:200],
+            )
+            for r in untested_rows
+        ]
+    finally:
+        conn.close()
 
-    found_tokens = _collect_id_references(
-        workspace_path,
-        skip_files=frozenset({os.path.abspath(spec_abs)}),
-        target_tokens=frozenset(req_id for req_id, _ in declared),
-    )
-
-    untraced = [
-        UntracedRequirement(req_id=req_id, kind=kind)
-        for req_id, kind in declared
-        if req_id not in found_tokens
-    ]
+    total_reqs = len(all_reqs)
     return TraceabilityReport(
         spec_path=spec_relpath,
-        total_ids=len(declared),
-        traced_ids=len(declared) - len(untraced),
+        total_reqs=total_reqs,
+        traced_reqs=total_reqs - len(untraced),
         untraced=untraced,
+        total_acs=int(total_acs),
+        verified_acs=int(total_acs) - len(untested),
+        untested_acs=untested,
     )
 
 
 def format_report(report: TraceabilityReport) -> str:
     """Render the report as a human-readable Markdown block.
 
-    Empty when coverage is 100% — saves the operator from a noisy
-    "everything is fine" line in the end-of-session output.
+    Returns the empty string when both gap sets are empty (saves
+    the operator from a noisy "everything is fine" line in the
+    end-of-session output).
     """
-    if not report.untraced:
+    if not report.has_failures():
         return ""
+
     lines: list[str] = [
-        f"## Requirement Traceability Audit ({report.spec_path})",
+        "## Requirement & Acceptance-Criterion Traceability Audit",
+        f"_Spec: {report.spec_path}_",
+        "",
         (
-            f"{report.traced_ids}/{report.total_ids} requirement IDs "
-            f"have at least one mention in source/test/doc files "
-            f"({report.coverage_pct:.0f}% coverage). The following "
-            f"{len(report.untraced)} ID(s) declared in the spec do NOT "
-            f"appear anywhere in the workspace — likely silently dropped "
-            f"by codegen. Verify each before considering the session "
-            f"complete:"
+            f"- **Requirements**: {report.traced_reqs}/{report.total_reqs} "
+            f"with a satisfying story ({report.req_coverage_pct:.0f}% coverage)."
         ),
+        (
+            f"- **Acceptance criteria**: {report.verified_acs}/{report.total_acs} "
+            f"with a verifying test ({report.ac_coverage_pct:.0f}% coverage)."
+        ),
+        "",
     ]
-    by_kind: dict[str, list[str]] = {}
-    for item in report.untraced:
-        by_kind.setdefault(item.kind, []).append(item.req_id)
-    for kind in ("fr", "us", "nfr"):
-        ids = by_kind.get(kind)
-        if not ids:
-            continue
-        label = {
+
+    if report.untraced:
+        lines.append(
+            f"### Untraced requirements ({len(report.untraced)})"
+        )
+        lines.append(
+            "These requirement IDs are declared in the spec but no "
+            "story satisfies them — codegen has not covered the "
+            "intent. Add a story that cites the requirement_key "
+            "or revise the spec."
+        )
+        by_kind: dict[str, list[str]] = {}
+        for item in report.untraced:
+            by_kind.setdefault(item.kind, []).append(item.req_id)
+        kind_labels = {
             "fr": "Functional Requirements",
             "us": "User Stories",
             "nfr": "Non-Functional Requirements",
-        }[kind]
-        lines.append(f"\n### {label}")
-        for req_id in sorted(ids):
-            lines.append(f"- `{req_id}` — not referenced in any source/test/doc file.")
+            "cr_synthetic": "Change Requests",
+        }
+        for kind in ("fr", "us", "nfr", "cr_synthetic"):
+            ids = by_kind.get(kind)
+            if not ids:
+                continue
+            lines.append(f"\n#### {kind_labels.get(kind, kind)}")
+            for req_id in sorted(ids):
+                lines.append(f"- `{req_id}`")
+
+    if report.untested_acs:
+        lines.append("")
+        lines.append(
+            f"### Untested acceptance criteria ({len(report.untested_acs)})"
+        )
+        lines.append(
+            "These acceptance criteria have no test that cites them "
+            "via a `# @verifies: STORY-N.AC-N` marker. Either the "
+            "test was never generated, the marker is missing/malformed, "
+            "or the generated test failed and its link was dropped."
+        )
+        by_story: dict[str, list[UntestedCriterion]] = {}
+        for ac in report.untested_acs:
+            by_story.setdefault(ac.story_key, []).append(ac)
+        for story_key in sorted(by_story):
+            lines.append(f"\n#### {story_key}")
+            for ac in by_story[story_key]:
+                snippet = ac.text or "(no text)"
+                lines.append(f"- `{ac.ac_key}` — {snippet}")
+
     return "\n".join(lines) + "\n"
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _extract_declared_ids(spec_abs: str) -> list[tuple[str, str]]:
-    """Scan the spec markdown for all FR / US / NFR identifiers.
-
-    Returns a list of ``(req_id, kind)`` tuples preserving first-seen
-    order. Duplicates within the spec are collapsed — the spec naturally
-    references each ID multiple times (in the body, in the traceability
-    table, etc.).
-    """
-    try:
-        with open(spec_abs, "r", encoding="utf-8", errors="replace") as f:
-            body = f.read()
-    except OSError as exc:
-        logger.warning("[traceability] Could not read spec %s: %s", spec_abs, exc)
-        return []
-
-    seen: dict[str, str] = {}
-    for kind, pattern in (("fr", _FR_ID_RE), ("us", _US_ID_RE), ("nfr", _NFR_ID_RE)):
-        for match in pattern.finditer(body):
-            token = match.group(0)
-            if token not in seen:
-                seen[token] = kind
-    return list(seen.items())
-
-
-def _collect_id_references(
-    workspace_path: str,
-    *,
-    skip_files: frozenset[str],
-    target_tokens: frozenset[str],
-) -> set[str]:
-    """Walk the workspace and return which of ``target_tokens`` were
-    referenced in source/test/doc files.
-
-    Reads each candidate file at most once and short-circuits once every
-    target token has been found at least once — large workspaces where
-    the spec is heavily traceable stay fast.
-    """
-    found: set[str] = set()
-    if not target_tokens:
-        return found
-    files_scanned = 0
-    try:
-        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
-            sub_dirs[:] = [
-                d for d in sub_dirs
-                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
-            ]
-            for fname in sub_files:
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in _SOURCE_EXTS:
-                    continue
-                abs_path = os.path.join(sub_root, fname)
-                if os.path.abspath(abs_path) in skip_files:
-                    continue
-                files_scanned += 1
-                if files_scanned > _SCAN_FILE_CAP:
-                    logger.info(
-                        "[traceability] File scan cap reached (%d); "
-                        "remaining files skipped. Audit reports a lower "
-                        "bound on coverage.",
-                        _SCAN_FILE_CAP,
-                    )
-                    return found
-                try:
-                    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                        body = f.read()
-                except OSError:
-                    continue
-                for token in target_tokens - found:
-                    if token in body:
-                        found.add(token)
-                if found == target_tokens:
-                    return found
-    except OSError:
-        return found
-    return found

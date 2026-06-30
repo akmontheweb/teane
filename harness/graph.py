@@ -12108,25 +12108,47 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
         )
         install_path = None
 
-    # Requirement-traceability audit: surface any FR-XXX / US-XX-YY /
-    # NFR-XXX-NNN declared in the spec that never appears in the
-    # generated source tree. Advisory: prints a report block but does
-    # not block the run. Operator can use this to spot stories codegen
-    # silently dropped before they cause a prod surprise.
+    # v5 traceability audit — SQL-backed, surfaces BOTH untraced
+    # requirements AND untested acceptance criteria from state.db.
+    # When the audit reports any gap AND ``traceability.enforce`` is
+    # true (default), the session blocks via a synthetic compiler
+    # error so route_after_installation_doc reroutes to HITL instead
+    # of the END terminator. Operators with broken specs can set
+    # ``traceability.enforce = false`` in .harness_config.json to
+    # disable the block during transition (the report still prints).
+    traceability_blocked = False
     try:
         from harness.traceability import audit_workspace, format_report
         report = audit_workspace(workspace_path)
-        if report is not None and report.untraced:
+        if report is not None and report.has_failures():
             report_text = format_report(report)
+            tr_cfg = (state.get("harness_config") or {}).get(
+                "traceability", {},
+            )
+            enforce = bool(tr_cfg.get("enforce", True))
             if report_text:
                 print()
-                print(report_text)
+                if enforce:
+                    print("==================== TRACEABILITY BLOCK ====================")
+                    print(report_text)
+                    print("Set traceability.enforce=false in .harness_config.json")
+                    print("to bypass and ship anyway (NOT RECOMMENDED).")
+                    print("==========================================================")
+                else:
+                    print("[traceability advisory — enforce disabled]")
+                    print(report_text)
                 logger.info(
-                    "[traceability] %d/%d requirement IDs traced (%.0f%% "
-                    "coverage); %d untraced — see report above.",
-                    report.traced_ids, report.total_ids,
-                    report.coverage_pct, len(report.untraced),
+                    "[traceability] reqs %d/%d (%.0f%%), ACs %d/%d (%.0f%%); "
+                    "untraced=%d, untested=%d; enforce=%s",
+                    report.traced_reqs, report.total_reqs,
+                    report.req_coverage_pct,
+                    report.verified_acs, report.total_acs,
+                    report.ac_coverage_pct,
+                    len(report.untraced), len(report.untested_acs),
+                    enforce,
                 )
+            if enforce:
+                traceability_blocked = True
     except Exception as exc:  # noqa: BLE001 — audit must never break the run
         logger.debug("[traceability] Audit failed (%s); skipping report.", exc)
 
@@ -12145,13 +12167,38 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
         budget=state.get("budget_remaining_usd", 0.0),
     )
 
+    node_state_delta: dict[str, Any] = {"current_node": "installation_doc"}
     out: dict[str, Any] = {
-        "node_state": {"current_node": "installation_doc"},
         "budget_remaining_usd": new_budget,
     }
     if install_path:
         out["installation_doc_path"] = install_path
+    if traceability_blocked:
+        # Surface the failure to the router so it reroutes to HITL
+        # instead of END. The diagnostic carries enough context for
+        # the operator to find the offending FRs/ACs without re-running
+        # the audit.
+        node_state_delta["traceability_blocked"] = True
+        out["exit_code"] = 1
+    out["node_state"] = node_state_delta
     return out
+
+
+def route_after_installation_doc(state: AgentState) -> str:
+    """Conditional edge after ``installation_doc_node``.
+
+    Returns ``"human_intervention_node"`` when the v5 traceability
+    audit gated the session with ``enforce=true``; otherwise
+    ``END`` (the standard terminator). Operators with broken
+    specs can opt out by setting ``traceability.enforce = false``
+    in ``.harness_config.json`` (the gate then logs but does not
+    block — the audit print still fires).
+    """
+    from langgraph.graph import END
+    node_state = state.get("node_state") or {}
+    if node_state.get("traceability_blocked"):
+        return "human_intervention_node"
+    return END
 
 
 async def _emit_application_usage_guide(
@@ -13419,7 +13466,20 @@ def build_graph() -> Any:
     # blueprint when present). Gated on state["install_doc"] so the no-op
     # path is a single state-pass-through for change-request runs.
     graph.add_node("installation_doc_node", installation_doc_node)
-    graph.add_edge("installation_doc_node", END)
+    # v5 traceability gate — when audit_workspace reports gaps AND
+    # ``traceability.enforce`` is true (default), installation_doc_node
+    # sets node_state.traceability_blocked and this conditional edge
+    # reroutes the session to HITL instead of END so the operator
+    # can address the gaps before shipping. enforce=false makes the
+    # gate advisory-only (report prints, edge falls through to END).
+    graph.add_conditional_edges(
+        "installation_doc_node",
+        route_after_installation_doc,
+        {
+            "human_intervention_node": "human_intervention_node",
+            END: END,
+        },
+    )
 
     # Route security_scan clean → deployment discovery (or installation_doc
     # for --deploy-dev=false success exits); findings → repair_node

@@ -2063,6 +2063,93 @@ def _render_arch_coverage(
     return lines
 
 
+def _render_requirements_coverage(
+    requirements: list[dict[str, Any]],
+    stories_by_req_key: dict[str, list[tuple[str, str]]],
+) -> list[str]:
+    """Render the v5 Requirements coverage table.
+
+    ``stories_by_req_key`` maps each ``req_key`` to a list of
+    ``(story_key, status)`` tuples. An empty list flags the
+    requirement as **untraced** (gap) — no story satisfies it.
+
+    Returns an empty list when ``requirements`` is empty so legacy
+    workspaces with no v5 ingest produce byte-identical TRACEABILITY.md
+    output to the previous version (the caller ``extend()``s).
+    """
+    if not requirements:
+        return []
+    lines: list[str] = [
+        "## Requirements coverage",
+        "",
+        "_Cross-references ``docs/SPEC_REQUIREMENTS.md`` requirements "
+        "against the stories table. A `gap` row is a declared "
+        "requirement with no story satisfying it — the planner "
+        "missed it or the spec needs revision._",
+        "",
+        "| Requirement | Kind | Title | Stories | Status |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for r in requirements:
+        title = (r.get("title") or "").strip() or "—"
+        pairs = stories_by_req_key.get(r["req_key"], [])
+        if not pairs:
+            story_cell = "— (gap)"
+            status_cell = "—"
+        else:
+            story_cell = ", ".join(p[0] for p in pairs)
+            status_cell = ", ".join(_status_label(p[1]) for p in pairs)
+        lines.append(
+            f"| `{r['req_key']}` | {r.get('kind', '?')} | {title} | "
+            f"{story_cell} | {status_cell} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_ac_coverage(
+    acs: list[dict[str, Any]],
+    tests_by_ac_key: dict[str, list[str]],
+) -> list[str]:
+    """Render the v5 Acceptance-criteria coverage table.
+
+    ``tests_by_ac_key`` maps each ``ac_key`` to the list of
+    ``test_path`` strings that verify it (from ``test_verifies_ac``).
+    Empty list = untested AC (gap).
+
+    Returns an empty list when ``acs`` is empty so legacy workspaces
+    produce no AC-coverage section.
+    """
+    if not acs:
+        return []
+    lines: list[str] = [
+        "## Acceptance-criteria coverage",
+        "",
+        "_Each acceptance criterion paired with the tests that cite it "
+        "via a ``# @verifies: STORY-N.AC-N`` marker. A `gap` row means "
+        "no passing test claims to verify the criterion._",
+        "",
+        "| Story | AC | Text | Tests |",
+        "| --- | --- | --- | --- |",
+    ]
+    for ac in acs:
+        text = (ac.get("text") or "").strip()
+        # Markdown tables don't render embedded pipes well; soften
+        # them to a unicode bar so the cell stays visually distinct.
+        text_cell = text.replace("|", "│")[:160] or "—"
+        tests = tests_by_ac_key.get(ac["ac_key"], [])
+        if not tests:
+            tests_cell = "— (gap)"
+        else:
+            tests_cell = ", ".join(f"`{t}`" for t in tests)
+        lines.append(
+            f"| {ac['story_key']} | `{ac['ac_key']}` | {text_cell} | "
+            f"{tests_cell} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_traceability_md(
     stories: list[dict[str, Any]],
     files_by_story: dict[str, list[tuple[str, str]]],
@@ -2070,6 +2157,10 @@ def _render_traceability_md(
     commits_by_story: dict[str, list[dict[str, Any]]],
     *,
     arch_summary: Optional[dict[str, Any]] = None,
+    requirements: Optional[list[dict[str, Any]]] = None,
+    stories_by_req_key: Optional[dict[str, list[tuple[str, str]]]] = None,
+    acs: Optional[list[dict[str, Any]]] = None,
+    tests_by_ac_key: Optional[dict[str, list[str]]] = None,
 ) -> str:
     lines = [
         "# Traceability matrix",
@@ -2124,6 +2215,16 @@ def _render_traceability_md(
             for c in commits:
                 lines.append(f"- `{c['sha'][:7]}` — {c['message']}")
             lines.append("")
+    # v5 Requirements + AC coverage sections — appended only when the
+    # v5 ingest populated these collections (empty list inputs render
+    # nothing, preserving byte-identical TRACEABILITY.md output for
+    # legacy workspaces that never ran a v5 decomposition pass).
+    lines.extend(_render_requirements_coverage(
+        requirements or [], stories_by_req_key or {},
+    ))
+    lines.extend(_render_ac_coverage(
+        acs or [], tests_by_ac_key or {},
+    ))
     # Architecture coverage matrix, appended only when SPEC_ARCHITECTURE.md's
     # §11 summary is available. Bytes-identical TRACEABILITY.md output when
     # no summary is passed in — keeps backward compatibility with projects
@@ -2139,7 +2240,27 @@ def _collect_view_inputs(
     dict[str, list[tuple[str, str]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
+    list[dict[str, Any]],
+    dict[str, list[tuple[str, str]]],
+    list[dict[str, Any]],
+    dict[str, list[str]],
 ]:
+    """Collect everything the markdown renderers need in one pass.
+
+    Returns the legacy 4-tuple (stories, files, defects, commits)
+    extended with v5 traceability inputs:
+
+      - ``requirements`` — full list for ``_render_requirements_coverage``.
+      - ``stories_by_req_key`` — req_key → [(story_key, status), ...]
+        from the ``story_satisfies_req`` join.
+      - ``acs`` — flat AC list joined with story_key for ``_render_ac_coverage``.
+      - ``tests_by_ac_key`` — ac_key → [test_path, ...] from
+        ``test_verifies_ac``.
+
+    Empty v5 inputs (no requirements/ACs/links rows) render to
+    empty sections, so the markdown stays backward-compatible with
+    pre-v5 workspaces.
+    """
     stories = list_stories(conn, workspace)
     by_key = {s["story_key"]: s for s in stories}
     # O(1) story_id → story_key lookup so the FK resolution below is
@@ -2177,7 +2298,62 @@ def _collect_view_inputs(
         if key is not None:
             commits_by_story[key].append({"sha": sha, "message": message})
 
-    return stories, files_by_story, defects_by_story, commits_by_story
+    # v5 traceability inputs ---------------------------------------------------
+    requirements = list_requirements(conn, workspace)
+    stories_by_req_key: dict[str, list[tuple[str, str]]] = {
+        r["req_key"]: [] for r in requirements
+    }
+    if requirements:
+        # LEFT JOIN so requirements with no satisfying story still appear
+        # in the dict (with an empty list — rendered as a gap row).
+        for req_key, story_key, status in conn.execute(
+            "SELECT r.req_key, s.story_key, s.status "
+            "FROM requirements r "
+            "LEFT JOIN story_satisfies_req ssr ON ssr.requirement_id = r.id "
+            "LEFT JOIN stories s ON s.id = ssr.story_id "
+            "WHERE r.workspace = ? "
+            "ORDER BY r.id, s.id",
+            (workspace,),
+        ):
+            if story_key is not None:
+                stories_by_req_key[req_key].append(
+                    (story_key, status or "planned"),
+                )
+
+    acs: list[dict[str, Any]] = []
+    tests_by_ac_key: dict[str, list[str]] = {}
+    for ac_key, story_key, text, ordinal, story_id in conn.execute(
+        "SELECT ac.ac_key, s.story_key, ac.text, ac.ordinal, ac.story_id "
+        "FROM acceptance_criteria ac "
+        "JOIN stories s ON s.id = ac.story_id "
+        "WHERE ac.workspace = ? "
+        "ORDER BY s.id, ac.ordinal",
+        (workspace,),
+    ):
+        acs.append({
+            "ac_key": ac_key,
+            "story_key": story_key,
+            "text": text,
+            "ordinal": ordinal,
+            "story_id": story_id,
+        })
+        tests_by_ac_key.setdefault(ac_key, [])
+
+    if acs:
+        for ac_key, test_path in conn.execute(
+            "SELECT ac.ac_key, tva.test_path "
+            "FROM test_verifies_ac tva "
+            "JOIN acceptance_criteria ac ON ac.id = tva.ac_id "
+            "WHERE tva.workspace = ? "
+            "ORDER BY ac.story_id, ac.ordinal, tva.test_path",
+            (workspace,),
+        ):
+            tests_by_ac_key.setdefault(ac_key, []).append(test_path)
+
+    return (
+        stories, files_by_story, defects_by_story, commits_by_story,
+        requirements, stories_by_req_key, acs, tests_by_ac_key,
+    )
 
 
 def regenerate_markdown_views(
@@ -2203,13 +2379,18 @@ def regenerate_markdown_views(
     output byte-for-byte until a caller explicitly opts in.
     """
     workspace = app_name_for_workspace(workspace_path)
-    stories, files_by_story, defects_by_story, commits_by_story = (
-        _collect_view_inputs(conn, workspace)
-    )
+    (
+        stories, files_by_story, defects_by_story, commits_by_story,
+        requirements, stories_by_req_key, acs, tests_by_ac_key,
+    ) = _collect_view_inputs(conn, workspace)
     stories_md = _render_stories_md(stories)
     trace_md = _render_traceability_md(
         stories, files_by_story, defects_by_story, commits_by_story,
         arch_summary=arch_summary,
+        requirements=requirements,
+        stories_by_req_key=stories_by_req_key,
+        acs=acs,
+        tests_by_ac_key=tests_by_ac_key,
     )
 
     docs_dir = os.path.join(os.path.expanduser(workspace_path), "docs")

@@ -1,113 +1,369 @@
-"""Tests for the FR-XXX traceability audit."""
+"""Tests for the v5 SQL-backed traceability audit.
+
+Replaces the legacy filesystem text-grep audit (Phase 4 of the
+schema-v5 plan). Each test seeds the per-workspace state.db with
+requirements / stories / ACs / link rows, then asserts what
+``audit_workspace`` and ``format_report`` produce.
+
+The conftest autouse fixture redirects ``TEANE_STATE_DB`` into a
+per-test tmpdir so these tests never touch the operator's real DB.
+"""
+
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
-from harness.traceability import audit_workspace, format_report
+import pytest
 
-
-def _w(tmp_path, rel: str, body: str) -> None:
-    abs_path = os.path.join(str(tmp_path), rel)
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(body)
-
-
-def test_no_spec_returns_none(tmp_path):
-    assert audit_workspace(str(tmp_path)) is None
+from harness import story_state
+from harness.traceability import (
+    TraceabilityReport,
+    UntestedCriterion,
+    UntracedRequirement,
+    audit_workspace,
+    format_report,
+)
 
 
-def test_empty_spec_yields_full_coverage(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md", "# Empty spec\n\nNothing here.\n")
-    report = audit_workspace(str(tmp_path))
+@pytest.fixture
+def workspace(tmp_path: Path) -> str:
+    """Workspace dir. Its basename is the app name used to scope
+    state.db rows."""
+    ws = tmp_path / "trace-ws"
+    ws.mkdir()
+    return str(ws)
+
+
+@pytest.fixture
+def app(workspace: str) -> str:
+    return story_state.app_name_for_workspace(workspace)
+
+
+def _seed_story_with_ac(
+    app: str, *, title: str = "S", ac: list[str] | None = None,
+) -> int:
+    """Seed one story with optional AC strings; return its story_id."""
+    conn = story_state.open_story_db()
+    try:
+        story_state.ensure_feature(conn, app, "f", name="F")
+        keys = story_state.create_stories(conn, app, [{
+            "title": title, "feature": "f",
+            "acceptance_criteria": list(ac or []),
+        }])
+        return story_state.get_story(conn, app, keys[0])["id"]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# audit_workspace — empty / vacuous cases
+# ---------------------------------------------------------------------------
+
+def test_invalid_workspace_returns_none():
+    assert audit_workspace("") is None
+    assert audit_workspace("/nonexistent/path/xyz") is None
+
+
+def test_empty_db_returns_clean_report(workspace: str):
+    """No requirements + no ACs = vacuously clean (legacy workspace
+    pre-v5 ingest)."""
+    report = audit_workspace(workspace)
     assert report is not None
-    assert report.total_ids == 0
-    assert report.coverage_pct == 100.0
+    assert report.total_reqs == 0
+    assert report.total_acs == 0
+    assert report.req_coverage_pct == 100.0
+    assert report.ac_coverage_pct == 100.0
     assert report.untraced == []
+    assert report.untested_acs == []
+    assert report.has_failures() is False
 
 
-def test_fully_traced_spec(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md",
-       "# Spec\n\n## FR-001 Login\n\n## FR-002 Logout\n")
-    _w(tmp_path, "src/auth.py",
-       "# Implements FR-001 and FR-002.\n"
-       "def login(): pass\n"
-       "def logout(): pass\n")
-    report = audit_workspace(str(tmp_path))
-    assert report is not None
-    assert report.total_ids == 2
-    assert report.traced_ids == 2
+# ---------------------------------------------------------------------------
+# audit_workspace — requirement-coverage gaps
+# ---------------------------------------------------------------------------
+
+def test_all_requirements_satisfied_has_no_failures(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "FR-001", "kind": "fr", "title": "Login"},
+            {"req_key": "FR-002", "kind": "fr", "title": "Logout"},
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app, title="Auth flows")
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(
+            conn, app, sid, ["FR-001", "FR-002"],
+        )
+    finally:
+        conn.close()
+
+    report = audit_workspace(workspace)
+    assert report.total_reqs == 2
+    assert report.traced_reqs == 2
+    assert report.req_coverage_pct == 100.0
     assert report.untraced == []
+    assert report.has_failures() is False
 
 
-def test_untraced_fr_surfaces(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md",
-       "# Spec\n\n## FR-001\n## FR-002\n## FR-007 Email password reset\n")
-    _w(tmp_path, "src/auth.py",
-       "# Implements FR-001 and FR-002.\ndef login(): pass\n")
-    report = audit_workspace(str(tmp_path))
-    assert report is not None
-    assert report.total_ids == 3
-    assert report.traced_ids == 2
-    assert len(report.untraced) == 1
-    assert report.untraced[0].req_id == "FR-007"
+def test_unsatisfied_requirement_surfaces_as_untraced(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "FR-001", "kind": "fr", "title": "covered"},
+            {"req_key": "FR-002", "kind": "fr", "title": "gap"},
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app)
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(conn, app, sid, ["FR-001"])
+    finally:
+        conn.close()
+
+    report = audit_workspace(workspace)
+    assert report.total_reqs == 2
+    assert report.traced_reqs == 1
+    assert report.req_coverage_pct == 50.0
+    assert [u.req_id for u in report.untraced] == ["FR-002"]
     assert report.untraced[0].kind == "fr"
+    assert report.has_failures() is True
 
 
-def test_us_and_nfr_identifiers_picked_up(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md",
-       "## US-01-02 Login flow\n"
-       "## NFR-SEC-001 TLS 1.3 minimum\n")
-    _w(tmp_path, "tests/test_auth.py", "# Covers US-01-02 happy path.\n")
-    report = audit_workspace(str(tmp_path))
-    assert report is not None
-    # US-01-02 traced via test file; NFR-SEC-001 not mentioned anywhere.
-    untraced_ids = {u.req_id for u in report.untraced}
-    assert untraced_ids == {"NFR-SEC-001"}
+def test_nfr_and_cr_synthetic_kinds_preserved(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "NFR-SEC-001", "kind": "nfr", "title": "TLS"},
+            {"req_key": "CR-7", "kind": "cr_synthetic", "title": "CR 7"},
+        ])
+    finally:
+        conn.close()
+    report = audit_workspace(workspace)
+    assert {(u.req_id, u.kind) for u in report.untraced} == {
+        ("NFR-SEC-001", "nfr"),
+        ("CR-7", "cr_synthetic"),
+    }
 
 
-def test_spec_self_reference_does_not_count_as_trace(tmp_path):
-    # If FR-001 only appears in the spec itself (and nowhere else), it
-    # should still be flagged as untraced.
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md",
-       "## FR-001 Some requirement\n\n"
-       "This requirement is FR-001 and we keep saying FR-001 here.\n")
-    report = audit_workspace(str(tmp_path))
-    assert report is not None
-    assert report.total_ids == 1
-    assert report.traced_ids == 0
-    assert report.untraced[0].req_id == "FR-001"
+# ---------------------------------------------------------------------------
+# audit_workspace — AC-coverage gaps
+# ---------------------------------------------------------------------------
+
+def test_all_acs_verified_has_no_ac_failures(workspace: str, app: str):
+    sid = _seed_story_with_ac(app, ac=["AC-a", "AC-b"])
+    conn = story_state.open_story_db()
+    try:
+        acs = story_state.list_acceptance_criteria(conn, app, sid)
+        story_state.link_test_to_ac(conn, app, "tests/test_a.py", acs[0]["id"])
+        story_state.link_test_to_ac(conn, app, "tests/test_b.py", acs[1]["id"])
+    finally:
+        conn.close()
+
+    report = audit_workspace(workspace)
+    assert report.total_acs == 2
+    assert report.verified_acs == 2
+    assert report.ac_coverage_pct == 100.0
+    assert report.untested_acs == []
 
 
-def test_skips_never_source_dirs(tmp_path):
-    # If the only mention of FR-001 is inside node_modules, it must
-    # NOT count as a trace — codegen artefacts there don't reflect
-    # the project's actual implementation.
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md", "## FR-001\n")
-    _w(tmp_path, "node_modules/some-pkg/README.md",
-       "This package mentions FR-001 for unrelated reasons.\n")
-    report = audit_workspace(str(tmp_path))
-    assert report is not None
-    assert report.untraced[0].req_id == "FR-001"
+def test_unverified_ac_surfaces_grouped_by_story(workspace: str, app: str):
+    s1 = _seed_story_with_ac(app, title="S1", ac=["a", "b"])
+    _seed_story_with_ac(app, title="S2", ac=["c"])
+    conn = story_state.open_story_db()
+    try:
+        # Verify only the first AC of S1.
+        acs = story_state.list_acceptance_criteria(conn, app, s1)
+        story_state.link_test_to_ac(conn, app, "tests/test_s1.py", acs[0]["id"])
+    finally:
+        conn.close()
+
+    report = audit_workspace(workspace)
+    assert report.total_acs == 3
+    assert report.verified_acs == 1
+    keys = [(u.story_key, u.ac_key) for u in report.untested_acs]
+    # Ordered by story_id then ordinal — S1.AC-2 before S2.AC-1.
+    assert keys == [
+        ("STORY-1", "STORY-1.AC-2"),
+        ("STORY-2", "STORY-2.AC-1"),
+    ]
+    assert report.has_failures() is True
 
 
-def test_format_report_empty_when_full_coverage(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md", "## FR-001\n")
-    _w(tmp_path, "src/main.py", "# FR-001\n")
-    report = audit_workspace(str(tmp_path))
+def test_ac_text_truncated_at_200_chars(workspace: str, app: str):
+    long_text = "X" * 500
+    _seed_story_with_ac(app, ac=[long_text])
+    report = audit_workspace(workspace)
+    assert len(report.untested_acs) == 1
+    # Cap is 200 chars; the original was 500.
+    assert len(report.untested_acs[0].text) == 200
+
+
+# ---------------------------------------------------------------------------
+# format_report — rendering
+# ---------------------------------------------------------------------------
+
+def test_format_report_empty_when_no_failures():
+    report = TraceabilityReport(
+        spec_path="docs/SPEC_REQUIREMENTS.md",
+        total_reqs=2, traced_reqs=2, untraced=[],
+        total_acs=2, verified_acs=2, untested_acs=[],
+    )
     assert format_report(report) == ""
 
 
-def test_format_report_groups_by_kind(tmp_path):
-    _w(tmp_path, "docs/SPEC_REQUIREMENTS.md",
-       "## FR-001\n## FR-002\n## US-01-01\n## NFR-PERF-001\n")
-    # Nothing referenced anywhere else.
-    _w(tmp_path, "src/empty.py", "# unrelated\n")
-    report = audit_workspace(str(tmp_path))
-    text = format_report(report)
-    assert "Functional Requirements" in text
-    assert "User Stories" in text
-    assert "Non-Functional Requirements" in text
-    assert "FR-001" in text and "FR-002" in text
-    assert "US-01-01" in text
-    assert "NFR-PERF-001" in text
+def test_format_report_includes_both_sections_when_both_fail():
+    report = TraceabilityReport(
+        spec_path="docs/SPEC_REQUIREMENTS.md",
+        total_reqs=2, traced_reqs=1,
+        untraced=[UntracedRequirement(req_id="FR-002", kind="fr")],
+        total_acs=2, verified_acs=1,
+        untested_acs=[UntestedCriterion(
+            ac_key="STORY-1.AC-2", story_key="STORY-1", text="some criterion",
+        )],
+    )
+    out = format_report(report)
+    assert "Untraced requirements (1)" in out
+    assert "Untested acceptance criteria (1)" in out
+    assert "FR-002" in out
+    assert "STORY-1.AC-2" in out
+    assert "some criterion" in out
+    # Coverage percentages render with %0.f
+    assert "50% coverage" in out
+
+
+def test_format_report_groups_untraced_by_kind():
+    report = TraceabilityReport(
+        spec_path="docs/SPEC_REQUIREMENTS.md",
+        total_reqs=3, traced_reqs=0,
+        untraced=[
+            UntracedRequirement(req_id="FR-001", kind="fr"),
+            UntracedRequirement(req_id="NFR-SEC-001", kind="nfr"),
+            UntracedRequirement(req_id="CR-7", kind="cr_synthetic"),
+        ],
+        total_acs=0, verified_acs=0, untested_acs=[],
+    )
+    out = format_report(report)
+    assert "Functional Requirements" in out
+    assert "Non-Functional Requirements" in out
+    assert "Change Requests" in out
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias surface
+# ---------------------------------------------------------------------------
+
+def test_legacy_coverage_pct_aliases_req_coverage(workspace: str, app: str):
+    """Old call sites referenced ``coverage_pct``, ``total_ids``, and
+    ``traced_ids``. Keep them working pointing at the req metrics."""
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "FR-001", "kind": "fr", "title": "x"},
+            {"req_key": "FR-002", "kind": "fr", "title": "y"},
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app)
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(conn, app, sid, ["FR-001"])
+    finally:
+        conn.close()
+    report = audit_workspace(workspace)
+    assert report.total_ids == 2
+    assert report.traced_ids == 1
+    assert report.coverage_pct == report.req_coverage_pct == 50.0
+
+
+# ---------------------------------------------------------------------------
+# route_after_installation_doc — end-of-session gate
+# ---------------------------------------------------------------------------
+
+class TestRouteAfterInstallationDoc:
+    """The conditional edge that hard-blocks the session when
+    traceability.enforce=true and the audit reported failures."""
+
+    def test_returns_end_when_no_block(self):
+        from harness.graph import route_after_installation_doc
+        from langgraph.graph import END
+        assert route_after_installation_doc({"node_state": {}}) == END
+        assert route_after_installation_doc({}) == END
+
+    def test_returns_hitl_when_traceability_blocked(self):
+        from harness.graph import route_after_installation_doc
+        state = {"node_state": {"traceability_blocked": True}}
+        assert route_after_installation_doc(state) == "human_intervention_node"
+
+
+# ---------------------------------------------------------------------------
+# TRACEABILITY.md render — Requirements + AC coverage sections
+# ---------------------------------------------------------------------------
+
+class TestTraceabilityMdCoverageSections:
+    """Phase 4b: regenerate_markdown_views emits new Requirements and
+    Acceptance-criteria coverage sections when v5 ingest has run."""
+
+    def test_legacy_workspace_omits_v5_sections(self, workspace: str, app: str):
+        """No requirements, no ACs → byte-identical to pre-v5 output
+        (no v5 sections rendered)."""
+        story_state.ensure_feature(
+            story_state.open_story_db(), app, "f", name="F",
+        )
+        conn = story_state.open_story_db()
+        try:
+            story_state.regenerate_markdown_views(conn, workspace)
+        finally:
+            conn.close()
+        import os
+        with open(os.path.join(workspace, "docs", "TRACEABILITY.md")) as f:
+            body = f.read()
+        assert "Requirements coverage" not in body
+        assert "Acceptance-criteria coverage" not in body
+
+    def test_render_includes_requirements_table(self, workspace: str, app: str):
+        conn = story_state.open_story_db()
+        try:
+            story_state.create_requirements(conn, app, [
+                {"req_key": "FR-001", "kind": "fr", "title": "Login"},
+                {"req_key": "FR-002", "kind": "fr", "title": "Gap"},
+            ])
+        finally:
+            conn.close()
+        sid = _seed_story_with_ac(app, title="Login", ac=["AC text"])
+        conn = story_state.open_story_db()
+        try:
+            story_state.link_story_to_requirements(conn, app, sid, ["FR-001"])
+            story_state.regenerate_markdown_views(conn, workspace)
+        finally:
+            conn.close()
+        import os
+        with open(os.path.join(workspace, "docs", "TRACEABILITY.md")) as f:
+            body = f.read()
+        assert "## Requirements coverage" in body
+        assert "`FR-001`" in body
+        assert "`FR-002`" in body
+        assert "— (gap)" in body  # FR-002 has no story
+
+    def test_render_includes_ac_table_with_gap(self, workspace: str, app: str):
+        sid = _seed_story_with_ac(app, ac=["covered", "uncovered"])
+        conn = story_state.open_story_db()
+        try:
+            acs = story_state.list_acceptance_criteria(conn, app, sid)
+            story_state.link_test_to_ac(
+                conn, app, "tests/test_x.py", acs[0]["id"],
+            )
+            story_state.regenerate_markdown_views(conn, workspace)
+        finally:
+            conn.close()
+        import os
+        with open(os.path.join(workspace, "docs", "TRACEABILITY.md")) as f:
+            body = f.read()
+        assert "## Acceptance-criteria coverage" in body
+        assert "`STORY-1.AC-1`" in body
+        assert "`STORY-1.AC-2`" in body
+        assert "`tests/test_x.py`" in body
+        assert "— (gap)" in body  # STORY-1.AC-2 has no test

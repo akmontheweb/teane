@@ -1635,9 +1635,19 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         # writable venv instead of /usr/local/lib/python3.11/dist-packages
         # — non-root sandbox users can't write there.
         if os.path.isfile(os.path.join(full, "pyproject.toml")):
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e . && python3 -m pytest -q"
+            dev_step = (
+                " && uv pip install -r requirements-dev.txt"
+                if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
+                else ""
+            )
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e .{dev_step} && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "requirements.txt")):
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt && python3 -m pytest -q"
+            dev_step = (
+                " && uv pip install -r requirements-dev.txt"
+                if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
+                else ""
+            )
+            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt{dev_step} && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
         if os.path.isfile(os.path.join(full, "gradlew")):
@@ -1708,9 +1718,11 @@ def _detect_default_build_command(
     # 10-30× faster on cold caches, hits the harness-managed /cache/uv
     # volume across runs. uv is pre-baked into the sandbox builder image.
     if has("pyproject.toml"):
-        return f"{_uv_venv_prefix()} && uv pip install -e . && python3 -m pytest -q"
+        dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
+        return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && python3 -m pytest -q"
     if has("requirements.txt"):
-        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt && python3 -m pytest -q"
+        dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
+        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && python3 -m pytest -q"
     # Java — Maven first, then Gradle (wrapper if present).
     if has("pom.xml"):
         return "mvn -B test"

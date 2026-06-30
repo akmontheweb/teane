@@ -978,10 +978,18 @@ def test_status_lists_running_session_with_no_session_end(tmp_path):
 # --- View Dashboards --------------------------------------------------------
 
 def test_dashboards_landing_lists_all_tile_links(tmp_path):
+    """Phase 7 cleanup: dropped /live + /config tiles (replaced by
+    /sessions running rows and the /config-ui tree editor); added the
+    /run/presets tile for the Phase 5.1 preset CRUD UI."""
     cfg = _make_cfg(tmp_path)
     _, _, body = dispatch(cfg, "/dashboards")
-    for href in ("/status", "/cost", "/sessions", "/schedule", "/index", "/memory", "/live", "/config"):
-        assert f"href='{href}'" in body
+    for href in (
+        "/status", "/cost", "/sessions", "/run/presets",
+        "/schedule", "/index", "/memory",
+    ):
+        assert f"href='{href}'" in body, f"missing {href} tile"
+    for absent in ("/live", "/config"):
+        assert f"href='{absent}'" not in body, f"legacy tile {absent} still present"
 
 
 # --- View Documents ---------------------------------------------------------

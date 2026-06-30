@@ -193,117 +193,19 @@ def test_writes_blocked_when_writes_disabled(tmp_path):
 # 2. Config save round-trip
 # ---------------------------------------------------------------------------
 
-def test_config_save_writes_atomically(tmp_path):
-    cfg = _make_cfg(tmp_path)
-    handle, base_url = _start(cfg)
-    csrf = handle.csrf_token
-    assert csrf is not None
-    try:
-        resp = _post(
-            base_url + "/config/token_budget",
-            body={
-                "token_budget.hard_cap_usd": "9.99",
-                "token_budget.context_window_threshold_pct": "0.75",
-                "token_budget.stages": "",
-            },
-            csrf=csrf,
-        )
-        assert resp.status == 200
-        # Read the file back.
-        with open(cfg.config_path, "r", encoding="utf-8") as f:
-            written = json.load(f)
-        assert written["token_budget"]["hard_cap_usd"] == pytest.approx(9.99)
-        assert written["token_budget"]["context_window_threshold_pct"] == pytest.approx(0.75)
-    finally:
-        handle.shutdown()
+# Tests for the legacy /config/<section> POST endpoint were removed
+# in Phase 7 when the curated form save path was dropped — the
+# /config-tree/<section> tree editor replaced it. Coverage for the
+# tree editor lives in tests/test_dashboard.py around
+# test_config_tree_form_renders_path_inputs.
 
 
-def test_config_save_rejects_invalid_value(tmp_path):
-    cfg = _make_cfg(tmp_path)
-    handle, base_url = _start(cfg)
-    csrf = handle.csrf_token
-    try:
-        # context_window_threshold_pct expects a number; send garbage.
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            _post(
-                base_url + "/config/token_budget",
-                body={
-                    "token_budget.hard_cap_usd": "5.0",
-                    "token_budget.context_window_threshold_pct": "not-a-number",
-                    "token_budget.stages": "",
-                },
-                csrf=csrf,
-            )
-        assert exc.value.code == 400
-    finally:
-        handle.shutdown()
-
-
-def test_config_save_rejected_when_disk_changed_under_us(tmp_path):
-    """End-to-end: render-time stamps base mtime → external rewrite →
-    save POST carrying the stale baseline gets 409 with the
-    operator-facing "modified outside this browser tab" message. The
-    file content is left untouched so the operator can reload and
-    re-apply their edits against the current state."""
-    cfg = _make_cfg(tmp_path)
-    handle, base_url = _start(cfg)
-    csrf = handle.csrf_token
-    try:
-        # Snapshot the file's current mtime as the operator's "baseline".
-        baseline_ns = os.stat(cfg.config_path).st_mtime_ns
-        # Simulate a backend rewrite by bumping the mtime forward 1s.
-        new_ns = baseline_ns + 1_000_000_000
-        os.utime(cfg.config_path, ns=(new_ns, new_ns))
-        # Save with the stale baseline → must be rejected with 409.
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            _post(
-                base_url + "/config/token_budget",
-                body={
-                    "token_budget.hard_cap_usd": "9.99",
-                    "token_budget.context_window_threshold_pct": "0.75",
-                    "token_budget.stages": "",
-                    "__base_mtime_ns": str(baseline_ns),
-                },
-                csrf=csrf,
-            )
-        assert exc.value.code == 409
-        msg = exc.value.read().decode("utf-8", errors="replace")
-        assert "modified outside this browser tab" in msg
-        # File untouched: hard_cap_usd still its original value.
-        with open(cfg.config_path, "r", encoding="utf-8") as f:
-            on_disk = json.load(f)
-        assert on_disk["token_budget"]["hard_cap_usd"] == pytest.approx(3.0)
-    finally:
-        handle.shutdown()
-
-
-def test_config_save_succeeds_with_fresh_base_mtime(tmp_path):
-    """The stale-write check doesn't block legitimate saves — when the
-    submitted baseline still matches disk, the write lands and the
-    file's mtime advances (which is what the next render baselines
-    against)."""
-    cfg = _make_cfg(tmp_path)
-    handle, base_url = _start(cfg)
-    csrf = handle.csrf_token
-    try:
-        baseline_ns = os.stat(cfg.config_path).st_mtime_ns
-        resp = _post(
-            base_url + "/config/token_budget",
-            body={
-                "token_budget.hard_cap_usd": "12.5",
-                "token_budget.context_window_threshold_pct": "0.9",
-                "token_budget.stages": "",
-                "__base_mtime_ns": str(baseline_ns),
-            },
-            csrf=csrf,
-        )
-        assert resp.status == 200
-        with open(cfg.config_path, "r", encoding="utf-8") as f:
-            on_disk = json.load(f)
-        assert on_disk["token_budget"]["hard_cap_usd"] == pytest.approx(12.5)
-        assert os.stat(cfg.config_path).st_mtime_ns >= baseline_ns
-    finally:
-        handle.shutdown()
+# test_config_save_rejected_when_disk_changed_under_us and
+# test_config_save_succeeds_with_fresh_base_mtime were removed in
+# Phase 7. The legacy /config/<section> POST handler they exercised
+# is gone; equivalent stale-write coverage for the new
+# /config-tree/<section> tree editor lives in tests/test_dashboard.py
+# (search for `config_tree`).
 
 
 def test_api_config_mtime_endpoint_serves_current_mtime(tmp_path):

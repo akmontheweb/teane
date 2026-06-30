@@ -1355,6 +1355,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             cta_text="Run harness",
             cta_href="/run",
         )
+    log_dir = os.path.expanduser(cfg.log_dir)
     rows = []
     agile_cache: dict[str, str] = {}
     for s in sessions:
@@ -1365,6 +1366,14 @@ def _render_sessions(cfg: DashboardConfig) -> str:
         elif s.exit_code is not None:
             status, cls = f"exit {s.exit_code}", "fail"
         sid = _esc(s.session_id)
+        # Phase 4.3 progress-tracker badge — surfaces alongside the
+        # status column when the most recent JSONL event for this
+        # session indicates the no-progress failsafe tripped.
+        warn_badge = ""
+        if s.exit_code is None:  # only meaningful for in-flight runs
+            warn_badge = _render_progress_warn_badge(
+                os.path.join(log_dir, f"{s.session_id}.jsonl"),
+            )
         mode = _agile_mode_label(s.workspace_path, agile_cache)
         if mode == "Agile":
             mode_html = "<span class='bx--tag bx--tag--green'>Agile</span>"
@@ -1379,7 +1388,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             f"aria-label='Copy session id'>{_icon('copy', size=14)}</button></td>"
             f"<td>{_esc(s.started_at)}</td>"
             f"<td>{_esc(s.ended_at)}</td>"
-            f"<td class='{cls}'>{_esc(status)}</td>"
+            f"<td class='{cls}'>{_esc(status)} {warn_badge}</td>"
             f"<td>{mode_html}</td>"
             f"<td class='num'>{_fmt_int(s.llm_calls)}</td>"
             f"<td class='num'>{_fmt_cost(s.total_cost_usd)}</td>"
@@ -1461,14 +1470,98 @@ fetch('/api/cost-burn').then(r => r.json()).then(data => {{
 """
 
 
+def _render_schedule_jobs_card(
+    cfg: DashboardConfig, *, flash: str = "",
+) -> str:
+    """Render the configured-jobs panel for the /schedule page.
+
+    Reads ``schedule.jobs`` from ``config.json`` and renders one row per
+    job with name / schedule expression / workspace / enabled state.
+    The "Add" form below the table POSTs to the existing
+    ``_handle_schedule_add`` handler (dashboard.py:3871) which already
+    validates via ``add_schedule_job_to_config``.
+    """
+    csrf_token = resolve_csrf_token(cfg) or ""
+    cfg_data = read_config_file(cfg)
+    jobs = cfg_data.get("schedule", {}).get("jobs", []) if isinstance(cfg_data, dict) else []
+
+    flash_html = f"<div class='card ok'>{_esc(flash)}</div>" if flash else ""
+
+    if jobs:
+        rows = []
+        for j in jobs:
+            if not isinstance(j, dict):
+                continue
+            name = str(j.get("name") or "")
+            sched = str(j.get("schedule") or "")
+            workspace = str(j.get("workspace") or "")
+            enabled = bool(j.get("enabled", True))
+            enabled_tag = (
+                "<span class='bx--tag bx--tag--green'>enabled</span>"
+                if enabled else "<span class='bx--tag'>disabled</span>"
+            )
+            rows.append(
+                "<tr>"
+                f"<td><code>{_esc(name)}</code></td>"
+                f"<td><code>{_esc(sched)}</code></td>"
+                f"<td>{_esc(workspace)}</td>"
+                f"<td>{enabled_tag}</td>"
+                "</tr>"
+            )
+        table = (
+            "<div class='table-wrap'><table class='w-100'>"
+            "<thead><tr><th>Name</th><th>Schedule</th>"
+            "<th>Workspace</th><th>Enabled</th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table></div>"
+        )
+    else:
+        table = "<p class='muted'>No jobs configured yet.</p>"
+
+    form_html = ""
+    if cfg.writes_enabled:
+        form_html = (
+            "<h3>Add a scheduled job</h3>"
+            "<form method='post' action='/schedule/jobs'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            "<label class='bx--label'>Job name</label>"
+            "<input class='bx--text-input' name='name' type='text' "
+            "placeholder='nightly-retest' required>"
+            "<label class='bx--label'>Schedule (cron expression or interval)</label>"
+            "<input class='bx--text-input' name='schedule' type='text' "
+            "placeholder='0 3 * * *' required>"
+            "<label class='bx--label'>Workspace path</label>"
+            "<input class='bx--text-input' name='workspace' type='text' "
+            "placeholder='/path/to/repo' required>"
+            "<label class='bx--label'>Prompt</label>"
+            "<textarea class='bx--text-area' name='prompt' rows='3' "
+            "placeholder='Optional — leave blank if the workspace already carries product_spec/'></textarea>"
+            "<label class='bx--checkbox-label'>"
+            "<input type='checkbox' name='enabled' value='true' checked> "
+            "Enabled</label>"
+            "<p><button class='bx--btn bx--btn--primary'>Add job</button></p>"
+            "</form>"
+        )
+    return (
+        f"{flash_html}"
+        "<div class='card'><h2>Scheduled jobs</h2>"
+        f"{table}{form_html}"
+        "</div>"
+    )
+
+
 def _render_schedule(cfg: DashboardConfig) -> str:
+    # Header: the configured-jobs panel + add-form (Phase 5.2). The
+    # historical runs-history table follows below.
+    jobs_card = _render_schedule_jobs_card(cfg)
     runs = list_schedule_runs(cfg, limit=200)
     if not runs:
-        return (
+        runs_section = (
+            "<div class='card'><h2>Run history</h2>"
             "<p class='muted'>No scheduled-job runs recorded yet. "
-            "Configure jobs under <code>schedule.jobs</code> in "
-            "<code>config.json</code> and start <code>teane schedule run</code>.</p>"
+            "Configure jobs above and start <code>teane schedule run</code>.</p>"
+            "</div>"
         )
+        return jobs_card + runs_section
     rows = []
     for r in runs:
         ec = r["exit_code"]
@@ -1489,12 +1582,14 @@ def _render_schedule(cfg: DashboardConfig) -> str:
             f"<td><span class='muted'>{_esc(r['log_path'])}</span></td>"
             f"</tr>"
         )
-    return (
+    runs_section = (
+        "<div class='card'><h2>Run history</h2>"
         "<div class='table-wrap'><table id='schedule-table'>"
         "<thead><tr><th>job</th><th>started</th><th>ended</th>"
         "<th>status</th><th class='num'>duration</th><th>log</th></tr></thead>"
-        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div></div>"
     )
+    return jobs_card + runs_section
 
 
 def _render_index(cfg: DashboardConfig) -> str:
@@ -1548,33 +1643,9 @@ def _render_memory_file(cfg: DashboardConfig, name: str) -> tuple[int, str]:
     )
 
 
-def _render_overview(cfg: DashboardConfig) -> str:
-    sessions = list_sessions(cfg)
-    total = sum(s.total_cost_usd for s in sessions)
-    calls = sum(s.llm_calls for s in sessions)
-    success = sum(1 for s in sessions if s.exit_code == 0)
-    fail = sum(1 for s in sessions if s.exit_code not in (0, None))
-    return f"""\
-<div class='card'>
-  <h2>At a glance</h2>
-  <table>
-    <tr><th>Sessions on disk</th><td>{len(sessions)}</td></tr>
-    <tr><th>Successful runs</th><td class='ok'>{success}</td></tr>
-    <tr><th>Failed runs</th><td class='fail'>{fail}</td></tr>
-    <tr><th>Total LLM calls</th><td>{calls}</td></tr>
-    <tr><th>Cumulative spend</th><td>{_fmt_cost(total)}</td></tr>
-  </table>
-</div>
-<div class='card'>
-  <h2>Where this data comes from</h2>
-  <table>
-    <tr><th>Sessions</th><td><code>{_esc(cfg.log_dir)}/*.jsonl</code></td></tr>
-    <tr><th>Scheduled runs</th><td><code>{_esc(cfg.schedule_db)}</code></td></tr>
-    <tr><th>Repo index</th><td><code>{_esc(cfg.repo_index_dir)}/repo_index.db</code></td></tr>
-    <tr><th>Per-repo memory</th><td><code>{_esc(cfg.memory_dir)}/*.md</code></td></tr>
-  </table>
-</div>
-"""
+# _render_overview / _route_overview removed in Phase 7 — the
+# at-a-glance card duplicated /status content and was never wired
+# into a live route.
 
 
 # ---------------------------------------------------------------------------
@@ -1582,10 +1653,6 @@ def _render_overview(cfg: DashboardConfig) -> str:
 # ---------------------------------------------------------------------------
 
 Route = tuple[re.Pattern[str], Callable[[DashboardConfig, dict[str, str]], tuple[int, str, str]]]
-
-
-def _route_overview(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Overview", _render_overview(cfg), cfg)
 
 
 def _route_sessions(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
@@ -2699,11 +2766,10 @@ _DASHBOARD_TILES: tuple[tuple[str, str, str, str], ...] = (
     ("View Status", "Day / week / month summary plus what's running right now.", "/status", "chart-line"),
     ("Cost burn-down", "Cumulative spend and per-call cost across every session.", "/cost", "chart-line"),
     ("Sessions list", "Every harness session on disk with exit code and token totals.", "/sessions", "list"),
-    ("Schedule history", "Past runs from the cron-driven scheduled-job daemon.", "/schedule", "calendar"),
+    ("Saved presets", "Reusable workspace + prompt + flag bundles for one-click recall.", "/run/presets", "bookmark"),
+    ("Schedule", "Configured jobs + run history for the cron-driven scheduled-job daemon.", "/schedule", "calendar"),
     ("Repo index", "Status of the semantic retrieval index per workspace.", "/index", "search"),
     ("Memory list", "Per-repo memory files appended after each session.", "/memory", "document"),
-    ("Live runs", "Currently-running processes spawned from this dashboard.", "/live", "terminal"),
-    ("Configuration (raw)", "Section-by-section view of the legacy config form.", "/config", "settings"),
 )
 
 
@@ -3276,12 +3342,9 @@ def make_request_handler(
             if m:
                 self._handle_config_tree_save(m.group("section"), form)
                 return
-            # /config/<section> — legacy curated editor (kept for the
-            # /config raw page that still wires it).
-            m = re.match(r"^/config/(?P<section>[A-Za-z0-9_]+)/?$", path)
-            if m:
-                self._handle_config_save(m.group("section"), form)
-                return
+            # /config/<section> legacy POST removed in Phase 7 — the
+            # /config-tree/<section> tree editor replaced it. Bookmarks
+            # to the old path land in the dispatch fall-through 404.
             # /memory/<name>
             m = re.match(r"^/memory/(?P<name>[A-Za-z0-9_.\-]+\.md)$", path)
             if m:
@@ -3290,6 +3353,13 @@ def make_request_handler(
             # /run/now (legacy — defaults to subcommand="build")
             if path == "/run/now":
                 self._handle_run_now(form)
+                return
+            # /run/presets/* — Phase 5.1 preset CRUD.
+            if path in ("/run/presets/save", "/run/presets/save/"):
+                self._handle_preset_save(form)
+                return
+            if path in ("/run/presets/delete", "/run/presets/delete/"):
+                self._handle_preset_delete(form)
                 return
             # /run/<subcommand> — Phase 2.2 per-subcommand handlers.
             # Five focused forms (build / patch / deploy / test / audit)
@@ -3362,58 +3432,9 @@ def make_request_handler(
 
         # ---- Write handlers ----------------------------------------------
 
-        def _handle_config_save(self, section_name: str, form: dict[str, Any]) -> None:
-            from harness.web_forms import build_section, parse_section_post
-            current = read_config_file(cfg)
-            section = build_section(section_name, current_config=current)
-            parsed, errors = parse_section_post(section, form)
-            if errors:
-                err_map = {e.dotted_key: e.message for e in errors}
-                body = _render_config_section(
-                    cfg, section_name, csrf_token=csrf_token, errors=err_map,
-                )
-                self._send(400, "text/html; charset=utf-8",
-                           _layout(f"Config · {section_name}", body, cfg))
-                return
-            base_mtime_ns = _extract_base_mtime_ns(form)
-            ok, msg = write_config_section_atomic(
-                cfg, section_name, parsed,
-                expected_base_mtime_ns=base_mtime_ns,
-            )
-            if not ok:
-                if msg.startswith(CONFIG_STALE_MARKER):
-                    flash = msg[len(CONFIG_STALE_MARKER):].strip()
-                    body = _render_config_section(
-                        cfg, section_name, csrf_token=csrf_token,
-                        flash=flash,
-                    )
-                    self._send(409, "text/html; charset=utf-8",
-                               _layout(f"Config · {section_name}", body, cfg))
-                    return
-                err_map = {section.fields[0].dotted_key: msg} if section.fields else {}
-                body = _render_config_section(
-                    cfg, section_name, csrf_token=csrf_token,
-                    errors=err_map, flash=f"save failed: {msg}",
-                )
-                self._send(400, "text/html; charset=utf-8",
-                           _layout(f"Config · {section_name}", body, cfg))
-                return
-            try:
-                # Redact any field flagged secret=True before persisting
-                # the diff to audit_log — the raw form would otherwise
-                # carry e.g. models[].api_key cleartext into web.db
-                # forever. Audit §3.9.
-                safe_parsed = _redact_secret_fields_for_audit(section, parsed)
-                append_audit(db_path=cfg.web_db_path, action="config_save",
-                             target=section_name, detail=json.dumps(safe_parsed, default=str))
-            except Exception:  # noqa: BLE001
-                pass
-            body = _render_config_section(
-                cfg, section_name, csrf_token=csrf_token,
-                flash="Saved.",
-            )
-            self._send(200, "text/html; charset=utf-8",
-                       _layout(f"Config · {section_name}", body, cfg))
+        # _handle_config_save (legacy /config/<section> POST) removed in
+        # Phase 7 — the /config-ui tree editor + /config-tree/<section>
+        # POST replaced it.
 
         def _handle_config_tree_save(
             self, section_name: str, form: dict[str, Any],
@@ -3519,6 +3540,93 @@ def make_request_handler(
             and share the same handler via ``_handle_run_subcommand``.
             """
             self._handle_run_subcommand("build", form)
+
+        def _handle_preset_save(self, form: dict[str, Any]) -> None:
+            """POST /run/presets/save — capture current run form as a preset.
+
+            Stores the operator-supplied name + workspace + prompt and
+            the argv that ``build_subcommand_argv_from_form`` would
+            emit for the form's ``subcommand`` field. The subcommand
+            token is prepended to ``harness_args`` (convention) so the
+            preset list's "Use" link can deep-link to the right
+            ``/run/<subcommand>`` page.
+            """
+            name = str(form.get("preset_name") or "").strip()
+            if not name:
+                self._send(
+                    400, "text/plain",
+                    "preset_name required (give it a memorable label "
+                    "before saving)\n",
+                )
+                return
+            import re as _re
+            if not _re.fullmatch(r"[A-Za-z0-9._\-]{1,64}", name):
+                self._send(
+                    400, "text/plain",
+                    "preset name must match [A-Za-z0-9._-]{1,64}\n",
+                )
+                return
+            subcommand = str(form.get("subcommand") or "build").strip()
+            from harness.dashboard_runlike import is_valid_subcommand
+            if not is_valid_subcommand(subcommand):
+                self._send(400, "text/plain", f"unknown subcommand: {subcommand}\n")
+                return
+            workspace = str(form.get("workspace") or "").strip()
+            prompt = str(form.get("prompt") or "").strip()
+            extra_args, flag_errors = _collect_run_argv(form, subcommand=subcommand)
+            if flag_errors:
+                self._send(
+                    400, "text/plain",
+                    "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n",
+                )
+                return
+            # Convention: subcommand is the first arg so the preset
+            # round-trips through `Use` back to /run/<subcommand>.
+            harness_args = [subcommand] + list(extra_args)
+            try:
+                save_run_preset(
+                    db_path=cfg.web_db_path, name=name,
+                    workspace=workspace, prompt=prompt,
+                    harness_args=harness_args,
+                )
+            except ValueError as exc:
+                self._send(400, "text/plain", f"{exc}\n")
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, "text/plain", f"save failed: {exc}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="preset_save",
+                    target=name, detail=f"subcommand={subcommand}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/run/presets")
+            self.end_headers()
+
+        def _handle_preset_delete(self, form: dict[str, Any]) -> None:
+            """POST /run/presets/delete — drop a saved preset by name."""
+            name = str(form.get("name") or "").strip()
+            if not name:
+                self._send(400, "text/plain", "name required\n")
+                return
+            try:
+                delete_run_preset(db_path=cfg.web_db_path, name=name)
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, "text/plain", f"delete failed: {exc}\n")
+                return
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="preset_delete",
+                    target=name, detail="",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header("Location", "/run/presets")
+            self.end_headers()
 
         def _handle_run_subcommand(
             self, subcommand: str, form: dict[str, Any],
@@ -4221,13 +4329,16 @@ from harness.web_state import (  # noqa: E402  (intentional late import)
     add_oneshot_job,
     append_audit,
     consume_chat_notes,
+    delete_run_preset,
     find_oneshot_jobs_near,
     get_hitl_queue,
     get_process_registry,
     list_pending_oneshot_jobs,
+    list_run_presets,
     pending_chat_notes,
     queue_chat_note,
     reset_shared_state as reset_shared_state,  # re-export for test hook
+    save_run_preset,
 )
 
 
@@ -5538,30 +5649,13 @@ def _parse_multipart_body(
 
 
 # ---------------------------------------------------------------------------
-# Route handlers — Tier A new views
+# Route handlers
+#
+# Phase 7 cleanup: removed _route_live (replaced by /sessions running
+# rows), _route_config_index / _route_config_section (replaced by the
+# /config-ui tree editor), _route_run_new (replaced by the focused
+# /run/<subcommand> pages below).
 # ---------------------------------------------------------------------------
-
-def _route_live(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Live runs", _render_live(cfg), cfg, active="dashboards")
-
-
-def _route_config_index(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 200, "text/html; charset=utf-8", _layout("Configuration", _render_config_index(cfg), cfg, active="dashboards")
-
-
-def _route_config_section(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
-    csrf = resolve_csrf_token(cfg)
-    body = _render_config_section(cfg, params["section"], csrf_token=csrf)
-    return 200, "text/html; charset=utf-8", _layout(
-        f"Config · {params['section']}", body, cfg, active="dashboards",
-    )
-
-
-def _route_run_new(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    csrf = resolve_csrf_token(cfg)
-    return 200, "text/html; charset=utf-8", _layout(
-        "New run", _render_run_new(cfg, csrf), cfg, active="dashboards",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -5638,6 +5732,7 @@ def _render_run_subcommand_page(
   <p class='muted'>{_esc(blurb)}</p>
   <form id='run-{_esc(subcommand)}-form' method='post' action='/run/{_esc(subcommand)}'>
     <input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>
+    <input type='hidden' name='subcommand' value='{_esc(subcommand)}'>
     <div class='field'>
       <label class='bx--label' for='workspace'>Workspace path</label>
       <input class='bx--text-input' id='workspace' name='workspace' type='text'
@@ -5645,12 +5740,100 @@ def _render_run_subcommand_page(
     </div>
     {prompt_html}
     {flag_table_html}
+    <fieldset class='field-group'>
+      <legend class='bx--label'>Save as preset (optional)</legend>
+      <p class='muted'>Give this configuration a name to recall it from
+      <a href='/run/presets'>/run/presets</a> later. Re-using an existing
+      name overwrites that preset.</p>
+      <input class='bx--text-input' name='preset_name' type='text'
+             placeholder='nightly-retest'>
+    </fieldset>
     <div class='actions'>
       <button class='bx--btn bx--btn--primary' type='submit'>{_icon("play")}Run {_esc(label)}</button>
-      <a href='/run' class='bx--btn bx--btn--tertiary'>Back</a>
+      <button class='bx--btn bx--btn--tertiary' type='submit'
+              formaction='/run/presets/save'>Save preset</button>
+      <a href='/run/presets' class='bx--btn bx--btn--ghost'>View saved</a>
+      <a href='/run' class='bx--btn bx--btn--ghost'>Back</a>
     </div>
   </form>
 </div>"""
+
+
+def _render_run_presets_page(
+    cfg: DashboardConfig, *, flash: str = "",
+) -> str:
+    """Standalone /run/presets page — list saved presets with Use/Delete.
+
+    Each preset stores ``(name, workspace, prompt, harness_args)``. The
+    convention adopted in Phase 5.1 prepends the subcommand token as
+    the first element of ``harness_args`` (e.g. ``["build", "--git=true"]``)
+    so the "Use" button can deep-link back to the matching
+    ``/run/<subcommand>`` page.
+    """
+    if not cfg.writes_enabled:
+        return (
+            "<div class='card'><p class='muted'>Writes are disabled — "
+            "presets are read-only here. Enable "
+            "<code>dashboard.writes_enabled</code> in config.json to manage them.</p>"
+            "</div>"
+        )
+    csrf_token = resolve_csrf_token(cfg) or ""
+    try:
+        presets = list_run_presets(db_path=cfg.web_db_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[presets] list failed: %s", exc)
+        presets = []
+
+    flash_html = f"<div class='card ok'>{_esc(flash)}</div>" if flash else ""
+
+    if not presets:
+        return (
+            f"{flash_html}<div class='card'><h2>Saved presets</h2>"
+            "<p class='muted'>No presets saved yet. Use the "
+            "&ldquo;Save as preset&rdquo; card on any <code>/run/&lt;subcommand&gt;</code> "
+            "page to capture the current form.</p></div>"
+        )
+
+    rows = []
+    for p in presets:
+        args = p.get("harness_args") or []
+        subcommand = ""
+        if args and isinstance(args[0], str) and args[0] in (
+            "build", "patch", "deploy", "test", "audit",
+        ):
+            subcommand = args[0]
+        prompt_snip = (p.get("prompt") or "")[:80]
+        use_button = (
+            f"<a href='/run/{_esc(subcommand)}?preset={_esc(p['name'])}' "
+            "class='bx--btn bx--btn--primary bx--btn--sm'>Use</a>"
+        ) if subcommand else (
+            "<span class='muted'>—</span>"
+        )
+        delete_form = (
+            f"<form method='post' action='/run/presets/delete' style='display:inline'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            f"<input type='hidden' name='name' value='{html.escape(p['name'])}'>"
+            "<button class='bx--btn bx--btn--danger bx--btn--sm' "
+            "onclick=\"return confirm('Delete preset?')\">Delete</button>"
+            "</form>"
+        )
+        rows.append(
+            "<tr>"
+            f"<td><code>{_esc(p['name'])}</code></td>"
+            f"<td><span class='bx--tag'>{_esc(subcommand or '(unknown)')}</span></td>"
+            f"<td>{_esc(p['workspace'])}</td>"
+            f"<td>{_esc(prompt_snip)}</td>"
+            f"<td>{_esc(p['created_at'])}</td>"
+            f"<td>{use_button} {delete_form}</td>"
+            "</tr>"
+        )
+    return (
+        f"{flash_html}<div class='card'><h2>Saved presets</h2>"
+        "<div class='table-wrap'><table class='w-100'>"
+        "<thead><tr><th>Name</th><th>Subcommand</th><th>Workspace</th>"
+        "<th>Prompt</th><th>Saved</th><th>Actions</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div></div>"
+    )
 
 
 def _render_run_index(cfg: DashboardConfig) -> str:
@@ -5729,6 +5912,16 @@ def _route_workspace_traceability(
 # through the dispatch path's str-only return type.
 
 
+def _route_run_presets(
+    cfg: DashboardConfig, _params: dict[str, str],
+) -> tuple[int, str, str]:
+    """``GET /run/presets`` — saved-preset list with Use/Delete buttons."""
+    return 200, "text/html; charset=utf-8", _layout(
+        "Saved presets", _render_run_presets_page(cfg), cfg,
+        active="dashboards",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tier C: pending HITL listing (read endpoint; answer + cancel are POSTs)
 # ---------------------------------------------------------------------------
@@ -5791,14 +5984,15 @@ def _route_hitl_webhook_marker(cfg: DashboardConfig, params: dict[str, str]) -> 
 # ---------------------------------------------------------------------------
 
 _ROUTES.extend([
-    (re.compile(r"^/live/?$"), _route_live),
-    (re.compile(r"^/config/?$"), _route_config_index),
-    (re.compile(r"^/config/(?P<section>[A-Za-z0-9_]+)/?$"), _route_config_section),
-    (re.compile(r"^/run/new/?$"), _route_run_new),
+    # Legacy routes removed in Phase 7: /live (superseded by /sessions
+    # + /status running rows), /config + /config/<section> (superseded
+    # by /config-ui tree editor), /run/new (superseded by the
+    # per-subcommand Run pages below).
     (re.compile(r"^/run/console/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_run_console),
-    # Per-subcommand focused Run pages (Phase 2.2). Must precede the
-    # less-specific /run/console match above? No — console is more
-    # specific (path prefix `/run/console/`). Order is fine.
+    # Per-subcommand focused Run pages (Phase 2.2). /run/presets must
+    # precede the regex match for /run/<subcommand> so the static
+    # "presets" segment doesn't get captured as a subcommand candidate.
+    (re.compile(r"^/run/presets/?$"), _route_run_presets),
     (re.compile(r"^/run/(?P<subcommand>build|patch|deploy|test|audit)/?$"), _route_run_subcommand),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending/?$"), _route_hitl_pending),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending\.html$"), _route_hitl_pending_html),

@@ -1662,6 +1662,17 @@ _CRITICAL_ERROR_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bNo such file or directory\b", re.IGNORECASE),
     re.compile(r"\bcannot access\b", re.IGNORECASE),
     re.compile(r"\bPermission denied\b", re.IGNORECASE),
+    # Prod-import smoke markers. The smoke script in graph.py emits a
+    # PROD_IMPORT_SMOKE_FAILURES header followed by one FAIL: line per
+    # failing module, and _run_prod_import_smoke_check parses that
+    # header out of raw_output. Without these patterns, exception types
+    # not otherwise listed here (ValidationError, AttributeError,
+    # NameError, RuntimeError, KeyError, ValueError, …) get stripped by
+    # this filter — the smoke parser then sees no header and falls back
+    # to a useless install-chatter diagnostic, and the repair loop burns
+    # iterations on blind guesses.
+    re.compile(r"^FAIL:\s"),
+    re.compile(r"PROD_IMPORT_SMOKE_(?:FAILURES|OK)"),
 ]
 
 

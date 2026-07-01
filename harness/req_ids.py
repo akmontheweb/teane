@@ -18,9 +18,12 @@ Agile / SAFe (Epic → Feature → Story hierarchy emitted by the
 
 - ``EPIC-NNN`` — epic-level requirement (``EPIC-001``)
 - ``FEAT-NNN`` — feature-level requirement (``FEAT-014``)
-- ``STORY-NNN`` — story-level requirement, 3+ digits to avoid
-  collisions with v5's internal ``STORY-N`` work-unit keys
-  (``STORY-001`` is a spec requirement; ``STORY-1`` is a v5 row).
+- ``STORY-NNN`` — story-level requirement. Any digit count is accepted
+  at parse time (``STORY-1``, ``STORY-01``, ``STORY-001`` are the same
+  identifier) and canonicalised to zero-padded 3-digit form via
+  :func:`canonicalize_req_key`. v5's internal work-unit keys share the
+  ``STORY-`` prefix but live in a separate namespace (the ``stories``
+  table) and are never fed through this module's canonicaliser.
 - ``STORY-NFR-NNN`` — agile "enabler story" for non-functional work
   (``STORY-NFR-001``)
 
@@ -38,6 +41,44 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+# Unicode hyphen/dash variants the spec-synthesis LLM sometimes emits
+# instead of ASCII HYPHEN-MINUS (U+002D). Left un-normalised, every
+# identifier regex below silently misses (``\bSTORY-\d+\b`` does not
+# match ``STORY‑001``), the requirements table stays empty, and the
+# decomposition validator escalates to HITL with "Known req_keys in
+# this workspace: []". Fold them to ASCII once, at every ingest site.
+#
+# The set covers hyphen-family (2010, 2011, 2043, 2212, FE63, FF0D)
+# and dash-family (2012, 2013, 2014, 2015, FE58) glyphs — the LLM
+# reaches for any of these when auto-formatting compound IDs or when
+# a stylised em/en dash sneaks into an identifier position.
+_DASH_TRANSLATE = str.maketrans({
+    "‐": "-",  # HYPHEN
+    "‑": "-",  # NON-BREAKING HYPHEN
+    "‒": "-",  # FIGURE DASH
+    "–": "-",  # EN DASH
+    "—": "-",  # EM DASH
+    "―": "-",  # HORIZONTAL BAR
+    "⁃": "-",  # HYPHEN BULLET
+    "−": "-",  # MINUS SIGN
+    "﹘": "-",  # SMALL EM DASH
+    "﹣": "-",  # SMALL HYPHEN-MINUS
+    "－": "-",  # FULLWIDTH HYPHEN-MINUS
+})
+
+
+def normalize_dashes(text: str) -> str:
+    """Fold Unicode hyphen/dash variants down to ASCII ``-``.
+
+    Idempotent, no-op on ASCII-only input. Call at every boundary
+    where an LLM-authored string is compared against a canonical
+    requirement identifier or fed to one of the ID regexes in this
+    module — spec parsing, LLM-emitted key validation, and the
+    spec-synthesis trust check all normalise via this function.
+    """
+    return text.translate(_DASH_TRANSLATE)
+
+
 # Identifier patterns. Anchored on word boundaries so plain text
 # containing the token gets matched without picking up sub-strings
 # inside identifiers like ``USER-1234``.
@@ -47,14 +88,18 @@ FR_ID_RE = re.compile(r"\bFR-\d{1,4}\b")
 US_ID_RE = re.compile(r"\bUS-\d{1,3}-\d{1,3}\b")
 NFR_ID_RE = re.compile(r"\bNFR-[A-Z]+-\d{1,4}\b")
 
-# Agile / SAFe family. STORY_ID_RE requires 3+ digits so SAFe
-# requirement IDs (``STORY-001``) never collide with v5 internal
-# story_keys (``STORY-1``, ``STORY-2``, …) in heading parses. The
-# STORY_NFR_ID_RE check must run BEFORE STORY_ID_RE (``\b`` matches
-# the dash, so ``STORY-001`` is a substring of ``STORY-NFR-001``).
+# Agile / SAFe family. STORY_ID_RE accepts 1-4 digits — the old 3+
+# rule was there to segregate spec req_keys (``STORY-001``) from v5
+# work-unit story_keys (``STORY-1``, ``STORY-2``, …), but every parsed
+# key now flows through :func:`canonicalize_req_key` which zero-pads
+# to 3 digits, so ``STORY-1`` and ``STORY-001`` become the same
+# identifier on the requirements side. Work-unit story_keys live in a
+# separate table and never touch this module's canonicaliser.
+# The STORY_NFR_ID_RE check must still run BEFORE STORY_ID_RE (``\b``
+# matches the dash, so ``STORY-001`` is a substring of ``STORY-NFR-001``).
 EPIC_ID_RE = re.compile(r"\bEPIC-\d{1,4}\b")
 FEAT_ID_RE = re.compile(r"\bFEAT-\d{1,4}\b")
-STORY_ID_RE = re.compile(r"\bSTORY-\d{3,4}\b")
+STORY_ID_RE = re.compile(r"\bSTORY-\d{1,4}\b")
 STORY_NFR_ID_RE = re.compile(r"\bSTORY-NFR-\d{1,4}\b")
 
 # Heading patterns the ingest parser looks for. Convention matches what
@@ -87,7 +132,7 @@ _HEADING_RE = re.compile(
     r"|EPIC-\d{1,4}"
     r"|FEAT-\d{1,4}"
     r"|STORY-NFR-\d{1,4}"
-    r"|STORY-\d{3,4}"
+    r"|STORY-\d{1,4}"
     r")"
     # Title separator: ``:``, em-dash, or `` -`` (markdown header style).
     r"\s*(?:[:\-]|—)\s*(?P<title>.+?)\s*$"
@@ -98,6 +143,62 @@ _HEADING_RE = re.compile(
 # ``#``-prefixed heading qualifies (a new requirement OR a section
 # header), as does a horizontal rule.
 _BODY_TERMINATOR_RE = re.compile(r"^\s*(?:#{1,}\s|---\s*$)")
+
+
+# Canonical zero-pad width per requirement family. Every family in the
+# spec convention publishes at 3-digit width (``STORY-001``, ``FR-014``,
+# etc.) except the paired ``US-NN-NN`` form which uses 2-digit segments.
+# The parser accepts any width 1-4 at ingest and normalises here so
+# ``STORY-1``, ``STORY-01``, and ``STORY-001`` all persist as the same
+# canonical string.
+_CANONICAL_WIDTH_TAIL = 3
+_CANONICAL_WIDTH_US_SEG = 2
+
+
+def canonicalize_req_key(req_key: str) -> str:
+    """Return the canonical spelling of a requirement identifier.
+
+    Idempotent, no-op on already-canonical input. Normalises Unicode
+    hyphen/dash variants first (delegates to :func:`normalize_dashes`),
+    then zero-pads numeric segments to each family's published width so
+    ``STORY-1`` and ``STORY-001`` compare equal downstream.
+
+    Tokens that don't match any known family shape are returned
+    unchanged — the caller (spec parser or decomposition validator)
+    handles unknown tokens through its own error path.
+    """
+    key = normalize_dashes(req_key).strip()
+    parts = key.split("-")
+    if len(parts) < 2:
+        return key
+    prefix = parts[0]
+    # US-NN-NN: two numeric segments, both 2-digit canonical.
+    if (
+        prefix == "US" and len(parts) == 3
+        and parts[1].isdigit() and parts[2].isdigit()
+    ):
+        return (
+            f"US-{int(parts[1]):0{_CANONICAL_WIDTH_US_SEG}d}"
+            f"-{int(parts[2]):0{_CANONICAL_WIDTH_US_SEG}d}"
+        )
+    # NFR-XXX-NNN and STORY-NFR-NNN: alphabetic middle, numeric tail.
+    if (
+        prefix == "NFR" and len(parts) == 3
+        and parts[1].isalpha() and parts[2].isdigit()
+    ):
+        return f"NFR-{parts[1]}-{int(parts[2]):0{_CANONICAL_WIDTH_TAIL}d}"
+    if (
+        prefix == "STORY" and len(parts) == 3
+        and parts[1] == "NFR" and parts[2].isdigit()
+    ):
+        return f"STORY-NFR-{int(parts[2]):0{_CANONICAL_WIDTH_TAIL}d}"
+    # Single-numeric-tail families: FR, EPIC, FEAT, STORY.
+    if (
+        prefix in ("FR", "EPIC", "FEAT", "STORY")
+        and len(parts) == 2 and parts[1].isdigit()
+    ):
+        return f"{prefix}-{int(parts[1]):0{_CANONICAL_WIDTH_TAIL}d}"
+    return key
 
 
 def kind_for(req_key: str) -> Optional[str]:
@@ -162,6 +263,7 @@ def parse_spec_requirements(
     ``harness/story_state.py:create_requirements``.
     """
     out: list[ParsedRequirement] = []
+    text = normalize_dashes(text)
     lines = text.splitlines()
     n = len(lines)
     i = 0
@@ -171,7 +273,10 @@ def parse_spec_requirements(
         if not m:
             i += 1
             continue
-        req_key = m.group("id")
+        # Canonicalise before use — parser accepts ``STORY-1`` /
+        # ``STORY-01`` / ``STORY-001`` alike and folds them to the
+        # zero-padded form so DB rows and LLM-facing key lists agree.
+        req_key = canonicalize_req_key(m.group("id"))
         kind = kind_for(req_key)
         if kind is None:
             # Shouldn't happen given the regex above, but defensive:

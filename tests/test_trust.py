@@ -392,6 +392,21 @@ class TestValidateSynthesizedSpec:
         _, errors = validate_synthesized_spec(content)
         assert errors == []
 
+    def test_malformed_id_with_unicode_hyphen_still_caught(self):
+        # Regression: without dash normalisation, an LLM could bypass
+        # the trust-layer malformed-ID check by stylising the split
+        # story with U+2011 (``STORY‑011B``). The check now folds
+        # dash variants before running the regex.
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# Spec\n\n"
+            "#### Story: STORY‑011B — Handling partial failures\n"
+            "#### Story: FR–014.2 — Retry on transient errors\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert any("STORY-011B" in e for e in errors)
+        assert any("FR-014.2" in e for e in errors)
+
 
 # ---------------------------------------------------------------------------
 # 7. safe_subprocess_env

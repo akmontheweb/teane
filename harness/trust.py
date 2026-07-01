@@ -454,7 +454,13 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
             )
             break  # report once — don't flood
 
-    bad_ids = _MALFORMED_REQUIREMENT_ID_RE.findall(content)
+    # Normalise Unicode hyphen/dash variants (U+2011 non-breaking
+    # hyphen, U+2013 en dash, …) to ASCII so the malformed-ID regex
+    # can't be bypassed by an LLM that stylises identifiers with
+    # non-ASCII dashes. Same fix applied at the parser and validator
+    # layers — see ``req_ids.normalize_dashes``.
+    from harness.req_ids import normalize_dashes
+    bad_ids = _MALFORMED_REQUIREMENT_ID_RE.findall(normalize_dashes(content))
     if bad_ids:
         unique = sorted(set(bad_ids))
         sample = ", ".join(unique[:5])

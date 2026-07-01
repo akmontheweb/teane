@@ -501,12 +501,19 @@ def _validate_story_requirement_keys(
     (used by unit tests that don't seed a DB). Production callers
     in ``decomposition_node`` always pass a real set.
     """
+    from harness.req_ids import canonicalize_req_key
+
     if not isinstance(raw, list) or not raw:
         raise ValueError(
             f"{story_key} must cite at least one 'requirement_keys' entry "
             "declared as a heading in docs/SPEC_REQUIREMENTS.md"
         )
-    keys = [str(x).strip() for x in raw if str(x).strip()]
+    # Canonicalise before set-membership: folds Unicode hyphen variants
+    # (``STORY‑001`` U+2011 → ``STORY-001``) AND zero-pads numeric tails
+    # (``STORY-1`` → ``STORY-001``) so an LLM's low-effort spelling
+    # collides with the canonical spec identifier. See
+    # ``req_ids.canonicalize_req_key``.
+    keys = [canonicalize_req_key(str(x)) for x in raw if str(x).strip()]
     if not keys:
         raise ValueError(
             f"{story_key} 'requirement_keys' must contain non-empty strings"

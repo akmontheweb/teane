@@ -1001,6 +1001,29 @@ class TestRequirementKeysValidation:
                 }],
             })
 
+    def test_unicode_hyphen_in_llm_emitted_key_matches_ascii_known_set(self):
+        # LLM sometimes echoes back the spec's non-breaking hyphen in
+        # its requirement_keys payload. Validator normalises before
+        # set-membership comparison so ``STORY‑001`` (U+2011) matches
+        # the canonical ``STORY-001`` sitting in ``known_req_keys``.
+        known = {"STORY-001", "STORY-002"}
+        keys = decomposition._validate_story_requirement_keys(
+            "STORY-7", ["STORY‑001"], known_req_keys=known,
+        )
+        assert keys == ["STORY-001"]
+
+    def test_short_digit_llm_key_canonicalises_to_padded_known_key(self):
+        # LLM emits ``STORY-1`` when the spec (and DB) hold the padded
+        # ``STORY-001``. Validator canonicalises both sides so the
+        # citation matches without a repair round-trip.
+        known = {"STORY-001", "FR-007", "EPIC-002"}
+        assert decomposition._validate_story_requirement_keys(
+            "STORY-7", ["STORY-1"], known_req_keys=known,
+        ) == ["STORY-001"]
+        assert decomposition._validate_story_requirement_keys(
+            "STORY-8", ["FR-7", "EPIC-2"], known_req_keys=known,
+        ) == ["FR-007", "EPIC-002"]
+
 
 # ---------------------------------------------------------------------------
 # v5 requirements ingest (parse SPEC_REQUIREMENTS.md -> requirements table)

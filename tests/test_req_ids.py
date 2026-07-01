@@ -52,13 +52,17 @@ class TestKindFor:
         assert kind_for("STORY-NFR-001") == "safe_nfr_story"
         assert kind_for("STORY-NFR-014") == "safe_nfr_story"
 
-    def test_v5_internal_story_keys_not_matched(self):
-        """v5's internal ``STORY-N`` (no padding) MUST NOT match
-        the SAFe ``STORY-NNN`` regex (3+ digits required). Otherwise
-        v5 story_keys would silently become "requirements"."""
-        assert kind_for("STORY-1") is None
-        assert kind_for("STORY-9") is None
-        assert kind_for("STORY-99") is None
+    def test_short_digit_story_ids_now_match_after_canonicalisation(self):
+        """The former ``STORY_ID_RE`` "3+ digits" rule was retired: a
+        spec author writing ``STORY-1`` gets the same req_key as
+        ``STORY-001`` via :func:`canonicalize_req_key`. Kind-lookup
+        therefore reports ``safe_story`` for either width; the two
+        namespaces (spec req_key vs v5 work-unit story_key) are kept
+        separate by call-site, not by digit count."""
+        assert kind_for("STORY-1") == "safe_story"
+        assert kind_for("STORY-9") == "safe_story"
+        assert kind_for("STORY-99") == "safe_story"
+        assert kind_for("STORY-001") == "safe_story"
 
     def test_v5_ac_keys_not_matched(self):
         """``STORY-3.AC-2`` is the v5 AC marker form — the SAFe
@@ -196,13 +200,18 @@ class TestMixedSpec:
 
 class TestRegexSanity:
 
-    def test_story_id_re_requires_three_plus_digits(self):
+    def test_story_id_re_accepts_1_to_4_digits(self):
+        # The "3+ digits" rule was retired — canonicalisation now
+        # collapses any width into the padded form, and STORY_ID_RE
+        # matches every valid width. Namespace separation between
+        # spec req_keys and v5 work-unit story_keys is enforced by
+        # the call-site, not by the regex.
+        assert STORY_ID_RE.search("STORY-1")
+        assert STORY_ID_RE.search("STORY-9")
+        assert STORY_ID_RE.search("STORY-99")
         assert STORY_ID_RE.search("STORY-001")
         assert STORY_ID_RE.search("STORY-100")
-        # v5 internal keys with 1-2 digits must NOT match.
-        assert not STORY_ID_RE.search("STORY-1 ")
-        assert not STORY_ID_RE.search("STORY-9")
-        assert not STORY_ID_RE.search("STORY-99 ")
+        assert STORY_ID_RE.search("STORY-1000")
 
     def test_epic_and_feat_accept_1_4_digits(self):
         assert EPIC_ID_RE.search("EPIC-1")
@@ -220,3 +229,136 @@ class TestRegexSanity:
         assert not NFR_ID_RE.search("ANFR-SEC-001")
         # ``US-`` is a real prefix, so this one IS expected to match.
         assert US_ID_RE.search("US-01-02")
+
+
+# ---------------------------------------------------------------------------
+# normalize_dashes — LLM-emitted Unicode hyphen/dash variants
+# ---------------------------------------------------------------------------
+
+class TestUnicodeHyphenNormalization:
+    """Regression for the FinancialResearch HITL incident (session
+    ``5aef5fc7``, 2026-07-01): the spec-synthesis LLM emitted every
+    requirement heading with U+2011 NON-BREAKING HYPHEN, so
+    ``parse_spec_requirements`` matched zero rows, ``known_req_keys``
+    was empty, decomposition's auto-repair had nothing to fall back
+    to, and the graph routed to human_intervention. Normalising at
+    ingest closes the whole class."""
+
+    AGILE_SPEC_WITH_NB_HYPHEN = (
+        "# SRS\n"
+        "\n"
+        "## Epic: EPIC‑001 — Auth\n"
+        "\n"
+        "### Feature: FEAT‑014 — Password reset\n"
+        "\n"
+        "#### Story: STORY‑101 — Operator can reset own password\n"
+        "Body prose.\n"
+        "\n"
+        "#### Enabler Story: STORY‑NFR‑001 — TLS ≥ 1.3\n"
+    )
+
+    def test_non_breaking_hyphen_in_agile_headings_still_parses(self):
+        rows = parse_spec_requirements(self.AGILE_SPEC_WITH_NB_HYPHEN)
+        keys = {r.req_key for r in rows}
+        # Canonical ASCII keys — comparison-safe against DB / LLM output.
+        assert keys == {
+            "EPIC-001", "FEAT-014", "STORY-101", "STORY-NFR-001",
+        }
+
+    def test_en_dash_and_em_dash_variants_also_normalize(self):
+        # LLM sometimes reaches for EN DASH (U+2013) or EM DASH (U+2014)
+        # inside an ID position when auto-formatting compound tokens.
+        # Zero-padded 3-digit canonical form after dash normalisation.
+        spec = (
+            "### FR–2: Login endpoint\n"
+            "\n"
+            "### NFR–SEC–1: Session encryption\n"
+            "\n"
+            "### FR—3: Logout endpoint\n"
+        )
+        keys = {r.req_key for r in parse_spec_requirements(spec)}
+        assert keys == {"FR-002", "NFR-SEC-001", "FR-003"}
+
+    def test_ascii_input_is_unchanged(self):
+        from harness.req_ids import normalize_dashes
+        s = "STORY-001: Plain ASCII heading — no drift"
+        # Idempotent on pure-ASCII hyphens; em-dash in title normalises
+        # (harmless, since titles are display-only downstream).
+        got = normalize_dashes(s)
+        assert "STORY-001" in got
+        assert "‑" not in got and "—" not in got
+
+    def test_normalize_dashes_is_idempotent(self):
+        from harness.req_ids import normalize_dashes
+        once = normalize_dashes("STORY‑001 — title")
+        twice = normalize_dashes(once)
+        assert once == twice == "STORY-001 - title"
+
+
+# ---------------------------------------------------------------------------
+# canonicalize_req_key — collapse STORY-1 / STORY-01 / STORY-001 etc.
+# ---------------------------------------------------------------------------
+
+class TestCanonicalizeReqKey:
+    """The parser and validator both fold requirement keys to a
+    canonical zero-padded form so a spec author's ``STORY-1`` and an
+    LLM's ``STORY-001`` compare equal downstream."""
+
+    def test_short_forms_zero_pad_to_three_digits(self):
+        from harness.req_ids import canonicalize_req_key
+        assert canonicalize_req_key("STORY-1") == "STORY-001"
+        assert canonicalize_req_key("STORY-01") == "STORY-001"
+        assert canonicalize_req_key("FR-7") == "FR-007"
+        assert canonicalize_req_key("EPIC-2") == "EPIC-002"
+        assert canonicalize_req_key("FEAT-14") == "FEAT-014"
+        assert canonicalize_req_key("STORY-NFR-3") == "STORY-NFR-003"
+        assert canonicalize_req_key("NFR-SEC-1") == "NFR-SEC-001"
+
+    def test_already_canonical_forms_pass_through(self):
+        from harness.req_ids import canonicalize_req_key
+        for k in ("STORY-001", "FR-014", "EPIC-999", "STORY-NFR-042",
+                  "NFR-PERF-001", "STORY-1000"):
+            assert canonicalize_req_key(k) == k
+
+    def test_us_pair_uses_two_digit_segments(self):
+        from harness.req_ids import canonicalize_req_key
+        assert canonicalize_req_key("US-3-2") == "US-03-02"
+        assert canonicalize_req_key("US-03-02") == "US-03-02"
+
+    def test_unknown_shapes_returned_unchanged(self):
+        from harness.req_ids import canonicalize_req_key
+        # Placeholder work-unit key from augment mode — must not be
+        # mistaken for a canonicalisable req_key.
+        assert canonicalize_req_key("STORY-NEW-1") == "STORY-NEW-1"
+        assert canonicalize_req_key("random-token") == "random-token"
+        assert canonicalize_req_key("") == ""
+
+    def test_unicode_hyphen_input_is_canonicalised(self):
+        from harness.req_ids import canonicalize_req_key
+        # LLM ships STORY‑1 with U+2011 — one call handles both
+        # normalisation and zero-padding.
+        assert canonicalize_req_key("STORY‑1") == "STORY-001"
+        assert canonicalize_req_key("FR‑7") == "FR-007"
+
+    def test_canonicalize_is_idempotent(self):
+        from harness.req_ids import canonicalize_req_key
+        once = canonicalize_req_key("STORY-1")
+        twice = canonicalize_req_key(once)
+        assert once == twice == "STORY-001"
+
+    def test_spec_parser_canonicalises_headings(self):
+        # A spec author who writes ``STORY-1`` (no padding) gets the
+        # same DB row as the canonical ``STORY-001`` form — the parse
+        # no longer silently skips short-digit headings.
+        spec = (
+            "## Epic: EPIC-1 — Auth\n"
+            "### Feature: FEAT-2 — Login\n"
+            "#### Story: STORY-1 — Sign in with email\n"
+            "#### Enabler Story: STORY-NFR-1 — TLS 1.3\n"
+            "### FR-3: Retry failed requests\n"
+        )
+        keys = {r.req_key for r in parse_spec_requirements(spec)}
+        assert keys == {
+            "EPIC-001", "FEAT-002", "STORY-001",
+            "STORY-NFR-001", "FR-003",
+        }

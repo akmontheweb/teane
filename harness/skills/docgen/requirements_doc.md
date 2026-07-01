@@ -292,7 +292,11 @@ pass/fail.
 
 ### Gate 3 — INVEST (agile path only)
 All six INVEST criteria must pass for every Story.
-- Fails "Small" → split the story before emitting.
+- Fails "Small" → split the story before emitting. Each resulting piece MUST
+  get its own fresh `STORY-NNN` from the next-available integer in the
+  global sequence — do NOT extrude a suffix (``STORY-011A``, ``STORY-011B``)
+  or decimal (``STORY-011.1``) off the original ID. See "ID numbering
+  convention" below.
 - Fails "Testable" → rewrite AC until each scenario has a binary outcome.
 - Fails "Independent" → identify the blocking dependency and add it as a
   separate story with a `blocks:` annotation.
@@ -332,6 +336,15 @@ NFR-PERF-001, NFR-SEC-001, NFR-AVAIL-001, ...  (default path NFRs)
 UC-001, UC-002, ...           (default path use cases)
 TEST-001, TEST-NFR-001, ...   (test hook stubs — populated by Phase 5)
 ```
+
+Every ID in every family MUST match exactly one of the shapes shown above —
+a fixed prefix followed by a zero-padded integer (three digits or more).
+**Never** append a letter suffix (``STORY-011A``, ``FR-014B``), a decimal
+(``STORY-011.1``, ``FR-014.2``), a dotted child (``STORY-011.a``), or any
+other extension when you need "another one like the previous". Every
+requirement — including one produced by splitting a larger story under
+Gate 3 or renumbering under Gate 5 — gets its own fresh integer from the
+next-available position in that family's global sequence.
 
 When the user message includes a prior `SPEC_REQUIREMENTS.md` (change-request
 mode — see below), continue from the highest existing ID in each sequence.

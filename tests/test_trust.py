@@ -340,6 +340,58 @@ class TestValidateSynthesizedSpec:
         _, errors = validate_synthesized_spec(content)
         assert errors == []
 
+    def test_suffixed_story_id_rejected(self):
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# Spec\n\n"
+            "#### Story: STORY-011B — Handling Partial Pipeline Failures\n"
+            "**Parent feature:** FEAT-002\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert any("STORY-011B" in e for e in errors)
+
+    def test_decimal_requirement_id_rejected(self):
+        from harness.trust import validate_synthesized_spec
+        content = "## FR list\n\n- FR-014.2: The system shall retry.\n"
+        _, errors = validate_synthesized_spec(content)
+        assert any("FR-014.2" in e for e in errors)
+
+    def test_multiple_bad_ids_reported_deduplicated(self):
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "STORY-011A appears, then STORY-011B, then STORY-011A again, "
+            "and finally EPIC-003c.\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert len(errors) == 1
+        msg = errors[0]
+        # Each bad ID reported exactly once (deduplicated + sorted).
+        assert "STORY-011A" in msg
+        assert "STORY-011B" in msg
+        assert "EPIC-003c" in msg
+
+    def test_valid_ids_accepted(self):
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# Spec\n\n"
+            "EPIC-001, FEAT-002, STORY-011, STORY-NFR-001, FR-014, "
+            "NFR-PERF-001, NFR-SEC-002, UC-005, TEST-001, TEST-NFR-001.\n"
+            "Text: 'As per STORY-011, the system shall respond within 1.5 ms.'\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert errors == []
+
+    def test_unrelated_dotted_identifiers_not_flagged(self):
+        from harness.trust import validate_synthesized_spec
+        # Real docs mention semver / paths / lowercase — none should match.
+        content = (
+            "Use Python 3.11 and package django-3.2.5. "
+            "The story-011b endpoint (lowercase) is a URL path segment. "
+            "See TEST-P-001 in the RTM.\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert errors == []
+
 
 # ---------------------------------------------------------------------------
 # 7. safe_subprocess_env

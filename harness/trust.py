@@ -394,6 +394,24 @@ def validate_blueprint_json(content: str) -> tuple[dict[str, Any], list[str]]:
 
 _MAX_SPEC_BYTES = 256 * 1024  # 256 KB
 
+# Requirement-ID families declared by the requirements_doc skill's "ID
+# numbering convention" section. Every valid ID in each family is
+# ``<PREFIX>-<zero-padded integer>`` — no letter suffix, no decimal, no
+# dotted child. The regex below catches the malformed shapes at the
+# trust boundary; the source-level fix lives in the skill prompt itself
+# (see harness/skills/docgen/requirements_doc.md Gate 3 + ID convention).
+# Failure mode: LLM emits ``STORY-011B`` or ``FR-014.2`` when splitting a
+# larger requirement instead of allocating the next integer from the
+# global sequence. Commit 018cf92 fixed the same shape at the
+# decomposition prompt; this catches it one hop earlier at spec synthesis.
+_MALFORMED_REQUIREMENT_ID_RE = re.compile(
+    r"\b(?:"
+    r"EPIC|FEAT|STORY(?:-NFR)?|FR|"
+    r"NFR-(?:PERF|SEC|AVAIL|SCALE|MAINT|COMP)|"
+    r"UC|TEST(?:-NFR)?"
+    r")-\d+(?:[A-Za-z]|\.\d)\w*"
+)
+
 
 def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
     """
@@ -404,6 +422,7 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
       - UTF-8 encodable (should already be — belt-and-suspenders)
       - No NUL bytes or C0 control chars (except LF, CR, TAB)
       - Within the 256 KB length cap
+      - No requirement IDs with letter suffixes or decimal extensions
 
     Returns:
         (validated_content, errors)
@@ -434,6 +453,17 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
                 f"spec contains control character U+{cp:04X} at position {i}"
             )
             break  # report once — don't flood
+
+    bad_ids = _MALFORMED_REQUIREMENT_ID_RE.findall(content)
+    if bad_ids:
+        unique = sorted(set(bad_ids))
+        sample = ", ".join(unique[:5])
+        overflow = f" (+ {len(unique) - 5} more)" if len(unique) > 5 else ""
+        errors.append(
+            "spec contains requirement IDs with letter suffixes or decimal "
+            "extensions — every ID must be <PREFIX>-<zero-padded integer> "
+            f"with no extension: {sample}{overflow}"
+        )
 
     return content, errors
 

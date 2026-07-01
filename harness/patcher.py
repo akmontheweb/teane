@@ -30,7 +30,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -849,7 +849,23 @@ class TextPatcher(BasePatcher):
             # the resume continues cleanly. We require the replacement
             # to appear exactly once to avoid false positives where the
             # text happens to appear elsewhere.
-            if replace and original.count(replace) == 1:
+            if replace and (
+                original.count(replace) == 1
+                or len(_whitespace_tolerant_match(original, replace)) == 1
+                or len(_whitespace_tolerant_match(
+                    original, replace, normalize=str.strip,
+                )) == 1
+            ):
+                # Three tiers count as "already at target state":
+                #   1. Exact-byte match (original behavior)
+                #   2. Trailing-whitespace tolerant (CRLF / EOF newline drift)
+                #   3. Full-strip tolerant (tab vs space leading-indent drift)
+                # The full-strip tier covers the most common idempotent
+                # re-emit failure: the LLM re-issues a Makefile / YAML /
+                # Python patch whose ``replace`` content is logically
+                # identical but uses different leading whitespace than the
+                # file. Without tier 3, that re-emit looks like a search
+                # miss and trips the repair loop on a non-bug.
                 logger.info(
                     "[patcher:text] REPLACE_BLOCK no-op: %s already at target state (resume-safe).",
                     filepath,
@@ -903,6 +919,97 @@ class TextPatcher(BasePatcher):
                         f"Add more context lines to make the search unique."
                     ),
                 )
+
+            # Quote-style fallback. JS/TS files mix single- and double-quote
+            # conventions and LLMs frequently emit one style in REPLACE_BLOCK
+            # search while the file has the other (e.g. search for
+            # `from 'react-router-dom'` against a file that has
+            # `from "react-router-dom"`). Quote chars aren't whitespace so
+            # ws-tolerant doesn't catch this. Normalize both sides to a
+            # single canonical quote char and retry.
+            q_matches = _whitespace_tolerant_match(
+                original, search, normalize=_quote_normalize,
+            )
+            if len(q_matches) == 1:
+                modified = _whitespace_tolerant_replace(
+                    original, search, replace, q_matches[0],
+                )
+                lines_changed = _count_diff_lines(original, modified)
+                try:
+                    await _awrite(full_path, modified)
+                    logger.info(
+                        "[patcher:text] Replaced block in %s via quote-tolerant match "
+                        "(%d lines changed). The LLM's search block had "
+                        "single/double-quote drift relative to the file.",
+                        filepath, lines_changed,
+                    )
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.REPLACE_BLOCK,
+                        message=f"Replaced block in {filepath} (quote-tolerant match)",
+                        lines_changed=lines_changed,
+                    )
+                except OSError as exc:
+                    return PatchResult(
+                        success=False, file=filepath,
+                        operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                    )
+            if len(q_matches) > 1:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.REPLACE_BLOCK,
+                    error=(
+                        f"Search block matched {len(q_matches)} regions in "
+                        f"{filepath} under quote-tolerant comparison. "
+                        f"Add more context lines to make the search unique."
+                    ),
+                )
+
+            # Indent-style fallback. Makefile/Python/YAML are sensitive to
+            # leading whitespace, and LLM responses regularly drift tabs ↔
+            # spaces at line starts (especially Makefile recipes where the
+            # tokenizer prefers spaces). ws-tolerant only rstrips; this tier
+            # normalizes both leading AND trailing whitespace via full
+            # ``str.strip``. Last resort before giving up — strictly less
+            # safe than the rstrip tier because it can match across indent
+            # boundaries, so it's gated on producing a UNIQUE match.
+            i_matches = _whitespace_tolerant_match(
+                original, search, normalize=str.strip,
+            )
+            if len(i_matches) == 1:
+                modified = _whitespace_tolerant_replace(
+                    original, search, replace, i_matches[0],
+                )
+                lines_changed = _count_diff_lines(original, modified)
+                try:
+                    await _awrite(full_path, modified)
+                    logger.info(
+                        "[patcher:text] Replaced block in %s via indent-tolerant match "
+                        "(%d lines changed). The LLM's search block had "
+                        "leading-whitespace drift (tabs vs spaces).",
+                        filepath, lines_changed,
+                    )
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.REPLACE_BLOCK,
+                        message=f"Replaced block in {filepath} (indent-tolerant match)",
+                        lines_changed=lines_changed,
+                    )
+                except OSError as exc:
+                    return PatchResult(
+                        success=False, file=filepath,
+                        operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                    )
+            if len(i_matches) > 1:
+                # Don't error out on ambiguous indent-tolerant — fall through
+                # to the line-number-prefix fallback so the LLM gets the
+                # closest-match window. Indent-stripped ambiguity is mostly
+                # noise (every indented block looks similar) so we'd rather
+                # not waste the round on an error.
+                pass
 
             # Line-number-prefix fallback. The patcher's "Search block not
             # found" error includes a line-numbered view of the current
@@ -2096,26 +2203,33 @@ def _strip_line_number_prefixes(search: str) -> Optional[str]:
     return "".join(stripped)
 
 
-def _whitespace_tolerant_match(original: str, search: str) -> list[int]:
+def _whitespace_tolerant_match(
+    original: str, search: str, *, normalize: Optional[Callable[[str], str]] = None,
+) -> list[int]:
     """Find line-aligned regions of ``original`` that match ``search`` after
-    rstrip-per-line normalization.
+    per-line normalization.
 
     Returns a list of *byte* offsets where each match begins in ``original``.
     Empty list means no normalized match. Multiple entries means ambiguous —
     the caller should refuse rather than guess.
 
-    Tolerates: trailing whitespace per line, trailing-newline mismatch on the
-    final line, and CRLF/LF drift. Does NOT tolerate inserted/deleted blank
-    lines mid-block — that is a structural change the LLM should re-emit.
+    Default normalizer is ``str.rstrip`` — tolerates trailing whitespace per
+    line, trailing-newline mismatch on the final line, and CRLF/LF drift.
+    Callers can pass a different normalizer (e.g. ``str.strip`` for full
+    indent tolerance, or ``_quote_normalize`` for single/double-quote drift)
+    to layer additional tolerance tiers. Does NOT tolerate inserted/deleted
+    blank lines mid-block — that is a structural change the LLM should re-emit.
     """
     if not search:
         return []
+    if normalize is None:
+        normalize = str.rstrip
     orig_lines_keep = original.splitlines(keepends=True)
     search_lines = search.splitlines()
     if not search_lines:
         return []
-    orig_lines_stripped = [ln.rstrip() for ln in orig_lines_keep]
-    search_lines_stripped = [ln.rstrip() for ln in search_lines]
+    orig_lines_stripped = [normalize(ln) for ln in orig_lines_keep]
+    search_lines_stripped = [normalize(ln) for ln in search_lines]
     n_search = len(search_lines_stripped)
     if n_search > len(orig_lines_stripped):
         return []
@@ -2131,6 +2245,26 @@ def _whitespace_tolerant_match(original: str, search: str) -> list[int]:
         if orig_lines_stripped[i:i + n_search] == search_lines_stripped:
             matches.append(line_offsets[i])
     return matches
+
+
+_QUOTE_NORMALIZE_RE = re.compile(r"['\"]")
+
+
+def _quote_normalize(line: str) -> str:
+    """Per-line normalizer that collapses single/double quotes to a single
+    canonical char so the matcher tolerates JS/TS quote-style drift.
+
+    The LLM frequently emits ``'react-router-dom'`` in REPLACE_BLOCK search
+    while the file has ``"react-router-dom"`` (or vice versa). Neither
+    whitespace nor line-number-prefix fallback covers this — quote chars are
+    plain content. Normalizing both sides to the same quote char lets the
+    matcher find the line; the caller still applies the LLM's replace text
+    as written (mixed quote style is benign and a linter will fix it).
+
+    Also rstrips trailing whitespace so this composes the existing
+    whitespace-tolerant behavior in one pass.
+    """
+    return _QUOTE_NORMALIZE_RE.sub('"', line).rstrip()
 
 
 def _whitespace_tolerant_replace(
@@ -2233,6 +2367,34 @@ def _find_closest_match(text: str, search: str, context: int = 20) -> str:
 # ---------------------------------------------------------------------------
 # 10. Primary Integration Point
 # ---------------------------------------------------------------------------
+
+def _classify_patch_failure(error: str) -> str:
+    """Short tag for a PatchResult.error string, used in the rollup log so
+    operators see the dominant failure mode without digging into per-attempt
+    lines. Pure string matching against the canned error messages the
+    operation helpers above produce — kept in sync with those messages by
+    convention. Unknown errors fall back to ``error``."""
+    if not error:
+        return "unknown"
+    e = error.lower()
+    if "file not found" in e and "use create_file" in e:
+        return "file missing"
+    if "search block not found" in e:
+        return "search miss"
+    if "matched" in e and "regions" in e and "tolerant" in e:
+        return "ambiguous match"
+    if "matched" in e and "times in" in e:
+        return "ambiguous match"
+    if "rejected" in e and "create_file" in e:
+        return "rejected: file already exists"
+    if "not in skill allowlist" in e:
+        return "allowlist denied"
+    if "outside workspace" in e or "permission" in e:
+        return "path denied"
+    if "no patch blocks" in e:
+        return "no blocks parsed"
+    return "error"
+
 
 def sha256_file_bytes(abs_path: str) -> Optional[str]:
     """Return the SHA-256 hex digest of ``abs_path``'s bytes, or ``None``
@@ -2507,20 +2669,35 @@ async def apply_patch_blocks(
             if not r.success and isinstance(r.error, str)
             and "not in skill allowlist" in r.error
         })
-        other_failures = sorted({
-            r.file for r in results
-            if not r.success and (
-                not isinstance(r.error, str)
-                or "not in skill allowlist" not in r.error
-            )
-        })
+        # Per-file reason for non-allowlist failures. The previous rollup
+        # only listed the file paths, which forced the operator to dig into
+        # the per-attempt logs to learn whether each miss was a search-not-
+        # found / ambiguous / missing-file. Surfacing a short reason tag
+        # makes post-mortems 10× faster and helps the repair-loop tuning
+        # pass see the dominant failure mode at a glance.
+        other_failure_pairs: list[tuple[str, str]] = []
+        seen_failure_files: set[str] = set()
+        for r in results:
+            if r.success or not r.file:
+                continue
+            err = r.error if isinstance(r.error, str) else ""
+            if "not in skill allowlist" in err:
+                continue
+            if r.file in seen_failure_files:
+                continue
+            seen_failure_files.add(r.file)
+            other_failure_pairs.append((r.file, _classify_patch_failure(err)))
+        other_failure_pairs.sort(key=lambda p: p[0])
         parts = [f"[patcher] Applied {success_count}/{total} patches."]
         if touched_this_call:
             parts.append(f"Succeeded on: {touched_this_call}.")
         if rejected_paths:
             parts.append(f"Rejected by allowlist: {rejected_paths}.")
-        if other_failures:
-            parts.append(f"Other failures: {other_failures}.")
+        if other_failure_pairs:
+            formatted = ", ".join(
+                f"{path} ({reason})" for path, reason in other_failure_pairs
+            )
+            parts.append(f"Other failures: {formatted}.")
         logger.info(" ".join(parts))
 
     return results, modified_files

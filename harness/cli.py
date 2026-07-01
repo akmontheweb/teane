@@ -1562,6 +1562,60 @@ _SUBDIR_BUILD_SKIP = frozenset({
 })
 
 
+# Matches `cd <SUBDIR> && npm ...` and `cd <SUBDIR> && npx ...` patterns
+# in package.json `scripts` values. Used by _compose_node_build_command
+# to detect root-delegating-to-subdir layouts so we can install the
+# subdir's deps before the root build runs.
+_CD_SUBDIR_NPM_RE = re.compile(
+    r"\bcd\s+([A-Za-z0-9_\-./]+)\s*&&\s*(?:npm|npx|yarn|pnpm)\b"
+)
+
+# Bash metacharacters that disqualify a captured subdir name from being
+# safely re-emitted as ``cd <name>``. The regex above already excludes
+# spaces and obvious specials, but defense-in-depth so we never inject
+# something like ``cd .;rm -rf .`` into the build command.
+_UNSAFE_SUBDIR_CHARS = set(";|&`$<>(){}[]\\\"' \t\n")
+
+
+def _extract_delegate_subdirs(scripts: dict) -> list[str]:
+    """Return a stable-ordered list of first-level subdirectories that the
+    root ``scripts.{build,test,dev,start}`` values delegate to via a
+    ``cd <subdir> && npm/npx/yarn/pnpm ...`` shell idiom.
+
+    Common with the ``client/`` + ``server/`` monorepo layout where the
+    root package.json acts as an orchestrator (``"build": "cd client &&
+    npm run build"``) and the actual deps live in the subdirs. Without
+    a subdir-install step, the root ``npm install`` only materialises
+    root-level devDeps (e.g. ``concurrently``) and the subdir build
+    immediately crashes with 100+ "Cannot find module" errors — exactly
+    the symptom from session 7c30bce2.
+
+    Excludes ``.`` / ``..`` / absolute paths and anything containing
+    bash metacharacters so the result is safe to inline into a ``cd``.
+    """
+    if not isinstance(scripts, dict):
+        return []
+    found: list[str] = []
+    for key in ("build", "test", "dev", "start"):
+        value = scripts.get(key)
+        if not isinstance(value, str):
+            continue
+        for raw in _CD_SUBDIR_NPM_RE.findall(value):
+            name = raw.strip().strip("/")
+            if not name or name in {".", ".."}:
+                continue
+            if name.startswith("/") or name.startswith("~"):
+                continue
+            if any(ch in _UNSAFE_SUBDIR_CHARS for ch in name):
+                continue
+            # First-level subdirs only — nested paths (``packages/app``)
+            # are also valid, but we only emit a single ``cd <name>`` so
+            # capture the full relative path verbatim.
+            if name not in found:
+                found.append(name)
+    return found
+
+
 def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> str:
     """Build the Node command for a single ``package.json``.
 
@@ -1576,12 +1630,25 @@ def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> 
       - ``vitest`` in deps / devDeps → ``npx vitest run``
       - otherwise → ``npm test --if-present`` (silent no-op, exit 0)
 
+    For monorepos where the root ``scripts.build`` delegates via
+    ``cd <subdir> && npm run build``, we ALSO emit ``cd <subdir> &&
+    npm install`` for each referenced subdir before the root install.
+    Without this, root ``npm install`` materialises only root devDeps;
+    the subdir build crashes immediately with missing-module errors.
+    npm workspaces (declared via ``"workspaces": [...]``) are handled
+    by npm itself — root ``npm install`` installs workspace deps too —
+    so we skip the explicit subdir installs in that case to avoid
+    redundant work.
+
     ``prefix`` is used by the subdir probe to emit ``cd <dir> && ...``
     forms. Returns the full command string ready to drop into the
     detector.
     """
     has_test_script = False
     has_vitest = False
+    has_workspaces = False
+    delegate_subdirs: list[str] = []
+    pkg_dir = os.path.dirname(package_json_path)
     try:
         import json as _json
         with open(package_json_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1596,6 +1663,23 @@ def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> 
                 deps.update(section)
         if "vitest" in deps:
             has_vitest = True
+        workspaces = data.get("workspaces")
+        if isinstance(workspaces, (list, dict)) and workspaces:
+            has_workspaces = True
+        # Only collect delegations when not a workspaces project — npm
+        # workspaces installs subdir deps automatically at root install.
+        if not has_workspaces and isinstance(scripts, dict):
+            for sub in _extract_delegate_subdirs(scripts):
+                # Sanity-check: the subdir must actually exist under the
+                # package's dir AND contain its own package.json. Without
+                # this guard a stale script reference would emit a `cd`
+                # that fails with "No such file or directory" and trap
+                # the repair loop on a non-bug. ``pkg_dir`` may be empty
+                # for relative paths — fall back to "." in that case.
+                base = pkg_dir or "."
+                sub_pkg = os.path.join(base, sub, "package.json")
+                if os.path.isfile(sub_pkg):
+                    delegate_subdirs.append(sub)
     except (OSError, ValueError):
         # Malformed JSON / unreadable file → fall through to the safe
         # `--if-present` tail. Better than crashing the detector.
@@ -1610,7 +1694,13 @@ def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> 
         # wired vitest into yet, instead of trapping repair on a
         # non-bug.
         tail = "npm test --if-present"
-    return f"{prefix}npm install && npm run build && {tail}"
+    # Subdir installs go FIRST so the root build (which `cd`s into them)
+    # finds populated node_modules. Each step pushes/pops the directory
+    # with a subshell to avoid leaking ``cd`` state into the root step.
+    subdir_install = "".join(
+        f"(cd {sub} && npm install) && " for sub in delegate_subdirs
+    )
+    return f"{prefix}{subdir_install}npm install && npm run build && {tail}"
 
 
 def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:

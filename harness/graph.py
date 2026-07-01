@@ -6406,6 +6406,56 @@ _TRACE_FIRST_DIRECTIVE = (
 )
 
 
+# Diagnostic-code prefixes / message fragments that strongly indicate a
+# missing-dependency / environment-not-installed failure rather than a
+# bug in the source code under repair. When the persistent failing-set
+# is dominated by these, the right repair is to fix the install/build
+# step (e.g. emit `cd <subdir> && npm install` before tsc runs, or add
+# a missing package to package.json), NOT to keep editing the source.
+# See session 7c30bce2 where 102 TS2307 errors persisted across 4 rounds
+# because the harness's build command never ran `npm install` in the
+# client subdir — the judge kept pointing the repair LLM at App.tsx
+# while the real fix was upstream of the compile.
+_INSTALL_ERROR_CODE_PREFIXES = (
+    "TS2307",        # TypeScript "Cannot find module"
+    "MISSING_DEP",   # harness-emitted missing dep
+    "MODULENOTFOUND", # Python ModuleNotFoundError (uppercased)
+    "IMPORTERROR",   # Python ImportError (uppercased)
+)
+_INSTALL_ERROR_MSG_FRAGMENTS = (
+    "cannot find module",
+    "cannot find type definition",
+    "modulenotfounderror",
+    "module not found",
+    "no module named",
+)
+
+
+def _diagnostics_look_like_install_failure(
+    diagnostics: list[dict[str, Any]],
+) -> bool:
+    """True when the majority of persistent diagnostics look like missing
+    deps / unresolved imports — i.e. the kind of error that disappears
+    once ``npm install`` / ``pip install`` actually runs. Used by the
+    repair-reflection prompt to bias the judge toward classifying the
+    real blocker as build/install rather than source code."""
+    if not diagnostics:
+        return False
+    matched = 0
+    for d in diagnostics:
+        code = str(d.get("error_code", "") or "").upper()
+        msg = str(d.get("message", "") or "").lower()
+        if any(code.startswith(pfx) for pfx in _INSTALL_ERROR_CODE_PREFIXES):
+            matched += 1
+            continue
+        if any(frag in msg for frag in _INSTALL_ERROR_MSG_FRAGMENTS):
+            matched += 1
+    # Majority threshold — a handful of "Cannot find module" alongside
+    # real type errors is normal during repair; we only want to flip the
+    # judge when the failing-set is dominated by them.
+    return matched * 2 >= len(diagnostics) and matched >= 1
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -6414,6 +6464,7 @@ def _build_repair_reflection_prompt(
     persisted_fingerprints: list[str],
     new_fingerprints: list[str],
     top_persisted_diagnostics: list[dict[str, Any]],
+    install_failure_likely: bool = False,
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -6478,6 +6529,34 @@ def _build_repair_reflection_prompt(
     else:
         top_block = "  (no persistent errors)"
 
+    # Optional install-failure hint. Inserted only when the harness's
+    # heuristic flags the persistent set as dominated by missing-module /
+    # unresolved-import errors. Acts as a second-opinion nudge — the
+    # judge can still rule it a code issue if the data warrants, but the
+    # hint stops the LLM from chasing source-level fixes when the real
+    # blocker is upstream of the compile.
+    install_hint_block = (
+        "\nENVIRONMENT-FAILURE HINT — read before answering:\n"
+        "  The harness's pre-check on this round's failing diagnostics "
+        "found that the majority look like missing-dependency / "
+        "unresolved-import errors (TS2307 / MISSING_DEP / "
+        "ModuleNotFoundError / ImportError / \"Cannot find module\"). "
+        "When the imported names are declared in the workspace's "
+        "package.json / requirements.txt / pyproject.toml, the right "
+        "fix is the BUILD or INSTALL step, not the source code:\n"
+        "    - the install step may not be running in the subdir where "
+        "the deps actually live (root-delegating-to-subdir layouts);\n"
+        "    - the build command may invoke the compiler before deps "
+        "are installed;\n"
+        "    - a package may be missing from the manifest entirely.\n"
+        "  If your inspection confirms this pattern, set "
+        "``real_blocker`` to a one-sentence description that points "
+        "the repair LLM at the BUILD configuration (package.json "
+        "scripts, Makefile, requirements.txt, install command in CI) "
+        "rather than the source file. Patching source code will NOT "
+        "make these errors go away.\n\n"
+    ) if install_failure_likely else ""
+
     return (
         "You are auditing the previous repair iteration's outcome to "
         "tell the harness whether to keep going on the same track or "
@@ -6490,6 +6569,7 @@ def _build_repair_reflection_prompt(
         f"Persisted (still failing):\n{pers_block}\n\n"
         f"New (introduced by this round's patches):\n{new_block}\n\n"
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
+        f"{install_hint_block}"
         "Answer ONE structured question: did the previous round make "
         "PROGRESS on the highest-priority error, or did it spend the "
         "iteration on a distraction? Use these definitions:\n"
@@ -6667,19 +6747,37 @@ def _shared_root_cause_fanout(
 
 def _patches_touched_judge_files(
     patch_results: list[Any], judge_named: list[str],
+    *,
+    include_attempts: bool = False,
 ) -> bool:
-    """True iff at least one *successful* patch touched a file the judge
-    named (suffix / basename match — LLMs and the harness use slightly
-    different path roots, e.g. ``services/edgar.py`` vs
-    ``server/services/edgar.py``)."""
+    """True iff at least one patch touched a file the judge named (suffix /
+    basename match — LLMs and the harness use slightly different path
+    roots, e.g. ``services/edgar.py`` vs ``server/services/edgar.py``).
+
+    By default only *successful*, non-no-op patches count. When
+    ``include_attempts=True``, failed patches with a non-empty file also
+    count — for the judge-ignored gate we want to distinguish "the LLM
+    chose the wrong file" (real distraction) from "the LLM chose the right
+    file but the patch's REPLACE_BLOCK search missed" (mechanical failure,
+    not distraction). The patcher's per-file rejection diagnosis already
+    surfaces the search-miss reason to the next round, so escalating with
+    a judge-ignored banner on top causes the LLM to thrash between
+    "address the rejection" and "stop ignoring the judge".
+    """
     if not judge_named:
         return True  # nothing to enforce
     judge_norm = [(p, os.path.basename(p)) for p in judge_named]
     for r in patch_results:
-        if not getattr(r, "success", False):
-            continue
-        if getattr(r, "no_op", False):
-            continue  # idempotency no-ops don't count as touching
+        success = getattr(r, "success", False)
+        no_op = getattr(r, "no_op", False)
+        if not include_attempts:
+            if not success or no_op:
+                continue
+        else:
+            # Attempt-mode: count both successes (non-no-op) and failures.
+            # Skip only no-ops since those neither succeeded nor were tried.
+            if no_op:
+                continue
         f = str(getattr(r, "file", "") or "")
         if not f:
             continue
@@ -7617,6 +7715,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     prior_diag_count = int(state.get("prior_diag_count") or 0)
     current_diag_count = int(state.get("last_diag_count") or 0)
     is_first_iteration = loop_counter["total_repairs"] == 1
+    # The prior reading is uninformative when it has no fingerprints AND no
+    # diagnostic count — that means the previous compiler run failed before
+    # producing any parseable errors (e.g. crashed in `npm install` so the
+    # TS-compile diagnostics never materialised). Going from prior=0 to a
+    # non-zero current is the first real signal, not a regression — without
+    # this guard the no_progress counter ticks on the very round that
+    # finally surfaced real errors. Treat as neutral, same as the first
+    # iteration. See session 7c30bce2 for the original symptom.
+    has_meaningful_prior = bool(prior_fps_set) or prior_diag_count > 0
     fps_shrank = bool(prior_fps_set - current_fps_set)
     # Raw-count shrinkage is the secondary signal — when many tests share
     # one fingerprint (e.g. 10 tests all hitting the same EDGAR-mock
@@ -7633,7 +7740,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         and current_diag_count < prior_diag_count
     )
     prior_round_made_progress = fps_shrank or count_shrank
-    if is_first_iteration:
+    if is_first_iteration or not has_meaningful_prior:
         prior_round_made_progress = True  # neutral; nothing to evaluate yet
     if not prior_round_made_progress:
         loop_counter["no_progress_repairs"] = (
@@ -7715,6 +7822,22 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     top_persisted_diagnostics.append(dict(err))
                 if len(top_persisted_diagnostics) >= 3:
                     break
+            install_failure_likely = _diagnostics_look_like_install_failure(
+                # Score against the FULL persistent failing-set, not just
+                # the top-3 we show — the heuristic should see the whole
+                # distribution before deciding the pattern.
+                [err for err in _reflection_errors
+                 if (str(err.get("error_code", "?")) + "::" +
+                     _normalize_diagnostic_message(str(err.get("message", ""))))
+                 in persisted]
+            )
+            if install_failure_likely:
+                logger.info(
+                    "[repair_node] Reflection input flagged as likely "
+                    "install/environment failure (majority of persistent "
+                    "errors are missing-module / unresolved-import). "
+                    "Judge prompt will include the install-failure hint."
+                )
             reflection_prompt = _build_repair_reflection_prompt(
                 prior_diagnostics_count=len(prior_fps_set),
                 current_diagnostics_count=len(current_fps_set),
@@ -7722,6 +7845,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 persisted_fingerprints=persisted,
                 new_fingerprints=new_fps,
                 top_persisted_diagnostics=top_persisted_diagnostics,
+                install_failure_likely=install_failure_likely,
             )
             verdict_raw, new_budget = await _maybe_judgment_llm(
                 prompt=reflection_prompt,
@@ -9066,7 +9190,22 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 _touched_judge_files = _patches_touched_judge_files(
                     patch_results, _judge_named_now,
                 )
-                if not _touched_judge_files:
+                # Soft-pass: if no SUCCESS touched a judge file but at least
+                # one ATTEMPTED patch did, treat as mechanical failure (not
+                # distraction). The patcher's per-file rejection diagnosis
+                # already tells the LLM why its REPLACE_BLOCK missed; piling
+                # on a judge-ignored banner makes the LLM flip between two
+                # contradictory directives. See session 7c30bce2: round 4
+                # patched client/package.json AND attempted client/src/App.tsx
+                # (quote-style search miss) — the attempt on the right file
+                # should have counted as compliance.
+                _attempted_judge_files = (
+                    _touched_judge_files
+                    or _patches_touched_judge_files(
+                        patch_results, _judge_named_now, include_attempts=True,
+                    )
+                )
+                if not _attempted_judge_files:
                     loop_counter["judge_ignored_last_round"] = True
                     loop_counter["judge_named_files_last_round"] = _judge_named_now
                     loop_counter["judge_round_touched_files"] = sorted({
@@ -9097,6 +9236,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     except Exception:  # noqa: BLE001
                         pass
                 else:
+                    if not _touched_judge_files:
+                        logger.info(
+                            "[repair_node] Judge-attempted: round %d had no "
+                            "SUCCESS on judge-named %s, but an attempt was "
+                            "recorded — soft-passing as compliance (patcher "
+                            "rejection diagnosis carries the mechanical "
+                            "fix-up directive).",
+                            loop_counter.get("total_repairs", 0),
+                            _judge_named_now,
+                        )
                     # Clear stale flags — this round complied with the judge.
                     loop_counter.pop("judge_ignored_last_round", None)
                     loop_counter.pop("judge_named_files_last_round", None)

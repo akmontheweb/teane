@@ -164,6 +164,9 @@ def _format_requirement_keys_guidance(
         "drawn from this workspace's actual spec identifiers"
         f"{truncated_note}: {embedded_str}. Do NOT invent identifiers in "
         "any other namespace — stories citing unknown keys are rejected. "
+        "Do NOT append suffixes (``STORY-011A``, ``STORY-011B``), decimals "
+        "(``STORY-011.1``), or otherwise extend a listed key — use the "
+        "exact string as shown above. "
         "A story that implements pure scaffolding without a matching spec "
         "requirement is itself a sign the decomposition is wrong."
     )
@@ -848,6 +851,64 @@ def _build_cycle_repair_prompt(raw_json: str, cycle_msg: str) -> str:
     )
 
 
+_UNKNOWN_REQ_KEY_ERR_MARKER = "cites unknown requirement_keys"
+"""Substring that identifies the validator error emitted by
+``_validate_story_requirement_keys`` when a story references a
+requirement_key that isn't in the workspace's requirements table.
+Used by ``decomposition_node`` to detect the auto-repair-eligible
+branch."""
+
+
+def _build_unknown_req_repair_prompt(
+    raw_json: str,
+    err_msg: str,
+    known_req_keys: set[str],
+) -> str:
+    """Targeted one-shot repair prompt for unknown ``requirement_keys``.
+
+    Mirrors the cycle-repair contract: feed the planner its own prior
+    payload plus the exact validator complaint (which already names the
+    invented key AND lists the workspace's valid alternatives), and ask
+    it to swap the offending entries for real ones without touching
+    anything else. The narrow scope prevents the common "fix the
+    payload" drift into renaming stories or shuffling acceptance
+    criteria that then breaks downstream traceability.
+
+    ``known_req_keys`` is re-listed in the repair prompt (up to the
+    same 80-key cap the initial prompt uses) so the planner sees the
+    universe of valid alternatives in one turn instead of having to
+    re-parse the validator error.
+    """
+    sorted_keys = sorted(known_req_keys)
+    embedded = sorted_keys[:_REQ_KEY_LIST_CAP]
+    embedded_str = ", ".join(f"``{k}``" for k in embedded)
+    truncated_note = (
+        f" (showing first {_REQ_KEY_LIST_CAP} of {len(sorted_keys)})"
+        if len(sorted_keys) > _REQ_KEY_LIST_CAP else ""
+    )
+    return (
+        "Your previous decomposition response cited requirement_keys "
+        "that do not exist in this workspace's specification:\n\n"
+        f"  {err_msg}\n\n"
+        "Valid requirement_keys for this workspace"
+        f"{truncated_note}: {embedded_str}.\n\n"
+        "Fix the payload by replacing every unknown key with an EXACT "
+        "match from the valid list above. If a story's intent maps to "
+        "no listed requirement, drop the offending key (leaving at "
+        "least one valid entry per story) rather than inventing a new "
+        "identifier. Do NOT append suffixes (A/B), decimals, or "
+        "otherwise extend a listed key — use the exact string as "
+        "shown. Do NOT remove or rename any stories, features, "
+        "acceptance_criteria, depends_on, or scope_files. Edit ONLY "
+        "the `requirement_keys` arrays.\n\n"
+        "Return the COMPLETE corrected payload as a single JSON object "
+        "with exactly the same shape as before. JSON only — no "
+        "commentary, no code fences.\n\n"
+        "Previous payload:\n"
+        f"{raw_json}"
+    )
+
+
 async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     """Decompose the approved spec into stories, persist them, regenerate views.
 
@@ -1052,19 +1113,32 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     try:
         features_cleaned, cleaned = _run_validator(data)
     except ValueError as exc:
-        # Cycle errors are amenable to a single targeted repair pass —
-        # feed the prior payload back with the cycle path and ask for
-        # the minimum edge removal. Other validation errors (unknown
-        # req_keys, malformed shape) are structural; a re-prompt
-        # historically does not help, so they continue to HITL.
-        cycle_err = str(exc).startswith("depends_on cycle detected:")
-        if cycle_err and budget > 0:
+        # Two validation-error classes support a single targeted
+        # auto-repair pass. Cycle errors: feed the payload back with
+        # the cycle path and ask for the minimum edge removal.
+        # Unknown-requirement_key errors: feed the payload back with
+        # the offending key(s) + the full valid-key universe and ask
+        # for an in-vocabulary swap. Both use narrow repair prompts
+        # (edit only the offending arrays) so the model doesn't drift
+        # into renaming stories or dropping traceability. Other
+        # validation errors (malformed shape, feature mismatches) stay
+        # structural and route to HITL.
+        exc_str = str(exc)
+        cycle_err = exc_str.startswith("depends_on cycle detected:")
+        unknown_req_err = _UNKNOWN_REQ_KEY_ERR_MARKER in exc_str
+        if (cycle_err or unknown_req_err) and budget > 0:
+            repair_kind = "cycle" if cycle_err else "unknown_req_key"
             logger.warning(
-                "[decomposition] %s — attempting 1-shot auto-repair "
+                "[decomposition] %s — attempting 1-shot %s auto-repair "
                 "(budget=$%.4f).",
-                exc, budget,
+                exc, repair_kind, budget,
             )
-            repair_prompt = _build_cycle_repair_prompt(raw, str(exc))
+            if cycle_err:
+                repair_prompt = _build_cycle_repair_prompt(raw, exc_str)
+            else:
+                repair_prompt = _build_unknown_req_repair_prompt(
+                    raw, exc_str, known_req_keys,
+                )
             repair_messages = [
                 system_msg, {"role": "user", "content": repair_prompt},
             ]
@@ -1081,13 +1155,13 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 features_cleaned, cleaned = _run_validator(data)
                 raw = repaired_raw
                 logger.info(
-                    "[decomposition] cycle auto-repair succeeded; "
-                    "budget_remaining=$%.4f.", budget,
+                    "[decomposition] %s auto-repair succeeded; "
+                    "budget_remaining=$%.4f.", repair_kind, budget,
                 )
             except Exception as repair_exc:  # noqa: BLE001
                 logger.error(
-                    "[decomposition] cycle auto-repair failed: %s",
-                    repair_exc,
+                    "[decomposition] %s auto-repair failed: %s",
+                    repair_kind, repair_exc,
                 )
                 return {
                     "exit_code": 1,

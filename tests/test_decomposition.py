@@ -530,6 +530,94 @@ def test_decomposition_node_dispatch_exception(workspace: str):
 
 
 # ---------------------------------------------------------------------------
+# Unknown-requirement_key auto-repair — same 1-shot contract as cycles
+# ---------------------------------------------------------------------------
+
+def _payload_with_bogus_req_key() -> str:
+    """A payload whose STORY-1 cites a suffix-extrapolated key (``FR-001B``)
+    that the workspace spec does not declare. Matches the failure mode
+    observed in session 5e0552bc where the LLM emitted ``STORY-011B``.
+    """
+    p = json.loads(_valid_payload())
+    p["stories"][0]["requirement_keys"] = ["FR-001B"]
+    return json.dumps(p)
+
+
+def test_decomposition_node_unknown_req_key_auto_repairs(workspace: str):
+    """Bogus req_key in the first response → 1-shot repair → commit."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_payload_with_bogus_req_key(), _valid_payload()])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["current_gate"] == "STORIES"
+    assert out["node_state"]["decomposition_complete"] is True
+    assert out["node_state"]["story_count"] == 2
+    assert len(gw.calls) == 2
+    repair_msg = gw.calls[1]["messages"][-1]["content"]
+    assert "cites unknown requirement_keys" in repair_msg
+    assert "FR-001B" in repair_msg
+    # Repair prompt must list the workspace's valid alternatives so the
+    # planner can swap in-vocabulary in one turn.
+    assert "FR-001" in repair_msg and "FR-002" in repair_msg
+
+
+def test_decomposition_node_unknown_req_key_repair_failure_routes_to_hitl(
+    workspace: str,
+):
+    """Repair attempt still cites unknown key → HITL with both errors."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([
+        _payload_with_bogus_req_key(),
+        _payload_with_bogus_req_key(),
+    ])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    err = out["node_state"]["error"]
+    assert err.startswith("validation:")
+    assert "repair_failed" in err
+    assert len(gw.calls) == 2
+
+
+def test_decomposition_node_unknown_req_key_repair_skipped_when_budget_zero(
+    workspace: str,
+):
+    """Budget exhausted after first call → no repair attempted."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_payload_with_bogus_req_key()], budget_after=0.0)
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    assert out["node_state"]["error"].startswith("validation:")
+    assert "repair_failed" not in out["node_state"]["error"]
+    assert len(gw.calls) == 1
+
+
+def test_prompt_constraint_forbids_suffix_extrapolation():
+    """Part 2 defense-in-depth: the planner prompt's Constraints block
+    must explicitly warn against extrapolating listed keys with
+    suffixes/decimals. Cheap prompt-level guard that complements the
+    validator's after-the-fact rejection."""
+    prompt = decomposition._build_decomposition_prompt(
+        spec_requirements="body", spec_architecture="",
+        workspace_path="/tmp/ws",
+        known_req_keys={"FR-001", "FR-002"},
+    )
+    assert "Do NOT append suffixes" in prompt
+    # Sanity: both the sample keys embedded in the constraint block.
+    assert "FR-001" in prompt and "FR-002" in prompt
+
+
+# ---------------------------------------------------------------------------
 # Augment mode — delta-only decomposition on workspaces with existing stories
 # ---------------------------------------------------------------------------
 

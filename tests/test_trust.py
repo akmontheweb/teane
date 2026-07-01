@@ -99,6 +99,27 @@ class TestIsPathAllowed:
         with tempfile.TemporaryDirectory() as ws:
             assert is_path_allowed("../../etc/passwd", ws, ["../../etc/"]) is False
 
+    def test_dotfile_entry_matches_dotfile_target(self):
+        # Regression: lstrip("./") stripped leading "." from ".env.example",
+        # turning it into "env.example" and rejecting every dotfile listed
+        # in patcher.root_files (.env, .env.example, .gitignore, ...).
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            for name in (
+                ".env.example", ".env", ".env.local",
+                ".gitignore", ".python-version", ".ruff.toml",
+            ):
+                assert is_path_allowed(name, ws, [name]) is True, name
+
+    def test_dot_slash_prefix_still_stripped(self):
+        # Companion: the "./" prefix that the original lstrip aimed to strip
+        # is still normalized by removeprefix so "./src/main.py" matches
+        # "src/main.py".
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/main.py", ws, ["./src/main.py"]) is True
+            assert is_path_allowed("src/auth/login.py", ws, ["./src/"]) is True
+
 
 # ---------------------------------------------------------------------------
 # 2. Identifier validators

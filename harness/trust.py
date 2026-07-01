@@ -139,7 +139,10 @@ def is_path_allowed(
     for entry in allowed_paths:
         if not isinstance(entry, str) or not entry:
             continue
-        e = entry.strip().lstrip("./").replace(os.sep, "/")
+        # removeprefix — not lstrip — because lstrip("./") strips any
+        # leading "." or "/" character, mangling dotfile entries like
+        # ".env.example" into "env.example" so they never match on disk.
+        e = entry.strip().removeprefix("./").replace(os.sep, "/")
         if not e:
             continue
         # Exact file match

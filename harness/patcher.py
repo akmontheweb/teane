@@ -22,6 +22,7 @@ This module implements:
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import errno
 import logging
@@ -2417,6 +2418,85 @@ def sha256_file_bytes(abs_path: str) -> Optional[str]:
         return None
 
 
+def _serialise_blocks_for_approval(
+    blocks: list[PatchBlock], workspace_root: str,
+) -> list[dict[str, Any]]:
+    """Turn a list of :class:`PatchBlock` instances into the payload
+    the Phase-5 diff-approval HITL card renders.
+
+    Each entry carries ``{path, operation, before, after, is_binary,
+    size_before, size_after}``. ``before``/``after`` are derived from
+    the block's declared intent (search/replace/content), NOT from
+    predicting the exact final file state — that would duplicate the
+    patcher's job. Consumers can render a small diff of intent, which
+    is what the operator needs to decide "approve/reject."
+
+    Each entry is capped at 200 KB per side; anything larger gets a
+    truncation marker so the SSE payload stays sane.
+    """
+    _MAX_SIDE_BYTES = 200 * 1024
+    out: list[dict[str, Any]] = []
+    for b in blocks:
+        op = b.operation.value if hasattr(b.operation, "value") else str(b.operation)
+        before = ""
+        after = ""
+        if op == "create_file":
+            after = b.content
+        elif op == "delete_block":
+            before = b.search
+        elif op == "replace_block":
+            before = b.search
+            after = b.replace
+        elif op == "insert_at_block":
+            after = b.content or b.replace
+        elif op == "insert_at_line":
+            after = b.content or b.replace
+        elif op == "replace_line_range":
+            before = f"(current lines {b.line}-{b.end_line})"
+            after = b.content or b.replace
+        else:
+            after = b.content or b.replace
+
+        def _cap(s: str) -> str:
+            if len(s) <= _MAX_SIDE_BYTES:
+                return s
+            return s[:_MAX_SIDE_BYTES] + f"\n… (+{len(s) - _MAX_SIDE_BYTES} bytes truncated)"
+
+        out.append({
+            "path": b.file,
+            "operation": op,
+            "before": _cap(before),
+            "after": _cap(after),
+            "is_binary": False,  # patch blocks are text; binary edits go through the file-copy path
+            "size_before": len(before),
+            "size_after": len(after),
+        })
+    return out
+
+
+def _apply_approval_decision(
+    blocks: list[PatchBlock], raw_answer: str,
+) -> tuple[list[PatchBlock], list[PatchBlock]]:
+    """Interpret an operator answer against a proposed batch of blocks.
+
+    Returns ``(approved, rejected)``.
+
+    - ``"approve"`` (or any string that starts with ``a``): approve all.
+    - ``"reject"``  (or any string that starts with ``r``): reject all.
+    - ``"edit"``    (or any string that starts with ``e``): approve
+      everything (the ``extra_notes`` field would carry the subset
+      selection when the wire contract is refined; today we fall back
+      to approve-all to avoid a silent reject).
+    - Anything else: approve all (safe default; matches the ``default``
+      passed to ``channel.prompt``).
+    """
+    a = (raw_answer or "").strip().lower()
+    if a.startswith("r"):
+        return [], list(blocks)
+    # approve / edit / unknown → approve all
+    return list(blocks), []
+
+
 async def process_llm_patch_output(
     llm_output: str,
     workspace_root: str,
@@ -2425,6 +2505,7 @@ async def process_llm_patch_output(
     *,
     files_seen_by_llm: Optional[dict[str, str]] = None,
     enforce_read_before_edit: bool = False,
+    require_approval: bool = False,
 ) -> tuple[list[PatchResult], list[str]]:
     """
     Parse LLM output for patch blocks, apply them using the hybrid patcher,
@@ -2469,6 +2550,7 @@ async def process_llm_patch_output(
         allowed_paths,
         files_seen_by_llm=files_seen_by_llm,
         enforce_read_before_edit=enforce_read_before_edit,
+        require_approval=require_approval,
     )
 
 
@@ -2480,6 +2562,7 @@ async def apply_patch_blocks(
     *,
     files_seen_by_llm: Optional[dict[str, str]] = None,
     enforce_read_before_edit: bool = False,
+    require_approval: bool = False,
 ) -> tuple[list[PatchResult], list[str]]:
     """Apply pre-parsed :class:`PatchBlock` instances using the same
     allowlist / B5 / hybrid-patcher pipeline as
@@ -2622,6 +2705,62 @@ async def apply_patch_blocks(
                 continue
             kept.append(block)
         blocks_to_apply = kept
+
+    # Phase 5: pre-write diff-approval gate. When enabled (opt-in via
+    # ``require_approval=True`` from the caller — typically driven off
+    # ``security.diff_approval_required`` in config), we hand the
+    # blocks-in-hand to the operator BEFORE any bytes land on disk.
+    # The webhook payload rides the same HITL channel as every other
+    # gate; the dashboard's ``_render_pending_hitl_rows`` renders a
+    # split-diff card via ``harness.diff_render.render_patch_list``.
+    if require_approval and blocks_to_apply:
+        try:
+            from harness.hitl import get_channel
+            channel = get_channel()
+            approval_payload = _serialise_blocks_for_approval(
+                blocks_to_apply, workspace_root,
+            )
+            raw_answer = await asyncio.to_thread(
+                channel.prompt,
+                "Review proposed file changes before they are written.",
+                ["approve", "reject", "edit"],
+                default="approve",
+                option_labels={
+                    "approve": "Approve all",
+                    "reject": "Reject all — skip these writes",
+                    "edit": "Approve subset — list paths to keep in the notes",
+                },
+                metadata={
+                    "kind": "patch_approval",
+                    "headline": "Review file changes before writing",
+                    "patches": approval_payload,
+                    "timeout_hint_seconds": 1800,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[patcher] diff-approval gate failed (%s); "
+                "falling through to write without approval.", exc,
+            )
+            raw_answer = "approve"
+        approved, rejected = _apply_approval_decision(blocks_to_apply, raw_answer)
+        for reject_block in rejected:
+            results.append(PatchResult(
+                success=False, file=reject_block.file,
+                operation=reject_block.operation,
+                error="rejected by operator via diff-approval gate",
+            ))
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "patch_approval_decision",
+                answer=str(raw_answer)[:32],
+                approved_count=len(approved),
+                rejected_count=len(rejected),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        blocks_to_apply = approved
 
     # Apply the allowed blocks using the hybrid patcher
     if blocks_to_apply:

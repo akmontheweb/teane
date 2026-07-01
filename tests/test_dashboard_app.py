@@ -780,7 +780,11 @@ def test_session_detail_renders_pending_hitl_form(tmp_path):
         resp = urllib.request.urlopen(req, timeout=4.0)
         body = resp.read().decode("utf-8")
         assert resp.status == 200
-        assert "HITL pending" in body
+        # Phase 4 replaced the "HITL pending — <id>" H3 with the
+        # plain-English headline. The request id still appears (as
+        # a muted subtitle inside the eyebrow) and the form action
+        # remains the same.
+        assert "hitl-card" in body
         assert "req-abc" in body
         assert "/sessions/sess-hitl/hitl/answer" in body
         # The hidden csrf_token field must carry a non-empty value. The
@@ -820,9 +824,11 @@ def test_session_detail_renders_hitl_above_events(tmp_path):
             headers={"Cookie": f"csrf_token={csrf}"},
         )
         body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
-        hitl_idx = body.find("hitl-alert")
+        # Phase 4 renamed the pending-card wrapper class from
+        # ``hitl-alert`` to ``hitl-card`` (Linear/Vercel-style tokens).
+        hitl_idx = body.find("hitl-card")
         events_idx = body.find("Events (")
-        assert hitl_idx != -1, "expected hitl-alert wrapper class on pending card"
+        assert hitl_idx != -1, "expected hitl-card wrapper class on pending card"
         assert events_idx != -1, "expected an Events header"
         assert hitl_idx < events_idx, (
             "HITL pending card must render before the Events section"
@@ -1139,7 +1145,9 @@ def test_hitl_pending_html_returns_card_html(tmp_path):
         assert resp.status == 200
         assert resp.headers.get("Content-Type", "").startswith("text/html")
         body = resp.read().decode("utf-8")
-        assert "hitl-alert" in body
+        # Phase 4: pending card uses the ``hitl-card`` class instead of
+        # the pre-Phase-4 ``hitl-alert`` Carbon wrapper.
+        assert "hitl-card" in body
         assert "req-ajax" in body
         assert "data-ajax='hitl-answer'" in body
     finally:

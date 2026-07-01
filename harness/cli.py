@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from harness import _platform
@@ -618,6 +619,18 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # speculative.enabled discussion in config/config.json. num_variants is
     # the fork count; temperature controls per-variant diversity (sweet spot
     # 0.2-0.4 for code); selection_strategy is the winner-pick rule.
+    "security": frozenset({
+        # Phase 5: PR-style diff-approval gate on writes. Off by
+        # default; the "Maximum quality" preset (Phase 6) flips it on.
+        "diff_approval_required",
+        # Existing security-scan configuration (mirrors the shipped
+        # config/config.json). Adding "security" to this dict at all
+        # switches nested-key checking on for the section; every key
+        # that was previously tolerated via fall-through must be
+        # enumerated explicitly.
+        "block_on", "warn_on", "ignore_below", "scanners",
+        "allowlist_rules", "max_findings_to_route_to_repair",
+    }),
     "speculative": frozenset({
         # Original keys (legacy schema — preserved for backwards compat).
         "enabled", "num_variants", "temperature",
@@ -791,6 +804,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "patcher.enforce_read_before_edit": (bool,),
     "patcher.root_files": (list,),
     "patcher.use_structured_tools": (bool,),
+    # Phase 5: PR-style diff approval before writes. Off by default so
+    # existing operators aren't blocked mid-run. The "Maximum quality"
+    # preset flips it on; consumers who want the safety opt in via a
+    # single-key config edit or the wizard.
+    "security.diff_approval_required": (bool,),
     "compiler.run_prod_import_smoke_check": (bool,),
     "change_requests.reverse_engineer_budget_usd": (int, float),
     "hitl.requirement": (bool,),
@@ -7453,10 +7471,13 @@ def cmd_web_start(args: argparse.Namespace) -> int:
 
     if background:
         return _web_start_background(host=host, port=port)
-    return _web_start_foreground(host=host, port=port)
+    return _web_start_foreground(
+        host=host, port=port,
+        print_mobile_url=bool(getattr(args, "print_mobile_url", False)),
+    )
 
 
-def _web_start_foreground(*, host: str, port: int) -> int:
+def _web_start_foreground(*, host: str, port: int, print_mobile_url: bool = False) -> int:
     """Run the server in the current process. Writes the marker with
     our own pid, installs a SIGTERM handler that triggers clean
     shutdown, blocks until the server exits, then releases the socket
@@ -7581,6 +7602,32 @@ def _web_start_foreground(*, host: str, port: int) -> int:
             f"[web] marker: {_web_marker_path()}\n"
             f"[web] stop with: teane web stop  (or Ctrl-C)",
         )
+
+        # Phase 7: --print-mobile-url. Emits a bookmarkable URL that a
+        # phone can hit once; the server exchanges the token for a
+        # cookie and strips the query on 302 so the token doesn't
+        # linger in browser history. No-op when auth is disabled — the
+        # mobile view is already reachable directly without a token.
+        if print_mobile_url:
+            token = None
+            try:
+                from harness.dashboard import resolve_expected_token
+                token = resolve_expected_token(dash_cfg)
+            except Exception:  # noqa: BLE001
+                token = None
+            if token:
+                print(
+                    f"[web] mobile URL (one-shot token): "
+                    f"http://{dash_cfg.host}:{dash_cfg.port}/m/<session-id>?t={token}\n"
+                    f"[web]   → open on your phone once; the token converts to "
+                    f"a cookie and is stripped from the URL."
+                )
+            else:
+                print(
+                    "[web] mobile URL: auth is disabled, so "
+                    f"http://{dash_cfg.host}:{dash_cfg.port}/m/<session-id> "
+                    "works directly without a token."
+                )
 
         try:
             # Block until the server thread exits. The signal handler
@@ -8244,45 +8291,39 @@ async def _doctor_check_mcp(
     return rows
 
 
-async def cmd_doctor(args: argparse.Namespace) -> int:
+@dataclass(frozen=True)
+class DoctorResult:
+    """One row of the doctor checklist. Mirrors preflight.CheckResult so
+    the web wizard (Phase 3) and any external caller (`teane doctor
+    --json`) can render both check types with one schema."""
+
+    name: str
+    status: str  # pass / warn / fail / skip — same vocabulary as preflight
+    detail: str
+
+
+async def collect_doctor_results(
+    workspace_path: str,
+) -> list[DoctorResult]:
+    """Run every doctor check and return the structured results.
+
+    This is the shared entry point for both the human-readable CLI
+    printer (:func:`render_doctor_human`) and the JSON emitter
+    (:func:`render_doctor_json`) — as well as the web wizard's
+    checklist card. All ordering, skipping, and status logic lives
+    here so the two renderers stay in lockstep.
     """
-    Execute the `teane doctor` subcommand.
-
-    Runs healthchecks and prints a green/yellow/red summary. Under the
-    single-source-config contract the very first check is "config" —
-    if it fails, the harness can't load anything else, so every
-    downstream check is marked "skipped" and the doctor returns
-    non-zero. When the config is valid we proceed to git, sandbox,
-    checkpoint DB, and the live API-key ping.
-
-    Exits 0 if every executed check passes (warn is non-blocking),
-    non-zero on any failure or when config validation prevents the
-    rest of the checks from running.
-
-    Examples:
-        teane doctor
-        teane doctor -r /path/to/repo
-    """
-    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     # Silence the chatty INFO logging from discover_config; we surface
     # the result via the explicit "config" check.
     logging.getLogger("harness.cli").setLevel(logging.ERROR)
 
-    # --- Step 1: deterministic config check. EVERYTHING else depends on
-    # this passing — if the canonical config doesn't load and validate,
-    # there's nothing meaningful to check downstream. We still run the
-    # workspace-independent git check (operators may be debugging a
-    # config-broken setup from a non-git directory).
     config_status, config_detail = _doctor_check_config(workspace_path)
-
     checks: list[tuple[str, tuple[str, str]]] = [
         ("config", (config_status, config_detail)),
         ("git repo", _doctor_check_git(workspace_path)),
     ]
 
     if config_status == "pass":
-        # Config is valid; load it for downstream checks and run them.
-        # discover_config can't raise here because the check just passed.
         config = discover_config(workspace_path)
         api_keys_result = await _doctor_check_api_keys(config)
         checks.extend([
@@ -8293,17 +8334,9 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             ("checkpoint db", _doctor_check_checkpoint_db(config)),
             ("patcher mode", _doctor_check_patcher_mode(config)),
         ])
-        # External tools the harness shells out to. Emits one row per
-        # tool so each is visible individually in the report.
         checks.extend(_doctor_check_external_tools(config, workspace_path))
-        # MCP healthcheck. Only adds rows when mcp.enabled=true (otherwise
-        # nothing to report — the check is silent on the off path so
-        # doctor stays terse for the default no-MCP install).
-        mcp_rows = await _doctor_check_mcp(config)
-        checks.extend(mcp_rows)
+        checks.extend(await _doctor_check_mcp(config))
     else:
-        # Config invalid → mark downstream checks as skipped so the
-        # operator sees they exist but understands they can't run yet.
         skipped_detail = "skipped — fix the config check above first"
         checks.extend([
             ("product spec", ("skip", skipped_detail)),
@@ -8314,36 +8347,114 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             ("external tools", ("skip", skipped_detail)),
         ])
 
-    print()
-    print("=" * 72)
-    print(f"teane doctor — workspace: {workspace_path}")
-    print(f"canonical config: {_get_global_config_path()}")
-    print("=" * 72)
-    for label, (status, detail) in checks:
-        print(_format_doctor_line(status, label, detail))
-    print("=" * 72)
+    return [DoctorResult(name=label, status=status, detail=detail)
+            for label, (status, detail) in checks]
 
-    failures = [label for label, (status, _) in checks if status == "fail"]
-    warnings = [label for label, (status, _) in checks if status == "warn"]
-    skipped = [label for label, (status, _) in checks if status == "skip"]
+
+def render_doctor_human(
+    results: list[DoctorResult],
+    workspace_path: str,
+    config_path: str,
+) -> tuple[str, int]:
+    """Render a doctor result list as the terminal-style report. Returns
+    ``(text, exit_code)`` so the caller (:func:`cmd_doctor`) can print
+    and exit without re-implementing the summary logic."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append(f"teane doctor — workspace: {workspace_path}")
+    lines.append(f"canonical config: {config_path}")
+    lines.append("=" * 72)
+    for r in results:
+        lines.append(_format_doctor_line(r.status, r.name, r.detail))
+    lines.append("=" * 72)
+
+    failures = [r.name for r in results if r.status == "fail"]
+    warnings = [r.name for r in results if r.status == "warn"]
+    skipped = [r.name for r in results if r.status == "skip"]
+    exit_code = 0
     if failures:
-        print(f"FAIL: {len(failures)} check(s) failed: {', '.join(failures)}")
+        lines.append(f"FAIL: {len(failures)} check(s) failed: {', '.join(failures)}")
         if "config" in failures:
-            print(
+            lines.append(
                 "Fix the config file at the path shown above and re-run "
                 "`teane doctor` — the harness will not proceed with "
                 "invalid configuration."
             )
-        return 1
-    if warnings:
-        print(f"OK with warnings ({len(warnings)}): {', '.join(warnings)}")
+        exit_code = 1
+    elif warnings:
+        lines.append(f"OK with warnings ({len(warnings)}): {', '.join(warnings)}")
     elif skipped:
-        # Defensive — shouldn't be reached because skipped requires a fail.
-        print(f"PARTIAL: {len(skipped)} check(s) skipped.")
-        return 1
+        lines.append(f"PARTIAL: {len(skipped)} check(s) skipped.")
+        exit_code = 1
     else:
-        print("OK: all checks passed.")
-    return 0
+        lines.append("OK: all checks passed.")
+    return "\n".join(lines), exit_code
+
+
+def render_doctor_json(
+    results: list[DoctorResult],
+    workspace_path: str,
+    config_path: str,
+) -> str:
+    """Stable machine-readable shape mirroring preflight.render_json:
+    ``{workspace, config_path, results: [...], summary: {...}}``."""
+    counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    exit_code = 1 if counts["fail"] > 0 or counts["skip"] > 0 else 0
+    payload = {
+        "workspace": workspace_path,
+        "config_path": config_path,
+        "results": [asdict(r) for r in results],
+        "summary": {
+            "pass": counts["pass"],
+            "warn": counts["warn"],
+            "fail": counts["fail"],
+            "skip": counts["skip"],
+            "exit_code": exit_code,
+        },
+    }
+    return json.dumps(payload, indent=2)
+
+
+async def cmd_doctor(args: argparse.Namespace) -> int:
+    """
+    Execute the `teane doctor` subcommand.
+
+    Runs healthchecks and prints a green/yellow/red summary — or, with
+    ``--json``, emits the same result set as a JSON document for the
+    web wizard (Phase 3) and any CI job. Under the single-source-config
+    contract the very first check is "config" — if it fails, the
+    harness can't load anything else, so every downstream check is
+    marked "skipped" and the doctor returns non-zero.
+
+    Exits 0 if every executed check passes (warn is non-blocking),
+    non-zero on any failure or when config validation prevents the
+    rest of the checks from running.
+
+    Examples:
+        teane doctor
+        teane doctor -r /path/to/repo
+        teane doctor --json          # machine-readable
+    """
+    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    results = await collect_doctor_results(workspace_path)
+    config_path = _get_global_config_path()
+
+    if getattr(args, "json", False):
+        sys.stdout.write(render_doctor_json(results, workspace_path, config_path))
+        sys.stdout.write("\n")
+        summary_exit = 0
+        if any(r.status == "fail" for r in results):
+            summary_exit = 1
+        elif any(r.status == "skip" for r in results):
+            summary_exit = 1
+        return summary_exit
+
+    text, exit_code = render_doctor_human(results, workspace_path, config_path)
+    print(text)
+    return exit_code
 
 
 def cmd_pre_flight(args: argparse.Namespace) -> int:
@@ -9179,6 +9290,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Enable debug-level logging.",
     )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit results as JSON on stdout instead of the coloured "
+            "terminal report. Consumed by the web wizard (Phase 3) and "
+            "CI. Shape matches `teane pre-flight --json-dump`."
+        ),
+    )
 
     # --- `teane pre-flight` ---
     pre_flight_parser = subparsers.add_parser(
@@ -9374,6 +9495,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--background", choices=["yes", "no"], default="no", metavar="{yes,no}",
         help="yes = detach (logs to ~/.harness/web.log), no = foreground. "
              "Default: no.",
+    )
+    web_start_parser.add_argument(
+        "--print-mobile-url", action="store_true", default=False,
+        help=(
+            "Print a bookmarkable URL for the Phase-7 mobile view "
+            "(includes a one-shot bearer token that the browser "
+            "exchanges for a cookie on first hit, then strips)."
+        ),
     )
     # `teane web stop`
     dashboard_subparsers.add_parser(

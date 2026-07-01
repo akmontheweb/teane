@@ -1,0 +1,6 @@
+{
+  "title": "Static Portfolio Site",
+  "description": "A single-page portfolio with a hero section, projects grid, and a contact form. Pure HTML + CSS + a sprinkle of vanilla JS. Deploy anywhere.",
+  "prompt": "Build a single-page personal portfolio site. Sections: hero (name, tagline, headshot placeholder), skills (a grid of ~6 tech logos), projects (3 cards, each with title/description/link), and a contact form that opens the user's mail client via a mailto: link. Modern, clean CSS — dark mode toggle in the header, saved to localStorage. Fully responsive (mobile-first). No framework — pure HTML, CSS, and a single small JS file. Include a README with instructions to open index.html or serve via `python -m http.server`.",
+  "suggested_workspace": "~/teane-projects/portfolio"
+}

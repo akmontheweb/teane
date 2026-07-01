@@ -1119,6 +1119,9 @@ def _empty_state(
 
 _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     # (slug, label, href, icon symbol name from sprite.svg)
+    # "home" is the consumer landing (wizard-first). Phase 1 ships a
+    # placeholder; Phase 3 wires up the real 3-state wizard.
+    ("home", "Home", "/home", "home"),
     ("status", "View Status", "/status", "chart-line"),
     ("run", "Run Harness", "/run", "play"),
     ("config", "Configure Harness", "/config-ui", "settings"),
@@ -1259,7 +1262,14 @@ def _static_asset_version(cfg: DashboardConfig, relpath: str) -> str:
 
 def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> str:
     app_css_v = _static_asset_version(cfg, "css/app.css")
+    tokens_css_v = _static_asset_version(cfg, "css/tokens.css")
     dashboard_js_v = _static_asset_version(cfg, "js/dashboard.js")
+    # Vendored (not CDN) so the dashboard works offline on a loopback
+    # laptop and to keep CDN attack surface bounded — see
+    # harness/static/vendor/LICENSES.md.
+    htmx_v = _static_asset_version(cfg, "vendor/htmx-1.9.12.min.js")
+    htmx_sse_v = _static_asset_version(cfg, "vendor/htmx-sse-1.9.12.min.js")
+    alpine_v = _static_asset_version(cfg, "vendor/alpine-3.14.1.min.js")
     # Scheme-validate CDN URLs before interpolation. html.escape doesn't
     # block ``javascript:`` schemes, and an attacker who can flip these
     # config values (default loopback dashboard with auth off + CSRF) can
@@ -1276,8 +1286,12 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
 <link rel="icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="{html.escape(safe_carbon)}">
 <link rel="stylesheet" href="/static/css/app.css?v={app_css_v}">
+<link rel="stylesheet" href="/static/css/tokens.css?v={tokens_css_v}">
 <style>{_BASE_CSS}</style>
 <script src="{html.escape(safe_chart)}"></script>
+<script defer src="/static/vendor/htmx-1.9.12.min.js?v={htmx_v}"></script>
+<script defer src="/static/vendor/htmx-sse-1.9.12.min.js?v={htmx_sse_v}"></script>
+<script defer src="/static/vendor/alpine-3.14.1.min.js?v={alpine_v}"></script>
 <script defer src="/static/js/dashboard.js?v={dashboard_js_v}"></script>
 </head>
 <body class="bx--body">
@@ -1760,7 +1774,175 @@ _REDIRECT_SENTINEL = "__REDIRECT__"
 
 
 def _route_root(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
-    return 302, "text/html; charset=utf-8", f"{_REDIRECT_SENTINEL}/status"
+    # Consumer-first: bare `/` lands on the wizard-first Home. Phase 1
+    # ships a placeholder; Phase 3 replaces it with the real 3-state
+    # wizard. This route stayed pointing at /status for operator-era
+    # muscle memory; that muscle memory is fine to break.
+    return 302, "text/html; charset=utf-8", f"{_REDIRECT_SENTINEL}/home"
+
+
+def _render_wizard_setup_step(state: Any, csrf_token: str) -> str:
+    """State 1: no config yet (or missing API keys). Prompt for a
+    provider and, for remote providers, an API key. Submits to
+    ``/home/wizard/setup``."""
+    from harness.web_wizard import DEFAULT_MODELS_BY_PROVIDER, PROVIDER_ENV_VAR
+
+    missing = state.missing_env_vars or ()
+    banner = ""
+    if state.has_config and missing:
+        banner = (
+            "<div class='card' style='border-left:4px solid var(--t-warn)'>"
+            "<div class='eyebrow' style='color:var(--t-warn)'>Config found — "
+            "keys missing</div>"
+            f"<p class='muted' style='margin:0'>These env vars aren't set: "
+            f"<code>{html.escape(', '.join(missing))}</code>. "
+            "Add a provider below to write a fresh config + sidecar.</p>"
+            "</div>"
+        )
+
+    provider_options = []
+    for provider in sorted(DEFAULT_MODELS_BY_PROVIDER):
+        model_key = DEFAULT_MODELS_BY_PROVIDER[provider]
+        env_var = PROVIDER_ENV_VAR.get(provider, "")
+        note = "no API key needed (local)" if not env_var else (
+            "key already set" if provider in state.providers_with_key_set
+            else f"needs {env_var}"
+        )
+        provider_options.append(
+            f"<option value='{html.escape(provider)}'>"
+            f"{html.escape(provider)} · {html.escape(model_key)} · {html.escape(note)}"
+            f"</option>"
+        )
+
+    return (
+        "<div class='wizard stack'>"
+        + banner +
+        "<div class='wizard-step stack'>"
+        "<div class='eyebrow'>Step 1 of 1 · Setup</div>"
+        "<h3 style='margin:0'>Let's pick a provider</h3>"
+        "<p class='muted'>Teane runs against any of these LLMs. Pick the one "
+        "whose key you already have, or use <strong>ollama</strong> to run "
+        "locally with no key at all.</p>"
+        "<form method='post' action='/home/wizard/setup' class='stack'>"
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+        "<label class='label' for='wiz-provider'>Provider</label>"
+        f"<select class='select' id='wiz-provider' name='provider' required>"
+        f"{''.join(provider_options)}</select>"
+        "<label class='label' for='wiz-key'>API key <span class='muted small'>"
+        "(leave empty for ollama)</span></label>"
+        "<input class='input' id='wiz-key' name='api_key' type='password' "
+        "autocomplete='off' placeholder='sk-... or hf_...'>"
+        "<p class='help'>The key is saved to <code>~/.teane/env.sh</code> "
+        "(mode 0600) so it's available to the CLI too. It's never written "
+        "into <code>config.json</code>.</p>"
+        "<div class='cluster'>"
+        "<button type='submit' class='btn btn--primary'>Save &amp; continue</button>"
+        "</div>"
+        "</form>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _render_wizard_build_step(state: Any, csrf_token: str) -> str:
+    """States 2 & 3: config OK. Renders a 'what do you want to build?'
+    textarea, three starter template cards, and (in state 3) a resume
+    panel below."""
+    from harness.web_wizard import load_starter_templates
+
+    templates = load_starter_templates()
+    template_cards = []
+    for t in templates:
+        # Escape the prompt so `x-on:click` receives it safely; Alpine
+        # will drop it into the textarea via a store on the wizard root.
+        prompt_json = html.escape(json.dumps(t.prompt), quote=True)
+        workspace_json = html.escape(json.dumps(t.suggested_workspace), quote=True)
+        template_cards.append(
+            "<div class='template-card' "
+            f"x-on:click=\"pickTemplate({prompt_json}, {workspace_json})\">"
+            f"<div class='template-card__title'>{html.escape(t.title)}</div>"
+            f"<div class='muted small'>{html.escape(t.description)}</div>"
+            f"<div class='eyebrow' style='color:var(--t-accent)'>"
+            f"Use this template →</div>"
+            "</div>"
+        )
+    templates_block = (
+        "<div class='grid grid--3'>" + "".join(template_cards) + "</div>"
+        if templates else ""
+    )
+
+    resume_block = ""
+    if state.kind == "has_sessions":
+        resume_block = (
+            "<div class='card stack'>"
+            "<div class='eyebrow'>Resume</div>"
+            "<h3 style='margin:0'>Continue an existing session</h3>"
+            f"<p class='muted' style='margin:0'>{state.session_count} session(s) "
+            "recorded in this workspace. Head to "
+            "<a href='/sessions'>Sessions</a> to pick one and resume, or "
+            "start fresh above.</p>"
+            "</div>"
+        )
+
+    return (
+        "<div class='wizard stack' x-data=\"teaneHomeBuild()\">"
+        "<div class='wizard-step stack'>"
+        "<div class='eyebrow'>Build</div>"
+        "<h3 style='margin:0'>What do you want to build?</h3>"
+        "<p class='muted'>Describe the app in plain English. Teane will "
+        "scaffold a workspace, generate the code, and run it.</p>"
+        "<form method='post' action='/home/wizard/start' class='stack'>"
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+        "<label class='label' for='wiz-prompt'>Prompt</label>"
+        "<textarea class='textarea' id='wiz-prompt' name='prompt' rows='6' "
+        "x-model='prompt' required placeholder='A Flask app that…'></textarea>"
+        "<label class='label' for='wiz-workspace'>Workspace path</label>"
+        "<input class='input' id='wiz-workspace' name='workspace' "
+        "x-model='workspace' required placeholder='~/teane-projects/my-app'>"
+        "<p class='help'>Teane will create the directory if it doesn't exist. "
+        "Nothing outside this path is touched.</p>"
+        "<div class='cluster'>"
+        "<button type='submit' class='btn btn--primary'>Start build</button>"
+        "<span class='muted small'>Uses <code>teane build</code> under the hood.</span>"
+        "</div>"
+        "</form>"
+        "</div>"
+        + (
+            "<div class='wizard-step stack'>"
+            "<div class='eyebrow'>Templates</div>"
+            "<h3 style='margin:0'>Or start from a template</h3>"
+            "<p class='muted'>Click one to prefill the form above.</p>"
+            + templates_block +
+            "</div>" if templates else ""
+        )
+        + resume_block +
+        "</div>"
+    )
+
+
+def _render_home(cfg: DashboardConfig, csrf_token: str = "") -> str:
+    """Compute the wizard state and render whichever step is active.
+
+    Wraps the state detection so unit tests can call this without a
+    live HTTP request — csrf_token defaults to "" (rendered forms
+    won't submit successfully without it, but the page still HTML-
+    validates for snapshot / structure tests)."""
+    from harness.web_wizard import wizard_state
+    state = wizard_state(cfg)
+    if state.kind == "needs_setup":
+        return _render_wizard_setup_step(state, csrf_token)
+    return _render_wizard_build_step(state, csrf_token)
+
+
+def _route_home(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    # CSRF token for the wizard's form POSTs. The token is available
+    # per-server; resolve_csrf_token is deterministic across the
+    # process lifetime so a GET → POST from the same tab uses the
+    # same token as the double-submit cookie.
+    csrf = resolve_csrf_token(cfg) or ""
+    return 200, "text/html; charset=utf-8", _layout(
+        "Home", _render_home(cfg, csrf_token=csrf), cfg, active="home",
+    )
 
 
 def _route_status(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
@@ -1776,8 +1958,184 @@ def _route_run(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str,
 
 
 def _route_configure_harness(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    """Phase 6: bare /config-ui redirects to /config-ui/presets so the
+    consumer-friendly picker is the default. The tree editor stays
+    reachable at /config-ui/advanced for operators who want fine-grain
+    control."""
+    return 302, "text/html; charset=utf-8", f"{_REDIRECT_SENTINEL}/config-ui/presets"
+
+
+def _route_config_advanced(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
     return 200, "text/html; charset=utf-8", _layout(
-        "Configure Harness", _render_configure_harness(cfg), cfg, active="config",
+        "Configure Harness · Advanced",
+        _render_configure_harness(cfg),
+        cfg, active="config",
+    )
+
+
+def _fmt_preset_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "(unset)"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return v if v else '""'
+    return json.dumps(v, default=str)
+
+
+def _render_config_presets(cfg: DashboardConfig) -> str:
+    """Render the three-card preset chooser + per-preset preview of
+    which config keys would change. Uses the reusable Alpine
+    `teanePresetChooser()` component to swap active preset without a
+    page reload."""
+    try:
+        from harness.presets import PRESET_LABELS, preview_preset
+        from harness.cli import load_raw_config
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "<div class='card'><p class='fail'>Could not load presets module: "
+            f"{html.escape(str(exc))}</p></div>"
+        )
+    try:
+        current = load_raw_config()
+    except Exception as exc:  # noqa: BLE001
+        current = {}
+        load_err = str(exc)
+    else:
+        load_err = ""
+
+    csrf_token = resolve_csrf_token(cfg) or ""
+    cards: list[str] = []
+    diffs: list[str] = []
+    for slug in ("frugal", "balanced", "maximum_quality"):
+        meta = PRESET_LABELS[slug]
+        preview = preview_preset(current, slug)
+        n_change = sum(1 for c in preview if c.changed)
+        cards.append(
+            f"<div class='preset-card' :class=\"selected === '{slug}' ? 'is-selected' : ''\" "
+            f"x-on:click=\"selected = '{slug}'\">"
+            f"<div class='preset-card__title'>{html.escape(meta['title'])}</div>"
+            f"<div class='preset-card__meta'>{html.escape(meta['tagline'])}</div>"
+            f"<div class='eyebrow' style='color:var(--t-accent)'>"
+            f"{n_change} key(s) would change</div>"
+            "</div>"
+        )
+        rows_html = []
+        for change in preview:
+            marker_class = "diff-add" if change.changed else "diff-ctx"
+            rows_html.append(
+                f"<div class='preset-diff-row {marker_class}'>"
+                f"<code class='mono'>{html.escape(change.key)}</code>"
+                f"<span class='muted small mono'>{html.escape(_fmt_preset_value(change.before))}</span>"
+                f"<span class='mono'>→</span>"
+                f"<span class='mono'>{html.escape(_fmt_preset_value(change.after))}</span>"
+                "</div>"
+            )
+        diffs.append(
+            f"<div class='preset-diff' x-show=\"selected === '{slug}'\">"
+            f"<div class='eyebrow'>{html.escape(meta['title'])} preview</div>"
+            + ("".join(rows_html) or "<p class='muted small'>No changes.</p>") +
+            "</div>"
+        )
+    load_banner = ""
+    if load_err:
+        load_banner = (
+            f"<div class='card' style='border-left:4px solid var(--t-warn)'>"
+            f"<p class='muted small' style='margin:0'>Current config could not "
+            f"be loaded ({html.escape(load_err)}) — the preview above compares "
+            f"against an empty baseline.</p></div>"
+        )
+    return (
+        "<div class='stack' x-data=\"{ selected: 'balanced' }\">"
+        + load_banner +
+        "<div class='card stack'>"
+        "<div><div class='eyebrow'>Presets</div>"
+        "<h3 style='margin:0'>Pick a preset</h3>"
+        "<p class='muted small' style='margin:var(--t-sp-1) 0 0'>"
+        "Presets overlay only the keys they name — every other value "
+        "in <code>config.json</code> is preserved. "
+        "For fine-grain control, use the <a href='/config-ui/advanced'>tree editor</a>."
+        "</p></div>"
+        "<div class='grid grid--3'>" + "".join(cards) + "</div>"
+        + "".join(diffs) +
+        "<form method='post' action='/config-ui/preset/apply' class='cluster'>"
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+        "<input type='hidden' name='preset' :value='selected'>"
+        "<button type='submit' class='btn btn--primary'>Apply preset</button>"
+        "<span class='muted small' x-text=\"'Selected: ' + selected\"></span>"
+        "</form>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _route_config_presets(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    return 200, "text/html; charset=utf-8", _layout(
+        "Configure Harness · Presets",
+        _render_config_presets(cfg),
+        cfg, active="config",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: mobile-friendly single-session view
+# ---------------------------------------------------------------------------
+# Auth model for /m/*:
+#   • Query string `?t=<token>` bootstraps a cookie, then 302 to the
+#     token-less URL so the token doesn't linger in browser history.
+#   • Subsequent requests present the cookie only.
+#   • When bearer auth is disabled entirely (loopback, no token env
+#     configured), /m/* is unauthenticated — same behaviour as every
+#     other page in that mode.
+# The mobile page is DELIBERATELY a stripped subset — no side nav, no
+# workspace tools. It's a phone-in-your-pocket cockpit for the
+# already-running session, not a way to launch new work.
+
+_MOBILE_COOKIE_NAME = "teane_mobile_auth"
+
+
+def _render_mobile_session(cfg: DashboardConfig, session_id: str) -> str:
+    """Render the mobile session page body. Reuses the same
+    :func:`_render_activity_feed_and_cost` component that the desktop
+    page uses, plus the pending-HITL slot (so approve/reject flows
+    still work), and adds a fixed bottom bar for on-thumb navigation."""
+    activity = _render_activity_feed_and_cost(cfg, session_id)
+    hitl_html = _render_pending_hitl_rows(cfg, session_id)
+    hitl_wrapper = (
+        f"<div id='hitl-pending-slot' data-session-id='{_esc(session_id)}' "
+        f"data-hitl-sse-url='/api/sessions/{_esc(session_id)}/events'>"
+        f"{hitl_html}"
+        f"</div>"
+    )
+    bottom_bar = (
+        "<nav class='mobile-bottom-bar' aria-label='Mobile actions'>"
+        "<a class='btn btn--ghost btn--sm btn--block' href='/home'>Home</a>"
+        f"<a class='btn btn--ghost btn--sm btn--block' href='#hitl-pending-slot'>HITL</a>"
+        f"<a class='btn btn--ghost btn--sm btn--block' href='/sessions/{_esc(session_id)}'>Full view</a>"
+        "</nav>"
+    )
+    return (
+        "<div class='mobile-view stack'>"
+        f"<div class='eyebrow'>Session</div>"
+        f"<h3 style='margin:0'>{_esc(session_id)}</h3>"
+        f"{hitl_wrapper}"
+        f"{activity}"
+        "</div>"
+        + bottom_bar
+    )
+
+
+def _route_mobile_session(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    """The dispatch layer doesn't do auth (that's the request handler's
+    job). By the time we're here, either the token was OK or auth was
+    disabled entirely. All we do is render the body."""
+    return 200, "text/html; charset=utf-8", _layout(
+        "Session · Mobile",
+        _render_mobile_session(cfg, params["sid"]),
+        cfg,
+        active="",  # mobile page hides the side nav via CSS on <640px
     )
 
 
@@ -3056,8 +3414,18 @@ _ROUTES: list[Route] = [
     (re.compile(r"^/memory/?$"), _route_memory),
     (re.compile(r"^/memory/(?P<name>[A-Za-z0-9_.\-]+\.md)$"), _route_memory_file),
     # Carbon shell — 5 new top-level pages. Each renders a stub in Phase 1.
+    (re.compile(r"^/home/?$"), _route_home),
     (re.compile(r"^/status/?$"), _route_status),
     (re.compile(r"^/run/?$"), _route_run),
+    # Phase 6 IA: presets is the new default; advanced tree editor is
+    # a sibling. Order matters — the more-specific paths must precede
+    # the parent to avoid the parent's regex swallowing them.
+    # Phase 7: mobile session view. Auth handled inline in the
+    # request handler (query-string-once → cookie) BEFORE dispatch
+    # reaches this route.
+    (re.compile(r"^/m/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_mobile_session),
+    (re.compile(r"^/config-ui/presets/?$"), _route_config_presets),
+    (re.compile(r"^/config-ui/advanced/?$"), _route_config_advanced),
     (re.compile(r"^/config-ui/?$"), _route_configure_harness),
     (re.compile(r"^/dashboards/?$"), _route_dashboards),
     (re.compile(r"^/docs/?$"), _route_docs),
@@ -3133,8 +3501,58 @@ def make_request_handler(
         # ---- Auth helpers -------------------------------------------------
 
         def _is_authed(self) -> tuple[bool, str]:
+            # Phase 7: for /m/* mobile routes, allow either the normal
+            # bearer header OR the mobile-auth cookie (bootstrapped via
+            # one-shot ?t=<token> below). The desktop routes remain
+            # header-only to avoid surprises for CSRF-checked writes.
+            parsed = urllib.parse.urlparse(self.path)
+            decoded = urllib.parse.unquote(parsed.path)
+            if expected_token is not None and decoded.startswith("/m/"):
+                cookie_val = None
+                for raw in (self.headers.get("Cookie") or "").split(";"):
+                    if "=" not in raw:
+                        continue
+                    k, v = raw.split("=", 1)
+                    if k.strip() == _MOBILE_COOKIE_NAME:
+                        cookie_val = v.strip()
+                        break
+                if cookie_val and hmac.compare_digest(cookie_val, expected_token):
+                    return True, "ok (mobile cookie)"
             auth = check_auth(expected_token, self.headers.get("Authorization"))
             return auth.ok, auth.detail
+
+        def _try_mobile_query_bootstrap(self) -> bool:
+            """If the incoming GET is `/m/<sid>?t=<token>` and the token
+            matches, set the mobile-auth cookie and 302 to the URL
+            without the token. Returns True when the redirect was
+            served (caller should return immediately)."""
+            if expected_token is None:
+                return False
+            parsed = urllib.parse.urlparse(self.path)
+            decoded = urllib.parse.unquote(parsed.path)
+            if not decoded.startswith("/m/"):
+                return False
+            q = urllib.parse.parse_qs(parsed.query)
+            token = (q.get("t") or [""])[0]
+            if not token:
+                return False
+            if not hmac.compare_digest(token, expected_token):
+                return False
+            # Strip the token from the URL so it doesn't linger in
+            # browser history. Preserve any other query params.
+            other = {k: v for k, v in q.items() if k != "t"}
+            new_query = urllib.parse.urlencode(other, doseq=True)
+            new_path = decoded + (f"?{new_query}" if new_query else "")
+            self.send_response(302)
+            self.send_header("Location", new_path)
+            self.send_header(
+                "Set-Cookie",
+                f"{_MOBILE_COOKIE_NAME}={expected_token}; "
+                f"Path=/m/; SameSite=Strict; HttpOnly; Max-Age=86400",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
 
         def _is_csrf_ok(self) -> tuple[bool, str]:
             cookie = None
@@ -3184,6 +3602,11 @@ def make_request_handler(
             # and so air-gap mirrors don't need a token. They're public
             # by design: nothing in static_dir is sensitive.
             if self._maybe_serve_static():
+                return
+            # Phase 7: mobile bearer-via-querystring bootstrap. Handles
+            # the very first hit from a printed URL by exchanging the
+            # token for a cookie, then 302s to the token-less URL.
+            if self._try_mobile_query_bootstrap():
                 return
             ok, detail = self._is_authed()
             if not ok:
@@ -3410,6 +3833,18 @@ def make_request_handler(
             # /api/memory/new — urlencoded form with name + content.
             if path == "/api/memory/new":
                 self._handle_api_memory_new(form)
+                return
+            # /home/wizard/setup — Phase 3 first-run wizard config write.
+            if path in ("/home/wizard/setup", "/home/wizard/setup/"):
+                self._handle_wizard_setup(form)
+                return
+            # /home/wizard/start — Phase 3 wizard-driven `teane build`.
+            if path in ("/home/wizard/start", "/home/wizard/start/"):
+                self._handle_wizard_start(form)
+                return
+            # /config-ui/preset/apply — Phase 6 preset overlay.
+            if path in ("/config-ui/preset/apply", "/config-ui/preset/apply/"):
+                self._handle_config_preset_apply(form)
                 return
             self._send(404, "text/plain", "404 not found\n")
 
@@ -3792,6 +4227,121 @@ def make_request_handler(
             self.send_response(303)
             self.send_header("Location", f"/run/console/{wp.session_id}")
             self.end_headers()
+
+        def _handle_wizard_setup(self, form: dict[str, Any]) -> None:
+            """Phase 3: /home/wizard/setup — accept provider + API key,
+            write a minimal config.json plus a ~/.teane/env.sh sidecar,
+            then redirect back to /home (which will now render the
+            build step)."""
+            from harness.web_wizard import apply_wizard_choice
+            provider = str(form.get("provider") or "").strip().lower()
+            api_key = str(form.get("api_key") or "")
+            if not provider:
+                self._send(400, "text/plain", "provider required\n")
+                return
+            result = apply_wizard_choice(
+                provider=provider,
+                api_key=api_key,
+                dashboard_cfg=cfg,
+            )
+            if not result.ok:
+                self._send(400, "text/plain", f"wizard setup failed: {result.error}\n")
+                return
+            logger.info(
+                "[wizard] setup applied: provider=%s config=%s env_sh=%s",
+                provider, result.config_path, result.env_sh_path or "-",
+            )
+            self.send_response(303)
+            self.send_header("Location", "/home?saved=1")
+            self.end_headers()
+
+        def _handle_config_preset_apply(self, form: dict[str, Any]) -> None:
+            """Phase 6: /config-ui/preset/apply — overlay the named
+            preset onto ``config.json`` and 303 back to /config-ui."""
+            from harness.cli import _get_global_config_path
+            from harness.presets import apply_preset
+            preset = str(form.get("preset") or "").strip().lower()
+            if not preset:
+                self._send(400, "text/plain", "preset required\n")
+                return
+            config_path = _get_global_config_path()
+            result = apply_preset(preset, config_path=config_path)
+            if not result.ok:
+                self._send(400, "text/plain", f"apply failed: {result.error}\n")
+                return
+            logger.info(
+                "[preset] applied %r; %d key(s) changed",
+                preset, len(result.changed_keys),
+            )
+            try:
+                append_audit(
+                    db_path=cfg.web_db_path, action="preset_apply",
+                    target=preset,
+                    detail=f"keys={','.join(result.changed_keys)}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.send_response(303)
+            self.send_header(
+                "Location", f"/config-ui/presets?saved={urllib.parse.quote(preset)}",
+            )
+            self.end_headers()
+
+        def _handle_wizard_start(self, form: dict[str, Any]) -> None:
+            """Phase 3: /home/wizard/start — spawn `teane build` from
+            the wizard prompt + workspace. Creates the workspace dir
+            (with parents) if it doesn't exist yet — consumers won't
+            pre-create empty directories."""
+            from harness.dashboard_runlike import spawn_harness_subcommand
+            prompt = str(form.get("prompt") or "").strip()
+            workspace = str(form.get("workspace") or "").strip()
+            if not prompt:
+                self._send(400, "text/plain", "prompt required\n")
+                return
+            if not workspace:
+                self._send(400, "text/plain", "workspace required\n")
+                return
+            if len(prompt) > _RUN_PROMPT_MAX_CHARS:
+                self._send(
+                    400, "text/plain",
+                    f"prompt too long ({len(prompt)} chars; "
+                    f"max {_RUN_PROMPT_MAX_CHARS})\n",
+                )
+                return
+            workspace_resolved = os.path.expanduser(workspace)
+            if not os.path.isdir(workspace_resolved):
+                try:
+                    os.makedirs(workspace_resolved, exist_ok=True)
+                except OSError as exc:
+                    self._send(
+                        400, "text/plain",
+                        f"could not create workspace {workspace!r}: {exc}\n",
+                    )
+                    return
+            reg = get_process_registry()
+            if not reg.acquire_pending(workspace_resolved):
+                self._send(
+                    409, "text/plain",
+                    f"A run is already in progress for {workspace}. "
+                    f"Try again once it completes.\n",
+                )
+                return
+            try:
+                try:
+                    wp = spawn_harness_subcommand(
+                        cfg,
+                        subcommand="build",
+                        workspace=workspace_resolved,
+                        prompt=prompt,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send(500, "text/plain", f"spawn failed: {exc}\n")
+                    return
+                self.send_response(303)
+                self.send_header("Location", f"/sessions/{wp.session_id}")
+                self.end_headers()
+            finally:
+                reg.release_pending(workspace_resolved)
 
         def _handle_run_schedule(self, form: dict[str, Any]) -> None:
             from datetime import datetime as _dt, timedelta as _td
@@ -5151,6 +5701,114 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
     )
 
 
+_HITL_TYPE_HEADLINE: dict[str, str] = {
+    # Plain-English rephrasing keyed by the ``type`` field of the HITL
+    # webhook payload. Keeps the raw ``message`` for detail but gives
+    # the operator a scannable one-liner at the top of the card.
+    "prompt":              "Choose how to continue",
+    "confirm":             "Please confirm",
+    "notes":               "Please add notes",
+    "wait_for_edit":       "Waiting for your edit",
+    "patch_approval":      "Review file changes before writing",
+}
+
+
+def _hitl_prompt_headline(prompt: dict[str, Any]) -> str:
+    """Return a short plain-English headline for a HITL prompt.
+
+    Prefers a `metadata["headline"]` override the harness may supply,
+    then falls back to the type-to-headline table, then to a generic
+    "Human input needed" so the card never shows a blank eyebrow."""
+    if not isinstance(prompt, dict):
+        return "Human input needed"
+    meta = prompt.get("metadata")
+    if isinstance(meta, dict):
+        h = str(meta.get("headline") or "").strip()
+        if h:
+            return h
+    kind = str(prompt.get("type") or "").strip().lower()
+    return _HITL_TYPE_HEADLINE.get(kind, "Human input needed")
+
+
+def _render_inline_context(metadata: dict[str, Any]) -> str:
+    """Surface common contextual fields (`command`, `file`, `cwd`, `diff`)
+    from the HITL metadata inline so the operator sees what's being
+    asked about without expanding a details block.
+
+    Special case: when ``metadata["kind"] == "patch_approval"`` and
+    ``metadata["patches"]`` is a list, render a PR-style multi-file
+    diff block (Phase 5). The operator sees exactly which files the
+    agent is about to write before answering approve / reject.
+
+    Returns the empty string when metadata contains none of the known
+    keys — the caller renders nothing rather than an empty container.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+
+    # Phase 5: patch approval takes over the whole context block —
+    # the diff cards ARE the context; command/file/cwd rows would be
+    # noise beside them.
+    if metadata.get("kind") == "patch_approval":
+        patches = metadata.get("patches") or []
+        try:
+            from harness.diff_render import render_patch_list
+            return (
+                "<div class='stack--sm'>"
+                f"<div class='muted small'>{len(patches)} file(s) proposed</div>"
+                + render_patch_list(patches)
+                + "</div>"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[hitl] patch_approval render failed: %s", exc)
+            return (
+                f"<div class='muted small'>Could not render diff: "
+                f"{html.escape(str(exc))}</div>"
+            )
+
+    rows: list[str] = []
+
+    def _kv(label: str, value: str, mono: bool = False) -> str:
+        klass = "mono" if mono else ""
+        return (
+            f"<div class='hitl-context-row'>"
+            f"<span class='eyebrow'>{html.escape(label)}</span>"
+            f"<span class='{klass}'>{html.escape(value)}</span>"
+            f"</div>"
+        )
+
+    cmd = str(metadata.get("command") or "").strip()
+    if cmd:
+        rows.append(_kv("Command", cmd, mono=True))
+    fp = str(metadata.get("file") or metadata.get("file_path") or "").strip()
+    if fp:
+        rows.append(_kv("File", fp, mono=True))
+    cwd = str(metadata.get("cwd") or metadata.get("workspace") or "").strip()
+    if cwd:
+        rows.append(_kv("Working dir", cwd, mono=True))
+    diff = str(metadata.get("diff") or "").strip()
+    if diff:
+        # Show a small preview; the operator can scroll if truncated.
+        max_lines = 12
+        lines = diff.splitlines()
+        preview = "\n".join(lines[:max_lines])
+        if len(lines) > max_lines:
+            preview += f"\n… ({len(lines) - max_lines} more line{'s' if len(lines) - max_lines != 1 else ''})"
+        rows.append(
+            "<div class='hitl-context-row'>"
+            "<span class='eyebrow'>Diff</span>"
+            f"<pre class='diff' style='margin:0'>{html.escape(preview)}</pre>"
+            "</div>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<div class='hitl-metadata-block stack--sm'>"
+        + "".join(rows)
+        + "</div>"
+    )
+
+
 def _render_hitl_metadata_block(metadata: dict[str, Any]) -> str:
     """Render the labelled-trigger / escalation-summary / outside-harness
     fix-list envelope the harness ships with the repair-menu HITL prompt.
@@ -5351,33 +6009,44 @@ def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
         metadata_html = (
             _render_hitl_metadata_block(metadata) if isinstance(metadata, dict) else ""
         )
+        # Phase 4: inline the most useful fields (command / file / cwd
+        # / diff) so the operator sees them BEFORE the option picker.
+        inline_context_html = (
+            _render_inline_context(metadata) if isinstance(metadata, dict) else ""
+        )
+        headline = _hitl_prompt_headline(p.prompt)
         question_html, input_html, button_label = _render_hitl_prompt_body(
             p.prompt, autofocus,
         )
         if cfg.writes_enabled and csrf_token:
             form_html = (
+                f"{inline_context_html}"
                 f"{metadata_html}"
                 f"{question_html}"
                 f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer' "
-                "data-ajax='hitl-answer'>"
+                "data-ajax='hitl-answer' class='hitl-action-row'>"
                 f"{csrf_field}"
                 f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
                 f"{input_html}"
-                f"<p><button>{html.escape(button_label)}</button></p>"
-                "<p class='hitl-form-error muted' role='alert'></p>"
+                f"<button class='btn btn--primary'>{html.escape(button_label)}</button>"
+                "<span class='hitl-form-error muted small' role='alert'></span>"
                 "</form>"
             )
         else:
             form_html = (
+                f"{inline_context_html}"
                 f"{metadata_html}"
                 f"{question_html}"
-                "<p class='muted'>Writes disabled — answer this prompt via "
+                "<p class='muted small'>Writes disabled — answer this prompt via "
                 f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
                 "with an authenticated client.</p>"
             )
         rows.append(
-            f"<div class='card hitl-alert'><h3>HITL pending — {_esc(p.request_id)}</h3>"
-            f"{form_html}</div>"
+            f"<div class='hitl-card stack--sm' data-hitl-request='{html.escape(p.request_id)}'>"
+            f"<div class='hitl-card__eyebrow'>{html.escape(headline)}"
+            f" · <span class='muted small'>{_esc(p.request_id)}</span></div>"
+            f"{form_html}"
+            "</div>"
         )
     return "".join(rows)
 
@@ -5451,6 +6120,247 @@ def _render_console_body(cfg: DashboardConfig, session_id: str) -> str:
     return "".join(parts)
 
 
+_ACTIVITY_EVENT_LABELS: dict[str, dict[str, str]] = {
+    # event-name → {icon (sprite id), label template, severity}
+    # Label templates support very small mustache-lite substitutions
+    # handled client-side by the Alpine activity-feed component; keep
+    # them plain-English and short. Unknown events fall through to a
+    # generic row so the feed never silently drops information.
+    "llm_call":              {"icon": "chart-line",       "label": "LLM call",           "severity": ""},
+    "embedding_call":        {"icon": "chart-line",       "label": "Embedding call",     "severity": ""},
+    "session_start":         {"icon": "play",             "label": "Session started",    "severity": "ok"},
+    "session_end":           {"icon": "checkmark-filled", "label": "Session ended",      "severity": "ok"},
+    "build_start":           {"icon": "renew",            "label": "Build started",      "severity": ""},
+    "build_end":             {"icon": "checkmark-filled", "label": "Build finished",     "severity": "ok"},
+    "node_transition":       {"icon": "chevron-right",    "label": "Graph transition",   "severity": ""},
+    "tool_call_succeeded":   {"icon": "checkmark-filled", "label": "Tool call",          "severity": "ok"},
+    "tool_call_failed":      {"icon": "error-filled",     "label": "Tool call failed",   "severity": "fail"},
+    "deployment_outcome":    {"icon": "launch",           "label": "Deployment",         "severity": ""},
+    "hitl_pending":          {"icon": "warning-alt",      "label": "Waiting for human",  "severity": "hitl"},
+    "hitl_resolved":         {"icon": "checkmark-filled", "label": "Human answered",     "severity": "ok"},
+    "sandbox_start_failed":  {"icon": "error-filled",     "label": "Sandbox failed",     "severity": "fail"},
+    "token_budget_exhausted": {"icon": "error-filled",    "label": "Budget exhausted",   "severity": "fail"},
+    "hitl_gate_blocked":     {"icon": "warning-alt",      "label": "HITL gate blocked",  "severity": "hitl"},
+}
+
+
+def _initial_cost_snapshot(cfg: DashboardConfig, session_id: str) -> dict[str, Any]:
+    """Seed the cost meter from the on-disk log so a page reload mid-run
+    keeps the cumulative running total correct.
+
+    Client-side we only add up ``llm_call`` events observed after the
+    connection opens — replaying history from the top would double-count.
+    So the server hands the browser a single frozen snapshot, and the
+    Alpine store increments from there.
+
+    Returns a dict with the fields the client needs. Never raises — a
+    missing log or empty session yields all zeros."""
+    try:
+        from harness.metrics import aggregate_session
+        m = aggregate_session(session_id, os.path.expanduser(cfg.log_dir))
+        return {
+            "cost": round(m.total_cost_usd, 6),
+            "calls": m.llm_call_count,
+            "tokens_in": m.tokens_in,
+            "tokens_out": m.tokens_out,
+            "cached_tokens": m.cached_tokens,
+        }
+    except Exception:  # noqa: BLE001
+        return {"cost": 0.0, "calls": 0, "tokens_in": 0, "tokens_out": 0, "cached_tokens": 0}
+
+
+def _render_activity_feed_and_cost(cfg: DashboardConfig, session_id: str) -> str:
+    """The plain-English activity ticker + running cost meter.
+
+    Renders as one card containing a header row (cost meter, live) and
+    the scrollable feed. Both hydrate from a server-computed snapshot
+    passed as `data-initial-*` attributes so a mid-run reload doesn't
+    reset the counters. Live updates arrive via the ``teane:sse:event``
+    CustomEvent that `wireEventStream` broadcasts from the existing
+    JSONL SSE stream (dashboard.js) — no second EventSource opened.
+    """
+    snap = _initial_cost_snapshot(cfg, session_id)
+    labels_json = html.escape(json.dumps(_ACTIVITY_EVENT_LABELS), quote=True)
+    initial_cost_json = html.escape(json.dumps(snap), quote=True)
+    sse_url = f"/api/sessions/{_esc(session_id)}/events"
+    # ``x-cloak`` hides the Alpine template until Alpine boots so users
+    # don't see raw {{ }} braces during first paint.
+    return (
+        "<div class='card stack'>"
+        "<div class='cluster' style='justify-content:space-between'>"
+        "<div><div class='eyebrow'>Activity</div>"
+        "<h3 style='margin:0'>Live session</h3></div>"
+        "<div class='cost-meter' "
+        f"data-initial='{initial_cost_json}' "
+        "x-data=\"teaneCostMeter($el.dataset.initial)\" "
+        "x-on:teane:sse:event.window=\"handleEvent($event.detail)\" "
+        ":class=\"pulse ? 'is-updated' : ''\">"
+        "<span class='cost-meter__label'>Spent</span>"
+        "<span class='cost-meter__value' x-text=\"formatCost(cost)\">"
+        f"${snap['cost']:.4f}"
+        "</span>"
+        "<span class='muted small tabular' "
+        "x-text=\"calls ? (calls + ' calls · ' + tokensTotal.toLocaleString() + ' tok') : ''\">"
+        "</span>"
+        "</div>"
+        "</div>"
+        "<div class='activity-feed' "
+        f"data-labels='{labels_json}' "
+        f"data-sse-url='{sse_url}' "
+        "x-data=\"teaneActivityFeed($el.dataset.labels)\" "
+        "x-on:teane:sse:event.window=\"pushEvent($event.detail)\">"
+        "<template x-for=\"row in rows.slice(-50).reverse()\" :key=\"row.id\">"
+        "<div class='activity-row' "
+        ":class=\"row.severity ? 'activity-row--' + row.severity : ''\">"
+        "<span x-html=\"row.icon\"></span>"
+        "<span x-text=\"row.label\"></span>"
+        "<span class='activity-row__ts' x-text=\"row.ts\"></span>"
+        "</div>"
+        "</template>"
+        "<div class='muted small' x-show=\"rows.length === 0\">"
+        "Waiting for events…</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _session_stderr_tail(cfg: DashboardConfig, session_id: str, *,
+                         max_bytes: int = 4096) -> str:
+    """Read the last ~max_bytes of the session's stdout/stderr file.
+    Used by Phase-8 error explanation for regex-matching against
+    provider errors, panics, etc."""
+    log_path = os.path.join(
+        os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl.stdout",
+    )
+    if not os.path.isfile(log_path):
+        return ""
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_session_events_tail(cfg: DashboardConfig, session_id: str, *,
+                              max_events: int = 200) -> list[dict[str, Any]]:
+    """Read at most the last ``max_events`` JSON lines from the session
+    log. Used by Phase-8 error explanation."""
+    log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
+    if not os.path.isfile(log_path):
+        return []
+    tail: list[dict[str, Any]] = []
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                evt = _safe_json(line)
+                if evt is not None:
+                    tail.append(evt)
+                    if len(tail) > max_events * 2:
+                        # trim to keep memory bounded
+                        tail = tail[-max_events:]
+    except OSError:
+        return tail
+    return tail[-max_events:]
+
+
+def _process_is_running(session_id: str) -> bool:
+    """True when the process registry has an entry for this session
+    that reports itself as still alive."""
+    try:
+        reg = get_process_registry()
+        for proc in reg.list_all():
+            if getattr(proc, "session_id", "") == session_id:
+                return bool(getattr(proc, "is_running", False))
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _render_session_end_card(
+    cfg: DashboardConfig, session_id: str, log_path: str,
+) -> str:
+    """Phase 8: render the session-end summary + Resume button when
+    the session is no longer running. Empty string while running so
+    an in-flight run isn't distracted by an "end" card."""
+    from harness.error_explain import (
+        STATUS_OK, STATUS_CRASHED, STATUS_KILLED, STATUS_RUNNING,
+        explain_session_end,
+    )
+    if _process_is_running(session_id):
+        return ""
+    events = _read_session_events_tail(cfg, session_id)
+    stderr_tail = _session_stderr_tail(cfg, session_id)
+    explanation = explain_session_end(
+        events, stderr_tail=stderr_tail, process_still_running=False,
+    )
+    if explanation.status == STATUS_RUNNING:
+        return ""
+    # Cost so far — same aggregator the live cost meter uses.
+    cost_snap = _initial_cost_snapshot(cfg, session_id)
+    cost_line = (
+        f"<span class='muted small tabular'>"
+        f"Spent: <strong>${cost_snap['cost']:.4f}</strong> · "
+        f"{cost_snap['calls']} LLM call(s)"
+        f"</span>"
+    )
+    workspace = ""
+    for evt in events:
+        if evt.get("event") == "session_start":
+            workspace = str(evt.get("workspace_path") or "").strip()
+            break
+    action = (explanation.suggested_action or "").strip()
+    css_class = {
+        STATUS_OK: "session-end-card--ok",
+        STATUS_CRASHED: "session-end-card--crashed",
+        STATUS_KILLED: "session-end-card--killed",
+    }.get(explanation.status, "")
+    resume_form = ""
+    if explanation.status != STATUS_OK:
+        csrf = resolve_csrf_token(cfg) or ""
+        resume_form = (
+            "<form method='post' action='/run/resume' class='cluster'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf)}'>"
+            f"<input type='hidden' name='resume_session_id' value='{_esc(session_id)}'>"
+            + (
+                f"<input type='hidden' name='resume_workspace' "
+                f"value='{html.escape(workspace)}'>"
+                if workspace else ""
+            ) +
+            "<button type='submit' class='btn btn--primary'>Resume</button>"
+            "<span class='muted small'>Picks up from the last "
+            "checkpoint.</span>"
+            "</form>"
+        )
+    cause_html = ""
+    if explanation.cause:
+        cause_html = (
+            "<pre class='muted small' style='margin:0;white-space:pre-wrap'>"
+            f"{html.escape(explanation.cause)}"
+            "</pre>"
+        )
+    return (
+        f"<div class='session-end-card {css_class} stack--sm'>"
+        f"<div class='session-end-card__status'>{html.escape(explanation.status)}</div>"
+        f"<h3 style='margin:0'>{html.escape(explanation.headline)}</h3>"
+        f"{cause_html}"
+        + (
+            f"<div class='muted small'>{html.escape(action)}</div>"
+            if action else ""
+        ) +
+        f"<div class='cluster' style='justify-content:space-between'>"
+        f"{cost_line}"
+        f"{resume_form}"
+        "</div>"
+        "</div>"
+    )
+
+
 def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
     """Detailed per-session view that includes pending HITL prompts +
     a queued-notes panel when writes are enabled.
@@ -5466,11 +6376,21 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
     arrives or a chat note is queued — no page reload."""
     log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
     parts: list[str] = []
+    # Phase 8: session-end explanation card. Rendered ABOVE the HITL
+    # slot (which is normally empty at end-of-session anyway) so a
+    # crashed run's cause is the first thing the operator sees. Emits
+    # the empty string while the session is still running.
+    parts.append(_render_session_end_card(cfg, session_id, log_path))
     parts.append(
         f"<div id='hitl-pending-slot' data-session-id='{_esc(session_id)}'>"
         + _render_pending_hitl_rows(cfg, session_id)
         + "</div>"
     )
+    # Phase 2: consumer-facing activity feed + running cost meter.
+    # Renders above the technical event stream (which stays for
+    # operators debugging JSONL fields). Both feed off the same SSE
+    # channel via dashboard.js's window CustomEvent broadcast.
+    parts.append(_render_activity_feed_and_cost(cfg, session_id))
 
     # v5 read-only cards (Phases 3.1, 3.2, 4.1). Resolve the workspace
     # from the JSONL session_start event; gracefully empty when the log

@@ -658,8 +658,89 @@
       if (kind === "hitl_pending" || kind === "hitl_resolved") {
         refreshHitlSlot();
       }
+      // Phase 4: fire a system notification when a HITL prompt lands
+      // while the operator isn't looking. Silent when the tab is
+      // visible — no double-notify for a card they're already staring
+      // at. requireInteraction keeps the notification visible until
+      // clicked; clicking focuses the tab.
+      if (kind === "hitl_pending" && document.hidden) {
+        maybeSendHitlNotification(data);
+      }
     };
     es.addEventListener("close", function () { es.close(); });
+  }
+
+  // -----------------------------------------------------------------
+  // Phase 4: desktop notifications
+  // -----------------------------------------------------------------
+
+  var _NOTIFY_PROMPT_KEY = "teane.notify.prompted";
+
+  function _notificationsSupported() {
+    return typeof window !== "undefined" &&
+           typeof window.Notification !== "undefined";
+  }
+
+  function maybeAskNotificationPermission() {
+    // Only prompt on session pages — the operator has already
+    // committed to watching a run; asking on the sessions LIST would
+    // feel spammy. Detect by URL rather than by page-content class so
+    // both /sessions/<id> and /run/console/<id> qualify.
+    if (!_notificationsSupported()) return;
+    var path = String(window.location.pathname || "");
+    if (path.indexOf("/sessions/") !== 0 && path.indexOf("/run/console/") !== 0) return;
+    if (Notification.permission !== "default") return;
+    try {
+      if (window.localStorage && window.localStorage.getItem(_NOTIFY_PROMPT_KEY)) return;
+    } catch (_e) { /* privacy-mode storage rejects; fine to prompt again */ }
+    // Post an in-page toast asking permission — clicking Enable
+    // triggers the permission prompt (must be user-gesture to satisfy
+    // browser rules). The toast host is created by ensureToastHost().
+    var host = document.getElementById("toast-host");
+    if (!host) return;
+    var toast = document.createElement("div");
+    toast.className = "toast toast--info";
+    toast.style.display = "flex";
+    toast.style.gap = "var(--t-sp-3)";
+    toast.style.alignItems = "center";
+    toast.innerHTML =
+      '<span class="small">Get a desktop notification when the agent needs you?</span>' +
+      '<button type="button" class="btn btn--sm btn--primary" data-action="notify-enable">Enable</button>' +
+      '<button type="button" class="btn btn--sm btn--ghost" data-action="notify-dismiss">Not now</button>';
+    host.appendChild(toast);
+    var mark = function () {
+      try { window.localStorage.setItem(_NOTIFY_PROMPT_KEY, "1"); } catch (_e) {}
+      toast.parentNode && toast.parentNode.removeChild(toast);
+    };
+    toast.querySelector('[data-action="notify-enable"]').addEventListener("click", function () {
+      Notification.requestPermission().then(mark);
+    });
+    toast.querySelector('[data-action="notify-dismiss"]').addEventListener("click", mark);
+  }
+
+  function maybeSendHitlNotification(data) {
+    if (!_notificationsSupported()) return;
+    if (Notification.permission !== "granted") return;
+    var meta = (data && data.metadata) || {};
+    var headline = String(meta.headline || meta.hitl_trigger || "Human input needed");
+    var summary = String(meta.hitl_escalation_summary || meta.message || data.message || "");
+    var summarySnip = summary.length > 140 ? (summary.slice(0, 137) + "…") : summary;
+    var opts = {
+      body: summarySnip || "The agent is waiting for a decision.",
+      tag: String(data.request_id || data.session_id || "teane-hitl"),
+      requireInteraction: true,
+    };
+    try {
+      var n = new Notification("teane · " + headline, opts);
+      n.onclick = function () {
+        try { window.focus(); } catch (_e) {}
+        var slot = document.getElementById("hitl-pending-slot");
+        if (slot && typeof slot.scrollIntoView === "function") {
+          slot.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        n.close();
+      };
+    } catch (_e) { /* browsers throttle permission-less new Notification */ }
   }
 
   function wireEventStream() {
@@ -699,6 +780,12 @@
       li.appendChild(body);
       appendWithStickyBottom(ul, li, 500);
       registerFilter(kind);
+      // Phase 2: broadcast every event on the window bus so the Alpine
+      // activity-feed + cost-meter components (rendered elsewhere on
+      // this page) can update without opening a second EventSource.
+      try {
+        window.dispatchEvent(new CustomEvent("teane:sse:event", { detail: data }));
+      } catch (_e) { /* pre-Alpine CustomEvent polyfills rare; safe to ignore */ }
     };
     es.addEventListener("close", function () { es.close(); });
   }
@@ -1296,6 +1383,147 @@
     });
   }
 
+  // -----------------------------------------------------------------
+  // Phase 2: Alpine components — activity feed + running cost meter.
+  //
+  // Exposed as globals so `x-data="teaneCostMeter(...)"` resolves the
+  // function regardless of whether Alpine has already booted when
+  // dashboard.js executes. Both components subscribe to the window
+  // `teane:sse:event` bus (dispatched from wireEventStream) rather than
+  // opening their own EventSource — one connection, N consumers.
+  // -----------------------------------------------------------------
+
+  var _teaneCostFormatter = function (cost) {
+    if (!cost || cost <= 0) return "$0.0000";
+    if (cost < 1) return "$" + cost.toFixed(4);
+    if (cost < 100) return "$" + cost.toFixed(3);
+    return "$" + cost.toFixed(2);
+  };
+
+  window.teaneCostMeter = function (initialJson) {
+    var snap;
+    try { snap = JSON.parse(initialJson || "{}"); } catch (_e) { snap = {}; }
+    return {
+      cost: Number(snap.cost) || 0,
+      calls: Number(snap.calls) || 0,
+      tokensIn: Number(snap.tokens_in) || 0,
+      tokensOut: Number(snap.tokens_out) || 0,
+      cachedTokens: Number(snap.cached_tokens) || 0,
+      pulse: false,
+      _pulseTimer: null,
+      get tokensTotal() { return this.tokensIn + this.tokensOut; },
+      formatCost: _teaneCostFormatter,
+      handleEvent: function (data) {
+        if (!data) return;
+        var kind = data.event;
+        if (kind !== "llm_call" && kind !== "embedding_call") return;
+        var add = Number(data.cost_usd) || 0;
+        this.cost += add;
+        this.calls += 1;
+        this.tokensIn += Number(data.tokens_in) || 0;
+        this.tokensOut += Number(data.tokens_out) || 0;
+        this.cachedTokens += Number(data.cached_tokens) || 0;
+        // Brief background flash on update; 400ms is short enough
+        // to feel like a heartbeat without becoming distracting on a
+        // busy run.
+        var self = this;
+        self.pulse = true;
+        if (self._pulseTimer) clearTimeout(self._pulseTimer);
+        self._pulseTimer = setTimeout(function () { self.pulse = false; }, 400);
+      },
+    };
+  };
+
+  // Phase 3: home-page build step. One store keeps prompt +
+  // workspace in sync so a template click prefills both.
+  window.teaneHomeBuild = function () {
+    return {
+      prompt: "",
+      workspace: "",
+      pickTemplate: function (prompt, workspace) {
+        if (typeof prompt === "string") this.prompt = prompt;
+        if (typeof workspace === "string" && workspace) this.workspace = workspace;
+        // Scroll the form into view so the user sees the fields populated.
+        var form = document.querySelector("form[action='/home/wizard/start']");
+        if (form && typeof form.scrollIntoView === "function") {
+          form.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      },
+    };
+  };
+
+  window.teaneActivityFeed = function (labelsJson) {
+    var labels;
+    try { labels = JSON.parse(labelsJson || "{}"); } catch (_e) { labels = {}; }
+    var seq = 0;
+    var iconFor = function (kind) {
+      var meta = labels[kind];
+      var symbol = (meta && meta.icon) || "chart-line";
+      // Use the sprite so we reuse the same icons the side nav uses.
+      return (
+        '<svg class="icon" width="12" height="12" aria-hidden="true">' +
+        '<use href="/static/icons/sprite.svg#i-' + symbol + '"></use>' +
+        '</svg>'
+      );
+    };
+    var labelFor = function (kind, data) {
+      var meta = labels[kind];
+      var base = (meta && meta.label) || kind || "event";
+      // Small enrichments for the most common types — plain-English
+      // extras so the row carries some substance rather than just a
+      // category name.
+      if (kind === "llm_call") {
+        var cost = Number(data.cost_usd) || 0;
+        var tok = (Number(data.tokens_in) || 0) + (Number(data.tokens_out) || 0);
+        var parts = [base];
+        if (data.role) parts.push("· " + data.role);
+        if (cost) parts.push("· " + _teaneCostFormatter(cost));
+        if (tok) parts.push("· " + tok.toLocaleString() + " tok");
+        return parts.join(" ");
+      }
+      if (kind === "node_transition") {
+        var from = data.from_node || data.from || "?";
+        var to = data.to_node || data.to || "?";
+        return base + " · " + from + " → " + to;
+      }
+      if (kind === "tool_call_succeeded" || kind === "tool_call_failed") {
+        var name = data.tool_name || data.tool || "";
+        return name ? (base + " · " + name) : base;
+      }
+      if (kind === "deployment_outcome") {
+        var status = data.status || data.outcome || "";
+        return status ? (base + " · " + status) : base;
+      }
+      return base;
+    };
+    var trimTs = function (ts) {
+      if (!ts) return "";
+      // "2026-06-30T14:22:03.492Z" → "14:22:03"
+      var m = /T(\d{2}:\d{2}:\d{2})/.exec(String(ts));
+      return m ? m[1] : String(ts).slice(0, 8);
+    };
+    return {
+      rows: [],
+      pushEvent: function (data) {
+        if (!data) return;
+        var kind = data.event || "unknown";
+        var meta = labels[kind] || { severity: "" };
+        seq += 1;
+        this.rows.push({
+          id: seq,
+          event: kind,
+          icon: iconFor(kind),
+          label: labelFor(kind, data),
+          severity: meta.severity || "",
+          ts: trimTs(data.ts || data.timestamp),
+        });
+        // Bound to 200 rows in memory; the template renders only the
+        // last 50 for on-screen. Slice keeps the state cheap.
+        if (this.rows.length > 200) this.rows = this.rows.slice(-200);
+      },
+    };
+  };
+
   function boot() {
     ensureToastHost();
     wireCopyButtons();
@@ -1305,6 +1533,7 @@
     wireEventStream();
     wireStdoutStream();
     wireHitlSseChannel();
+    maybeAskNotificationPermission();
     wireConfigTree();
     wireSessionPicker();
     wireSessionPurge();

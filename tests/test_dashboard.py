@@ -375,11 +375,14 @@ def test_list_memory_files_returns_metadata(tmp_path):
 # 4. dispatch — routes return the right shape
 # ---------------------------------------------------------------------------
 
-def test_dispatch_root_redirects_to_status(tmp_path):
+def test_dispatch_root_redirects_to_home(tmp_path):
+    """Phase 1 flipped the root redirect from /status (operator-era
+    default) to /home so consumers land on the wizard-first surface.
+    /status remains directly reachable via the side nav."""
     cfg = _make_cfg(tmp_path)
     status, _ctype, body = dispatch(cfg, "/")
     assert status == 302
-    assert body.endswith("/status")
+    assert body.endswith("/home")
 
 
 def test_dispatch_status_renders_with_side_nav(tmp_path):
@@ -1167,7 +1170,7 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
 
 def test_config_ui_off_when_writes_explicitly_disabled(tmp_path):
     cfg = _make_cfg(tmp_path, writes_enabled=False)
-    _, _, body = dispatch(cfg, "/config-ui")
+    _, _, body = dispatch(cfg, "/config-ui/advanced")
     assert "Writes are disabled" in body
     assert "dashboard.writes_enabled" in body
 
@@ -1187,7 +1190,7 @@ def test_config_ui_renders_sandbox_section_via_tree_editor(tmp_path, monkeypatch
         web_db_path=str(tmp_path / "web.db"),
         config_path=str(config_path),
     )
-    _, _, body = dispatch(cfg, "/config-ui")
+    _, _, body = dispatch(cfg, "/config-ui/advanced")
     # Section renders with the new ct-section wrapper, not bx--accordion.
     assert "data-section='sandbox'" in body
     # The form posts to the new /config-tree/<section> handler.
@@ -1219,7 +1222,7 @@ def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, mo
         web_db_path=str(tmp_path / "web.db"),
         config_path=str(config_path),
     )
-    _, _, body = dispatch(cfg, "/config-ui")
+    _, _, body = dispatch(cfg, "/config-ui/advanced")
     # Outer group is a native <details> with the legacy class names
     # preserved so operator CSS overrides keep working.
     assert "<details class='config-group'" in body
@@ -1301,7 +1304,7 @@ def test_config_ui_stamps_base_mtime_ns_on_every_section_form(tmp_path, monkeypa
     )
     expected_mtime = config_file_mtime_ns(cfg)
     assert expected_mtime is not None
-    _, _, body = dispatch(cfg, "/config-ui")
+    _, _, body = dispatch(cfg, "/config-ui/advanced")
     # Outer wrapper carries the snapshot + poll URL for the JS.
     assert f"data-config-mtime-ns='{expected_mtime}'" in body
     assert "data-config-mtime-poll-url='/api/config-mtime'" in body
@@ -1325,7 +1328,7 @@ def test_config_ui_empty_base_mtime_when_config_file_missing(tmp_path, monkeypat
         web_db_path=str(tmp_path / "web.db"),
         config_path=str(tmp_path / "missing.json"),
     )
-    _, _, body = dispatch(cfg, "/config-ui")
+    _, _, body = dispatch(cfg, "/config-ui/advanced")
     assert "data-config-mtime-ns=''" in body
     # No baseline → no banner trigger, but the wrapper still renders so
     # the poller no-ops cleanly.

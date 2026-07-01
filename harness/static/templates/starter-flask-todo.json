@@ -1,0 +1,6 @@
+{
+  "title": "Flask To-do App",
+  "description": "A minimal Python web app: Flask + SQLite, one HTML page for adding and completing to-do items. Good first project — small, deterministic, ~20 files.",
+  "prompt": "Build a Flask to-do app in Python. Use SQLite for storage (one 'items' table with id, text, done_at columns). The single '/' page shows the current items, lets me add a new item via a form POST, and toggles an item's done state via a POST to /toggle/<id>. Bootstrap-style CSS is fine but no JS framework — this is a server-rendered app. Include a requirements.txt (flask, only) and a short README explaining `python app.py` to run.",
+  "suggested_workspace": "~/teane-projects/flask-todo"
+}

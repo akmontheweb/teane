@@ -1,0 +1,6 @@
+{
+  "title": "FastAPI Notes API",
+  "description": "A JSON API for storing short notes: create, list, get, delete. FastAPI + SQLite. Comes with typed pydantic models and a Swagger UI at /docs.",
+  "prompt": "Build a FastAPI service in Python for storing notes. Endpoints: POST /notes (accepts {title, body}), GET /notes (list), GET /notes/{id} (single), DELETE /notes/{id}. Store notes in SQLite via SQLAlchemy 2.x. Use Pydantic v2 models for request/response schemas. Include a Dockerfile and a requirements.txt (fastapi, uvicorn, sqlalchemy, pydantic). No auth — this is a starter project. Add pytest tests hitting each endpoint via httpx.AsyncClient.",
+  "suggested_workspace": "~/teane-projects/fastapi-notes"
+}

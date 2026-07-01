@@ -5220,14 +5220,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # opt into --force-lock. Refuse to proceed.
         return 1
 
-    # Greenfield runs (`teane build` / --new-build) get a deterministic
-    # baselined build command — an LLM-scaffolded Makefile cannot override
-    # it. See _detect_default_build_command for the contract.
-    build_command = resolve_build_command(
-        config,
-        workspace_path,
-        is_greenfield=bool(getattr(args, "new_build", False)),
-    )
+    # NOTE: `build_command` is resolved LATER, after `_perform_new_build_reset`.
+    # Resolving here would sniff the workspace as it exists BEFORE the reset —
+    # so a leftover `backend/requirements.txt` from a previous run would seed
+    # `cd backend && ...` into a build command that survives the reset, and
+    # every subsequent build fails with `sh: cd: can't cd to backend`. See
+    # _detect_default_build_command for the contract.
 
     # --- Change-request mode validation (before resource allocation) ---
     # Validate BEFORE initializing checkpointer/gateway/MCP, so early returns
@@ -5512,6 +5510,21 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # rows here so the next run starts with no stale chunks for this
         # workspace either.
         _purge_workspace_repo_index(workspace_path)
+
+    # Resolve the build command AFTER the --new-build reset (if any) has
+    # cleared out leftover files from the previous run. Doing this before
+    # the reset would let `_detect_subdir_build_command` sniff a stale
+    # `backend/requirements.txt`, seed `cd backend && ...` into the build
+    # command, then have the reset delete `backend/` — leaving every
+    # subsequent build stuck on `sh: cd: can't cd to backend`. Greenfield
+    # runs (`teane build` / --new-build) get a deterministic baselined
+    # command; an LLM-scaffolded Makefile cannot override it. See
+    # _detect_default_build_command for the contract.
+    build_command = resolve_build_command(
+        config,
+        workspace_path,
+        is_greenfield=bool(getattr(args, "new_build", False)),
+    )
 
     # Initialize GitGuardian for branch lifecycle management. When
     # --git false, _make_git_guardian returns a no-op stub so the

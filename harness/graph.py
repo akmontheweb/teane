@@ -3963,6 +3963,23 @@ Generate your patches NOW. Only the blocks above. No other text."""
             )
         else:
             loop_counter["consecutive_zero_patch_rounds"] = 0
+        # Distinguish "LLM emitted patches, all rejected by allowlist" from
+        # the generic "0 patches applied" case. The former is high-signal:
+        # the model is deliberately targeting paths outside the allowlist
+        # and no amount of retry will get it back on track without either
+        # a rewire or operator intervention. Escalates to HITL faster than
+        # the generic zero-patch counter — see route_after_compiler.
+        all_rejected_by_allowlist = (
+            success_count == 0
+            and len(patch_results) > 0
+            and len(allowlist_rejections) == fail_count
+        )
+        if all_rejected_by_allowlist:
+            loop_counter["consecutive_all_allowlist_rejected_rounds"] = (
+                loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) + 1
+            )
+        else:
+            loop_counter["consecutive_all_allowlist_rejected_rounds"] = 0
         if current_story_id:
             sz = dict(loop_counter.get("story_zero_patch_rounds", {}) or {})
             if success_count == 0:
@@ -6918,6 +6935,155 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     )
 
 
+# Matches ` && cd <token> && ...` inside a shell command. The token can
+# be a bare dir name or a simple relative path; we intentionally ignore
+# quoted / substituted / absolute forms so an operator-customised
+# `cd "/opt/build" && ...` never trips the stale-cd guard. The leading
+# `&&` requirement skips `cd &&` typos that would already fail earlier.
+_CD_TARGET_RE = re.compile(r"&&\s*cd\s+([A-Za-z0-9_./-]+)\s*&&")
+
+
+def _first_missing_cd_target(
+    build_command: str, workspace_path: str,
+) -> Optional[str]:
+    """Return the first `cd <dir>` target in build_command that does
+    not exist under workspace_path, or None if every target resolves.
+
+    Used by compiler_node to detect a stale build_command (typically a
+    `cd backend && ...` frozen from a pre-reset workspace snapshot) and
+    trigger a re-resolve instead of running a build that will exit-2
+    with `sh: cd: can't cd to <dir>` and no structured diagnostics.
+
+    Absolute paths and anything containing shell substitutions are
+    ignored — those are operator-authored and the harness should not
+    second-guess them.
+    """
+    if not build_command or "cd " not in build_command:
+        return None
+    for match in _CD_TARGET_RE.finditer(build_command):
+        target = match.group(1).strip()
+        if not target or target.startswith("/") or "$" in target:
+            continue
+        full = os.path.join(workspace_path, target)
+        if not os.path.isdir(full):
+            return target
+    return None
+
+
+def _first_out_of_spec_cd_target(
+    build_command: str, workspace_path: str,
+) -> Optional[tuple[str, list[str]]]:
+    """Return (offending_target, spec_roots) when build_command's `cd X`
+    references a subdir that is NOT in the SPEC_ARCHITECTURE.md-declared
+    roots. Returns None when there is no spec, no `cd` target, or all
+    targets are spec-approved.
+
+    Complements :func:`_first_missing_cd_target`. That one catches the
+    case where the cd target simply doesn't exist on disk. This one
+    catches the harder case where the LLM already created a rogue
+    directory (e.g. `backend/` because the stale build_command told it
+    to) but the spec allowlist forbids writing there — the LLM sees a
+    passing `cd` but every patch it emits under that dir gets 100%
+    rejected, and the repair loop burns budget.
+
+    Returned spec_roots are the raw root paths from the spec so the
+    caller can rewrite the build_command against them (e.g. swap
+    `cd backend` for `cd server` when Python backend lives under
+    `server/`).
+    """
+    if not build_command or "cd " not in build_command:
+        return None
+    layout = _read_spec_layout(workspace_path)
+    if layout is None or not getattr(layout, "has_layout", False):
+        return None
+    spec_roots = [
+        r.path.strip("/").split("/", 1)[0]
+        for r in getattr(layout, "roots", []) or []
+        if getattr(r, "path", None)
+    ]
+    spec_roots = [r for r in spec_roots if r]
+    if not spec_roots:
+        return None
+    spec_root_set = set(spec_roots)
+    for match in _CD_TARGET_RE.finditer(build_command):
+        target = match.group(1).strip()
+        if not target or target.startswith("/") or "$" in target:
+            continue
+        # Top-level dir of the cd target — the spec roots are top-level
+        # by contract.
+        top = target.split("/", 1)[0]
+        if top not in spec_root_set:
+            return target, spec_roots
+    return None
+
+
+def _rewrite_cd_target(
+    build_command: str, old_target: str, new_target: str,
+) -> str:
+    """Rewrite the first `&& cd <old_target> &&` occurrence in
+    build_command to point at ``new_target``. Preserves surrounding
+    tokens exactly. Returns build_command unchanged when no match.
+    """
+    pattern = re.compile(
+        r"(&&\s*cd\s+)" + re.escape(old_target) + r"(\s*&&)"
+    )
+    return pattern.sub(rf"\g<1>{new_target}\g<2>", build_command, count=1)
+
+
+# Matches `sh: N: cd: can't cd to <dir>` and `bash: cd: <dir>: No such
+# file or directory` — the two shells that show up as the shell in
+# harness sandbox images (dash for the default docker image, bash for
+# alpine variants). Both forms carry the failing dir in group(1).
+_CD_FAILURE_PATTERNS = (
+    re.compile(r"sh:\s*\d+:\s*cd:\s*can'?t\s+cd\s+to\s+(\S+)"),
+    re.compile(r"bash:\s*cd:\s*(\S+):\s*No such file or directory"),
+    re.compile(r"cd:\s*(\S+):\s*No such file or directory"),
+)
+
+
+def _detect_cd_failure_from_output(raw_output: str) -> Optional[str]:
+    """Return the failing directory name when raw_output shows the
+    shell couldn't cd into it. Returns None when no cd failure is
+    present.
+
+    Compiler_node uses this to short-circuit to HITL: the LLM cannot
+    fix a build_command wiring problem (the allowlist would reject any
+    patch to the missing directory anyway).
+    """
+    if not raw_output or "cd" not in raw_output:
+        return None
+    for pattern in _CD_FAILURE_PATTERNS:
+        m = pattern.search(raw_output)
+        if m:
+            token = m.group(1).strip().rstrip(":,")
+            if token:
+                return token
+    return None
+
+
+def _pick_spec_backend_root(workspace_path: str, spec_roots: list[str]) -> Optional[str]:
+    """Return the first spec root that carries a Python manifest, or the
+    first Node-manifest root as a fallback. Used to rewire a stale
+    `cd backend` to the actual spec-approved backend root.
+    """
+    py_manifests = ("pyproject.toml", "requirements.txt")
+    node_manifests = ("package.json",)
+    node_fallback: Optional[str] = None
+    for root in spec_roots:
+        root_dir = os.path.join(workspace_path, root)
+        if not os.path.isdir(root_dir):
+            continue
+        for m in py_manifests:
+            if os.path.isfile(os.path.join(root_dir, m)):
+                return root
+        if node_fallback is None:
+            for m in node_manifests:
+                if os.path.isfile(os.path.join(root_dir, m)):
+                    node_fallback = root
+                    break
+    return node_fallback
+
+
 def _apply_toolchain_adaptation(
     build_command: str,
     sandbox_config: Optional[dict[str, Any]],
@@ -7165,6 +7331,87 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             )
             adapted_build_cmd = re_detected
             build_cmd = re_detected
+
+    # Fourth mid-session upgrade: build_cmd references `cd <subdir>` but
+    # the subdir does not exist in the workspace. Without this, the build
+    # exits with `sh: cd: can't cd to <subdir>` (exit 2, zero structured
+    # diagnostics), the router sends the LLM back to repair, and the LLM
+    # either creates files under a directory the allowlist forbids (100%
+    # rejected → repair loop) or gives up. Root cause is usually a stale
+    # build_command frozen from a pre-reset workspace snapshot; the fix
+    # is to re-resolve now that the workspace has stabilised. See cli.py
+    # `resolve_build_command`.
+    if adapted_build_cmd is None:
+        missing_cd = _first_missing_cd_target(build_cmd, workspace)
+        if missing_cd is not None:
+            try:
+                from harness.cli import (
+                    _strip_comments,
+                    load_raw_config,
+                    resolve_build_command as _resolve_bc,
+                )
+                cfg = _strip_comments(load_raw_config())
+            except Exception:  # noqa: BLE001 — config read is advisory here
+                cfg = {}
+                _resolve_bc = None  # type: ignore[assignment]
+            re_resolved = None
+            if _resolve_bc is not None:
+                try:
+                    re_resolved = _resolve_bc(
+                        cfg if isinstance(cfg, dict) else {},
+                        workspace,
+                        is_greenfield=is_greenfield_compile,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[compiler_node] Stale-cd re-resolve raised %s; "
+                        "leaving build_cmd unchanged so the router can "
+                        "surface the cd failure to HITL.", exc,
+                    )
+            if re_resolved and re_resolved != build_cmd:
+                logger.warning(
+                    "[compiler_node] Build command references `cd %s` but that "
+                    "directory does not exist in the workspace; re-resolving. "
+                    "Old: %r  New: %r",
+                    missing_cd, build_cmd, re_resolved,
+                )
+                adapted_build_cmd = re_resolved
+                build_cmd = re_resolved
+
+    # Fifth mid-session upgrade: build_cmd's `cd X` target exists on disk
+    # but is NOT one of the spec-approved roots. Root cause: the LLM
+    # (mis)followed a stale `cd backend` in the system prompt and
+    # created `backend/` even though the spec puts code under `server/`.
+    # Every patch it now emits under backend/ gets rejected by the
+    # spec-driven allowlist (roots=['client', 'server']). Rewriting the
+    # build_command to point at a spec-approved root makes the two
+    # signals in the LLM's system prompt agree and lets the patcher
+    # accept the next batch. See _first_out_of_spec_cd_target for the
+    # detection contract.
+    if adapted_build_cmd is None:
+        out_of_spec = _first_out_of_spec_cd_target(build_cmd, workspace)
+        if out_of_spec is not None:
+            bad_target, spec_roots = out_of_spec
+            new_target = _pick_spec_backend_root(workspace, spec_roots)
+            if new_target and new_target != bad_target:
+                rewritten = _rewrite_cd_target(build_cmd, bad_target, new_target)
+                if rewritten != build_cmd:
+                    logger.warning(
+                        "[compiler_node] Build command's `cd %s` conflicts with "
+                        "spec-driven allowlist roots %s; rewriting to `cd %s` so "
+                        "the patcher and the build agree. Old: %r  New: %r",
+                        bad_target, spec_roots, new_target, build_cmd, rewritten,
+                    )
+                    adapted_build_cmd = rewritten
+                    build_cmd = rewritten
+            else:
+                logger.warning(
+                    "[compiler_node] Build command's `cd %s` conflicts with "
+                    "spec-driven allowlist roots %s but no spec root has a "
+                    "usable manifest yet; leaving build_cmd unchanged so the "
+                    "router can surface this to HITL.",
+                    bad_target, spec_roots,
+                )
 
     # Late-bound sandbox image / network adaptation. With the pre-flight
     # adaptation in run_graph this is now a safety net — it only fires when
@@ -7524,6 +7771,26 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 cmd_blocked_rule,
             )
 
+    # Detect `sh: N: cd: can't cd to <dir>` (exit 2, zero structured
+    # diagnostics). The upstream Fix 2/Fix 3 self-heal covers the common
+    # case, but survives only when the workspace already carries a spec-
+    # approved manifest to point at. When both self-heals leave the
+    # build_command pointing at a missing dir, another repair round has
+    # nothing to fix — the failure is entirely in build_command wiring,
+    # not in the LLM's code. Route to HITL with a build_command_cd_missing
+    # tag so the operator can rewire and resume.
+    cd_missing_dir: Optional[str] = None
+    if exit_code != 0 and not compiler_errors and not cmd_blocked_rule:
+        cd_missing_dir = _detect_cd_failure_from_output(raw_log)
+        if cd_missing_dir:
+            logger.warning(
+                "[compiler_node] Shell failed to cd into '%s' — the build "
+                "command references a directory that does not exist in the "
+                "workspace and repair cannot create it (allowlist would "
+                "reject or the LLM has no signal to write there). "
+                "Short-circuiting to HITL.", cd_missing_dir,
+            )
+
     # Build the return dictionary by MERGING into the existing node_state,
     # not replacing it. Cross-iteration signals like patch_failures (the
     # patcher's "Current file content around closest match" window),
@@ -7542,6 +7809,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     if cmd_blocked_rule:
         node_state["build_command_blocked"] = True
         node_state["build_command_blocked_rule"] = cmd_blocked_rule
+    if cd_missing_dir:
+        node_state["build_command_cd_missing"] = True
+        node_state["build_command_cd_missing_dir"] = cd_missing_dir
 
     # First-failure snapshot. Without this the HITL escalation summary
     # only sees the FINAL round's build output — which lies to the
@@ -9169,6 +9439,23 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             )
         else:
             loop_counter["consecutive_zero_patch_rounds"] = 0
+        # See patching_node — mirror the all-allowlist-rejected counter so
+        # the same short-circuit fires whether the rejection happened in
+        # the initial patching pass or in a downstream repair round.
+        # `fail_count` here excludes no-ops (real_success_count subtracted
+        # already), so equality with allowlist_rejections is exact.
+        _non_success = len(patch_results) - success_count
+        all_rejected_by_allowlist_repair = (
+            real_success_count == 0
+            and len(patch_results) > 0
+            and len(allowlist_rejections) == _non_success
+        )
+        if all_rejected_by_allowlist_repair:
+            loop_counter["consecutive_all_allowlist_rejected_rounds"] = (
+                loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) + 1
+            )
+        else:
+            loop_counter["consecutive_all_allowlist_rejected_rounds"] = 0
 
         # Judge-ignored gate (Fix #3). When the reflection verdict named
         # specific files as the real blocker, check that the round's
@@ -9481,12 +9768,20 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if node_state.get("env_misconfig"):
         sym = node_state.get("env_misconfig_symbol", "")
         return f"env_misconfig:{sym}" if sym else "env_misconfig"
+    if node_state.get("build_command_cd_missing"):
+        d = node_state.get("build_command_cd_missing_dir", "")
+        return f"build_command_cd_missing:{d}" if d else "build_command_cd_missing"
     if budget_remaining <= 0.0:
         return "budget_exhausted"
     if _np_tripped_inf(loop_counter):
         return "no_progress_failsafe"
     if sec_attempts >= max_sec_attempts and max_sec_attempts > 0:
         return f"security_fix_limit:{sec_attempts}/{max_sec_attempts}"
+    consecutive_all_rejected = int(
+        loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) or 0
+    )
+    if consecutive_all_rejected >= 1:
+        return f"all_allowlist_rejected:{consecutive_all_rejected}"
     if consecutive_zero >= 2:
         return f"zero_patch_loop:{consecutive_zero}"
     # Consecutive-DISTRACTION circuit breaker. The route gate compares
@@ -10317,6 +10612,22 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         )
         return _transition("human_intervention_node")
 
+    # Build command references `cd <dir>` but <dir> doesn't exist and the
+    # compiler_node auto-rewire (Fixes 2 & 3) couldn't repoint it at a
+    # spec-approved root. Every repair round the LLM emits will either
+    # target the missing dir (allowlist rejects → 0 patches applied) or
+    # give up. The rewire is a config-level fix — operator must edit the
+    # build_command or the workspace layout, not the code. Escalate to
+    # HITL immediately.
+    if state.get("node_state", {}).get("build_command_cd_missing"):
+        missing = state.get("node_state", {}).get("build_command_cd_missing_dir", "")
+        logger.warning(
+            "[router] Build command's `cd %s` failed and no auto-rewire "
+            "target is available. Repair cannot fix build wiring. "
+            "Routing to HITL.", missing,
+        )
+        return _transition("human_intervention_node")
+
     # P1.5: empty LLM response detected. Three rounds of an empty repair LLM
     # would burn three compile cycles with no chance of success; short-circuit
     # to HITL with the precise trigger so the operator sees "llm_silent"
@@ -10394,6 +10705,28 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
                 stuck_files, _STUCK_TARGET_LIMIT,
             )
             return _transition("human_intervention_node")
+
+    # All-allowlist-rejected tripwire. This is a much sharper signal than
+    # the generic zero-patch counter: the LLM emitted patches, all of them
+    # targeted paths outside the patcher allowlist, and nothing landed.
+    # Another round won't change that — the model is picking targets from
+    # signals in its system prompt (build_command, stale examples) that
+    # disagree with the allowlist, and only the operator can rewire that.
+    # Escalate after 1 round instead of the generic 2- / 5-round waits so
+    # we don't burn budget on a self-repeating rejection.
+    consecutive_all_rejected = int(
+        loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) or 0
+    )
+    if consecutive_all_rejected >= 1:
+        logger.warning(
+            "[router] %d consecutive round(s) where every patch was rejected "
+            "by the allowlist. The LLM is targeting paths outside the "
+            "configured layout; another round won't change that. Routing to "
+            "HITL so the operator can widen the allowlist or rewire the "
+            "signals the LLM is picking up.",
+            consecutive_all_rejected,
+        )
+        return _transition("human_intervention_node")
 
     # No-patches-landed tripwire (A6). Two consecutive repair rounds where
     # the patcher applied zero patches means the loop is stuck (LLM keeps

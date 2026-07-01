@@ -1673,6 +1673,19 @@ _CRITICAL_ERROR_PATTERNS: list[re.Pattern[str]] = [
     # iterations on blind guesses.
     re.compile(r"^FAIL:\s"),
     re.compile(r"PROD_IMPORT_SMOKE_(?:FAILURES|OK)"),
+    # "No tests collected" markers across stacks. These look benign but
+    # graph.py's `_is_no_tests_collected` uses them to fold the runner's
+    # non-zero exit to success (the batch just has no tests yet).
+    # Without preserving them here, `filter_critical_errors` drops the
+    # marker whenever ANY earlier line in the log matches a critical
+    # pattern (session 648309aa: uv's `warning: Failed to hardlink` fired
+    # `\bFAILED\b` and its 5-line context pushed pytest's tail out of the
+    # kept window). The repair loop then spun on a non-error.
+    re.compile(r"\bno tests ran in\b", re.IGNORECASE),                     # pytest
+    re.compile(r"\bno tests? (?:were )?found\b", re.IGNORECASE),           # Jest / Vitest / Mocha / Gradle
+    re.compile(r"\bno test files? found\b", re.IGNORECASE),                # Vitest / Mocha
+    re.compile(r"\bthere are no tests? to run\b", re.IGNORECASE),          # Maven Surefire
+    re.compile(r"\bno tests were executed\b", re.IGNORECASE),              # Maven Surefire (failIfNoTests)
 ]
 
 

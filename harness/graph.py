@@ -4337,12 +4337,61 @@ def _node_module_exists_in_workspace(module: str, workspace_path: str) -> bool:
     return False
 
 
-# pytest's exit code 5 means "no tests collected" — distinct from a genuine
-# compile/test failure. Confirm via the literal "no tests ran" line so we
-# don't misclassify a config error that happens to produce exit 5.
+# Test-runner "no tests collected" markers across stacks. Each runner
+# emits a distinct message + a non-zero exit code when the collector
+# found zero tests to execute:
+#   * pytest       → exit 5
+#   * Jest         → exit 1 (unless --passWithNoTests)
+#   * Vitest       → exit 1
+#   * Mocha        → exit 1 with --fail-zero (v10+) or when files missing
+#   * Maven        → exit 1 with failIfNoTests=true (Surefire/Failsafe)
+#   * Gradle test  → exit 1 with --fail-on-no-matching-tests
+# The batch's verification unit simply has no tests yet — the repair
+# LLM cannot fix this from inside the loop. We confirm via the literal
+# marker line (so a config error that happens to produce the same exit
+# code isn't misclassified) AND require the build command to actually
+# exercise one of these runners.
 _NO_TESTS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # pytest — "==== no tests ran in 0.01s ===="
     re.compile(r"(?m)^=+\s*no tests ran in [\d.]+s\s*=*$"),
     re.compile(r"(?m)^no tests ran in [\d.]+s\s*$"),
+    # Jest — "No tests found, exiting with code 1"
+    re.compile(r"(?im)^\s*no tests found, exiting with code \d+\s*$"),
+    re.compile(r"(?im)^\s*no tests found related to files changed\b"),
+    # Vitest — "No test files found, exiting with code 1"
+    re.compile(r"(?im)^\s*no test files? found, exiting with code \d+\s*$"),
+    re.compile(r"(?im)^\s*no test files? found\b"),
+    # Mocha — "Error: No test files found"
+    re.compile(r"(?im)^\s*error: no test files? found\b"),
+    # Maven Surefire / Failsafe — "There are no tests to run." /
+    # "No tests were executed" (variants across plugin versions).
+    re.compile(r"(?im)^.*there are no tests? to run\b.*$"),
+    re.compile(r"(?im)^.*no tests were executed\b.*$"),
+    # Gradle test task with --fail-on-no-matching-tests
+    re.compile(r"(?im)^.*no tests found for given includes\b.*$"),
+    re.compile(r"(?im)^.*no tests were found for the following includes\b.*$"),
+)
+
+
+# Substrings that identify a test-runner invocation in the build command.
+# Used to gate `_is_no_tests_collected` — without a runner in the command,
+# a marker match in the output is almost certainly incidental (e.g. an
+# error message that quotes one of these strings).
+_TEST_RUNNER_TOKENS: tuple[str, ...] = (
+    "pytest",           # Python
+    "vitest",           # Web
+    "jest",             # Web
+    "mocha",            # Web
+    "karma",            # Web
+    "playwright",       # Web e2e
+    "cypress",          # Web e2e
+    "mvn",              # Java (Maven)
+    "maven",            # Java (Maven)
+    "gradle",           # Java (Gradle)
+    "gradlew",          # Java (Gradle wrapper)
+    "junit",            # Java (direct)
+    "surefire",         # Java (Maven plugin)
+    "failsafe",         # Java (Maven plugin)
 )
 
 
@@ -4433,19 +4482,26 @@ def _is_command_blocked_by_security(raw_output: str) -> Optional[str]:
 
 
 def _is_no_tests_collected(exit_code: int, raw_output: str, build_command: str) -> bool:
-    """True when the build's failure is pytest's exit-5 'no tests collected'
-    rather than an actual test/compile failure.
+    """True when a non-zero build exit came from a test runner reporting
+    "no tests collected" rather than from an actual compile/test failure.
 
-    Detected by matching the literal 'no tests ran' line in the output AND
-    requiring the build to actually exercise pytest. Treating this as a
-    generic build failure burns repair iterations on a problem the repair
-    LLM cannot fix (there's nothing to repair — the test runner found
-    nothing). The router uses this to route to test_generation_node or
-    HITL with a precise message instead.
+    Detected across stacks (see :data:`_NO_TESTS_PATTERNS` and
+    :data:`_TEST_RUNNER_TOKENS`):
+      * pytest exit 5 → "no tests ran in Xs"
+      * Jest / Vitest / Mocha exit 1 → "no tests found" / "no test files found"
+      * Maven Surefire/Failsafe exit 1 → "there are no tests to run"
+      * Gradle test exit 1 → "no tests found for given includes"
+
+    Treating any of these as a generic build failure burns repair
+    iterations on a problem the repair LLM cannot fix (there's nothing
+    to repair — the runner found nothing). ``compiler_node`` folds the
+    exit to 0 when source files exist, or hands off to HITL when the
+    workspace is empty.
     """
-    if exit_code != 5 or not raw_output:
+    if exit_code == 0 or not raw_output:
         return False
-    if "pytest" not in build_command.lower():
+    cmd_lower = build_command.lower()
+    if not any(tok in cmd_lower for tok in _TEST_RUNNER_TOKENS):
         return False
     tail = raw_output[-4000:]
     return any(p.search(tail) for p in _NO_TESTS_PATTERNS)
@@ -8098,28 +8154,47 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             dict(e) for e in (compiler_errors or [])[:8]
         ]
 
-    # Pytest exit-5 (no tests collected) is NOT a build failure — the test
-    # runner just had nothing to run. Surface as a distinct condition so the
-    # router can fan out to test_generation (when source exists) or HITL
-    # (when the workspace is empty), instead of burning the repair budget
-    # on a problem the repair LLM cannot fix from inside the loop.
+    # Test-runner "no tests collected" is NOT a build failure — the runner
+    # just had nothing to run. Two dispositions:
+    #   * Workspace has source → fold to exit 0 and let the graph advance.
+    #     Per the batch-verification design (memory:
+    #     [[project_per_batch_pipeline]]) an empty test set in a batch is a
+    #     valid intermediate state — test_generation_node may have run and
+    #     produced 0 tests, or the stack has no test files by design. The
+    #     repair LLM cannot fix a non-error; routing anywhere but forward
+    #     just burns iterations.
+    #   * Workspace has no source → route to HITL. The prior patching pass
+    #     produced nothing usable (e.g. allowlist rejected every patch);
+    #     the operator needs to fix layout/config, not run repair.
     #
-    # Deliberately do NOT populate `compiler_errors` here. If we did, the
-    # downstream `route_after_test_generation` would see a non-empty errors
-    # list (even after test_generation_node skips or finishes cleanly) and
-    # spin into a repair loop trying to "fix" a non-error.
+    # Deliberately do NOT populate `compiler_errors` here — a non-empty
+    # errors list would flip downstream routers into repair even after the
+    # exit fold.
+    #
+    # Covers pytest exit 5, Jest/Vitest/Mocha exit 1, Maven Surefire /
+    # Gradle test exit 1 (see `_NO_TESTS_PATTERNS`).
     if exit_code != 0 and not compiler_errors and _is_no_tests_collected(
         exit_code, raw_log, build_cmd,
     ):
         has_source = _workspace_has_source_files(workspace)
-        node_state["no_tests_collected"] = True
-        node_state["no_tests_has_source"] = has_source
-        logger.warning(
-            "[compiler_node] pytest exit=5: no tests collected. "
-            "Source files present: %s. Router will %s.",
-            has_source,
-            "route to test_generation" if has_source else "route to HITL",
-        )
+        if has_source:
+            logger.warning(
+                "[compiler_node] Test runner reported no tests collected "
+                "(exit=%d) but workspace has source files — treating as "
+                "success and advancing the graph.",
+                exit_code,
+            )
+            exit_code = 0
+        else:
+            # Preserved for the router's HITL branch. `no_tests_has_source`
+            # stays False so the router picks the "empty workspace" path.
+            node_state["no_tests_collected"] = True
+            node_state["no_tests_has_source"] = False
+            logger.warning(
+                "[compiler_node] Test runner reported no tests collected "
+                "(exit=%d) AND workspace has no source files. Routing to HITL.",
+                exit_code,
+            )
 
     # Rotate the survival-tracking fingerprints: yesterday's "current"
     # becomes today's "prior", and the new diagnostics' shape becomes the

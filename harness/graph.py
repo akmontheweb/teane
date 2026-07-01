@@ -4555,9 +4555,41 @@ def _slice_build_output_for_repair(
     head = cleaned[:head_chars]
     tail = cleaned[-tail_chars:]
     dropped = total - head_chars - tail_chars
+    # Rescue middle-band "Caused by:" chains before returning. uv / cargo
+    # / gradle / maven emit 3-6 levels of ``Caused by:`` and the salient
+    # ROOT line is usually the deepest — which for a >3.7KB log lands in
+    # the dropped middle. Sweep item #4: session db6bfcbe lost the uv
+    # wheel-install root at literally the word "Caused" because of this
+    # slice. Lift ``Caused by:`` lines into a small preamble so the LLM
+    # sees them even when head+tail miss the region.
+    causal_lines: list[str] = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Caused by:") or stripped.startswith("caused by:"):
+            causal_lines.append(line.rstrip())
+        # Cap to avoid a runaway chain crowding out the head/tail views.
+        if len(causal_lines) >= 12:
+            break
+    causal_block = ""
+    if causal_lines:
+        # Deduplicate consecutive identical lines while preserving order —
+        # some tools repeat the same ``Caused by:`` line across contexts.
+        seen: set[str] = set()
+        unique_causal: list[str] = []
+        for c in causal_lines:
+            key = c.strip()
+            if key not in seen:
+                seen.add(key)
+                unique_causal.append(c)
+        causal_block = (
+            "--- (Caused-by chain lifted from middle of log) ---\n"
+            + "\n".join(unique_causal)
+            + "\n--- (end lifted chain) ---\n"
+        )
     return (
         f"{head}\n"
         f"... [truncated {dropped} chars from the middle of {total}-char build log] ...\n"
+        f"{causal_block}"
         f"{tail}"
     )
 
@@ -4862,6 +4894,109 @@ def _surface_salient_errors(raw_output: str) -> str:
     head = "\n".join(salient[:20])
     tail = raw_output[-2000:]
     return f"{head}\n--- (build output tail) ---\n{tail}"
+
+
+# uv prints ``you require <name> ∅`` when the resolver has non-empty
+# candidate packages but the version constraint intersects to the empty
+# set. The name uv shows is PEP503-normalised (``.``/``_``/``-`` → ``-``
+# lower-case), so the repair LLM — reading the file source, which may
+# spell it ``pdfminer.six`` — keeps prescribing a rename that is already
+# done. Session a7e0bef1 burned 4 iterations on this exact confusion
+# before HITL. Detecting this pattern and lifting the offending manifest
+# line into the diagnostic short-circuits the misdiagnosis.
+_UV_EMPTY_VERSION_SET_RE = re.compile(r"you require ([A-Za-z0-9._-]+) ∅")
+
+
+def _pep503_normalize(name: str) -> str:
+    """PEP 503 name normalisation: collapse ``-``/``_``/``.`` runs to
+    a single ``-`` and lower-case. Used to match uv's error-display
+    name against manifest lines that may spell the same package
+    differently."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _uv_empty_version_set_hint(
+    raw_output: str, workspace_path: Optional[str],
+) -> Optional[str]:
+    """When uv's output includes ``you require <NAME> ∅``, return a
+    hint that (a) names PEP503 normalisation so ``pdfminer-six`` in the
+    error is not mistaken for a different package than ``pdfminer.six``
+    in the file, and (b) quotes the offending constraint from
+    ``requirements.txt`` / ``pyproject.toml`` so the LLM sees the real
+    culprit — a bounded range that doesn't overlap any released
+    version. Returns None when the pattern isn't present.
+
+    Common cause: LLM chose ``<2024.0`` on a calendar-versioned package
+    whose releases look like ``20231228`` — 2024.0 < 20231228 → empty
+    range. Without this hint the LLM reads ``pdfminer-six`` (uv's
+    normalised display) as a different package from ``pdfminer.six``
+    (its own file) and keeps prescribing a rename that changes nothing.
+    """
+    if not raw_output:
+        return None
+    m = _UV_EMPTY_VERSION_SET_RE.search(raw_output)
+    if not m:
+        return None
+    reported = m.group(1)
+    normalized = _pep503_normalize(reported)
+    matched_line: Optional[str] = None
+    if workspace_path and os.path.isdir(workspace_path):
+        for manifest in ("requirements.txt", "requirements-dev.txt",
+                         "pyproject.toml"):
+            path = os.path.join(workspace_path, manifest)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            continue
+                        # Extract the package-name token: up to the first
+                        # constraint / extra / comment / quote character.
+                        head = re.split(
+                            r"[<>=!~;\[\s,'\"]", stripped, maxsplit=1,
+                        )[0]
+                        if _pep503_normalize(head) == normalized:
+                            matched_line = f"{manifest}:{lineno}: {stripped}"
+                            break
+                if matched_line:
+                    break
+            except OSError:
+                continue
+    lines = [
+        "[uv version-constraint failure detected]",
+        (
+            f"uv reports `you require {reported} ∅` — the trailing ∅ is "
+            f"the EMPTY VERSION SET (no released version satisfies the "
+            f"constraint), NOT 'package not found'. The package exists; "
+            f"the version range you wrote doesn't overlap any release."
+        ),
+    ]
+    if matched_line:
+        lines.append(f"Offending constraint: `{matched_line}`.")
+        lines.append(
+            "Fix: widen or correct the version bound so at least one "
+            "released version satisfies it. Common trap: bounds like "
+            "`<2024.0` on a calendar-versioned package whose releases "
+            "look like `20231228` — 2024.0 is numerically less than "
+            "20231228, so the range is empty. Use e.g. `<20250101` for "
+            "calendar-versioned packages, or drop the upper bound."
+        )
+    else:
+        lines.append(
+            f"Search for `{reported}` (any of `{reported.replace('-', '.')}` "
+            f"/ `{reported.replace('-', '_')}` / `{reported}`) in "
+            f"`requirements.txt` / `pyproject.toml` and widen its bound. "
+            "Common trap: bounds like `<2024.0` on a calendar-versioned "
+            "package whose releases look like `20231228` — empty range."
+        )
+    lines.append(
+        f"Note: uv normalises names per PEP 503 (`.`/`_`/`-` runs → `-`, "
+        f"lower-case). `{reported}` in the error is the same package "
+        f"however it is spelled in the manifest — do NOT rename it."
+    )
+    return "\n".join(lines)
 
 
 def _uv_venv_prefix() -> str:
@@ -5250,9 +5385,21 @@ async def _run_prod_import_smoke_check(
         # ("error: Failed to install …  Permission denied") gets buried
         # past the truncation boundary — surface ERROR markers up front
         # so the first 1500 chars hit the LLM's prompt.
+        raw = result.raw_output or ""
+        uv_hint = _uv_empty_version_set_hint(raw, workspace_path)
+        if uv_hint:
+            # Distinct error_code so the fingerprint doesn't blur with
+            # generic PROD_IMPORT_SMOKE failures — persistence across
+            # rounds then keys off "version-constraint" specifically,
+            # and the reflection LLM sees the same tag if it recurs.
+            error_code = "UV_VERSION_CONSTRAINT_EMPTY"
+            message = f"{uv_hint}\n\n{_surface_salient_errors(raw)}"
+        else:
+            error_code = "PROD_IMPORT_SMOKE"
+            message = _surface_salient_errors(raw)
         diagnostics.append({
-            "error_code": "PROD_IMPORT_SMOKE",
-            "message": _surface_salient_errors(result.raw_output or ""),
+            "error_code": error_code,
+            "message": message,
             "file": "<prod-import-smoke>",
             "line": 0,
             "column": 0,
@@ -6604,6 +6751,17 @@ def _build_repair_reflection_prompt(
         "above. The file:line locations shown are the ONLY files you "
         "may name. Do NOT invent file paths, symbol names, or call-site "
         "guesses that are not present above.\n"
+        "  - EXCEPTION for install / unresolved-import errors (TS2307, "
+        "MISSING_DEP, MODULENOTFOUND, IMPORTERROR, UV_VERSION_CONSTRAINT "
+        "and any diagnostic whose message includes \"cannot find module\" "
+        "or \"no module named\"): the file:line shown is the IMPORT site "
+        "(where the code writes `import X`), NOT where the fix lives. "
+        "For these codes the fix belongs in the manifest — "
+        "`package.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml` "
+        "— or in the build/install command. You MAY name that manifest "
+        "even when it does not appear in the diagnostics above; the "
+        "grounding rule above does not apply to install-class fixes. "
+        "Do NOT recommend editing the import site.\n"
         "  - If the top-error messages are too generic to localize "
         "(e.g. just a bare exception type), set ``real_blocker`` to "
         "the literal string \"insufficient data — investigate <file>'s "
@@ -6681,7 +6839,34 @@ def _reflection_grounds_in_diagnostics(
         # No file info to ground against — fall open (don't penalise
         # diagnostics that lack file info; injection MAY still help).
         return True
-    return any(name in haystack for name in files_seen)
+    if any(name in haystack for name in files_seen):
+        return True
+    # Install-class escape hatch — mirror of the reflection prompt's
+    # grounding-rules exception. For TS2307 / MISSING_DEP / MODULE_NOT_
+    # FOUND / IMPORTERROR / UV_VERSION_CONSTRAINT, the diagnostic's
+    # file:line is the IMPORT site (App.tsx:2 for "cannot find module
+    # 'react-router-dom'"), NOT where the fix goes. The reflection is
+    # told to name package.json / requirements.txt / pyproject.toml /
+    # Cargo.toml instead — files that legitimately won't appear in
+    # ``compiler_errors``. Without this branch the strict grounding
+    # check mutes those verdicts as "ungrounded" even though they are
+    # the correct answer. See sweep item #3.
+    codes = {str(e.get("error_code", "") or "").upper() for e in compiler_errors}
+    is_install_class = (
+        any(c.startswith(pfx) for c in codes
+            for pfx in _INSTALL_ERROR_CODE_PREFIXES)
+        or any(frag in str(e.get("message", "") or "").lower()
+               for e in compiler_errors
+               for frag in _INSTALL_ERROR_MSG_FRAGMENTS)
+    )
+    if is_install_class:
+        for manifest in (
+            "package.json", "requirements.txt", "pyproject.toml",
+            "cargo.toml", "package-lock.json",
+        ):
+            if manifest in haystack:
+                return True
+    return False
 
 
 def _verdict_named_files(
@@ -6887,13 +7072,64 @@ _PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
 })
 
 
-def _repairable_dep_hint(symbol: str, build_command: str) -> str:
-    """Repair-friendly diagnostic for a missing pip-installable test / lint
-    tool. Reaches the repair LLM via compiler_errors and points it at the
-    smallest possible patch (add the dep to requirements.txt or pyproject
-    dev extras). Distinct from :func:`_env_misconfig_hint`, which is sent
-    to HITL because no in-container patch can fix it.
+def _npm_root_package(symbol: str) -> str:
+    """Return the installable npm package name for ``symbol``, stripping
+    any sub-path. Mirrors the strip logic in
+    ``autofix._try_missing_npm_dep`` so the LLM's diagnostic points at
+    the same string the autofix would write into ``package.json``.
+
+    Examples:
+        ``react-router-dom/dist/x`` → ``react-router-dom``
+        ``@scope/pkg/sub``         → ``@scope/pkg``
+        ``next``                    → ``next``
     """
+    if not symbol:
+        return symbol
+    if symbol.startswith("@"):
+        parts = symbol.split("/", 2)
+        return "/".join(parts[:2]) if len(parts) >= 2 else symbol
+    return symbol.split("/", 1)[0]
+
+
+def _repairable_dep_hint(
+    symbol: str, build_command: str, miss_kind: str = "python",
+) -> str:
+    """Repair-friendly diagnostic for a missing test / lint tool. Reaches
+    the repair LLM via compiler_errors and points it at the smallest
+    possible patch. Distinct from :func:`_env_misconfig_hint`, which is
+    sent to HITL because no in-container patch can fix it.
+
+    ``miss_kind`` toggles Python vs Node phrasing: for ``node``, the fix
+    target is ``package.json`` (not ``requirements.txt``), and we strip
+    any sub-path so the LLM writes the installable root name instead of
+    ``pkg/dist/x`` (session-4d1f9e1c-adjacent misread).
+    """
+    if miss_kind == "node":
+        root = _npm_root_package(symbol)
+        sub_note = ""
+        if root != symbol:
+            sub_note = (
+                f" The reported miss was `{symbol}` (a sub-path); the "
+                f"npm-installable package is its root `{root}` — do "
+                f"NOT put `{symbol}` in `package.json`.\n\n"
+            )
+        return (
+            f"Build failed: node cannot find module `{symbol}`. This "
+            f"means the npm package `{root}` is not installed in the "
+            f"workspace's `node_modules`. The sandbox runs "
+            f"`{build_command.strip()}`, which invokes node after the "
+            f"install step — but `{root}` isn't in `package.json` (or "
+            f"the install step didn't run in the subdir where "
+            f"`package.json` lives).\n\n"
+            f"{sub_note}"
+            f"Fix in ONE place: add `{root}` to `dependencies` (or "
+            f"`devDependencies` if it's a build-time-only tool) in "
+            f"`package.json`. If `package.json` does not exist, CREATE "
+            f"it with a minimal shape that includes `{root}`.\n"
+            f"Do not edit the import site (`import '{symbol}'`) — the "
+            f"import statement is correct; the missing piece is the "
+            f"dependency declaration."
+        )
     return (
         f"Build failed: '{symbol}' is required by the build command but is "
         f"not declared as a dependency. The sandbox runs "
@@ -6914,7 +7150,16 @@ def _repairable_dep_hint(symbol: str, build_command: str) -> str:
 
 
 def _env_misconfig_hint(symbol: str, build_command: str) -> str:
-    """Build the actionable HITL message for an env-misconfig hit."""
+    """Build the actionable HITL message for an env-misconfig hit.
+
+    Distinct from :func:`_repairable_dep_hint` — this message flows to
+    HITL because no in-container edit will unblock the run (the missing
+    runtime is baked into the docker image, not installable from
+    inside). Name the exact config file the operator must touch so the
+    operator (and any LLM reading the log) knows where to look and, more
+    importantly, does NOT try to patch it from inside the repair loop —
+    the patcher allowlist blocks harness-internal configs regardless.
+    """
     # Pick the most likely installer for the missing symbol.
     py_symbols = {"pytest", "ruff", "mypy", "black", "poetry", "tox", "nox"}
     if symbol.lower() in py_symbols or "python" in symbol.lower():
@@ -6927,11 +7172,22 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     else:
         installer = f"install {symbol} before running the build"
     return (
-        f"Build container is missing '{symbol}'. The repair LLM cannot fix this — "
-        f"it's a sandbox/dependency setup issue. "
-        f"Fix: update build_command to prepend the install step "
-        f"(e.g. '{installer} && {build_command.strip()}') "
-        f"or switch sandbox.docker_image to one that ships '{symbol}'."
+        f"Build container is missing '{symbol}'. The repair LLM cannot "
+        f"fix this — it's a sandbox/dependency setup issue that lives "
+        f"OUTSIDE the workspace. Do NOT emit patches against "
+        f".harness_config.json or any harness-internal file; the "
+        f"patcher allowlist will reject them and the docker_image "
+        f"setting is stored in the operator's global config anyway.\n\n"
+        f"Operator fix (one of):\n"
+        f"  - Update the workspace's `build_command` (typically in "
+        f"`Makefile`, `package.json` scripts, or `pyproject.toml` "
+        f"`[tool.harness]` if present) to prepend the install step: "
+        f"`{installer} && {build_command.strip()}`.\n"
+        f"  - Change the harness's `sandbox.docker_image` in the "
+        f"operator config (`~/.harness/config.json` or `~/.harness/"
+        f"config.yaml`, NOT any file in the workspace) to an image "
+        f"that ships `{symbol}` pre-installed (e.g. `node:20-slim` for "
+        f"node/npm, `python:3.11-slim` for python)."
     )
 
 
@@ -7696,7 +7952,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                     "dep manifest.",
                     env_misconfig_symbol, miss_kind,
                 )
-                msg = _repairable_dep_hint(env_misconfig_symbol, build_cmd)
+                msg = _repairable_dep_hint(
+                    env_misconfig_symbol, build_cmd, miss_kind=miss_kind,
+                )
                 code = "MISSING_DEP"
             else:
                 logger.warning(

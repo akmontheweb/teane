@@ -791,13 +791,16 @@ class TextPatcher(BasePatcher):
                 error=(
                     f"File already exists with different content: "
                     f"{filepath}. The patcher will NOT overwrite blindly. "
-                    f"If you intended to replace the existing file, emit a "
-                    f"REPLACE_BLOCK against the current content shown below "
-                    f"(copy the EXACT lines you want to replace, WITHOUT the "
-                    f"line-number prefix `  N| `). If you intended to add to "
-                    f"it, use REPLACE_BLOCK to insert around an existing "
-                    f"anchor line. If your CREATE_FILE content actually "
-                    f"matches what's here, this will silently no-op on retry."
+                    f"NEXT-ROUND DIRECTIVE: switch operations. Do NOT "
+                    f"emit another CREATE_FILE for this path — the "
+                    f"patcher will reject the same shape again. Emit a "
+                    f"REPLACE_BLOCK against the current content shown "
+                    f"below (copy the EXACT lines you want to replace, "
+                    f"WITHOUT the line-number prefix `  N| `). If you "
+                    f"intended to add to it, use REPLACE_BLOCK to insert "
+                    f"around an existing anchor line. If your intended "
+                    f"content actually matches what's here, no patch is "
+                    f"needed — move on to the next diagnostic."
                     f"\n\nCurrent file content:\n{annotated}"
                 ),
             )
@@ -836,11 +839,28 @@ class TextPatcher(BasePatcher):
                     "treating REPLACE_BLOCK as CREATE_FILE.", filepath,
                 )
                 return await self.create_file(filepath, replace)
+            # List existing siblings with the same stem so the LLM
+            # can tell whether it meant e.g. `jest.config.cjs` when
+            # `jest.config.js` is what's on disk. Session 4d1f9e1c
+            # bounced between `.js` and `.cjs` for 3+ rounds because
+            # neither message named the actual file that exists.
+            siblings = _list_stem_siblings(full_path)
+            hint = ""
+            if siblings:
+                hint = (
+                    f" Existing files with the same stem in that "
+                    f"directory: {', '.join(siblings)}. If you meant "
+                    f"one of those, REPLACE_BLOCK it directly (the "
+                    f"file is not this exact extension)."
+                )
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.REPLACE_BLOCK,
-                error=f"File not found: {filepath}. Use CREATE_FILE for new files.",
+                error=(
+                    f"File not found: {filepath}. Use CREATE_FILE for "
+                    f"new files, NOT another REPLACE_BLOCK.{hint}"
+                ),
             )
 
         try:
@@ -1598,13 +1618,34 @@ def _check_file_hash(
         return None
     actual = sha256_file_bytes(abs_path) or ""
     if actual.lower() != expected_hash.lower():
+        # Show the current bytes rather than an opaque hash prefix.
+        # Some models attempt to "match the hash" by editing content
+        # (a hallucinatory response to a machine-readable signal), and
+        # "re-extract diagnostics" isn't something the LLM can do
+        # anyway — it's the harness's job. Point at the actionable
+        # move: emit READ_FILE, then rewrite the line range against
+        # the current content shown below.
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as fh:
+                current = fh.read()
+        except OSError:
+            current = ""
+        if current:
+            annotated = _find_closest_match(current, current)
+            content_block = f"\n\nCurrent file content:\n{annotated}"
+        else:
+            content_block = " (current file unreadable)."
         return PatchResult(
             success=False, file=rel_path, operation=op,
             error=(
-                f"File hash drift on {rel_path}: expected sha256="
-                f"{expected_hash[:12]}…, actual sha256={actual[:12] if actual else 'unreadable'}…. "
-                "The file changed since the line numbers were chosen — re-extract "
-                "diagnostics and retry."
+                f"File hash drift on {rel_path}: the file changed since "
+                f"the line numbers in your patch were chosen (a prior "
+                f"patch in this batch, or an external editor, rewrote "
+                f"it). Do NOT try to \"match\" the sha256 by editing "
+                f"content — the hash is a machine signal, not a value "
+                f"you can produce. Emit READ_FILE for the up-to-date "
+                f"bytes, then re-issue your line-range patch against "
+                f"the numbering shown below.{content_block}"
             ),
         )
     return None
@@ -2315,6 +2356,40 @@ def _whitespace_tolerant_replace(
     return original[:start_byte] + replace_text + original[start_byte + replaced_bytes:]
 
 
+def _list_stem_siblings(missing_path: str, limit: int = 6) -> list[str]:
+    """Return workspace-relative filenames in ``missing_path``'s directory
+    that share its stem (basename minus the last extension) — the LLM's
+    ``jest.config.cjs`` vs the on-disk ``jest.config.js`` case.
+
+    Used by REPLACE_BLOCK's file-not-found error to point the LLM at
+    the actual file variant that exists, so it stops REPLACE_BLOCK-ing
+    a phantom .cjs/.mjs/.ts extension across rounds (session 4d1f9e1c).
+    Returns at most ``limit`` names, sorted, to keep the error string
+    bounded.
+    """
+    try:
+        parent = os.path.dirname(missing_path) or "."
+        if not os.path.isdir(parent):
+            return []
+        base = os.path.basename(missing_path)
+        stem = os.path.splitext(base)[0]
+        # Guard against a bare-extension file (``.gitignore``) whose
+        # splitext stem is empty — every dotfile in the dir would match.
+        if not stem:
+            return []
+        out: list[str] = []
+        for entry in sorted(os.listdir(parent)):
+            if entry == base:
+                continue
+            if os.path.splitext(entry)[0] == stem:
+                out.append(entry)
+            if len(out) >= limit:
+                break
+        return out
+    except OSError:
+        return []
+
+
 def _find_closest_match(text: str, search: str, context: int = 20) -> str:
     """Return a line-numbered view of the current file content for the
     LLM's next REPLACE_BLOCK attempt.
@@ -2650,13 +2725,34 @@ async def apply_patch_blocks(
             if is_path_allowed(block.file, workspace_root, allowed_list):
                 blocks_to_apply.append(block)
             else:
+                # Two things the LLM commonly misreads about this message:
+                # (a) the list is an ALLOWLIST (paths the patcher will
+                # write to), not "the only paths that exist in the
+                # workspace" — files on disk outside the list are real,
+                # they're just off-limits for editing.
+                # (b) the fix is not to guess a listed root that "looks
+                # closest" — it's to name a listed root or manifest that
+                # actually contains the file the LLM was trying to
+                # touch. Session 4d1f9e1c pinged among listed roots
+                # until it landed on `server/.harness_config.json`,
+                # which was rejected as harness-internal anyway.
                 results.append(PatchResult(
                     success=False,
                     file=block.file,
                     operation=block.operation,
                     error=(
-                        f"path not in skill allowlist: {block.file!r} "
-                        f"(allowed: {allowed_list})"
+                        f"path not in skill allowlist: {block.file!r}. "
+                        f"The list below is the set of paths this run is "
+                        f"PERMITTED to edit — NOT a list of files that "
+                        f"exist. Do NOT pick a listed path just because "
+                        f"it looks like the closest match to {block.file!r}: "
+                        f"only patch a path if it's the actual file you "
+                        f"meant to change. If your intended file is a "
+                        f"real workspace file that isn't listed, either "
+                        f"(1) target it via a listed parent directory, "
+                        f"or (2) surface the requirement in the next "
+                        f"turn's diagnostic — do NOT keep retrying "
+                        f"variants of the same path. Allowlist: {allowed_list}"
                     ),
                 ))
                 logger.warning(

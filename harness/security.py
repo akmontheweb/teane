@@ -659,8 +659,25 @@ class CommandValidator:
                 return CommandValidationResult(
                     allowed=False,
                     command=command,
-                    reason=f"Command '{base_cmd}' is not in the allowed commands whitelist. "
-                           f"Add it to 'security.allowed_commands' in .harness_config.json to permit it.",
+                    # NOTE for repair LLMs reading this string in build
+                    # output: the validator config lives in the operator's
+                    # global config, NOT in the workspace. Do NOT create
+                    # or patch `.harness_config.json` — the patcher
+                    # allowlist will refuse it and no round of edits will
+                    # unblock the run. The fix on the LLM's side is to
+                    # rewrite the failing command so `base_cmd` isn't the
+                    # first token (e.g. drop stray leading parens, avoid
+                    # invoking a binary that isn't on the whitelist,
+                    # replace `sh -c '…'` with a direct invocation).
+                    reason=(
+                        f"Command '{base_cmd}' is not in the sandbox "
+                        f"security-validator whitelist. This is an operator-"
+                        f"side config the repair loop cannot reach: do NOT "
+                        f"emit `CREATE_FILE .harness_config.json`. Instead, "
+                        f"rewrite the offending command so its first token "
+                        f"is a whitelisted binary (drop leading parens, "
+                        f"avoid `sh -c`, use a direct binary invocation)."
+                    ),
                     matched_rule=f"whitelist_missing:{base_cmd}",
                 )
 
@@ -692,12 +709,24 @@ class CommandValidator:
         """
         result = self.validate(command)
         if not result.allowed:
+            # The "Tip" line is deliberately phrased for the OPERATOR
+            # (who runs the CLI) and for a repair LLM reading this in
+            # build output. The LLM cannot reach `.harness_config.json`
+            # (the patcher allowlist blocks it and the file lives in
+            # the operator's global config anyway), so we lead with the
+            # LLM-side unblock — rewrite the command — before the
+            # operator-side instruction. `_is_command_blocked_by_security`
+            # keys off the `Matched Rule:` line so the exact format of
+            # that line MUST stay stable across edits.
             raise ValueError(
                 f"[SECURITY BLOCKED]: {result.reason}\n"
                 f"  Command: {command}\n"
                 f"  Matched Rule: {result.matched_rule}\n"
-                f"  Tip: Configure 'security.allowed_commands' or 'security.blocked_patterns' "
-                f"in .harness_config.json to adjust."
+                f"  LLM: rewrite the command; do NOT create "
+                f".harness_config.json.\n"
+                f"  Operator: configure 'security.allowed_commands' / "
+                f"'security.blocked_patterns' in the harness config to "
+                f"adjust the whitelist."
             )
         return command
 

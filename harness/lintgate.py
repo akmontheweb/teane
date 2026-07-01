@@ -323,6 +323,20 @@ def is_tool_available(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+def _truncate_lint_output(err_msg: str, cap: int = 2000) -> str:
+    """Truncate ruff / eslint / mypy output but leave a visible marker
+    saying how much was dropped. The previous 500-char silent cap cut
+    code frames mid-line and folded multi-rule violations into what
+    looked like one, so the repair LLM chased the wrong fix. Raising
+    the cap to ~2000 keeps the rule ID + code frame + fix hint intact
+    for the common case; the ``…(+N chars truncated)`` marker makes
+    any residual truncation explicit rather than silent (sweep #8).
+    """
+    if len(err_msg) <= cap:
+        return err_msg
+    return f"{err_msg[:cap]}…(+{len(err_msg) - cap} chars truncated)"
+
+
 # ---------------------------------------------------------------------------
 # 2. LintGate Node — Deterministic Format + Lint
 # ---------------------------------------------------------------------------
@@ -560,8 +574,8 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                     else:
                         err_msg = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
                         if err_msg:
-                            lint_errors.append(f"{filepath}: {err_msg[:500]}")
-                            logger.warning("[lintgate_node] Lint failed for %s: %s", filepath, err_msg[:500])
+                            lint_errors.append(f"{filepath}: {_truncate_lint_output(err_msg)}")
+                            logger.warning("[lintgate_node] Lint failed for %s: %s", filepath, _truncate_lint_output(err_msg))
                 except Exception as exc:
                     lint_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Lint error for %s: %s", filepath, exc)
@@ -588,8 +602,8 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                 else:
                     err_msg = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
                     if err_msg:
-                        lint_errors.append(f"{filepath}: {err_msg[:500]}")
-                        logger.warning("[lintgate_node] Lint-only failed for %s: %s", filepath, err_msg[:500])
+                        lint_errors.append(f"{filepath}: {_truncate_lint_output(err_msg)}")
+                        logger.warning("[lintgate_node] Lint-only failed for %s: %s", filepath, _truncate_lint_output(err_msg))
             except Exception as exc:
                 lint_errors.append(f"{filepath}: {exc}")
 

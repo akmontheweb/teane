@@ -6745,6 +6745,7 @@ def _build_repair_reflection_prompt(
     top_persisted_diagnostics: list[dict[str, Any]],
     install_failure_likely: bool = False,
     path_wiring_module: Optional[str] = None,
+    build_output_tail: str = "",
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -6808,6 +6809,39 @@ def _build_repair_reflection_prompt(
         top_block = "\n".join(lines)
     else:
         top_block = "  (no persistent errors)"
+
+    # Fix A — enrich the judge with the raw build-output tail when the top
+    # persistent error's message is bare (equals the error code, or too short
+    # to localize). Without this, an AssertionError from pytest whose only
+    # useful info lives in the `--tb=long` traceback (e.g. "assert True is
+    # False where True = <Session>.is_active") reaches the judge as just
+    # "[AssertionError] tests/foo.py:42 :: AssertionError". The judge then
+    # hits the "insufficient data" escape hatch, and the repair loop chases
+    # ghosts for the rest of max_iterations (session 116667f5). Passing the
+    # tail unconditionally would double the judge's token cost; gating on a
+    # bare top message keeps the extra cost to sessions that need it.
+    def _top_message_is_bare(diags: list[dict[str, Any]]) -> bool:
+        if not diags:
+            return False
+        top = diags[0]
+        code = str(top.get("error_code", "") or "").strip()
+        msg = str(top.get("message", "") or "").strip()
+        if not msg:
+            return True
+        if code and msg.lower() == code.lower():
+            return True
+        return len(msg) < 40
+    tail_block = ""
+    if build_output_tail and _top_message_is_bare(top_persisted_diagnostics):
+        _tail_snippet = build_output_tail[-2500:]
+        tail_block = (
+            "\nBUILD OUTPUT TAIL (last ~2.5KB — the top persistent error's "
+            "message is a bare exception type, so the full traceback below is "
+            "your primary source of grounding for ``real_blocker``):\n"
+            "---\n"
+            f"{_tail_snippet}\n"
+            "---\n\n"
+        )
 
     # Whether the LLM has ANY concrete file:line anchor to substitute into
     # the "insufficient data — investigate <file>" escape hatch. When this
@@ -6925,6 +6959,7 @@ def _build_repair_reflection_prompt(
         f"Persisted (still failing):\n{pers_block}\n\n"
         f"New (introduced by this round's patches):\n{new_block}\n\n"
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
+        f"{tail_block}"
         f"{path_wiring_hint_block}"
         f"{install_hint_block}"
         "Answer ONE structured question: did the previous round make "
@@ -6970,6 +7005,26 @@ def _build_repair_reflection_prompt(
         '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
         'instead of passing options as the second arg.\\""}\n'
     )
+
+
+def _reflection_verdict_is_low_signal(verdict: dict[str, str]) -> bool:
+    """Return True when the reflection verdict's ``real_blocker`` is the
+    prompt's ``insufficient data`` escape-hatch sentinel — i.e. the judge
+    could not localize the failure and emitted a placeholder rather than a
+    grounded diagnosis.
+
+    Callers use this to (a) skip promoting the verdict into the "JUDGE'S
+    VERDICT" banner (there is nothing actionable to inject), and (b) skip
+    ticking ``consecutive_distraction_rounds`` so a stream of low-signal
+    verdicts does not race the circuit-breaker to HITL when the underlying
+    problem may be fixable if given more context (see Fix A which enriches
+    the judge's view of bare exception-type errors). Observed in session
+    116667f5: six rounds of oscillating DISTRACTION/REGRESSION verdicts,
+    each promoted verbatim as the banner directive despite the sentinel
+    containing zero actionable information.
+    """
+    blocker = (verdict.get("real_blocker") or "").strip().lower()
+    return blocker.startswith("insufficient data")
 
 
 def _reflection_grounds_in_diagnostics(
@@ -8645,6 +8700,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 top_persisted_diagnostics=top_persisted_diagnostics,
                 install_failure_likely=install_failure_likely,
                 path_wiring_module=path_wiring_module,
+                build_output_tail=str(
+                    state.get("node_state", {}).get("last_build_output", "")
+                    or ""
+                ),
             )
             verdict_raw, new_budget = await _maybe_judgment_llm(
                 prompt=reflection_prompt,
@@ -8673,7 +8732,8 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # the counter against ``max_consecutive_distraction_rounds``
                 # and escalates to HITL when it saturates.
                 _v = reflection_verdict["verdict"]
-                if _v in {"DISTRACTION", "REGRESSION"}:
+                _low_signal = _reflection_verdict_is_low_signal(reflection_verdict)
+                if _v in {"DISTRACTION", "REGRESSION"} and not _low_signal:
                     loop_counter["consecutive_distraction_rounds"] = (
                         loop_counter.get("consecutive_distraction_rounds", 0) + 1
                     )
@@ -8681,6 +8741,21 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "[repair_node] consecutive_distraction_rounds=%d "
                         "(verdict=%s).",
                         loop_counter["consecutive_distraction_rounds"], _v,
+                    )
+                elif _v in {"DISTRACTION", "REGRESSION"} and _low_signal:
+                    # Fix B — the judge fell back to "insufficient data" (its
+                    # escape hatch for bare exception-type errors). The verdict
+                    # word oscillates on the failing-count delta but carries no
+                    # actionable content, so ticking the circuit-breaker would
+                    # race us to HITL on noise instead of a real distraction
+                    # signal. Hold the counter steady; the ``total_repairs``
+                    # ceiling still bounds the loop.
+                    logger.info(
+                        "[repair_node] Reflection verdict %s but real_blocker "
+                        "is the 'insufficient data' sentinel — holding "
+                        "consecutive_distraction_rounds at %d.",
+                        _v,
+                        loop_counter.get("consecutive_distraction_rounds", 0),
                     )
                 else:  # PROGRESS — earn back the budget.
                     if loop_counter.get("consecutive_distraction_rounds", 0) > 0:
@@ -9471,6 +9546,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
             and reflection_verdict["real_blocker"]
+            and not _reflection_verdict_is_low_signal(reflection_verdict)
             and _reflection_grounds_in_diagnostics(
                 reflection_verdict, state.get("compiler_errors", []) or []
             )
@@ -9487,9 +9563,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             ignored_touched_prev = list(
                 loop_counter.get("judge_round_touched_files") or []
             )
+            # Fix C — put a stable preamble at the top so the LLM
+            # provider's prefix cache matches from round to round. The
+            # verdict word (DISTRACTION vs REGRESSION) is the noisiest
+            # field: it can flip round-to-round on the same underlying
+            # blocker just because the failing-count delta changed sign
+            # (session 116667f5 logged three cache_prefix_drift events
+            # driven purely by the ``Verdict:`` line at offset 67).
+            # Moving the volatile fields to the end keeps a couple hundred
+            # chars of banner in-cache regardless of how the verdict
+            # oscillates.
             reflection_banner_lines = [
                 "=== JUDGE'S VERDICT — READ THIS FIRST AND OBEY ===",
-                f"Verdict: {reflection_verdict['verdict']}",
+                (
+                    "The reflection judge audited the previous repair round "
+                    "and issues the authoritative directive below. Treat it "
+                    "as course-correction: apply the required action to your "
+                    "next patch set exactly as written. If the directive "
+                    "seems to disagree with the failing diagnostics you see, "
+                    "assume your reading of the diagnostics is what's wrong "
+                    "— the judge saw the delta between rounds; you did not."
+                ),
+                "----- directive -----",
                 f"Real blocker: {reflection_verdict['real_blocker']}",
             ]
             if reflection_verdict["recommendation"]:
@@ -9501,6 +9596,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "YOUR PATCHES THIS ROUND MUST MODIFY at least one of: "
                     + ", ".join(judge_named_files)
                 )
+            # Verdict word last: this is the noisiest single field across
+            # rounds and belongs after everything the cache can plausibly
+            # match.
+            reflection_banner_lines.append(
+                f"Verdict category (meta): {reflection_verdict['verdict']}"
+            )
             # Fan-out directive (Fix #3): see ``_shared_root_cause_fanout``.
             # Logic lives in the helper so it can be unit-tested without
             # standing up a full repair_node fixture.
@@ -9595,6 +9696,33 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     messages_after=len(messages),
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+        elif (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and reflection_verdict["real_blocker"]
+            and _reflection_verdict_is_low_signal(reflection_verdict)
+        ):
+            # Fix B — the judge fell back to the "insufficient data" sentinel.
+            # Promoting it to the banner gave the repair LLM no actionable
+            # direction and cost a cache-prefix miss on the noise (session
+            # 116667f5). Skip injection; let the ordinary error_summary do
+            # the talking.
+            logger.info(
+                "[repair_node] Reflection verdict is low-signal "
+                "('insufficient data' sentinel) — skipping banner "
+                "injection (verdict=%s).",
+                reflection_verdict["verdict"],
+            )
+            try:
+                from harness.observability import emit_event as _emit_skip
+                _emit_skip(
+                    "repair_reflection_injection_skipped",
+                    reason="low_signal_sentinel",
+                    verdict=reflection_verdict["verdict"],
+                    real_blocker=reflection_verdict["real_blocker"][:500],
+                )
+            except Exception:  # noqa: BLE001
                 pass
         elif (
             reflection_verdict is not None
@@ -9998,6 +10126,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and not _reflection_verdict_is_low_signal(reflection_verdict)
         ):
             _judge_named_now = _verdict_named_files(
                 reflection_verdict, state.get("compiler_errors", []) or []

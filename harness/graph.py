@@ -1739,6 +1739,28 @@ content:
 <<<END_CREATE_FILE>>>
 ```
 
+### REWRITE_FILE — escape hatch, NOT the default
+```
+<<<REWRITE_FILE>>>
+file: path/to/existing/file.ext
+content:
+<complete new file contents>
+<<<END_REWRITE_FILE>>>
+```
+
+REWRITE_FILE overwrites an existing file wholesale. Only use it when the
+JUDGE'S VERDICT banner explicitly says "You MAY now emit REWRITE_FILE
+on X" — that flag fires only after the SAME file:line has been the
+blocker for 3+ rounds and surgical REPLACE_BLOCKs have demonstrably
+failed to converge. For everyday edits, use REPLACE_BLOCK.
+
+Because REWRITE_FILE clobbers the file, you MUST supply the COMPLETE
+corrected contents (imports, every class, every def, every existing
+test). A partial rewrite deletes whatever you didn't include —
+recovery is expensive. Post-patch parse validation still applies: if
+your REWRITE_FILE produces unparseable Python or JSON the patcher rolls
+the file back to its pre-patch state and reports the block as failed.
+
 **CREATE_FILE vs REPLACE_BLOCK — read this carefully.**
 - `CREATE_FILE` is for files that **do not yet exist**.
 - If a file already exists with the **same** content, `CREATE_FILE` is a safe no-op (used for resumes).
@@ -7291,6 +7313,97 @@ def _verdict_named_files(
     return matched
 
 
+def _verdict_named_file_lines(
+    verdict: dict[str, str],
+    compiler_errors: list[dict[str, Any]],
+) -> list[tuple[str, int]]:
+    """Extract ``(file, line)`` tuples from the judge's ``real_blocker`` /
+    ``recommendation`` text that also appear in ``compiler_errors``.
+
+    Used by the persistent-blocker directive (Fixes #2/#3 from the audit).
+    When the judge names the SAME ``file:line`` two rounds running, the
+    repair LLM's last patch either missed the target or landed a cosmetic
+    change nearby. Round N+1's banner promotes that fact to a hard
+    directive ("your patch MUST alter line 126 of test_edgar.py"), so
+    the LLM stops nibbling around the target.
+
+    Grounding rule: the tuple must be present in the CURRENT failing set.
+    A stale ``real_blocker`` string that mentions a file:line pair the
+    compiler is no longer complaining about is dropped — we never
+    hard-target a file the build has already moved past.
+
+    Returns ``[]`` when nothing matches; caller treats that as "no
+    persistence directive this round."
+    """
+    blocker = (verdict.get("real_blocker") or "")
+    recommendation = (verdict.get("recommendation") or "")
+    if not blocker and not recommendation:
+        return []
+    haystack = blocker + " " + recommendation
+    # Match "<any path>.<py|json|ts|tsx|js|jsx|md>:<line>" and
+    # "<path> line <line>" / "line <line> of <path>" / "line <line> in <path>".
+    # File chars stay conservative — no whitespace, no punctuation that would
+    # cross word boundaries. Line 0 is filtered out (summary-row artefact from
+    # ``_parse_pytest_summary``, not a real location).
+    _colon = re.compile(
+        r"(?P<file>[\w./\-]+\.(?:py|json|ts|tsx|js|jsx|md))"
+        r":(?P<line>\d+)\b"
+    )
+    _line_of = re.compile(
+        r"line\s+(?P<line>\d+)\s+(?:of|in)\s+"
+        r"(?P<file>[\w./\-]+\.(?:py|json|ts|tsx|js|jsx|md))",
+        re.IGNORECASE,
+    )
+    _file_line = re.compile(
+        r"(?P<file>[\w./\-]+\.(?:py|json|ts|tsx|js|jsx|md))\s+"
+        r"(?:on\s+|at\s+)?line\s+(?P<line>\d+)",
+        re.IGNORECASE,
+    )
+    candidates: set[tuple[str, int]] = set()
+    for pat in (_colon, _line_of, _file_line):
+        for m in pat.finditer(haystack):
+            try:
+                lineno = int(m.group("line"))
+            except (TypeError, ValueError):
+                continue
+            if lineno <= 0:
+                continue
+            candidates.add((m.group("file"), lineno))
+    if not candidates:
+        return []
+    # Ground the tuples against compiler_errors — file suffix match on
+    # either full path or basename, line number must equal. Preserves the
+    # form the compiler reported (full relative path), so subsequent
+    # comparisons across rounds use a stable key.
+    matched: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for err in compiler_errors:
+        err_file = str(err.get("file", "") or "").strip()
+        try:
+            err_line = int(err.get("line", 0) or 0)
+        except (TypeError, ValueError):
+            err_line = 0
+        if not err_file or err_line <= 0 or err_file.startswith("<"):
+            continue
+        err_basename = os.path.basename(err_file).lower()
+        for cand_file, cand_line in candidates:
+            if cand_line != err_line:
+                continue
+            cand_low = cand_file.lower()
+            if (
+                cand_low == err_file.lower()
+                or err_file.lower().endswith(cand_low)
+                or cand_low.endswith(err_file.lower())
+                or (err_basename and cand_low.endswith(err_basename))
+            ):
+                key = (err_file, err_line)
+                if key not in seen:
+                    matched.append(key)
+                    seen.add(key)
+                break
+    return matched
+
+
 def _shared_root_cause_fanout(
     compiler_errors: list[dict[str, Any]],
     *,
@@ -9829,6 +9942,94 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "YOUR PATCHES THIS ROUND MUST MODIFY at least one of: "
                     + ", ".join(judge_named_files)
                 )
+            # Persistent-blocker directive (Fixes #2/#3). When the judge's
+            # real_blocker names the SAME (file, line) two rounds running,
+            # the previous repair round either missed the target entirely
+            # or landed a cosmetic change nearby — session 674bfdbd cycled
+            # 8+ rounds on `test_edgar.py:126` with 0-1 patches per round,
+            # each leaving line 126 untouched. Promote that fact to a
+            # non-negotiable directive: patch MUST alter the exact line.
+            _current_named_lines = _verdict_named_file_lines(
+                reflection_verdict,
+                state.get("compiler_errors", []) or [],
+            )
+            _prev_named_lines_raw = list(
+                loop_counter.get("judge_named_file_lines_last_round") or []
+            )
+            _prev_named_lines: set[tuple[str, int]] = set()
+            for _pair in _prev_named_lines_raw:
+                # Stored as list-of-lists / list-of-tuples depending on
+                # roundtrip through JSON — normalise on read.
+                if isinstance(_pair, (list, tuple)) and len(_pair) == 2:
+                    try:
+                        _prev_named_lines.add((str(_pair[0]), int(_pair[1])))
+                    except (TypeError, ValueError):
+                        continue
+            _persistent_lines = [
+                (f, ln) for (f, ln) in _current_named_lines
+                if (f, ln) in _prev_named_lines
+            ]
+            if _persistent_lines:
+                _display = ", ".join(
+                    f"{f}:{ln}" for f, ln in _persistent_lines[:5]
+                )
+                # Streak counter: how many CONSECUTIVE rounds this exact
+                # location has been the blocker. 2 rounds → normal
+                # persistent directive. 3+ rounds → also unlock
+                # REWRITE_FILE as the escape hatch. Tracked per-file so
+                # a fresh blocker in a different file resets the streak
+                # correctly on that file only.
+                _streak_raw = loop_counter.get(
+                    "persistent_blocker_streak_per_file"
+                ) or {}
+                _streak: dict[str, int] = (
+                    dict(_streak_raw) if isinstance(_streak_raw, dict) else {}
+                )
+                _persistent_files_set = {f for f, _ in _persistent_lines}
+                for _f in _persistent_files_set:
+                    _streak[_f] = _streak.get(_f, 1) + 1
+                # Reset streaks for files that dropped out of the
+                # persistent set — keeps the counter honest across
+                # blocker migrations.
+                for _f in list(_streak.keys()):
+                    if _f not in _persistent_files_set:
+                        _streak.pop(_f, None)
+                loop_counter["persistent_blocker_streak_per_file"] = _streak
+                _max_streak = max(_streak.values(), default=0)
+                reflection_banner_lines.append(
+                    "PERSISTENT BLOCKER — the SAME location has failed "
+                    f"two+ rounds running: {_display}. Your previous "
+                    "patch either missed the target or landed a cosmetic "
+                    "change nearby. MANDATORY: your search block(s) THIS "
+                    "round MUST include the exact failing line — read "
+                    "the current file (READ_FILE) if needed to lift the "
+                    "surrounding context, then emit a REPLACE_BLOCK / "
+                    "DELETE_BLOCK that textually contains the failing "
+                    "line. A patch that does not touch these lines will "
+                    "be treated as no progress."
+                )
+                if _max_streak >= 3:
+                    _stuck_files = sorted({
+                        f for f, s in _streak.items() if s >= 3
+                    })[:5]
+                    reflection_banner_lines.append(
+                        "ESCAPE HATCH — this location has been stuck for "
+                        f"3+ rounds. You MAY now emit <<<REWRITE_FILE>>> "
+                        f"on: {', '.join(_stuck_files)}. Use it ONLY if "
+                        "your surgical patches keep missing — REWRITE_FILE "
+                        "replaces the entire file content, so you must "
+                        "supply the FULL corrected file body (imports, "
+                        "class defs, all tests). Format: same as "
+                        "CREATE_FILE, but the block name is REWRITE_FILE / "
+                        "END_REWRITE_FILE. Post-patch parse validation "
+                        "still applies: broken syntax rolls the file "
+                        "back."
+                    )
+            else:
+                # No persistent lines this round — clear per-file streaks
+                # so a NEW blocker on a stale-streak file doesn't inherit
+                # a bogus count.
+                loop_counter.pop("persistent_blocker_streak_per_file", None)
             # Verdict word last: this is the noisiest single field across
             # rounds and belongs after everything the cache can plausibly
             # match.
@@ -10347,6 +10548,31 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             )
         else:
             loop_counter["consecutive_all_allowlist_rejected_rounds"] = 0
+
+        # Persistent-blocker persistence (Fixes #2/#3). Save the
+        # ``(file, line)`` tuples the judge named this round so the NEXT
+        # round's banner can detect two-round persistence and inject a
+        # hard "your patch MUST alter line N" directive. Save only on
+        # DISTRACTION/REGRESSION (a persistent stuck state); clear on
+        # PROGRESS so stale locations from earlier failures don't leak.
+        # Serialise as list-of-list so JSON checkpointing round-trips
+        # cleanly.
+        if (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and not _reflection_verdict_is_low_signal(reflection_verdict)
+        ):
+            _named_file_lines_now = _verdict_named_file_lines(
+                reflection_verdict, state.get("compiler_errors", []) or []
+            )
+            if _named_file_lines_now:
+                loop_counter["judge_named_file_lines_last_round"] = [
+                    [f, ln] for (f, ln) in _named_file_lines_now
+                ]
+            else:
+                loop_counter.pop("judge_named_file_lines_last_round", None)
+        else:
+            loop_counter.pop("judge_named_file_lines_last_round", None)
 
         # Judge-ignored gate (Fix #3). When the reflection verdict named
         # specific files as the real blocker, check that the round's

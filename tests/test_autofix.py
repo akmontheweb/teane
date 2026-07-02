@@ -695,6 +695,9 @@ class TestOperationTypeDispatchCoverage:
             OperationType.CREATE_FILE: PatchBlock(
                 operation=OperationType.CREATE_FILE, file="x", content="y",
             ),
+            OperationType.REWRITE_FILE: PatchBlock(
+                operation=OperationType.REWRITE_FILE, file="x", content="y",
+            ),
             OperationType.REPLACE_BLOCK: PatchBlock(
                 operation=OperationType.REPLACE_BLOCK, file="x", search="a", replace="b",
             ),
@@ -737,6 +740,7 @@ class TestOperationTypeDispatchCoverage:
         # only assert tool-use coverage for the patch ops.
         tool_inputs = {
             OperationType.CREATE_FILE: ("create_file", {"file_path": "x", "content": "y"}),
+            OperationType.REWRITE_FILE: ("rewrite_file", {"file_path": "x", "content": "y"}),
             OperationType.REPLACE_BLOCK: (
                 "edit_file", {"file_path": "x", "old_string": "a", "new_string": "b"},
             ),

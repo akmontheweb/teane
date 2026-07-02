@@ -386,6 +386,12 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
             file=str(args.get("file_path", "")).strip(),
             content=str(args.get("content", "")),
         )
+    if name == "rewrite_file":
+        return PatchBlock(
+            operation=OperationType.REWRITE_FILE,
+            file=str(args.get("file_path", "")).strip(),
+            content=str(args.get("content", "")),
+        )
     if name == "delete_block":
         return PatchBlock(
             operation=OperationType.DELETE_BLOCK,

@@ -22,9 +22,11 @@ This module implements:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import difflib
 import errno
+import json
 import logging
 import os
 import re
@@ -34,6 +36,57 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Post-patch syntactic validation
+# ---------------------------------------------------------------------------
+#
+# When the repair LLM emits a REPLACE_BLOCK / DELETE_BLOCK that surgically
+# lands but leaves the file syntactically broken (mismatched braces, orphan
+# dict tails, mid-scope indent jumps), the diagnostic surface on the next
+# compile is dominated by that same file's SyntaxError. The judge then
+# points at line N again, and the repair loop cycles on a self-inflicted
+# blocker instead of the original one — observed session 674bfdbd, where
+# a REPLACE_BLOCK left a `}}}}}` tail at test_edgar.py:187 and the next
+# 6 rounds kept nibbling around it without ever landing a fix.
+#
+# The guard here re-parses every ``.py`` (and ``.json``) file after a
+# successful patch. If the file was CLEAN before and is BROKEN after,
+# the patch is rolled back and reported as a failure to the LLM. If the
+# file was ALREADY broken pre-patch, we keep the change — the LLM may be
+# iteratively fixing it and rolling back would regress partial progress.
+_VALIDATED_SUFFIXES = (".py", ".json")
+
+
+def _validate_syntax(filepath: str, content: str) -> Optional[str]:
+    """Return an error-message string when ``content`` doesn't parse for
+    the language implied by ``filepath``, otherwise None.
+
+    Deliberately narrow: only Python and JSON, since those are the two
+    formats where a bad patch reliably wedges the whole build (SyntaxError
+    at collect time; malformed manifest at install time). Extending to
+    TS/JS would require ``tsc``/``node`` in the harness runtime, which
+    we don't guarantee.
+    """
+    if filepath.endswith(".py"):
+        try:
+            ast.parse(content)
+            return None
+        except SyntaxError as e:
+            loc = f"line {e.lineno}" if e.lineno else "unknown line"
+            return f"SyntaxError at {loc}: {e.msg}"
+        except ValueError as e:
+            # Empty ``\x00`` bytes and similar make ast.parse raise ValueError
+            # rather than SyntaxError. Treat them the same for rollback.
+            return f"ValueError during Python parse: {e}"
+    if filepath.endswith(".json"):
+        try:
+            json.loads(content)
+            return None
+        except json.JSONDecodeError as e:
+            return f"JSONDecodeError at line {e.lineno}: {e.msg}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +110,15 @@ class OperationType(Enum):
     INSERT_AT_BLOCK = "insert_at_block"
     INSERT_AT_LINE = "insert_at_line"
     REPLACE_LINE_RANGE = "replace_line_range"
+    # Full-file overwrite. Emitted as an escape hatch when surgical
+    # patches on a single file have failed to converge across multiple
+    # repair rounds — the LLM's mental model of the file has drifted so
+    # far that fresh regeneration is cheaper than another round of
+    # REPLACE_BLOCK guessing. Behaves like CREATE_FILE but tolerates a
+    # pre-existing file (which CREATE_FILE deliberately does not).
+    # Post-patch parse validation still applies, so a REWRITE_FILE that
+    # produces broken syntax is rolled back the same as any other op.
+    REWRITE_FILE = "rewrite_file"
 
 
 class Placement(Enum):
@@ -262,7 +324,7 @@ def strip_promote_deferred_blocks(llm_output: str) -> str:
 # guard, the malformed first block simply fails to match → the patcher
 # logs "no patches parsed" → repair sees the failure cleanly.
 _TEMPERED_CONTENT = (
-    r'(?:(?!<<<(?:CREATE_FILE|REPLACE_BLOCK|DELETE_BLOCK|INSERT_AT_BLOCK)>>>).)*?'
+    r'(?:(?!<<<(?:CREATE_FILE|REWRITE_FILE|REPLACE_BLOCK|DELETE_BLOCK|INSERT_AT_BLOCK)>>>).)*?'
 )
 
 
@@ -290,6 +352,13 @@ _BLOCK_PATTERNS = {
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_CREATE_FILE>>>',
+        re.DOTALL,
+    ),
+    OperationType.REWRITE_FILE: re.compile(
+        r'<<<REWRITE_FILE>>>\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'<<<END_REWRITE_FILE>>>',
         re.DOTALL,
     ),
     OperationType.DELETE_BLOCK: re.compile(
@@ -382,6 +451,13 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
             elif op_type == OperationType.CREATE_FILE:
                 blocks.append(PatchBlock(
                     operation=OperationType.CREATE_FILE,
+                    file=gd["file"].strip(),
+                    content=gd["content"].rstrip(),
+                    raw_block=raw,
+                ))
+            elif op_type == OperationType.REWRITE_FILE:
+                blocks.append(PatchBlock(
+                    operation=OperationType.REWRITE_FILE,
                     file=gd["file"].strip(),
                     content=gd["content"].rstrip(),
                     raw_block=raw,
@@ -822,6 +898,67 @@ class TextPatcher(BasePatcher):
                 success=False,
                 file=filepath,
                 operation=OperationType.CREATE_FILE,
+                error=str(exc),
+            )
+
+    async def rewrite_file(self, filepath: str, content: str) -> PatchResult:
+        """Overwrite ``filepath`` with ``content``. Unlike ``create_file``,
+        this DOES clobber an existing file — that's the whole point of the
+        escape hatch. Post-patch parse validation still applies (see
+        ``HybridPatcher._validate_and_maybe_rollback``), so a REWRITE_FILE
+        that produces broken syntax is rolled back to the pre-patch state
+        just like any other op.
+
+        Also idempotent: writing byte-identical content is a successful
+        no-op (matches ``create_file``'s resume semantics).
+        """
+        full_path = self._resolve_safe(filepath, OperationType.REWRITE_FILE)
+        if isinstance(full_path, PatchResult):
+            return full_path
+        expected = content + "\n"
+        if os.path.exists(full_path):
+            try:
+                actual = await _aread(full_path)
+            except OSError as exc:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.REWRITE_FILE,
+                    error=f"File exists but unreadable: {exc}",
+                )
+            if actual == expected:
+                logger.info(
+                    "[patcher:text] REWRITE_FILE no-op: %s already at target state.",
+                    filepath,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.REWRITE_FILE,
+                    message=f"already at target state (no-op): {filepath}",
+                    lines_changed=0,
+                    no_op=True,
+                )
+        try:
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            await _awrite(full_path, expected)
+            new_lines = content.count("\n") + 1
+            logger.info(
+                "[patcher:text] Rewrote file: %s (%d lines)",
+                filepath, new_lines,
+            )
+            return PatchResult(
+                success=True,
+                file=filepath,
+                operation=OperationType.REWRITE_FILE,
+                message=f"Rewrote {filepath} ({new_lines} lines)",
+                lines_changed=new_lines,
+            )
+        except OSError as exc:
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.REWRITE_FILE,
                 error=str(exc),
             )
 
@@ -2133,6 +2270,14 @@ class HybridPatcher:
 
         if block.operation == OperationType.CREATE_FILE:
             return await patcher.create_file(block.file, block.content)
+        elif block.operation == OperationType.REWRITE_FILE:
+            # REWRITE_FILE always uses the text path — we're overwriting
+            # the whole file, not doing an AST-level edit, so tree-sitter
+            # buys nothing and the text patcher's atomic write is the
+            # right primitive.
+            return await self._text_patcher.rewrite_file(
+                block.file, block.content,
+            )
         elif block.operation == OperationType.REPLACE_BLOCK:
             return await patcher.replace_block(
                 block.file, block.search, block.replace, count=block.count,
@@ -2187,7 +2332,25 @@ class HybridPatcher:
         """
         results: list[PatchResult] = []
         for block in blocks:
+            # Snapshot pre-patch state for post-patch validation rollback.
+            # Skip validation entirely for extensions we don't check —
+            # keeps the fast path allocation-free for non-Python files.
+            pre_snapshot: Optional[tuple[Optional[str], bool]] = None
+            if block.file.endswith(_VALIDATED_SUFFIXES):
+                abs_path = _safe_resolve(self.workspace_root, block.file)
+                if abs_path is not None and os.path.isfile(abs_path):
+                    try:
+                        with open(abs_path, encoding="utf-8") as f:
+                            pre_content = f.read()
+                        pre_snapshot = (pre_content, True)
+                    except (OSError, UnicodeDecodeError):
+                        # Unreadable / binary — skip validation for this block.
+                        pre_snapshot = None
+                else:
+                    pre_snapshot = (None, False)
+
             result = await self.apply_patch(block)
+            result = self._validate_and_maybe_rollback(block, result, pre_snapshot)
             results.append(result)
             if not result.success:
                 logger.error(
@@ -2197,6 +2360,95 @@ class HybridPatcher:
                     result.error,
                 )
         return results
+
+    def _validate_and_maybe_rollback(
+        self,
+        block: PatchBlock,
+        result: PatchResult,
+        pre_snapshot: Optional[tuple[Optional[str], bool]],
+    ) -> PatchResult:
+        """Re-parse the patched file; roll back and return a failure result
+        if the patch turned a clean file into a broken one.
+
+        Contract:
+            - No-op when the patch already failed (nothing to validate).
+            - No-op when ``pre_snapshot`` is None (extension not in
+              ``_VALIDATED_SUFFIXES`` or the pre-read errored).
+            - No-op when the pre-patch content ALSO failed to parse —
+              the LLM might be iteratively repairing an already-broken
+              file and rolling back would regress partial progress.
+            - Rollback + report failure when pre-patch parsed and
+              post-patch does not.
+        """
+        if not result.success or pre_snapshot is None:
+            return result
+        abs_path = _safe_resolve(self.workspace_root, block.file)
+        if abs_path is None:
+            return result
+        try:
+            if os.path.isfile(abs_path):
+                with open(abs_path, encoding="utf-8") as f:
+                    new_content = f.read()
+            else:
+                # File does not exist post-patch (e.g. a hypothetical delete
+                # op). Nothing to validate.
+                return result
+        except (OSError, UnicodeDecodeError):
+            return result
+
+        post_err = _validate_syntax(block.file, new_content)
+        if post_err is None:
+            return result
+
+        pre_content, pre_existed = pre_snapshot
+        pre_err = (
+            _validate_syntax(block.file, pre_content) if pre_content is not None else None
+        )
+        if pre_content is not None and pre_err is not None:
+            # File was already broken — keep the change; the LLM may be
+            # iteratively fixing it. Log at debug so a run trace can
+            # confirm no rollback fired.
+            logger.debug(
+                "[patcher:validate] %s: pre-patch already unparseable (%s); "
+                "not rolling back post-patch state (%s).",
+                block.file, pre_err, post_err,
+            )
+            return result
+
+        # Pre-patch was clean; post-patch is broken. Roll back and report.
+        try:
+            if pre_existed and pre_content is not None:
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(pre_content)
+            elif not pre_existed:
+                os.remove(abs_path)
+        except OSError as exc:
+            logger.warning(
+                "[patcher:validate] Rollback write failed for %s: %s. "
+                "File is left in broken state; patch reported as failed anyway.",
+                block.file, exc,
+            )
+        logger.info(
+            "[patcher:validate] Rolled back %s: patch left the file "
+            "unparseable (%s). Reporting as patch failure so the LLM "
+            "sees the corruption on the next round.",
+            block.file, post_err,
+        )
+        return PatchResult(
+            success=False,
+            file=block.file,
+            operation=block.operation,
+            error=(
+                f"Post-patch validation failed: {post_err}. "
+                "The file was syntactically clean before your patch and is "
+                "broken after. The patch was ROLLED BACK — the on-disk file "
+                "is unchanged. Emit a corrected patch that preserves valid "
+                "syntax (balanced braces/brackets, consistent indent, "
+                "matching quotes). If your intent was to remove code, use "
+                "DELETE_BLOCK on the exact lines rather than a REPLACE_BLOCK "
+                "that leaves orphan syntax."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

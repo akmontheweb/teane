@@ -2690,6 +2690,17 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     ):
         if key in loop_counter:
             loop_counter[key] = 0
+    # Persistent-blocker directive keys — clear so a resumed session
+    # doesn't fire a "same location twice in a row" banner using state
+    # that predates the auto-resume. The next round starts fresh.
+    for key in (
+        "judge_named_file_lines_last_round",
+        "judge_named_files_last_round",
+        "judge_round_touched_files",
+        "judge_ignored_last_round",
+        "persistent_blocker_streak_per_file",
+    ):
+        loop_counter.pop(key, None)
     # Per-file miss counts drive the "use a different operation" LLM
     # directive at >=2 — we want to keep that signal alive but not let
     # the >=3 stuck-file HITL guard immediately re-trip. Cap at 2.

@@ -211,6 +211,8 @@ async def _apply_block(patcher: TextPatcher, block: PatchBlock) -> PatchResult:
     """
     if block.operation == OperationType.CREATE_FILE:
         return await patcher.create_file(block.file, block.content)
+    if block.operation == OperationType.REWRITE_FILE:
+        return await patcher.rewrite_file(block.file, block.content)
     if block.operation == OperationType.REPLACE_BLOCK:
         return await patcher.replace_block(block.file, block.search, block.replace)
     if block.operation == OperationType.DELETE_BLOCK:

@@ -260,19 +260,6 @@ def test_validate_rejects_orphan_feature():
         decomposition._validate_stories_payload(payload)
 
 
-def test_validate_rejects_over_cap():
-    payload = _payload_with_one_feature([
-        {
-            "story_key": f"STORY-{i}",
-            "title": f"t{i}",
-            "acceptance_criteria": ["x"],
-        }
-        for i in range(1, decomposition.MAX_STORIES_PER_PASS + 2)
-    ])
-    with pytest.raises(ValueError, match="too many"):
-        decomposition._validate_stories_payload(payload)
-
-
 def test_validate_rejects_bad_story_key():
     payload = _payload_with_one_feature([{
         "story_key": "ABC-1", "title": "t", "acceptance_criteria": ["x"]

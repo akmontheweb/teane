@@ -18,10 +18,13 @@ The node:
 4. Regenerates ``docs/STORIES.md`` from the DB so the STORIES
    gatekeeper has a fresh view to show the operator.
 
-LLM cost is capped: at most ``MAX_STORIES_PER_PASS`` stories per
-call. If the model wants more, ``next_pass_summary`` carries
-remaining intent into the next decomposition pass (future work — for
-now a single pass is the contract).
+Since v6 the LLM's output is enrichment only: ``harness.spec_reconciler``
+runs immediately after this node and rewrites the workspace's story
+rows using spec-authored IDs (``STORY-NNN``, ``STORY-NFR-NNN``) parsed
+directly from ``SPEC_REQUIREMENTS.md``. The LLM's ``scope_files`` hints
+are preserved by story-key or fuzzy-title match. This node therefore
+no longer caps its output — a spec with 50 stories yields 50 stories in
+the DB regardless of the LLM's compression tendencies.
 """
 
 from __future__ import annotations
@@ -34,11 +37,16 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-MAX_STORIES_PER_PASS = 20
-"""Hard cap. The prompt instructs the LLM to merge or defer beyond this.
-Large specs that need more than 20 stories should re-run decomposition
-after the first batch lands — incremental decomposition is cheaper and
-gives the operator a chance to course-correct after seeing real output."""
+MAX_STORIES_PER_AUGMENT_PASS = 50
+"""Soft cap for the change-request augment path only.
+
+Initial decomposition is uncapped because ``harness.spec_reconciler`` runs
+downstream and enforces spec-authored coverage. The reconciler explicitly
+skips ``change_request_mode`` to preserve historical ``done`` rows, so
+the CR augment path has no downstream safety net — this cap catches an
+LLM that fans out into a large synthetic story set from a small CR file.
+A single CR that materially exceeds this bound should be split.
+"""
 
 MAX_FEATURES_PER_PASS = 8
 """Soft-ish cap on features per decomposition pass. The decomposition
@@ -273,16 +281,19 @@ no commentary:
 
 ## Constraints
 
-- AT MOST {MAX_FEATURES_PER_PASS} features per pass. Merge or defer
-  beyond that — the harness can re-decompose after the first features
-  land.
-- AT MOST {MAX_STORIES_PER_PASS} stories per pass across ALL features.
-  If the spec calls for more, merge the closest-coupled ones and put
-  the leftovers in a final "polish" story that the next pass can
-  re-decompose.
-- ``story_key`` MUST be ``STORY-N`` with N starting at 1 and
-  monotonically increasing across the whole response (not per-feature).
-  The DB layer re-checks this — mismatches are rejected.
+- Emit ONE story per user-facing ``#### Story:`` / ``#### Enabler
+  Story:`` heading in the spec — do not merge, drop, or invent stories.
+  A deterministic reconciler (``harness.spec_reconciler``) runs
+  immediately after you and rewrites the DB using spec-authored IDs;
+  anything you omit is silently supplied from the spec, and anything
+  you invent is discarded. Cover every heading anyway so your
+  ``scope_files`` hints reach the corresponding rows.
+- AT MOST {MAX_FEATURES_PER_PASS} features per pass. Prefer the
+  ``FEAT-NNN`` labels from the spec — the reconciler expects them.
+- ``story_key`` SHOULD match the spec-authored heading verbatim
+  (e.g. ``STORY-001``, ``STORY-NFR-006``). The reconciler prefers an
+  exact match when merging your ``scope_files`` into the canonical
+  rows; falling back to title similarity works but is fuzzier.
 - Every story's ``feature`` MUST match a ``feature_key`` declared in
   the ``features`` block.
 - Every feature MUST own at least one story.
@@ -418,7 +429,10 @@ Output STRICT JSON in this exact shape — no markdown, no code fence:
 }}
 
 Constraints:
-- AT MOST {MAX_STORIES_PER_PASS} new stories per pass.
+- AT MOST {MAX_STORIES_PER_AUGMENT_PASS} new stories per pass. A change
+  request that would introduce more than that is a signal the CR should
+  be split; merge the closest-coupled ones and leave the rest for the
+  next CR.
 - AT MOST {MAX_FEATURES_PER_PASS} new features per pass.
 - Every new story MUST have at least one acceptance criterion.
 {req_constraint}
@@ -670,10 +684,13 @@ def _validate_augment_payload(
     features_cleaned = _validate_features_payload(data, allow_empty=True)
     if not stories:
         return features_cleaned, []
-    if len(stories) > MAX_STORIES_PER_PASS:
+    # Runaway-guard for the CR augment path. Initial decomposition is
+    # uncapped and reconciled downstream; augment mode has no reconciler
+    # net (it preserves ``done`` history), so we bound the LLM here.
+    if len(stories) > MAX_STORIES_PER_AUGMENT_PASS:
         raise ValueError(
-            f"too many new stories ({len(stories)} > {MAX_STORIES_PER_PASS}); "
-            "merge closely-coupled stories"
+            f"too many new stories ({len(stories)} > "
+            f"{MAX_STORIES_PER_AUGMENT_PASS}); split this change request"
         )
     seen_keys: set[str] = set()
     cleaned: list[dict[str, Any]] = []
@@ -749,11 +766,6 @@ def _validate_stories_payload(
     stories = data.get("stories")
     if not isinstance(stories, list) or not stories:
         raise ValueError("'stories' must be a non-empty list")
-    if len(stories) > MAX_STORIES_PER_PASS:
-        raise ValueError(
-            f"too many stories ({len(stories)} > {MAX_STORIES_PER_PASS}); "
-            "merge closely-coupled stories"
-        )
 
     seen_keys: set[str] = set()
     cleaned: list[dict[str, Any]] = []

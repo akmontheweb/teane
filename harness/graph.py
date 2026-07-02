@@ -15853,6 +15853,9 @@ def build_graph() -> Any:
     # them gates on that flag, so today's monolithic flow keeps running
     # exactly as it does on main.
     from harness.decomposition import decomposition_node as _decomposition_node
+    from harness.spec_reconciler import (
+        spec_reconciler_node as _spec_reconciler_node,
+    )
     from harness.story_loop import (
         batch_planner_node as _batch_planner_node,
         story_loop_node as _story_loop_node,
@@ -15865,6 +15868,12 @@ def build_graph() -> Any:
         route_after_batch_commit as _route_after_batch_commit,
     )
     graph.add_node("decomposition_node", _decomposition_node)  # type: ignore[type-var]
+    # spec_reconciler_node runs between decomposition_node and the STORIES
+    # gatekeeper. It parses SPEC_REQUIREMENTS.md deterministically and
+    # rewrites the workspace's stories/features rows using spec-authored
+    # IDs — LLM output becomes ENRICHMENT (scope_files) only. Guards
+    # against LLM renumbering / silent story-drop / phantom-feature drift.
+    graph.add_node("spec_reconciler_node", _spec_reconciler_node)  # type: ignore[type-var]
     graph.add_node("batch_planner_node", _batch_planner_node)  # type: ignore[type-var]
     graph.add_node("story_loop_node", _story_loop_node)  # type: ignore[type-var]
     # Phase F removed ``story_test_first_node``. Its xfail-stub
@@ -16069,7 +16078,7 @@ def build_graph() -> Any:
     #   traceability_node  → security_scan_node (rejoins existing tail)
     # =====================================================================
     def route_after_decomposition(state: AgentState) -> Literal[
-        "human_gatekeeper_node", "human_intervention_node"
+        "spec_reconciler_node", "human_intervention_node"
     ]:
         """Failure routing for ``decomposition_node``.
 
@@ -16079,6 +16088,9 @@ def build_graph() -> Any:
         gatekeeper would happily let the developer "approve", and the
         batch planner would then see an empty DB and report
         ``all_complete=True`` — generating code with zero traceability).
+
+        Success routes through ``spec_reconciler_node`` before the
+        STORIES gate so spec-authored IDs override any LLM renumbering.
         """
         ns = state.get("node_state", {}) or {}
         if ns.get("decomposition_failed"):
@@ -16087,11 +16099,40 @@ def build_graph() -> Any:
                 ns.get("error", "unknown"),
             )
             return "human_intervention_node"
-        return "human_gatekeeper_node"
+        return "spec_reconciler_node"
 
     graph.add_conditional_edges(
         "decomposition_node",
         route_after_decomposition,
+        {
+            "spec_reconciler_node": "spec_reconciler_node",
+            "human_intervention_node": "human_intervention_node",
+        },
+    )
+
+    def route_after_spec_reconciler(state: AgentState) -> Literal[
+        "human_gatekeeper_node", "human_intervention_node"
+    ]:
+        """Route reconciler → STORIES gate on success, HITL on failure.
+
+        ``reconcile_failed`` covers parse / SQL / regen errors from the
+        deterministic path. A missing spec file (``skipped_reason ==
+        'spec_missing'``) or CR-mode skip both fall through to the
+        STORIES gate — the LLM's output survives untouched in those
+        paths, which matches pre-reconciler behavior.
+        """
+        ns = state.get("node_state", {}) or {}
+        if ns.get("reconcile_failed"):
+            logger.warning(
+                "[router] spec_reconciler_node failed (%s); routing to HITL.",
+                ns.get("error", "unknown"),
+            )
+            return "human_intervention_node"
+        return "human_gatekeeper_node"
+
+    graph.add_conditional_edges(
+        "spec_reconciler_node",
+        route_after_spec_reconciler,
         {
             "human_gatekeeper_node": "human_gatekeeper_node",
             "human_intervention_node": "human_intervention_node",

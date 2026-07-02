@@ -4670,6 +4670,7 @@ def _print_new_build_preview(
 
 def _perform_new_build_reset(
     workspace_path: str, spec_dirname: str,
+    preserve_docs: bool = False,
 ) -> None:
     """When ``--new-build true`` fires, hard-reset the workspace.
 
@@ -4683,9 +4684,17 @@ def _perform_new_build_reset(
        session.
     2. Checkout the base branch (``master`` if it exists, else ``main``).
     3. Delete every file / directory at the workspace root EXCEPT the
-       preserved set (``.git/`` and the configured ``spec_dirname``) and
-       commit the deletions on the base branch.
+       preserved set (``.git/`` and the configured ``spec_dirname``,
+       plus ``docs/`` when ``preserve_docs=True``) and commit the
+       deletions on the base branch.
     4. Delete every orphaned ``agent/patch-*`` branch in the repo.
+
+    ``preserve_docs`` is set by ``cmd_build`` when the operator opted
+    to reuse the on-disk specs (see ``_resolve_reuse_docs``). The
+    reset still purges state.db, but the ``docs/`` folder survives so
+    the pre-graph synthesis step can read the preserved
+    ``SPEC_REQUIREMENTS.md`` / ``SPEC_ARCHITECTURE.md`` instead of
+    regenerating them via LLM.
 
     Runs BEFORE GitGuardian creates the new session's patch branch, so
     the new branch is forked from a now-clean base. Best-effort: any step
@@ -4754,8 +4763,17 @@ def _perform_new_build_reset(
 
     # Preserved at workspace root. .git/ can't be deleted without
     # destroying the repo; the configured product-spec folder is the
-    # source of truth for the next run and must survive.
-    preserved = frozenset({".git", spec_dirname})
+    # source of truth for the next run and must survive. `docs/` is
+    # added when the operator opted to reuse prior specs — see
+    # `_resolve_reuse_docs` and the preserve_docs param.
+    preserved_set = {".git", spec_dirname}
+    if preserve_docs:
+        preserved_set.add("docs")
+        logger.info(
+            "[new_build] Preserving docs/ per operator choice — spec "
+            "regeneration will be skipped."
+        )
+    preserved = frozenset(preserved_set)
     deleted = 0
     for entry in os.listdir(workspace_path):
         if entry in preserved:
@@ -5521,7 +5539,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
             "starting the session. Files outside `%s/` and `.git/` will be "
             "deleted from the base branch.", spec_dirname,
         )
-        _perform_new_build_reset(workspace_path, spec_dirname)
+        _perform_new_build_reset(
+            workspace_path, spec_dirname,
+            preserve_docs=getattr(args, "reuse_docs", False),
+        )
         # And purge every prior checkpoint + JSONL transcript that targeted
         # this workspace, so "fresh start" includes the persistence layer.
         # Runs BEFORE GitGuardian creates this session's patch branch and
@@ -5564,17 +5585,59 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # injects them as the LLM's task description in-graph.
     spec_override: Optional[str] = None
     manifest_path: Optional[str] = None
+    reuse_docs = getattr(args, "reuse_docs", False)
     if not change_request_mode:
-        import tempfile as _tempfile
-        fd, manifest_path = _tempfile.mkstemp(
-            prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(preloaded_consolidated_spec or "")
-        logger.info(
-            "[requirements] Product spec sourced from %s "
-            "(consolidated → %s).", resolved_spec_dir, manifest_path,
-        )
+        if reuse_docs:
+            # Operator opted to reuse the preserved docs/ (see
+            # `_resolve_reuse_docs` and `preserve_docs=True` on the
+            # reset above). Read the on-disk specs into spec_override
+            # instead of paying the LLM cost of regeneration; leave
+            # manifest_path=None so the synthesis block below is
+            # naturally skipped.
+            spec_req_path = os.path.join(
+                workspace_path, "docs", "SPEC_REQUIREMENTS.md",
+            )
+            spec_arch_path = os.path.join(
+                workspace_path, "docs", "SPEC_ARCHITECTURE.md",
+            )
+            spec_override = _read_spec_file(spec_req_path) or ""
+            logger.info(
+                "[requirements] Reusing %s (%d chars) — skipping "
+                "spec synthesis + reviewer cycles.",
+                spec_req_path, len(spec_override),
+            )
+            arch_content = (
+                _read_spec_file(spec_arch_path)
+                if os.path.exists(spec_arch_path) else ""
+            )
+            if arch_content:
+                spec_override = (
+                    f"{spec_override}\n\n"
+                    f"# Architecture Specification\n"
+                    f"_(reused from prior run)_\n\n"
+                    f"{arch_content}"
+                )
+                logger.info(
+                    "[architecture] Reusing %s (%d chars) — skipping "
+                    "architecture synthesis + reviewer cycles.",
+                    spec_arch_path, len(arch_content),
+                )
+            else:
+                logger.info(
+                    "[architecture] %s not present — nothing to reuse "
+                    "for architecture.", spec_arch_path,
+                )
+        else:
+            import tempfile as _tempfile
+            fd, manifest_path = _tempfile.mkstemp(
+                prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(preloaded_consolidated_spec or "")
+            logger.info(
+                "[requirements] Product spec sourced from %s "
+                "(consolidated → %s).", resolved_spec_dir, manifest_path,
+            )
     else:
         logger.info(
             "[change_requests] Skipping greenfield spec refinement; "
@@ -6121,6 +6184,48 @@ def _resolve_generate_specs(args: argparse.Namespace, *, workspace_path: str) ->
     return None
 
 
+def _resolve_reuse_docs(workspace_path: str) -> bool:
+    """Decide whether `teane build` should preserve docs/ and skip spec regen.
+
+    Semantics:
+      - If ``docs/SPEC_REQUIREMENTS.md`` is absent → False (nothing to
+        reuse; the normal reset + synthesis flow runs).
+      - Else if stdin is not a TTY → True (non-interactive default:
+        reuse so eval sweeps stop paying the spec-generation LLM cost
+        on every run).
+      - Else prompt the operator [Y/n]; default True on empty input.
+
+    The prompt is independent of ``-y/--yes`` — ``-y`` only suppresses
+    the destructive-reset confirmation, not this reuse choice.
+    """
+    spec_marker = os.path.join(workspace_path, "docs", "SPEC_REQUIREMENTS.md")
+    if not os.path.exists(spec_marker):
+        return False
+    if not sys.stdin.isatty():
+        logger.info(
+            "[build] Non-interactive run: %s exists — reusing docs/ "
+            "(skipping spec regeneration).", spec_marker,
+        )
+        return True
+    from harness.hitl import get_channel as _get_channel
+    reuse = _get_channel().confirm(
+        f"Existing specs found in {os.path.dirname(spec_marker)}. "
+        "Reuse them (skip spec regeneration)?",
+        default=True,
+    )
+    if reuse:
+        logger.info(
+            "[build] Operator chose to reuse docs/ — spec regeneration "
+            "will be skipped."
+        )
+    else:
+        logger.info(
+            "[build] Operator chose to regenerate docs/ — the reset "
+            "will wipe the folder and specs will be re-synthesised."
+        )
+    return reuse
+
+
 async def cmd_build(args: argparse.Namespace) -> int:
     """`teane build` — destructive greenfield.
 
@@ -6141,6 +6246,14 @@ async def cmd_build(args: argparse.Namespace) -> int:
     except Exception:  # noqa: BLE001 — cmd_run will re-load + error properly
         config = {}
     _resolve_agile_args(args, config=config, workspace_path=workspace_path, flow="build")
+    # Ask (or infer, when non-interactive) whether to preserve docs/
+    # and skip the pre-graph spec synthesis. This gates BOTH the reset's
+    # preserved-set (via preserve_docs) AND the manifest/synthesis
+    # block in cmd_run — the two are intentionally coupled since
+    # preserving the folder without skipping regen would just overwrite
+    # what we preserved, and skipping regen without preserving the
+    # folder would leave nothing to read.
+    args.reuse_docs = _resolve_reuse_docs(workspace_path)
     return await cmd_run(args)
 
 

@@ -389,7 +389,7 @@ class BaseLLM(ABC):
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self.spec.api_base_url,
-                timeout=httpx.Timeout(120.0, connect=10.0),
+                timeout=httpx.Timeout(300.0, connect=10.0),
                 headers=self._build_headers(),
                 verify=self.ssl_verify,
             )

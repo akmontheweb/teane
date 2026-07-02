@@ -16,7 +16,7 @@
     "supports_cache": true,
     "supports_tools": true,
     "anthropic_version": "2023-06-01",
-    "thinking_budget_tokens": 8000
+    "thinking_budget_tokens": 24000
   },
   "anthropic:claude-sonnet-4-6": {
     "provider": "anthropic",
@@ -31,7 +31,7 @@
     "supports_cache": true,
     "supports_tools": true,
     "anthropic_version": "2023-06-01",
-    "thinking_budget_tokens": 8000
+    "thinking_budget_tokens": 24000
   },
   "anthropic:claude-haiku-4-5": {
     "provider": "anthropic",

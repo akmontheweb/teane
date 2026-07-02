@@ -2427,8 +2427,8 @@ def _find_closest_match(text: str, search: str, context: int = 20) -> str:
             f"{(i + 1):>{width}}| {text_lines[i]}" for i in range(start, end)
         )
 
-    WHOLE_FILE_LINE_CAP = 300
-    WHOLE_FILE_CHAR_CAP = 6000
+    WHOLE_FILE_LINE_CAP = 1000
+    WHOLE_FILE_CHAR_CAP = 20000
 
     # Whole-file mode for small files: no closest-match logic at all,
     # just the full file with line numbers. The LLM sees everything and

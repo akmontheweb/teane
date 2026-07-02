@@ -654,6 +654,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # See the _llm_dispatch_comment block in config.json for the
         # per-role risk profile.
         "continue_on_length",
+        # Cap on continuation cycles per dispatch. Clamped to [1, 10]
+        # in graph._resolve_max_continuation_cycles; default 5.
+        "max_continuation_cycles",
+        # Cap on read_file tool-use rounds inside one patching turn.
+        # Clamped to [1, 30] in graph._resolve_patching_read_file_cap;
+        # default 10.
+        "patching_read_file_cap",
         # Prompt caching master switch. Default True. Falls back to the
         # legacy string-form Anthropic system payload when False, and
         # silences the prefix-stability drift events. Single-flag
@@ -899,6 +906,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.max_tokens_default": (int, str, type(None)),
     "llm_dispatch.max_tokens_per_role": (dict,),
     "llm_dispatch.continue_on_length": (dict,),
+    "llm_dispatch.max_continuation_cycles": (int,),
+    "llm_dispatch.patching_read_file_cap": (int,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "web_tools.enabled": (bool,),
     "web_tools.max_bytes": (int,),

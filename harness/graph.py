@@ -2386,6 +2386,82 @@ async def _maybe_judgment_llm(
         return None, budget_remaining_usd
 
 
+async def _repair_malformed_json(
+    *,
+    raw_text: str,
+    schema_hint: str,
+    dispatch: Any,
+    budget_remaining_usd: float,
+    purpose: str,
+) -> tuple[Optional[Any], float]:
+    """One-shot JSON-repair pass for strict-schema nodes.
+
+    When a reviewer / discovery / reflection dispatch returns text that
+    doesn't parse as JSON, callers historically discarded the whole
+    response (empty findings, terminated interview, dropped verdict).
+    That's the most severe form of LLM starvation — the model DID
+    produce signal, and the code threw it away over a formatting slip.
+
+    This helper re-prompts the model with the offending text plus the
+    schema and asks it to emit JSON only. On success, returns
+    ``(parsed_object, new_budget)``. On persistent failure, returns
+    ``(None, new_budget)`` and the caller falls back to its existing
+    empty-critique / skip-injection behaviour.
+
+    ``dispatch`` is an async callable
+    ``(messages, budget) -> (response, new_budget)`` — captured by the
+    caller so this helper stays role-agnostic. ``purpose`` is a short
+    tag used only for log lines.
+    """
+    if not raw_text or not raw_text.strip():
+        return None, budget_remaining_usd
+    if budget_remaining_usd < 0.01:
+        return None, budget_remaining_usd
+    truncated = raw_text.strip()
+    if len(truncated) > 8000:
+        truncated = truncated[:8000] + "\n...(truncated for repair prompt)"
+    repair_prompt = (
+        "Your previous response could not be parsed as JSON. Re-emit the "
+        "same content as VALID JSON that matches the schema below. "
+        "Output ONLY the JSON object — no prose, no markdown fences, no "
+        "commentary before or after.\n\n"
+        f"## Expected schema\n{schema_hint}\n\n"
+        f"## Your previous (unparseable) response\n{truncated}\n\n"
+        "Emit the corrected JSON now."
+    )
+    try:
+        response, new_budget = await dispatch(
+            [{"role": "user", "content": repair_prompt}],
+            budget_remaining_usd,
+        )
+    except Exception as exc:  # noqa: BLE001 — repair must never break the loop
+        logger.warning(
+            "[json_repair:%s] Re-dispatch failed (%s); falling back.",
+            purpose, exc,
+        )
+        return None, budget_remaining_usd
+    repaired_text = (getattr(response, "content", "") or "").strip()
+    if not repaired_text:
+        return None, new_budget
+    try:
+        from harness.trust import _strip_code_fences
+        repaired_text = _strip_code_fences(repaired_text)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        parsed = json.loads(repaired_text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "[json_repair:%s] Repair pass still not valid JSON (%s); "
+            "falling back.", purpose, exc,
+        )
+        return None, new_budget
+    logger.info(
+        "[json_repair:%s] Recovered valid JSON after one re-prompt.", purpose,
+    )
+    return parsed, new_budget
+
+
 # ---------------------------------------------------------------------------
 # 3. Memory Cleanse Utility (Module 4)
 # ---------------------------------------------------------------------------
@@ -2633,12 +2709,18 @@ def _web_tool_cap_from_state(_state: "AgentState") -> int:
 # from reading the whole repo before emitting a single edit. The cap
 # applies to the number of *re-dispatches*; the model can ask for
 # multiple files in one round and each counts as a single round.
-_PATCHING_READ_FILE_CAP = 6
+# Operators can override via
+# ``llm_dispatch.patching_read_file_cap`` in config.json (clamped to
+# [1, 30] at read time — see :func:`_resolve_patching_read_file_cap`).
+_PATCHING_READ_FILE_CAP = 10
 
 # Cap on continuation cycles for nodes that opt into
 # llm_dispatch.continue_on_length.<role>. See the comment on that
 # section in config/config.json for the per-role risk profile.
-_MAX_CONTINUATION_CYCLES = 3
+# Operators can override via
+# ``llm_dispatch.max_continuation_cycles`` in config.json (clamped to
+# [1, 10] at read time — see :func:`_resolve_max_continuation_cycles`).
+_MAX_CONTINUATION_CYCLES = 5
 
 # Per-role default for ``continue_on_length`` when the operator's
 # config.json omits the section or the role entry. Patching's default
@@ -2672,6 +2754,46 @@ def _resolve_continue_on_length(
     return bool(val) if val is not None else default
 
 
+def _resolve_max_continuation_cycles(
+    state_or_cfg: Any,
+) -> int:
+    """Resolve the cap on continuation cycles.
+
+    Accepts either an ``AgentState`` (reads
+    ``state.llm_dispatch_config.max_continuation_cycles``) or the
+    ``llm_dispatch_config`` dict directly. Clamps to ``[1, 10]``; falls
+    back to :data:`_MAX_CONTINUATION_CYCLES` when the config omits it or
+    supplies a non-int / out-of-range value.
+    """
+    if isinstance(state_or_cfg, dict) and "llm_dispatch_config" in state_or_cfg:
+        cfg = state_or_cfg.get("llm_dispatch_config", {}) or {}
+    else:
+        cfg = state_or_cfg or {}
+    raw = cfg.get("max_continuation_cycles", _MAX_CONTINUATION_CYCLES)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _MAX_CONTINUATION_CYCLES
+    return max(1, min(10, val))
+
+
+def _resolve_patching_read_file_cap(state: "AgentState") -> int:
+    """Resolve the cap on ``read_file`` rounds inside one patching turn.
+
+    Reads ``state.llm_dispatch_config.patching_read_file_cap`` and
+    clamps to ``[1, 30]``; falls back to
+    :data:`_PATCHING_READ_FILE_CAP` when the config omits it or supplies
+    a non-int / out-of-range value.
+    """
+    cfg = state.get("llm_dispatch_config", {}) or {}
+    raw = cfg.get("patching_read_file_cap", _PATCHING_READ_FILE_CAP)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _PATCHING_READ_FILE_CAP
+    return max(1, min(30, val))
+
+
 async def _continue_on_length(
     *,
     initial_response: Any,
@@ -2681,6 +2803,7 @@ async def _continue_on_length(
     continue_prompt: str,
     enabled: bool,
     role_label: str,
+    max_cycles: int = _MAX_CONTINUATION_CYCLES,
 ) -> tuple[Any, float, list[str]]:
     """Run the finish_reason==length continuation loop for a node.
 
@@ -2743,13 +2866,13 @@ async def _continue_on_length(
     # trigger the loop.
     while (
         getattr(response, "finish_reason", "stop") == "length"
-        and continuation_cycles < _MAX_CONTINUATION_CYCLES
+        and continuation_cycles < max_cycles
     ):
         continuation_cycles += 1
         logger.info(
             "[%s] hit output token cap (cycle %d/%d) — requesting "
             "continuation.",
-            role_label, continuation_cycles, _MAX_CONTINUATION_CYCLES,
+            role_label, continuation_cycles, max_cycles,
         )
         messages.append(MessageDict(
             role="assistant", content=response.content or "",
@@ -2760,13 +2883,13 @@ async def _continue_on_length(
         response, budget = await dispatch(messages, budget)
         accumulated_chunks.append(response.content or "")
     if (
-        continuation_cycles >= _MAX_CONTINUATION_CYCLES
+        continuation_cycles >= max_cycles
         and getattr(response, "finish_reason", "stop") == "length"
     ):
         logger.warning(
             "[%s] LLM still truncated after %d continuation cycle(s); "
             "accepting what landed and moving on.",
-            role_label, _MAX_CONTINUATION_CYCLES,
+            role_label, max_cycles,
         )
     return response, budget, accumulated_chunks
 # Cap on bytes returned per read_file tool_result so a single edit
@@ -2915,8 +3038,9 @@ async def _patching_tool_loop(
     if not use_tools or not getattr(response, "tool_calls", None):
         return response, budget, messages, files_seen
 
+    read_file_cap = _resolve_patching_read_file_cap(state)
     rounds = 0
-    while rounds < _PATCHING_READ_FILE_CAP:
+    while rounds < read_file_cap:
         tool_calls_list = getattr(response, "tool_calls", None) or []
         read_calls = [
             c for c in tool_calls_list if c.get("name") == "read_file"
@@ -2978,11 +3102,11 @@ async def _patching_tool_loop(
             )
             break
 
-    if rounds >= _PATCHING_READ_FILE_CAP:
+    if rounds >= read_file_cap:
         logger.info(
             "[patching_tool_loop] hit cap of %d read_file rounds; "
             "patching proceeds with what the LLM has so far.",
-            _PATCHING_READ_FILE_CAP,
+            read_file_cap,
         )
         # Audit §6.3: tell the model the read-cap is hit and ask it
         # to emit patches now. Without this synthetic note, the final
@@ -2995,7 +3119,7 @@ async def _patching_tool_loop(
                 role="user",
                 content=(
                     f"[System]: You've used the read_file tool "
-                    f"{_PATCHING_READ_FILE_CAP} times — the cap is reached. "
+                    f"{read_file_cap} times — the cap is reached. "
                     f"Emit SEARCH/REPLACE patches now using the file content "
                     f"you've already seen. Do NOT call read_file again."
                 ),
@@ -3346,6 +3470,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             ),
             enabled=_resolve_continue_on_length(state, "planning"),
             role_label="planning_node",
+            max_cycles=_resolve_max_continuation_cycles(state),
         )
         _planning_combined_content = "\n".join(
             chunk for chunk in _planning_chunks if chunk
@@ -3740,6 +3865,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             ),
             enabled=_resolve_continue_on_length(state, "patching"),
             role_label="patching_node",
+            max_cycles=_resolve_max_continuation_cycles(state),
         )
 
         # Update token tracker (per-stage attribution: patching).
@@ -5579,8 +5705,8 @@ def _format_test_collection_cascade_section(
             except OSError:
                 continue
             # Cap each attachment so the prompt doesn't blow up.
-            if len(content) > 6000:
-                content = content[:6000] + "\n# ...(truncated)\n"
+            if len(content) > 20000:
+                content = content[:20000] + "\n# ...(truncated)\n"
             prod_attachments[prod_rel] = content
 
     lines = [
@@ -5941,8 +6067,8 @@ def _resolve_read_blocks(
     return intro + "\n" + "\n".join(sections) + "\n"
 
 
-_DEFAULT_REPAIR_DIAGNOSTIC_CAP = 12
-_DEFAULT_REPAIR_INVENTORY_CAP = 50
+_DEFAULT_REPAIR_DIAGNOSTIC_CAP = 24
+_DEFAULT_REPAIR_INVENTORY_CAP = 100
 _EOS_REPAIR_DIAGNOSTIC_CAP = 30
 _EOS_REPAIR_INVENTORY_CAP = 150
 
@@ -8717,6 +8843,42 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 state = cast(AgentState, dict(state))
                 state["budget_remaining_usd"] = float(new_budget)
             reflection_verdict = _parse_repair_reflection_verdict(verdict_raw or "")
+            # One-shot JSON-repair when the verdict didn't parse — the
+            # judge often produced signal but wrapped it wrong. Better
+            # to spend one small judgment call than to silently drop
+            # the reasoning.
+            if reflection_verdict is None and (verdict_raw or "").strip():
+                _gw = get_gateway()
+                if _gw is not None:
+                    from harness.gateway import NodeRole as _NodeRole
+                    async def _reflection_repair_dispatch(msgs, bud):
+                        return await _gw.dispatch(
+                            messages=list(msgs),
+                            role=_NodeRole.JUDGMENT,
+                            budget_remaining_usd=bud,
+                        )
+                    _reflection_schema = (
+                        "A JSON object with exactly three keys: "
+                        "'verdict' (one of 'PROGRESS', 'DISTRACTION', "
+                        "'REGRESSION'), 'real_blocker' (string — the "
+                        "underlying reason the repair loop is stuck; "
+                        "may be empty only when verdict='PROGRESS'), "
+                        "and 'recommendation' (string). No other keys."
+                    )
+                    repaired_verdict, repaired_budget = await _repair_malformed_json(
+                        raw_text=verdict_raw or "",
+                        schema_hint=_reflection_schema,
+                        dispatch=_reflection_repair_dispatch,
+                        budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
+                        purpose="repair_reflection",
+                    )
+                    if isinstance(repaired_budget, (int, float)) and repaired_budget != state.get("budget_remaining_usd", 0.0):
+                        state = cast(AgentState, dict(state))
+                        state["budget_remaining_usd"] = float(repaired_budget)
+                    if isinstance(repaired_verdict, dict):
+                        reflection_verdict = _parse_repair_reflection_verdict(
+                            json.dumps(repaired_verdict)
+                        )
             if reflection_verdict:
                 logger.info(
                     "[repair_node] Reflection verdict: %s. Blocker: %s",
@@ -8746,16 +8908,29 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     # Fix B — the judge fell back to "insufficient data" (its
                     # escape hatch for bare exception-type errors). The verdict
                     # word oscillates on the failing-count delta but carries no
-                    # actionable content, so ticking the circuit-breaker would
-                    # race us to HITL on noise instead of a real distraction
-                    # signal. Hold the counter steady; the ``total_repairs``
-                    # ceiling still bounds the loop.
+                    # actionable content, so ticking the distraction circuit-
+                    # breaker would race us to HITL on noise instead of a real
+                    # distraction signal. Hold that counter steady.
+                    #
+                    # Fix D (session 116667f5 escalation) — but tick a SECOND
+                    # counter that measures how many consecutive rounds the
+                    # judge could not localize. When it hits the escalation
+                    # threshold the repair prompt injects the raw build-output
+                    # tail so the repair LLM sees the full pytest traceback
+                    # (assertion-rewrite lines, attribute values, etc.) that
+                    # the structured diagnostics lack. Without this the loop
+                    # was silently spinning until ``total_repairs`` ran out.
+                    loop_counter["consecutive_low_signal_rounds"] = (
+                        loop_counter.get("consecutive_low_signal_rounds", 0) + 1
+                    )
                     logger.info(
                         "[repair_node] Reflection verdict %s but real_blocker "
                         "is the 'insufficient data' sentinel — holding "
-                        "consecutive_distraction_rounds at %d.",
+                        "consecutive_distraction_rounds at %d, "
+                        "consecutive_low_signal_rounds=%d.",
                         _v,
                         loop_counter.get("consecutive_distraction_rounds", 0),
+                        loop_counter["consecutive_low_signal_rounds"],
                     )
                 else:  # PROGRESS — earn back the budget.
                     if loop_counter.get("consecutive_distraction_rounds", 0) > 0:
@@ -8766,6 +8941,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                             loop_counter["consecutive_distraction_rounds"],
                         )
                     loop_counter["consecutive_distraction_rounds"] = 0
+                    # Any PROGRESS verdict also clears the low-signal streak —
+                    # the judge is engaging with the diagnostics again, so the
+                    # raw-tail escalation is no longer needed on the next round.
+                    if loop_counter.get("consecutive_low_signal_rounds", 0) > 0:
+                        logger.info(
+                            "[repair_node] Reflection verdict PROGRESS; "
+                            "resetting consecutive_low_signal_rounds from "
+                            "%d to 0.",
+                            loop_counter["consecutive_low_signal_rounds"],
+                        )
+                    loop_counter["consecutive_low_signal_rounds"] = 0
                 try:
                     from harness.observability import emit_event as _emit
                     _emit(
@@ -9310,6 +9496,53 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if raw_output:
             error_summary += f"\n## Raw Build Output\n```\n{_slice_build_output_for_repair(raw_output)}\n```"
 
+    # Fix D — low-signal escalation. When the judge has returned the
+    # ``insufficient data — investigate <file>`` sentinel on two or more
+    # consecutive rounds, the structured diagnostics alone are not enough
+    # for the repair LLM to converge (session 116667f5: 6 rounds spent
+    # guessing at the value ``session.is_active`` returned because the
+    # bare AssertionError message hid it). Inject the raw build-output
+    # tail alongside the structured summary so the LLM sees the full
+    # pytest traceback (assertion-rewrite lines, ``+  where`` value
+    # explanations, attribute traversals) that the parser cannot reduce
+    # to a single message. Gated on the counter so we don't pay the
+    # extra tokens on healthy sessions where the diagnostics suffice.
+    _low_signal_streak = int(
+        loop_counter.get("consecutive_low_signal_rounds", 0) or 0
+    )
+    if errors and _low_signal_streak >= 2:
+        raw_output = state.get("node_state", {}).get("last_build_output", "")
+        if raw_output:
+            error_summary += (
+                "\n## Raw Build Output (low-signal escalation)\n"
+                "The reflection judge has been unable to localize the "
+                "failing diagnostic for "
+                f"{_low_signal_streak} consecutive rounds — the "
+                "structured diagnostics above collapse to bare exception "
+                "types. The full pytest traceback below is your primary "
+                "source of grounding this round: look for ``E   assert "
+                "<expr>``, ``E    +  where <val> = <obj>.<attr>``, and "
+                "similar assertion-rewrite lines that name the resolved "
+                "values so you can see what the assertion actually "
+                "compared.\n"
+                f"```\n{_slice_build_output_for_repair(raw_output)}\n```\n"
+            )
+            logger.info(
+                "[repair_node] Low-signal escalation: injected raw build "
+                "output tail into repair prompt "
+                "(consecutive_low_signal_rounds=%d).",
+                _low_signal_streak,
+            )
+            try:
+                from harness.observability import emit_event as _emit_ls
+                _emit_ls(
+                    "repair_low_signal_escalation",
+                    iteration=loop_counter.get("total_repairs", 0),
+                    consecutive_low_signal_rounds=_low_signal_streak,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     # When any diagnostic is MISSING_DEP, attach the current contents of the
     # dependency manifest the build command references. Without this the LLM
     # tries CREATE_FILE (which fails — "already exists with different content")
@@ -9840,6 +10073,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             ),
             enabled=_resolve_continue_on_length(state, "repair"),
             role_label="repair_node",
+            max_cycles=_resolve_max_continuation_cycles(state),
         )
         # Splice the accumulated chunks into the final response so
         # downstream READ_FILE parsing + the patcher see every block
@@ -13054,12 +13288,46 @@ async def requirements_discovery_node(state: AgentState) -> dict[str, Any]:
         from harness.trust import validate_discovery_json
         discovery_data, trust_errors = validate_discovery_json(response.content)
         if trust_errors:
-            logger.error("[reqs_disc] Discovery response failed trust validation: %s", trust_errors)
-            return {
-                "messages": messages,
-                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
-                "budget_remaining_usd": budget,
-            }
+            logger.info(
+                "[reqs_disc] Discovery response failed trust validation "
+                "(%s) — asking planner to re-emit.", trust_errors,
+            )
+            # One-shot repair: re-prompt the planner with the schema so
+            # a formatting slip doesn't terminate the interview and leave
+            # the operator staring at an empty screen.
+            async def _reqs_repair_dispatch(msgs, bud):
+                return await gateway.dispatch(
+                    messages=list(msgs),
+                    role=NodeRole.PLANNING,
+                    budget_remaining_usd=bud,
+                )
+            _discovery_schema = (
+                "A JSON object with exactly two top-level keys: "
+                "'modules' and 'complete'. 'modules' is an array of "
+                "objects, each with 'name' (string) and 'questions' "
+                "(array of objects with fields 'id' (string), 'text' "
+                "(string), 'critical' (bool)). 'complete' is a boolean "
+                "signalling whether discovery is finished. Emit no "
+                "other top-level keys."
+            )
+            repaired, budget = await _repair_malformed_json(
+                raw_text=response.content or "",
+                schema_hint=_discovery_schema,
+                dispatch=_reqs_repair_dispatch,
+                budget_remaining_usd=budget,
+                purpose="requirements_discovery",
+            )
+            if not isinstance(repaired, dict):
+                logger.warning(
+                    "[reqs_disc] Repair pass did not yield a JSON "
+                    "object — terminating discovery.",
+                )
+                return {
+                    "messages": messages,
+                    "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                    "budget_remaining_usd": budget,
+                }
+            discovery_data = repaired
 
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
@@ -13186,12 +13454,42 @@ async def architecture_discovery_node(state: AgentState) -> dict[str, Any]:
         from harness.trust import validate_discovery_json
         discovery_data, trust_errors = validate_discovery_json(response.content)
         if trust_errors:
-            logger.error("[arch_disc] Discovery response failed trust validation: %s", trust_errors)
-            return {
-                "messages": messages,
-                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
-                "budget_remaining_usd": budget,
-            }
+            logger.info(
+                "[arch_disc] Discovery response failed trust validation "
+                "(%s) — asking planner to re-emit.", trust_errors,
+            )
+            async def _arch_repair_dispatch(msgs, bud):
+                return await gateway.dispatch(
+                    messages=list(msgs),
+                    role=NodeRole.PLANNING,
+                    budget_remaining_usd=bud,
+                )
+            _arch_schema = (
+                "A JSON object with exactly two top-level keys: "
+                "'modules' and 'complete'. 'modules' is an array of "
+                "objects, each with 'name' (string) and 'questions' "
+                "(array of objects with fields 'id' (string), 'text' "
+                "(string), 'critical' (bool)). 'complete' is a boolean. "
+                "Emit no other top-level keys."
+            )
+            repaired, budget = await _repair_malformed_json(
+                raw_text=response.content or "",
+                schema_hint=_arch_schema,
+                dispatch=_arch_repair_dispatch,
+                budget_remaining_usd=budget,
+                purpose="architecture_discovery",
+            )
+            if not isinstance(repaired, dict):
+                logger.warning(
+                    "[arch_disc] Repair pass did not yield a JSON "
+                    "object — terminating discovery.",
+                )
+                return {
+                    "messages": messages,
+                    "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                    "budget_remaining_usd": budget,
+                }
+            discovery_data = repaired
 
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
@@ -13400,12 +13698,42 @@ JSON. No markdown, no explanation, no code blocks.""" + telemetry_block + resolv
         from harness.trust import validate_discovery_json
         discovery_data, trust_errors = validate_discovery_json(response.content)
         if trust_errors:
-            logger.error("[deploy_disc] Discovery response failed trust validation: %s", trust_errors)
-            return {
-                "messages": messages,
-                "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
-                "budget_remaining_usd": budget,
-            }
+            logger.info(
+                "[deploy_disc] Discovery response failed trust validation "
+                "(%s) — asking planner to re-emit.", trust_errors,
+            )
+            async def _deploy_repair_dispatch(msgs, bud):
+                return await gateway.dispatch(
+                    messages=list(msgs),
+                    role=NodeRole.PLANNING,
+                    budget_remaining_usd=bud,
+                )
+            _deploy_schema = (
+                "A JSON object with exactly two top-level keys: "
+                "'modules' and 'complete'. 'modules' is an array of "
+                "objects, each with 'name' (string) and 'questions' "
+                "(array of objects with fields 'id' (string), 'text' "
+                "(string), 'critical' (bool)). 'complete' is a boolean. "
+                "Emit no other top-level keys."
+            )
+            repaired, budget = await _repair_malformed_json(
+                raw_text=response.content or "",
+                schema_hint=_deploy_schema,
+                dispatch=_deploy_repair_dispatch,
+                budget_remaining_usd=budget,
+                purpose="deploy_discovery",
+            )
+            if not isinstance(repaired, dict):
+                logger.warning(
+                    "[deploy_disc] Repair pass did not yield a JSON "
+                    "object — terminating discovery.",
+                )
+                return {
+                    "messages": messages,
+                    "node_state": {"discovery_complete": True, "error": f"trust validation: {trust_errors}"},
+                    "budget_remaining_usd": budget,
+                }
+            discovery_data = repaired
 
         complete = discovery_data.get("complete", False)
         modules = discovery_data.get("modules", [])
@@ -13754,6 +14082,7 @@ async def review_and_revise_spec(
         ),
         enabled=_doc_continue_enabled,
         role_label="spec_review:critique",
+        max_cycles=_resolve_max_continuation_cycles(llm_dispatch_config or {}),
     )
     if len(_critique_chunks) > 1:
         critique_response.content = "\n".join(
@@ -13773,8 +14102,42 @@ async def review_and_revise_spec(
         if not isinstance(critique, dict):
             raise ValueError("critique JSON must be an object")
     except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("[spec_review] Critique was not valid JSON (%s) — passing through.", exc)
-        return result
+        logger.info(
+            "[spec_review] Critique was not valid JSON (%s) — asking "
+            "reviewer to re-emit.", exc,
+        )
+        # One-shot repair: re-prompt the reviewer with the schema and
+        # the offending text before discarding its output. See
+        # :func:`_repair_malformed_json`.
+        async def _spec_repair_dispatch(msgs, bud):
+            return await gateway.dispatch(
+                messages=list(msgs),
+                role=NodeRole.DOC_REVIEWER,
+                budget_remaining_usd=bud,
+            )
+        _schema_hint = (
+            "A JSON object with keys: 'issues' (array of strings), "
+            "'gaps' (array of strings), 'clarity_items' (array of "
+            "strings), 'followup_questions' (array of objects with "
+            "fields id, text, critical). Any of the arrays may be "
+            "empty; unknown keys are permitted."
+        )
+        repaired, new_budget = await _repair_malformed_json(
+            raw_text=critique_response.content or "",
+            schema_hint=_schema_hint,
+            dispatch=_spec_repair_dispatch,
+            budget_remaining_usd=new_budget,
+            purpose="spec_review_critique",
+        )
+        result["new_budget_usd"] = new_budget
+        if isinstance(repaired, dict):
+            critique = repaired
+        else:
+            logger.warning(
+                "[spec_review] Repair pass did not yield a JSON object — "
+                "passing through.",
+            )
+            return result
     result["critique"] = critique
 
     review_path = os.path.join(os.path.dirname(spec_path), review_filename)
@@ -13824,6 +14187,7 @@ async def review_and_revise_spec(
             ),
             enabled=_doc_continue_enabled,
             role_label="spec_review:revise",
+            max_cycles=_resolve_max_continuation_cycles(llm_dispatch_config or {}),
         )
         if len(_revise_chunks) > 1:
             revised_response.content = "\n".join(
@@ -14106,6 +14470,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         ),
         enabled=_code_continue_enabled,
         role_label="code_review:critique",
+        max_cycles=_resolve_max_continuation_cycles(state),
     )
     if len(_code_critique_chunks) > 1:
         critique_response.content = "\n".join(
@@ -14142,9 +14507,42 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
                     "result.", other_keys,
                 )
     except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("[code_review] Critique was not valid JSON (%s) — passing through.", exc)
-        findings = []
-        critique = {"findings": []}
+        logger.info(
+            "[code_review] Critique was not valid JSON (%s) — asking "
+            "reviewer to re-emit.", exc,
+        )
+        async def _code_repair_dispatch(msgs, bud):
+            return await gateway.dispatch(
+                messages=list(msgs),
+                role=NodeRole.CODE_REVIEWER,
+                budget_remaining_usd=bud,
+            )
+        _findings_schema = (
+            "A JSON object with a top-level 'findings' key holding an "
+            "array of finding objects. Each finding must include at "
+            "least: 'file' (string), 'severity' (one of 'critical', "
+            "'high', 'medium', 'low', 'info'), and 'message' (string). "
+            "May also include 'line' (int), 'category' (string), "
+            "'suggestion' (string). Emit an empty array when the code "
+            "is clean."
+        )
+        repaired, new_budget = await _repair_malformed_json(
+            raw_text=critique_response.content or "",
+            schema_hint=_findings_schema,
+            dispatch=_code_repair_dispatch,
+            budget_remaining_usd=new_budget,
+            purpose="code_review_critique",
+        )
+        if isinstance(repaired, dict) and isinstance(repaired.get("findings"), list):
+            critique = repaired
+            findings = repaired["findings"]
+        else:
+            logger.warning(
+                "[code_review] Repair pass did not yield a valid "
+                "findings JSON — passing through.",
+            )
+            findings = []
+            critique = {"findings": []}
 
     # Persist the critique regardless of whether findings exist.
     docs_dir = os.path.join(workspace, "docs")
@@ -14260,6 +14658,7 @@ Generate the patches that address every finding below. Output only the blocks �
             ),
             enabled=_code_continue_enabled,
             role_label="code_review:repatch",
+            max_cycles=_resolve_max_continuation_cycles(state),
         )
         if len(_code_repatch_chunks) > 1:
             repatch_response.content = "\n".join(
@@ -16100,6 +16499,7 @@ async def _reset_stale_gate_counters_on_resume(
         "consecutive_zero_patch_rounds",
         "no_progress_repairs",
         "consecutive_distraction_rounds",
+        "consecutive_low_signal_rounds",
         "missing_dep_consecutive_same",
     )
     before = {k: int(loop_counter.get(k, 0) or 0) for k in gate_keys}

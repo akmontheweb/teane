@@ -5,7 +5,7 @@ Verifies the three behaviour changes the repair pipeline gets when
 ``end_of_session_regression_node``:
 
 1. ``_repair_file_caps(state)`` returns the bigger (30, 150) tuple
-   (configurable via gateway config). Default returns (12, 50).
+   (configurable via gateway config). Default returns (24, 100).
 2. Repair prompt prepends an end-of-session framing block that names
    shared-utility cascades as a likely cause.
 3. Reasoning-model escalation is forced on the FIRST attempt (no need
@@ -51,11 +51,11 @@ def clean_gateway():
 class TestRepairFileCaps:
     def test_returns_defaults_outside_end_of_session_phase(self, clean_gateway):
         diag, inv = _repair_file_caps({"node_state": {}})
-        assert diag == _DEFAULT_REPAIR_DIAGNOSTIC_CAP == 12
-        assert inv == _DEFAULT_REPAIR_INVENTORY_CAP == 50
+        assert diag == _DEFAULT_REPAIR_DIAGNOSTIC_CAP == 24
+        assert inv == _DEFAULT_REPAIR_INVENTORY_CAP == 100
 
     def test_returns_defaults_when_node_state_missing(self, clean_gateway):
-        assert _repair_file_caps({}) == (12, 50)
+        assert _repair_file_caps({}) == (24, 100)
 
     def test_returns_eos_caps_when_phase_set(self, clean_gateway):
         st = {"node_state": {"end_of_session_phase": True}}
@@ -85,10 +85,10 @@ class TestRepairFileCaps:
         # False / 0 / "" → still uses defaults.
         assert _repair_file_caps(
             {"node_state": {"end_of_session_phase": False}},
-        ) == (12, 50)
+        ) == (24, 100)
         assert _repair_file_caps(
             {"node_state": {"end_of_session_phase": 0}},
-        ) == (12, 50)
+        ) == (24, 100)
 
 
 # ---------------------------------------------------------------------------

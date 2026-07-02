@@ -5765,16 +5765,16 @@ class TestPriorPatchFailureSurfacing:
         # Files larger than the whole-file caps fall back to a window
         # around the closest match.
         from harness.patcher import _find_closest_match
-        # 400 lines, well over the 300-line cap.
+        # 1500 lines, well over the 1000-line cap.
         text = "\n".join(
-            f"line_{i}: lorem ipsum dolor sit amet consectetur" for i in range(400)
+            f"line_{i}: lorem ipsum dolor sit amet consectetur" for i in range(1500)
         )
-        out = _find_closest_match(text, "line_200: lorem ipsum dolor sit amet")
-        # The window centres on the match (line 200), NOT line 1.
-        assert "line_200" in out
+        out = _find_closest_match(text, "line_800: lorem ipsum dolor sit amet")
+        # The window centres on the match (line 800), NOT line 1.
+        assert "line_800" in out
         assert "line_0:" not in out  # the top of the file is NOT shown
         # And the window is capped — not the whole file.
-        assert len(out) <= 6100  # 6000 cap + tiny truncation suffix headroom
+        assert len(out) <= 20100  # 20000 cap + tiny truncation suffix headroom
 
     def test_failure_block_includes_file_op_and_full_error(self):
         from harness.graph import _format_prior_patch_failures
@@ -7510,8 +7510,10 @@ class TestContinueOnLengthHelper:
         asyncio.run(_go())
 
     def test_cap_at_three_cycles(self, caplog):
-        # 4 length responses → exactly 3 continuation dispatches
-        # (initial + 3) and a warning logged for the unfinished tail.
+        # With an explicit max_cycles=3, 4 length responses → exactly
+        # 3 continuation dispatches (initial + 3) and a warning logged
+        # for the unfinished tail. The default cap is 5, so this test
+        # pins the caller-supplied override path.
         import asyncio
         import logging
         from harness.graph import _continue_on_length
@@ -7534,6 +7536,7 @@ class TestContinueOnLengthHelper:
                     continue_prompt="more",
                     enabled=True,
                     role_label="test_role",
+                    max_cycles=3,
                 )
             assert len(log) == 3, "must cap at 3 continuation dispatches"
             assert chunks == ["c0", "c1", "c2", "c3"]

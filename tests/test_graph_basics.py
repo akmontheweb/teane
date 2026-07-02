@@ -2047,13 +2047,13 @@ class TestPatchingNodeContinuation:
 
     def test_caps_continuation_at_three_cycles(self, monkeypatch, tmp_path):
         """Pathological case: LLM keeps returning ``length``. The
-        node must not loop forever — three continuation cycles is
-        the ceiling, after which the node accepts what landed."""
+        node must not loop forever — the default continuation ceiling
+        (5 cycles) is respected, after which the node accepts what landed."""
         graph_mod = self._install_gateway_stub(monkeypatch)
 
-        # Initial + 3 continuations = 4 dispatches, all "length".
+        # Initial + 5 continuations = 6 dispatches, all "length".
         responses = [
-            _PatchingResponse(f"chunk{i} ", "length") for i in range(1, 5)
+            _PatchingResponse(f"chunk{i} ", "length") for i in range(1, 7)
         ]
         dispatches: list[int] = []
 
@@ -2086,8 +2086,8 @@ class TestPatchingNodeContinuation:
 
         asyncio.run(graph_mod.patching_node(state))
 
-        # 4 = initial + 3 continuation cycles. No more.
-        assert len(dispatches) == 4
-        # All four chunks reached the patcher.
+        # 6 = initial + 5 continuation cycles. No more.
+        assert len(dispatches) == 6
+        # All six chunks reached the patcher.
         assert "chunk1" in captured["content"]
-        assert "chunk4" in captured["content"]
+        assert "chunk6" in captured["content"]

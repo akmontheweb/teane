@@ -2690,15 +2690,23 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     ):
         if key in loop_counter:
             loop_counter[key] = 0
-    # Persistent-blocker directive keys — clear so a resumed session
-    # doesn't fire a "same location twice in a row" banner using state
-    # that predates the auto-resume. The next round starts fresh.
+    # judge_ignored bookkeeping resets on auto-resume — those flags
+    # exist to make the NEXT round's banner escalate ("YOU IGNORED THE
+    # JUDGE"), which only makes sense in a single unbroken repair
+    # stretch. But we deliberately KEEP
+    # ``judge_named_file_lines_last_round`` and
+    # ``persistent_blocker_streak_per_file``: in headless auto-resume
+    # nothing outside the harness has changed, so a blocker that was
+    # persistent BEFORE the HITL trip is still persistent AFTER it, and
+    # the persistent-blocker banner should fire IMMEDIATELY on the next
+    # round instead of waiting two more rounds to re-detect the streak
+    # from zero. Session bs27lvfpl demonstrated the miss: hard-cap fired
+    # every 6 rounds on ``edgar.py:172``, the wipe reset the streak, and
+    # the ESCAPE HATCH banner never got to fire because streak >= 3
+    # required three consecutive rounds without a HITL interruption.
     for key in (
-        "judge_named_file_lines_last_round",
-        "judge_named_files_last_round",
         "judge_round_touched_files",
         "judge_ignored_last_round",
-        "persistent_blocker_streak_per_file",
     ):
         loop_counter.pop(key, None)
     # Per-file miss counts drive the "use a different operation" LLM

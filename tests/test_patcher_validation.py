@@ -179,6 +179,51 @@ class TestPostPatchValidation:
             assert os.path.isfile(os.path.join(td, "new.py"))
 
     @pytest.mark.asyncio
+    async def test_create_file_overwrites_empty_existing(self):
+        # Regression for the DELETE_BLOCK + CREATE_FILE trap: after the
+        # LLM has failed REPLACE_BLOCK twice on a file, the harness
+        # directs it to use DELETE_BLOCK + CREATE_FILE instead. If the
+        # first step lands (file becomes empty) and the CREATE_FILE step
+        # then rejects on "file already exists with different content",
+        # the file stays empty and the loop cycles. An empty file has
+        # no author-preserving content, so CREATE_FILE should overwrite
+        # it. Session b61f48a7 spent 3+ HITL cycles on this exact loop
+        # for ``backend/api/search.py``.
+        with tempfile.TemporaryDirectory() as td:
+            # Case: file exists with a single newline (typical LLM
+            # DELETE_BLOCK residue).
+            with open(os.path.join(td, "m.py"), "w") as f:
+                f.write("\n")
+            patcher = HybridPatcher(td)
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.CREATE_FILE,
+                file="m.py",
+                content="def f():\n    return 1\n",
+            )])
+            assert results[0].success is True
+            with open(os.path.join(td, "m.py")) as f:
+                assert "def f" in f.read()
+
+    @pytest.mark.asyncio
+    async def test_create_file_still_rejects_non_empty_existing(self):
+        # The empty-file overwrite must NOT weaken the guard for real
+        # content — a file with author code still gets the classic
+        # "file already exists with different content" rejection.
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "m.py"), "w") as f:
+                f.write("existing = 1\n")
+            patcher = HybridPatcher(td)
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.CREATE_FILE,
+                file="m.py",
+                content="new = 2\n",
+            )])
+            assert results[0].success is False
+            assert "already exists" in (results[0].error or "").lower()
+            with open(os.path.join(td, "m.py")) as f:
+                assert "existing = 1" in f.read()
+
+    @pytest.mark.asyncio
     async def test_apply_all_continues_past_validation_rollback(self):
         # A validation-rolled-back block must not stop subsequent blocks
         # from applying — same invariant as

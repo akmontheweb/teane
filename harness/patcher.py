@@ -848,6 +848,43 @@ class TextPatcher(BasePatcher):
                     lines_changed=0,
                     no_op=True,
                 )
+            # Empty / whitespace-only file: treat CREATE_FILE as a
+            # first-write, not a conflict. This is the DELETE_BLOCK +
+            # CREATE_FILE trap the LLM falls into after failing REPLACE_
+            # BLOCK twice: the harness's own directive tells it to use
+            # DELETE_BLOCK to clear the file, then CREATE_FILE the new
+            # content. The DELETE lands (file is now ``\n``), then
+            # CREATE_FILE rejects on "different content" because empty
+            # != new — net result is an empty file and a wasted round.
+            # Session b61f48a7 spent 3+ HITL cycles on
+            # ``backend/api/search.py`` in this exact loop.
+            # An empty file has no operator-authored content to preserve,
+            # so overwriting it is safe and the correct end-state anyway.
+            if not actual.strip():
+                logger.info(
+                    "[patcher:text] CREATE_FILE overwriting empty/whitespace-only "
+                    "file %s (no content to preserve).", filepath,
+                )
+                try:
+                    await _awrite(full_path, expected)
+                    lines_added = content.count("\n") + 1
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.CREATE_FILE,
+                        message=(
+                            f"Created {filepath} ({lines_added} lines; "
+                            "overwrote empty file)"
+                        ),
+                        lines_changed=lines_added,
+                    )
+                except OSError as exc:
+                    return PatchResult(
+                        success=False,
+                        file=filepath,
+                        operation=OperationType.CREATE_FILE,
+                        error=str(exc),
+                    )
             # File exists with different content — surface the FULL
             # current content (line-numbered, whole-file mode when small)
             # so the LLM's next round can emit a REPLACE_BLOCK against

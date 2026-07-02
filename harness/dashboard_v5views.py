@@ -545,3 +545,491 @@ def render_traceability_card(workspace_path: str) -> str:
         + gauges + untraced_html + untested_html +
         "</div>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stories browser — cross-session workspace-scoped views
+# ---------------------------------------------------------------------------
+# Two entry points:
+#
+# - :func:`render_stories_index_page` — one row per workspace with story
+#   data, rolling up feature/story/defect counts and last activity.
+# - :func:`render_stories_workspace_page` — for one workspace: features
+#   with per-status rollups, recent batches, open+closed defects.
+#
+# These read the same ``~/.harness/state.db`` the session-detail cards
+# already query; the difference is scope. The session cards answer
+# "what did THIS run touch"; the stories page answers "what does this
+# workspace look like, across every run".
+
+
+_STORY_KEY_URL_RE = "[A-Za-z0-9_.\\-]+"
+"""Regex fragment reused in the dashboard route table so the stories
+routes accept the same workspace-basename shape ``app_name_for_workspace``
+already produces."""
+
+
+def _list_workspaces_with_story_data(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """One row per workspace that has any features/stories/batches/defects.
+
+    Rollup counts come from a single UNION-ALL scan so the query works
+    even when a workspace has features but no stories yet (or a defect
+    orphaned by a deleted story). Empty state.db → empty list.
+    """
+    sql = """
+    WITH ws AS (
+        SELECT workspace FROM features
+        UNION SELECT workspace FROM stories
+        UNION SELECT workspace FROM batches
+        UNION SELECT workspace FROM defects
+    )
+    SELECT
+        ws.workspace,
+        (SELECT COUNT(*) FROM features f WHERE f.workspace = ws.workspace)   AS features,
+        (SELECT COUNT(*) FROM stories  s WHERE s.workspace = ws.workspace)   AS stories,
+        (SELECT COUNT(*) FROM stories  s WHERE s.workspace = ws.workspace AND s.status = 'done')        AS done,
+        (SELECT COUNT(*) FROM stories  s WHERE s.workspace = ws.workspace AND s.status = 'in_progress') AS in_progress,
+        (SELECT COUNT(*) FROM stories  s WHERE s.workspace = ws.workspace AND s.status = 'planned')     AS planned,
+        (SELECT COUNT(*) FROM stories  s WHERE s.workspace = ws.workspace AND s.status = 'blocked')     AS blocked,
+        (SELECT COUNT(*) FROM defects  d WHERE d.workspace = ws.workspace AND d.status = 'open')        AS open_defects,
+        (SELECT COUNT(*) FROM batches  b WHERE b.workspace = ws.workspace)   AS batches,
+        (SELECT MAX(COALESCE(s.completed_at, s.started_at, s.created_at))
+           FROM stories s WHERE s.workspace = ws.workspace)                  AS last_story_activity,
+        (SELECT MAX(COALESCE(b.completed_at, b.started_at))
+           FROM batches b WHERE b.workspace = ws.workspace)                  AS last_batch_activity
+    FROM ws
+    ORDER BY COALESCE(last_batch_activity, last_story_activity, '') DESC, ws.workspace
+    """
+    rows = conn.execute(sql).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "workspace": r[0],
+            "features": int(r[1] or 0),
+            "stories": int(r[2] or 0),
+            "done": int(r[3] or 0),
+            "in_progress": int(r[4] or 0),
+            "planned": int(r[5] or 0),
+            "blocked": int(r[6] or 0),
+            "open_defects": int(r[7] or 0),
+            "batches": int(r[8] or 0),
+            "last_activity": r[9] or r[10] or "",
+        })
+    return out
+
+
+def _feature_rollups(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """One row per feature with per-status story counts.
+
+    A LEFT JOIN keeps features that have no stories yet — rendering them
+    as empty rather than dropping them, so the operator can see the
+    planned decomposition even before any batch has run.
+    """
+    sql = """
+    SELECT
+        f.id, f.feature_key, f.name,
+        COUNT(s.id)                                    AS total,
+        SUM(CASE WHEN s.status='done'        THEN 1 ELSE 0 END) AS done,
+        SUM(CASE WHEN s.status='in_progress' THEN 1 ELSE 0 END) AS in_progress,
+        SUM(CASE WHEN s.status='planned'     THEN 1 ELSE 0 END) AS planned,
+        SUM(CASE WHEN s.status='blocked'     THEN 1 ELSE 0 END) AS blocked
+    FROM features f
+    LEFT JOIN stories s
+        ON s.workspace = f.workspace AND s.feature_id = f.id
+    WHERE f.workspace = ?
+    GROUP BY f.id, f.feature_key, f.name
+    ORDER BY f.id
+    """
+    rows = conn.execute(sql, (workspace,)).fetchall()
+    return [
+        {
+            "id": r[0], "feature_key": r[1], "name": r[2],
+            "total": int(r[3] or 0),
+            "done": int(r[4] or 0),
+            "in_progress": int(r[5] or 0),
+            "planned": int(r[6] or 0),
+            "blocked": int(r[7] or 0),
+        }
+        for r in rows
+    ]
+
+
+def _list_recent_batches(
+    conn: sqlite3.Connection, workspace: str, limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Last ``limit`` batches for the workspace, newest first, joined
+    with feature_key so the row is readable without a second lookup."""
+    rows = conn.execute(
+        "SELECT b.id, b.session_id, b.started_at, b.completed_at, b.status, "
+        "b.committed_sha, b.build_kind, b.cr_ids, "
+        "f.feature_key, "
+        "(SELECT COUNT(*) FROM batch_stories bs WHERE bs.batch_id = b.id) AS story_count "
+        "FROM batches b "
+        "LEFT JOIN features f ON f.id = b.feature_id "
+        "WHERE b.workspace = ? "
+        "ORDER BY b.id DESC LIMIT ?",
+        (workspace, int(limit)),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            cr_list = json.loads(r[7]) if r[7] else []
+        except (json.JSONDecodeError, TypeError):
+            cr_list = []
+        out.append({
+            "id": r[0],
+            "session_id": r[1],
+            "started_at": r[2],
+            "completed_at": r[3],
+            "status": r[4],
+            "committed_sha": r[5],
+            "build_kind": r[6] or "",
+            "cr_ids": cr_list,
+            "feature_key": r[8],
+            "story_count": int(r[9] or 0),
+        })
+    return out
+
+
+def _list_defects(
+    conn: sqlite3.Connection, workspace: str, *, only_open: bool,
+) -> list[dict[str, Any]]:
+    """Defects joined with the offending story's key/title.
+
+    ``only_open=True`` scopes to ``status='open'`` — the default view.
+    ``False`` returns every defect, resolved rows included, so operators
+    can review closures in the expanded panel.
+    """
+    where = "d.workspace = ?"
+    params: list[Any] = [workspace]
+    if only_open:
+        where += " AND d.status = 'open'"
+    rows = conn.execute(
+        "SELECT d.id, d.session_id, d.severity, d.summary, d.status, "
+        "d.created_at, d.resolved_at, s.story_key, s.title "
+        "FROM defects d "
+        "LEFT JOIN stories s ON s.id = d.story_id "
+        f"WHERE {where} "
+        "ORDER BY (d.status='open') DESC, d.created_at DESC",
+        tuple(params),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "session_id": r[1], "severity": r[2], "summary": r[3],
+            "status": r[4], "created_at": r[5], "resolved_at": r[6],
+            "story_key": r[7], "title": r[8],
+        }
+        for r in rows
+    ]
+
+
+def render_stories_index_page(cfg: Any = None) -> str:
+    """Full-page HTML for ``GET /stories``.
+
+    Lists every workspace that has story data, with rollup counts and a
+    click-through to the workspace detail page. Empty state.db renders
+    as an "no story data yet" card so the route never 500s.
+    """
+    conn = _open_state_db_readonly()
+    if conn is None:
+        return _stories_empty_state_index()
+    try:
+        rows = _list_workspaces_with_story_data(conn)
+    except sqlite3.Error as exc:
+        logger.warning("[v5views] stories index read failed: %s", exc)
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not rows:
+        return _stories_empty_state_index()
+
+    body_rows = []
+    for r in rows:
+        ws = r["workspace"]
+        ws_link = f"<a href='/stories/{_esc(ws)}'><code>{_esc(ws)}</code></a>"
+        defect_cell = (
+            f"<span class='bx--tag bx--tag--red'>{r['open_defects']}</span>"
+            if r["open_defects"] else
+            "<span class='muted'>0</span>"
+        )
+        body_rows.append(
+            "<tr>"
+            f"<td>{ws_link}</td>"
+            f"<td>{r['features']}</td>"
+            f"<td>{r['done']} / {r['stories']}</td>"
+            f"<td>{r['in_progress']}</td>"
+            f"<td>{r['planned']}</td>"
+            f"<td>{r['blocked']}</td>"
+            f"<td>{defect_cell}</td>"
+            f"<td>{r['batches']}</td>"
+            f"<td><span class='muted'>{_esc(r['last_activity'] or '—')}</span></td>"
+            "</tr>"
+        )
+    table = (
+        "<div class='table-wrap'><table class='w-100'>"
+        "<thead><tr>"
+        "<th>Workspace</th><th>Features</th><th>Done / total</th>"
+        "<th>In progress</th><th>Planned</th><th>Blocked</th>"
+        "<th>Open defects</th><th>Batches</th><th>Last activity</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(body_rows) + "</tbody></table></div>"
+    )
+    return (
+        "<div class='card'><h2>Stories &amp; coverage</h2>"
+        "<p class='muted'>Every workspace with feature/story/batch/defect "
+        "rows in <code>~/.harness/state.db</code>. Click a workspace to "
+        "see its features, batches and defect list.</p>"
+        + table +
+        "</div>"
+    )
+
+
+def _stories_empty_state_index() -> str:
+    return (
+        "<div class='card'><h2>Stories &amp; coverage</h2>"
+        "<p class='muted'>No story data yet. This page populates as "
+        "<code>teane build</code> / <code>teane patch</code> / "
+        "<code>teane test</code> runs create features, stories, batches "
+        "and defects in <code>~/.harness/state.db</code>.</p>"
+        "</div>"
+    )
+
+
+def render_stories_workspace_page(cfg: Any, workspace_basename: str) -> str:
+    """Full-page HTML for ``GET /stories/<workspace_basename>``.
+
+    Renders four cards: Features (with per-feature story rollups),
+    Batches (recent 50), Defects (open + closed collapsed), and a
+    breadcrumb back to /stories. Unknown workspace → empty-state card
+    listing what a valid workspace basename looks like.
+    """
+    ws = (workspace_basename or "").strip()
+    breadcrumb = (
+        "<ol class='breadcrumb' aria-label='Breadcrumb'>"
+        "<li><a href='/stories'>Stories</a></li>"
+        f"<li class='breadcrumb__current' aria-current='page'>{_esc(ws)}</li>"
+        "</ol>"
+    )
+    if not ws:
+        return breadcrumb + _stories_workspace_missing_card(ws)
+
+    conn = _open_state_db_readonly()
+    if conn is None:
+        return breadcrumb + _stories_workspace_missing_card(ws)
+    try:
+        features = _feature_rollups(conn, ws)
+        stories = []
+        try:
+            from harness.story_state import list_stories  # local import
+            stories = list_stories(conn, ws)
+        except (ImportError, sqlite3.Error) as exc:
+            logger.warning("[v5views] list_stories failed for %s: %s", ws, exc)
+        batches = _list_recent_batches(conn, ws)
+        open_defects = _list_defects(conn, ws, only_open=True)
+        all_defects = _list_defects(conn, ws, only_open=False)
+    except sqlite3.Error as exc:
+        logger.warning("[v5views] stories workspace read failed: %s", exc)
+        return breadcrumb + _stories_workspace_missing_card(ws)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # If nothing exists for this workspace basename, treat it as unknown
+    # rather than rendering four empty cards.
+    if not features and not stories and not batches and not all_defects:
+        return breadcrumb + _stories_workspace_missing_card(ws)
+
+    stories_by_feature: dict[Optional[int], list[dict[str, Any]]] = {}
+    for s in stories:
+        stories_by_feature.setdefault(s.get("feature_id"), []).append(s)
+
+    parts: list[str] = [breadcrumb]
+    parts.append(_render_features_rollup_card(features, stories_by_feature))
+    parts.append(_render_batches_card(batches))
+    parts.append(_render_defects_card(open_defects, all_defects))
+    return "".join(parts)
+
+
+def _stories_workspace_missing_card(ws: str) -> str:
+    return (
+        "<div class='card'><h2>Workspace not found</h2>"
+        f"<p class='muted'>No story data for workspace "
+        f"<code>{_esc(ws) if ws else '(empty)'}</code>. The "
+        "identifier is the workspace folder's basename (see "
+        "<code>app_name_for_workspace</code>).</p>"
+        "<p><a href='/stories' class='bx--btn bx--btn--tertiary'>"
+        "Back to Stories index</a></p></div>"
+    )
+
+
+def _render_features_rollup_card(
+    features: list[dict[str, Any]],
+    stories_by_feature: dict[Optional[int], list[dict[str, Any]]],
+) -> str:
+    if not features:
+        return (
+            "<div class='card'><h2>Features</h2>"
+            "<p class='muted'>No feature rows yet for this workspace.</p>"
+            "</div>"
+        )
+    blocks: list[str] = []
+    for f in features:
+        fid = f["id"]
+        f_key = f.get("feature_key") or "(unknown)"
+        f_name = f.get("name") or f_key
+        rollup = (
+            f"<span class='bx--tag bx--tag--green'>{f['done']} done</span> "
+            f"<span class='bx--tag bx--tag--blue'>{f['in_progress']} in flight</span> "
+            f"<span class='bx--tag'>{f['planned']} planned</span> "
+            + (
+                f"<span class='bx--tag bx--tag--red'>{f['blocked']} blocked</span>"
+                if f["blocked"] else ""
+            )
+        )
+        summary = (
+            f"<summary><strong>{_esc(f_name)}</strong> "
+            f"<code class='muted fs-sm'>{_esc(f_key)}</code> "
+            f"<span class='muted'>· {f['total']} stories</span> "
+            f"{rollup}</summary>"
+        )
+        story_rows = stories_by_feature.get(fid, [])
+        if story_rows:
+            rows = []
+            for s in story_rows:
+                rows.append(
+                    "<tr>"
+                    f"<td><code>{_esc(s.get('story_key'))}</code></td>"
+                    f"<td>{_esc(s.get('title') or '')}</td>"
+                    f"<td><span class='bx--tag'>{_esc(s.get('status') or '')}</span></td>"
+                    f"<td>{_build_kind_badge(str(s.get('build_kind') or ''))}</td>"
+                    f"<td>{_cr_ids_badge(s.get('cr_ids'))}</td>"
+                    "</tr>"
+                )
+            table = (
+                "<div class='table-wrap'><table class='w-100'>"
+                "<thead><tr><th>Story</th><th>Title</th><th>Status</th>"
+                "<th>Build kind</th><th>CRs</th></tr></thead>"
+                "<tbody>" + "".join(rows) + "</tbody></table></div>"
+            )
+        else:
+            table = "<p class='muted'>No stories yet.</p>"
+        blocks.append(f"<details open>{summary}{table}</details>")
+    return "<div class='card'><h2>Features</h2>" + "".join(blocks) + "</div>"
+
+
+def _render_batches_card(batches: list[dict[str, Any]]) -> str:
+    if not batches:
+        return (
+            "<div class='card'><h2>Batches</h2>"
+            "<p class='muted'>No batches recorded for this workspace yet.</p>"
+            "</div>"
+        )
+    rows = []
+    for b in batches:
+        sha = (b.get("committed_sha") or "")[:10]
+        sid = b.get("session_id") or ""
+        session_cell = (
+            f"<a href='/sessions/{_esc(sid)}'><code>{_esc(sid)}</code></a>"
+            if sid else "<span class='muted'>—</span>"
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{int(b['id'])}</td>"
+            f"<td>{session_cell}</td>"
+            f"<td>{_esc(b.get('feature_key') or '—')}</td>"
+            f"<td>{b.get('story_count', 0)}</td>"
+            f"<td>{_esc(b.get('status') or '')}</td>"
+            f"<td>{_build_kind_badge(str(b.get('build_kind') or ''))}</td>"
+            f"<td><code class='muted'>{_esc(sha) if sha else '—'}</code></td>"
+            f"<td>{_cr_ids_badge(b.get('cr_ids'))}</td>"
+            f"<td>{_esc(b.get('started_at') or '')}</td>"
+            f"<td>{_esc(b.get('completed_at') or '—')}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='card'><h2>Batches</h2>"
+        "<div class='table-wrap'><table class='w-100'>"
+        "<thead><tr><th>ID</th><th>Session</th><th>Feature</th>"
+        "<th>Stories</th><th>Status</th><th>Build kind</th>"
+        "<th>Commit</th><th>CRs</th><th>Started</th><th>Completed</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div></div>"
+    )
+
+
+def _render_defects_card(
+    open_defects: list[dict[str, Any]],
+    all_defects: list[dict[str, Any]],
+) -> str:
+    if not all_defects:
+        return (
+            "<div class='card'><h2>Defects</h2>"
+            "<p class='muted'>No defects recorded for this workspace.</p>"
+            "</div>"
+        )
+    open_table = _defects_table(open_defects, empty_msg="No open defects.")
+    resolved = [d for d in all_defects if d.get("status") != "open"]
+    resolved_html = ""
+    if resolved:
+        resolved_html = (
+            f"<details><summary><strong>Resolved defects "
+            f"({len(resolved)})</strong></summary>"
+            + _defects_table(resolved, empty_msg="")
+            + "</details>"
+        )
+    return (
+        "<div class='card'><h2>Defects</h2>"
+        f"<h3>Open ({len(open_defects)})</h3>"
+        + open_table + resolved_html +
+        "</div>"
+    )
+
+
+def _defects_table(defects: list[dict[str, Any]], *, empty_msg: str) -> str:
+    if not defects:
+        return f"<p class='muted'>{_esc(empty_msg)}</p>" if empty_msg else ""
+    rows = []
+    for d in defects:
+        sid = d.get("session_id") or ""
+        session_cell = (
+            f"<a href='/sessions/{_esc(sid)}'><code>{_esc(sid)}</code></a>"
+            if sid else "<span class='muted'>—</span>"
+        )
+        story_cell = (
+            f"<code>{_esc(d.get('story_key'))}</code>"
+            if d.get("story_key") else "<span class='muted'>—</span>"
+        )
+        severity = str(d.get("severity") or "").lower()
+        severity_class = (
+            "bx--tag--red" if severity in ("critical", "high", "error")
+            else "bx--tag--purple" if severity == "medium"
+            else "bx--tag"
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{int(d['id'])}</td>"
+            f"<td><span class='bx--tag {severity_class}'>{_esc(d.get('severity') or '')}</span></td>"
+            f"<td>{_esc(d.get('summary') or '')}</td>"
+            f"<td>{story_cell}</td>"
+            f"<td>{session_cell}</td>"
+            f"<td>{_esc(d.get('created_at') or '')}</td>"
+            f"<td>{_esc(d.get('resolved_at') or '—')}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='table-wrap'><table class='w-100'>"
+        "<thead><tr><th>ID</th><th>Severity</th><th>Summary</th>"
+        "<th>Story</th><th>Session</th><th>Created</th><th>Resolved</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+    )

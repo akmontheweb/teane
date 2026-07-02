@@ -1765,6 +1765,23 @@ def _route_memory_file(cfg: DashboardConfig, params: dict[str, str]) -> tuple[in
     )
 
 
+def _route_stories_index(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, str, str]:
+    from harness.dashboard_v5views import render_stories_index_page
+    body = render_stories_index_page(cfg)
+    return 200, "text/html; charset=utf-8", _layout(
+        "Stories & coverage", body, cfg, active="dashboards",
+    )
+
+
+def _route_stories_workspace(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    from harness.dashboard_v5views import render_stories_workspace_page
+    ws = params["ws"]
+    body = render_stories_workspace_page(cfg, ws)
+    return 200, "text/html; charset=utf-8", _layout(
+        f"Stories · {ws}", body, cfg, active="dashboards",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. Carbon shell — 5 top-level pages
 # ---------------------------------------------------------------------------
@@ -3124,6 +3141,7 @@ _DASHBOARD_TILES: tuple[tuple[str, str, str, str], ...] = (
     ("View Status", "Day / week / month summary plus what's running right now.", "/status", "chart-line"),
     ("Cost burn-down", "Cumulative spend and per-call cost across every session.", "/cost", "chart-line"),
     ("Sessions list", "Every harness session on disk with exit code and token totals.", "/sessions", "list"),
+    ("Stories & coverage", "Features, stories, batches and open defects for every workspace.", "/stories", "checkmark-filled"),
     ("Saved presets", "Reusable workspace + prompt + flag bundles for one-click recall.", "/run/presets", "bookmark"),
     ("Schedule", "Configured jobs + run history for the cron-driven scheduled-job daemon.", "/schedule", "calendar"),
     ("Repo index", "Status of the semantic retrieval index per workspace.", "/index", "search"),
@@ -3413,6 +3431,8 @@ _ROUTES: list[Route] = [
     (re.compile(r"^/index/?$"), _route_index),
     (re.compile(r"^/memory/?$"), _route_memory),
     (re.compile(r"^/memory/(?P<name>[A-Za-z0-9_.\-]+\.md)$"), _route_memory_file),
+    (re.compile(r"^/stories/?$"), _route_stories_index),
+    (re.compile(r"^/stories/(?P<ws>[A-Za-z0-9_.\-]+)/?$"), _route_stories_workspace),
     # Carbon shell — 5 new top-level pages. Each renders a stub in Phase 1.
     (re.compile(r"^/home/?$"), _route_home),
     (re.compile(r"^/status/?$"), _route_status),

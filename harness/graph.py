@@ -7404,6 +7404,78 @@ def _verdict_named_file_lines(
     return matched
 
 
+def _related_test_files(
+    source_file: str,
+    workspace_path: str,
+    *,
+    max_matches: int = 5,
+) -> list[str]:
+    """Return relative paths of test files whose basename matches
+    ``test_<stem>.py`` for the given ``source_file`` and live under a
+    ``tests/`` / ``test/`` directory in the workspace.
+
+    Used by the "fix may belong in the test file" hint (session
+    b92043caq): when the reflection judge persistently names a source
+    file (``backend/services/edgar.py`` → 4 rounds of "coroutine not
+    awaited"), the LLM tends to keep patching the source even when the
+    real fix is in the test's mock setup. Surfacing the related test
+    path gives the LLM a concrete second target to consider.
+
+    Path resolution is basename-only — we don't try to match full
+    module paths because tests are often placed in a mirror layout
+    (``tests/backend/services/test_edgar.py``) OR flat
+    (``backend/tests/test_edgar.py``) OR top-level (``tests/test_edgar.py``).
+    Basename covers all three without hard-coding a project layout.
+
+    Returns ``[]`` when no candidate matches or ``workspace_path``
+    can't be walked. Never raises.
+    """
+    if not source_file or not workspace_path:
+        return []
+    stem = os.path.splitext(os.path.basename(source_file))[0]
+    if not stem or stem.startswith("__"):
+        return []
+    target = f"test_{stem}.py"
+    matches: list[str] = []
+    try:
+        for root, dirs, files in os.walk(workspace_path):
+            # Skip obviously irrelevant dirs. VCS + package caches +
+            # deps trees dominate os.walk runtime without ever
+            # containing a project test file. Keep the exclusion set
+            # narrow so we don't accidentally skip a legitimate
+            # ``tests/`` layout the operator happened to place under
+            # e.g. ``vendor/``.
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".")
+                and d not in {
+                    "node_modules", "__pycache__", ".pytest_cache",
+                    ".mypy_cache", ".venv", "venv", "dist", "build",
+                }
+            ]
+            rel_root = os.path.relpath(root, workspace_path)
+            # Only accept matches under a directory named ``tests`` or
+            # ``test`` somewhere in the relative path — a bare
+            # ``test_foo.py`` sitting at workspace root next to source
+            # is much more likely to be an accidental collision than
+            # a real test target.
+            path_parts = {p.lower() for p in rel_root.split(os.sep)}
+            if not ({"tests", "test"} & path_parts):
+                continue
+            if target in files:
+                rel_path = os.path.normpath(os.path.join(rel_root, target))
+                # Never suggest editing the file that IS the persistent
+                # blocker source — happens when someone named their
+                # source file test_x.py by mistake.
+                if os.path.normpath(rel_path) != os.path.normpath(source_file):
+                    matches.append(rel_path)
+                    if len(matches) >= max_matches:
+                        break
+    except OSError:
+        return []
+    return matches
+
+
 def _shared_root_cause_fanout(
     compiler_errors: list[dict[str, Any]],
     *,
@@ -10025,6 +10097,50 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "still applies: broken syntax rolls the file "
                         "back."
                     )
+                    # "Fix may belong in the test file" hint. When a
+                    # source file has been the persistent blocker for
+                    # 3+ rounds without converging, the fix is often
+                    # actually in the test's mock setup or assertion,
+                    # NOT the source file the traceback points at.
+                    # Session b92043caq stalled on
+                    # ``backend/services/edgar.py:96`` for 4 rounds while
+                    # the real bug was an AsyncMock context-manager
+                    # setup in ``backend/tests/test_edgar.py``. Surface
+                    # the sibling test path so the LLM has a concrete
+                    # second target to consider before REWRITE_FILE'ing
+                    # the source.
+                    _workspace = str(state.get("workspace_path", "") or "")
+                    _companion_tests: list[str] = []
+                    for _sf in _stuck_files:
+                        # Only look for a companion when the stuck file
+                        # is NOT itself a test — patching a test with a
+                        # test is not the failure mode this catches.
+                        _sf_norm = _sf.lower()
+                        if "test_" in os.path.basename(_sf_norm):
+                            continue
+                        _companion_tests.extend(
+                            _related_test_files(_sf, _workspace)
+                        )
+                    # Dedupe + cap to keep the banner focused.
+                    _companion_tests = list(dict.fromkeys(_companion_tests))[:5]
+                    if _companion_tests:
+                        reflection_banner_lines.append(
+                            "TEST-FILE HINT — before REWRITE_FILE'ing the "
+                            "source, check whether the fix belongs in the "
+                            f"related test file(s): {', '.join(_companion_tests)}. "
+                            "This pattern (persistent blocker in a source "
+                            "file after 3+ rounds) is often caused by a "
+                            "mock setup bug in the test: `session.get()` "
+                            "patched with `return_value=`, `AsyncMock` "
+                            "used as an async-context-manager without "
+                            "wiring `__aenter__`, `json_side_effect` "
+                            "assigned to `mock.json` instead of "
+                            "`mock.json.side_effect`, etc. Read the test "
+                            "file (READ_FILE) and consider whether the "
+                            "traceback is telling you the source is wrong "
+                            "OR that the test's harness is lying to it. "
+                            "Patch whichever side is actually broken."
+                        )
             else:
                 # No persistent lines this round — clear per-file streaks
                 # so a NEW blocker on a stale-streak file doesn't inherit

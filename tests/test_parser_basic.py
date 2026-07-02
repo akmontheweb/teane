@@ -268,6 +268,37 @@ class TestPythonParserAssertionBody:
         assert "is_active" in d.semantic_context
         assert "where True" in d.semantic_context
 
+    def test_syntax_error_recovers_user_file_from_e_bare(self):
+        # Pytest short-traceback layout for a SyntaxError raised during
+        # collection: the traceback frame points at Python's ast.py (the
+        # stdlib compile() call), and the user file+line live in the
+        # bare-E ``File "<path>", line N`` block that pytest inlines.
+        # Without recovery, the diagnostic anchors to /usr/lib/python3.11/
+        # ast.py — the reflection judge marks it "insufficient data — no
+        # diagnostic locations available", the repair LLM guesses, and
+        # the loop fails to converge (session 70877929).
+        output = (
+            "___ ERROR collecting tests/backend/test_rate_limiter.py ___\n"
+            "/usr/lib/python3.11/ast.py:50: in parse\n"
+            "    return compile(source, filename, mode, flags | PyCF_ONLY_AST)\n"
+            'E     File "tests/backend/test_rate_limiter.py", line 129\n'
+            "E       assert exc_info.value.response.status_code == 500tries exhausted...\n"
+            "E                                                          ^\n"
+            "E   SyntaxError: invalid decimal literal\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        precise = [d for d in diags if d.error_code == "SyntaxError"]
+        assert precise, (
+            f"expected SyntaxError diagnostic, got "
+            f"{[(d.file, d.line, d.error_code) for d in diags]}"
+        )
+        d = precise[0]
+        assert d.file == "tests/backend/test_rate_limiter.py", (
+            f"regression: SyntaxError anchored to stdlib instead of user "
+            f"file (got {d.file!r})"
+        )
+        assert d.line == 129, f"expected line 129, got {d.line}"
+
     def test_bare_e_line_dedupes_against_failing_source(self):
         # When the assertion has no rewrite explanation (e.g. ``assert
         # 1 == 2`` where pytest just echoes the same expression back on

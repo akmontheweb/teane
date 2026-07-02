@@ -178,6 +178,14 @@ class PythonParser(BaseLanguageParser):
     # ``AssertionError``; without them the diagnostic collapses to just the
     # exception type and the LLM has to guess what the value was.
     _PYTEST_E_BARE_PATTERN = re.compile(r'^E\s+(?P<body>\S.*)$')
+    # Embedded ``File "path", line N`` inside a bare-E body — emitted by
+    # pytest when the exception is a SyntaxError (or similar compile-time
+    # error) whose real location is the user file being parsed, not the
+    # stdlib frame that raised. Without this recovery, the diagnostic anchors
+    # to ``/usr/lib/python3.11/ast.py:50`` and the repair LLM cannot ground.
+    _E_BARE_FILE_LINE_PATTERN = re.compile(
+        r'^File\s+"(?P<file>[^"]+\.py)",\s+line\s+(?P<line>\d+)\s*$'
+    )
     # Pytest "short test summary info" lines at run end:
     #   FAILED tests/foo.py::test_x - AssertionError: assert ...
     #   ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'x'
@@ -296,6 +304,23 @@ class PythonParser(BaseLanguageParser):
                 parts.append(f"assertion-rewrite:\n  {joined}")
             return "\n".join(parts)
 
+        def _recover_user_frame_from_e_bare(
+            frame: Optional[tuple[str, int]],
+            bare_lines: list[str],
+        ) -> Optional[tuple[str, int]]:
+            # Trust the recorded frame when it already points at user code.
+            if frame is not None and PythonParser._is_user_frame(frame[0]):
+                return frame
+            # Pytest tags SyntaxError bodies with ``E   File "<path>", line N``.
+            # Prefer the last user-code hit — the deepest user frame wins the
+            # same way ``_parse_standard_traceback`` picks innermost user code.
+            recovered: Optional[tuple[str, int]] = None
+            for body in bare_lines:
+                m = PythonParser._E_BARE_FILE_LINE_PATTERN.match(body.strip())
+                if m and PythonParser._is_user_frame(m.group("file")):
+                    recovered = (m.group("file"), int(m.group("line")))
+            return recovered if recovered is not None else frame
+
         for line in lines:
             stripped = line.rstrip()
             bare = stripped.strip()
@@ -351,8 +376,11 @@ class PythonParser(BaseLanguageParser):
             if e_line:
                 # Always remember it for the terminal-line fallback above.
                 pending_e = (e_line.group("type"), e_line.group("msg"))
-                if last_frame is not None:
-                    file_path, lineno = last_frame
+                recovered = _recover_user_frame_from_e_bare(
+                    last_frame, pending_e_bare,
+                )
+                if recovered is not None:
+                    file_path, lineno = recovered
                 elif conftest_path is not None:
                     file_path, lineno = conftest_path, 0
                 else:

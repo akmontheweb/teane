@@ -5834,6 +5834,19 @@ def _extract_wider_context_from_failure(failure: Any) -> tuple[str, Optional[str
 _PREFLIGHT_FILE_LINE_CAP = 300
 _PREFLIGHT_FILE_CHAR_CAP = 6000
 _PREFLIGHT_SECTION_CHAR_CAP = 24000
+# When the persistent-blocker directive fires on a file, ordinary preflight
+# caps (300 lines / 6000 chars) truncate large files so the LLM can only
+# see the head and cannot compose a REPLACE_BLOCK that spans the failing
+# line. Session badv74q2n showed exactly this: the judge named
+# ``backend/services/edgar.py:172`` for 4 consecutive rounds, but the
+# repair prompt only surfaced lines 1-133, so the LLM patched blind. When
+# a caller marks a path as full-read, we lift the caps ~10-15× so files
+# up to ~2500 lines / ~100 KB come through end-to-end. The prompt is
+# still bounded (~25 K tokens for one file is a lot but not catastrophic),
+# and the escalation is triggered — not the default — so only truly
+# stuck files pay the cost.
+_PERSISTENT_BLOCKER_FILE_LINE_CAP = 3000
+_PERSISTENT_BLOCKER_FILE_CHAR_CAP = 100000
 
 
 def _render_file_with_line_numbers(
@@ -6253,6 +6266,7 @@ def _collect_workspace_file_content(
     *,
     max_files: int = 12,
     record_hashes_into: Optional[dict[str, str]] = None,
+    full_read_paths: Optional[set[str]] = None,
 ) -> list[tuple[str, str]]:
     """Read each ``rel_paths`` entry under ``workspace_path`` and return
     ``(rel_path, line_numbered_content)`` pairs. Silently skips files that
@@ -6265,15 +6279,32 @@ def _collect_workspace_file_content(
     The caller persists this dict into ``node_state.files_seen_by_llm`` so
     the patcher's B5 drift detector can later confirm the file hasn't
     changed since the LLM was shown its content.
+
+    When ``full_read_paths`` contains a path, that path is rendered with
+    the persistent-blocker caps (3 K lines / 100 KB) instead of the
+    standard preflight caps (300 lines / 6 KB). Used by the
+    persistent-blocker directive: when the same file:line has been the
+    blocker two rounds running, truncation prevents the LLM from
+    composing a REPLACE_BLOCK that spans the failing line. Lifting the
+    caps for exactly the stuck files keeps the token budget bounded to
+    the actual failure surface.
     """
     out: list[tuple[str, str]] = []
+    _full_set: set[str] = full_read_paths or set()
     for rel in rel_paths:
         if len(out) >= max_files:
             break
         if not isinstance(rel, str) or not rel.strip():
             continue
         abs_path = os.path.join(workspace_path, rel)
-        rendered, file_hash = _render_file_with_line_numbers_and_hash(abs_path)
+        if rel in _full_set:
+            rendered, file_hash = _render_file_with_line_numbers_and_hash(
+                abs_path,
+                max_lines=_PERSISTENT_BLOCKER_FILE_LINE_CAP,
+                max_chars=_PERSISTENT_BLOCKER_FILE_CHAR_CAP,
+            )
+        else:
+            rendered, file_hash = _render_file_with_line_numbers_and_hash(abs_path)
         if rendered is None:
             continue
         out.append((rel, rendered))
@@ -9413,10 +9444,26 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             files_for_preflight = (
                 list(diag_files) + cr_extra + import_prefetch
             )
+            # Persistent-blocker files get full-read treatment: the
+            # standard 6 KB truncation hides the failing line when it
+            # sits past the head of a large file (session badv74q2n
+            # stalled 4+ rounds on ``edgar.py:172`` because the prompt
+            # showed only lines 1-133 of a 250-line file). Any file the
+            # judge named in the previous round with a specific line is
+            # a candidate — lift the caps for exactly those paths so
+            # the failing line is visible.
+            _prev_named_lines_raw = list(
+                loop_counter.get("judge_named_file_lines_last_round") or []
+            )
+            _persistent_files: set[str] = set()
+            for _pair in _prev_named_lines_raw:
+                if isinstance(_pair, (list, tuple)) and len(_pair) == 2:
+                    _persistent_files.add(str(_pair[0]))
             preflight_pairs = _collect_workspace_file_content(
                 workspace_path, files_for_preflight,
                 max_files=diag_cap,
                 record_hashes_into=files_seen_by_llm,
+                full_read_paths=_persistent_files,
             )
             error_summary += _format_preflight_file_content(
                 preflight_pairs,

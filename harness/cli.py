@@ -2663,6 +2663,44 @@ def _discovery_suspend(
     return {"messages": messages, "node_state": node_state}
 
 
+def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
+    """Zero the counters that gate ``route_after_compiler`` / ``route_after_patching``
+    HITL escalation so a headless auto-resume can't ping-pong forever.
+
+    In a TTY session the operator picks `[r]` after they've done something
+    outside the harness (widened the allowlist, edited config, fixed a
+    file); the preserved counters keep the directive-shaping context that
+    LLMs need across the resume. In the no-TTY auto-resume path nothing
+    outside the harness has changed — the counters are still at their
+    trip values, so the next ``route_after_compiler`` immediately re-fires
+    the same HITL trigger and the loop repeats within seconds until budget
+    is drained (observed session 4754c913).
+
+    Resets iff the caller explicitly opts in via ``hitl_menu_loop``'s
+    auto-resume path. Human resume path stays byte-identical to preserve
+    session 2d0164f0 / 19b28eff / 0a5c6fe8's fix (see
+    ``_reset_iteration_counters``).
+    """
+    for key in (
+        "consecutive_zero_patch_rounds",
+        "consecutive_all_allowlist_rejected_rounds",
+        "no_progress_repairs",
+        "consecutive_distraction_rounds",
+        "consecutive_low_signal_rounds",
+    ):
+        if key in loop_counter:
+            loop_counter[key] = 0
+    # Per-file miss counts drive the "use a different operation" LLM
+    # directive at >=2 — we want to keep that signal alive but not let
+    # the >=3 stuck-file HITL guard immediately re-trip. Cap at 2.
+    per_file = loop_counter.get("replace_block_misses_per_file")
+    if isinstance(per_file, dict):
+        for f in list(per_file.keys()):
+            v = per_file[f]
+            if isinstance(v, int) and v > 2:
+                per_file[f] = 2
+
+
 def _reset_iteration_counters(
     loop_counter: Optional[dict[str, Any]], *, total_repairs: int = 0,
 ) -> dict[str, Any]:
@@ -3199,8 +3237,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         # --hitl-repair=false / env auto-approve: take the [r] resume
         # default (matches the existing HARNESS_AUTO_APPROVE behaviour
         # — proceed when possible). Skips the prompt entirely.
+        auto_resumed_this_round = False
         if not _hitl_gate_enabled("repair") or _gatekeeper_auto_approves():
             choice = "r"
+            auto_resumed_this_round = True
             logger.info(
                 "[HITL] Repair menu auto-resumed "
                 "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
@@ -3246,6 +3286,20 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             state["loop_counter"] = _reset_iteration_counters(
                 state.get("loop_counter"), total_repairs=2,
             )
+            # Auto-resume path only: also clear the counters that gate
+            # ``route_after_compiler`` / ``route_after_patching`` HITL
+            # escalation. In a TTY session the operator did something
+            # outside the harness and those counters carry useful history;
+            # in headless mode nothing changed, so preserving them
+            # guarantees the very next router pass re-fires the same
+            # trigger — a ~7s ping-pong that only stops when budget dies
+            # (session 4754c913).
+            if auto_resumed_this_round:
+                _reset_hitl_trip_counters(state["loop_counter"])
+                logger.info(
+                    "[HITL] Auto-resume: HITL-trip counters cleared to "
+                    "break the headless ping-pong."
+                )
             # Re-read on-disk config so operator edits between HITL triggers
             # (sandbox.docker_image, build_command, etc.) reach the in-memory
             # state. Without this the [r] Resume keeps using whatever

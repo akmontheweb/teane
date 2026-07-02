@@ -34,6 +34,7 @@ from harness.graph import (
     _missing_module_matches_workspace_source,
     _parse_repair_reflection_verdict,
     _patches_touched_judge_files,
+    _reflection_verdict_is_low_signal,
 )
 from harness.patcher import (
     TextPatcher,
@@ -610,3 +611,78 @@ def test_classify_patch_failure_recognises_missing_file():
 def test_classify_patch_failure_falls_back_for_unknown():
     assert _classify_patch_failure("disk full") == "error"
     assert _classify_patch_failure("") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Fix D — low-signal escalation. Session 116667f5 spun for six repair
+# rounds because pytest's bare AssertionError diagnostics gave the judge
+# nothing to localize; it kept returning the ``insufficient data`` sentinel
+# and the loop treated that as "hold the counter steady" — silently
+# spinning until the total_repairs ceiling. The escalation gates on a
+# NEW counter (``consecutive_low_signal_rounds``) so a streak of low-
+# signal verdicts widens the repair prompt with the raw build-output
+# tail without polluting the distraction circuit-breaker.
+# ---------------------------------------------------------------------------
+
+
+def test_reflection_verdict_low_signal_matches_sentinel():
+    """The insufficient-data sentence in ``real_blocker`` must be
+    recognised regardless of which fallback form the judge picked
+    (per-file substitution OR the no-locations plain string)."""
+    assert _reflection_verdict_is_low_signal({
+        "verdict": "DISTRACTION",
+        "real_blocker": (
+            "insufficient data — investigate tests/test_db_base.py's "
+            "data flow into the assertion"
+        ),
+        "recommendation": "Focus on the AssertionError.",
+    })
+    assert _reflection_verdict_is_low_signal({
+        "verdict": "REGRESSION",
+        "real_blocker": "insufficient data — no diagnostic locations available",
+        "recommendation": "Look at the raw build output.",
+    })
+    # Leading whitespace and mixed case must still trip the check —
+    # LLM outputs sometimes drift and the sentinel check is our only
+    # signal that the verdict is content-free.
+    assert _reflection_verdict_is_low_signal({
+        "verdict": "DISTRACTION",
+        "real_blocker": "  Insufficient Data — nothing to localise",
+        "recommendation": "",
+    })
+
+
+def test_reflection_verdict_low_signal_rejects_grounded_blocker():
+    """A grounded blocker that names a real file:line must NOT be
+    treated as low-signal — that would silence a legitimately actionable
+    verdict and let the distraction counter drift forever."""
+    assert not _reflection_verdict_is_low_signal({
+        "verdict": "DISTRACTION",
+        "real_blocker": (
+            "tests/test_math.py:42 asserts 3 == 2 because reduce() "
+            "adds instead of multiplying"
+        ),
+        "recommendation": "Change '+' to '*' in reduce().",
+    })
+    assert not _reflection_verdict_is_low_signal({
+        "verdict": "PROGRESS",
+        "real_blocker": "",
+        "recommendation": "",
+    })
+
+
+def test_low_signal_counter_included_in_resume_gate_keys():
+    """The resume path zeros the counters that gate the repair loop so
+    a resumed session doesn't immediately re-trip HITL. The new
+    ``consecutive_low_signal_rounds`` counter must join that reset list
+    or resume-then-fail-again would come back with the escalation
+    already primed — attaching the raw tail on iteration 1 before the
+    judge has weighed in on the fresh diagnostics."""
+    import inspect
+
+    from harness.graph import _reset_stale_gate_counters_on_resume
+    src = inspect.getsource(_reset_stale_gate_counters_on_resume)
+    assert "consecutive_low_signal_rounds" in src, (
+        "resume-reset must zero consecutive_low_signal_rounds so a "
+        "resumed session gets a fresh escalation budget"
+    )

@@ -220,3 +220,75 @@ class TestPythonParserAssertionBody:
         # semantic_context so the repair prompt can show the LLM exactly
         # which expression failed.
         assert "type must be a non-empty string" in d.semantic_context
+
+    def test_bare_e_lines_carry_resolved_values(self):
+        # Pytest's default assertion-rewrite output for a plain ``assert``
+        # with no custom message emits BARE E-lines (no ``ErrorType:``
+        # prefix) that carry the actual resolved values:
+        #
+        #     E       assert True is False
+        #     E        +  where True = <Session>.is_active
+        #
+        # Before this fix these lines were dropped by the parser, leaving
+        # the diagnostic message as just ``AssertionError`` — so the
+        # judge/repair prompts had no way to know that ``session.is_active``
+        # was ``True`` when the test expected ``False``. Observed in
+        # session 116667f5 where six repair rounds failed to converge
+        # because the LLM kept guessing at the value. See docs in
+        # parser_registry.PythonParser._PYTEST_E_BARE_PATTERN.
+        output = (
+            "____________ test_get_db_yields_session ____________\n"
+            "    def test_get_db_yields_session():\n"
+            "        # After close, session should be closed\n"
+            ">       assert session.is_active is False\n"
+            "E       assert True is False\n"
+            "E        +  where True = <Session at 0x7f>.is_active\n"
+            "\n"
+            "tests/test_db_base.py:38: AssertionError\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        precise = [d for d in diags if d.line == 38]
+        assert precise, (
+            f"expected diagnostic on line 38, got "
+            f"{[(d.file, d.line, d.message) for d in diags]}"
+        )
+        d = precise[0]
+        assert d.error_code == "AssertionError"
+        # The bare E-line body must be promoted into the message so the
+        # ranked diagnostic list in the judge/repair prompts shows the
+        # resolved expression instead of just the exception type.
+        assert d.message != "AssertionError", (
+            "regression: bare E-lines were dropped and message collapsed "
+            "to the exception type"
+        )
+        assert "assert True is False" in d.message
+        # The `+  where True = ...` explanation is the highest-signal
+        # context — it names the object AND the attribute that produced
+        # the unexpected value. It must land in semantic_context.
+        assert "is_active" in d.semantic_context
+        assert "where True" in d.semantic_context
+
+    def test_bare_e_line_dedupes_against_failing_source(self):
+        # When the assertion has no rewrite explanation (e.g. ``assert
+        # 1 == 2`` where pytest just echoes the same expression back on
+        # the E-line), the parser should NOT double-attach the same text
+        # in both ``failing source:`` and ``assertion-rewrite:`` slots.
+        output = (
+            "____________ test_simple ____________\n"
+            "    def test_simple():\n"
+            ">       assert 1 == 2\n"
+            "E       assert 1 == 2\n"
+            "\n"
+            "tests/test_simple.py:2: AssertionError\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        precise = [d for d in diags if d.line == 2]
+        assert precise
+        d = precise[0]
+        # The failing source should still be present; the redundant E-line
+        # should be suppressed so we don't ship duplicate context.
+        assert "failing source: assert 1 == 2" in d.semantic_context
+        assert d.semantic_context.count("assert 1 == 2") == 1, (
+            f"expected the failing source to appear once, "
+            f"got context {d.semantic_context!r}"
+        )

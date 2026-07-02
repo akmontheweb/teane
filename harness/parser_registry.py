@@ -170,6 +170,14 @@ class PythonParser(BaseLanguageParser):
     _PYTEST_E_PATTERN = re.compile(
         r'^E\s+(?P<type>\w+(?:Error|Warning|Exception)):\s*(?P<msg>.+)$'
     )
+    # Bare pytest "E   " continuation line without an ``ErrorType:`` prefix —
+    # emitted by pytest's assertion-rewrite for plain ``assert`` failures
+    # (``E   assert True is False``, ``E    +  where True = <obj>.attr``).
+    # These lines carry the ACTUAL value the assertion evaluated to and are
+    # the single most useful piece of context for the repair LLM on a bare
+    # ``AssertionError``; without them the diagnostic collapses to just the
+    # exception type and the LLM has to guess what the value was.
+    _PYTEST_E_BARE_PATTERN = re.compile(r'^E\s+(?P<body>\S.*)$')
     # Pytest "short test summary info" lines at run end:
     #   FAILED tests/foo.py::test_x - AssertionError: assert ...
     #   ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'x'
@@ -269,6 +277,24 @@ class PythonParser(BaseLanguageParser):
         # attach them.
         pending_e: Optional[tuple[str, str]] = None  # (error_type, message)
         pending_failing_src: Optional[str] = None
+        # Buffer bare ``E   ...`` lines from pytest's assertion-rewrite output
+        # (``E   assert True is False``, ``E    +  where True = <obj>.attr``).
+        # These are the resolved values the assertion actually evaluated to —
+        # they turn "AssertionError at line 38" (unactionable) into
+        # "session.is_active was True where the test asserted False"
+        # (immediately actionable). Cap at 8 lines to bound context growth
+        # on tests that print large diffs (``assert big_dict == other_dict``).
+        pending_e_bare: list[str] = []
+        _MAX_E_BARE_LINES = 8
+
+        def _fmt_e_bare(bare_lines: list[str], src: Optional[str]) -> str:
+            parts: list[str] = []
+            if src:
+                parts.append(f"failing source: {src}")
+            if bare_lines:
+                joined = "\n  ".join(bare_lines)
+                parts.append(f"assertion-rewrite:\n  {joined}")
+            return "\n".join(parts)
 
         for line in lines:
             stripped = line.rstrip()
@@ -297,11 +323,15 @@ class PythonParser(BaseLanguageParser):
                 # Prefer the pending E-line body when it matches the terminal
                 # error type — that's the actual assertion text the LLM needs.
                 msg = term_type
-                ctx = ""
                 if pending_e is not None and pending_e[0] == term_type:
                     msg = f"{term_type}: {pending_e[1]}"
-                if pending_failing_src:
-                    ctx = f"failing source: {pending_failing_src}"
+                elif pending_e_bare:
+                    # No typed E-line, but assertion-rewrite gave us the
+                    # resolved expression (``assert True is False``).
+                    # Promote the first bare line into the message so the
+                    # judge/repair prompts don't show a bare exception type.
+                    msg = f"{term_type}: {pending_e_bare[0]}"
+                ctx = _fmt_e_bare(pending_e_bare, pending_failing_src)
                 diags.append(DiagnosticObject(
                     file=term.group("file"),
                     line=int(term.group("line")),
@@ -313,6 +343,7 @@ class PythonParser(BaseLanguageParser):
                 ))
                 last_frame = None
                 pending_e = None
+                pending_e_bare = []
                 pending_failing_src = None
                 continue
 
@@ -327,10 +358,7 @@ class PythonParser(BaseLanguageParser):
                 else:
                     # No frame yet — wait for the terminal fail line to pair us.
                     continue
-                ctx = (
-                    f"failing source: {pending_failing_src}"
-                    if pending_failing_src else ""
-                )
+                ctx = _fmt_e_bare(pending_e_bare, pending_failing_src)
                 diags.append(DiagnosticObject(
                     file=file_path,
                     line=lineno,
@@ -343,7 +371,24 @@ class PythonParser(BaseLanguageParser):
                 last_frame = None
                 conftest_path = None
                 pending_e = None
+                pending_e_bare = []
                 pending_failing_src = None
+                continue
+
+            # Bare ``E   ...`` line without an ``ErrorType:`` prefix —
+            # assertion-rewrite output. Buffer it; it will be attached to
+            # whichever diagnostic emits next (terminal fail-line or typed
+            # E-line). Skip if it duplicates the ``>`` failing source line
+            # (pytest sometimes echoes the raw assertion back on the E-line
+            # verbatim, adding noise without new info).
+            e_bare = PythonParser._PYTEST_E_BARE_PATTERN.match(stripped)
+            if e_bare:
+                body = e_bare.group("body").rstrip()
+                if pending_failing_src and body == pending_failing_src:
+                    continue
+                if len(pending_e_bare) < _MAX_E_BARE_LINES:
+                    pending_e_bare.append(body)
+                continue
         return diags
 
     @staticmethod

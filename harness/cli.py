@@ -8556,14 +8556,70 @@ async def cmd_purge(args: argparse.Namespace) -> int:
     from harness.storage import HarnessAsyncSqliteSaver, purge_checkpoints
 
     if args.all:
-        print("WARNING: This will delete ALL checkpoint data permanently.")
+        print(
+            "WARNING: This will delete ALL teane data permanently: "
+            "checkpoints, story/feature/batch/defect state, repo index, "
+            "and JSONL session logs — across every workspace."
+        )
         from harness.hitl import get_channel as _get_channel
-        confirmed = _get_channel().confirm("Type 'yes' to confirm purge of all checkpoint data", default=False)
+        confirmed = _get_channel().confirm("Type 'yes' to confirm full purge", default=False)
         if not confirmed:
             print("Purge cancelled.")
             return 0
+
+        # 1) Checkpoint DB (writes + checkpoints).
         deleted = await purge_checkpoints(db_path)
         print(f"Purged {deleted} rows from the checkpoint database.")
+
+        # 2) state.db — stories, features, batches, defects, requirements,
+        #    ACs, test_runs, file_links, commits, link tables. Global.
+        try:
+            from harness import story_state as _story_state_mod
+            state_counts = _story_state_mod.purge_state_db_all()
+            state_total = sum(state_counts.values())
+            print(f"Purged {state_total} rows from the story state database.")
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("state.db purge failed: %s", exc)
+            print(f"WARNING: state.db purge failed: {exc}")
+
+        # 3) Repo index DB — meta + chunks across all workspaces. Honor
+        #    the operator's ``repo_index.index_dir`` override so the
+        #    purge hits the same DB the harness actually writes to.
+        try:
+            from harness.repo_index import (
+                RepoIndexConfig as _RepoIndexConfig,
+                purge_all as _purge_repo_all,
+            )
+            rcfg = _RepoIndexConfig.from_config(config)
+            meta_n, chunk_n = _purge_repo_all(rcfg)
+            print(
+                f"Purged repo index ({meta_n} workspace entries, "
+                f"{chunk_n} chunks)."
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("repo_index purge failed: %s", exc)
+            print(f"WARNING: repo_index purge failed: {exc}")
+
+        # 4) JSONL session logs — every *.jsonl and rotated backup in
+        #    the configured log dir. Directory itself is left in place.
+        log_cfg = config.get("logging", {})
+        log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
+        removed_logs = 0
+        if os.path.isdir(log_dir):
+            import glob
+            for pat in (
+                os.path.join(log_dir, "*.jsonl"),
+                os.path.join(log_dir, "*.jsonl.*"),
+            ):
+                for path in glob.glob(pat):
+                    try:
+                        os.remove(path)
+                        removed_logs += 1
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not remove log file %s: %s", path, exc,
+                        )
+        print(f"Removed {removed_logs} JSONL log file(s) from {log_dir}.")
     elif args.session_id:
         checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
         await checkpointer.adelete_thread(args.session_id)

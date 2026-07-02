@@ -586,6 +586,70 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
     return counts
 
 
+def purge_state_db_all() -> dict[str, int]:
+    """Delete every row from every table in state.db across ALL workspaces.
+
+    Used by ``teane purge --all``. Preserves the DB file and schema so
+    subsequent runs skip re-migration. Best-effort: a missing DB or open
+    failure logs and returns zeros.
+
+    Returns a dict ``{table: rows_deleted}`` mirroring the per-workspace
+    variant so callers can log a symmetric summary.
+    """
+    counts: dict[str, int] = {
+        "features": 0, "stories": 0, "batches": 0, "defects": 0,
+        "test_runs": 0, "file_links": 0, "commits": 0,
+        "requirements": 0, "acceptance_criteria": 0,
+        "story_satisfies_req": 0, "test_verifies_ac": 0,
+        "batch_stories": 0,
+    }
+    db = state_db_path()
+    if not os.path.isfile(db):
+        return counts
+
+    try:
+        conn = sqlite3.connect(db)
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "[story_state] Could not open %s for global purge: %s", db, exc,
+        )
+        return counts
+
+    try:
+        _apply_sqlite_pragmas(conn)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Deepest FK children first, then parents.
+            for table in (
+                "test_verifies_ac",
+                "story_satisfies_req",
+                "acceptance_criteria",
+                "file_links", "test_runs", "defects", "commits",
+                "batch_stories",
+                "batches", "stories", "requirements", "features",
+            ):
+                try:
+                    cur = conn.execute(f"DELETE FROM {table}")
+                except sqlite3.OperationalError:
+                    # Table absent (older DB / partial migration) — skip.
+                    continue
+                counts[table] = cur.rowcount or 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    total = sum(counts.values())
+    if total:
+        logger.info(
+            "[story_state] Global purge removed %d row(s) from %s.",
+            total, db,
+        )
+    return counts
+
+
 def workspace_is_agile_managed(workspace_path: str) -> bool:
     """Return True when ``workspace_path`` has at least one row in the
     ``stories`` table of the global state DB — i.e. a prior ``teane

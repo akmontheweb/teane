@@ -176,6 +176,37 @@ def test_build_query_clear_roundtrip(tmp_path):
     assert query_top_chunks(str(workspace), "anything", cfg=cfg) == []
 
 
+def test_purge_all_wipes_every_workspace(tmp_path):
+    """purge_all clears repo_meta + repo_chunks across all workspaces."""
+    from harness.repo_index import purge_all
+
+    index_dir = tmp_path / "indices"
+    cfg = RepoIndexConfig(
+        enabled=True, top_k=3, chunk_lines=50, index_dir=str(index_dir),
+    )
+    for name in ("ws-alpha", "ws-beta"):
+        ws = tmp_path / name
+        ws.mkdir()
+        (ws / "a.py").write_text("def f(): return 1\n")
+        build_index(str(ws), cfg)
+        assert get_stats(str(ws), cfg) is not None
+
+    meta_n, chunk_n = purge_all(cfg)
+    assert meta_n >= 2
+    assert chunk_n >= 2
+
+    for name in ("ws-alpha", "ws-beta"):
+        assert get_stats(str(tmp_path / name), cfg) is None
+
+
+def test_purge_all_no_db_returns_zeros(tmp_path):
+    """purge_all soft-fails when the index DB file is absent."""
+    from harness.repo_index import purge_all
+
+    cfg = RepoIndexConfig(index_dir=str(tmp_path / "empty"))
+    assert purge_all(cfg) == (0, 0)
+
+
 def test_query_top_chunks_returns_empty_when_no_index(tmp_path):
     cfg = RepoIndexConfig(index_dir=str(tmp_path / "ix"))
     workspace = tmp_path / "ws"

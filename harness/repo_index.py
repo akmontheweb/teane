@@ -771,6 +771,45 @@ def purge_workspace(
     return meta_n, chunk_n
 
 
+def purge_all(cfg: Optional[RepoIndexConfig] = None) -> tuple[int, int]:
+    """Delete every ``repo_meta`` and ``repo_chunks`` row across ALL
+    workspaces. Used by ``teane purge --all``. Preserves the DB file so
+    the schema is still ready for the next index build.
+
+    Returns ``(meta_rows_deleted, chunk_rows_deleted)``. Best-effort: a
+    missing or unreadable DB logs and returns ``(0, 0)``.
+    """
+    cfg = cfg or RepoIndexConfig()
+    db_path = _db_path(cfg)
+    if not os.path.isfile(db_path):
+        return 0, 0
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "[repo_index] Could not open index DB %s for global purge: %s",
+            db_path, exc,
+        )
+        return 0, 0
+    try:
+        meta_cur = conn.execute("DELETE FROM repo_meta")
+        chunk_cur = conn.execute("DELETE FROM repo_chunks")
+        conn.commit()
+        meta_n = meta_cur.rowcount or 0
+        chunk_n = chunk_cur.rowcount or 0
+    except sqlite3.DatabaseError as exc:
+        logger.warning("[repo_index] Global purge failed: %s", exc)
+        return 0, 0
+    finally:
+        conn.close()
+    if meta_n or chunk_n:
+        logger.info(
+            "[repo_index] Global purge removed meta=%d, chunks=%d.",
+            meta_n, chunk_n,
+        )
+    return meta_n, chunk_n
+
+
 def update_index_for_files(
     workspace_path: str,
     modified_files: Iterable[str],

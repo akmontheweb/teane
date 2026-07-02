@@ -1039,3 +1039,54 @@ def test_purge_state_db_clears_v5_tables(workspace, app):
         ).fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_purge_state_db_all_wipes_every_workspace(tmp_path):
+    """purge_state_db_all must clear rows across ALL workspaces, not just one."""
+    from harness.story_state import purge_state_db_all
+
+    ws_a = tmp_path / "ws-alpha"
+    ws_a.mkdir()
+    ws_b = tmp_path / "ws-beta"
+    ws_b.mkdir()
+    app_a = app_name_for_workspace(str(ws_a))
+    app_b = app_name_for_workspace(str(ws_b))
+
+    conn = open_story_db()
+    try:
+        for a in (app_a, app_b):
+            _seed_feature(conn, a)
+            keys = create_stories(conn, a, [{
+                "title": "S", "feature": "test",
+                "acceptance_criteria": ["AC1"],
+            }])
+            sid = get_story(conn, a, keys[0])["id"]
+            create_requirements(conn, a, [
+                {"req_key": "FR-001", "kind": "fr", "title": "x"},
+            ])
+            link_story_to_requirements(conn, a, sid, ["FR-001"])
+    finally:
+        conn.close()
+
+    counts = purge_state_db_all()
+    assert counts["stories"] >= 2
+    assert counts["features"] >= 2
+    assert counts["requirements"] >= 2
+
+    conn = open_story_db()
+    try:
+        for table in ("features", "stories", "requirements",
+                      "acceptance_criteria", "story_satisfies_req"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert n == 0, f"{table} still has {n} row(s) after global purge"
+    finally:
+        conn.close()
+
+
+def test_purge_state_db_all_no_db_returns_zeros(tmp_path, monkeypatch):
+    """Missing DB file must return the empty counts dict without raising."""
+    from harness.story_state import purge_state_db_all
+
+    monkeypatch.setenv("TEANE_STATE_DB", str(tmp_path / "does-not-exist.db"))
+    counts = purge_state_db_all()
+    assert all(v == 0 for v in counts.values())

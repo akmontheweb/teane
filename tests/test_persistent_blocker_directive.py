@@ -2,6 +2,8 @@
 names the same ``(file, line)`` two rounds running, the repair prompt
 injects a hard directive requiring the LLM to alter that exact line."""
 
+import os
+
 from harness.graph import _verdict_named_file_lines
 
 
@@ -103,6 +105,76 @@ class TestVerdictNamedFileLines:
         assert _verdict_named_file_lines(
             {"real_blocker": "", "recommendation": ""},
             _errs(("a.py", 1)),
+        ) == []
+
+
+class TestVerdictReferencedFiles:
+    """The loose extractor used by the persistent-blocker save site — grounds
+    on workspace existence instead of compiler_errors membership, so a
+    judge that names a source file whose failure surfaces in a DIFFERENT
+    file (session b8vbfdxxa: judge blames ``parser.py``, the ImportError
+    location is ``tests/test_parser.py``) still gets remembered."""
+
+    def test_finds_file_when_workspace_has_it(self, tmp_path):
+        from harness.graph import _verdict_referenced_files
+        (tmp_path / "backend" / "services").mkdir(parents=True)
+        (tmp_path / "backend" / "services" / "parser.py").write_text("x = 1")
+        verdict = {
+            "real_blocker": (
+                "backend/services/parser.py does not export HAS_BS4"
+            ),
+            "recommendation": "",
+        }
+        out = _verdict_referenced_files(verdict, str(tmp_path))
+        assert out == [os.path.join("backend", "services", "parser.py")]
+
+    def test_ignores_files_that_dont_exist(self, tmp_path):
+        from harness.graph import _verdict_referenced_files
+        verdict = {
+            "real_blocker": "phantom/does_not_exist.py is broken",
+            "recommendation": "",
+        }
+        assert _verdict_referenced_files(verdict, str(tmp_path)) == []
+
+    def test_blocks_path_traversal(self, tmp_path):
+        # A judge that emits ../etc/passwd should NOT return a match
+        # even if the traversal target happens to exist on the host.
+        from harness.graph import _verdict_referenced_files
+        verdict = {
+            "real_blocker": "../outside/file.py is the issue",
+            "recommendation": "",
+        }
+        assert _verdict_referenced_files(verdict, str(tmp_path)) == []
+
+    def test_only_accepts_source_like_extensions(self, tmp_path):
+        # Random-extension matches (``.txt``, ``.log``, arbitrary
+        # regex-y strings) don't count — narrows the surface.
+        from harness.graph import _verdict_referenced_files
+        (tmp_path / "notes.txt").write_text("x")
+        (tmp_path / "config.json").write_text("{}")
+        verdict = {
+            "real_blocker": "see notes.txt and config.json",
+            "recommendation": "",
+        }
+        out = _verdict_referenced_files(verdict, str(tmp_path))
+        assert out == ["config.json"]  # .txt ignored, .json accepted
+
+    def test_dedupes_within_and_across_fields(self, tmp_path):
+        from harness.graph import _verdict_referenced_files
+        (tmp_path / "a.py").write_text("x")
+        verdict = {
+            "real_blocker": "a.py has an issue at a.py",
+            "recommendation": "fix a.py",
+        }
+        out = _verdict_referenced_files(verdict, str(tmp_path))
+        assert out == ["a.py"]
+
+    def test_empty_verdict_returns_empty(self, tmp_path):
+        from harness.graph import _verdict_referenced_files
+        assert _verdict_referenced_files({}, str(tmp_path)) == []
+        assert _verdict_referenced_files(
+            {"real_blocker": "", "recommendation": ""},
+            str(tmp_path),
         ) == []
 
 

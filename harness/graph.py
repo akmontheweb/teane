@@ -7435,6 +7435,77 @@ def _verdict_named_file_lines(
     return matched
 
 
+def _verdict_referenced_files(
+    verdict: dict[str, str],
+    workspace_path: str,
+    *,
+    max_matches: int = 10,
+) -> list[str]:
+    """Return workspace-relative paths of files that appear in the judge's
+    ``real_blocker`` / ``recommendation`` text AND exist on disk under
+    ``workspace_path``.
+
+    Looser than ``_verdict_named_files`` (which requires the file to
+    appear in current compiler_errors). Used by the persistent-blocker
+    save so a file the judge names round-over-round is remembered even
+    when the compile diagnostics point at a DIFFERENT file — the common
+    case for symbol-not-found ImportErrors where the failing test file
+    is in compiler_errors but the source file the judge blames isn't.
+    Session b8vbfdxxa demonstrated this: judge repeatedly named
+    ``backend/services/parser.py`` (missing ``HAS_BS4``, ``BeautifulSoup``,
+    etc.) but pytest's ImportError location was ``backend/tests/
+    test_parser.py``. ``_verdict_named_files`` returned [] → no
+    persistence → no banner.
+
+    Matches by workspace-suffix so the judge's bare
+    ``backend/services/parser.py`` grounds against the on-disk
+    workspace-root file. Guards against filesystem noise: only accepts
+    paths that (a) exist as regular files, (b) live under the workspace
+    root (path traversal blocked by the ``os.path.commonpath`` check),
+    (c) look like a source/test file (``.py``, ``.ts``, ``.tsx``,
+    ``.js``, ``.jsx``, ``.json``, ``.md``, ``.yaml``, ``.yml``,
+    ``.toml``) rather than an arbitrary regex hit.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return []
+    blocker = (verdict.get("real_blocker") or "")
+    recommendation = (verdict.get("recommendation") or "")
+    haystack = blocker + " " + recommendation
+    if not haystack.strip():
+        return []
+    _path_re = re.compile(
+        r"(?<![\w./\-])"
+        r"([\w][\w./\-]*?"
+        r"\.(?:py|ts|tsx|js|jsx|json|md|yaml|yml|toml))"
+        r"(?![\w])"
+    )
+    workspace_abs = os.path.abspath(workspace_path)
+    matched: list[str] = []
+    seen: set[str] = set()
+    for m in _path_re.finditer(haystack):
+        candidate = m.group(1)
+        # Path traversal / absolute-path guard: resolve to real
+        # workspace-relative form, drop anything that would escape.
+        abs_candidate = os.path.abspath(os.path.join(workspace_abs, candidate))
+        try:
+            common = os.path.commonpath([abs_candidate, workspace_abs])
+        except ValueError:
+            continue  # different drives on Windows, etc.
+        if common != workspace_abs:
+            continue
+        if not os.path.isfile(abs_candidate):
+            continue
+        rel = os.path.relpath(abs_candidate, workspace_abs)
+        rel_norm = os.path.normpath(rel)
+        if rel_norm in seen:
+            continue
+        seen.add(rel_norm)
+        matched.append(rel_norm)
+        if len(matched) >= max_matches:
+            break
+    return matched
+
+
 def _related_test_files(
     source_file: str,
     workspace_path: str,
@@ -10018,13 +10089,48 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # SRS-driven repair LLM was reading the spec and patching
         # cosmetics; with the SRS gone the verdict is the only authority
         # left in front of the model.
+        # Pre-compute whether the outer conditional would ordinarily
+        # fail but the persistence path still has something to say.
+        # When the judge names a file the previous round already named,
+        # persistence trumps the "did you engage with compiler_errors"
+        # gate — we KNOW the location is real because the same judge
+        # made the same call twice. Without this bypass, session
+        # b8vbfdxxa's ``parser.py`` file-only persistent-blocker never
+        # got to fire even though the state was being saved correctly.
+        _workspace_for_persist_check = str(
+            state.get("workspace_path", "") or ""
+        )
+        _persistence_bypass_grounds = False
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
             and reflection_verdict["real_blocker"]
             and not _reflection_verdict_is_low_signal(reflection_verdict)
-            and _reflection_grounds_in_diagnostics(
-                reflection_verdict, state.get("compiler_errors", []) or []
+        ):
+            _pb_prev_files = set(
+                str(p) for p in (
+                    loop_counter.get("judge_persistent_files_last_round") or []
+                )
+                if isinstance(p, str)
+            )
+            if _pb_prev_files:
+                _pb_current = set(
+                    _verdict_referenced_files(
+                        reflection_verdict, _workspace_for_persist_check,
+                    )
+                )
+                if _pb_current & _pb_prev_files:
+                    _persistence_bypass_grounds = True
+        if (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and reflection_verdict["real_blocker"]
+            and not _reflection_verdict_is_low_signal(reflection_verdict)
+            and (
+                _reflection_grounds_in_diagnostics(
+                    reflection_verdict, state.get("compiler_errors", []) or []
+                )
+                or _persistence_bypass_grounds
             )
         ):
             judge_named_files = _verdict_named_files(
@@ -10109,7 +10215,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # SAME FILE (not file:line) recurs round-over-round, promote
             # it too — with a weaker directive since we can't hard-target
             # a specific line.
-            _current_named_files_only = set(judge_named_files or [])
+            # Use the LOOSER file-reference extractor for current-round
+            # detection so a judge that names a source file (which
+            # isn't in compiler_errors because the compile error location
+            # is elsewhere) still enters the persistence check. Grounded
+            # via workspace-existence, same as the save site.
+            _workspace_for_banner = str(state.get("workspace_path", "") or "")
+            _current_named_files_only: set[str] = set(
+                _verdict_referenced_files(
+                    reflection_verdict, _workspace_for_banner,
+                )
+            )
             _prev_named_files_only = set(
                 str(p) for p in (
                     loop_counter.get("judge_persistent_files_last_round") or []
@@ -10797,8 +10913,19 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # during judge-ignored rounds; this one saves on every
             # DISTRACTION/REGRESSION so the persistent-blocker directive
             # sees the full history.
-            _named_files_now = _verdict_named_files(
-                reflection_verdict, state.get("compiler_errors", []) or []
+            #
+            # Uses ``_verdict_referenced_files`` (looser) rather than
+            # ``_verdict_named_files`` (stricter) so we save files the
+            # judge names EVEN WHEN they're not in the current-round
+            # compiler_errors. This is the common case for symbol-not-
+            # found errors: the judge blames ``backend/services/
+            # parser.py`` but the ImportError location in
+            # compiler_errors is ``backend/tests/test_parser.py``.
+            # Grounding is preserved by requiring the file to actually
+            # exist under workspace_path.
+            _workspace_for_ref = str(state.get("workspace_path", "") or "")
+            _named_files_now = _verdict_referenced_files(
+                reflection_verdict, _workspace_for_ref,
             )
             if _named_files_now:
                 loop_counter["judge_persistent_files_last_round"] = list(

@@ -7748,9 +7748,41 @@ def _workspace_has_source_files(workspace_path: str) -> bool:
 # base image itself is wrong and only a config change can unblock the
 # run; those still short-circuit to HITL.
 _PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
+    # Dev tooling — the original set. Kept as-is.
     "pytest", "pytest-asyncio", "pytest-cov", "pytest-mock", "pytest-xdist",
     "ruff", "mypy", "black", "isort", "flake8", "pylint",
     "coverage", "tox", "nox", "poetry",
+    # Common runtime packages that showed up in FinancialResearch
+    # session ModuleNotFoundErrors and each took 3-6 LLM rounds to
+    # converge. Whitelisting them here means the autofix installs the
+    # dep in ONE compile cycle instead of routing to the repair LLM.
+    # The autofix is conservative — it only writes a `pkg` line into
+    # the manifest; the repair LLM can still pin/adjust versions later.
+    # Async / HTTP stack
+    "aiofiles", "aiohttp", "httpx", "httpcore", "anyio", "trio",
+    "uvicorn", "starlette", "fastapi", "asyncpg", "aiosqlite",
+    "aioredis", "aiomysql",
+    # DB / cache
+    "redis", "fakeredis", "sqlalchemy", "alembic", "psycopg2",
+    "psycopg2-binary", "psycopg", "pymongo", "motor", "minio",
+    # Pydantic / config
+    "pydantic", "pydantic-settings", "pydantic-core", "python-dotenv",
+    "structlog", "loguru",
+    # HTML / doc / PDF processing (session 21a638b4)
+    "beautifulsoup4", "bs4", "lxml", "pdfplumber", "pdf2image",
+    "pypdf", "pypdf2", "weasyprint", "openpyxl", "python-docx",
+    # HTTP clients
+    "requests", "urllib3", "certifi",
+    # Task queues / workers
+    "celery", "kombu", "billiard",
+    # Serialization / dates / IDs
+    "pyyaml", "yaml", "toml", "tomli", "dateutil", "python-dateutil",
+    "arrow", "pendulum", "ulid", "shortuuid",
+    # Auth / crypto (safe defaults — no compilation)
+    "passlib", "bcrypt", "pyjwt", "jose", "cryptography",
+    # Test doubles / mocks
+    "pytest-mock", "pytest-cov", "freezegun", "responses",
+    "aioresponses", "moto",
 })
 
 

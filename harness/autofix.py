@@ -742,14 +742,20 @@ def _try_missing_dep(
     install_name = _DEP_INSTALL_NAMES.get(symbol, symbol)
     build_cmd = str(diag.get("build_command", "") or "").lower()
 
-    # Defer to the LLM only when the build command points at pyproject
-    # (`pip install -e .`) — autofixing TOML structure is too error-prone.
-    # Everything else (bare `pip install pytest && pytest -q`,
-    # `pip install -r requirements.txt && pytest`, any pip-prefixed flow)
-    # gets a requirements.txt edit; the compiler_node's adapter will
-    # upgrade the build command to consume it on the next compile cycle.
+    # pyproject.toml path: sessions across FinancialResearch stalled 3-6
+    # rounds each on ``aiofiles``, ``pdfplumber``, ``pdf2image``,
+    # ``beautifulsoup4`` etc. because the workspace had a pyproject.toml
+    # and this function bailed out — every dep add went through the
+    # repair LLM, at ~$0.02 and ~30s per attempt. Route to the
+    # pyproject-specific autofix now.
     if "pip install -e" in build_cmd or "pyproject" in build_cmd:
-        return None
+        py_block = _try_missing_dep_pyproject(install_name, workspace_path)
+        if py_block is not None:
+            return py_block
+        # No pyproject.toml on disk despite the build command hint — fall
+        # through to the requirements.txt branch as a last resort. Better
+        # to add the dep to a manifest that's about to be created than
+        # to burn another LLM round.
 
     manifest_rel = "requirements.txt"
     manifest_abs = os.path.join(workspace_path, manifest_rel)
@@ -799,6 +805,164 @@ def _try_missing_dep(
         file=manifest_rel,
         search=last_line,
         replace=f"{last_line}\n{install_name}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# R4b — Missing pip-installable dep autofix for pyproject.toml
+# ---------------------------------------------------------------------------
+
+# Anchor the ``dependencies = [`` list header inside the ``[project]``
+# table. TOML allows the header line to have a comment or trailing
+# whitespace; we accept both. ``\A[^\[]*`` gates the search to the file
+# section before the FIRST table header when no ``[project]`` is
+# explicit — some minimal pyprojects put ``dependencies`` at the file
+# root without an explicit ``[project]`` table.
+_PYPROJECT_DEPS_START_RE = re.compile(
+    r"^dependencies\s*=\s*\[\s*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
+_PYPROJECT_OPTIONAL_DEPS_START_RE = re.compile(
+    r"^dependencies\s*=\s*\[\s*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
+
+
+def _find_pyproject_dependencies_span(text: str) -> Optional[tuple[int, int, str]]:
+    """Locate the ``dependencies = [ ... ]`` list in ``text``. Returns
+    ``(start_offset, end_offset, inner_content)`` where ``start`` is the
+    character index of the ``[`` opener, ``end`` is the index of the
+    matching ``]`` closer, and ``inner_content`` is the substring
+    between them. Returns ``None`` when no list is present or the
+    brackets don't balance.
+
+    Deliberately regex+bracket-walk instead of full TOML parsing: the
+    stdlib ``tomllib`` (Python 3.11+) parses to a dict but throws away
+    formatting, and we need to *edit* the file in place so the diff is
+    small and the LLM's mental model of the file stays intact.
+    """
+    m = _PYPROJECT_DEPS_START_RE.search(text)
+    if m is None:
+        return None
+    # Walk forward from the ``[`` looking for the matching ``]``.
+    # Ignores brackets inside strings — TOML supports both '...' and
+    # "..." but list entries never span quotes across lines in
+    # practice, so a small state machine is enough.
+    bracket_pos = text.find("[", m.start())
+    if bracket_pos < 0:
+        return None
+    depth = 1
+    i = bracket_pos + 1
+    in_str: Optional[str] = None  # active quote char, or None
+    while i < len(text):
+        c = text[i]
+        if in_str is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            in_str = c
+            i += 1
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return (bracket_pos, i, text[bracket_pos + 1 : i])
+        i += 1
+    return None
+
+
+def _try_missing_dep_pyproject(
+    install_name: str,
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Append ``install_name`` to ``pyproject.toml``'s
+    ``[project].dependencies`` list. Idempotent: returns ``None`` when the
+    dep is already present under any pin. Returns ``None`` (fall-through)
+    when the file lacks a ``dependencies`` list — the caller can decide
+    whether to defer to the LLM or write ``requirements.txt`` instead.
+
+    Emits a REPLACE_BLOCK that surgically appends before the closing
+    ``]`` while preserving whatever indent the existing entries use.
+    Matches the operator's formatting: 4-space indent + ``"pkg>=X.Y",``
+    if the existing entries use that shape, or single-line ``"pkg"``
+    if the list is empty. Session 21a638b4's ``pdfplumber`` /
+    ``pdf2image`` cascade would have converged in ONE compile cycle
+    with this helper instead of the 4+ LLM-driven rounds it actually
+    took.
+    """
+    pyproject_rel = "pyproject.toml"
+    pyproject_abs = os.path.join(workspace_path, pyproject_rel)
+    if not os.path.isfile(pyproject_abs):
+        return None
+    try:
+        with open(pyproject_abs, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    span = _find_pyproject_dependencies_span(text)
+    if span is None:
+        return None
+    start, end, inner = span
+
+    # Idempotency: dep already present. Match either bare
+    # ``"pkg"`` or ``"pkg[extra]>=1.2"`` — the version pin varies.
+    _norm_target = install_name.lower()
+    _existing_re = re.compile(
+        rf'["\']({re.escape(_norm_target)})(?:\[[^\]]*\])?(?:[<>=!~][^"\']*)?["\']',
+        re.IGNORECASE,
+    )
+    if _existing_re.search(inner):
+        return None
+
+    # Preserve the caller's indent + quote style. Sample the LAST
+    # non-empty entry's leading whitespace — that's the shape the
+    # operator has been using.
+    lines = inner.split("\n")
+    indent = "    "  # sensible default
+    quote = '"'
+    for _ln in reversed(lines):
+        _stripped = _ln.strip()
+        if not _stripped or _stripped.startswith("#"):
+            continue
+        _lead = _ln[: len(_ln) - len(_ln.lstrip())]
+        if _lead:
+            indent = _lead
+        # Detect quote style from the sample line.
+        if _stripped.startswith("'"):
+            quote = "'"
+        break
+
+    new_entry = f"{indent}{quote}{install_name}{quote},"
+
+    # Insert as a new line RIGHT BEFORE the closing ``]``. Preserve
+    # the original text on either side of the bracket for a minimal
+    # diff. Use INSERT_AT_LINE would require line coordinates we
+    # don't want to compute; a REPLACE_BLOCK against the exact
+    # closing bracket line is more robust.
+    #
+    # Locate the closing ``]`` line boundaries so we can build the
+    # smallest possible search block that uniquely matches.
+    close_line_start = text.rfind("\n", 0, end) + 1
+    close_line_end = text.find("\n", end)
+    if close_line_end < 0:
+        close_line_end = len(text)
+    close_line = text[close_line_start:close_line_end]
+
+    # The search block: the closing ``]`` line as it stands on disk.
+    # The replace block: same content, but with ``new_entry`` prepended
+    # on its own line above.
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=pyproject_rel,
+        search=close_line,
+        replace=f"{new_entry}\n{close_line}",
     )
 
 

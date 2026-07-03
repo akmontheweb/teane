@@ -5213,6 +5213,19 @@ def _uv_venv_prefix() -> str:
     sandbox container (``/tmp`` is ephemeral); within a container the
     ``test -d`` guard makes re-activation a no-op.
 
+    Also ensures ``pytest-timeout`` is installed. It's baked into the
+    harness-builder image (``Dockerfile.builder``) so the ``--system-
+    site-packages`` venv typically inherits it for free — the extra
+    ``uv pip install --quiet`` here is a fail-open safety net for
+    operators running against a custom image built before the
+    Dockerfile change landed. Idempotent when already present.
+    Motivation: ``_PYTEST_RUN`` unconditionally passes
+    ``--timeout=30 --timeout-method=thread`` so LLM-generated infinite
+    loops fail at the test level with an actionable traceback instead
+    of at the 300s sandbox SIGKILL with exit code -9 and zero
+    diagnostic (session 6de334c3 lost 10+ minutes to this exact
+    class of failure in a rate limiter).
+
     Note: no subshell parens here. In bash ``&&`` and ``||`` are equal-
     precedence and left-associative, so ``test -d X || uv venv X && …``
     parses identically to ``(test -d X || uv venv X) && …``. The earlier
@@ -5224,7 +5237,8 @@ def _uv_venv_prefix() -> str:
     return (
         f"test -d {_PROD_SMOKE_VENV_PATH}/bin "
         f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH} "
-        f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate"
+        f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate "
+        f"&& uv pip install --quiet pytest-timeout"
     )
 
 

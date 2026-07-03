@@ -640,7 +640,10 @@ class TestDetectSubdirBuildCommand:
         with_dev = _detect_default_build_command(str(tmp_path))
         assert no_dev is not None and with_dev is not None
 
-        _CLI_PYTEST_TAIL = " && python3 -m pytest -vv --tb=long --showlocals"
+        _CLI_PYTEST_TAIL = (
+            " && python3 -m pytest -vv --tb=long --showlocals "
+            "--timeout=30 --timeout-method=thread"
+        )
         assert no_dev.endswith(_CLI_PYTEST_TAIL)
         assert with_dev.endswith(_CLI_PYTEST_TAIL)
         no_dev_head = no_dev[: -len(_CLI_PYTEST_TAIL)]

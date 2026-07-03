@@ -69,7 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && python3 -m pip install --no-cache-dir --upgrade \
       pip setuptools wheel \
  && python3 -m pip install --no-cache-dir \
-      uv pytest pytest-cov pytest-xdist \
+      uv pytest pytest-cov pytest-xdist pytest-timeout \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
       npx --yes playwright install --with-deps chromium \
  && chmod -R a+rX /opt/playwright-browsers \

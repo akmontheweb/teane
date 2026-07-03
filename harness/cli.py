@@ -1580,7 +1580,31 @@ def _makefile_has_target(workspace_path: str, target: str) -> bool:
 # The previous ``-q`` was capturing dots-only output that left the judge
 # repeatedly emitting "insufficient data — investigate <file>" because
 # the captured ``AssertionError`` had no traceback values.
-_PYTEST_RUN = "python3 -m pytest -vv --tb=long --showlocals"
+#
+# ``--timeout=30 --timeout-method=thread`` (pytest-timeout) is what turns
+# LLM-generated infinite loops into an actionable traceback instead of a
+# 5-minute sandbox SIGKILL that produces zero diagnostic. Session
+# 6de334c3 lost 10+ minutes to a
+# ``while True: ... await asyncio.sleep(sleep_time)`` in a rate limiter:
+# pytest hung, sandbox timed out at 300s, exit code was -9, the repair
+# LLM saw nothing and generated another hanging test. With
+# ``--timeout=30`` pytest kills the offending test at 30s and prints a
+# ``__________ Timeout __________`` block naming the exact file:line the
+# thread was stuck on. ``method=thread`` (vs the default ``signal``) is
+# necessary because ``signal`` fails on threads other than the main
+# thread — irrelevant here since our sandbox pytest always runs main,
+# but no downside and the thread method also works inside asyncio-run
+# tests where signals would be intercepted by the loop.
+#
+# The plugin is baked into ``harness-builder:latest`` (see
+# ``Dockerfile.builder``) so no runtime install is needed. Older/custom
+# images that lack it will error out with "unrecognized argument
+# --timeout" — operators can fix that with a one-line
+# ``python3 -m pip install pytest-timeout`` in their build command.
+_PYTEST_RUN = (
+    "python3 -m pytest -vv --tb=long --showlocals "
+    "--timeout=30 --timeout-method=thread"
+)
 
 
 _SUBDIR_BUILD_SKIP = frozenset({
@@ -1962,7 +1986,11 @@ def resolve_build_command(
     seed = (
         "mvn -B test"
         if backend == "Java"
-        else f"python3 -m pip install pytest && {_PYTEST_RUN}"
+        # Install pytest-timeout alongside pytest so ``_PYTEST_RUN``'s
+        # ``--timeout=30`` flag doesn't error out with "unrecognized
+        # argument" on the very first compile — before any venv or
+        # manifest is wired up.
+        else f"python3 -m pip install pytest pytest-timeout && {_PYTEST_RUN}"
     )
     logger.info(
         "[cli] Workspace has no build markers yet; seeding build command "

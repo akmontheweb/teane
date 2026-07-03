@@ -2694,7 +2694,8 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     # exist to make the NEXT round's banner escalate ("YOU IGNORED THE
     # JUDGE"), which only makes sense in a single unbroken repair
     # stretch. But we deliberately KEEP
-    # ``judge_named_file_lines_last_round`` and
+    # ``judge_named_file_lines_last_round``,
+    # ``judge_persistent_files_last_round``, and
     # ``persistent_blocker_streak_per_file``: in headless auto-resume
     # nothing outside the harness has changed, so a blocker that was
     # persistent BEFORE the HITL trip is still persistent AFTER it, and

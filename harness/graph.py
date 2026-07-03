@@ -9459,6 +9459,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             for _pair in _prev_named_lines_raw:
                 if isinstance(_pair, (list, tuple)) and len(_pair) == 2:
                     _persistent_files.add(str(_pair[0]))
+            # Also lift caps for files named without a line — session
+            # bz4xcajwa stalled on ``backend/services/parser.py`` for 3+
+            # rounds where the judge only had a "missing symbol" error
+            # (no line number). The file-only persistence detection above
+            # promotes such files to the persistent set, so the same
+            # full-file rendering should apply to them.
+            for _f in loop_counter.get(
+                "judge_persistent_files_last_round"
+            ) or []:
+                if isinstance(_f, str) and _f:
+                    _persistent_files.add(_f)
             preflight_pairs = _collect_workspace_file_content(
                 workspace_path, files_for_preflight,
                 max_files=diag_cap,
@@ -10088,7 +10099,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 (f, ln) for (f, ln) in _current_named_lines
                 if (f, ln) in _prev_named_lines
             ]
-            if _persistent_lines:
+            # File-only persistence detection (fallback when the diagnostic
+            # doesn't carry a line number). Session bz4xcajwa demonstrated
+            # the miss: judge said "backend/services/parser.py does not
+            # export FilingParser" for 3+ rounds, but with no line
+            # reference the file:line persistence never triggered, ESCAPE
+            # HATCH never fired, and the LLM kept emitting failing
+            # DELETE_BLOCK+CREATE_FILE against an empty file. When the
+            # SAME FILE (not file:line) recurs round-over-round, promote
+            # it too — with a weaker directive since we can't hard-target
+            # a specific line.
+            _current_named_files_only = set(judge_named_files or [])
+            _prev_named_files_only = set(
+                str(p) for p in (
+                    loop_counter.get("judge_persistent_files_last_round") or []
+                )
+                if isinstance(p, str)
+            )
+            _persistent_files_only = sorted(
+                (_current_named_files_only & _prev_named_files_only)
+                - {f for f, _ in _persistent_lines}
+            )
+            if _persistent_lines or _persistent_files_only:
                 _display = ", ".join(
                     f"{f}:{ln}" for f, ln in _persistent_lines[:5]
                 )
@@ -10104,7 +10136,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _streak: dict[str, int] = (
                     dict(_streak_raw) if isinstance(_streak_raw, dict) else {}
                 )
-                _persistent_files_set = {f for f, _ in _persistent_lines}
+                _persistent_files_set = (
+                    {f for f, _ in _persistent_lines}
+                    | set(_persistent_files_only)
+                )
                 for _f in _persistent_files_set:
                     _streak[_f] = _streak.get(_f, 1) + 1
                 # Reset streaks for files that dropped out of the
@@ -10115,18 +10150,38 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         _streak.pop(_f, None)
                 loop_counter["persistent_blocker_streak_per_file"] = _streak
                 _max_streak = max(_streak.values(), default=0)
-                reflection_banner_lines.append(
-                    "PERSISTENT BLOCKER — the SAME location has failed "
-                    f"two+ rounds running: {_display}. Your previous "
-                    "patch either missed the target or landed a cosmetic "
-                    "change nearby. MANDATORY: your search block(s) THIS "
-                    "round MUST include the exact failing line — read "
-                    "the current file (READ_FILE) if needed to lift the "
-                    "surrounding context, then emit a REPLACE_BLOCK / "
-                    "DELETE_BLOCK that textually contains the failing "
-                    "line. A patch that does not touch these lines will "
-                    "be treated as no progress."
-                )
+                if _persistent_lines:
+                    reflection_banner_lines.append(
+                        "PERSISTENT BLOCKER — the SAME location has failed "
+                        f"two+ rounds running: {_display}. Your previous "
+                        "patch either missed the target or landed a "
+                        "cosmetic change nearby. MANDATORY: your search "
+                        "block(s) THIS round MUST include the exact "
+                        "failing line — read the current file (READ_FILE) "
+                        "if needed to lift the surrounding context, then "
+                        "emit a REPLACE_BLOCK / DELETE_BLOCK that "
+                        "textually contains the failing line. A patch "
+                        "that does not touch these lines will be treated "
+                        "as no progress."
+                    )
+                if _persistent_files_only:
+                    _file_display = ", ".join(_persistent_files_only[:5])
+                    reflection_banner_lines.append(
+                        "PERSISTENT BLOCKER (file scope) — the SAME file(s) "
+                        f"have been the blocker two+ rounds without a "
+                        f"specific line: {_file_display}. This usually "
+                        "means the file is missing an entire symbol / "
+                        "class / definition (not a wrong line), or your "
+                        "previous patches keep landing outside the "
+                        "allowlist. If the file is empty or nearly empty, "
+                        "emit CREATE_FILE with the FULL required content. "
+                        "If the file exists but lacks the symbol the "
+                        "import expects, emit REPLACE_BLOCK / "
+                        "INSERT_AT_BLOCK adding the required definition. "
+                        "Do NOT emit patches whose search block cannot be "
+                        "found on disk — a REPLACE_BLOCK miss on a "
+                        "persistent-file target is treated as no progress."
+                    )
                 if _max_streak >= 3:
                     _stuck_files = sorted({
                         f for f, s in _streak.items() if s >= 3
@@ -10734,8 +10789,26 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 ]
             else:
                 loop_counter.pop("judge_named_file_lines_last_round", None)
+            # File-only (line-agnostic) counterpart — needed for the
+            # "PERSISTENT BLOCKER (file scope)" banner to detect
+            # symbol-not-found errors that recur across rounds without a
+            # line reference. Distinct from the existing
+            # ``judge_named_files_last_round`` which is only maintained
+            # during judge-ignored rounds; this one saves on every
+            # DISTRACTION/REGRESSION so the persistent-blocker directive
+            # sees the full history.
+            _named_files_now = _verdict_named_files(
+                reflection_verdict, state.get("compiler_errors", []) or []
+            )
+            if _named_files_now:
+                loop_counter["judge_persistent_files_last_round"] = list(
+                    _named_files_now
+                )
+            else:
+                loop_counter.pop("judge_persistent_files_last_round", None)
         else:
             loop_counter.pop("judge_named_file_lines_last_round", None)
+            loop_counter.pop("judge_persistent_files_last_round", None)
 
         # Judge-ignored gate (Fix #3). When the reflection verdict named
         # specific files as the real blocker, check that the round's

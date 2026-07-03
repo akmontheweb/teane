@@ -104,3 +104,44 @@ class TestVerdictNamedFileLines:
             {"real_blocker": "", "recommendation": ""},
             _errs(("a.py", 1)),
         ) == []
+
+
+class TestVerdictNamedFilesFileOnly:
+    """Independent tests for _verdict_named_files — the file-only detector
+    that backs the "PERSISTENT BLOCKER (file scope)" banner. Extends the
+    existing file:line detector for diagnostics that lack a line number
+    (missing-symbol import errors, session bz4xcajwa)."""
+
+    def test_matches_file_named_without_line(self):
+        from harness.graph import _verdict_named_files
+        verdict = {
+            "real_blocker": (
+                "backend/services/parser.py does not export the name "
+                "'FilingParser', causing ImportError."
+            ),
+            "recommendation": "",
+        }
+        errs = [
+            {
+                "file": "backend/services/parser.py",
+                "line": 0,
+                "error_code": "ImportError",
+                "message": "cannot import name 'FilingParser'",
+            }
+        ]
+        out = _verdict_named_files(verdict, errs)
+        assert out == ["backend/services/parser.py"]
+
+    def test_returns_empty_when_file_not_in_compiler_errors(self):
+        from harness.graph import _verdict_named_files
+        verdict = {
+            "real_blocker": "utils.py is missing helper_x",
+            "recommendation": "",
+        }
+        errs = [
+            {
+                "file": "backend/api/other.py", "line": 5,
+                "error_code": "NameError", "message": "helper_x undefined",
+            }
+        ]
+        assert _verdict_named_files(verdict, errs) == []

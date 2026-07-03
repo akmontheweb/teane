@@ -3320,6 +3320,33 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     "[HITL] Auto-resume: HITL-trip counters cleared to "
                     "break the headless ping-pong."
                 )
+                # Clear env_misconfig state flags too. These are the
+                # "compile / test-generation hit a condition the operator
+                # is supposed to fix outside the harness" markers
+                # (missing binary in the sandbox image, exhausted
+                # test_generation_max_iterations, missing LLM API key,
+                # etc.). ``route_after_compiler`` inspects them on
+                # entry, so if we don't wipe them here the very next
+                # router pass re-detects the same misconfig and
+                # re-triggers HITL — which auto-resumes — which routes
+                # back to compiler_node — which re-detects — infinite
+                # loop at ~10 events/sec until the process is killed
+                # externally. Session 21a638b4 demonstrated this on
+                # ``test_generation_max_iterations`` (a per-batch soft
+                # cap the batch already burned through; the correct
+                # behaviour is to move on with what's been written, not
+                # spin forever).
+                _ns = state.get("node_state") or {}
+                if isinstance(_ns, dict):
+                    for _k in (
+                        "env_misconfig",
+                        "env_misconfig_symbol",
+                        "build_command_blocked",
+                        "build_command_blocked_rule",
+                        "llm_silent",
+                    ):
+                        _ns.pop(_k, None)
+                    state["node_state"] = _ns
             # Re-read on-disk config so operator edits between HITL triggers
             # (sandbox.docker_image, build_command, etc.) reach the in-memory
             # state. Without this the [r] Resume keeps using whatever

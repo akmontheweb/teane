@@ -54,15 +54,40 @@ _FEAT_RE = re.compile(
     re.M,
 )
 
-# ``#### Story: STORY-001 — Ticker & Name Search``
-# ``#### Enabler Story: STORY-NFR-006 — Document Caching & Reuse``
+# Story headings — accepts both level-4 (regular stories under a
+# feature) and level-3 (enabler stories often live at feature depth
+# in SAFe specs).
+#
+#   ``#### Story: STORY-001 — Ticker & Name Search``     (level 4)
+#   ``#### Enabler Story: STORY-NFR-006 — Doc Caching``  (level 4)
+#   ``### Enabler Story: STORY-NFR-001 — Perf``          (level 3)
+#
+# 2026-07-04 fix — the ciod spec used ``### Enabler Story`` (level 3)
+# and the strict ``^####`` prefix silently skipped every enabler
+# story. All six of ciod's ``STORY-NFR-*`` requirements ended up in
+# the ``requirements`` table (parsed by ``req_ids`` with a looser
+# heading regex) but never landed in ``stories`` → the identity-link
+# fix from earlier in the day had nothing to link. Loosening the
+# heading level closes the gap without breaking existing
+# ``#### Story`` layouts.
+#
+# Level range: at LEAST 3 hashes (SAFe convention floor) and up to
+# 6 (Markdown's max h6). Uses a bounded quantifier so a stray
+# ``## Story:`` at page-title level doesn't get promoted.
 _STORY_RE = re.compile(
-    r"^####\s+(?:Enabler\s+)?Story:\s+(STORY-[\w-]+)\s+—\s+(.+?)\s*$",
+    r"^#{3,6}\s+(?:Enabler\s+)?Story:\s+(STORY-[\w-]+)\s+—\s+(.+?)\s*$",
     re.M,
 )
 
 # ``**Parent feature:** FEAT-001``
 _PARENT_FEAT_RE = re.compile(r"\*\*Parent feature:\*\*\s+(FEAT-\d+)")
+
+# ``**Parent epic:** EPIC-001`` — declared inside a feature body.
+# Used by the reconciler to write ``story_satisfies_req`` edges from
+# each story up through its feature to the enclosing epic, so
+# structural parent requirements (EPIC / FEAT rows) are traced by
+# their descendants and don't linger in the "untraced" report.
+_PARENT_EPIC_RE = re.compile(r"\*\*Parent epic:\*\*\s+(EPIC-\d+)")
 
 # ` ```gherkin ... ``` ` blocks inside a story body
 _GHERKIN_BLOCK_RE = re.compile(r"```gherkin\s*\n(.+?)\n```", re.S)
@@ -104,11 +129,25 @@ def parse_spec_requirements(text: str) -> dict[str, Any]:
         }
     """
     features: list[dict[str, Any]] = []
-    for m in _FEAT_RE.finditer(text):
+    feat_matches = list(_FEAT_RE.finditer(text))
+    for i, m in enumerate(feat_matches):
+        # Body spans from THIS feature heading to the next feature
+        # heading (or EOF for the last feature). Used to locate the
+        # ``**Parent epic:** EPIC-N`` line for structural
+        # traceability. 2026-07-04 extension — closes the ciod v12
+        # 15/26 epic/feature gap.
+        body_start = m.start()
+        body_end = (
+            feat_matches[i + 1].start()
+            if i + 1 < len(feat_matches) else len(text)
+        )
+        body = text[body_start:body_end]
+        pe = _PARENT_EPIC_RE.search(body)
         features.append({
             "feature_key": m.group(1),
             "name": m.group(2).strip(),
             "description": "",
+            "parent_epic": pe.group(1) if pe else None,
         })
 
     stories: list[dict[str, Any]] = []
@@ -449,6 +488,23 @@ def reconcile_workspace_from_spec(
                 canonical = canonicalize_req_key(str(llm_key))
                 if canonical in req_id_by_key:
                     candidate_req_keys.add(canonical)
+            # Structural parent inference (2026-07-04) — the ciod v12
+            # 15/26 traceability report showed 5 requirement rows
+            # (1 EPIC + 4 FEATs) untraced because coverage was only
+            # counted via story identity links. Every story implicitly
+            # satisfies its parent feature (via ``spec['feature']``)
+            # and, transitively, that feature's parent epic. Write
+            # both edges here so structural requirements get traced by
+            # their descendants — no dedicated feature/epic story is
+            # required.
+            if fk in req_id_by_key:
+                candidate_req_keys.add(fk)
+            for feat in parsed["features"]:
+                if feat.get("feature_key") == fk:
+                    parent_epic = feat.get("parent_epic")
+                    if parent_epic and parent_epic in req_id_by_key:
+                        candidate_req_keys.add(parent_epic)
+                    break
             for rk in candidate_req_keys:
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO story_satisfies_req"

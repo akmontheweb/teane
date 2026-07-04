@@ -16167,8 +16167,38 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
         # instead of END. The diagnostic carries enough context for
         # the operator to find the offending FRs/ACs without re-running
         # the audit.
+        #
+        # Cycle counter (2026-07-04) — the DB-level story→req links
+        # are not fixable via auto-resume: HITL routes to
+        # ``traceability_node`` which regenerates docs from unchanged
+        # DB state, which routes back through security_scan →
+        # installation_doc → same audit → same failure. Ciod session
+        # 523e86a7 spent 376 iterations in this loop before manual
+        # kill. Track the cycle count in loop_counter so
+        # ``route_after_installation_doc`` can escape to END after the
+        # second attempt: the first fires HITL (an interactive
+        # operator CAN fix the DB by hand); the auto-resume path
+        # re-enters and the second failure exits cleanly rather than
+        # burning budget forever.
+        loop_counter = dict(state.get("loop_counter") or {})
+        cycles = int(loop_counter.get("traceability_block_cycles", 0) or 0) + 1
+        loop_counter["traceability_block_cycles"] = cycles
+        out["loop_counter"] = loop_counter
         node_state_delta["traceability_blocked"] = True
+        node_state_delta["traceability_block_cycles"] = cycles
         out["exit_code"] = 1
+        logger.info(
+            "[traceability] block cycle %d — router will HITL up to the "
+            "cap; further cycles terminate to END to prevent the "
+            "headless auto-resume infinite loop.",
+            cycles,
+        )
+    else:
+        # Clean audit — reset the counter so a later regression doesn't
+        # inherit stale cycle count.
+        loop_counter = dict(state.get("loop_counter") or {})
+        if loop_counter.pop("traceability_block_cycles", None) is not None:
+            out["loop_counter"] = loop_counter
     out["node_state"] = node_state_delta
     return out
 
@@ -16182,12 +16212,47 @@ def route_after_installation_doc(state: AgentState) -> str:
     specs can opt out by setting ``traceability.enforce = false``
     in ``.harness_config.json`` (the gate then logs but does not
     block — the audit print still fires).
+
+    Cycle cap (2026-07-04): after ``TRACEABILITY_BLOCK_CYCLE_CAP``
+    consecutive HITL trips against the same traceability gap, route
+    to END regardless. Ciod session 523e86a7 spent 376 iterations
+    ping-ponging this gate under headless auto-resume: HITL routes
+    to ``traceability_node`` which regenerates docs from unchanged
+    DB state, which routes back through security_scan →
+    installation_doc → same audit → same failure. An interactive
+    operator can break the loop on the first trip by editing
+    ``.harness_config.json``'s ``traceability.enforce`` or by
+    populating the story→req links; a headless session cannot, so
+    we exit cleanly with ``exit_code=1`` after the cap. The
+    counter is bumped in ``installation_doc_node`` above and
+    cleared on any clean audit.
     """
     from langgraph.graph import END
     node_state = state.get("node_state") or {}
-    if node_state.get("traceability_blocked"):
-        return "human_intervention_node"
-    return END
+    if not node_state.get("traceability_blocked"):
+        return END
+    loop_counter = state.get("loop_counter") or {}
+    cycles = int(loop_counter.get("traceability_block_cycles", 0) or 0)
+    if cycles >= TRACEABILITY_BLOCK_CYCLE_CAP:
+        logger.warning(
+            "[router] traceability_block cycle %d ≥ cap %d — "
+            "auto-resume cannot fix DB-level story→req links; "
+            "routing to END with exit_code=1 to prevent the "
+            "headless ping-pong loop (ciod session 523e86a7 spent "
+            "376 iterations here before manual kill).",
+            cycles, TRACEABILITY_BLOCK_CYCLE_CAP,
+        )
+        return END
+    return "human_intervention_node"
+
+
+# Ciod session 523e86a7 (2026-07-04) hit 376 iterations of the
+# ``installation_doc_node → HITL → traceability_node → security_scan
+# → installation_doc_node`` cycle because headless auto-resume kept
+# re-entering a gate that only a human edit outside the harness can
+# clear. Two attempts is enough to let an interactive operator
+# respond; beyond that, exit cleanly rather than burn budget.
+TRACEABILITY_BLOCK_CYCLE_CAP = 2
 
 
 async def _emit_application_usage_guide(

@@ -39,6 +39,7 @@ from difflib import SequenceMatcher
 from typing import Any, Optional
 
 from harness import story_state
+from harness.req_ids import canonicalize_req_key
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +390,16 @@ def reconcile_workspace_from_spec(
         feature_id_by_key = _insert_features(
             conn, workspace, parsed["features"], now,
         )
+        # Snapshot the requirement universe AFTER wipe (which does NOT
+        # touch ``requirements`` — cascades hit stories/features/ACs
+        # only). Used below to write ``story_satisfies_req`` edges for
+        # each spec-authored story.
+        req_id_by_key: dict[str, int] = {
+            r["req_key"]: r["id"]
+            for r in story_state.list_requirements(conn, workspace)
+        }
         stories_written = 0
+        links_written = 0
         for spec in parsed["stories"]:
             fk = spec["feature"]
             if fk not in feature_id_by_key:
@@ -410,10 +420,42 @@ def reconcile_workspace_from_spec(
                 spec["acceptance_criteria"],
             )
             stories_written += 1
+            # Root-cause fix (2026-07-04) — ``_wipe_workspace`` above
+            # cascades-deletes ``story_satisfies_req`` (FK on
+            # story_id). Without re-populating the link table here, the
+            # end-of-session traceability audit ALWAYS reports 0%
+            # requirement coverage even when every spec story is
+            # written to disk. Ciod session 523e86a7 hit this and
+            # spun ~376 iterations in the traceability_block HITL loop
+            # (see graph.route_after_installation_doc) before external
+            # kill. The identity link (``story STORY-N`` satisfies
+            # ``requirement STORY-N``) mirrors the SAFe spec convention
+            # where every story heading is itself a requirement; when
+            # the LLM's story cites additional ``requirement_keys``
+            # (FEAT-*, FR-*, NFR-*), they are added on top. Missing
+            # requirement rows (rare — happens when the spec was
+            # revised between ingest and reconcile) are logged but
+            # do not abort — a broken spec must never poison the run.
+            candidate_req_keys: set[str] = set()
+            self_ref = spec["story_key"]
+            if self_ref in req_id_by_key:
+                candidate_req_keys.add(self_ref)
+            for llm_key in ((llm_hit or {}).get("requirement_keys") or []):
+                canonical = canonicalize_req_key(str(llm_key))
+                if canonical in req_id_by_key:
+                    candidate_req_keys.add(canonical)
+            for rk in candidate_req_keys:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO story_satisfies_req"
+                    "(story_id, requirement_id) VALUES(?, ?)",
+                    (story_id, req_id_by_key[rk]),
+                )
+                links_written += cur.rowcount or 0
 
     summary = {
         "features_written": len(feature_id_by_key),
         "stories_written": stories_written,
+        "story_satisfies_req_written": links_written,
         "spec_features_seen": len(parsed["features"]),
         "spec_stories_seen": len(parsed["stories"]),
         "orphan_stories": len(orphan_stories_after),
@@ -422,9 +464,11 @@ def reconcile_workspace_from_spec(
         "fuzzy_matched": len(matches),
     }
     logger.info(
-        "[spec_reconciler] wrote %d features, %d stories from spec; LLM had "
-        "%d stories (%d matched by key/title); orphaned %d",
+        "[spec_reconciler] wrote %d features, %d stories, %d "
+        "story_satisfies_req edges from spec; LLM had %d stories "
+        "(%d matched by key/title); orphaned %d",
         summary["features_written"], summary["stories_written"],
+        summary["story_satisfies_req_written"],
         summary["llm_before"]["story_count"], summary["fuzzy_matched"],
         summary["orphan_stories"],
     )

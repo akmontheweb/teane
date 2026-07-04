@@ -298,6 +298,59 @@ class TestRouteAfterInstallationDoc:
         state = {"node_state": {"traceability_blocked": True}}
         assert route_after_installation_doc(state) == "human_intervention_node"
 
+    def test_still_hitl_at_first_cycle(self):
+        # First trip → HITL. Interactive operator can still fix by
+        # editing ``.harness_config.json`` outside the harness.
+        from harness.graph import route_after_installation_doc
+        state = {
+            "node_state": {"traceability_blocked": True},
+            "loop_counter": {"traceability_block_cycles": 1},
+        }
+        assert route_after_installation_doc(state) == "human_intervention_node"
+
+    def test_routes_to_end_at_cycle_cap(self):
+        # Ciod session 523e86a7 (2026-07-04): 376 iterations of
+        # traceability_block → HITL(auto-resume) → traceability_node →
+        # security_scan → installation_doc → same audit → same block.
+        # Auto-resume cannot fix DB-level story→req links; after the
+        # cap we must exit cleanly instead of spinning forever.
+        from harness.graph import route_after_installation_doc, TRACEABILITY_BLOCK_CYCLE_CAP
+        from langgraph.graph import END
+        state = {
+            "node_state": {"traceability_blocked": True},
+            "loop_counter": {
+                "traceability_block_cycles": TRACEABILITY_BLOCK_CYCLE_CAP,
+            },
+        }
+        assert route_after_installation_doc(state) == END
+
+    def test_routes_to_end_when_cycles_over_cap(self):
+        # Defensive: even if the counter overshot the cap (e.g. a
+        # stale checkpoint), we still want END, not HITL.
+        from harness.graph import route_after_installation_doc, TRACEABILITY_BLOCK_CYCLE_CAP
+        from langgraph.graph import END
+        state = {
+            "node_state": {"traceability_blocked": True},
+            "loop_counter": {
+                "traceability_block_cycles": TRACEABILITY_BLOCK_CYCLE_CAP + 5,
+            },
+        }
+        assert route_after_installation_doc(state) == END
+
+    def test_cycle_counter_ignored_when_not_blocked(self):
+        # If the audit is clean this pass, the cycle counter should
+        # NOT force END prematurely — a fresh clean pass wins.
+        from harness.graph import route_after_installation_doc, TRACEABILITY_BLOCK_CYCLE_CAP
+        from langgraph.graph import END
+        state = {
+            "node_state": {},  # no traceability_blocked
+            "loop_counter": {
+                "traceability_block_cycles": TRACEABILITY_BLOCK_CYCLE_CAP + 1,
+            },
+        }
+        # Clean run terminates as before — no HITL, no lingering.
+        assert route_after_installation_doc(state) == END
+
 
 class TestHarnessConfigPlumbing:
     """Phase 7 BUG #1 regression: ``state["harness_config"]`` is the

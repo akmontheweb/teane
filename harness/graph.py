@@ -9524,6 +9524,35 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     top_persisted_diagnostics.append(dict(err))
                 if len(top_persisted_diagnostics) >= 3:
                     break
+            # Bug A fix — when no diagnostic is persisted (every failure this
+            # round is fresh, e.g. after a recent patch broke a new test), the
+            # judge would previously receive an empty ``top_persisted_diagnostics``
+            # list and fall back to the "insufficient data — no diagnostic
+            # locations available" sentinel, even though ``compiler_errors``
+            # actually carried locations. That drove the ciod session 54f4eaf2
+            # loop: pytest kept surfacing 2 fresh diagnostics/round with
+            # file:line info, the judge kept saying "no locations", the repair
+            # LLM kept guessing. Fall back to the top-3 fresh diagnostics with
+            # a real file field so the judge has SOMETHING to ground on. Prefer
+            # entries whose file field is a real path (not the ``<no location>``
+            # placeholder or a bare-code stub).
+            if not top_persisted_diagnostics:
+                for err in _reflection_errors:
+                    f = str(err.get("file", "") or "").strip()
+                    if not f or f.startswith("<"):
+                        continue
+                    top_persisted_diagnostics.append(dict(err))
+                    if len(top_persisted_diagnostics) >= 3:
+                        break
+                if top_persisted_diagnostics:
+                    logger.info(
+                        "[repair_node] No diagnostics were in the persisted "
+                        "intersection this round; passing %d fresh "
+                        "diagnostic(s) with file locations to the judge so "
+                        "it can ground on real anchors instead of emitting "
+                        "the 'insufficient data' sentinel.",
+                        len(top_persisted_diagnostics),
+                    )
             persistent_errors_for_scoring = [
                 err for err in _reflection_errors
                 if (str(err.get("error_code", "?")) + "::" +
@@ -9694,17 +9723,40 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                             loop_counter["consecutive_distraction_rounds"],
                         )
                     loop_counter["consecutive_distraction_rounds"] = 0
-                    # Any PROGRESS verdict also clears the low-signal streak —
-                    # the judge is engaging with the diagnostics again, so the
-                    # raw-tail escalation is no longer needed on the next round.
-                    if loop_counter.get("consecutive_low_signal_rounds", 0) > 0:
+                    # Bug B fix — a PROGRESS verdict that is ITSELF low-signal
+                    # (the judge said "insufficient data — no diagnostic
+                    # locations available") is NOT progress. It's the judge
+                    # telling us it can't see anything. Previously the reset
+                    # below fired on every PROGRESS regardless of signal,
+                    # which meant ciod session 54f4eaf2 accumulated 21
+                    # consecutive PROGRESS+insufficient-data verdicts without
+                    # ever ticking the low-signal counter — the loop just
+                    # ground until HITL was tripped by other means. When the
+                    # PROGRESS is low-signal, tick the counter the same as a
+                    # low-signal DISTRACTION/REGRESSION so the HITL gate below
+                    # sees the streak.
+                    if _low_signal:
+                        loop_counter["consecutive_low_signal_rounds"] = (
+                            loop_counter.get("consecutive_low_signal_rounds", 0) + 1
+                        )
                         logger.info(
-                            "[repair_node] Reflection verdict PROGRESS; "
-                            "resetting consecutive_low_signal_rounds from "
-                            "%d to 0.",
+                            "[repair_node] Reflection verdict PROGRESS but "
+                            "real_blocker is the 'insufficient data' "
+                            "sentinel — NOT resetting low-signal streak "
+                            "(now %d). Judge cannot see the failing "
+                            "diagnostic; if this repeats, HITL will be "
+                            "escalated by the low_signal_verdict_loop gate.",
                             loop_counter["consecutive_low_signal_rounds"],
                         )
-                    loop_counter["consecutive_low_signal_rounds"] = 0
+                    else:
+                        if loop_counter.get("consecutive_low_signal_rounds", 0) > 0:
+                            logger.info(
+                                "[repair_node] Reflection verdict PROGRESS; "
+                                "resetting consecutive_low_signal_rounds from "
+                                "%d to 0.",
+                                loop_counter["consecutive_low_signal_rounds"],
+                            )
+                        loop_counter["consecutive_low_signal_rounds"] = 0
                 try:
                     from harness.observability import emit_event as _emit
                     _emit(
@@ -11797,6 +11849,22 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     )
     if consecutive_distraction >= _distraction_cap:
         return f"reflection_distraction_loop:{consecutive_distraction}"
+    # Bug B — low-signal-verdict circuit breaker. When the judge has
+    # said "insufficient data — no diagnostic locations available" for
+    # ``max_consecutive_low_signal_rounds`` rounds running (default 5),
+    # the loop is grinding on failures the judge can't ground. That is
+    # exactly the ciod session 54f4eaf2 pattern where 21 consecutive
+    # PROGRESS+insufficient-data verdicts burned ~2 hours of budget
+    # without converging. Mirrored on the route side below.
+    _low_signal_cap = (
+        int(getattr(_gw_for_inf.config, "max_consecutive_low_signal_rounds", 5))
+        if _gw_for_inf is not None else 5
+    )
+    consecutive_low_signal = int(
+        loop_counter.get("consecutive_low_signal_rounds", 0) or 0
+    )
+    if consecutive_low_signal >= _low_signal_cap:
+        return f"low_signal_verdict_loop:{consecutive_low_signal}"
     if int(loop_counter.get("total_repairs", 0) or 0) >= max_repair:
         return "repair_loop_limit"
     exit_code_raw = state.get("exit_code", -1)
@@ -12824,6 +12892,33 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "blocker; further rounds will keep cycling on the same "
             "guidance. Routing to HITL.",
             consecutive_distraction, max_distraction,
+        )
+        return _transition("human_intervention_node")
+
+    # Bug B fix — low-signal-verdict circuit breaker. Ticked by
+    # ``repair_node`` whenever the judge falls back to "insufficient
+    # data — no diagnostic locations available" regardless of the verdict
+    # word. When it saturates ``max_consecutive_low_signal_rounds`` the
+    # loop is grinding on diagnostics the judge cannot ground — the
+    # repair LLM is guessing without a target. Escalating to HITL lets
+    # the operator inject a hint or accept the current diff before more
+    # budget burns. Ciod session 54f4eaf2 ran 21 consecutive
+    # PROGRESS+insufficient-data verdicts for ~2 hours before we killed
+    # it; this gate would have caught it in ~5 rounds.
+    max_low_signal = (
+        int(getattr(gw.config, "max_consecutive_low_signal_rounds", 5))
+        if gw is not None else 5
+    )
+    consecutive_low_signal = int(
+        loop_counter.get("consecutive_low_signal_rounds", 0) or 0
+    )
+    if consecutive_low_signal >= max_low_signal:
+        logger.warning(
+            "[router] %d consecutive reflection verdict(s) collapsed to the "
+            "'insufficient data' sentinel (cap=%d). The judgment LLM has "
+            "been unable to ground on a real file:line for that many rounds "
+            "— the repair LLM is patching without a target. Routing to HITL.",
+            consecutive_low_signal, max_low_signal,
         )
         return _transition("human_intervention_node")
 

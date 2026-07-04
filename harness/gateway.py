@@ -1697,6 +1697,16 @@ class GatewayConfig:
     # repair LLM isn't touching the real blocker N rounds in a row,
     # the router escalates to HITL. Clamped to [1, 10] at config load.
     max_consecutive_distraction_rounds: int = 3
+    # Bug B (2026-07-04) — low-signal-verdict circuit breaker. Ticked
+    # whenever the reflection judge falls back to the "insufficient
+    # data — no diagnostic locations available" sentinel, regardless of
+    # the verdict word. When it saturates this cap ``route_after_compiler``
+    # escalates to HITL — the judge has been unable to ground on the
+    # failing diagnostic for that many rounds, so the repair LLM is
+    # patching without a target. Session 54f4eaf2 (ciod) hit 21
+    # consecutive low-signal PROGRESS verdicts before external kill;
+    # this cap catches the same pattern in ~5. Clamped [1, 20].
+    max_consecutive_low_signal_rounds: int = 5
     # Phase G — end-of-session regression repair cap. Caps the
     # repair → recompile loop the harness runs after security_scan
     # passes but before deployment. Read by
@@ -3131,6 +3141,35 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 10
         return value
 
+    def _clamp_low_signal_rounds(raw: Any) -> int:
+        """Clamp ``node_throttle.max_consecutive_low_signal_rounds`` to [1, 20].
+
+        Ciod session 54f4eaf2 hit 21 consecutive low-signal PROGRESS
+        verdicts before external kill; a default cap of 5 is chosen to
+        catch the same pattern early while allowing brief bursts (bare
+        AssertionError from pytest recovering after one round of judge
+        confusion). Floor of 1 lets operators force immediate HITL on
+        any low-signal verdict; ceiling of 20 keeps the gate meaningful
+        even for permissive configs.
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 5
+        if value < 1:
+            logger.warning(
+                "max_consecutive_low_signal_rounds %d < 1; clamping to 1.",
+                value,
+            )
+            return 1
+        if value > 20:
+            logger.warning(
+                "max_consecutive_low_signal_rounds %d > 20; clamping to 20.",
+                value,
+            )
+            return 20
+        return value
+
     def _clamp_discovery_iterations(raw: Any) -> int:
         try:
             value = int(raw)
@@ -3233,6 +3272,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_consecutive_distraction_rounds=_clamp_distraction_rounds(
             node_throttle.get("max_consecutive_distraction_rounds", 3)
+        ),
+        max_consecutive_low_signal_rounds=_clamp_low_signal_rounds(
+            node_throttle.get("max_consecutive_low_signal_rounds", 5)
         ),
         # Phase G + Phase J — end-of-session repair / regression knobs.
         # Clamp the cycle / cap fields to sane ranges so a bogus

@@ -116,6 +116,47 @@ def test_zero_patch_loop_label_includes_count():
     assert out == "zero_patch_loop:3"
 
 
+def test_low_signal_verdict_loop_trips_at_default_cap():
+    # Bug B (2026-07-04): ciod session 54f4eaf2 accumulated 21 consecutive
+    # PROGRESS+"insufficient data" verdicts without any counter firing —
+    # the reset branch in repair_node cleared the streak on every
+    # PROGRESS. The route gate must fire at the default cap of 5 so the
+    # loop no longer grinds silently.
+    out = _infer_hitl_trigger(
+        _state(loop_counter={"consecutive_low_signal_rounds": 5}),
+        max_repair=10,
+    )
+    assert out == "low_signal_verdict_loop:5"
+
+
+def test_low_signal_verdict_loop_holds_under_cap():
+    # Below the cap the label must NOT switch to low-signal — the loop
+    # is still allowed to try one more round of the low-signal
+    # escalation prompt (build-output tail injected at streak >=2).
+    out = _infer_hitl_trigger(
+        _state(loop_counter={
+            "consecutive_low_signal_rounds": 4,
+            "total_repairs": 2,
+        }),
+        max_repair=10,
+    )
+    assert out != "low_signal_verdict_loop:4"
+
+
+def test_distraction_loop_takes_priority_over_low_signal():
+    # Both counters can co-exist — a DISTRACTION streak is a stronger
+    # signal (judge IS grounding but the LLM is ignoring it). Make sure
+    # ordering surfaces the more actionable label.
+    out = _infer_hitl_trigger(
+        _state(loop_counter={
+            "consecutive_distraction_rounds": 3,
+            "consecutive_low_signal_rounds": 8,
+        }),
+        max_repair=10,
+    )
+    assert out == "reflection_distraction_loop:3"
+
+
 def test_repair_loop_limit_at_cap():
     out = _infer_hitl_trigger(
         _state(loop_counter={"total_repairs": 3}, exit_code=1),

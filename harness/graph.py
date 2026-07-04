@@ -11098,44 +11098,63 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "this round — no exceptions.\n\n"
                     + reflection_msg
                 )
-            # Build the focused dispatch list. Skip messages[0] (the SRS),
-            # keep small autofix system notes, keep the last assistant turn
-            # so the model sees its own previous patch attempt as delta
-            # context. apply_repair_iteration_cleanse already ran for
-            # iter ≥ 2, so ``messages`` is mostly minimal — we just need to
-            # also drop the SRS itself, which it deliberately preserves.
+            # Build the focused dispatch list. 2026-07-04 fix — keep
+            # ``messages[0]`` (the SRS) AND ``messages[1]`` (the static
+            # repair-role framer) byte-stable across every focused-
+            # dispatch call so the provider prompt cache actually hits.
+            # Previously the reflection banner was written to index 0;
+            # its ``Real blocker:`` / ``REQUIRED ACTION:`` fields change
+            # every round, so the stable-prefix hash (n_stable=2)
+            # invalidated every dispatch. Ciod session 523e86a7 logged
+            # 29 cache_prefix_drift events on the repair role alone;
+            # this restructure eliminates them.
+            #
+            # New layout:
+            #   [0] SRS system prompt         — session-static, cache anchor
+            #   [1] static repair framer      — session-static
+            #   [2] reflection banner         — volatile, but past cache window
+            #   [...preserved chatter...]
+            #   [last assistant turn]         — variable, past cache window
+            #
+            # The SRS is intentionally kept in-context here (not trimmed
+            # as before). The attention-competition concern the prior
+            # trim was designed to address is a smaller cost than the
+            # provider cache miss on every repair dispatch.
             _focused: list[MessageDict] = [
-                MessageDict(role="system", content=reflection_msg),
+                messages[0],
                 MessageDict(role="system", content=(
-                    "You are the repair LLM. Your only job this turn is to "
-                    "fix the failing diagnostic the judge named above. The "
-                    "spec/SRS has been intentionally trimmed for this turn "
-                    "so it does not compete for your attention. Emit "
-                    "patches in the block DSL only — no prose."
+                    "You are the repair LLM. Your only job this turn "
+                    "is to fix the failing diagnostic the judge names "
+                    "in the banner below. The SRS above is workspace "
+                    "context you may reference; do not re-derive the "
+                    "goal from it. Emit patches in the block DSL only "
+                    "— no prose."
                 )),
+                MessageDict(role="system", content=reflection_msg),
             ]
             _last_assistant_msg: Optional[MessageDict] = None
             for _m in reversed(messages):
                 if _m.get("role") == "assistant":
                     _last_assistant_msg = _m
                     break
-            if _last_assistant_msg is not None:
-                _focused.append(_last_assistant_msg)
-            # Preserve any non-SRS system messages already accumulated this
-            # turn (autofix note, budget_warning). Skip messages[0] which
-            # is the SRS and any system messages that look like full
-            # planning prompts (>8000 chars heuristic — the SRS and the
-            # original planning user message both exceed this; reflection
-            # / autofix / status notes do not).
+            # Preserve any non-SRS system messages already accumulated
+            # this turn (autofix note, budget_warning). Skip messages[0]
+            # (the SRS — already at index 0) and any system messages
+            # that look like full planning prompts (>8000 chars
+            # heuristic — the SRS and the original planning user message
+            # both exceed this; reflection / autofix / status notes do
+            # not).
             for _idx, _m in enumerate(messages):
                 if _idx == 0:
-                    continue  # the SRS
+                    continue  # the SRS — already at index 0
                 if _m.get("role") != "system":
                     continue
                 content = str(_m.get("content", "") or "")
                 if len(content) > 8000:
                     continue  # likely a planning blob
                 _focused.append(_m)
+            if _last_assistant_msg is not None:
+                _focused.append(_last_assistant_msg)
             _before = len(messages)
             messages = _focused
             logger.info(

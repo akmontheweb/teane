@@ -561,6 +561,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Bug B (2026-07-04) — consecutive-low-signal-verdict circuit
         # breaker for the repair loop.
         "max_consecutive_low_signal_rounds",
+        # 2026-07-04 — router hard-ceiling multiplier for total repair
+        # rounds per compile phase. Combined with
+        # ``max_patch_repair_iterations`` to compute the absolute cap.
+        "total_hard_cap_multiplier",
         "max_doc_review_cycles",
         "max_code_review_cycles",
         "max_discovery_iterations",
@@ -847,6 +851,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "node_throttle.max_patch_repair_iterations": (int,),
     "node_throttle.max_consecutive_distraction_rounds": (int,),
     "node_throttle.max_consecutive_low_signal_rounds": (int,),
+    "node_throttle.total_hard_cap_multiplier": (int,),
     "node_throttle.max_doc_review_cycles": (int,),
     "node_throttle.max_code_review_cycles": (int,),
     "node_throttle.max_discovery_iterations": (int,),

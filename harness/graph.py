@@ -12944,8 +12944,22 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # progress signal. Catches the fingerprint-churn case where each round
     # technically resolves one fingerprint but introduces a new one of
     # equal weight, so no_progress_repairs never trips.
-    _TOTAL_HARD_CAP_MULTIPLIER = 2
-    total_hard_cap = max_iterations * _TOTAL_HARD_CAP_MULTIPLIER
+    #
+    # Multiplier promoted to ``gw.config.total_hard_cap_multiplier`` on
+    # 2026-07-04 (default 4, was hard-coded 2) after ciod session
+    # 523e86a7 tripped the ceiling at 6/6 while making genuine per-round
+    # progress on a prod-smoke cascade. The batch converged 3 minutes
+    # after auto-resume, so the HITL trip was purely wall-clock loss.
+    # With ``max_patch_repair_iterations`` default 3, the new cap is
+    # 3 × 4 = 12 total rounds — enough headroom for a cascade whose
+    # per-round fix rate is honest but slow, still tight enough to
+    # catch fingerprint-churn thrash. Operators can override via
+    # config.json ``node_throttle.total_hard_cap_multiplier``.
+    _hard_cap_multiplier = (
+        int(getattr(gw.config, "total_hard_cap_multiplier", 4))
+        if gw is not None else 4
+    )
+    total_hard_cap = max_iterations * _hard_cap_multiplier
     if total_repairs >= total_hard_cap and not has_autofixable:
         logger.warning(
             "[router] Hard total-iteration ceiling reached (%d/%d). "

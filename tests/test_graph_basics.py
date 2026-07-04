@@ -1479,15 +1479,21 @@ class TestProgressBasedBudget:
         result = _graph.route_after_compiler(state)
         assert result == "human_intervention_node"
 
-    def test_router_hard_ceiling_at_2x_total_repairs(self):
+    def test_router_hard_ceiling_at_4x_total_repairs(self):
         """Even with every round making progress, run away protection
-        kicks in at 2 * max_iterations to prevent fingerprint-churn loops."""
+        kicks in at 4 * max_iterations to prevent fingerprint-churn loops.
+
+        Multiplier was raised from 2 → 4 on 2026-07-04 (ciod session
+        523e86a7): a converging prod-smoke cascade needed more than
+        6 rounds and the ceiling was tripping while genuine progress was
+        landing. 4 × 3 = 12 total gives cascades enough runway without
+        losing the tripwire for real thrash."""
         from harness import graph as _graph
         state = {
             "exit_code": 2,
             "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
             "loop_counter": {
-                "total_repairs": 6,        # 2 * 3 = hard ceiling
+                "total_repairs": 12,       # 4 * 3 = hard ceiling
                 "no_progress_repairs": 0,
                 "consecutive_zero_patch_rounds": 0,
             },
@@ -1496,6 +1502,26 @@ class TestProgressBasedBudget:
         }
         result = _graph.route_after_compiler(state)
         assert result == "human_intervention_node"
+
+    def test_router_below_hard_ceiling_continues(self):
+        """Sanity guard for the raised multiplier: at 11 rounds
+        (one below the new 4×3=12 cap), we must still route to repair,
+        not HITL. Locks in the 4× ratio so a future refactor that
+        accidentally reverts to 2× produces a clear test failure."""
+        from harness import graph as _graph
+        state = {
+            "exit_code": 2,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "total_repairs": 11,
+                "no_progress_repairs": 0,
+                "consecutive_zero_patch_rounds": 0,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        result = _graph.route_after_compiler(state)
+        assert result == "repair_node"
 
     def test_router_backward_compat_no_progress_field_absent(self):
         """Sessions checkpointed before Phase 1.1 won't have

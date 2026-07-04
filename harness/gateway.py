@@ -1707,6 +1707,18 @@ class GatewayConfig:
     # consecutive low-signal PROGRESS verdicts before external kill;
     # this cap catches the same pattern in ~5. Clamped [1, 20].
     max_consecutive_low_signal_rounds: int = 5
+    # Multiplier for the router's hard total-iteration ceiling. Combined
+    # with ``max_patch_repair_iterations``, sets the absolute cap on
+    # total repair rounds per compile phase — the tripwire for
+    # fingerprint-churn loops where each round technically resolves one
+    # fingerprint but introduces a new one of equal weight, so
+    # ``no_progress_repairs`` never trips. Default 4 gives a 3-round
+    # primary loop 12 rounds of headroom, enough for a cascading
+    # prod-smoke fix (ciod session 523e86a7 needed 9 rounds to converge
+    # cleanly on genuine per-round progress). Clamped [1, 20]: floor 1
+    # makes the hard ceiling equal to the primary limit; ceiling 20
+    # keeps a max_iterations=10 config from running to 200+ rounds.
+    total_hard_cap_multiplier: int = 4
     # Phase G — end-of-session regression repair cap. Caps the
     # repair → recompile loop the harness runs after security_scan
     # passes but before deployment. Read by
@@ -3170,6 +3182,32 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 20
         return value
 
+    def _clamp_hard_cap_multiplier(raw: Any) -> int:
+        """Clamp ``node_throttle.total_hard_cap_multiplier`` to [1, 20].
+
+        Floor 1: hard cap equals primary limit — no ceiling headroom,
+        useful for operators who want the loop to escalate immediately
+        after ``max_patch_repair_iterations`` rounds. Ceiling 20: caps
+        the runaway risk when the primary limit is also large (a
+        max_iterations=10 with multiplier=20 already lets the loop run
+        200 rounds).
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 4
+        if value < 1:
+            logger.warning(
+                "total_hard_cap_multiplier %d < 1; clamping to 1.", value,
+            )
+            return 1
+        if value > 20:
+            logger.warning(
+                "total_hard_cap_multiplier %d > 20; clamping to 20.", value,
+            )
+            return 20
+        return value
+
     def _clamp_discovery_iterations(raw: Any) -> int:
         try:
             value = int(raw)
@@ -3275,6 +3313,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_consecutive_low_signal_rounds=_clamp_low_signal_rounds(
             node_throttle.get("max_consecutive_low_signal_rounds", 5)
+        ),
+        total_hard_cap_multiplier=_clamp_hard_cap_multiplier(
+            node_throttle.get("total_hard_cap_multiplier", 4)
         ),
         # Phase G + Phase J — end-of-session repair / regression knobs.
         # Clamp the cycle / cap fields to sane ranges so a bogus

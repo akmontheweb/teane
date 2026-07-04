@@ -7520,6 +7520,426 @@ def _verdict_referenced_files(
     return matched
 
 
+# Maximum entries per section — bounded so a single stuck file doesn't
+# blow token budget. History is oldest→newest; symbol/caller lists are
+# alphabetical. Values chosen so a typical multi-round persistent
+# blocker (session b9369w5uu had 8 rounds targeting one file) shows
+# every attempt without truncating.
+_WORKSPACE_CTX_MAX_HISTORY = 12
+_WORKSPACE_CTX_MAX_SYMBOLS = 25
+_WORKSPACE_CTX_MAX_CALLERS = 8
+
+
+def _record_file_modification_history(
+    loop_counter: dict[str, Any],
+    round_number: int,
+    patch_results: list[Any],
+) -> None:
+    """Append per-file records for this round's ``apply_all`` results
+    into ``loop_counter["file_modification_history"]``.
+
+    Structure:
+        {
+          "path/to/file.py": [
+            [round_number, op_type_str, success_bool, no_op_bool,
+             one_line_note_str_or_empty],
+            ...
+          ],
+          ...
+        }
+
+    Values are plain lists rather than tuples so JSON checkpointing
+    round-trips cleanly. Kept per-file bounded at
+    ``_WORKSPACE_CTX_MAX_HISTORY`` (oldest evicted) so a runaway loop
+    can't unbounded-grow state.
+
+    Motivation: session b9369w5uu on ciod had the LLM emit REWRITE_FILE
+    with byte-identical content two rounds running because it had no
+    signal that its previous attempt on the same file had already
+    "succeeded" (in the patcher sense — no-op). This record surfaces
+    into the repair prompt so the LLM sees "you already tried the same
+    op on this file at round N — try something different."
+    """
+    hist_raw = loop_counter.get("file_modification_history")
+    history: dict[str, list[list[Any]]] = (
+        dict(hist_raw) if isinstance(hist_raw, dict) else {}
+    )
+    for r in patch_results:
+        if r is None:
+            continue
+        f = getattr(r, "file", "") or ""
+        if not f:
+            continue
+        op = getattr(r, "operation", None)
+        op_str = op.value if hasattr(op, "value") else str(op or "?")
+        success = bool(getattr(r, "success", False))
+        no_op = bool(getattr(r, "no_op", False))
+        # One-line note: the leading sentence of the error, truncated.
+        note = ""
+        err = getattr(r, "error", None)
+        if isinstance(err, str) and err.strip():
+            first_line = err.strip().splitlines()[0].strip()
+            note = first_line[:140]
+        entries = list(history.get(f) or [])
+        entries.append([round_number, op_str, success, no_op, note])
+        if len(entries) > _WORKSPACE_CTX_MAX_HISTORY:
+            entries = entries[-_WORKSPACE_CTX_MAX_HISTORY:]
+        history[f] = entries
+    loop_counter["file_modification_history"] = history
+
+
+def _dotted_module_names_for_file(
+    workspace_path: str, filepath: str,
+) -> list[str]:
+    """Return the Python-style dotted module names a file can be
+    imported as. Handles the ``pkg/__init__.py`` → ``pkg`` alias plus
+    the plain ``pkg/mod.py`` → ``pkg.mod`` form. Both variants are
+    returned so a caller lookup catches import-by-package and
+    import-by-module.
+    """
+    if not filepath.endswith(".py"):
+        return []
+    try:
+        rel = os.path.relpath(filepath, workspace_path)
+    except ValueError:
+        return []
+    parts = rel.replace(os.sep, "/").split("/")
+    if not parts:
+        return []
+    variants: list[str] = []
+    # module form: parts stripped of .py
+    parts_mod = parts[:]
+    if parts_mod[-1].endswith(".py"):
+        parts_mod[-1] = parts_mod[-1][:-3]
+    variants.append(".".join(parts_mod))
+    # package form: __init__ trimmed
+    if parts_mod and parts_mod[-1] == "__init__":
+        pkg = ".".join(parts_mod[:-1])
+        if pkg:
+            variants.append(pkg)
+    return variants
+
+
+def _grep_imported_names(
+    caller_file: str, module_dotted: str, workspace_path: str,
+) -> set[str]:
+    """Return the set of identifiers ``caller_file`` imports from
+    ``module_dotted``. Empty set if the file can't be read.
+
+    Grep-based rather than AST-based so it works on partially-broken
+    Python (which is common mid-repair-loop). Handles the ``from X
+    import A, B as C`` and ``from X import (A, B)`` shapes.
+    """
+    try:
+        with open(caller_file, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return set()
+    pat = re.compile(
+        r"^\s*from\s+" + re.escape(module_dotted)
+        + r"\s+import\s+(?P<what>[\w\*,\s\(\)]+?)(?:\s+as\s+\w+)?\s*$",
+        re.MULTILINE,
+    )
+    names: set[str] = set()
+    for m in pat.finditer(text):
+        what = m.group("what").strip()
+        what = what.replace("(", " ").replace(")", " ")
+        for piece in what.split(","):
+            piece = piece.strip()
+            if not piece or piece.startswith("*"):
+                continue
+            piece = piece.split(" as ")[0].strip()
+            if piece.isidentifier():
+                names.add(piece)
+    return names
+
+
+def _format_workspace_context_for_files(
+    files: Iterable[str],
+    workspace_path: str,
+    loop_counter: dict[str, Any],
+) -> str:
+    """Build a compact per-file context block for the repair prompt.
+
+    For each file in ``files`` (typically the persistent-blocker set),
+    surfaces three pieces of info the LLM cannot otherwise derive from
+    the truncated current-content view:
+
+      1. Modification history this session — "you already tried
+         REWRITE_FILE on this at round 3, it succeeded; round 5 was
+         a no-op; round 7 rolled back with a SyntaxError."
+      2. Currently-defined symbols — the file's ACTUAL exports as
+         seen by the workspace's dependency graph, so the LLM knows
+         what's really there without having to re-derive it from a
+         truncated file.
+      3. Callers + imports — which OTHER files import from this one,
+         and what symbols they expect. Reveals missing exports (a
+         file imports symbol Z but Z isn't in this file's export
+         list) which is exactly the class of bug ciod session
+         b9369w5uu spent 20+ rounds chasing on
+         ``server/models/__init__.py``.
+
+    Language-aware via the tree-sitter grammars already registered in
+    ``harness.impact.DependencyGraph``: Python, Java, TypeScript / TSX,
+    JavaScript / JSX, plus text-fallback for anything else. Silent
+    no-op when the graph fails to build — best-effort prompt
+    enrichment, never a hard blocker.
+    """
+    file_list = sorted({f for f in files if isinstance(f, str) and f.strip()})
+    if not file_list:
+        return ""
+    try:
+        from harness.impact import DependencyGraph
+        graph = DependencyGraph(workspace_path)
+        graph.build()
+    except Exception:  # noqa: BLE001 — graph build is best-effort
+        graph = None
+
+    def _resolve(path: str) -> Optional[str]:
+        if graph is None:
+            return None
+        try:
+            return graph._resolve_path(path)  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _rel(path: str) -> str:
+        try:
+            return os.path.relpath(path, workspace_path)
+        except ValueError:
+            return path
+
+    hist_raw = loop_counter.get("file_modification_history") or {}
+    history: dict[str, list[list[Any]]] = (
+        hist_raw if isinstance(hist_raw, dict) else {}
+    )
+
+    sections: list[str] = []
+    for f in file_list:
+        section: list[str] = [f"### `{f}`"]
+        resolved = _resolve(f)
+
+        # -------- 1. modification history --------
+        entries = list(history.get(f) or [])
+        if entries:
+            section.append("**This session's modification history:**")
+            for entry in entries:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 4:
+                    continue
+                rnd, op_str, success, no_op = entry[:4]
+                note = entry[4] if len(entry) > 4 else ""
+                status: str
+                if no_op and success:
+                    status = "success (no change)"
+                elif no_op and not success:
+                    status = "NO-OP FAILURE (content matched disk)"
+                elif success:
+                    status = "succeeded"
+                else:
+                    status = "FAILED"
+                line = f"  - Round {rnd}: {op_str} — {status}"
+                if note:
+                    line += f" ({note})"
+                section.append(line)
+        else:
+            section.append("**This session's modification history:** (none yet)")
+
+        # -------- 2. currently-defined symbols --------
+        if resolved is not None and graph is not None:
+            symbols = sorted(graph._exports.get(resolved, set()))  # noqa: SLF001
+            if symbols:
+                shown = symbols[:_WORKSPACE_CTX_MAX_SYMBOLS]
+                more = max(0, len(symbols) - len(shown))
+                sym_str = ", ".join(shown)
+                if more:
+                    sym_str += f" (+{more} more)"
+                section.append(
+                    f"**Currently-defined symbols:** {sym_str}"
+                )
+            else:
+                section.append(
+                    "**Currently-defined symbols:** (none detected — "
+                    "file may be empty or unparseable)"
+                )
+
+        # -------- 3. callers + expected imports --------
+        if resolved is not None and graph is not None:
+            symbols_here = graph._exports.get(resolved, set())  # noqa: SLF001
+            # Map caller_file -> set of symbols they import from
+            # this file. Cross-reference against the file's actual
+            # exports to surface "expected but not defined" symbols.
+            #
+            # DependencyGraph's ``_build_reverse_index`` cross-links
+            # symbols back to caller files for TS/Java etc., but Python
+            # package roots (``pkg/__init__.py``) don't get resolved by
+            # the module_to_files stem match (stripped stem contains
+            # ``__init__``). Fall back to the raw import key —
+            # ``_dependents[dotted_module_path]`` — which the scanner
+            # populated directly. Both paths merged so a Java file (via
+            # symbol match) and a Python package init (via module
+            # match) both surface callers.
+            caller_map: dict[str, set[str]] = {}
+            for symbol, dep_files in graph._dependents.items():  # noqa: SLF001
+                if symbol not in symbols_here:
+                    continue
+                for df in dep_files:
+                    if df == resolved:
+                        continue
+                    caller_map.setdefault(df, set()).add(symbol)
+            # Python package fallback — resolve callers via the
+            # module's dotted path when the symbol-based lookup found
+            # nothing (or missed __init__.py).
+            if resolved.endswith(".py"):
+                module_variants = _dotted_module_names_for_file(
+                    workspace_path, resolved,
+                )
+                for mod in module_variants:
+                    dep_files = graph._dependents.get(mod, set())  # noqa: SLF001
+                    for df in dep_files:
+                        if df == resolved:
+                            continue
+                        # Best-effort symbol attribution: re-parse the
+                        # caller's imports to figure out which symbols
+                        # it pulls from this module.
+                        syms = _grep_imported_names(df, mod, workspace_path)
+                        caller_map.setdefault(df, set()).update(syms)
+            if caller_map:
+                section.append("**Files that import from here:**")
+                for caller, syms in sorted(caller_map.items())[:_WORKSPACE_CTX_MAX_CALLERS]:
+                    caller_rel = _rel(caller)
+                    section.append(
+                        f"  - `{caller_rel}` imports: "
+                        f"{', '.join(sorted(syms))}"
+                    )
+                extra = max(0, len(caller_map) - _WORKSPACE_CTX_MAX_CALLERS)
+                if extra:
+                    section.append(f"  - (+{extra} more caller(s))")
+            else:
+                section.append(
+                    "**Files that import from here:** (none detected)"
+                )
+
+            # ---- Missing-symbol candidates: imports pointing at this
+            # module that resolve to symbols NOT in this file's export
+            # set. Reveals the exact class of bug ciod session
+            # b9369w5uu spent 20+ rounds chasing (BlacklistedToken,
+            # etc.). Only report when the file is definitely a Python
+            # module — Java/TS import syntax makes the "expected
+            # symbol" harder to infer without full type resolution.
+            if resolved.endswith(".py"):
+                missing = _infer_missing_exports_for_module(
+                    graph, workspace_path, resolved,
+                )
+                if missing:
+                    shown_missing = missing[:_WORKSPACE_CTX_MAX_SYMBOLS]
+                    more = max(0, len(missing) - len(shown_missing))
+                    m_str = ", ".join(shown_missing)
+                    if more:
+                        m_str += f" (+{more} more)"
+                    section.append(
+                        f"**Missing-symbol candidates** (imported by "
+                        f"callers but not currently defined here): {m_str}"
+                    )
+        sections.append("\n".join(section))
+    if not sections:
+        return ""
+    return (
+        "\n## Workspace context for files this loop keeps targeting\n"
+        "These blocks are workspace-level facts about the files below — "
+        "your session-history against them plus the dependency graph's "
+        "view of what they define and who imports from them. If a caller "
+        "imports a symbol not listed under \"Currently-defined\", THAT "
+        "is your missing export. If your last op on a file was a NO-OP "
+        "FAILURE, you are stuck emitting the same wrong content — do "
+        "not emit it again.\n\n"
+        + "\n\n".join(sections)
+        + "\n"
+    )
+
+
+def _infer_missing_exports_for_module(
+    graph: Any, workspace_path: str, module_file: str,
+) -> list[str]:
+    """Return names that OTHER files import from ``module_file`` but
+    that don't appear in the module's own export set. Python-only for
+    now — TS/Java import syntax requires deeper type resolution.
+
+    Approach: grep the workspace for
+    ``from <module_dotted_path> import X, Y, Z`` and
+    ``from <module_dotted_path> import X as Y``. Anything on the
+    right-hand side that isn't in ``graph._exports[module_file]`` is
+    a candidate missing export.
+
+    Best-effort: only walks up to 200 python files past cache/venv/
+    node_modules ignores; larger workspaces would silently under-
+    report but never fabricate a missing name (grounded on grep).
+    """
+    if not module_file.endswith(".py"):
+        return []
+    rel = os.path.relpath(module_file, workspace_path)
+    dotted_variants: set[str] = set()
+    parts = rel.replace(os.sep, "/").split("/")
+    if parts and parts[-1].endswith(".py"):
+        parts[-1] = parts[-1][:-3]
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            dotted_variants.add(".".join(parts))
+    if not dotted_variants:
+        return []
+    exports_here = set(graph._exports.get(module_file, set()))  # noqa: SLF001
+    imported: set[str] = set()
+    scanned = 0
+    _MAX = 200
+    _IMPORT_RE = re.compile(
+        r"^\s*from\s+(?P<mod>[\w\.]+)\s+import\s+(?P<what>[\w\*,\s\(\)]+?)"
+        r"(?:\s+as\s+\w+)?\s*$",
+        re.MULTILINE,
+    )
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [
+            d for d in dirs
+            if d not in {
+                "__pycache__", "node_modules", ".git", ".venv", "venv",
+                ".pytest_cache", ".mypy_cache", "dist", "build",
+                ".tox", ".nox",
+            }
+        ]
+        for name in files:
+            if scanned >= _MAX:
+                break
+            if not name.endswith(".py"):
+                continue
+            fp = os.path.join(root, name)
+            if fp == module_file:
+                continue
+            try:
+                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            scanned += 1
+            for m in _IMPORT_RE.finditer(text):
+                mod = m.group("mod").strip()
+                if mod not in dotted_variants:
+                    continue
+                what = m.group("what").strip()
+                # Strip parens, split on commas, drop `as` clauses.
+                what = what.replace("(", " ").replace(")", " ")
+                for piece in what.split(","):
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    if piece.startswith("*"):
+                        continue
+                    piece = piece.split(" as ")[0].strip()
+                    if piece.isidentifier():
+                        imported.add(piece)
+        if scanned >= _MAX:
+            break
+    return sorted(imported - exports_here)
+
+
 def _related_test_files(
     source_file: str,
     workspace_path: str,
@@ -10405,6 +10825,27 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                             "OR that the test's harness is lying to it. "
                             "Patch whichever side is actually broken."
                         )
+                # Workspace context enrichment (fixes 1+2+3): for every
+                # persistent-blocker file, surface (a) modification history
+                # this session so the LLM sees which ops already ran, (b)
+                # currently-defined symbols so it doesn't have to
+                # re-derive from a truncated file view, (c) which callers
+                # import which symbols and any missing-export candidates
+                # cross-checked against the dep graph. Best-effort:
+                # helper swallows dep-graph build failures.
+                try:
+                    _ws_ctx = _format_workspace_context_for_files(
+                        _persistent_files_set,
+                        _workspace_for_banner,
+                        loop_counter,
+                    )
+                    if _ws_ctx.strip():
+                        reflection_banner_lines.append(_ws_ctx)
+                except Exception as _ws_exc:  # noqa: BLE001
+                    logger.debug(
+                        "[repair_node] workspace context enrichment "
+                        "failed: %s", _ws_exc,
+                    )
             else:
                 # No persistent lines this round — clear per-file streaks
                 # so a NEW blocker on a stale-streak file doesn't inherit
@@ -11071,6 +11512,21 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             loop_counter.pop("judge_ignored_last_round", None)
             loop_counter.pop("judge_named_files_last_round", None)
             loop_counter.pop("judge_round_touched_files", None)
+
+        # Per-file modification history — surfaces into the repair
+        # prompt via ``_format_workspace_context_for_files`` so the LLM
+        # sees "you already tried REWRITE_FILE on ``models/__init__.py``
+        # at round 5 and it was a no-op — do not repeat." Session
+        # b9369w5uu (ciod) had 8 rounds attacking the same file with
+        # the same op because the LLM had no history it could see.
+        try:
+            _record_file_modification_history(
+                loop_counter,
+                loop_counter.get("total_repairs", 0) or 0,
+                patch_results,
+            )
+        except Exception as _hist_exc:  # noqa: BLE001
+            logger.debug("[repair_node] file history record failed: %s", _hist_exc)
 
         # Per-file REPLACE_BLOCK miss tracker (fix #3). Bump for each
         # failed REPLACE_BLOCK, clear for any file with a successful

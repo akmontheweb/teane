@@ -10464,7 +10464,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # N comes from the operator's config (node_throttle.max_patch_repair_iterations).
         total_repairs = loop_counter["total_repairs"]
         max_repair_attempts = int(getattr(gateway.config, "max_patch_repair_iterations", 5))
-        use_escalation = total_repairs >= max(1, max_repair_attempts - 1)
+        # 2026-07-04 fix — decouple escalation from ``total_repairs``.
+        # ``total_repairs`` is used for iteration counting, memory-cleanse
+        # timing, hard-cap gating, and previously ALSO for escalation.
+        # When ``_TOTAL_HARD_CAP_MULTIPLIER`` was raised to 4 (default
+        # hard cap = 12 rounds) the escalation-side coupling meant every
+        # round from round 2 onward used the reasoning model — 11
+        # reasoning-model rounds per HITL cycle, which showed up as
+        # "5+ escalations per batch" cost in ciod session 523e86a7.
+        #
+        # ``cheap_shots_taken`` is a dedicated counter that:
+        #   * increments each round that ran the cheap model,
+        #   * resets on session start and on HITL auto-resume via
+        #     ``_reset_hitl_trip_counters``,
+        # so the cheap model gets ``max_repair_attempts - 1`` fresh
+        # shots every HITL cycle, not one-and-done.
+        cheap_shots_taken = int(loop_counter.get("cheap_shots_taken", 0) or 0)
+        use_escalation = cheap_shots_taken >= max(1, max_repair_attempts - 1)
         # Phase J: at end-of-session repair, jump straight to the
         # reasoning model. The failing tests at this gate ran after
         # security-scan repairs, so a one-shot diagnosis benefits
@@ -10481,6 +10497,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if _eos_active and _eos_force:
             use_escalation = True
 
+        # Persist the incremented cheap-shot count when we're about to
+        # spend a cheap round. Stored in ``loop_counter`` so the next
+        # repair_node call sees the running tally. Skipped when
+        # ``use_escalation`` is True — that round is going to spend
+        # the reasoning model, so the cheap-shot budget stays intact
+        # for the fresh chance the next HITL auto-resume grants.
+        if not use_escalation:
+            loop_counter["cheap_shots_taken"] = cheap_shots_taken + 1
         if use_escalation:
             escalation_model = gateway.config.repair_fallback or gateway.config.planning_fallback
             primary_model = gateway.config.repair_primary

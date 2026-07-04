@@ -2724,6 +2724,15 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
         "no_progress_repairs",
         "consecutive_distraction_rounds",
         "consecutive_low_signal_rounds",
+        # 2026-07-04 — reset the cheap-model shot counter on HITL
+        # auto-resume so the cheap model gets a fresh
+        # ``max_repair_attempts - 1`` shots per HITL cycle. Without
+        # this, the counter accumulates across the whole session and
+        # every post-HITL round burns the reasoning model. Ciod
+        # session 523e86a7 saw 5+ escalations per batch because the
+        # cheap-shot budget was effectively exhausted after the first
+        # HITL cycle.
+        "cheap_shots_taken",
     ):
         if key in loop_counter:
             loop_counter[key] = 0

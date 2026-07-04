@@ -5867,6 +5867,17 @@ _PREFLIGHT_FILE_LINE_CAP = 300
 # (:data:`_PREFLIGHT_FILE_LINE_CAP`,
 # :data:`_PREFLIGHT_FILE_CHAR_CAP`) still apply on each entry.
 _REREAD_INJECTION_CAP = 5
+# Max number of files that get the workspace-context enrichment
+# (modification history + symbol registry + reverse import map) on
+# every repair round. Prior to 2026-07-04 the enrichment fired ONLY
+# inside the persistent-blocker banner, whose gate is narrow (same
+# file/line targeted 2+ rounds running). Ciod session 523e86a7's
+# batch 28 stalled 90+ minutes in repair without ever tripping the
+# gate because the judge named a different file each round. Cross-
+# round context is what breaks the LLM's memoryless
+# "1-patch-per-round" pattern; capping at 3 keeps the prompt bounded
+# while still covering the diagnostic hot-spots.
+_CROSS_ROUND_CTX_CAP = 3
 _PREFLIGHT_FILE_CHAR_CAP = 6000
 _PREFLIGHT_SECTION_CHAR_CAP = 24000
 # When the persistent-blocker directive fires on a file, ordinary preflight
@@ -10136,6 +10147,67 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "you write."
                 ),
             )
+    # 2026-07-04 fix — always-on cross-round workspace context.
+    # ``_format_workspace_context_for_files`` (modification history +
+    # symbol registry + reverse import map) used to fire ONLY inside
+    # the persistent-blocker banner. That gate requires the SAME
+    # file/line to be targeted 2+ rounds running; ciod session
+    # 523e86a7's batch 28 stalled 90+ minutes in repair because the
+    # judge named different files each round, so the gate never
+    # tripped. Widening the trigger: inject cross-round context for
+    # files that are relevant to THIS round (either they appear in
+    # a diagnostic, or the LLM modified them within the last two
+    # rounds). Bounded by ``_CROSS_ROUND_CTX_CAP`` so the prompt
+    # stays predictable.
+    try:
+        _hist_raw = loop_counter.get("file_modification_history") or {}
+        _hist: dict[str, list] = _hist_raw if isinstance(_hist_raw, dict) else {}
+        _current_round = int(loop_counter.get("total_repairs", 0) or 0)
+        _recent_modified: set[str] = set()
+        for _f, _entries in _hist.items():
+            if not isinstance(_entries, list) or not _entries:
+                continue
+            _last_entry = _entries[-1]
+            if not isinstance(_last_entry, (list, tuple)) or not _last_entry:
+                continue
+            try:
+                _last_round = int(_last_entry[0])
+            except (TypeError, ValueError):
+                continue
+            if _current_round - _last_round <= 2:
+                _recent_modified.add(str(_f))
+        _cross_round_files: list[str] = []
+        _seen_cr: set[str] = set()
+        # Prefer files in the current diagnostic set — they're where
+        # the LLM is about to work — then top up with recently
+        # modified paths that might carry stale mental-model bits.
+        for _f in list(diag_files) + sorted(_recent_modified):
+            if _f in _seen_cr:
+                continue
+            _seen_cr.add(_f)
+            _cross_round_files.append(_f)
+            if len(_cross_round_files) >= _CROSS_ROUND_CTX_CAP:
+                break
+        if _cross_round_files:
+            _cross_ctx = _format_workspace_context_for_files(
+                _cross_round_files, workspace_path, loop_counter,
+            )
+            if _cross_ctx.strip():
+                error_summary += _cross_ctx
+                logger.info(
+                    "[repair_node] Cross-round workspace context injected "
+                    "for %d file(s): %s. Surfaces modification history + "
+                    "currently-defined symbols + caller import map so the "
+                    "LLM has session memory beyond the last assistant "
+                    "turn.",
+                    len(_cross_round_files), _cross_round_files,
+                )
+    except Exception as _cr_exc:  # noqa: BLE001
+        logger.debug(
+            "[repair_node] Cross-round context enrichment failed: %s",
+            _cr_exc,
+        )
+
     # Workspace-aware conftest chain (Fix #3). When tests fail, surface
     # the EXACT chain of ``conftest.py`` files pytest is loading for
     # each failing test, with content inlined. The repair LLM otherwise

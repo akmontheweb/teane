@@ -5856,6 +5856,17 @@ def _extract_wider_context_from_failure(failure: Any) -> tuple[str, Optional[str
 
 
 _PREFLIGHT_FILE_LINE_CAP = 300
+# Max number of previously-READ_FILE'd paths re-injected into the
+# preflight-file block on each repair round. Prevents post-cleanse
+# duplicate ``<<<READ_FILE>>>`` round trips: without re-injection, a
+# memory-cleanse strips the file content from the LLM's context, and
+# on the next round the LLM emits ``<<<READ_FILE>>>`` for the same
+# path — costing an extra full dispatch each time. Cap protects the
+# prompt budget on sessions that touched many files across HITL
+# boundaries; per-file line/char caps
+# (:data:`_PREFLIGHT_FILE_LINE_CAP`,
+# :data:`_PREFLIGHT_FILE_CHAR_CAP`) still apply on each entry.
+_REREAD_INJECTION_CAP = 5
 _PREFLIGHT_FILE_CHAR_CAP = 6000
 _PREFLIGHT_SECTION_CHAR_CAP = 24000
 # When the persistent-blocker directive fires on a file, ordinary preflight
@@ -10043,6 +10054,43 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             files_for_preflight = (
                 list(diag_files) + cr_extra + import_prefetch
             )
+            # 2026-07-04 fix — re-inject files the LLM previously
+            # ``READ_FILE``'d whose content was cleansed out of message
+            # history by ``_trim_mid_loop_messages`` /
+            # ``apply_memory_cleanse``. Without this the LLM emits
+            # ``<<<READ_FILE>>>`` for the same paths on every post-cleanse
+            # round, costing one extra full dispatch per re-read (2-3
+            # per HITL resume observed in ciod session 523e86a7).
+            # ``files_seen_by_llm`` is the auth-of-record for "paths the
+            # LLM's mental model already contains" — it survives cleanses
+            # in node_state. Cap at ``_REREAD_INJECTION_CAP`` files so
+            # this can't unbounded-inflate the prompt on a session that
+            # touched dozens of files; ``_collect_workspace_file_content``
+            # already applies per-file line + char caps on each entry.
+            _existing_preflight = set(files_for_preflight)
+            _reread_candidates: list[str] = []
+            for _seen_path in files_seen_by_llm.keys():
+                if _seen_path in _existing_preflight:
+                    continue
+                _abs = os.path.join(workspace_path, _seen_path)
+                # Skip files that no longer exist on disk — a deletion
+                # would render the injection as "(file not found)" and
+                # confuse the LLM. Best-effort.
+                if not os.path.isfile(_abs):
+                    continue
+                _reread_candidates.append(_seen_path)
+                if len(_reread_candidates) >= _REREAD_INJECTION_CAP:
+                    break
+            if _reread_candidates:
+                files_for_preflight = (
+                    list(files_for_preflight) + _reread_candidates
+                )
+                logger.info(
+                    "[repair_node] Re-injecting %d previously-READ_FILE'd "
+                    "path(s) into preflight to prevent post-cleanse "
+                    "duplicate READ_FILE round trips: %s",
+                    len(_reread_candidates), _reread_candidates,
+                )
             # Persistent-blocker files get full-read treatment: the
             # standard 6 KB truncation hides the failing line when it
             # sits past the head of a large file (session badv74q2n

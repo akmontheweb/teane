@@ -11083,6 +11083,22 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             op_str = (
                 r.operation.value if hasattr(r.operation, "value") else str(r.operation)
             )
+            # A successful REWRITE_FILE wholesale replaces the file. Any
+            # prior REPLACE_BLOCK misses were against content that no
+            # longer exists on disk — the mental-model-stale signal the
+            # counter tracks is definitionally reset. Without this,
+            # session b9369w5uu (ciod) hit the stuck-file guard on
+            # ``server/models/__init__.py`` 20+ minutes AFTER a
+            # REWRITE_FILE against that same file landed, because the
+            # counter still remembered the misses from before the
+            # rewrite. Skip the increment path for rewrite_file too
+            # (there's no such thing as a "rewrite miss" once we're
+            # here — a failed rewrite bubbles up through the normal
+            # patch-failure surface).
+            if op_str == "rewrite_file":
+                if r.success and not getattr(r, "no_op", False):
+                    rb_misses.pop(r.file, None)
+                continue
             if op_str != "replace_block":
                 continue
             if r.success:
@@ -11307,7 +11323,7 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     consecutive_all_rejected = int(
         loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) or 0
     )
-    if consecutive_all_rejected >= 1:
+    if consecutive_all_rejected >= 2:
         return f"all_allowlist_rejected:{consecutive_all_rejected}"
     if consecutive_zero >= 2:
         return f"zero_patch_loop:{consecutive_zero}"
@@ -12268,18 +12284,22 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             )
             return _transition("human_intervention_node")
 
-    # All-allowlist-rejected tripwire. This is a much sharper signal than
-    # the generic zero-patch counter: the LLM emitted patches, all of them
+    # All-allowlist-rejected tripwire. The LLM emitted patches, all of them
     # targeted paths outside the patcher allowlist, and nothing landed.
-    # Another round won't change that — the model is picking targets from
-    # signals in its system prompt (build_command, stale examples) that
-    # disagree with the allowlist, and only the operator can rewire that.
-    # Escalate after 1 round instead of the generic 2- / 5-round waits so
-    # we don't burn budget on a self-repeating rejection.
+    # Another round MIGHT change that in headless auto-resume mode where
+    # ``_reset_hitl_trip_counters`` wipes the counter — the follow-up
+    # dispatch has the same directive shape but a fresh judge banner. To
+    # give that recovery attempt a chance we escalate at ``>= 2`` (mirrors
+    # ``consecutive_zero_patch_rounds``); at ``>= 1`` the router tripped
+    # HITL on the very first rejected round and the auto-resume reset
+    # then re-tripped on the next round in ~15s, burning the budget on
+    # the ping-pong dance instead of the actual repair (session
+    # 7e9c1... on ciod). At ``>= 2`` the auto-resume gets one full round
+    # to land patches before we escalate again.
     consecutive_all_rejected = int(
         loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) or 0
     )
-    if consecutive_all_rejected >= 1:
+    if consecutive_all_rejected >= 2:
         logger.warning(
             "[router] %d consecutive round(s) where every patch was rejected "
             "by the allowlist. The LLM is targeting paths outside the "

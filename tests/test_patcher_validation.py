@@ -144,6 +144,36 @@ class TestPostPatchValidation:
             assert "def new" in text and "def old" not in text
 
     @pytest.mark.asyncio
+    async def test_rewrite_file_noop_signals_actionable_failure(self):
+        # Session b9369w5uu (ciod) had the LLM emit REWRITE_FILE with
+        # content byte-identical to disk twice in a row while the judge
+        # kept flagging a missing symbol. Silently marking the no-op as
+        # success hid the "you're stuck" signal from the LLM. It must
+        # surface as an actionable failure with a hint about READ_FILE.
+        with tempfile.TemporaryDirectory() as td:
+            existing = "def f():\n    return 1\n"
+            with open(os.path.join(td, "m.py"), "w") as f:
+                f.write(existing)
+            patcher = HybridPatcher(td)
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.REWRITE_FILE,
+                file="m.py",
+                content="def f():\n    return 1",  # trailing \n added by patcher
+            )])
+            assert len(results) == 1
+            r = results[0]
+            assert r.success is False, (
+                "REWRITE_FILE no-op must be reported as failure so the "
+                "LLM sees it in the next round's patch-failure surface"
+            )
+            assert r.no_op is True
+            assert "no-op" in (r.error or "").lower()
+            assert "read_file" in (r.error or "").lower()
+            # File must be unchanged on disk.
+            with open(os.path.join(td, "m.py")) as f:
+                assert f.read() == existing
+
+    @pytest.mark.asyncio
     async def test_rewrite_file_rolls_back_on_broken_syntax(self):
         # Post-patch validation applies to REWRITE_FILE the same as
         # every other op — a rewrite that produces unparseable Python

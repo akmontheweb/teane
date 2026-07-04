@@ -964,15 +964,48 @@ class TextPatcher(BasePatcher):
                     error=f"File exists but unreadable: {exc}",
                 )
             if actual == expected:
+                # Report as failure with an actionable message so the
+                # LLM sees it in the patch-failure surface next round.
+                # Unlike ``CREATE_FILE`` no-op (which happens on
+                # resume/idempotency and IS success), a ``REWRITE_FILE``
+                # no-op means the LLM deliberately generated content
+                # that matched disk byte-for-byte — it thought it was
+                # fixing something and did nothing. Silently marking it
+                # success hid the signal: session b9369w5uu (ciod) had
+                # the LLM emit the SAME wrong content for
+                # ``server/models/__init__.py`` two rounds running while
+                # the judge kept flagging a missing symbol. Surfacing
+                # the no-op as an actionable failure gives the LLM a
+                # concrete "you're stuck in a loop" nudge.
                 logger.info(
-                    "[patcher:text] REWRITE_FILE no-op: %s already at target state.",
+                    "[patcher:text] REWRITE_FILE no-op signaled as failure: "
+                    "%s content byte-identical to disk. LLM will see the "
+                    "'you emitted what's already there' hint next round.",
                     filepath,
                 )
                 return PatchResult(
-                    success=True,
+                    success=False,
                     file=filepath,
                     operation=OperationType.REWRITE_FILE,
-                    message=f"already at target state (no-op): {filepath}",
+                    error=(
+                        f"REWRITE_FILE no-op: the content you emitted for "
+                        f"`{filepath}` is byte-identical to what's already "
+                        "on disk. Your patch changed nothing. This usually "
+                        "means one of two things:\n"
+                        "  1) The file is already correct — the bug is "
+                        "somewhere ELSE (a caller, an import site, a test "
+                        "expectation). Re-read the judge's real_blocker "
+                        "and look for a different target.\n"
+                        "  2) You are stuck rewriting the same wrong "
+                        "content — your mental model of what this file "
+                        "should contain is out of date. Emit a READ_FILE "
+                        "block on this file AND on any callers/importers "
+                        "before your next patch attempt.\n"
+                        "Do NOT emit REWRITE_FILE again with the exact "
+                        "same content — that will be rejected as a no-op "
+                        "again. Either change target, change content, or "
+                        "READ_FILE first."
+                    ),
                     lines_changed=0,
                     no_op=True,
                 )

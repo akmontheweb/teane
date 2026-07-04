@@ -39,58 +39,58 @@ def _story(key: str, *, deps: list[str] | None = None) -> dict[str, Any]:
 
 class TestTopoSortWithinBatch:
     def test_independent_keys_preserve_input_order(self):
-        deps = {"STORY-1": set(), "STORY-2": set(), "STORY-3": set()}
-        out = _topo_sort_within_batch(["STORY-1", "STORY-2", "STORY-3"], deps)
-        assert out == ["STORY-1", "STORY-2", "STORY-3"]
+        deps = {"STORY-001": set(), "STORY-002": set(), "STORY-003": set()}
+        out = _topo_sort_within_batch(["STORY-001", "STORY-002", "STORY-003"], deps)
+        assert out == ["STORY-001", "STORY-002", "STORY-003"]
 
     def test_chain_dependency_reordered(self):
-        # STORY-3 depends on STORY-2 depends on STORY-1; input order
+        # STORY-003 depends on STORY-002 depends on STORY-001; input order
         # has them reversed.
         deps = {
-            "STORY-1": set(),
-            "STORY-2": {"STORY-1"},
-            "STORY-3": {"STORY-2"},
+            "STORY-001": set(),
+            "STORY-002": {"STORY-001"},
+            "STORY-003": {"STORY-002"},
         }
         out = _topo_sort_within_batch(
-            ["STORY-3", "STORY-2", "STORY-1"], deps,
+            ["STORY-003", "STORY-002", "STORY-001"], deps,
         )
-        assert out == ["STORY-1", "STORY-2", "STORY-3"]
+        assert out == ["STORY-001", "STORY-002", "STORY-003"]
 
     def test_only_intra_batch_deps_considered(self):
-        # STORY-1 depends on EXTERNAL-9 (not in the batch). The deps_by_key
+        # STORY-001 depends on EXTERNAL-9 (not in the batch). The deps_by_key
         # set is intersected with the batch's keys inside the helper, so
         # EXTERNAL-9 doesn't influence ordering.
-        deps = {"STORY-1": {"EXTERNAL-9"}, "STORY-2": set()}
-        out = _topo_sort_within_batch(["STORY-1", "STORY-2"], deps)
-        assert out == ["STORY-1", "STORY-2"]
+        deps = {"STORY-001": {"EXTERNAL-9"}, "STORY-002": set()}
+        out = _topo_sort_within_batch(["STORY-001", "STORY-002"], deps)
+        assert out == ["STORY-001", "STORY-002"]
 
     def test_cycle_falls_back_to_input_order(self):
         # A↔B cycle inside one batch shouldn't happen in practice (the
         # validator would reject), but the helper must not infinite-loop.
         deps = {
-            "STORY-1": {"STORY-2"},
-            "STORY-2": {"STORY-1"},
+            "STORY-001": {"STORY-002"},
+            "STORY-002": {"STORY-001"},
         }
-        out = _topo_sort_within_batch(["STORY-1", "STORY-2"], deps)
+        out = _topo_sort_within_batch(["STORY-001", "STORY-002"], deps)
         # Both stories appear; exact order is the input order (defensive).
-        assert sorted(out) == ["STORY-1", "STORY-2"]
+        assert sorted(out) == ["STORY-001", "STORY-002"]
         assert len(out) == 2
 
     def test_diamond_preserves_partial_order(self):
-        # STORY-1 → (STORY-2, STORY-3) → STORY-4 with input as [4, 2, 3, 1].
+        # STORY-001 → (STORY-002, STORY-003) → STORY-004 with input as [4, 2, 3, 1].
         deps = {
-            "STORY-1": set(),
-            "STORY-2": {"STORY-1"},
-            "STORY-3": {"STORY-1"},
-            "STORY-4": {"STORY-2", "STORY-3"},
+            "STORY-001": set(),
+            "STORY-002": {"STORY-001"},
+            "STORY-003": {"STORY-001"},
+            "STORY-004": {"STORY-002", "STORY-003"},
         }
         out = _topo_sort_within_batch(
-            ["STORY-4", "STORY-2", "STORY-3", "STORY-1"], deps,
+            ["STORY-004", "STORY-002", "STORY-003", "STORY-001"], deps,
         )
-        # STORY-1 must come first; STORY-4 must come last.
-        assert out[0] == "STORY-1"
-        assert out[-1] == "STORY-4"
-        assert set(out[1:3]) == {"STORY-2", "STORY-3"}
+        # STORY-001 must come first; STORY-004 must come last.
+        assert out[0] == "STORY-001"
+        assert out[-1] == "STORY-004"
+        assert set(out[1:3]) == {"STORY-002", "STORY-003"}
 
 
 # ---------------------------------------------------------------------------
@@ -99,29 +99,29 @@ class TestTopoSortWithinBatch:
 
 class TestValidateBatchesIntraBatchDeps:
     def test_same_batch_dep_in_correct_order_is_accepted(self):
-        # STORY-2 depends on STORY-1; both in batch 1 with STORY-1 first.
-        stories = [_story("STORY-1"), _story("STORY-2", deps=["STORY-1"])]
-        batches = [{"batch_id": 1, "story_keys": ["STORY-1", "STORY-2"]}]
+        # STORY-002 depends on STORY-001; both in batch 1 with STORY-001 first.
+        stories = [_story("STORY-001"), _story("STORY-002", deps=["STORY-001"])]
+        batches = [{"batch_id": 1, "story_keys": ["STORY-001", "STORY-002"]}]
         assert validate_batches(stories, batches) == []
 
     def test_same_batch_dep_out_of_order_is_flagged(self):
-        # STORY-2 depends on STORY-1 but STORY-2 listed first.
-        stories = [_story("STORY-1"), _story("STORY-2", deps=["STORY-1"])]
-        batches = [{"batch_id": 1, "story_keys": ["STORY-2", "STORY-1"]}]
+        # STORY-002 depends on STORY-001 but STORY-002 listed first.
+        stories = [_story("STORY-001"), _story("STORY-002", deps=["STORY-001"])]
+        batches = [{"batch_id": 1, "story_keys": ["STORY-002", "STORY-001"]}]
         errs = validate_batches(stories, batches)
         assert any("must come BEFORE its dependent" in e for e in errs)
 
     def test_cross_batch_forward_still_rejected(self):
-        # STORY-1 (batch 1) depends on STORY-2 (batch 2) — cross-batch
+        # STORY-001 (batch 1) depends on STORY-002 (batch 2) — cross-batch
         # forward dep is the only ordering violation that's still
         # outright forbidden post-Phase-I.
         stories = [
-            _story("STORY-1", deps=["STORY-2"]),
-            _story("STORY-2"),
+            _story("STORY-001", deps=["STORY-002"]),
+            _story("STORY-002"),
         ]
         batches = [
-            {"batch_id": 1, "story_keys": ["STORY-1"]},
-            {"batch_id": 2, "story_keys": ["STORY-2"]},
+            {"batch_id": 1, "story_keys": ["STORY-001"]},
+            {"batch_id": 2, "story_keys": ["STORY-002"]},
         ]
         errs = validate_batches(stories, batches)
         assert any(
@@ -130,8 +130,8 @@ class TestValidateBatchesIntraBatchDeps:
 
     def test_orphan_dep_still_tolerated(self):
         # External dep that isn't in any batch shouldn't trigger errors.
-        stories = [_story("STORY-1", deps=["EXTERNAL-9"])]
-        batches = [{"batch_id": 1, "story_keys": ["STORY-1"]}]
+        stories = [_story("STORY-001", deps=["EXTERNAL-9"])]
+        batches = [{"batch_id": 1, "story_keys": ["STORY-001"]}]
         assert validate_batches(stories, batches) == []
 
 
@@ -142,21 +142,21 @@ class TestValidateBatchesIntraBatchDeps:
 class TestDeterministicBatchesTopo:
     def test_chain_emits_one_story_per_batch_in_order(self):
         out = deterministic_batches([
-            _story("STORY-1"),
-            _story("STORY-2", deps=["STORY-1"]),
-            _story("STORY-3", deps=["STORY-2"]),
+            _story("STORY-001"),
+            _story("STORY-002", deps=["STORY-001"]),
+            _story("STORY-003", deps=["STORY-002"]),
         ])
         # Chain → one story per batch by the dep-frontier algorithm.
         assert [b["story_keys"] for b in out] == [
-            ["STORY-1"], ["STORY-2"], ["STORY-3"],
+            ["STORY-001"], ["STORY-002"], ["STORY-003"],
         ]
 
     def test_output_passes_post_phase_i_validator(self):
         stories = [
-            _story("STORY-1"),
-            _story("STORY-2", deps=["STORY-1"]),
-            _story("STORY-3", deps=["STORY-1"]),
-            _story("STORY-4", deps=["STORY-2", "STORY-3"]),
+            _story("STORY-001"),
+            _story("STORY-002", deps=["STORY-001"]),
+            _story("STORY-003", deps=["STORY-001"]),
+            _story("STORY-004", deps=["STORY-002", "STORY-003"]),
         ]
         assert validate_batches(stories, deterministic_batches(stories)) == []
 
@@ -194,56 +194,56 @@ class TestNextStoryInBatchDepGuard:
         conn, ws, app = db
         story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
-            {"title": "B", "depends_on": ["STORY-1"]},
+            {"title": "B", "depends_on": ["STORY-001"]},
         ]))
-        # Put them in one batch with STORY-1 first (topo-correct).
+        # Put them in one batch with STORY-001 first (topo-correct).
         bid = story_state.start_batch(
-            conn, app, "sess-1", ["STORY-1", "STORY-2"],
+            conn, app, "sess-1", ["STORY-001", "STORY-002"],
         )
-        # Both are still 'planned'. The first call must return STORY-1
-        # (no deps); STORY-2 is deferred because its dep is not 'done'.
+        # Both are still 'planned'. The first call must return STORY-001
+        # (no deps); STORY-002 is deferred because its dep is not 'done'.
         nxt = story_loop._next_story_in_batch(conn, app, bid)
-        assert nxt["story_key"] == "STORY-1"
+        assert nxt["story_key"] == "STORY-001"
 
     def test_dependent_story_returns_after_dep_done(self, db):
         conn, ws, app = db
         story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
-            {"title": "B", "depends_on": ["STORY-1"]},
+            {"title": "B", "depends_on": ["STORY-001"]},
         ]))
         bid = story_state.start_batch(
-            conn, app, "sess-1", ["STORY-1", "STORY-2"],
+            conn, app, "sess-1", ["STORY-001", "STORY-002"],
         )
-        # Mark STORY-1 done; STORY-2's intra-batch dep is now satisfied.
-        story_state.mark_done(conn, app, "STORY-1")
+        # Mark STORY-001 done; STORY-002's intra-batch dep is now satisfied.
+        story_state.mark_done(conn, app, "STORY-001")
         nxt = story_loop._next_story_in_batch(conn, app, bid)
-        assert nxt["story_key"] == "STORY-2"
+        assert nxt["story_key"] == "STORY-002"
 
     def test_intra_batch_dep_deferral_skips_to_independent_story(self, db):
-        """If a batch contains [STORY-1, STORY-2, STORY-3] where STORY-2
-        depends on STORY-1 (which is 'in_progress' from a resumed
-        session) and STORY-3 is independent, the loop should defer
-        STORY-2 and pick STORY-3 — preserving forward progress."""
+        """If a batch contains [STORY-001, STORY-002, STORY-003] where STORY-002
+        depends on STORY-001 (which is 'in_progress' from a resumed
+        session) and STORY-003 is independent, the loop should defer
+        STORY-002 and pick STORY-003 — preserving forward progress."""
         conn, ws, app = db
         story_state.create_stories(conn, app, _wrap([
             {"title": "A"},
-            {"title": "B", "depends_on": ["STORY-1"]},
+            {"title": "B", "depends_on": ["STORY-001"]},
             {"title": "C"},
         ]))
         bid = story_state.start_batch(
-            conn, app, "sess-1", ["STORY-1", "STORY-2", "STORY-3"],
+            conn, app, "sess-1", ["STORY-001", "STORY-002", "STORY-003"],
         )
-        # Simulate a resumed session: STORY-1 is mid-patch.
-        story_state.mark_in_progress(conn, app, "STORY-1")
+        # Simulate a resumed session: STORY-001 is mid-patch.
+        story_state.mark_in_progress(conn, app, "STORY-001")
         # _next_story_in_batch's primary order returns in_progress
-        # rows first (STORY-1) — verify that comes back, and then
-        # marking it done unblocks STORY-2.
+        # rows first (STORY-001) — verify that comes back, and then
+        # marking it done unblocks STORY-002.
         first = story_loop._next_story_in_batch(conn, app, bid)
-        assert first["story_key"] == "STORY-1"
-        story_state.mark_done(conn, app, "STORY-1")
-        # STORY-2's dep is now done; sequence-order picks STORY-2 first.
+        assert first["story_key"] == "STORY-001"
+        story_state.mark_done(conn, app, "STORY-001")
+        # STORY-002's dep is now done; sequence-order picks STORY-002 first.
         second = story_loop._next_story_in_batch(conn, app, bid)
-        assert second["story_key"] == "STORY-2"
+        assert second["story_key"] == "STORY-002"
 
     def test_cross_batch_dep_does_not_block(self, db):
         """A story whose dep is in an EARLIER batch (and is already
@@ -253,12 +253,12 @@ class TestNextStoryInBatchDepGuard:
         conn, ws, app = db
         story_state.create_stories(conn, app, _wrap([
             {"title": "Earlier"},
-            {"title": "Current", "depends_on": ["STORY-1"]},
+            {"title": "Current", "depends_on": ["STORY-001"]},
         ]))
-        # First batch contains STORY-1 alone; STORY-1 done.
-        story_state.start_batch(conn, app, "sess-1", ["STORY-1"])
-        story_state.mark_done(conn, app, "STORY-1")
-        # Second batch contains STORY-2 alone; its dep is cross-batch.
-        b2 = story_state.start_batch(conn, app, "sess-1", ["STORY-2"])
+        # First batch contains STORY-001 alone; STORY-001 done.
+        story_state.start_batch(conn, app, "sess-1", ["STORY-001"])
+        story_state.mark_done(conn, app, "STORY-001")
+        # Second batch contains STORY-002 alone; its dep is cross-batch.
+        b2 = story_state.start_batch(conn, app, "sess-1", ["STORY-002"])
         nxt = story_loop._next_story_in_batch(conn, app, b2)
-        assert nxt["story_key"] == "STORY-2"
+        assert nxt["story_key"] == "STORY-002"

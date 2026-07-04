@@ -112,7 +112,7 @@ def compute_scenario_cache_key(context: ScenarioContext) -> str:
 class Scenario:
     """One runnable Playwright test the generator wants emitted.
 
-    ``verifies`` is the teane-convention back-reference: ``STORY-3.AC-2``
+    ``verifies`` is the teane-convention back-reference: ``STORY-003.AC-2``
     in agile workspaces, a spec section anchor in waterfall. The defect
     emitter (Phase 2) reads this off the .spec.ts file via the
     ``// @verifies:`` line and populates ``source_spec.md`` with the

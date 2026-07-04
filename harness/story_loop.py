@@ -366,7 +366,7 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
 
     Per-story zero-patch auto-advance (Layer 2 — added after a session
     burned ~1h22m and $18 looping story_loop ↔ patching with the same
-    STORY-1 selected every cycle): before picking the next story, this
+    STORY-001 selected every cycle): before picking the next story, this
     node consults ``loop_counter['story_zero_patch_rounds']`` for the
     currently-cursored story. If that story has accumulated
     ``story_zero_patch_cap`` (default 3) consecutive patching turns with
@@ -1010,6 +1010,32 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         batch_id, len(stories_in_batch), len(done_keys), blocked_count,
         committed_sha or "—", len(batch_files),
     )
+
+    # v5 test_verifies_ac sweep (2026-07-04) — walk the workspace,
+    # parse ``@verifies:`` markers from every generated test file, and
+    # persist ``(test_path, ac_id)`` edges into ``test_verifies_ac``.
+    # ``test_generation_node`` only writes links inside its own single
+    # invocation when the sandbox run passes ON THAT CALL; in practice
+    # tests fail their initial marker gate or their initial run and
+    # repair fixes them via ``compiler_node``, which never routes back
+    # to ``test_generation_node``. Ciod session 523e86a7 sealed 5
+    # batches with passing tests but ``test_verifies_ac`` stayed empty
+    # for every AC. Sweeping at batch-seal time closes that gap —
+    # idempotent, best-effort, never fails the seal.
+    try:
+        from harness.test_generation import sweep_verifies_links
+        scanned, inserted, dropped = sweep_verifies_links(workspace_path)
+        if inserted or dropped:
+            logger.info(
+                "[batch_commit] test_verifies_ac sweep: scanned=%d, "
+                "inserted=%d, dropped=%d (unknown ac_keys).",
+                scanned, inserted, dropped,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[batch_commit] test_verifies_ac sweep raised (%s) — "
+            "continuing seal without link persistence.", exc,
+        )
     return {
         "current_batch_id": 0,
         "current_story_id": "",

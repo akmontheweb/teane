@@ -201,6 +201,54 @@ def canonicalize_req_key(req_key: str) -> str:
     return key
 
 
+def canonicalize_ac_key(ac_key: str) -> str:
+    """Canonical spelling of an acceptance-criterion identifier.
+
+    AC keys have the shape ``<story_key>.AC-<n>`` where ``<story_key>``
+    is itself a canonicalisable STORY-N identifier and ``<n>`` is the
+    per-story ordinal. Canonicalises the STORY part (zero-pads to 3
+    digits) and the AC-N tail, so ``STORY-1.AC-1``, ``STORY-01.AC-01``,
+    and ``STORY-001.AC-1`` all fold to ``STORY-001.AC-1``.
+
+    Idempotent. Non-matching input returned unchanged so grep/replace
+    callers don't have to guard the shape.
+
+    2026-07-04 addition: needed because
+    :func:`~harness.test_generation._parse_verifies_marker` sees raw
+    LLM output where the marker may cite either form
+    (``# @verifies: STORY-1.AC-1`` OR ``# @verifies: STORY-001.AC-1``),
+    while the DB always holds the canonical form. Without folding at
+    the boundary, the linkage lookup misses and the row is dropped as
+    "unknown ac_key".
+    """
+    raw = normalize_dashes(ac_key).strip()
+    if "." not in raw:
+        return raw
+    story_part, ac_part = raw.split(".", 1)
+    story_canon = canonicalize_req_key(story_part)
+    # AC-N tail: fold ``AC-1``, ``AC-01``, ``AC-001`` all to ``AC-1``.
+    # The AC ordinal is a plain 1-based per-story index; unlike req_key
+    # tails it is NOT zero-padded (matches
+    # ``create_acceptance_criteria``'s ``f"{key}.AC-{i+1}"`` format).
+    if ac_part.startswith("AC-"):
+        tail = ac_part[3:]
+        if tail.isdigit():
+            return f"{story_canon}.AC-{int(tail)}"
+    return f"{story_canon}.{ac_part}"
+
+
+# Public alias — story keys are a subset of req keys under the
+# canonicalizer's rules, but explicit named import at the call site
+# reads more clearly ("we're canonicalising a story key, not a
+# generic requirement").
+def canonicalize_story_key(story_key: str) -> str:
+    """Canonicalise a story identifier (``STORY-N`` family). Delegates
+    to :func:`canonicalize_req_key`; kept as a distinct symbol so
+    callers that specifically handle stories self-document at the
+    import site."""
+    return canonicalize_req_key(story_key)
+
+
 def kind_for(req_key: str) -> Optional[str]:
     """Return the ``kind`` string for a given requirement id, or
     ``None`` when the token doesn't match any known family.

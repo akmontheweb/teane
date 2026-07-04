@@ -404,11 +404,16 @@ def reconcile_workspace_from_spec(
             fk = spec["feature"]
             if fk not in feature_id_by_key:
                 continue
+            # Fold the spec key to the DB storage form (canonical
+            # zero-padded). The parser already produces canonical
+            # form; ``_canon`` is idempotent so this is defence-in-
+            # depth against a future spec parser change.
+            spec_key = story_state._canon(spec["story_key"])
             llm_hit = matches.get(spec["story_key"])
             scope_files = (llm_hit or {}).get("scope_files", []) or []
             story_id = _insert_story(
                 conn, workspace,
-                story_key=spec["story_key"],
+                story_key=spec_key,
                 feature_id=feature_id_by_key[fk],
                 title=spec["title"],
                 description=spec["description"],
@@ -416,7 +421,7 @@ def reconcile_workspace_from_spec(
                 now=now,
             )
             _insert_acs(
-                conn, workspace, story_id, spec["story_key"],
+                conn, workspace, story_id, spec_key,
                 spec["acceptance_criteria"],
             )
             stories_written += 1

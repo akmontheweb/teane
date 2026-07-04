@@ -152,6 +152,10 @@ async def apply_autofixes(
             if candidate is not None:
                 fix_kind = "dep"
         if candidate is None:
+            candidate = _try_deps_not_installed(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "dep"
+        if candidate is None:
             candidate = _try_missing_npm_dep(diag, workspace_path)
             if candidate is not None:
                 fix_kind = "npm_dep"
@@ -805,6 +809,185 @@ def _try_missing_dep(
         file=manifest_rel,
         search=last_line,
         replace=f"{last_line}\n{install_name}",
+    )
+
+
+# Recovers packages from the human-readable ``Missing: pkg1, pkg2, pkg3.``
+# tail on the DEPS_NOT_INSTALLED diagnostic emitted by
+# ``harness.graph._run_prod_import_smoke_check``. Only used as a fallback
+# when the structured ``missing_packages`` field is absent (legacy shape
+# or fingerprint replay from a pre-2026-07-04 checkpoint).
+_DEPS_NOT_INSTALLED_LIST_RE = re.compile(
+    r"Missing:\s*([^.\n]+?)\.\s*", re.IGNORECASE,
+)
+
+
+def _try_deps_not_installed(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Batch-append every third-party package named in a
+    DEPS_NOT_INSTALLED diagnostic to the workspace's requirements
+    manifest. Fires on the coarse diagnostic that
+    ``_run_prod_import_smoke_check`` emits when a prod-import smoke
+    catches N missing pip packages at once.
+
+    Ciod session 523e86a7 spent 3+ hours in a REPLACE_BLOCK /
+    DELETE_BLOCK dance on ``requirements.txt`` because ``flask``,
+    ``flask_cors``, and ``flask_limiter`` were bundled into ONE
+    DEPS_NOT_INSTALLED diagnostic and the per-symbol
+    ``_try_missing_dep`` handler couldn't consume it — the loop's
+    autofix path saw no candidate and fell through to the LLM, which
+    kept emitting ambiguous DELETE_BLOCKs.
+
+    Idempotent — reuses ``_try_missing_dep``'s pin_pattern check on
+    each package so an already-declared dep is silently skipped.
+    Returns None when every package is already present or when the
+    diagnostic carries no packages.
+
+    Format: emits ONE PatchBlock that appends all missing packages in
+    a single REPLACE_BLOCK / CREATE_FILE, so the patcher applies the
+    fix atomically and the next compile picks up every dep at once.
+    """
+    if str(diag.get("error_code", "")) != "DEPS_NOT_INSTALLED":
+        return None
+    raw = diag.get("missing_packages")
+    packages: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        packages = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        # Fallback: re-parse the human-readable message. Handles
+        # checkpoint replays from pre-fix runs.
+        m = _DEPS_NOT_INSTALLED_LIST_RE.search(
+            str(diag.get("message", "") or "")
+        )
+        if m is None:
+            return None
+        packages = [
+            p.strip() for p in m.group(1).split(",") if p.strip()
+        ]
+    # Canonicalise: prefer the mapped install name over the import name
+    # (``bs4`` → ``beautifulsoup4``). Filter empties defensively.
+    install_names = [
+        _DEP_INSTALL_NAMES.get(p, p) for p in packages if p
+    ]
+    if not install_names:
+        return None
+
+    # Route through pyproject.toml first when the build command hints
+    # at it — otherwise fall through to requirements.txt.
+    build_cmd = str(diag.get("build_command", "") or "").lower()
+    if "pip install -e" in build_cmd or "pyproject" in build_cmd:
+        py_result = _try_multiple_deps_pyproject(
+            install_names, workspace_path,
+        )
+        if py_result is not None:
+            return py_result
+
+    manifest_rel = "requirements.txt"
+    manifest_abs = os.path.join(workspace_path, manifest_rel)
+
+    if not os.path.isfile(manifest_abs):
+        # Fresh manifest — write every dep on its own line.
+        content = "\n".join(install_names) + "\n"
+        return PatchBlock(
+            operation=OperationType.CREATE_FILE,
+            file=manifest_rel,
+            content=content,
+        )
+
+    try:
+        with open(manifest_abs, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    except OSError:
+        return None
+
+    # Filter out packages already declared. Reuses the
+    # ``_try_missing_dep`` pin-pattern shape for consistency.
+    new_names: list[str] = []
+    for name in install_names:
+        pin_pattern = re.compile(
+            rf"^\s*{re.escape(name)}(?:\[|[<>=!~]|\s|$)",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        if not pin_pattern.search(existing):
+            new_names.append(name)
+
+    if not new_names:
+        # Every package is already present — the diagnostic is stale
+        # (probably a fingerprint replay after a partial success).
+        # Let the diagnostic fall through unhandled so the LLM sees it.
+        return None
+
+    stripped = existing.rstrip("\n")
+    if not stripped:
+        # File is empty / whitespace — REPLACE the whitespace with
+        # every missing dep. CREATE_FILE would reject on "already
+        # exists".
+        return PatchBlock(
+            operation=OperationType.REPLACE_BLOCK,
+            file=manifest_rel,
+            search=existing,
+            replace="\n".join(new_names) + "\n",
+        )
+    last_line = stripped.split("\n")[-1]
+    appended = "\n".join(new_names)
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=manifest_rel,
+        search=last_line,
+        replace=f"{last_line}\n{appended}",
+    )
+
+
+def _try_multiple_deps_pyproject(
+    install_names: list[str], workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Batch equivalent of ``_try_missing_dep_pyproject`` for the
+    DEPS_NOT_INSTALLED path. Emits a single REPLACE_BLOCK that appends
+    every missing package to ``[project].dependencies``, preserving
+    the existing entry indent style. Returns None when the
+    dependencies list can't be located (pyproject.toml uses a
+    non-standard shape) so the caller falls back to
+    requirements.txt.
+    """
+    manifest_rel = "pyproject.toml"
+    manifest_abs = os.path.join(workspace_path, manifest_rel)
+    if not os.path.isfile(manifest_abs):
+        return None
+    try:
+        with open(manifest_abs, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    span = _find_pyproject_dependencies_span(text)
+    if span is None:
+        return None
+    start, end, inner = span
+    # Reuse the per-package present check.
+    absent: list[str] = []
+    for name in install_names:
+        already = re.search(
+            rf'["\']?\s*{re.escape(name)}(?:\[|[<>=!~]|\s|["\'])',
+            inner, re.IGNORECASE,
+        )
+        if not already:
+            absent.append(name)
+    if not absent:
+        return None
+    # Preserve the leading indent (first non-blank entry) if any.
+    indent_match = re.search(r"\n(\s+)[\"']", inner)
+    indent = indent_match.group(1) if indent_match else "    "
+    new_entries = "".join(f'\n{indent}"{n}",' for n in absent)
+    # Insert new entries right before the closing ``]``. Include a
+    # trailing comma so downstream diffs are minimal if entries are
+    # already terminated with commas.
+    new_inner = inner.rstrip() + new_entries + "\n"
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=manifest_rel,
+        search=text[start : end + 1],
+        replace="[" + new_inner + "]",
     )
 
 

@@ -118,7 +118,7 @@ def _valid_payload() -> str:
         ],
         "stories": [
             {
-                "story_key": "STORY-1",
+                "story_key": "STORY-001",
                 "feature": "core",
                 "title": "Create a TODO",
                 "description": "POST /todos creates an item.",
@@ -131,13 +131,13 @@ def _valid_payload() -> str:
                 "scope_files": ["src/todos/create.py"],
             },
             {
-                "story_key": "STORY-2",
+                "story_key": "STORY-002",
                 "feature": "core",
                 "title": "List TODOs",
                 "description": "GET /todos returns the list.",
                 "requirement_keys": ["FR-002"],
                 "acceptance_criteria": ["GET /todos returns JSON array"],
-                "depends_on": ["STORY-1"],
+                "depends_on": ["STORY-001"],
                 "scope_files": ["src/todos/list.py"],
             },
         ],
@@ -203,7 +203,7 @@ def test_validate_accepts_minimal_valid_payload():
     assert len(stories) == 2
     assert stories[0]["title"] == "Create a TODO"
     assert stories[0]["feature"] == "core"
-    assert stories[1]["depends_on"] == ["STORY-1"]
+    assert stories[1]["depends_on"] == ["STORY-001"]
 
 
 def test_validate_rejects_non_dict():
@@ -223,7 +223,7 @@ def test_validate_rejects_empty_stories():
 def test_validate_rejects_missing_features():
     """v4 schema makes features mandatory in initial decomposition."""
     payload = {"stories": [{
-        "story_key": "STORY-1", "feature": "core",
+        "story_key": "STORY-001", "feature": "core",
         "title": "t", "acceptance_criteria": ["x"],
     }]}
     with pytest.raises(ValueError, match="features"):
@@ -234,7 +234,7 @@ def test_validate_rejects_story_referencing_undeclared_feature():
     payload = {
         "features": [{"feature_key": "core", "name": "Core"}],
         "stories": [{
-            "story_key": "STORY-1", "feature": "ghost",
+            "story_key": "STORY-001", "feature": "ghost",
             "title": "t", "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-001"],
         }],
@@ -251,7 +251,7 @@ def test_validate_rejects_orphan_feature():
             {"feature_key": "orphan", "name": "Nobody"},
         ],
         "stories": [{
-            "story_key": "STORY-1", "feature": "core",
+            "story_key": "STORY-001", "feature": "core",
             "title": "t", "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-001"],
         }],
@@ -270,7 +270,7 @@ def test_validate_rejects_bad_story_key():
 
 def test_validate_rejects_missing_acceptance():
     payload = _payload_with_one_feature([{
-        "story_key": "STORY-1", "title": "t", "acceptance_criteria": []
+        "story_key": "STORY-001", "title": "t", "acceptance_criteria": []
     }])
     with pytest.raises(ValueError, match="acceptance"):
         decomposition._validate_stories_payload(payload)
@@ -281,23 +281,23 @@ def test_validate_accepts_forward_dependency():
     order. A forward depends_on is acyclic and therefore safe; the validator
     must accept it (the runtime planner gates on deps being 'done')."""
     payload = _payload_with_one_feature([
-        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
-         "acceptance_criteria": ["x"], "depends_on": ["STORY-2"]},
-        {"story_key": "STORY-2", "title": "b", "requirement_keys": ["FR-001"],
+        {"story_key": "STORY-001", "title": "a", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["x"], "depends_on": ["STORY-002"]},
+        {"story_key": "STORY-002", "title": "b", "requirement_keys": ["FR-001"],
          "acceptance_criteria": ["y"]},
     ])
     _, stories = decomposition._validate_stories_payload(
         payload, known_req_keys={"FR-001"},
     )
-    assert stories[0]["depends_on"] == ["STORY-2"]
+    assert stories[0]["depends_on"] == ["STORY-002"]
 
 
 def test_validate_rejects_unknown_dependency_target():
     payload = _payload_with_one_feature([
-        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
-         "acceptance_criteria": ["x"], "depends_on": ["STORY-99"]},
+        {"story_key": "STORY-001", "title": "a", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["x"], "depends_on": ["STORY-099"]},
     ])
-    with pytest.raises(ValueError, match="STORY-99"):
+    with pytest.raises(ValueError, match="STORY-099"):
         decomposition._validate_stories_payload(
             payload, known_req_keys={"FR-001"},
         )
@@ -305,10 +305,10 @@ def test_validate_rejects_unknown_dependency_target():
 
 def test_validate_rejects_dependency_cycle():
     payload = _payload_with_one_feature([
-        {"story_key": "STORY-1", "title": "a", "requirement_keys": ["FR-001"],
-         "acceptance_criteria": ["x"], "depends_on": ["STORY-2"]},
-        {"story_key": "STORY-2", "title": "b", "requirement_keys": ["FR-001"],
-         "acceptance_criteria": ["y"], "depends_on": ["STORY-1"]},
+        {"story_key": "STORY-001", "title": "a", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["x"], "depends_on": ["STORY-002"]},
+        {"story_key": "STORY-002", "title": "b", "requirement_keys": ["FR-001"],
+         "acceptance_criteria": ["y"], "depends_on": ["STORY-001"]},
     ])
     with pytest.raises(ValueError, match="cycle"):
         decomposition._validate_stories_payload(
@@ -318,8 +318,8 @@ def test_validate_rejects_dependency_cycle():
 
 def test_validate_rejects_duplicate_keys():
     payload = _payload_with_one_feature([
-        {"story_key": "STORY-1", "title": "a", "acceptance_criteria": ["x"]},
-        {"story_key": "STORY-1", "title": "b", "acceptance_criteria": ["y"]},
+        {"story_key": "STORY-001", "title": "a", "acceptance_criteria": ["x"]},
+        {"story_key": "STORY-001", "title": "b", "acceptance_criteria": ["y"]},
     ])
     with pytest.raises(ValueError, match="duplicate"):
         decomposition._validate_stories_payload(payload)
@@ -354,7 +354,7 @@ def test_decomposition_node_happy_path(workspace: str, monkeypatch):
     assert out["current_gate"] == "STORIES"
     assert out["node_state"]["decomposition_complete"] is True
     assert out["node_state"]["story_count"] == 2
-    assert out["node_state"]["story_keys"] == ["STORY-1", "STORY-2"]
+    assert out["node_state"]["story_keys"] == ["STORY-001", "STORY-002"]
     assert out["stories_db_path"].endswith("state.db")
     assert out["budget_remaining_usd"] == 1.50
 
@@ -365,8 +365,8 @@ def test_decomposition_node_happy_path(workspace: str, monkeypatch):
         stories = story_state.list_stories(conn, app)
     finally:
         conn.close()
-    assert [s["story_key"] for s in stories] == ["STORY-1", "STORY-2"]
-    assert stories[1]["depends_on"] == ["STORY-1"]
+    assert [s["story_key"] for s in stories] == ["STORY-001", "STORY-002"]
+    assert stories[1]["depends_on"] == ["STORY-001"]
 
     # Markdown view regenerated
     assert os.path.exists(os.path.join(workspace, "docs", "STORIES.md"))
@@ -448,10 +448,10 @@ def test_decomposition_node_validation_failure(workspace: str):
 
 
 def _cyclic_payload() -> str:
-    """Same shape as _valid_payload but with a STORY-1 ↔ STORY-2 cycle."""
+    """Same shape as _valid_payload but with a STORY-001 ↔ STORY-002 cycle."""
     p = json.loads(_valid_payload())
-    p["stories"][0]["depends_on"] = ["STORY-2"]
-    p["stories"][1]["depends_on"] = ["STORY-1"]
+    p["stories"][0]["depends_on"] = ["STORY-002"]
+    p["stories"][1]["depends_on"] = ["STORY-001"]
     return json.dumps(p)
 
 
@@ -472,7 +472,7 @@ def test_decomposition_node_cycle_auto_repairs(workspace: str):
     # Repair prompt must reference the cycle path
     repair_msg = gw.calls[1]["messages"][-1]["content"]
     assert "depends_on cycle detected" in repair_msg
-    assert "STORY-1" in repair_msg and "STORY-2" in repair_msg
+    assert "STORY-001" in repair_msg and "STORY-002" in repair_msg
 
 
 def test_decomposition_node_cycle_repair_failure_routes_to_hitl(workspace: str):
@@ -521,7 +521,7 @@ def test_decomposition_node_dispatch_exception(workspace: str):
 # ---------------------------------------------------------------------------
 
 def _payload_with_bogus_req_key() -> str:
-    """A payload whose STORY-1 cites a suffix-extrapolated key (``FR-001B``)
+    """A payload whose STORY-001 cites a suffix-extrapolated key (``FR-001B``)
     that the workspace spec does not declare. Matches the failure mode
     observed in session 5e0552bc where the LLM emitted ``STORY-011B``.
     """
@@ -614,17 +614,17 @@ def test_augment_prompt_includes_existing_stories():
             {"feature_key": "auth", "name": "Auth"},
         ],
         existing_stories=[
-            {"story_key": "STORY-1", "status": "done",
+            {"story_key": "STORY-001", "status": "done",
              "feature_key": "auth",
              "title": "Login", "acceptance_criteria": ["POST /login returns 200"]},
-            {"story_key": "STORY-2", "status": "in_progress",
+            {"story_key": "STORY-002", "status": "in_progress",
              "feature_key": "auth",
              "title": "Logout", "acceptance_criteria": ["POST /logout returns 204"]},
         ],
         spec_requirements="req", spec_architecture="arch",
         workspace_path="/tmp/ws",
     )
-    assert "STORY-1" in p and "STORY-2" in p
+    assert "STORY-001" in p and "STORY-002" in p
     assert "[done]" in p and "[in_progress]" in p
     assert "Login" in p
     assert "augment mode" in p.lower()
@@ -704,9 +704,9 @@ def test_augment_validator_rejects_cross_response_forward_dep():
 
 
 def test_decomposition_node_augment_mode_appends_new_story(workspace: str):
-    """Workspace already has STORY-1 from a prior agile run. New
+    """Workspace already has STORY-001 from a prior agile run. New
     decomposition pass detects the existing row and runs in augment
-    mode, appending only the genuinely new story (STORY-2)."""
+    mode, appending only the genuinely new story (STORY-002)."""
     from harness.graph import set_gateway
 
     # Seed an existing feature + story in the DB for this workspace.
@@ -895,7 +895,7 @@ class TestRequirementKeysValidation:
         silently let bogus keys through and the end-of-session audit
         passed vacuously."""
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-001"],  # bogus — empty known set
         }])
@@ -906,7 +906,7 @@ class TestRequirementKeysValidation:
 
     def test_missing_requirement_keys_rejected(self):
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
         }])
         del payload["stories"][0]["requirement_keys"]
@@ -915,7 +915,7 @@ class TestRequirementKeysValidation:
 
     def test_empty_requirement_keys_rejected(self):
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
         }])
         payload["stories"][0]["requirement_keys"] = []
@@ -924,7 +924,7 @@ class TestRequirementKeysValidation:
 
     def test_non_list_requirement_keys_rejected(self):
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
         }])
         payload["stories"][0]["requirement_keys"] = "FR-001"  # str not list
@@ -936,7 +936,7 @@ class TestRequirementKeysValidation:
         a message that lists valid alternatives so the operator sees
         the universe of choices without re-opening the spec."""
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-099"],
         }])
@@ -951,7 +951,7 @@ class TestRequirementKeysValidation:
 
     def test_known_key_accepted(self):
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-001"],
         }])
@@ -962,7 +962,7 @@ class TestRequirementKeysValidation:
 
     def test_known_keys_capped_at_40_in_error_message(self):
         payload = _payload_with_one_feature([{
-            "story_key": "STORY-1", "title": "t",
+            "story_key": "STORY-001", "title": "t",
             "acceptance_criteria": ["x"],
             "requirement_keys": ["FR-9999"],
         }])
@@ -973,9 +973,9 @@ class TestRequirementKeysValidation:
             )
         msg = str(excinfo.value)
         assert "first 40" in msg
-        # Sort puts FR-0000 first; FR-0099 lives past index 39 so is excluded.
-        assert "FR-0000" in msg
-        assert "FR-0099" not in msg
+        # Sort puts FR-000 first; FR-099 lives past index 39 so is excluded.
+        assert "FR-000" in msg
+        assert "FR-099" not in msg
 
     def test_augment_validator_enforces_requirement_keys(self):
         with pytest.raises(ValueError, match="requirement_keys"):
@@ -995,20 +995,20 @@ class TestRequirementKeysValidation:
         # the canonical ``STORY-001`` sitting in ``known_req_keys``.
         known = {"STORY-001", "STORY-002"}
         keys = decomposition._validate_story_requirement_keys(
-            "STORY-7", ["STORY‑001"], known_req_keys=known,
+            "STORY-007", ["STORY‑001"], known_req_keys=known,
         )
         assert keys == ["STORY-001"]
 
     def test_short_digit_llm_key_canonicalises_to_padded_known_key(self):
-        # LLM emits ``STORY-1`` when the spec (and DB) hold the padded
+        # LLM emits ``STORY-001`` when the spec (and DB) hold the padded
         # ``STORY-001``. Validator canonicalises both sides so the
         # citation matches without a repair round-trip.
         known = {"STORY-001", "FR-007", "EPIC-002"}
         assert decomposition._validate_story_requirement_keys(
-            "STORY-7", ["STORY-1"], known_req_keys=known,
+            "STORY-007", ["STORY-001"], known_req_keys=known,
         ) == ["STORY-001"]
         assert decomposition._validate_story_requirement_keys(
-            "STORY-8", ["FR-7", "EPIC-2"], known_req_keys=known,
+            "STORY-008", ["FR-007", "EPIC-002"], known_req_keys=known,
         ) == ["FR-007", "EPIC-002"]
 
 
@@ -1189,7 +1189,7 @@ def test_build_decomposition_augment_prompt_no_fr_leak_on_agile_workspace():
     prompt = decomposition._build_decomposition_augment_prompt(
         existing_features=[{"feature_key": "auth", "name": "Auth"}],
         existing_stories=[{
-            "story_key": "STORY-1", "feature_key": "auth",
+            "story_key": "STORY-001", "feature_key": "auth",
             "title": "Login", "status": "done", "acceptance_criteria": [],
         }],
         spec_requirements="## EPIC-001: Auth\n",
@@ -1209,7 +1209,7 @@ def test_validator_error_no_longer_hardcodes_waterfall_hint():
     just needs to point at the spec."""
     with pytest.raises(ValueError) as exc_info:
         decomposition._validate_story_requirement_keys(
-            "STORY-1", raw=[], known_req_keys={"EPIC-001"},
+            "STORY-001", raw=[], known_req_keys={"EPIC-001"},
         )
     msg = str(exc_info.value)
     assert "FR-NNN" not in msg

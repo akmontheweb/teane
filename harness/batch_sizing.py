@@ -82,7 +82,7 @@ def build_batch_sizing_prompt(stories: list[dict[str, Any]]) -> str:
         "Output STRICT JSON in this exact shape — no markdown, no code "
         "fence, no commentary:\n"
     )
-    lines.append('{"batches": [{"batch_id": 1, "story_keys": ["STORY-1", "STORY-2"]}, ...]}')
+    lines.append('{"batches": [{"batch_id": 1, "story_keys": ["STORY-001", "STORY-002"]}, ...]}')
     lines.append("")
     lines.append(
         "Constraints:\n"

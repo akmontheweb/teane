@@ -54,10 +54,10 @@ class UntestedCriterion:
     """An acceptance criterion with no verifying test.
 
     Attributes:
-        ac_key: The criterion identifier (``STORY-3.AC-2``) — the
+        ac_key: The criterion identifier (``STORY-003.AC-2``) — the
             same string the test-gen ``@verifies:`` marker is
             expected to cite.
-        story_key: The owning story (``STORY-3``).
+        story_key: The owning story (``STORY-003``).
         text: The criterion's text body, capped at 200 chars in
             the report so the console block stays readable.
     """

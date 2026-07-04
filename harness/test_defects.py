@@ -69,7 +69,7 @@ class FailureRecord:
     """``{"trace": "/abs/path/trace.zip", "screenshot": "/abs/...", "dom": "/abs/..."}``"""
 
     source_spec_id: Optional[str] = None
-    """``STORY-3.AC-2`` (agile) or section anchor (waterfall). Populated by
+    """``STORY-003.AC-2`` (agile) or section anchor (waterfall). Populated by
     Phase 4 scenario generator via inline comments in the .spec.ts file —
     parsed at execution time, not here. Optional in Phase 2."""
 
@@ -310,7 +310,7 @@ def _write_narrative(cr_dir: str, cluster: Cluster) -> None:
 
 def _write_source_spec(cr_dir: str, cluster: Cluster) -> None:
     """Phase 2 ships a placeholder; Phase 4 will populate this from the
-    scenario's ``// @verifies: STORY-3.AC-2`` annotation (agile) or
+    scenario's ``// @verifies: STORY-003.AC-2`` annotation (agile) or
     spec-section anchor (waterfall). Until then, surface the field so
     the layout is stable for ``teane patch``."""
     p = cluster.primary

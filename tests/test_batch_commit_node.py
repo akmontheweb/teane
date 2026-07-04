@@ -142,24 +142,24 @@ class TestStoryMarking:
         bid, keys = _seed_batch(ws, stories=[
             {"title": "A"}, {"title": "B"}, {"title": "C"},
         ])
-        # Pre-block STORY-2 (e.g. a per-story repair-cap failure
+        # Pre-block STORY-002 (e.g. a per-story repair-cap failure
         # carried into this batch).
         app = _app(ws)
         conn = story_state.open_story_db()
         try:
-            story_state.mark_blocked(conn, app, "STORY-2")
+            story_state.mark_blocked(conn, app, "STORY-002")
         finally:
             conn.close()
 
         out = batch_commit_node(_state(ws, bid))
-        assert out["node_state"]["marked_done"] == 2  # STORY-1 + STORY-3
+        assert out["node_state"]["marked_done"] == 2  # STORY-001 + STORY-003
         assert out["node_state"]["blocked_count"] == 1
 
         conn = story_state.open_story_db()
         try:
-            assert story_state.get_story(conn, app, "STORY-1")["status"] == "done"
-            assert story_state.get_story(conn, app, "STORY-2")["status"] == "blocked"
-            assert story_state.get_story(conn, app, "STORY-3")["status"] == "done"
+            assert story_state.get_story(conn, app, "STORY-001")["status"] == "done"
+            assert story_state.get_story(conn, app, "STORY-002")["status"] == "blocked"
+            assert story_state.get_story(conn, app, "STORY-003")["status"] == "done"
         finally:
             conn.close()
 
@@ -182,7 +182,7 @@ class TestStoryMarking:
         app = _app(ws)
         conn = story_state.open_story_db()
         try:
-            story_state.mark_blocked(conn, app, "STORY-1")
+            story_state.mark_blocked(conn, app, "STORY-001")
         finally:
             conn.close()
         batch_commit_node(_state(ws, bid))
@@ -202,7 +202,7 @@ class TestStoryMarking:
         conn = story_state.open_story_db()
         try:
             story_state.record_defect(
-                conn, workspace=app, story_key="STORY-1", session_id="sess-1",
+                conn, workspace=app, story_key="STORY-001", session_id="sess-1",
                 severity="compile", summary="leftover open defect",
             )
         finally:
@@ -226,7 +226,7 @@ class TestStateReset:
         bid, _ = _seed_batch(ws)
         out = batch_commit_node(_state(
             ws, bid,
-            current_story_id="STORY-1",
+            current_story_id="STORY-001",
             story_scope_files=["a.py"],
             story_modified_baseline=["b.py"],
             batch_modified_files=["x.py", "y.py"],
@@ -274,7 +274,7 @@ class TestGitCommit:
         app = _app(ws)
         conn = story_state.open_story_db()
         try:
-            assert story_state.get_story(conn, app, "STORY-1")["status"] == "done"
+            assert story_state.get_story(conn, app, "STORY-001")["status"] == "done"
         finally:
             conn.close()
 
@@ -310,7 +310,7 @@ class TestGitCommit:
             assert len(rows) == 1
             assert rows[0][0] is None
             assert rows[0][1].startswith(f"BATCH-{bid}:")
-            assert "STORY-1" in rows[0][1] and "STORY-2" in rows[0][1]
+            assert "STORY-001" in rows[0][1] and "STORY-002" in rows[0][1]
         finally:
             conn.close()
 
@@ -321,8 +321,8 @@ class TestGitCommit:
         )
         first_line = log.stdout.splitlines()[0]
         assert first_line.startswith(f"BATCH-{bid}:")
-        assert "STORY-1" in first_line
-        assert "STORY-2" in first_line
+        assert "STORY-001" in first_line
+        assert "STORY-002" in first_line
 
 
 class TestRouter:

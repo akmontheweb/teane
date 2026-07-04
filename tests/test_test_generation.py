@@ -293,7 +293,7 @@ class TestHappyPath:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calculator.py\n"
             "content:\n"
-            "# @verifies: STORY-1.AC-1\n"
+            "# @verifies: STORY-001.AC-1\n"
             "from calculator import divide\n"
             "def test_divide():\n"
             "    assert divide(10, 2) == 5\n"
@@ -372,7 +372,7 @@ class TestFailurePath:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_foo.py\n"
             "content:\n"
-            "# @verifies: STORY-1.AC-1\n"
+            "# @verifies: STORY-001.AC-1\n"
             "from foo import foo\n"
             "def test_foo(): assert foo() == 2  # wrong on purpose\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -500,23 +500,23 @@ class TestVerifiesMarkerParser:
 
     def test_python_comment_style(self):
         assert _parse_verifies_marker(
-            "# @verifies: STORY-3.AC-2\nimport pytest"
-        ) == ["STORY-3.AC-2"]
+            "# @verifies: STORY-003.AC-2\nimport pytest"
+        ) == ["STORY-003.AC-2"]
 
     def test_js_java_comment_style(self):
         assert _parse_verifies_marker(
-            "// @verifies: STORY-1.AC-1\nimport foo;"
-        ) == ["STORY-1.AC-1"]
+            "// @verifies: STORY-001.AC-1\nimport foo;"
+        ) == ["STORY-001.AC-1"]
 
     def test_multi_ac_comma_separated(self):
         assert _parse_verifies_marker(
-            "// @verifies: STORY-1.AC-1, STORY-1.AC-2, STORY-2.AC-3\n"
-        ) == ["STORY-1.AC-1", "STORY-1.AC-2", "STORY-2.AC-3"]
+            "// @verifies: STORY-001.AC-1, STORY-001.AC-2, STORY-002.AC-3\n"
+        ) == ["STORY-001.AC-1", "STORY-001.AC-2", "STORY-002.AC-3"]
 
     def test_permissive_whitespace(self):
         assert _parse_verifies_marker(
-            "#  @verifies:   STORY-5.AC-7\n"
-        ) == ["STORY-5.AC-7"]
+            "#  @verifies:   STORY-005.AC-7\n"
+        ) == ["STORY-005.AC-7"]
 
     def test_missing_marker_returns_empty(self):
         assert _parse_verifies_marker(
@@ -529,12 +529,12 @@ class TestVerifiesMarkerParser:
 
     def test_mixed_valid_and_invalid_keeps_valid(self):
         assert _parse_verifies_marker(
-            "# @verifies: STORY-1.AC-1, BOGUS, STORY-2.AC-3\n"
-        ) == ["STORY-1.AC-1", "STORY-2.AC-3"]
+            "# @verifies: STORY-001.AC-1, BOGUS, STORY-002.AC-3\n"
+        ) == ["STORY-001.AC-1", "STORY-002.AC-3"]
 
     def test_marker_buried_past_scan_window_ignored(self):
         body = "\n".join(
-            ["# preamble"] * 60 + ["# @verifies: STORY-1.AC-1"]
+            ["# preamble"] * 60 + ["# @verifies: STORY-001.AC-1"]
         )
         assert _parse_verifies_marker(body) == []
 
@@ -644,12 +644,12 @@ class TestVerifiesLinkPersistence:
         inserted, dropped = _persist_verifies_links(
             str(ws),
             {
-                "tests/test_real.py": [known_ac_key, "STORY-99.AC-99"],
+                "tests/test_real.py": [known_ac_key, "STORY-099.AC-99"],
                 "tests/test_other.py": [known_ac_key],
             },
         )
         assert inserted == 2  # one per file pointing at the known AC
-        assert dropped == 1  # the STORY-99 key
+        assert dropped == 1  # the STORY-099 key
 
         # Round-trip: link rows present
         conn = story_state.open_story_db()
@@ -776,7 +776,7 @@ class TestNonAgileSkipsVerifiesGate:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calc.py\n"
             "content:\n"
-            "# @verifies: STORY-1.AC-1\n"
+            "# @verifies: STORY-001.AC-1\n"
             "from calc import add\n"
             "def test_add(): assert add(1, 2) == 3\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -793,7 +793,7 @@ class TestNonAgileSkipsVerifiesGate:
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
         assert "@verifies" in joined
-        assert "STORY-3.AC-2" in joined  # canonical example in RULE 5
+        assert "STORY-003.AC-2" in joined  # canonical example in RULE 5
 
 
 class TestStoryPreambleInjectedIntoTestGenPrompt:
@@ -811,7 +811,7 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
         self, tmp_path, stub_sandbox, stub_gateway, monkeypatch,
     ):
         from harness import story_state
-        # Seed an agile workspace with a real STORY-1 + AC.
+        # Seed an agile workspace with a real STORY-001 + AC.
         ws = tmp_path / "agile-preamble-ws"
         ws.mkdir()
         (ws / "pyproject.toml").write_text("[project]\nname='x'\n")
@@ -833,7 +833,7 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calc.py\n"
             "content:\n"
-            "# @verifies: STORY-1.AC-1\n"
+            "# @verifies: STORY-001.AC-1\n"
             "from calc import add\n"
             "def test_add(): assert add(1, 2) == 3\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -846,12 +846,12 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
             "decomposition_enabled": True,
-            "current_story_id": "STORY-1",
+            "current_story_id": "STORY-001",
         })
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
         # Story preamble rendered with the AC key so the LLM can cite it.
-        assert "STORY-1.AC-1" in joined
+        assert "STORY-001.AC-1" in joined
         assert "add(1, 2) returns 3" in joined
 
     @pytest.mark.asyncio
@@ -894,7 +894,7 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calc.py\n"
             "content:\n"
-            "# @verifies: STORY-1.AC-1, STORY-2.AC-1\n"
+            "# @verifies: STORY-001.AC-1, STORY-002.AC-1\n"
             "from calc import add\n"
             "def test_add(): assert add(1, 2) == 3\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -910,15 +910,15 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
             # Mid-verification state: story_loop already cleared this.
             "current_story_id": "",
             "current_batch_id": 1,
-            "batch_patched_story_keys": ["STORY-1", "STORY-2"],
+            "batch_patched_story_keys": ["STORY-001", "STORY-002"],
         })
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
         # Batch preamble must list BOTH stories' AC keys so the LLM
         # has real keys to cite in the @verifies marker.
         assert "Batch Scope:" in joined
-        assert "STORY-1.AC-1" in joined
-        assert "STORY-2.AC-1" in joined
+        assert "STORY-001.AC-1" in joined
+        assert "STORY-002.AC-1" in joined
         assert "add(1, 2) returns 3" in joined
         assert "sub(2, 1) returns 1" in joined
 

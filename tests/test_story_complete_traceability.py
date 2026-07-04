@@ -236,7 +236,7 @@ def test_complete_commits_when_commit_on_story_set(workspace: str):
         ["git", "-C", workspace, "log", "-1", "--pretty=%s"],
         capture_output=True, text=True, check=True,
     )
-    assert "STORY-1: Add foo" in log.stdout
+    assert "STORY-001: Add foo" in log.stdout
 
     conn = story_state.open_story_db()
     try:
@@ -246,7 +246,7 @@ def test_complete_commits_when_commit_on_story_set(workspace: str):
     finally:
         conn.close()
     assert row[0] == out["node_state"]["committed_sha"]
-    assert "STORY-1: Add foo" in row[1]
+    assert "STORY-001: Add foo" in row[1]
 
 
 def test_complete_no_git_repo_is_silently_skipped(workspace: str):
@@ -287,8 +287,8 @@ def test_traceability_regenerates_both_views(workspace: str):
     assert out["node_state"]["skipped"] is False
     assert os.path.exists(out["node_state"]["stories_md"])
     assert os.path.exists(out["node_state"]["traceability_md"])
-    assert "STORY-1" in Path(out["node_state"]["stories_md"]).read_text()
-    assert "STORY-1" in Path(out["node_state"]["traceability_md"]).read_text()
+    assert "STORY-001" in Path(out["node_state"]["stories_md"]).read_text()
+    assert "STORY-001" in Path(out["node_state"]["traceability_md"]).read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ _BASE_ARCH_SUMMARY: dict[str, Any] = {
                 "id": "EP-001",
                 "method": "POST",
                 "path": "/api/v1/login",
-                "rsd_story_ids": ["STORY-1"],
+                "rsd_story_ids": ["STORY-001"],
             },
             {
                 "id": "EP-002",
@@ -317,7 +317,7 @@ _BASE_ARCH_SUMMARY: dict[str, Any] = {
                 "id": "EP-003",
                 "method": "GET",
                 "path": "/api/v1/ghost",
-                "rsd_story_ids": ["STORY-99"],  # story doesn't exist → missing
+                "rsd_story_ids": ["STORY-099"],  # story doesn't exist → missing
             },
         ],
     },
@@ -326,7 +326,7 @@ _BASE_ARCH_SUMMARY: dict[str, Any] = {
             {
                 "name": "LoginForm",
                 "path": "pages/auth/LoginPage.tsx",
-                "rsd_story_ids": ["STORY-1"],
+                "rsd_story_ids": ["STORY-001"],
             },
         ],
     },
@@ -357,7 +357,7 @@ def test_traceability_emits_arch_section_from_state(workspace: str):
 
 
 def test_traceability_links_story_status(workspace: str):
-    """When EP-001 cites STORY-1, the coverage row should carry the
+    """When EP-001 cites STORY-001, the coverage row should carry the
     live story status — not just the ID."""
     _seed_one_story(workspace, title="Demo")
     out = story_loop.traceability_node({
@@ -367,10 +367,10 @@ def test_traceability_links_story_status(workspace: str):
     body = Path(out["node_state"]["traceability_md"]).read_text()
     # The seeded story lands as "planned" — exact label depends on
     # _status_label, so we accept any non-empty status cell next to
-    # the STORY-1 ID and just assert the ID surfaces in the coverage
+    # the STORY-001 ID and just assert the ID surfaces in the coverage
     # block (which sits AFTER the per-story drill-down).
     coverage_section = body.split("Architecture coverage", 1)[1]
-    assert "STORY-1" in coverage_section
+    assert "STORY-001" in coverage_section
     assert "EP-001" in coverage_section
 
 
@@ -400,7 +400,7 @@ def test_traceability_flags_missing_story_for_unknown_id(workspace: str):
     body = Path(out["node_state"]["traceability_md"]).read_text()
     ghost_line = [ln for ln in body.splitlines() if "EP-003" in ln]
     assert ghost_line, "EP-003 row missing from coverage table"
-    assert "STORY-99" in ghost_line[0]
+    assert "STORY-099" in ghost_line[0]
     assert "missing" in ghost_line[0].lower()
 
 

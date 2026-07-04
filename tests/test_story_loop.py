@@ -72,7 +72,7 @@ def test_batch_planner_creates_batch_for_independent_stories(workspace: str):
     out = story_loop.batch_planner_node(_state(workspace))
     assert out["node_state"]["batch_planned"] is True
     assert out["current_batch_id"] > 0
-    assert set(out["node_state"]["story_keys"]) == {"STORY-1", "STORY-2", "STORY-3"}
+    assert set(out["node_state"]["story_keys"]) == {"STORY-001", "STORY-002", "STORY-003"}
 
 
 def test_batch_planner_honors_batch_size(workspace: str):
@@ -84,10 +84,10 @@ def test_batch_planner_honors_batch_size(workspace: str):
 def test_batch_planner_honors_dependencies(workspace: str):
     _seed_stories(workspace, [
         {"title": "Base"},
-        {"title": "Feature", "depends_on": ["STORY-1"]},
+        {"title": "Feature", "depends_on": ["STORY-001"]},
     ])
     out = story_loop.batch_planner_node(_state(workspace))
-    assert out["node_state"]["story_keys"] == ["STORY-1"]
+    assert out["node_state"]["story_keys"] == ["STORY-001"]
 
 
 def test_batch_planner_reports_all_complete_when_every_story_done(workspace: str):
@@ -95,7 +95,7 @@ def test_batch_planner_reports_all_complete_when_every_story_done(workspace: str
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_done(conn, app, "STORY-1")
+        story_state.mark_done(conn, app, "STORY-001")
     finally:
         conn.close()
     out = story_loop.batch_planner_node(_state(workspace))
@@ -106,18 +106,18 @@ def test_batch_planner_reports_all_complete_when_every_story_done(workspace: str
 def test_batch_planner_reports_stall_when_only_blocked_remains(workspace: str):
     _seed_stories(workspace, [
         {"title": "Base"},
-        {"title": "Feature", "depends_on": ["STORY-1"]},
+        {"title": "Feature", "depends_on": ["STORY-001"]},
     ])
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_blocked(conn, app, "STORY-1")
+        story_state.mark_blocked(conn, app, "STORY-001")
     finally:
         conn.close()
     out = story_loop.batch_planner_node(_state(workspace))
     assert out["node_state"]["batch_planned"] is False
     assert out["node_state"]["stalled"] is True
-    assert "STORY-1" in out["node_state"]["outstanding_deps"]
+    assert "STORY-001" in out["node_state"]["outstanding_deps"]
 
 
 def test_batch_planner_writes_batch_row(workspace: str):
@@ -156,7 +156,7 @@ def test_batch_planner_never_crosses_feature_boundary(workspace: str):
     assert out["node_state"]["batch_planned"] is True
     keys = out["node_state"]["story_keys"]
     # Only the auth feature's two stories — billing waits its turn.
-    assert set(keys) == {"STORY-1", "STORY-2"}
+    assert set(keys) == {"STORY-001", "STORY-002"}
     assert out["node_state"]["feature_key"] == "auth"
     # The batches row carries the feature_id.
     conn = story_state.open_story_db()
@@ -211,13 +211,13 @@ def test_batch_planner_advances_to_next_feature_when_first_done(workspace: str):
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_done(conn, app, "STORY-1")
+        story_state.mark_done(conn, app, "STORY-001")
     finally:
         conn.close()
     # Second batch: feature billing now picks up.
     out2 = story_loop.batch_planner_node(_state(workspace))
     assert out2["node_state"]["feature_key"] == "billing"
-    assert out2["node_state"]["story_keys"] == ["STORY-2"]
+    assert out2["node_state"]["story_keys"] == ["STORY-002"]
 
 
 # ---------------------------------------------------------------------------
@@ -241,16 +241,16 @@ def test_story_loop_picks_first_planned_story(workspace: str):
     out = story_loop.story_loop_node(
         _state(workspace, current_batch_id=batch_id)
     )
-    assert out["current_story_id"] == "STORY-1"
+    assert out["current_story_id"] == "STORY-001"
     assert out["story_scope_files"] == ["a.py"]
     assert out["node_state"]["batch_complete"] is False
     assert out["node_state"]["acceptance_criteria"] == ["AC-A"]
 
-    # STORY-1 now in_progress
+    # STORY-001 now in_progress
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        s = story_state.get_story(conn, app, "STORY-1")
+        s = story_state.get_story(conn, app, "STORY-001")
     finally:
         conn.close()
     assert s["status"] == "in_progress"
@@ -263,18 +263,18 @@ def test_story_loop_resumes_in_progress_before_planned(workspace: str):
     planned = story_loop.batch_planner_node(_state(workspace))
     batch_id = planned["current_batch_id"]
 
-    # Pretend STORY-2 was started, then process died before STORY-1.
+    # Pretend STORY-002 was started, then process died before STORY-001.
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_in_progress(conn, app, "STORY-2")
+        story_state.mark_in_progress(conn, app, "STORY-002")
     finally:
         conn.close()
 
     out = story_loop.story_loop_node(
         _state(workspace, current_batch_id=batch_id)
     )
-    assert out["current_story_id"] == "STORY-2"
+    assert out["current_story_id"] == "STORY-002"
 
 
 def test_story_loop_returns_complete_when_all_done(workspace: str):
@@ -285,7 +285,7 @@ def test_story_loop_returns_complete_when_all_done(workspace: str):
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_done(conn, app, "STORY-1")
+        story_state.mark_done(conn, app, "STORY-001")
     finally:
         conn.close()
 
@@ -318,8 +318,8 @@ def test_story_loop_reports_blocked_count(workspace: str):
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_done(conn, app, "STORY-1")
-        story_state.mark_blocked(conn, app, "STORY-2")
+        story_state.mark_done(conn, app, "STORY-001")
+        story_state.mark_blocked(conn, app, "STORY-002")
     finally:
         conn.close()
 
@@ -356,35 +356,35 @@ def test_story_loop_auto_completes_story_at_zero_patch_cap(workspace: str):
     planned = story_loop.batch_planner_node(_state(workspace))
     batch_id = planned["current_batch_id"]
 
-    # Simulate STORY-1 in-progress with 3 zero-patch rounds accumulated.
+    # Simulate STORY-001 in-progress with 3 zero-patch rounds accumulated.
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_in_progress(conn, app, "STORY-1")
+        story_state.mark_in_progress(conn, app, "STORY-001")
     finally:
         conn.close()
 
     out = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-1",
+        current_story_id="STORY-001",
         loop_counter={
-            "story_zero_patch_rounds": {"STORY-1": story_loop.STORY_ZERO_PATCH_CAP}
+            "story_zero_patch_rounds": {"STORY-001": story_loop.STORY_ZERO_PATCH_CAP}
         },
     ))
 
-    # Advanced to STORY-2.
-    assert out["current_story_id"] == "STORY-2"
+    # Advanced to STORY-002.
+    assert out["current_story_id"] == "STORY-002"
     assert out["node_state"]["batch_complete"] is False
-    assert out["node_state"]["auto_completed_story"] == "STORY-1"
+    assert out["node_state"]["auto_completed_story"] == "STORY-001"
     assert out["node_state"]["auto_completed_zero_rounds"] == (
         story_loop.STORY_ZERO_PATCH_CAP
     )
 
-    # STORY-1 should now be done in the DB.
+    # STORY-001 should now be done in the DB.
     conn = story_state.open_story_db()
     try:
-        s = story_state.get_story(conn, app, "STORY-1")
+        s = story_state.get_story(conn, app, "STORY-001")
     finally:
         conn.close()
     assert s["status"] == "done"
@@ -410,37 +410,37 @@ def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_in_progress(conn, app, "STORY-1")
+        story_state.mark_in_progress(conn, app, "STORY-001")
     finally:
         conn.close()
 
     out = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-1",
+        current_story_id="STORY-001",
         loop_counter={
             "story_zero_patch_rounds": {
-                "STORY-1": story_loop.STORY_ZERO_PATCH_CAP - 1
+                "STORY-001": story_loop.STORY_ZERO_PATCH_CAP - 1
             }
         },
     ))
 
-    # Phase E.3 cursor-advance: STORY-1 is recorded as patched and STORY-2
-    # is picked next; STORY-1 is NOT re-selected even though it's still
+    # Phase E.3 cursor-advance: STORY-001 is recorded as patched and STORY-002
+    # is picked next; STORY-001 is NOT re-selected even though it's still
     # in_progress in the DB.
-    assert out["current_story_id"] == "STORY-2"
+    assert out["current_story_id"] == "STORY-002"
     assert out["node_state"].get("auto_completed_story") is None
-    assert "STORY-1" in out["batch_patched_story_keys"]
+    assert "STORY-001" in out["batch_patched_story_keys"]
     # Counter survives unchanged — auto-complete didn't fire.
-    assert out["loop_counter"]["story_zero_patch_rounds"]["STORY-1"] == (
+    assert out["loop_counter"]["story_zero_patch_rounds"]["STORY-001"] == (
         story_loop.STORY_ZERO_PATCH_CAP - 1
     )
 
-    # STORY-1 is still in_progress in the DB; batch_commit_node will seal
+    # STORY-001 is still in_progress in the DB; batch_commit_node will seal
     # it as ``done`` after the per-batch verification chain runs.
     conn = story_state.open_story_db()
     try:
-        s = story_state.get_story(conn, app, "STORY-1")
+        s = story_state.get_story(conn, app, "STORY-001")
     finally:
         conn.close()
     assert s["status"] == "in_progress"
@@ -464,50 +464,50 @@ def test_story_loop_advances_cursor_after_patching_turn(workspace: str):
     planned = story_loop.batch_planner_node(_state(workspace))
     batch_id = planned["current_batch_id"]
 
-    # First story_loop entry — picks STORY-1.
+    # First story_loop entry — picks STORY-001.
     out1 = story_loop.story_loop_node(
         _state(workspace, current_batch_id=batch_id)
     )
-    assert out1["current_story_id"] == "STORY-1"
+    assert out1["current_story_id"] == "STORY-001"
     assert out1["batch_patched_story_keys"] == []
 
     # Simulate the LangGraph channel layer: the next call sees
-    # current_story_id="STORY-1" (patching_node didn't change it) and
+    # current_story_id="STORY-001" (patching_node didn't change it) and
     # batch_patched_story_keys is still empty until story_loop_node runs.
     # The patching_node turn is a no-op for this test — we only care that
     # story_loop_node advances the cursor on re-entry.
     out2 = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-1",
+        current_story_id="STORY-001",
         batch_patched_story_keys=[],
     ))
-    assert out2["current_story_id"] == "STORY-2"
-    assert out2["batch_patched_story_keys"] == ["STORY-1"]
+    assert out2["current_story_id"] == "STORY-002"
+    assert out2["batch_patched_story_keys"] == ["STORY-001"]
 
-    # Third entry — STORY-2 just patched; STORY-3 is next.
+    # Third entry — STORY-002 just patched; STORY-003 is next.
     out3 = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-2",
-        batch_patched_story_keys=["STORY-1"],
+        current_story_id="STORY-002",
+        batch_patched_story_keys=["STORY-001"],
     ))
-    assert out3["current_story_id"] == "STORY-3"
+    assert out3["current_story_id"] == "STORY-003"
     assert sorted(out3["batch_patched_story_keys"]) == [
-        "STORY-1", "STORY-2",
+        "STORY-001", "STORY-002",
     ]
 
-    # Fourth entry — STORY-3 patched, no stories left → batch_complete.
+    # Fourth entry — STORY-003 patched, no stories left → batch_complete.
     out4 = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-3",
-        batch_patched_story_keys=["STORY-1", "STORY-2"],
+        current_story_id="STORY-003",
+        batch_patched_story_keys=["STORY-001", "STORY-002"],
     ))
     assert out4["current_story_id"] == ""
     assert out4["node_state"]["batch_complete"] is True
     assert sorted(out4["batch_patched_story_keys"]) == [
-        "STORY-1", "STORY-2", "STORY-3",
+        "STORY-001", "STORY-002", "STORY-003",
     ]
 
 
@@ -530,19 +530,19 @@ def test_story_loop_auto_complete_respects_cap_override(workspace: str):
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_in_progress(conn, app, "STORY-1")
+        story_state.mark_in_progress(conn, app, "STORY-001")
     finally:
         conn.close()
 
     out = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-1",
+        current_story_id="STORY-001",
         story_zero_patch_cap=1,
-        loop_counter={"story_zero_patch_rounds": {"STORY-1": 1}},
+        loop_counter={"story_zero_patch_rounds": {"STORY-001": 1}},
     ))
 
-    assert out["node_state"]["auto_completed_story"] == "STORY-1"
+    assert out["node_state"]["auto_completed_story"] == "STORY-001"
 
 
 def test_story_loop_auto_complete_finishes_batch_when_last_story(workspace: str):
@@ -556,16 +556,16 @@ def test_story_loop_auto_complete_finishes_batch_when_last_story(workspace: str)
     app = _app(workspace)
     conn = story_state.open_story_db()
     try:
-        story_state.mark_in_progress(conn, app, "STORY-1")
+        story_state.mark_in_progress(conn, app, "STORY-001")
     finally:
         conn.close()
 
     out = story_loop.story_loop_node(_state(
         workspace,
         current_batch_id=batch_id,
-        current_story_id="STORY-1",
+        current_story_id="STORY-001",
         loop_counter={
-            "story_zero_patch_rounds": {"STORY-1": story_loop.STORY_ZERO_PATCH_CAP}
+            "story_zero_patch_rounds": {"STORY-001": story_loop.STORY_ZERO_PATCH_CAP}
         },
     ))
 

@@ -154,6 +154,10 @@ def test_reconciler_writes_story_satisfies_req_edges(isolated_state_db, tmp_path
         conn.close()
 
     pairs = {(row["sk"], row["rk"]) for row in rows}
+    # stories table stores keys in raw form (``STORY-N``) while the
+    # requirements table stores them zero-padded (``STORY-NNN``). Both
+    # conventions are stable at the boundary — see
+    # ``story_state._canon`` / ``req_ids.canonicalize_req_key``.
     assert ("STORY-001", "STORY-001") in pairs
     assert ("STORY-002", "STORY-002") in pairs
 

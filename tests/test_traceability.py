@@ -187,8 +187,8 @@ def test_unverified_ac_surfaces_grouped_by_story(workspace: str, app: str):
     keys = [(u.story_key, u.ac_key) for u in report.untested_acs]
     # Ordered by story_id then ordinal — S1.AC-2 before S2.AC-1.
     assert keys == [
-        ("STORY-1", "STORY-1.AC-2"),
-        ("STORY-2", "STORY-2.AC-1"),
+        ("STORY-001", "STORY-001.AC-2"),
+        ("STORY-002", "STORY-002.AC-1"),
     ]
     assert report.has_failures() is True
 
@@ -222,14 +222,14 @@ def test_format_report_includes_both_sections_when_both_fail():
         untraced=[UntracedRequirement(req_id="FR-002", kind="fr")],
         total_acs=2, verified_acs=1,
         untested_acs=[UntestedCriterion(
-            ac_key="STORY-1.AC-2", story_key="STORY-1", text="some criterion",
+            ac_key="STORY-001.AC-2", story_key="STORY-001", text="some criterion",
         )],
     )
     out = format_report(report)
     assert "Untraced requirements (1)" in out
     assert "Untested acceptance criteria (1)" in out
     assert "FR-002" in out
-    assert "STORY-1.AC-2" in out
+    assert "STORY-001.AC-2" in out
     assert "some criterion" in out
     # Coverage percentages render with %0.f
     assert "50% coverage" in out
@@ -463,7 +463,7 @@ class TestTraceabilityMdCoverageSections:
         with open(os.path.join(workspace, "docs", "TRACEABILITY.md")) as f:
             body = f.read()
         assert "## Acceptance-criteria coverage" in body
-        assert "`STORY-1.AC-1`" in body
-        assert "`STORY-1.AC-2`" in body
+        assert "`STORY-001.AC-1`" in body
+        assert "`STORY-001.AC-2`" in body
         assert "`tests/test_x.py`" in body
-        assert "— (gap)" in body  # STORY-1.AC-2 has no test
+        assert "— (gap)" in body  # STORY-001.AC-2 has no test

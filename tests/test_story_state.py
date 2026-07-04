@@ -160,7 +160,7 @@ def test_open_migrates_legacy_v3_db(isolated_state_db):
             created_at TEXT NOT NULL
         );
         INSERT INTO stories(workspace, story_key, epic, title, status, created_at)
-        VALUES ('legacy-ws', 'STORY-1', 'legacy-epic', 'old story', 'done', '2026-01-01');
+        VALUES ('legacy-ws', 'STORY-001', 'legacy-epic', 'old story', 'done', '2026-01-01');
         """
     )
     raw.commit()
@@ -226,12 +226,12 @@ def test_create_stories_assigns_sequential_keys(conn, app):
         {"title": "Add logout"},
         {"title": "Add password reset"},
     ])
-    assert keys == ["STORY-1", "STORY-2", "STORY-3"]
+    assert keys == ["STORY-001", "STORY-002", "STORY-003"]
 
 
 def test_create_stories_defaults_to_greenfield(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
-    s = get_story(conn, app, "STORY-1")
+    s = get_story(conn, app, "STORY-001")
     assert s["build_kind"] == BUILD_KIND_GREENFIELD
     assert s["cr_ids"] == []
 
@@ -246,7 +246,7 @@ def test_create_stories_persists_json_columns(conn, app):
         "scope_files": ["auth.py", "tests/test_auth.py"],
         "external_ref": "CR-7",
     }])
-    s = get_story(conn, app, "STORY-1")
+    s = get_story(conn, app, "STORY-001")
     assert s is not None
     assert s["acceptance_criteria"] == ["AC1", "AC2"]
     assert s["scope_files"] == ["auth.py", "tests/test_auth.py"]
@@ -279,39 +279,39 @@ def test_create_stories_rejects_unknown_feature(conn, app):
 
 def test_status_transitions(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
-    mark_in_progress(conn, app, "STORY-1")
-    assert get_story(conn, app, "STORY-1")["status"] == "in_progress"
-    assert get_story(conn, app, "STORY-1")["started_at"] is not None
-    mark_done(conn, app, "STORY-1")
-    assert get_story(conn, app, "STORY-1")["status"] == "done"
-    assert get_story(conn, app, "STORY-1")["completed_at"] is not None
+    mark_in_progress(conn, app, "STORY-001")
+    assert get_story(conn, app, "STORY-001")["status"] == "in_progress"
+    assert get_story(conn, app, "STORY-001")["started_at"] is not None
+    mark_done(conn, app, "STORY-001")
+    assert get_story(conn, app, "STORY-001")["status"] == "done"
+    assert get_story(conn, app, "STORY-001")["completed_at"] is not None
 
 
 def test_mark_in_progress_idempotent_on_resume(conn, app):
     """Calling mark_in_progress twice (resume scenario) refreshes
     started_at instead of silently no-oping."""
     _create_stories(conn, app, [{"title": "T"}])
-    assert mark_in_progress(conn, app, "STORY-1") == 1
-    first_started = get_story(conn, app, "STORY-1")["started_at"]
+    assert mark_in_progress(conn, app, "STORY-001") == 1
+    first_started = get_story(conn, app, "STORY-001")["started_at"]
     # Second call against an already-in_progress story still matches.
-    assert mark_in_progress(conn, app, "STORY-1") == 1
-    assert get_story(conn, app, "STORY-1")["started_at"] >= first_started
+    assert mark_in_progress(conn, app, "STORY-001") == 1
+    assert get_story(conn, app, "STORY-001")["started_at"] >= first_started
 
 
 def test_mark_blocked(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
-    mark_blocked(conn, app, "STORY-1")
-    assert get_story(conn, app, "STORY-1")["status"] == "blocked"
+    mark_blocked(conn, app, "STORY-001")
+    assert get_story(conn, app, "STORY-001")["status"] == "blocked"
 
 
 def test_list_stories_filter_by_status(conn, app):
     _create_stories(conn, app, [{"title": "A"}, {"title": "B"}, {"title": "C"}])
-    mark_done(conn, app, "STORY-2")
+    mark_done(conn, app, "STORY-002")
     assert [s["story_key"] for s in list_stories(conn, app, status="planned")] == [
-        "STORY-1", "STORY-3"
+        "STORY-001", "STORY-003"
     ]
     assert [s["story_key"] for s in list_stories(conn, app, status="done")] == [
-        "STORY-2"
+        "STORY-002"
     ]
 
 
@@ -320,15 +320,15 @@ def test_list_stories_filter_by_status(conn, app):
 # ---------------------------------------------------------------------------
 
 def test_two_workspaces_each_own_story_1(conn, tmp_path):
-    """Two workspaces can each have a ``STORY-1`` simultaneously."""
+    """Two workspaces can each have a ``STORY-001`` simultaneously."""
     app_a = app_name_for_workspace(str(tmp_path / "alpha"))
     app_b = app_name_for_workspace(str(tmp_path / "beta"))
     (tmp_path / "alpha").mkdir()
     (tmp_path / "beta").mkdir()
     _create_stories(conn, app_a, [{"title": "alpha story 1"}])
     _create_stories(conn, app_b, [{"title": "beta story 1"}])
-    assert get_story(conn, app_a, "STORY-1")["title"] == "alpha story 1"
-    assert get_story(conn, app_b, "STORY-1")["title"] == "beta story 1"
+    assert get_story(conn, app_a, "STORY-001")["title"] == "alpha story 1"
+    assert get_story(conn, app_b, "STORY-001")["title"] == "beta story 1"
 
 
 def test_list_stories_scopes_by_workspace(conn, tmp_path):
@@ -349,9 +349,9 @@ def test_mark_done_in_one_workspace_does_not_touch_other(conn, tmp_path):
     (tmp_path / "beta").mkdir()
     _create_stories(conn, app_a, [{"title": "A"}])
     _create_stories(conn, app_b, [{"title": "B"}])
-    mark_done(conn, app_a, "STORY-1")
-    assert get_story(conn, app_a, "STORY-1")["status"] == "done"
-    assert get_story(conn, app_b, "STORY-1")["status"] == "planned"
+    mark_done(conn, app_a, "STORY-001")
+    assert get_story(conn, app_a, "STORY-001")["status"] == "done"
+    assert get_story(conn, app_b, "STORY-001")["status"] == "planned"
 
 
 # ---------------------------------------------------------------------------
@@ -361,29 +361,29 @@ def test_mark_done_in_one_workspace_does_not_touch_other(conn, tmp_path):
 def test_get_planned_stories_honors_depends_on(conn, app):
     _create_stories(conn, app, [
         {"title": "Base"},
-        {"title": "Feature", "depends_on": ["STORY-1"]},
-        {"title": "Polish", "depends_on": ["STORY-2"]},
+        {"title": "Feature", "depends_on": ["STORY-001"]},
+        {"title": "Polish", "depends_on": ["STORY-002"]},
     ])
     ready = [s["story_key"] for s in get_planned_stories(conn, app)]
-    assert ready == ["STORY-1"]  # only Base is unblocked
+    assert ready == ["STORY-001"]  # only Base is unblocked
 
-    mark_done(conn, app, "STORY-1")
+    mark_done(conn, app, "STORY-001")
     ready = [s["story_key"] for s in get_planned_stories(conn, app)]
-    assert ready == ["STORY-2"]
+    assert ready == ["STORY-002"]
 
-    mark_done(conn, app, "STORY-2")
+    mark_done(conn, app, "STORY-002")
     ready = [s["story_key"] for s in get_planned_stories(conn, app)]
-    assert ready == ["STORY-3"]
+    assert ready == ["STORY-003"]
 
 
 def test_get_planned_stories_returns_parallel_independent(conn, app):
     _create_stories(conn, app, [
         {"title": "A"},
         {"title": "B"},
-        {"title": "C", "depends_on": ["STORY-1", "STORY-2"]},
+        {"title": "C", "depends_on": ["STORY-001", "STORY-002"]},
     ])
     ready = sorted(s["story_key"] for s in get_planned_stories(conn, app))
-    assert ready == ["STORY-1", "STORY-2"]
+    assert ready == ["STORY-001", "STORY-002"]
 
 
 def test_get_planned_stories_includes_reopened(conn, app):
@@ -394,13 +394,13 @@ def test_get_planned_stories_includes_reopened(conn, app):
     _create_stories(conn, app, [
         {"title": "Login"}, {"title": "Logout"},
     ])
-    mark_done(conn, app, "STORY-1")
-    mark_done(conn, app, "STORY-2")
-    # Spec drifted — story_reopen_node flips STORY-1.
-    assert mark_reopened(conn, app, "STORY-1") == 1
+    mark_done(conn, app, "STORY-001")
+    mark_done(conn, app, "STORY-002")
+    # Spec drifted — story_reopen_node flips STORY-001.
+    assert mark_reopened(conn, app, "STORY-001") == 1
     ready = [s["story_key"] for s in get_planned_stories(conn, app)]
-    assert "STORY-1" in ready
-    assert "STORY-2" not in ready  # still done
+    assert "STORY-001" in ready
+    assert "STORY-002" not in ready  # still done
 
 
 def test_mark_in_progress_accepts_reopened(conn, app):
@@ -408,12 +408,12 @@ def test_mark_in_progress_accepts_reopened(conn, app):
     'reopened' rows too, not just ('planned', 'in_progress')."""
     from harness.story_state import mark_reopened
     _create_stories(conn, app, [{"title": "A"}])
-    mark_done(conn, app, "STORY-1")
-    mark_reopened(conn, app, "STORY-1")
+    mark_done(conn, app, "STORY-001")
+    mark_reopened(conn, app, "STORY-001")
     # Planner picks it up and tries to mark it in_progress.
-    moved = mark_in_progress(conn, app, "STORY-1")
+    moved = mark_in_progress(conn, app, "STORY-001")
     assert moved == 1
-    s = get_story(conn, app, "STORY-1")
+    s = get_story(conn, app, "STORY-001")
     assert s["status"] == "in_progress"
 
 
@@ -423,7 +423,7 @@ def test_mark_in_progress_accepts_reopened(conn, app):
 
 def test_batch_lifecycle(conn, app):
     _create_stories(conn, app, [{"title": "A"}, {"title": "B"}])
-    batch_id = start_batch(conn, app, "sess-1", ["STORY-1", "STORY-2"])
+    batch_id = start_batch(conn, app, "sess-1", ["STORY-001", "STORY-002"])
     row = conn.execute(
         "SELECT session_id, status, workspace FROM batches WHERE id = ?",
         (batch_id,),
@@ -444,7 +444,7 @@ def test_batch_lifecycle(conn, app):
 
 def test_batch_skips_unknown_story_keys(conn, app):
     _create_stories(conn, app, [{"title": "A"}])
-    batch_id = start_batch(conn, app, "sess-1", ["STORY-1", "STORY-99"])
+    batch_id = start_batch(conn, app, "sess-1", ["STORY-001", "STORY-099"])
     count = conn.execute(
         "SELECT COUNT(*) FROM batch_stories WHERE batch_id = ?", (batch_id,)
     ).fetchone()[0]
@@ -453,7 +453,7 @@ def test_batch_skips_unknown_story_keys(conn, app):
 
 def test_start_batch_defaults_to_greenfield(conn, app):
     _create_stories(conn, app, [{"title": "A"}])
-    bid = start_batch(conn, app, "sess-1", ["STORY-1"])
+    bid = start_batch(conn, app, "sess-1", ["STORY-001"])
     row = conn.execute(
         "SELECT build_kind, cr_ids FROM batches WHERE id = ?", (bid,),
     ).fetchone()
@@ -470,7 +470,7 @@ def test_create_stories_tags_as_cr(conn, app):
         conn, app, [{"title": "Add 2FA"}],
         build_kind=BUILD_KIND_CR, cr_ids=[2],
     )
-    s = get_story(conn, app, "STORY-1")
+    s = get_story(conn, app, "STORY-001")
     assert s["build_kind"] == BUILD_KIND_CR
     assert s["cr_ids"] == [2]
 
@@ -481,7 +481,7 @@ def test_start_batch_tags_as_cr(conn, app):
         build_kind=BUILD_KIND_CR, cr_ids=[3],
     )
     bid = start_batch(
-        conn, app, "sess-1", ["STORY-1"],
+        conn, app, "sess-1", ["STORY-001"],
         build_kind=BUILD_KIND_CR, cr_ids=[3],
     )
     row = conn.execute(
@@ -512,14 +512,14 @@ def test_list_stories_for_cr_filters_by_cr_id(conn, app):
 def test_list_batches_for_cr_filters_by_cr_id(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
     # Greenfield batch.
-    start_batch(conn, app, "sess-1", ["STORY-1"])
+    start_batch(conn, app, "sess-1", ["STORY-001"])
     # CR-3 batch.
     _create_stories(
         conn, app, [{"title": "CR-3 thing"}],
         build_kind=BUILD_KIND_CR, cr_ids=[3],
     )
     start_batch(
-        conn, app, "sess-2", ["STORY-2"],
+        conn, app, "sess-2", ["STORY-002"],
         build_kind=BUILD_KIND_CR, cr_ids=[3],
     )
     batches = list_batches_for_cr(conn, app, 3)
@@ -542,7 +542,7 @@ def test_record_and_resolve_defect(conn, app):
     did = record_defect(
         conn,
         workspace=app,
-        story_key="STORY-1",
+        story_key="STORY-001",
         session_id="sess-1",
         severity="compile",
         summary="syntax error in foo.py",
@@ -556,7 +556,7 @@ def test_record_and_resolve_defect(conn, app):
     assert "foo.py" in row[1]
     assert "42" in row[2]
 
-    n = resolve_defects_for_story(conn, app, "STORY-1")
+    n = resolve_defects_for_story(conn, app, "STORY-001")
     assert n == 1
     assert conn.execute(
         "SELECT status FROM defects WHERE id = ?", (did,)
@@ -584,7 +584,7 @@ def test_record_test_run(conn, app):
     record_test_run(
         conn,
         workspace=app,
-        story_key="STORY-1",
+        story_key="STORY-001",
         session_id="sess-1",
         phase="tests_first",
         exit_code=1,
@@ -599,9 +599,9 @@ def test_record_test_run(conn, app):
 
 def test_link_file_dedups(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
-    link_file(conn, app, "STORY-1", "auth.py", "code")
-    link_file(conn, app, "STORY-1", "auth.py", "code")  # duplicate kind
-    link_file(conn, app, "STORY-1", "auth.py", "test")  # different kind, allowed
+    link_file(conn, app, "STORY-001", "auth.py", "code")
+    link_file(conn, app, "STORY-001", "auth.py", "code")  # duplicate kind
+    link_file(conn, app, "STORY-001", "auth.py", "test")  # different kind, allowed
     rows = conn.execute(
         "SELECT path, kind FROM file_links ORDER BY kind"
     ).fetchall()
@@ -609,14 +609,14 @@ def test_link_file_dedups(conn, app):
 
 
 def test_link_file_unknown_story_is_noop(conn, app):
-    link_file(conn, app, "STORY-99", "auth.py", "code")
+    link_file(conn, app, "STORY-099", "auth.py", "code")
     assert conn.execute("SELECT COUNT(*) FROM file_links").fetchone()[0] == 0
 
 
 def test_link_file_stamps_batch_id(conn, app):
     _create_stories(conn, app, [{"title": "Auth"}])
-    bid = start_batch(conn, app, "sess-1", ["STORY-1"])
-    link_file(conn, app, "STORY-1", "auth.py", "code", batch_id=bid)
+    bid = start_batch(conn, app, "sess-1", ["STORY-001"])
+    link_file(conn, app, "STORY-001", "auth.py", "code", batch_id=bid)
     row = conn.execute(
         "SELECT batch_id, workspace FROM file_links WHERE path = ?",
         ("auth.py",),
@@ -629,10 +629,10 @@ def test_link_file_updates_batch_id_on_reapply(conn, app):
     """If a later batch touches the same (story, path, kind), the
     stamp updates so 'last batch that touched this file' is queryable."""
     _create_stories(conn, app, [{"title": "Auth"}])
-    b1 = start_batch(conn, app, "sess-1", ["STORY-1"])
-    link_file(conn, app, "STORY-1", "auth.py", "code", batch_id=b1)
-    b2 = start_batch(conn, app, "sess-1", ["STORY-1"])
-    link_file(conn, app, "STORY-1", "auth.py", "code", batch_id=b2)
+    b1 = start_batch(conn, app, "sess-1", ["STORY-001"])
+    link_file(conn, app, "STORY-001", "auth.py", "code", batch_id=b1)
+    b2 = start_batch(conn, app, "sess-1", ["STORY-001"])
+    link_file(conn, app, "STORY-001", "auth.py", "code", batch_id=b2)
     row = conn.execute(
         "SELECT batch_id FROM file_links WHERE path = ?", ("auth.py",)
     ).fetchone()
@@ -644,9 +644,9 @@ def test_link_file_without_batch_id_preserves_existing_stamp(conn, app):
     exists must not clear the stamp — the unstamped call is a no-op
     when the (story, path, kind) tuple already exists."""
     _create_stories(conn, app, [{"title": "Auth"}])
-    b1 = start_batch(conn, app, "sess-1", ["STORY-1"])
-    link_file(conn, app, "STORY-1", "auth.py", "code", batch_id=b1)
-    link_file(conn, app, "STORY-1", "auth.py", "code")  # no batch_id
+    b1 = start_batch(conn, app, "sess-1", ["STORY-001"])
+    link_file(conn, app, "STORY-001", "auth.py", "code", batch_id=b1)
+    link_file(conn, app, "STORY-001", "auth.py", "code")  # no batch_id
     row = conn.execute(
         "SELECT batch_id FROM file_links WHERE path = ?", ("auth.py",)
     ).fetchone()
@@ -655,22 +655,22 @@ def test_link_file_without_batch_id_preserves_existing_stamp(conn, app):
 
 def test_files_for_batch_returns_only_stamped_files(conn, app):
     _create_stories(conn, app, [{"title": "A"}, {"title": "B"}])
-    b1 = start_batch(conn, app, "sess-1", ["STORY-1", "STORY-2"])
-    link_file(conn, app, "STORY-1", "a.py", "code", batch_id=b1)
-    link_file(conn, app, "STORY-2", "b.py", "code", batch_id=b1)
+    b1 = start_batch(conn, app, "sess-1", ["STORY-001", "STORY-002"])
+    link_file(conn, app, "STORY-001", "a.py", "code", batch_id=b1)
+    link_file(conn, app, "STORY-002", "b.py", "code", batch_id=b1)
     # Unstamped row (legacy / out-of-band touch) must not appear
     # in files_for_batch results.
-    link_file(conn, app, "STORY-1", "stale.py", "doc")
+    link_file(conn, app, "STORY-001", "stale.py", "doc")
     rows = files_for_batch(conn, b1)
     assert sorted(rows) == [
-        ("STORY-1", "a.py", "code"),
-        ("STORY-2", "b.py", "code"),
+        ("STORY-001", "a.py", "code"),
+        ("STORY-002", "b.py", "code"),
     ]
 
 
 def test_set_batch_committed_sha_persists(conn, app):
     _create_stories(conn, app, [{"title": "T"}])
-    bid = start_batch(conn, app, "sess-1", ["STORY-1"])
+    bid = start_batch(conn, app, "sess-1", ["STORY-001"])
     set_batch_committed_sha(conn, bid, "deadbeefcafe")
     row = conn.execute(
         "SELECT committed_sha FROM batches WHERE id = ?", (bid,)
@@ -688,14 +688,14 @@ def test_record_commit(conn, app):
     record_commit(
         conn,
         workspace=app,
-        sha="abc1234567", story_key="STORY-1",
-        session_id="sess-1", message="STORY-1: add auth",
+        sha="abc1234567", story_key="STORY-001",
+        session_id="sess-1", message="STORY-001: add auth",
     )
     row = conn.execute(
         "SELECT sha, message, story_id, workspace FROM commits"
     ).fetchone()
     assert row[0] == "abc1234567"
-    assert row[1] == "STORY-1: add auth"
+    assert row[1] == "STORY-001: add auth"
     assert row[2] is not None
     assert row[3] == app
 
@@ -719,29 +719,29 @@ def test_regenerate_markdown_views_renders_stories_and_traceability(
     _create_stories(conn, app, [
         {"title": "Add login", "feature": "auth",
          "acceptance_criteria": ["redirect after login"]},
-        {"title": "Add logout", "feature": "auth", "depends_on": ["STORY-1"]},
+        {"title": "Add logout", "feature": "auth", "depends_on": ["STORY-001"]},
     ])
-    mark_done(conn, app, "STORY-1")
-    link_file(conn, app, "STORY-1", "src/auth.py", "code")
-    link_file(conn, app, "STORY-1", "tests/test_auth.py", "test")
+    mark_done(conn, app, "STORY-001")
+    link_file(conn, app, "STORY-001", "src/auth.py", "code")
+    link_file(conn, app, "STORY-001", "tests/test_auth.py", "test")
     record_defect(
-        conn, workspace=app, story_key="STORY-1", session_id="s1",
+        conn, workspace=app, story_key="STORY-001", session_id="s1",
         severity="lint", summary="line too long",
     )
     record_commit(
-        conn, workspace=app, sha="abcdef0123456789", story_key="STORY-1",
-        session_id="s1", message="STORY-1: add login",
+        conn, workspace=app, sha="abcdef0123456789", story_key="STORY-001",
+        session_id="s1", message="STORY-001: add login",
     )
 
     stories_path, trace_path = regenerate_markdown_views(conn, workspace)
     stories_md = Path(stories_path).read_text()
     trace_md = Path(trace_path).read_text()
 
-    assert "STORY-1" in stories_md
-    assert "STORY-2" in stories_md
+    assert "STORY-001" in stories_md
+    assert "STORY-002" in stories_md
     assert "auth" in stories_md
     assert "redirect after login" in stories_md
-    assert "STORY-1" in trace_md
+    assert "STORY-001" in trace_md
     assert "src/auth.py" in trace_md
     assert "tests/test_auth.py" in trace_md
     assert "abcdef0" in trace_md
@@ -980,7 +980,7 @@ def test_migrate_v4_to_v5_drops_legacy_acceptance_criteria_column(isolated_state
             );
             INSERT INTO stories(
                 workspace, story_key, title, acceptance_criteria, created_at
-            ) VALUES ('demo', 'STORY-1', 'legacy v4', '["old"]', '2026-01-01T00:00:00');
+            ) VALUES ('demo', 'STORY-001', 'legacy v4', '["old"]', '2026-01-01T00:00:00');
         """)
         conn.commit()
     finally:

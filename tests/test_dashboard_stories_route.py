@@ -61,14 +61,14 @@ def _seed_workspace(tmp_path: Path, name: str = "ws-alpha") -> str:
             {"title": "Logout link", "feature": "auth"},
             {"title": "Invoice PDF", "feature": "billing"},
         ])
-        mark_done(conn, app, "STORY-1")
-        mark_in_progress(conn, app, "STORY-2")
-        # STORY-3 stays planned.
+        mark_done(conn, app, "STORY-001")
+        mark_in_progress(conn, app, "STORY-002")
+        # STORY-003 stays planned.
         start_batch(
-            conn, app, "sess-abc", ["STORY-1", "STORY-2"],
+            conn, app, "sess-abc", ["STORY-001", "STORY-002"],
         )
         record_defect(
-            conn, workspace=app, story_key="STORY-2",
+            conn, workspace=app, story_key="STORY-002",
             session_id="sess-abc", severity="high",
             summary="logout link 404s in Safari",
         )
@@ -102,9 +102,9 @@ def test_stories_index_lists_workspaces_with_data(tmp_path):
     assert status == 200
     # Workspace surfaces as a link into the detail page.
     assert f"/stories/{app}" in body
-    # Rollup: 1 done out of 3 stories (STORY-1 done, STORY-2 in flight,
-    # STORY-3 planned). Two features, one batch, one open defect
-    # (STORY-2 tagged; the orphan defect also counts as open).
+    # Rollup: 1 done out of 3 stories (STORY-001 done, STORY-002 in flight,
+    # STORY-003 planned). Two features, one batch, one open defect
+    # (STORY-002 tagged; the orphan defect also counts as open).
     assert "1 / 3" in body  # done / total
     assert "Open defects" in body
 
@@ -122,7 +122,7 @@ def test_stories_workspace_page_shows_features_batches_defects(tmp_path):
     assert "1 in flight" in body
     # Stories card content: story keys and titles show inside expanded
     # feature <details> blocks.
-    assert "STORY-1" in body
+    assert "STORY-001" in body
     assert "Login form" in body
     # Batches card: session id linked back to /sessions.
     assert "/sessions/sess-abc" in body

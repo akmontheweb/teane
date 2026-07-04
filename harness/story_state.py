@@ -58,8 +58,8 @@ v5 (industry-grade traceability — schema-v5 plan):
   can group naturally.
 - New ``acceptance_criteria`` table — promotes the old
   ``stories.acceptance_criteria`` JSON column into per-row records
-  with stable ``ac_key`` identifiers (``STORY-3.AC-2``). Lets the
-  test-gen marker contract (``# @verifies: STORY-3.AC-2``) point at
+  with stable ``ac_key`` identifiers (``STORY-003.AC-2``). Lets the
+  test-gen marker contract (``# @verifies: STORY-003.AC-2``) point at
   a real PK. The legacy JSON column is dropped from v5.
 - New link tables ``story_satisfies_req`` (story → requirement, M:N)
   and ``test_verifies_ac`` (test file → AC, M:N). These are the
@@ -99,7 +99,7 @@ v3 (multi-workspace global DB + CR tagging):
   ``cr``) plus ``cr_ids`` (JSON list of integer CR ids ingested in the
   run that created the row). Together these mark a row as an
   incremental change-request layer on top of the original build, so
-  traceability views can show "STORY-7 was added by CR-2" without
+  traceability views can show "STORY-007 was added by CR-2" without
   losing the greenfield history.
 
 v2 (per-batch verification pipeline, historical — applied to a v1 DB):
@@ -125,6 +125,66 @@ _VALID_BUILD_KINDS = frozenset({BUILD_KIND_GREENFIELD, BUILD_KIND_CR})
 _DEFAULT_STATE_DB_PATH = "~/.harness/state.db"
 
 _INVALID_BASENAME = frozenset({"", ".", ".."})
+
+
+# ---------------------------------------------------------------------------
+# Canonicalisation boundary
+# ---------------------------------------------------------------------------
+#
+# Prior to 2026-07-04 story keys could exist in the DB in either raw
+# (``STORY-1``, ``STORY-2``) or canonical (``STORY-001``, ``STORY-002``)
+# form depending on which node populated the row:
+#
+#   - ``decomposition_node`` called ``_next_story_key`` which returned
+#     raw form.
+#   - ``spec_reconciler_node`` re-inserted stories from
+#     ``docs/SPEC_REQUIREMENTS.md`` using the spec's own headings,
+#     which the parser already canonicalises.
+#
+# Downstream joins (``link_story_to_requirements``, ``link_test_to_ac``,
+# ``get_story``, ``mark_done``, etc.) all use exact-string match on
+# ``story_key``, so a query with the wrong form silently missed. Ciod
+# session 523e86a7 exposed this via the traceability audit reporting
+# 0/26 coverage even after batches sealed successfully.
+#
+# ``_canon`` is applied at EVERY public boundary that takes a story_key
+# or ac_key parameter, and the ``_next_story_key`` allocator now
+# returns canonical form. The net effect: any caller can pass either
+# ``STORY-1`` or ``STORY-001`` and hit the same row.
+
+
+def _canon(story_key: str) -> str:
+    """Fold a story key to the DB storage form.
+
+    Storage form is the zero-padded canonical form (``STORY-001``,
+    ``FR-007``, ``EPIC-042``, ``NFR-SEC-001``, ``STORY-NFR-003``) —
+    identical to :func:`harness.req_ids.canonicalize_req_key`. This is
+    also what the spec parser produces and what the requirements
+    table already stores, so every table in ``state.db`` now uses one
+    invariant: **canonical form, everywhere**.
+
+    Idempotent. Safe on empty inputs (returns empty string) so
+    ``record_defect``-style call sites that pass ``None`` don't need
+    guards.
+    """
+    if not story_key:
+        return ""
+    from harness.req_ids import canonicalize_req_key
+    return canonicalize_req_key(story_key)
+
+
+def _canon_ac(ac_key: str) -> str:
+    """Fold an acceptance-criterion key to the DB storage form.
+
+    Storage form: ``<canonical_story_key>.AC-<n>`` where the story
+    part is zero-padded and the AC-N tail is NOT padded (matches
+    :func:`create_acceptance_criteria`'s ``f"{key}.AC-{i+1}"``
+    format). Wraps :func:`harness.req_ids.canonicalize_ac_key`.
+    """
+    if not ac_key:
+        return ""
+    from harness.req_ids import canonicalize_ac_key
+    return canonicalize_ac_key(ac_key)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +332,7 @@ CREATE TABLE IF NOT EXISTS acceptance_criteria (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace TEXT NOT NULL,
     story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
-    ac_key TEXT NOT NULL,            -- 'STORY-3.AC-2'
+    ac_key TEXT NOT NULL,            -- 'STORY-003.AC-2'
     text TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     UNIQUE(story_id, ac_key)
@@ -1015,7 +1075,10 @@ def link_story_to_requirements(
     Idempotent on duplicate edges (composite PK). Returns the count
     of edges actually inserted (excludes pre-existing).
     """
-    keys = [k for k in req_keys if k]
+    # Canonicalise at the boundary — every id column in state.db now
+    # stores the zero-padded canonical form, so a caller that passes
+    # a raw ``FR-1`` folds to ``FR-001`` and matches the stored row.
+    keys = [_canon(k) for k in req_keys if k]
     if not keys:
         return 0
     placeholders = ",".join(["?"] * len(keys))
@@ -1067,7 +1130,7 @@ def create_acceptance_criteria(
     items: Iterable[dict[str, Any]],
 ) -> list[str]:
     """Insert AC rows for a story. Each item: ``ac_key`` (e.g.
-    ``"STORY-3.AC-2"``), ``text``, ``ordinal``. UPSERTs on
+    ``"STORY-003.AC-2"``), ``text``, ``ordinal``. UPSERTs on
     (story_id, ac_key) so re-decomposition rewrites the text without
     a UNIQUE violation; the row id is preserved across upserts so
     existing ``test_verifies_ac`` edges survive.
@@ -1077,6 +1140,9 @@ def create_acceptance_criteria(
         ac_key = (item.get("ac_key") or "").strip()
         if not ac_key:
             raise ValueError("acceptance_criterion requires 'ac_key'")
+        # Canonicalise so ``STORY-1.AC-1`` and ``STORY-001.AC-1`` land
+        # on the same row (2026-07-04 canonicalisation-boundary fix).
+        ac_key = _canon_ac(ac_key)
         text = item.get("text")
         if not text:
             raise ValueError(
@@ -1115,9 +1181,9 @@ def list_acceptance_criteria(
 def get_ac_by_key(
     conn: sqlite3.Connection, workspace: str, ac_key: str,
 ) -> Optional[dict[str, Any]]:
-    """Resolve an ``ac_key`` (e.g. ``STORY-3.AC-2``) to its full row.
+    """Resolve an ``ac_key`` (e.g. ``STORY-003.AC-2``) to its full row.
     Returns None if no AC matches. Used by the test-gen marker parser
-    to convert ``@verifies: STORY-3.AC-2`` strings into FK ids before
+    to convert ``@verifies: STORY-003.AC-2`` strings into FK ids before
     inserting link rows.
     """
     row = conn.execute(
@@ -1203,11 +1269,17 @@ def acs_without_verifying_test(
 # ---------------------------------------------------------------------------
 
 def _next_story_key(conn: sqlite3.Connection, workspace: str) -> str:
-    """Allocate the next ``STORY-N`` key within ``workspace``.
+    """Allocate the next ``STORY-NNN`` key within ``workspace``.
 
-    Keys are unique WITHIN a workspace; two workspaces can each have
-    a ``STORY-1`` simultaneously — that's why every join carries the
-    workspace filter.
+    Returns the zero-padded canonical form (``STORY-001``,
+    ``STORY-002``, ...) — matches :func:`_canon` /
+    :func:`harness.req_ids.canonicalize_req_key`. Every table in
+    ``state.db`` — stories, requirements, acceptance_criteria — now
+    stores keys in this single canonical form.
+
+    Keys are unique WITHIN a workspace; two workspaces can each hold
+    a ``STORY-001`` simultaneously — that's why every join carries
+    the workspace filter.
     """
     row = conn.execute(
         "SELECT story_key FROM stories WHERE workspace = ? "
@@ -1215,7 +1287,7 @@ def _next_story_key(conn: sqlite3.Connection, workspace: str) -> str:
         (workspace,),
     ).fetchone()
     if row is None:
-        return "STORY-1"
+        return _canon("STORY-1")
     last = row[0]
     try:
         n = int(last.rsplit("-", 1)[1])
@@ -1223,7 +1295,7 @@ def _next_story_key(conn: sqlite3.Connection, workspace: str) -> str:
         n = conn.execute(
             "SELECT COUNT(*) FROM stories WHERE workspace = ?", (workspace,),
         ).fetchone()[0]
-    return f"STORY-{n + 1}"
+    return _canon(f"STORY-{n + 1}")
 
 
 def create_stories(
@@ -1455,6 +1527,14 @@ def list_stories(
 def get_story(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> Optional[dict[str, Any]]:
+    # Fold at the read boundary so callers can pass either
+    # ``STORY-1`` (raw) or ``STORY-001`` (canonical) and hit the same
+    # row. Prior to 2026-07-04 the DB could hold either form
+    # depending on whether ``spec_reconciler_node`` had run; a
+    # get_story lookup with the "wrong" form silently returned None
+    # and the caller (link_story_to_requirements, batch_planner,
+    # etc.) then dropped the story from processing.
+    story_key = _canon(story_key)
     row = conn.execute(
         f"SELECT {_STORY_COLS} FROM {_STORY_FROM} "
         "WHERE s.workspace = ? AND s.story_key = ?",
@@ -1502,6 +1582,7 @@ def mark_in_progress(
     deterministically. Returns affected rowcount so callers can detect
     a vanished story_key (rowcount=0).
     """
+    story_key = _canon(story_key)
     cur = conn.execute(
         "UPDATE stories SET status = 'in_progress', started_at = ? "
         "WHERE workspace = ? AND story_key = ? "
@@ -1515,6 +1596,7 @@ def mark_in_progress(
 def mark_done(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> None:
+    story_key = _canon(story_key)
     conn.execute(
         "UPDATE stories SET status = 'done', completed_at = ? "
         "WHERE workspace = ? AND story_key = ?",
@@ -1532,6 +1614,7 @@ def mark_reopened(
 
     Returns affected rowcount (0 = vanished story or already non-DONE).
     """
+    story_key = _canon(story_key)
     cur = conn.execute(
         "UPDATE stories SET status = 'reopened', completed_at = NULL "
         "WHERE workspace = ? AND story_key = ? AND status = 'done'",
@@ -1544,6 +1627,7 @@ def mark_reopened(
 def mark_blocked(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> None:
+    story_key = _canon(story_key)
     conn.execute(
         "UPDATE stories SET status = 'blocked' "
         "WHERE workspace = ? AND story_key = ?",
@@ -1597,6 +1681,7 @@ def start_batch(
     if batch_id is None:
         raise RuntimeError("failed to allocate batch id")
     for seq, key in enumerate(story_keys, start=1):
+        key = _canon(key)
         story_row = conn.execute(
             "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
             (workspace, key),
@@ -1687,6 +1772,7 @@ def record_defect(
 ) -> int:
     story_id = None
     if story_key:
+        story_key = _canon(story_key)
         row = conn.execute(
             "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
             (workspace, story_key),
@@ -1717,6 +1803,7 @@ def record_defect(
 def resolve_defects_for_story(
     conn: sqlite3.Connection, workspace: str, story_key: str,
 ) -> int:
+    story_key = _canon(story_key)
     row = conn.execute(
         "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
         (workspace, story_key),
@@ -1747,6 +1834,7 @@ def record_test_run(
 ) -> None:
     story_id = None
     if story_key:
+        story_key = _canon(story_key)
         row = conn.execute(
             "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
             (workspace, story_key),
@@ -1781,6 +1869,7 @@ def link_file(
     A subsequent call with a different (non-None) ``batch_id`` updates
     the stamp; ``None`` is a no-op against the stored value.
     """
+    story_key = _canon(story_key)
     row = conn.execute(
         "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
         (workspace, story_key),
@@ -1844,6 +1933,7 @@ def record_commit(
 ) -> None:
     story_id = None
     if story_key:
+        story_key = _canon(story_key)
         row = conn.execute(
             "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
             (workspace, story_key),
@@ -2032,7 +2122,7 @@ def _render_arch_coverage(
       - the summary has neither endpoints nor components
 
     The story status carried into the table is the live DB status —
-    a row reading ``STORY-3 (in_progress)`` flags incomplete work
+    a row reading ``STORY-003 (in_progress)`` flags incomplete work
     against a resolved arch decision better than the per-story drill-
     down does on its own.
     """

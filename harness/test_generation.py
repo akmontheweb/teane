@@ -358,6 +358,136 @@ def _persist_verifies_links(
     return (inserted, dropped)
 
 
+# Directory names that never contain generated tests. Prevents the
+# sweep helper from walking node_modules / .venv / dist / etc. on
+# large workspaces.
+_SWEEP_IGNORED_DIRS = frozenset({
+    "__pycache__", "node_modules", ".git", ".venv", "venv",
+    ".pytest_cache", ".mypy_cache", "dist", "build",
+    ".tox", ".nox", ".next", "target",
+})
+
+# File extensions the sweep considers "test files". Mirrors what
+# test_generation_node actually writes for each supported stack.
+_SWEEP_TEST_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".jsx", ".java")
+
+
+def _looks_like_test_file(rel_path: str) -> bool:
+    """Filter to test files by conventional naming — matches Python
+    ``test_*.py`` / ``*_test.py``, JS/TS ``*.test.tsx`` / ``*.spec.ts``,
+    and Java ``*Test.java`` / ``*Tests.java``. Skips source files even
+    if they happen to carry a stray ``@verifies:`` comment."""
+    base = os.path.basename(rel_path)
+    stem, ext = os.path.splitext(base)
+    ext_l = ext.lower()
+    if ext_l not in _SWEEP_TEST_EXTENSIONS:
+        return False
+    if ext_l == ".py":
+        return stem.startswith("test_") or stem.endswith("_test")
+    if ext_l in (".ts", ".tsx", ".js", ".jsx"):
+        return (
+            ".test." in base.lower()
+            or ".spec." in base.lower()
+        )
+    if ext_l == ".java":
+        return stem.endswith("Test") or stem.endswith("Tests")
+    return False
+
+
+def sweep_verifies_links(workspace_path: str) -> tuple[int, int, int]:
+    """Walk the workspace, parse ``@verifies:`` markers from every test
+    file, and persist the corresponding ``test_verifies_ac`` edges.
+
+    Ciod session 523e86a7 sealed 5 batches with tests passing but the
+    audit reported ``test_verifies_ac`` was empty. Root cause:
+    ``_persist_verifies_links`` only fires inside ``test_generation_node``
+    when the sandbox run passes on THAT one invocation, but in practice
+    the LLM's tests fail the initial marker gate or fail their run, and
+    repair fixes them via ``compiler_node`` — which never routes back
+    to ``test_generation_node``. Markers land on disk but the link
+    table stays empty.
+
+    This helper is called from ``batch_commit_node`` (the natural point
+    where "this batch is verified done" is known) and rescans EVERY
+    test file the batch touched. Idempotent — reuses
+    ``story_state.link_test_to_ac``'s (test_path, ac_id) INSERT OR
+    IGNORE contract, so a marker whose link was already written by an
+    earlier batch's sweep is a silent no-op.
+
+    Returns ``(files_scanned, links_inserted, unknown_keys_dropped)``.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return (0, 0, 0)
+    try:
+        from harness import story_state
+        app_name = story_state.app_name_for_workspace(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[test_generation] verifies sweep skipped (workspace=%r): %s",
+            workspace_path, exc,
+        )
+        return (0, 0, 0)
+
+    marker_keys_by_file: dict[str, list[str]] = {}
+    files_scanned = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _SWEEP_IGNORED_DIRS]
+        for name in files:
+            abs_path = os.path.join(root, name)
+            rel = os.path.relpath(abs_path, workspace_path)
+            if not _looks_like_test_file(rel):
+                continue
+            files_scanned += 1
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except OSError:
+                continue
+            keys = _parse_verifies_marker(body)
+            if keys:
+                marker_keys_by_file[rel] = keys
+
+    if not marker_keys_by_file:
+        return (files_scanned, 0, 0)
+
+    try:
+        conn = story_state.open_story_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[test_generation] verifies sweep skipped (open_story_db "
+            "failed): %s", exc,
+        )
+        return (files_scanned, 0, 0)
+    inserted = 0
+    dropped = 0
+    try:
+        all_keys = sorted({
+            k for keys in marker_keys_by_file.values() for k in keys
+        })
+        ac_rows: dict[str, int] = {}
+        if all_keys:
+            placeholders = ",".join(["?"] * len(all_keys))
+            for row in conn.execute(
+                f"SELECT ac_key, id FROM acceptance_criteria "
+                f"WHERE workspace = ? AND ac_key IN ({placeholders})",
+                (app_name, *all_keys),
+            ):
+                ac_rows[row[0]] = int(row[1])
+        for test_path, keys in marker_keys_by_file.items():
+            for key in keys:
+                ac_id = ac_rows.get(key)
+                if ac_id is None:
+                    dropped += 1
+                    continue
+                if story_state.link_test_to_ac(
+                    conn, app_name, test_path, ac_id,
+                ):
+                    inserted += 1
+    finally:
+        conn.close()
+    return (files_scanned, inserted, dropped)
+
+
 def _parse_verifies_marker(body: str) -> list[str]:
     """Return the AC key list from the first ``@verifies:`` marker in
     ``body``'s first :data:`_VERIFIES_SCAN_LINES` lines.
@@ -384,10 +514,20 @@ def _parse_verifies_marker(body: str) -> list[str]:
         return []
     raw = match.group("keys") or ""
     candidates = [c.strip() for c in raw.split(",")]
+    # Fold every AC key to the DB storage form so the downstream
+    # lookup matches regardless of which form the LLM wrote
+    # (``STORY-1.AC-1`` vs. ``STORY-001.AC-1``). The story_state
+    # module holds keys in the raw form; ``_canon_ac`` strips leading
+    # zeros so both incoming shapes hit the same row (2026-07-04
+    # canonicalisation-boundary fix).
+    from harness.story_state import _canon_ac
     keys: list[str] = []
     for c in candidates:
-        if c and _AC_KEY_RE.match(c):
-            keys.append(c)
+        if not c:
+            continue
+        folded = _canon_ac(c)
+        if _AC_KEY_RE.match(folded):
+            keys.append(folded)
     return keys
 
 
@@ -434,10 +574,10 @@ _VERIFIES_RULE = """  5. EVERY generated test file MUST carry a `@verifies` mark
      of the file (after the module docstring / imports, within the first
      50 non-blank lines) naming the acceptance criteria the file's tests
      verify. Use the language-appropriate comment style:
-       - Python:    # @verifies: STORY-3.AC-2
-       - JS / TS:   // @verifies: STORY-3.AC-2
-       - Java:      // @verifies: STORY-3.AC-2
-     Comma-separate multiple ACs (e.g. `# @verifies: STORY-3.AC-1, STORY-3.AC-2`).
+       - Python:    # @verifies: STORY-003.AC-2
+       - JS / TS:   // @verifies: STORY-003.AC-2
+       - Java:      // @verifies: STORY-003.AC-2
+     Comma-separate multiple ACs (e.g. `# @verifies: STORY-003.AC-1, STORY-003.AC-2`).
      Use the AC keys exactly as they appear in the story preamble's
      "Acceptance criteria" block. A file with no marker — or a marker
      that uses an AC key absent from the preamble — is rejected and

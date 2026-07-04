@@ -1753,7 +1753,18 @@ async def run_trivy_scan(
         os.makedirs(cache_dir, exist_ok=True)
         stamp_path = os.path.join(cache_dir, ".db_refreshed_at")
         now = time.time()
-        if os.path.isfile(stamp_path):
+        # Trivy stores its vulnerability DB under ``<cache_dir>/db/``.
+        # The stamp check alone is not enough: ciod session 523e86a7
+        # hit ``FATAL --skip-db-update cannot be specified on the first
+        # run`` because the stamp file existed from an earlier session
+        # but the ``db/`` directory (or the trivy.db inside it) was
+        # missing — cleared by an operator, trimmed by disk-pressure
+        # eviction, or wiped by a trivy version upgrade that changed the
+        # DB schema path. Gate ``--skip-db-update`` on BOTH the stamp
+        # AND the actual presence of the DB file so a first-run trivy
+        # invocation always downloads without crashing.
+        trivy_db_present = os.path.isfile(os.path.join(cache_dir, "db", "trivy.db"))
+        if os.path.isfile(stamp_path) and trivy_db_present:
             try:
                 last = os.path.getmtime(stamp_path)
             except OSError:

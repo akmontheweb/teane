@@ -234,8 +234,8 @@ A good story:
   have a high-confidence guess.
 - Declares hard dependencies on prior stories in ``depends_on``.
   Independent stories run in parallel, so omit deps where genuinely
-  optional. Use the ``story_key`` strings you assign (STORY-1,
-  STORY-2, …).
+  optional. Use the ``story_key`` strings you assign (STORY-001,
+  STORY-002, …).
 - Carries a ``feature`` field whose value is one of the
   ``feature_key`` strings you defined in the ``features`` block.
 
@@ -263,7 +263,7 @@ no commentary:
   ],
   "stories": [
     {{
-      "story_key": "STORY-1",
+      "story_key": "STORY-001",
       "feature": "auth",
       "title": "User can register",
       "description": "1-2 sentence summary of intent.",

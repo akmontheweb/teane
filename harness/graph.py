@@ -5579,6 +5579,16 @@ async def _run_prod_import_smoke_check(
             "column": 0,
             "severity": "error",
             "semantic_context": "",
+            # Structured field so ``autofix._try_deps_not_installed``
+            # can batch-append each package to the manifest without
+            # having to parse the human-readable ``Missing: ...`` list
+            # back out of ``message``. Added 2026-07-04 after ciod
+            # session 523e86a7 spent 3+ hours on a Flask/Flask-CORS/
+            # Flask-Limiter DEPS_NOT_INSTALLED cascade that the LLM
+            # kept trying (and failing) to patch surgically. Kept
+            # backward-compat with the field-less legacy shape by
+            # having the autofix fall back to re-parsing the message.
+            "missing_packages": packages,
         })
         logger.warning(
             "[prod-smoke] %d third-party package(s) missing from build env: "

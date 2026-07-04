@@ -88,8 +88,8 @@ def _ingest_and_decompose(workspace: str, app: str) -> None:
     parsed, upserted = decomposition._ingest_requirements(workspace, app, SPEC)
     assert parsed == 4 and upserted == 4, "spec parser should pick up 4 IDs"
 
-    # Phase 1 + 2: features + stories. STORY-1 covers FR-001 + NFR-SEC-001;
-    # STORY-2 covers FR-002. FR-003 is intentionally untraced.
+    # Phase 1 + 2: features + stories. STORY-001 covers FR-001 + NFR-SEC-001;
+    # STORY-002 covers FR-002. FR-003 is intentionally untraced.
     conn = story_state.open_story_db()
     try:
         story_state.create_features(conn, app, [
@@ -113,8 +113,8 @@ def _ingest_and_decompose(workspace: str, app: str) -> None:
             },
         ])
         # Phase 2 link writer.
-        s1 = story_state.get_story(conn, app, "STORY-1")
-        s2 = story_state.get_story(conn, app, "STORY-2")
+        s1 = story_state.get_story(conn, app, "STORY-001")
+        s2 = story_state.get_story(conn, app, "STORY-002")
         story_state.link_story_to_requirements(
             conn, app, s1["id"], ["FR-001", "NFR-SEC-001"],
         )
@@ -123,7 +123,7 @@ def _ingest_and_decompose(workspace: str, app: str) -> None:
         )
 
         # Phase 3 link writer (simulates test-gen + sandbox pass).
-        # Cover STORY-1.AC-1 and STORY-2.AC-1; leave STORY-1.AC-2
+        # Cover STORY-001.AC-1 and STORY-002.AC-1; leave STORY-001.AC-2
         # uncovered so the audit surfaces an untested AC.
         s1_acs = story_state.list_acceptance_criteria(conn, app, s1["id"])
         s2_acs = story_state.list_acceptance_criteria(conn, app, s2["id"])
@@ -151,12 +151,12 @@ def test_e2e_audit_surfaces_both_gap_sets(workspace: str, app: str):
     assert report.req_coverage_pct == 75.0
     assert [u.req_id for u in report.untraced] == ["FR-003"]
 
-    # AC coverage: 2/3 (STORY-1.AC-1 + STORY-2.AC-1 verified;
-    # STORY-1.AC-2 uncovered).
+    # AC coverage: 2/3 (STORY-001.AC-1 + STORY-002.AC-1 verified;
+    # STORY-001.AC-2 uncovered).
     assert report.total_acs == 3
     assert report.verified_acs == 2
     assert [(u.story_key, u.ac_key) for u in report.untested_acs] == [
-        ("STORY-1", "STORY-1.AC-2"),
+        ("STORY-001", "STORY-001.AC-2"),
     ]
 
 
@@ -172,7 +172,7 @@ def test_e2e_format_report_renders_both_sections(workspace: str, app: str):
 
     # Untested ACs section.
     assert "Untested acceptance criteria (1)" in rendered
-    assert "STORY-1.AC-2" in rendered
+    assert "STORY-001.AC-2" in rendered
 
     # Coverage stats line.
     assert "3/4" in rendered  # req coverage
@@ -200,12 +200,12 @@ def test_e2e_traceability_md_emits_both_v5_tables(workspace: str, app: str):
     assert "`FR-001`" in md
     assert "`FR-003`" in md
     assert "— (gap)" in md  # FR-003 has no story
-    assert "STORY-1" in md  # FR-001 covered by STORY-1
+    assert "STORY-001" in md  # FR-001 covered by STORY-001
 
-    # AC table: STORY-1.AC-2 marked as gap; the others list their test path.
-    assert "`STORY-1.AC-1`" in md
-    assert "`STORY-1.AC-2`" in md
-    assert "`STORY-2.AC-1`" in md
+    # AC table: STORY-001.AC-2 marked as gap; the others list their test path.
+    assert "`STORY-001.AC-1`" in md
+    assert "`STORY-001.AC-2`" in md
+    assert "`STORY-002.AC-1`" in md
     assert "`tests/test_login_success.py`" in md
     assert "`tests/test_logout.py`" in md
 

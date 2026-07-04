@@ -84,8 +84,8 @@ def test_gather_context_populates_agile_stories(tmp_path: Path) -> None:
     assert ctx.flow_kind == FLOW_AGILE
     assert len(ctx.stories) == 1
     story = ctx.stories[0]
-    assert story["story_key"] == "STORY-1"
-    assert "STORY-1.AC-1" in story["acceptance_criteria_keys"]
+    assert story["story_key"] == "STORY-001"
+    assert "STORY-001.AC-1" in story["acceptance_criteria_keys"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ def test_fallback_seed_marks_meta_row() -> None:
     ctx = SchemaContext(
         workspace_path="/x", flow_kind=FLOW_AGILE,
         spec_excerpts={"docs/SPEC_REQUIREMENTS.md": "hi"},
-        stories=[{"story_key": "STORY-1"}],
+        stories=[{"story_key": "STORY-001"}],
     )
     seed = fallback_seed(ctx)
     meta = seed["tables"]["_teane_test_meta"][0]
@@ -204,7 +204,7 @@ def test_apply_seed_to_sqlite_inserts_rows(tmp_path: Path) -> None:
     seed = {"tables": {
         "users": [
             {"id": "1", "email": "alice@test"},
-            {"id": "2", "email": "bob@test", "_verifies": "STORY-1.AC-1"},
+            {"id": "2", "email": "bob@test", "_verifies": "STORY-001.AC-1"},
         ],
     }}
     count = apply_seed_to_sqlite(db_path, seed)
@@ -271,25 +271,25 @@ def _seed_one_story(workspace: Path) -> None:
     try:
         app = story_state.app_name_for_workspace(str(workspace))
         story_state.create_features(
-            conn, app, [{"feature_key": "FEAT-1", "name": "auth", "description": "auth flow"}],
+            conn, app, [{"feature_key": "FEAT-001", "name": "auth", "description": "auth flow"}],
         )
-        feature_id = story_state.get_feature_by_key(conn, app, "FEAT-1")["id"]
+        feature_id = story_state.get_feature_by_key(conn, app, "FEAT-001")["id"]
         now = "2026-06-30T00:00:00+00:00"
         conn.execute(
             "INSERT INTO stories(workspace, story_key, feature_id, title, "
             "description, depends_on, scope_files, status, external_ref, "
             "build_kind, cr_ids, created_at) "
-            "VALUES(?, 'STORY-1', ?, 'login', 'log in', '[]', '[]', "
+            "VALUES(?, 'STORY-001', ?, 'login', 'log in', '[]', '[]', "
             "'planned', NULL, 'greenfield', '[]', ?)",
             (app, feature_id, now),
         )
         story_id = conn.execute(
-            "SELECT id FROM stories WHERE workspace=? AND story_key='STORY-1'",
+            "SELECT id FROM stories WHERE workspace=? AND story_key='STORY-001'",
             (app,),
         ).fetchone()[0]
         story_state.create_acceptance_criteria(
             conn, app, int(story_id),
-            [{"ac_key": "STORY-1.AC-1", "text": "user submits valid creds", "ordinal": 1}],
+            [{"ac_key": "STORY-001.AC-1", "text": "user submits valid creds", "ordinal": 1}],
         )
         conn.commit()
     finally:

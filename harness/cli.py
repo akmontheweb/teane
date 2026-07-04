@@ -3305,12 +3305,32 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         # — proceed when possible). Skips the prompt entirely.
         auto_resumed_this_round = False
         if not _hitl_gate_enabled("repair") or _gatekeeper_auto_approves():
-            choice = "r"
-            auto_resumed_this_round = True
-            logger.info(
-                "[HITL] Repair menu auto-resumed "
-                "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
-            )
+            # 2026-07-04 fix — budget_exhausted trigger MUST NOT auto-
+            # resume. The auto-resume path resets HITL trip counters
+            # but leaves ``budget_remaining_usd`` at 0, so the next
+            # dispatch immediately re-trips budget_exhausted and the
+            # loop grinds until manual kill. Terminate cleanly instead:
+            # choose ``q`` (abandon) so the graph exits with the
+            # budget-terminated marker set on state, and cmd_build
+            # returns the ``budget_exhausted`` exit code (3).
+            if trigger == "budget_exhausted":
+                choice = "q"
+                auto_resumed_this_round = False
+                logger.warning(
+                    "[HITL] budget_exhausted in headless mode — "
+                    "terminating instead of auto-resuming (spending "
+                    "more requires an operator to raise "
+                    "token_budget.hard_cap_usd or press [b])."
+                )
+                node_state["budget_terminated"] = True
+                state["node_state"] = node_state
+            else:
+                choice = "r"
+                auto_resumed_this_round = True
+                logger.info(
+                    "[HITL] Repair menu auto-resumed "
+                    "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
+                )
         else:
             # Structured envelope for remote UIs (the dashboard's HITL
             # panel). The console path prints these above the prompt; the
@@ -6263,7 +6283,80 @@ async def cmd_run(args: argparse.Namespace) -> int:
         },
     )
 
-    return 0 if exit_code == 0 else 1
+    return _resolve_cli_exit_code(
+        graph_exit_code=exit_code,
+        final_state=final_state,
+    )
+
+
+# Deterministic CLI exit codes — reserved for automation / CI
+# consumers. Prior to 2026-07-04 the CLI returned 0 or 1
+# indiscriminately, which meant a ``teane build && teane deploy``
+# script would happily deploy a run that finished with 15/26
+# traceability coverage. These constants let a caller distinguish
+# "everything clean" from every failure mode that surfaced during v10/
+# v11/v12 investigation.
+EXIT_CLEAN = 0
+"""All requested work completed, all guards clean."""
+EXIT_PARTIAL_SUCCESS = 1
+"""Some batches sealed, but one or more guards fired (traceability
+gap, HITL suspend/abandon, security warnings). Deploy-blocking."""
+EXIT_CONFIG_ERROR = 2
+"""Config or spec drift blocked the run before it could start.
+Same as argparse conventions and the current preflight validators."""
+EXIT_BUDGET_EXHAUSTED = 3
+"""``token_budget.hard_cap_usd`` reached before all stories shipped.
+Set on the ``budget_terminated`` node_state flag by the HITL
+budget-exhausted auto-terminate path."""
+EXIT_INFRASTRUCTURE_FAILURE = 4
+"""Sandbox / gateway / provider outage prevented the run from
+progressing. Distinguish from PARTIAL_SUCCESS so CI can retry
+these vs. surface a spec/code problem to the operator."""
+
+
+def _resolve_cli_exit_code(
+    *, graph_exit_code: int, final_state: dict[str, Any],
+) -> int:
+    """Map the graph's final state to one of the reserved CLI exit
+    codes. Runs at the very end of ``cmd_run``; consumes only
+    read-only state so it can be called from resume / patch flows too.
+
+    Precedence (most specific first):
+        * ``budget_terminated`` on node_state → EXIT_BUDGET_EXHAUSTED
+        * ``env_misconfig`` / ``build_command_cd_missing`` /
+          ``llm_silent`` / connectivity flags → EXIT_INFRASTRUCTURE_FAILURE
+        * ``traceability_blocked`` on node_state → EXIT_PARTIAL_SUCCESS
+        * ``hitl_abandon`` or ``hitl_suspend`` on node_state →
+          EXIT_PARTIAL_SUCCESS
+        * graph exit_code != 0 → EXIT_PARTIAL_SUCCESS
+        * else → EXIT_CLEAN
+
+    Callers use these codes to distinguish "green build ready to
+    deploy" from "shipped-with-warnings" from
+    "infrastructure-please-retry".
+    """
+    node_state = (final_state.get("node_state") or {}) if isinstance(
+        final_state, dict,
+    ) else {}
+    if node_state.get("budget_terminated"):
+        return EXIT_BUDGET_EXHAUSTED
+    # Infrastructure signals — the harness can't proceed until
+    # someone outside fixes an environmental condition.
+    infra_flags = (
+        "env_misconfig",
+        "build_command_blocked",
+        "build_command_cd_missing",
+        "llm_silent",
+    )
+    if any(node_state.get(f) for f in infra_flags):
+        return EXIT_INFRASTRUCTURE_FAILURE
+    if node_state.get("traceability_blocked"):
+        return EXIT_PARTIAL_SUCCESS
+    if node_state.get("hitl_abandon") or node_state.get("hitl_suspend"):
+        return EXIT_PARTIAL_SUCCESS
+    if int(graph_exit_code or 0) != 0:
+        return EXIT_PARTIAL_SUCCESS
+    return EXIT_CLEAN
 
 
 def _resolve_agile_args(args: argparse.Namespace, *, config: dict[str, Any], workspace_path: str, flow: str) -> None:
@@ -6813,7 +6906,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         exit_code=exit_code,
         config=config,
     )
-    return 0 if exit_code == 0 else 1
+    return _resolve_cli_exit_code(
+        graph_exit_code=exit_code,
+        final_state=final_state,
+    )
 
 
 async def cmd_status(args: argparse.Namespace) -> int:

@@ -4247,6 +4247,34 @@ def _build_command_needs_network(build_command: str) -> bool:
     ))
 
 
+def _build_command_writes_root_fs(build_command: str) -> bool:
+    """True when the build command installs into a location that lives on
+    the container's read-only root filesystem — currently just
+    ``npm install -g`` (and its aliases), which writes to
+    ``/usr/local/lib/node_modules``.
+
+    Pip / poetry / uv are intentionally excluded: the sandbox sets
+    ``PIP_USER=1`` and redirects ``HOME`` to ``/tmp/builder-home`` (a
+    writable tmpfs) when the container runs as the host user (see
+    :meth:`DockerBackend._default_user_mode_env`), so pip lands under
+    ``$HOME/.local`` regardless of whether the root FS is read-only.
+    Non-host-user runs mount ``/root`` as tmpfs for the same reason
+    (see :meth:`DockerBackend._build_docker_command`).
+
+    ``make`` is also excluded even though ``_build_command_needs_network``
+    treats it as install-needing for the network side. The LLM-authored
+    Makefile skill (``harness/skills/makefile_python.md``) is Python-
+    focused, so its recipe conventionally invokes pip — which lands in
+    the tmpfs HOME anyway. An operator whose Makefile does
+    ``npm install -g`` should pin ``sandbox.read_only_root=False`` in
+    their workspace config.
+    """
+    cmd = re.sub(r"\s+", " ", build_command.strip().lower())
+    return any(token in cmd for token in (
+        "npm install -g", "npm install --global", "npm i -g",
+    ))
+
+
 # Patterns that mean the build container is missing a required runtime
 # (interpreter, test framework, package manager) — NOT a code bug. When
 # one of these fires we route to HITL immediately instead of burning the
@@ -4272,6 +4300,21 @@ _PYTHON_MODULE_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Python: "ModuleNotFoundError: No module named 'pytest'"
     # Same dotted-name exclusion as above.
     re.compile(r"ModuleNotFoundError: No module named ['\"](?P<sym>[^'\".]+)['\"]"),
+    # Fix H — RuntimeError "requires the X package" family. Libraries
+    # with optional runtime deps (starlette.testclient → httpx2 since the
+    # 2026 pivot, Pillow → PIL plugins, some SQLAlchemy dialects) raise a
+    # ``RuntimeError`` that isn't a ``ModuleNotFoundError`` but semantically
+    # is one — the fix is still "add the package to requirements". Without
+    # this classifier the diagnostic is left as a bare ``RuntimeError``, the
+    # extractor's top-3 slot goes to a downstream symptom (route 404,
+    # ImportError from a stub module), and the repair LLM burns iterations
+    # patching the symptom. Session fe51a89a-* burned 8 rounds on
+    # ``backend/api/filings.py`` REPLACE_BLOCK misses because httpx2 never
+    # got classified as MISSING_DEP.
+    re.compile(
+        r"RuntimeError:\s+The\s+[\w.]+\s+module\s+requires\s+the\s+"
+        r"(?P<sym>[\w\-]+)\s+package\s+to\s+be\s+installed",
+    ),
 )
 
 _SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -7080,6 +7123,19 @@ def _build_repair_reflection_prompt(
         and not str(d.get("file", "")).strip().startswith("<")
         for d in top_persisted_diagnostics
     )
+
+    # Fix G — test-assertion mode. Pytest ``AssertionError`` failures report
+    # only the test's assert line in ``compiler_errors``, but the fix almost
+    # always lives in the implementation the test exercises. Without the
+    # judge naming an explicit impl path, downstream seeding
+    # (``_verdict_named_files``) can only surface the test file as the
+    # "MUST MODIFY" target — which trained the repair LLM to patch the test
+    # (session 52c16e16-*: 3 non-progress rounds all editing the test file).
+    # The hint below asks the judge to include an ``impl_file`` field naming
+    # the implementation being tested (inferred from the test's imports).
+    # The downstream seeder swaps the compiler-errors-derived test file for
+    # that impl path so the "MUST MODIFY" line points where the fix belongs.
+    _is_test_assertion = _top_error_is_test_assertion(top_persisted_diagnostics)
     if _has_anchor_location:
         _generic_fallback_rule = (
             "  - If the top-error messages are too generic to localize "
@@ -7172,6 +7228,38 @@ def _build_repair_reflection_prompt(
             "make these errors go away.\n\n"
         ) if install_failure_likely else ""
 
+    # Fix G — test-assertion hint. Fires only when the top persisted error
+    # is a pytest assertion failure whose location is inside a test file.
+    # Zero effect on compile/import errors — those never trigger it. Asks
+    # the judge to add an optional ``impl_file`` naming the implementation
+    # module the test exercises, which the downstream seeder promotes to
+    # the "MUST MODIFY" list so the repair LLM stops rewriting the test
+    # and touches the impl instead.
+    if _is_test_assertion:
+        test_assertion_hint_block = (
+            "\nTEST-ASSERTION HINT — read before answering:\n"
+            "  The top persistent diagnostic is a pytest assertion failure "
+            "inside a test file. The file:line above is the assertion "
+            "site — the ANCHOR, not the fix location. In almost all cases "
+            "the fix belongs in the implementation module the test "
+            "exercises (a service, model, or utility that the test "
+            "imports), NOT in the test itself.\n"
+            "  You MUST identify that implementation module and return "
+            "its workspace-relative path in an additional JSON field "
+            "``impl_file`` (e.g. ``\"impl_file\": "
+            "\"backend/services/edgar.py\"``). Infer it from the failing "
+            "test's imports — they are typically shown at the top of the "
+            "traceback in the BUILD OUTPUT TAIL, or you can name the "
+            "obvious import based on the test's name and message. If — "
+            "and only if — you are confident the test itself is wrong "
+            "(bad expectation, typo, off-by-one in fixture data), omit "
+            "``impl_file`` and say so explicitly in ``recommendation``. "
+            "When in doubt, prefer naming an impl file — the harness "
+            "will drop the field silently if the path doesn't exist.\n\n"
+        )
+    else:
+        test_assertion_hint_block = ""
+
     return (
         "You are auditing the previous repair iteration's outcome to "
         "tell the harness whether to keep going on the same track or "
@@ -7187,6 +7275,7 @@ def _build_repair_reflection_prompt(
         f"{tail_block}"
         f"{path_wiring_hint_block}"
         f"{install_hint_block}"
+        f"{test_assertion_hint_block}"
         "Answer ONE structured question: did the previous round make "
         "PROGRESS on the highest-priority error, or did it spend the "
         "iteration on a distraction? Use these definitions:\n"
@@ -7228,7 +7317,15 @@ def _build_repair_reflection_prompt(
         '"recommendation": "<one short imperative sentence for the next '
         'repair LLM, e.g. \\"Edit src/services/AuthService.ts lines '
         '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
-        'instead of passing options as the second arg.\\""}\n'
+        'instead of passing options as the second arg.\\""'
+        + (
+            ', "impl_file": "<workspace-relative path to the '
+            'implementation module the failing test exercises, e.g. '
+            'backend/services/edgar.py — REQUIRED per the TEST-ASSERTION '
+            'HINT above unless the test itself is genuinely wrong>"'
+            if _is_test_assertion else ""
+        )
+        + "}\n"
     )
 
 
@@ -7344,6 +7441,50 @@ def _reflection_grounds_in_diagnostics(
     return False
 
 
+_TEST_FILENAME_RE = re.compile(r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$")
+
+
+def _top_error_is_test_assertion(
+    top_persisted_diagnostics: list[dict[str, Any]],
+) -> bool:
+    """True when the top persistent diagnostic looks like a pytest
+    assertion failure — an ``AssertionError`` (or ``assert`` message)
+    whose location points at a test file.
+
+    Distinct from compile / import errors where the diagnostic file is
+    also the fix target. For assertions the file is only the *anchor*;
+    the fix usually lives in the impl the test exercises. Callers use
+    this to switch the reflection prompt / seeder into the test-
+    assertion path — see the ``impl_file`` field on the verdict.
+
+    Guarded to the *top* diagnostic only: a mixed set (assertion +
+    compile error) is treated as compile-class because those errors
+    take priority anyway.
+    """
+    if not top_persisted_diagnostics:
+        return False
+    top = top_persisted_diagnostics[0]
+    file_ = str(top.get("file", "") or "").strip()
+    if not file_ or file_.startswith("<"):
+        return False
+    is_test_file = (
+        _is_test_path(file_)
+        or bool(_TEST_FILENAME_RE.search(file_.replace(os.sep, "/")))
+    )
+    if not is_test_file:
+        return False
+    code = str(top.get("error_code", "") or "").strip().lower()
+    msg = str(top.get("message", "") or "").strip().lower()
+    assertion_signals = (
+        code == "assertionerror"
+        or code.startswith("assert")
+        or msg.startswith("assertionerror")
+        or msg.startswith("assert ")
+        or "assert " in msg[:200]
+    )
+    return assertion_signals
+
+
 def _verdict_named_files(
     verdict: dict[str, str],
     compiler_errors: list[dict[str, Any]],
@@ -7388,6 +7529,65 @@ def _verdict_named_files(
             matched.append(f)
             seen.add(f)
     return matched
+
+
+def _effective_judge_named_files(
+    verdict: dict[str, str],
+    compiler_errors: list[dict[str, Any]],
+    top_persisted_diagnostics: list[dict[str, Any]],
+    workspace_path: str,
+) -> tuple[list[str], Optional[str]]:
+    """Return ``(files, impl_file_promoted)`` — the effective "MUST MODIFY"
+    list to use in the JUDGE'S VERDICT banner AND in the judge-ignored gate.
+
+    On non-test-assertion rounds returns the standard
+    ``_verdict_named_files`` output unchanged and ``impl_file_promoted=None``.
+
+    Fix G — when the top persistent diagnostic is a pytest assertion failure
+    inside a test file AND the verdict carries an ``impl_file`` field that
+    exists on disk under ``workspace_path``, REPLACE the compiler-errors-
+    derived list with ``[impl_file]``. Rationale: for assertion failures the
+    only file in ``compiler_errors`` is the test (where the assert lives),
+    so the strict-grounding seeder can only name the test as the fix target.
+    That trained the repair LLM to rewrite the test until the assertion
+    passed instead of fixing the impl — session 52c16e16-* cycled 3 rounds
+    on ``tests/unit/backend/test_edgar.py:49`` doing exactly that. The judge
+    now names the actual impl (``backend/services/edgar.py``); we surface
+    that as the sole "MUST MODIFY" target so the banner directive and the
+    downstream ignored-gate check agree on where the fix belongs.
+
+    Both call sites (banner seeding and judge-ignored gate) MUST route
+    through this helper so the two stay consistent — otherwise the banner
+    says "MUST MODIFY impl" while the gate checks "did LLM patch test?".
+
+    ``impl_file_promoted`` is the impl_file path when the swap fired, so
+    the caller can emit a ``repair_impl_file_promoted`` event. ``None`` in
+    all other cases.
+    """
+    base_files = _verdict_named_files(verdict, compiler_errors)
+    if not _top_error_is_test_assertion(top_persisted_diagnostics):
+        return base_files, None
+    impl_file = str(verdict.get("impl_file", "") or "").strip()
+    if not impl_file:
+        return base_files, None
+    if not workspace_path:
+        return base_files, None
+    # Normalise + workspace-relative check. Reject absolute paths,
+    # traversal, and non-existent files — the LLM occasionally
+    # hallucinates plausible-looking paths.
+    if os.path.isabs(impl_file) or ".." in impl_file.split("/"):
+        return base_files, None
+    abs_path = os.path.join(workspace_path, impl_file)
+    if not os.path.isfile(abs_path):
+        return base_files, None
+    # Guard: refuse to promote a test path as the impl target (the judge
+    # would only do this by mistake, but we should never end up back
+    # where we started).
+    if _is_test_path(impl_file) or _TEST_FILENAME_RE.search(
+        impl_file.replace(os.sep, "/")
+    ):
+        return base_files, None
+    return [impl_file], impl_file
 
 
 def _verdict_named_file_lines(
@@ -8174,11 +8374,27 @@ def _parse_repair_reflection_verdict(
             real_blocker[:200],
         )
         real_blocker = "insufficient data — no diagnostic locations available"
-    return {
+    # Fix G — optional ``impl_file`` field, populated by the judge when
+    # the TEST-ASSERTION HINT fires. Absent on all non-test-assertion
+    # rounds. We do minimal sanitisation here (strip, reject placeholders
+    # and non-string) — the on-disk existence check happens in the
+    # seeder so we can drop hallucinated paths without penalising the
+    # rest of the verdict.
+    impl_file_raw = parsed.get("impl_file", "")
+    if isinstance(impl_file_raw, str):
+        impl_file = impl_file_raw.strip()
+        if impl_file and any(m in impl_file for m in _placeholder_markers):
+            impl_file = ""
+    else:
+        impl_file = ""
+    result = {
         "verdict": verdict,
         "real_blocker": real_blocker,
         "recommendation": recommendation,
     }
+    if impl_file:
+        result["impl_file"] = impl_file
+    return result
 
 
 def _workspace_has_source_files(workspace_path: str) -> bool:
@@ -8225,7 +8441,7 @@ _PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
     # The autofix is conservative — it only writes a `pkg` line into
     # the manifest; the repair LLM can still pin/adjust versions later.
     # Async / HTTP stack
-    "aiofiles", "aiohttp", "httpx", "httpcore", "anyio", "trio",
+    "aiofiles", "aiohttp", "httpx", "httpx2", "httpcore", "anyio", "trio",
     "uvicorn", "starlette", "fastapi", "asyncpg", "aiosqlite",
     "aioredis", "aiomysql",
     # DB / cache
@@ -8249,6 +8465,24 @@ _PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
     # Test doubles / mocks
     "pytest-mock", "pytest-cov", "freezegun", "responses",
     "aioresponses", "moto",
+    # Fix I — CLI tools that show up as ``command not found`` shell misses.
+    # Every entry here is a pip-installable console_script whose absence
+    # is fixable by adding the distribution to requirements.txt, NOT by
+    # an operator base-image swap. Adding these lets the autofix path
+    # resolve them in one compile cycle instead of short-circuiting to
+    # HITL on shell-kind misses.
+    "alembic", "celery", "uvicorn", "gunicorn", "hypercorn",
+    "django-admin", "flask", "pip-compile", "pip-tools",
+    "sqlfluff", "pre-commit", "mkdocs",
+    # Fix J — additional shell-invoked CLIs (django-management, ASGI
+    # servers, task-queue workers, HTTP client, notebooks). Each has a
+    # console_script entrypoint that runs from within CI as
+    # ``<name> <args>``; a missing ``<name>: command not found`` would
+    # otherwise short-circuit to HITL because the operator whitelist
+    # gate rejects it, even though `pip install` fixes it in seconds.
+    "django", "daphne", "granian",
+    "dramatiq", "arq", "taskiq",
+    "httpie", "jupyter",
 })
 
 
@@ -8617,13 +8851,15 @@ def _apply_toolchain_adaptation(
                 build_command,
             )
 
-    # Install commands (pip install -e ., npm install -g)
-    # write to system locations the --read-only root FS makes unreachable.
-    # Pip's `--user` fallback also fails because /root sits on the RO root.
-    # Auto-flip read_only_root → False so the install can land, unless the
-    # user has explicitly set it to True (respect explicit opt-in to hard
-    # isolation even if it breaks the build — they'll need a baked image).
-    if needs_install and "read_only_root" not in cfg:
+    # Only ``npm install -g`` writes to a location on the read-only root
+    # FS (``/usr/local/lib/node_modules``) that our other sandbox
+    # protections don't already cover. pip / poetry / uv / local
+    # ``npm install`` all land under the tmpfs-backed HOME (see
+    # :func:`_build_command_writes_root_fs` for the full rationale). We
+    # keep the auto-flip narrow so operators who want hard root-FS
+    # isolation for their Python builds actually get it, instead of
+    # having the harness silently relax it on every pip install.
+    if _build_command_writes_root_fs(build_command) and "read_only_root" not in cfg:
         cfg["read_only_root"] = False
         ro_root_was_adapted = True
 
@@ -8886,8 +9122,8 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     if ro_root_was_adapted:
         logger.info(
             "[compiler_node] Adapting sandbox.read_only_root from True to False "
-            "because build command installs packages (pip/npm) into "
-            "system locations the read-only root FS would block: %s",
+            "because build command runs `npm install -g`, which writes to "
+            "/usr/local/lib/node_modules on the container's root FS: %s",
             build_cmd,
         )
 
@@ -10805,9 +11041,35 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 or _persistence_bypass_grounds
             )
         ):
-            judge_named_files = _verdict_named_files(
-                reflection_verdict, state.get("compiler_errors", []) or []
+            _compiler_errors_for_seed = state.get("compiler_errors", []) or []
+            judge_named_files, _impl_promoted = _effective_judge_named_files(
+                reflection_verdict,
+                _compiler_errors_for_seed,
+                _compiler_errors_for_seed[:3],
+                _workspace_for_persist_check,
             )
+            if _impl_promoted:
+                logger.info(
+                    "[repair_node] Fix G — test-assertion mode: promoted "
+                    "judge's impl_file %r as the MUST-MODIFY target "
+                    "(compiler_errors named only the test anchor).",
+                    _impl_promoted,
+                )
+                try:
+                    from harness.observability import emit_event as _emit_ip
+                    _emit_ip(
+                        "repair_impl_file_promoted",
+                        iteration=loop_counter.get("total_repairs", 0),
+                        impl_file=_impl_promoted,
+                        anchor_files=[
+                            str(e.get("file", "") or "")
+                            for e in _compiler_errors_for_seed[:3]
+                            if str(e.get("file", "") or "").strip()
+                        ],
+                        source="banner_seed",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             ignored_last_round = bool(
                 loop_counter.get("judge_ignored_last_round")
             )
@@ -11663,8 +11925,12 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
             and not _reflection_verdict_is_low_signal(reflection_verdict)
         ):
-            _judge_named_now = _verdict_named_files(
-                reflection_verdict, state.get("compiler_errors", []) or []
+            _compiler_errors_for_gate = state.get("compiler_errors", []) or []
+            _judge_named_now, _ = _effective_judge_named_files(
+                reflection_verdict,
+                _compiler_errors_for_gate,
+                _compiler_errors_for_gate[:3],
+                str(state.get("workspace_path", "") or ""),
             )
             if _judge_named_now:
                 _touched_judge_files = _patches_touched_judge_files(
@@ -18386,7 +18652,9 @@ async def run_graph(
     if ro_root_was_adapted:
         logger.info(
             "[run_graph] Pre-flight sandbox.read_only_root=False because build "
-            "command installs packages into system locations: %s", build_command,
+            "command runs `npm install -g`, which writes to "
+            "/usr/local/lib/node_modules on the container's root FS: %s",
+            build_command,
         )
     if sandbox_config is not None or image_was_adapted or ro_root_was_adapted:
         initial_state["sandbox_config"] = adapted_cfg

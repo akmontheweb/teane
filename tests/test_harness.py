@@ -4556,10 +4556,12 @@ class TestToolchainAdaptation:
         )
         assert net_adapted
         assert allow_net is True
-        # Install command must also flip read_only_root → False, otherwise
-        # pip install fails with [Errno 30] on /root/.local.
-        assert ro_adapted
-        assert cfg["read_only_root"] is False
+        # Pip installs land under $HOME/.local (tmpfs-backed HOME +
+        # PIP_USER=1 in the sandbox env), so read_only_root=True is
+        # compatible. The auto-flip is reserved for `npm install -g`,
+        # which writes to /usr/local/lib/node_modules on the RO root FS.
+        assert not ro_adapted
+        assert "read_only_root" not in cfg
 
     def test_auto_network_off_refuses_to_flip(self):
         # P1.3 regression: when the opt-in is absent (the default), the
@@ -4586,12 +4588,14 @@ class TestToolchainAdaptation:
 
     def test_respects_explicit_read_only_root_setting(self):
         # If the user explicitly pinned read_only_root, don't override it
-        # even when the build command installs packages — they're opting
-        # into hard isolation knowing the build will need a baked image.
+        # even when the build command would otherwise trigger the flip —
+        # they're opting into hard isolation knowing the build will need
+        # a baked image. Use `npm install -g` so the auto-flip precondition
+        # is actually satisfied and the pin is what blocks it.
         from harness.graph import _apply_toolchain_adaptation
         cfg, _, _, _, ro_adapted = _apply_toolchain_adaptation(
-            "pip install -r requirements.txt && pytest",
-            {"docker_image": "python:3.12-slim", "read_only_root": True},
+            "npm install -g pnpm && pnpm test",
+            {"docker_image": "node:20-slim", "read_only_root": True},
             True,
         )
         assert not ro_adapted
@@ -4600,18 +4604,20 @@ class TestToolchainAdaptation:
     def test_ro_root_adaptation_is_idempotent(self):
         # Once read_only_root has been flipped to False, calling again is
         # a no-op — the key exists in cfg so the auto-flip doesn't refire.
+        # `npm install -g` is the sole trigger for the flip (writes to
+        # /usr/local/lib/node_modules on the RO root FS).
         from harness.graph import _apply_toolchain_adaptation
         cfg1, _, _, _, ro1 = _apply_toolchain_adaptation(
-            "pip install -e . && pytest",
+            "npm install -g pnpm && pnpm test",
             {
-                "docker_image": "python:3.12-slim",
+                "docker_image": "node:20-slim",
                 "auto_enable_network_for_install": True,
             },
             False,
         )
         assert ro1
         cfg2, _, _, _, ro2 = _apply_toolchain_adaptation(
-            "pip install -e . && pytest", cfg1, True,
+            "npm install -g pnpm && pnpm test", cfg1, True,
         )
         assert not ro2, "second call should not re-flag ro_root adaptation"
         assert cfg2["read_only_root"] is False
@@ -4732,12 +4738,14 @@ class TestToolchainAdaptation:
 
     def test_apply_toolchain_adaptation_make_network_readonly_compose(self):
         """Single call with `make build`: network flips on (via the make
-        bypass) and read_only_root flips to False (the install-branch at
-        the bottom of `_apply_toolchain_adaptation` covers `make` because
-        `needs_install` returns True). Both flips must compose without one
-        stepping on the other. (The image half is no longer swapped — the
-        kitchen-sink BUILDER_IMAGE has make + every other toolchain baked
-        in, picked up from DockerBackend's default.)
+        bypass) but read_only_root does NOT flip — the Makefile skill
+        (`harness/skills/makefile_python.md`) is Python-focused, so the
+        recipe conventionally invokes pip, which lands in the tmpfs HOME
+        regardless of RO root. Only `npm install -g` at the outer command
+        level triggers the RO-root flip; a Makefile that internally does
+        `npm install -g` should hard-pin `read_only_root=False` in
+        workspace config. (The image half stays no-op — the kitchen-sink
+        BUILDER_IMAGE is picked from DockerBackend's default.)
         """
         from harness.graph import _apply_toolchain_adaptation
         cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
@@ -4750,8 +4758,8 @@ class TestToolchainAdaptation:
         assert not img_adapted  # one-image-fits-all: no per-command swap
         assert net_adapted
         assert allow_net is True
-        assert ro_adapted
-        assert cfg["read_only_root"] is False
+        assert not ro_adapted
+        assert "read_only_root" not in cfg
 
     def test_apply_toolchain_adaptation_cmake_not_bypassed(self):
         """Substring-trap regression: `cmake build` must NOT trigger the
@@ -4770,6 +4778,47 @@ class TestToolchainAdaptation:
         )
         assert not net_adapted
         assert allow_net is False
+
+    def test_writes_root_fs_recognises_npm_global(self):
+        """The narrow root-FS predicate: only ``npm install -g`` and its
+        aliases return True. Pip / poetry / uv / local `npm install` land
+        under the tmpfs-backed HOME and do not need the RO-root flip.
+        """
+        from harness.graph import _build_command_writes_root_fs
+        # True: every documented spelling of npm-global
+        assert _build_command_writes_root_fs("npm install -g pnpm")
+        assert _build_command_writes_root_fs("npm install --global pnpm")
+        assert _build_command_writes_root_fs("npm i -g typescript")
+        assert _build_command_writes_root_fs("NPM INSTALL -G FOO")
+        assert _build_command_writes_root_fs("  npm install -g  pnpm ")
+        # False: pip / poetry / uv all land under $HOME/.local
+        assert not _build_command_writes_root_fs("pip install -r requirements.txt")
+        assert not _build_command_writes_root_fs("pip install -e . && pytest")
+        assert not _build_command_writes_root_fs("uv pip install pytest")
+        assert not _build_command_writes_root_fs("poetry install")
+        # False: local npm install writes to CWD/node_modules (workspace)
+        assert not _build_command_writes_root_fs("npm install && npm test")
+        assert not _build_command_writes_root_fs("npm ci")
+        # False: make (recipe is Python-focused per the LLM skill; operator
+        # opts in via workspace config if their Makefile does npm -g)
+        assert not _build_command_writes_root_fs("make build")
+
+    def test_apply_toolchain_adaptation_npm_global_flips_ro_root(self):
+        """Positive case for the narrowed rule: ``npm install -g`` writes
+        to /usr/local/lib/node_modules on the container's root FS, so
+        the auto-flip must fire even though the pip cases no longer do.
+        """
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, _allow, _img, _net, ro_adapted = _apply_toolchain_adaptation(
+            "npm install -g pnpm && pnpm test",
+            {
+                "docker_image": "node:20-slim",
+                "auto_enable_network_for_install": True,
+            },
+            False,
+        )
+        assert ro_adapted
+        assert cfg["read_only_root"] is False
 
 
 class TestDetectDefaultBuildCommandPyFallback:

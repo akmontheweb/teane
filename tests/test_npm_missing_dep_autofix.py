@@ -217,6 +217,21 @@ def test_try_missing_npm_dep_ignores_other_error_codes(tmp_path):
     ("axios", False),
     ("react", False),
     ("@scope/some-runtime", False),
+    # Fix J — bundlers / TS runners / formatting plugins / test mocks
+    # that were misclassifying as runtime and landing in ``dependencies``.
+    ("parcel", True),
+    ("tsx", True),
+    ("tsup", True),
+    ("swc", True),
+    ("msw", True),
+    ("prettier-plugin-tailwindcss", True),
+    # Regression guard: react-adjacent runtime packages must NOT get
+    # swept into devDependencies by an accidental overreach of the new
+    # entries (`tsx` is a common name that could clash with .tsx files,
+    # but the classifier is name-exact — no substring matching).
+    ("next", False),
+    ("express", False),
+    ("@nestjs/core", False),
 ])
 def test_npm_dev_classification(name, expected):
     assert _is_npm_dev_package(name) is expected

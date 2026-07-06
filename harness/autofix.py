@@ -716,7 +716,90 @@ _DEP_INSTALL_NAMES: dict[str, str] = {
     "sklearn": "scikit-learn",
     "skimage": "scikit-image",
     "bs4": "beautifulsoup4",
+    # Fix I — common import-name / pip-name mismatches that show up in
+    # backend / web-app sessions. Every entry here is a case where the
+    # LLM would otherwise guess the wrong pip name (e.g. `pip install
+    # jwt`, which is a squatted package, not PyJWT). Confidence bar:
+    # PyPI-verified, no ambiguous forks.
+    "dotenv": "python-dotenv",
+    "jwt": "PyJWT",
+    "magic": "python-magic",
+    "Crypto": "pycryptodome",
+    "dateutil": "python-dateutil",
+    "docx": "python-docx",
+    "pptx": "python-pptx",
+    "dns": "dnspython",
+    "attr": "attrs",
+    "git": "GitPython",
 }
+
+
+_INSTALL_NAME_OVERRIDES_SENTINEL: dict[str, str] = {}
+_INSTALL_NAME_OVERRIDES_LOADED: bool = False
+
+
+def _install_name_overrides() -> dict[str, str]:
+    """Return the operator-supplied override map (empty dict when no
+    overrides are configured or the config can't be loaded).
+
+    Cached at module scope after the first successful read — the harness
+    doesn't hot-reload config anyway, and this keeps the autofix hot path
+    off the disk. Config-load failures are swallowed silently: autofix
+    must never crash because of an unrelated config field.
+    """
+    global _INSTALL_NAME_OVERRIDES_LOADED
+    if _INSTALL_NAME_OVERRIDES_LOADED:
+        return _INSTALL_NAME_OVERRIDES_SENTINEL
+    _INSTALL_NAME_OVERRIDES_LOADED = True
+    try:
+        from harness.cli import load_raw_config  # lazy — avoid import cycle
+        cfg = load_raw_config()
+    except Exception:  # noqa: BLE001 — config unavailable → use defaults only
+        return _INSTALL_NAME_OVERRIDES_SENTINEL
+    deps_section = cfg.get("dependencies") if isinstance(cfg, dict) else None
+    if not isinstance(deps_section, dict):
+        return _INSTALL_NAME_OVERRIDES_SENTINEL
+    overrides = deps_section.get("install_name_overrides")
+    if not isinstance(overrides, dict):
+        return _INSTALL_NAME_OVERRIDES_SENTINEL
+    for k, v in overrides.items():
+        if isinstance(k, str) and isinstance(v, str) and v.strip():
+            _INSTALL_NAME_OVERRIDES_SENTINEL[k] = v.strip()
+    return _INSTALL_NAME_OVERRIDES_SENTINEL
+
+
+def _resolve_install_name(
+    symbol: str, config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the pip install name for ``symbol``. Precedence:
+
+      1. ``dependencies.install_name_overrides[symbol]`` from the supplied
+         ``config`` dict (test seam — production callers rely on #2).
+      2. ``dependencies.install_name_overrides[symbol]`` from the on-disk
+         canonical config (loaded lazily and cached).
+      3. Hardcoded ``_DEP_INSTALL_NAMES`` map.
+      4. The symbol itself (identity — most packages import and install
+         under the same name).
+
+    Fix I — override lets teams declare private-registry / vendored-fork
+    mappings once instead of watching the LLM guess wrong every session.
+    Additive: unknown symbols still fall through to the default (or the
+    symbol itself), so a partial override can't accidentally shrink the
+    coverage of the hardcoded defaults. Override wins only for symbols
+    it explicitly names.
+    """
+    if config:
+        deps_section = config.get("dependencies") or {}
+        if isinstance(deps_section, dict):
+            overrides = deps_section.get("install_name_overrides") or {}
+            if isinstance(overrides, dict):
+                override = overrides.get(symbol)
+                if isinstance(override, str) and override.strip():
+                    return override.strip()
+    disk_override = _install_name_overrides().get(symbol)
+    if disk_override:
+        return disk_override
+    return _DEP_INSTALL_NAMES.get(symbol, symbol)
 
 
 def _try_missing_dep(
@@ -743,7 +826,7 @@ def _try_missing_dep(
     symbol = str(diag.get("missing_symbol", "") or "").strip()
     if not symbol:
         return None
-    install_name = _DEP_INSTALL_NAMES.get(symbol, symbol)
+    install_name = _resolve_install_name(symbol)
     build_cmd = str(diag.get("build_command", "") or "").lower()
 
     # pyproject.toml path: sessions across FinancialResearch stalled 3-6
@@ -869,7 +952,7 @@ def _try_deps_not_installed(
     # Canonicalise: prefer the mapped install name over the import name
     # (``bs4`` → ``beautifulsoup4``). Filter empties defensively.
     install_names = [
-        _DEP_INSTALL_NAMES.get(p, p) for p in packages if p
+        _resolve_install_name(p) for p in packages if p
     ]
     if not install_names:
         return None
@@ -1182,6 +1265,13 @@ _NPM_DEV_EXACT: frozenset[str] = frozenset({
     "tailwindcss", "postcss", "autoprefixer", "typescript", "ts-node",
     "eslint", "prettier", "stylelint", "rollup", "webpack", "esbuild",
     "nodemon", "concurrently", "husky", "lint-staged",
+    # Fix J — bundlers / TS runners / formatting plugins / test mocks
+    # that were misclassifying as runtime and landing in ``dependencies``
+    # instead of ``devDependencies``. Every entry has no runtime import
+    # from application code — they are invoked by build tooling only.
+    "parcel", "tsx", "tsup", "swc",
+    "msw",
+    "prettier-plugin-tailwindcss",
 })
 
 

@@ -217,3 +217,234 @@ class TestVerdictNamedFilesFileOnly:
             }
         ]
         assert _verdict_named_files(verdict, errs) == []
+
+
+class TestFixGTestAssertionMode:
+    """Fix G — for pytest assertion failures the judge is asked to name the
+    impl file the test exercises; the seeder swaps that in for the compiler-
+    errors-derived test file so the ``MUST MODIFY`` banner points at the
+    impl instead of the test. Session 52c16e16-* burned 3 rounds patching
+    ``tests/unit/backend/test_edgar.py`` when the fix belonged in
+    ``backend/services/edgar.py``."""
+
+    def test_detector_matches_assertion_in_test_file(self):
+        from harness.graph import _top_error_is_test_assertion
+        diags = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 49,
+            "error_code": "AssertionError",
+            "message": "assert len(result) >= 1",
+        }]
+        assert _top_error_is_test_assertion(diags) is True
+
+    def test_detector_test_filename_pattern_outside_tests_dir(self):
+        from harness.graph import _top_error_is_test_assertion
+        diags = [{
+            "file": "backend/test_edgar.py",
+            "line": 10,
+            "error_code": "AssertionError",
+            "message": "assertion failed",
+        }]
+        assert _top_error_is_test_assertion(diags) is True
+
+    def test_detector_rejects_non_test_file(self):
+        from harness.graph import _top_error_is_test_assertion
+        diags = [{
+            "file": "backend/services/edgar.py",
+            "line": 100,
+            "error_code": "AssertionError",
+            "message": "assert x is None",
+        }]
+        assert _top_error_is_test_assertion(diags) is False
+
+    def test_detector_rejects_compile_error_in_test_file(self):
+        from harness.graph import _top_error_is_test_assertion
+        diags = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 5,
+            "error_code": "ImportError",
+            "message": "cannot import name X",
+        }]
+        assert _top_error_is_test_assertion(diags) is False
+
+    def test_detector_rejects_empty(self):
+        from harness.graph import _top_error_is_test_assertion
+        assert _top_error_is_test_assertion([]) is False
+
+    def test_parser_extracts_impl_file(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = (
+            '{"verdict": "DISTRACTION",'
+            '"real_blocker": "AssertionError at tests/unit/backend/test_edgar.py:49",'
+            '"recommendation": "Fix search impl.",'
+            '"impl_file": "backend/services/edgar.py"}'
+        )
+        out = _parse_repair_reflection_verdict(raw)
+        assert out is not None
+        assert out.get("impl_file") == "backend/services/edgar.py"
+
+    def test_parser_absent_impl_file_is_ok(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = (
+            '{"verdict": "DISTRACTION",'
+            '"real_blocker": "AssertionError at foo.py:1",'
+            '"recommendation": "Fix it."}'
+        )
+        out = _parse_repair_reflection_verdict(raw)
+        assert out is not None
+        assert "impl_file" not in out
+
+    def test_parser_rejects_placeholder_impl_file(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = (
+            '{"verdict": "DISTRACTION",'
+            '"real_blocker": "AssertionError at foo.py:1",'
+            '"recommendation": "Fix it.",'
+            '"impl_file": "<file>"}'
+        )
+        out = _parse_repair_reflection_verdict(raw)
+        assert out is not None
+        assert "impl_file" not in out
+
+    def test_seeder_swaps_impl_for_test_when_applicable(self, tmp_path):
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "backend" / "services").mkdir(parents=True)
+        impl = tmp_path / "backend" / "services" / "edgar.py"
+        impl.write_text("# impl\n")
+        verdict = {
+            "real_blocker": "AssertionError at tests/unit/backend/test_edgar.py:49",
+            "recommendation": "Modify the typeahead search implementation.",
+            "impl_file": "backend/services/edgar.py",
+        }
+        errs = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 49,
+            "error_code": "AssertionError",
+            "message": "assert len(result) >= 1",
+        }]
+        files, promoted = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["backend/services/edgar.py"]
+        assert promoted == "backend/services/edgar.py"
+
+    def test_seeder_falls_back_when_impl_missing_on_disk(self, tmp_path):
+        from harness.graph import _effective_judge_named_files
+        verdict = {
+            "real_blocker": "AssertionError at tests/unit/backend/test_edgar.py:49",
+            "recommendation": "Modify the typeahead search implementation.",
+            "impl_file": "backend/services/edgar.py",  # not created
+        }
+        errs = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 49,
+            "error_code": "AssertionError",
+            "message": "assert len(result) >= 1",
+        }]
+        files, promoted = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        # No swap → the standard grounding still matches the test file.
+        assert files == ["tests/unit/backend/test_edgar.py"]
+        assert promoted is None
+
+    def test_seeder_refuses_to_promote_test_path_as_impl(self, tmp_path):
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "tests" / "unit").mkdir(parents=True)
+        bogus = tmp_path / "tests" / "unit" / "test_other.py"
+        bogus.write_text("# also a test\n")
+        verdict = {
+            "real_blocker": "AssertionError at tests/unit/backend/test_edgar.py:49",
+            "recommendation": "Rename impl.",
+            "impl_file": "tests/unit/test_other.py",
+        }
+        errs = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 49,
+            "error_code": "AssertionError",
+            "message": "assert len(result) >= 1",
+        }]
+        files, promoted = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert promoted is None
+        assert files == ["tests/unit/backend/test_edgar.py"]
+
+    def test_seeder_unchanged_for_compile_errors(self, tmp_path):
+        """Non-test-assertion rounds must be byte-identical to the old
+        _verdict_named_files behavior — the whole point of Fix G being
+        isolated."""
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "backend" / "services").mkdir(parents=True)
+        (tmp_path / "backend" / "services" / "parser.py").write_text("# p\n")
+        verdict = {
+            "real_blocker": "ImportError from backend/services/parser.py",
+            "recommendation": "Fix the import.",
+            "impl_file": "backend/services/parser.py",  # present but ignored
+        }
+        errs = [{
+            "file": "backend/services/parser.py",
+            "line": 3,
+            "error_code": "ImportError",
+            "message": "cannot import name X",
+        }]
+        files, promoted = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert promoted is None
+        assert files == ["backend/services/parser.py"]
+
+    def test_seeder_rejects_absolute_and_traversal_paths(self, tmp_path):
+        from harness.graph import _effective_judge_named_files
+        errs = [{
+            "file": "tests/test_x.py", "line": 1,
+            "error_code": "AssertionError", "message": "assert False",
+        }]
+        for bad in ("/etc/passwd", "../secrets.py", "backend/../../etc"):
+            verdict = {
+                "real_blocker": "AssertionError at tests/test_x.py:1",
+                "recommendation": "Fix.",
+                "impl_file": bad,
+            }
+            files, promoted = _effective_judge_named_files(
+                verdict, errs, errs, str(tmp_path),
+            )
+            assert promoted is None, f"Should reject {bad}"
+
+    def test_prompt_test_assertion_hint_renders_when_detected(self):
+        from harness.graph import _build_repair_reflection_prompt
+        diags = [{
+            "file": "tests/unit/backend/test_edgar.py",
+            "line": 49,
+            "error_code": "AssertionError",
+            "message": "assert len(result) >= 1",
+        }]
+        prompt = _build_repair_reflection_prompt(
+            prior_diagnostics_count=2,
+            current_diagnostics_count=1,
+            resolved_fingerprints=[],
+            persisted_fingerprints=["AssertionError::x"],
+            new_fingerprints=[],
+            top_persisted_diagnostics=diags,
+        )
+        assert "TEST-ASSERTION HINT" in prompt
+        assert "impl_file" in prompt
+
+    def test_prompt_test_assertion_hint_absent_otherwise(self):
+        from harness.graph import _build_repair_reflection_prompt
+        diags = [{
+            "file": "backend/services/edgar.py",
+            "line": 10,
+            "error_code": "SyntaxError",
+            "message": "invalid syntax",
+        }]
+        prompt = _build_repair_reflection_prompt(
+            prior_diagnostics_count=2,
+            current_diagnostics_count=1,
+            resolved_fingerprints=[],
+            persisted_fingerprints=["SyntaxError::x"],
+            new_fingerprints=[],
+            top_persisted_diagnostics=diags,
+        )
+        assert "TEST-ASSERTION HINT" not in prompt
+        assert "impl_file" not in prompt

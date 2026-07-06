@@ -1139,7 +1139,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # installed → exit 127 in 0.2s, and the LLM gets routed to a wasted
     # repair iteration with a spurious "test failure". compiler_node does
     # the same adaptation via _toolchain_image_for; reuse it here.
-    from harness.graph import _toolchain_image_for, _build_command_needs_network
+    from harness.graph import _toolchain_image_for, _build_command_writes_root_fs
     desired_image = _toolchain_image_for(test_cmd)
     if desired_image and sandbox_cfg.get("docker_image") != desired_image:
         logger.info(
@@ -1148,13 +1148,15 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             desired_image, test_cmd,
         )
         sandbox_cfg["docker_image"] = desired_image
-    # Pip / npm install steps write into system locations the
-    # read-only root FS would block; flip the flag when the test command
-    # has an install step.
-    if _build_command_needs_network(test_cmd) and sandbox_cfg.get("read_only_root", True):
+    # Only ``npm install -g`` writes to a root-FS location the sandbox's
+    # tmpfs-backed HOME can't cover (/usr/local/lib/node_modules); every
+    # other install path (pip/poetry/uv/local npm) lands under $HOME on
+    # tmpfs and is compatible with read_only_root=True.
+    if _build_command_writes_root_fs(test_cmd) and sandbox_cfg.get("read_only_root", True):
         logger.info(
             "[test_generation_node] Adapting sandbox.read_only_root to False "
-            "because test command installs packages into system locations: %s",
+            "because test command runs `npm install -g`, which writes to "
+            "/usr/local/lib/node_modules on the container's root FS: %s",
             test_cmd,
         )
         sandbox_cfg["read_only_root"] = False

@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from harness.graph import (
+    _PIP_INSTALLABLE_SYMBOLS,
     _env_misconfig_hint,
     _is_env_misconfig,
     compiler_node,
@@ -119,6 +120,83 @@ class TestIsEnvMisconfig:
         assert _is_env_misconfig(raw) == ("httpx", "python")
         raw = "ModuleNotFoundError: No module named 'fastapi'\n"
         assert _is_env_misconfig(raw) == ("fastapi", "python")
+
+    # -----------------------------------------------------------------
+    # Fix H — RuntimeError "requires the X package" family
+    # -----------------------------------------------------------------
+
+    def test_starlette_testclient_requires_httpx2(self):
+        # Verbatim message from starlette.testclient when httpx2 isn't
+        # installed. Session fe51a89a-* saw this in
+        # backend/tests/test_api_filings.py at test-collection time; the
+        # pre-fix classifier missed it (it's a RuntimeError, not a
+        # ModuleNotFoundError) so the LLM chased downstream 404s and
+        # search-block misses for 8 rounds before HITL. Fix H tags it as
+        # MISSING_DEP so _try_missing_dep can auto-append `httpx2` to
+        # requirements.txt in one compile cycle.
+        raw = (
+            "  raise RuntimeError(\n"
+            "RuntimeError: The starlette.testclient module requires the "
+            "httpx2 package to be installed.\n"
+            "    $ pip install httpx2\n"
+        )
+        assert _is_env_misconfig(raw) == ("httpx2", "python")
+
+    def test_requires_package_family_generic(self):
+        # The same shape shows up beyond starlette — SQLAlchemy dialects,
+        # Pillow plugins, and any lib with optional runtime deps. Verify
+        # the pattern captures a plain generic form so we don't need to
+        # extend it every time a new lib adopts the idiom.
+        raw = (
+            "RuntimeError: The foo.bar module requires the baz-quux "
+            "package to be installed.\n"
+        )
+        assert _is_env_misconfig(raw) == ("baz-quux", "python")
+
+    def test_requires_package_does_not_match_prose(self):
+        # A README / commit-message mentioning "requires the httpx2
+        # package" without the RuntimeError prefix must NOT trigger.
+        raw = (
+            "The docs say: this feature requires the httpx2 package to "
+            "be installed.\n"
+        )
+        assert _is_env_misconfig(raw) is None
+
+
+# ---------------------------------------------------------------------------
+# Whitelist — shell-invoked CLIs
+# ---------------------------------------------------------------------------
+
+class TestPipInstallableWhitelist:
+    """Regression guard for the shell-CLI whitelist. Every entry gates a
+    ``command not found`` shell miss: on the whitelist → repair loop
+    autofix; off the whitelist → HITL short-circuit. Adding or removing
+    an entry is a policy change; these tests make sure such a change
+    lands deliberately, not by accident."""
+
+    @pytest.mark.parametrize("symbol", [
+        # Fix I additions.
+        "alembic", "celery", "uvicorn", "gunicorn", "hypercorn",
+        "django-admin", "flask", "pip-compile", "pip-tools",
+        "sqlfluff", "pre-commit", "mkdocs",
+        # Fix J additions — additional shell-invoked CLIs.
+        "django", "daphne", "granian",
+        "dramatiq", "arq", "taskiq",
+        "httpie", "jupyter",
+        # Pre-existing entries — asserting so a refactor can't silently
+        # drop them.
+        "pytest", "ruff", "mypy", "black",
+    ])
+    def test_symbol_in_whitelist(self, symbol):
+        assert symbol in _PIP_INSTALLABLE_SYMBOLS
+
+    def test_shell_command_not_covered_by_whitelist(self):
+        # A symbol that is genuinely NOT pip-installable (base-image
+        # concern, not a Python distribution) must NOT be on the list.
+        # If someone adds these, they're either wrong or the semantics
+        # changed and this test should be reviewed.
+        for name in ("docker", "node", "npm", "make", "gcc", "cargo"):
+            assert name not in _PIP_INSTALLABLE_SYMBOLS
 
 
 # ---------------------------------------------------------------------------

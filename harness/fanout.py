@@ -52,9 +52,47 @@ from harness.gateway import NodeRole
 logger = logging.getLogger(__name__)
 
 
+# Module-level fallback defaults — used only when the gateway config is
+# not yet loaded (e.g. pre-init test scaffolding). Live values are
+# resolved from ``gateway.config.fanout_max_concurrency`` /
+# ``fanout_timeout_seconds`` on 2026-07-06 (config.json ``fanout`` block).
 _DEFAULT_MAX_CONCURRENCY = 8
 _DEFAULT_TIMEOUT_SECONDS = 180.0
 _MIN_BUDGET_RESERVATION = 0.005  # per-task floor when budget hint absent
+
+
+def _default_max_concurrency() -> int:
+    """Resolve the fanout concurrency cap from gateway config, falling
+    back to :data:`_DEFAULT_MAX_CONCURRENCY` when the config isn't yet
+    loaded. Import lazily to avoid a circular dependency with
+    :mod:`harness.graph` (which imports :mod:`harness.fanout` in some
+    paths).
+
+    ``get_gateway_config()`` stashes the GatewayConfig object directly
+    (see :func:`harness.graph.set_gateway`), so we read the attribute
+    off it — no ``.config`` indirection.
+    """
+    try:
+        from harness.graph import get_gateway_config
+    except Exception:
+        return _DEFAULT_MAX_CONCURRENCY
+    gw_cfg = get_gateway_config()
+    if gw_cfg is None:
+        return _DEFAULT_MAX_CONCURRENCY
+    return int(getattr(gw_cfg, "fanout_max_concurrency", _DEFAULT_MAX_CONCURRENCY))
+
+
+def _default_timeout_seconds() -> float:
+    """Resolve the per-task timeout from gateway config, falling back to
+    :data:`_DEFAULT_TIMEOUT_SECONDS` when the config isn't loaded."""
+    try:
+        from harness.graph import get_gateway_config
+    except Exception:
+        return _DEFAULT_TIMEOUT_SECONDS
+    gw_cfg = get_gateway_config()
+    if gw_cfg is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    return float(getattr(gw_cfg, "fanout_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +125,7 @@ class AgentSpec:
     messages: list[dict[str, Any]] = field(default_factory=list)
     role: NodeRole = NodeRole.PLANNING
     model_override: Optional[str] = None
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
+    timeout_seconds: float = field(default_factory=_default_timeout_seconds)
     budget_hint: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -124,7 +162,7 @@ async def run_parallel_agents(
     gateway: Any,
     *,
     budget_remaining_usd: float,
-    max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+    max_concurrency: Optional[int] = None,
 ) -> tuple[list[AgentResult], float]:
     """Dispatch ``specs`` concurrently against ``gateway`` with a
     bounded semaphore + a shared budget reservation.
@@ -132,9 +170,15 @@ async def run_parallel_agents(
     Returns ``(results, new_budget)`` where ``results`` is in input
     order (gaps filled with ``success=False`` AgentResults so the
     caller can ``zip(specs, results)`` safely).
+
+    ``max_concurrency`` defaults to ``None`` — resolved from
+    ``gateway.config.fanout_max_concurrency`` at call time so config
+    edits take effect on the next run without a restart.
     """
     if not specs:
         return [], budget_remaining_usd
+    if max_concurrency is None:
+        max_concurrency = _default_max_concurrency()
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
     budget_lock = asyncio.Lock()
     state = {"budget": float(budget_remaining_usd)}
@@ -396,7 +440,9 @@ def make_fanout_skill() -> "Any":
                 return {"error": f"prompts[{i}] must be string or object"}
 
         budget = float(kwargs.get("budget_usd", 1.00))
-        max_concurrency = int(kwargs.get("max_concurrency", _DEFAULT_MAX_CONCURRENCY))
+        max_concurrency = int(kwargs.get(
+            "max_concurrency", _default_max_concurrency(),
+        ))
         results, remaining = await run_parallel_agents(
             specs, gateway,
             budget_remaining_usd=budget,

@@ -13823,7 +13823,10 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # work (LLM saw "use a different operation" prompt + the actual file
     # bytes, and still missed). Three is the smallest count where giving
     # up is more useful than retrying.
-    _STUCK_TARGET_LIMIT = 3
+    _STUCK_TARGET_LIMIT = (
+        int(getattr(gw.config, "stuck_target_limit", 3))
+        if gw is not None else 3
+    )
     _rb_per_file = loop_counter.get("replace_block_misses_per_file") or {}
     if isinstance(_rb_per_file, dict):
         stuck_files = sorted(
@@ -13890,7 +13893,10 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # when autofix is in play; that's enough cycles to give a real
     # autofix progression a fair chance while still bounding loops
     # that aren't actually making the build move forward.
-    _GENERIC_NO_PROGRESS_LIMIT = 5
+    _GENERIC_NO_PROGRESS_LIMIT = (
+        int(getattr(gw.config, "generic_no_progress_limit", 5))
+        if gw is not None else 5
+    )
     if consecutive_zero >= _GENERIC_NO_PROGRESS_LIMIT:
         logger.warning(
             "[router] %d consecutive repair iteration(s) landed zero real "
@@ -14011,7 +14017,10 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # sandbox image, not the manifest. Session 083770ac demonstrates the
     # unguarded loop: 21+ attempts on missing 'pip' against
     # buildpack-deps:bookworm before being killed externally.
-    SAME_MISSING_DEP_LIMIT = 3
+    SAME_MISSING_DEP_LIMIT = (
+        int(getattr(gw.config, "same_missing_dep_limit", 3))
+        if gw is not None else 3
+    )
     consecutive_same_dep = int(
         loop_counter.get("missing_dep_consecutive_same", 0) or 0
     )
@@ -17620,12 +17629,28 @@ def route_after_security_scan(state: AgentState) -> Literal[
     # — turning into a thrash loop that only ends when something else
     # (semgrep timeout, budget, code-review cap) shadows it. Past this
     # ceiling the run terminates rather than pretend the loop is
-    # productive. The default ratio is 3x; operators can tune via the
-    # `hard_security_loop_ceiling` config key.
+    # productive.
+    #
+    # Precedence (highest wins):
+    #   1. per-run override: ``security_scan_config.hard_security_loop_ceiling``
+    #   2. config.json:  ``security.hard_ceiling_multiplier`` × max_sec_attempts
+    #   3. code default: ``_HARD_SECURITY_CEILING_MULTIPLIER`` (=3)
     from harness.security import _HARD_SECURITY_CEILING_MULTIPLIER
+    # ``get_gateway_config()`` returns the GatewayConfig object directly
+    # (set_gateway stashes ``gateway.config``, not the Gateway). Read the
+    # multiplier off it with no ``.config`` indirection.
+    _gw_cfg_for_sec = get_gateway_config()
+    _multiplier = (
+        int(getattr(
+            _gw_cfg_for_sec,
+            "hard_security_ceiling_multiplier",
+            _HARD_SECURITY_CEILING_MULTIPLIER,
+        ))
+        if _gw_cfg_for_sec is not None else _HARD_SECURITY_CEILING_MULTIPLIER
+    )
     hard_ceiling = int(sec_cfg.get(
         "hard_security_loop_ceiling",
-        max_sec_attempts * _HARD_SECURITY_CEILING_MULTIPLIER,
+        max_sec_attempts * _multiplier,
     ))
     compiler_errors = state.get("compiler_errors", [])
 

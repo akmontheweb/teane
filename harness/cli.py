@@ -445,6 +445,10 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
     "test_generation", "metrics", "llm_dispatch",
+    # 2026-07-06 — parallel-agent fan-out defaults promoted from
+    # harness/fanout.py constants. See GatewayConfig.fanout_max_concurrency
+    # / fanout_timeout_seconds for semantics.
+    "fanout",
     # Operator-configurable name of the folder at the workspace root that
     # holds the product spec files (.txt / .md / .pdf). Mandatory in
     # config.json — the harness refuses to start without it.
@@ -574,6 +578,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "end_of_session_repair_diagnostic_cap",
         "end_of_session_repair_inventory_cap",
         "end_of_session_force_reasoning_model",
+        # 2026-07-06 — router tripwires promoted from hard-coded
+        # constants in graph.route_after_repair. See GatewayConfig
+        # fields of the same name for semantics.
+        "stuck_target_limit",
+        "generic_no_progress_limit",
+        "same_missing_dep_limit",
     }),
     "persistence": frozenset({
         "db_path", "ttl_days", "redact_messages",
@@ -615,6 +625,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_generation": frozenset({
         "enabled", "max_iterations",
     }),
+    "fanout": frozenset({
+        "max_concurrency",
+        "timeout_seconds",
+    }),
     # P2.7: cost-metrics aggregation (teane metrics subcommand).
     "metrics": frozenset({
         "burn_rate_window_minutes", "metrics_dir",
@@ -637,6 +651,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # enumerated explicitly.
         "block_on", "warn_on", "ignore_below", "scanners",
         "allowlist_rules", "max_findings_to_route_to_repair",
+        # 2026-07-06 — security-scan ceiling multiplier promoted from
+        # harness/security.py::_HARD_SECURITY_CEILING_MULTIPLIER.
+        "hard_ceiling_multiplier",
     }),
     "speculative": frozenset({
         # Original keys (legacy schema — preserved for backwards compat).
@@ -860,6 +877,13 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "node_throttle.end_of_session_repair_diagnostic_cap": (int,),
     "node_throttle.end_of_session_repair_inventory_cap": (int,),
     "node_throttle.end_of_session_force_reasoning_model": (bool,),
+    # 2026-07-06 promotions.
+    "node_throttle.stuck_target_limit": (int,),
+    "node_throttle.generic_no_progress_limit": (int,),
+    "node_throttle.same_missing_dep_limit": (int,),
+    "security.hard_ceiling_multiplier": (int,),
+    "fanout.max_concurrency": (int,),
+    "fanout.timeout_seconds": (int, float),
     "persistence.db_path": (str,),
     "persistence.ttl_days": (int,),
     "persistence.redact_messages": (bool,),

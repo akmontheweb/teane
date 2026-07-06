@@ -1738,6 +1738,38 @@ class GatewayConfig:
     # cheap-model rounds first. Off to fall back to the cycle-driven
     # escalation rule (escalates only on the LAST attempt before HITL).
     end_of_session_force_reasoning_model: bool = True
+    # Router tripwires promoted from hard-coded constants in
+    # ``harness/graph.py::route_after_repair`` on 2026-07-06 (session
+    # celery-cascade). Each caps a specific loop-fixation pattern:
+    #  * ``stuck_target_limit`` — router routes to HITL as soon as ANY
+    #    single file has failed to accept a REPLACE_BLOCK this many
+    #    times (default 3). Catches the "keep patching the same broken
+    #    anchor" loop.
+    #  * ``generic_no_progress_limit`` — hard cap on consecutive
+    #    zero-patch repair rounds EVEN when autofix is enabled
+    #    (default 5). Autofix normally bypasses the primary iteration
+    #    limit; this tripwire prevents that bypass from becoming
+    #    infinite.
+    #  * ``same_missing_dep_limit`` — router escalates when the SAME
+    #    MISSING_DEP symbol repeats consecutively (default 3). Catches
+    #    the "missing tool the manifest can't install" case (e.g.
+    #    ``pip`` itself against buildpack-deps:bookworm — 21+ attempts
+    #    observed in session 083770ac before external kill).
+    stuck_target_limit: int = 3
+    generic_no_progress_limit: int = 5
+    same_missing_dep_limit: int = 3
+    # Security-scan tripwire promoted from
+    # ``harness/security.py::_HARD_SECURITY_CEILING_MULTIPLIER`` on
+    # 2026-07-06. Absolute ceiling on security-repair rounds =
+    # ``max_sec_attempts × hard_security_ceiling_multiplier`` (default
+    # 3 → 3× the primary sec-attempt cap).
+    hard_security_ceiling_multiplier: int = 3
+    # Fanout defaults promoted from ``harness/fanout.py`` constants on
+    # 2026-07-06. ``fanout_max_concurrency`` caps parallel workers in
+    # ``run_fanout_tasks``; ``fanout_timeout_seconds`` is the per-task
+    # wall-clock cutoff before individual workers are cancelled.
+    fanout_max_concurrency: int = 8
+    fanout_timeout_seconds: float = 180.0
     ollama_local_model: str = ""
     ollama_local_backup: str = ""
     force_local_only: bool = False
@@ -3208,6 +3240,60 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 20
         return value
 
+    def _clamp_positive_int(
+        raw: Any, *, name: str, default: int,
+        floor: int = 1, ceiling: int = 100,
+    ) -> int:
+        """Generic int clamp for the router-tripwire / fanout knobs.
+        Returns ``default`` on unparseable input, clamps to
+        ``[floor, ceiling]`` on out-of-range values with a warning.
+
+        Shared by the 2026-07-06 config promotions
+        (``stuck_target_limit``, ``generic_no_progress_limit``,
+        ``same_missing_dep_limit``, ``hard_security_ceiling_multiplier``,
+        ``fanout.max_concurrency``) so every new knob gets identical
+        guardrails without another bespoke clamp function per key.
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        if value < floor:
+            logger.warning(
+                "%s %d < %d; clamping to %d.", name, value, floor, floor,
+            )
+            return floor
+        if value > ceiling:
+            logger.warning(
+                "%s %d > %d; clamping to %d.", name, value, ceiling, ceiling,
+            )
+            return ceiling
+        return value
+
+    def _clamp_positive_float(
+        raw: Any, *, name: str, default: float,
+        floor: float = 1.0, ceiling: float = 3600.0,
+    ) -> float:
+        """Float variant of :func:`_clamp_positive_int` for
+        ``fanout.timeout_seconds`` (any config knob measured in
+        seconds). Ceiling default 3600s = 1h guards against typos that
+        would effectively disable the per-task cancellation gate."""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if value < floor:
+            logger.warning(
+                "%s %s < %s; clamping to %s.", name, value, floor, floor,
+            )
+            return floor
+        if value > ceiling:
+            logger.warning(
+                "%s %s > %s; clamping to %s.", name, value, ceiling, ceiling,
+            )
+            return ceiling
+        return value
+
     def _clamp_discovery_iterations(raw: Any) -> int:
         try:
             value = int(raw)
@@ -3337,6 +3423,37 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         end_of_session_force_reasoning_model=bool(node_throttle.get(
             "end_of_session_force_reasoning_model", True,
         )),
+        stuck_target_limit=_clamp_positive_int(
+            node_throttle.get("stuck_target_limit", 3),
+            name="stuck_target_limit", default=3, floor=1, ceiling=50,
+        ),
+        generic_no_progress_limit=_clamp_positive_int(
+            node_throttle.get("generic_no_progress_limit", 5),
+            name="generic_no_progress_limit", default=5, floor=1, ceiling=50,
+        ),
+        same_missing_dep_limit=_clamp_positive_int(
+            node_throttle.get("same_missing_dep_limit", 3),
+            name="same_missing_dep_limit", default=3, floor=1, ceiling=50,
+        ),
+        hard_security_ceiling_multiplier=_clamp_positive_int(
+            (config_dict.get("security", {}) or {}).get(
+                "hard_ceiling_multiplier", 3,
+            ),
+            name="hard_ceiling_multiplier", default=3, floor=1, ceiling=20,
+        ),
+        fanout_max_concurrency=_clamp_positive_int(
+            (config_dict.get("fanout", {}) or {}).get(
+                "max_concurrency", 8,
+            ),
+            name="fanout.max_concurrency", default=8, floor=1, ceiling=64,
+        ),
+        fanout_timeout_seconds=_clamp_positive_float(
+            (config_dict.get("fanout", {}) or {}).get(
+                "timeout_seconds", 180.0,
+            ),
+            name="fanout.timeout_seconds", default=180.0,
+            floor=1.0, ceiling=3600.0,
+        ),
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
         force_local_only=model_routing.get("force_local_only", False),

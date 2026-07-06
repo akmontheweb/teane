@@ -806,7 +806,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
 
     loop_counter = dict(state.get("loop_counter") or {})
     loop_counter["test_generation"] = loop_counter.get("test_generation", 0) + 1
-    max_iterations = int(cfg.get("max_iterations", 2))
+    max_iterations = int(cfg.get("max_iterations", 3))
     if loop_counter["test_generation"] > max_iterations:
         logger.warning(
             "[test_generation_node] Max iterations (%d) reached. Routing to HITL.",

@@ -13143,7 +13143,7 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         return _transition("human_intervention_node")
 
     if exit_code == 0:
-        logger.info("[router] Build succeeded (exit 0). Routing to security scan.")
+        logger.info("[router] Build succeeded (exit 0). Routing to code review / security gate.")
         return _transition("security_scan_node")
 
     # Environment misconfig (missing pytest, npm, etc.) — LLM repair cannot

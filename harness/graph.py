@@ -9694,7 +9694,18 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # finally surfaced real errors. Treat as neutral, same as the first
     # iteration. See session 7c30bce2 for the original symptom.
     has_meaningful_prior = bool(prior_fps_set) or prior_diag_count > 0
-    fps_shrank = bool(prior_fps_set - current_fps_set)
+    # Primary progress signal: at least one fingerprint that was in the
+    # prior set is NO LONGER in the current set. Set-difference, NOT
+    # cardinality shrinkage — a 1 → 1 transition where the identity
+    # changed (prior failure resolved, downstream failure surfaced by
+    # the same fix) counts as progress. Regressions where the new
+    # fingerprint was *introduced* by the round's patch (rather than
+    # uncovered by fixing the prior one) are caught downstream by the
+    # LLM judge's REGRESSION verdict. The name and log copy below say
+    # "advanced" rather than "shrank" because the set can advance without
+    # shrinking in cardinality — historically both were phrased as
+    # "shrank", which was misleading when the numbers were equal.
+    fps_advanced = bool(prior_fps_set - current_fps_set)
     # Raw-count shrinkage is the secondary signal — when many tests share
     # one fingerprint (e.g. 10 tests all hitting the same EDGAR-mock
     # guard collapse to ONE ``RuntimeError::Real EDGAR HTTP call …``
@@ -9709,7 +9720,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         and current_diag_count > 0
         and current_diag_count < prior_diag_count
     )
-    prior_round_made_progress = fps_shrank or count_shrank
+    prior_round_made_progress = fps_advanced or count_shrank
     if is_first_iteration or not has_meaningful_prior:
         prior_round_made_progress = True  # neutral; nothing to evaluate yet
     if not prior_round_made_progress:
@@ -9717,9 +9728,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             loop_counter.get("no_progress_repairs", 0) + 1
         )
         logger.info(
-            "[repair_node] Prior repair did not shrink failing fingerprints "
-            "OR raw count (fps prior=%d/current=%d shared=%d; count "
-            "prior=%d/current=%d). no_progress_repairs=%d.",
+            "[repair_node] Prior repair resolved no prior fingerprint AND "
+            "did not shrink raw count (fps prior=%d/current=%d shared=%d; "
+            "count prior=%d/current=%d). no_progress_repairs=%d.",
             len(prior_fps_set), len(current_fps_set),
             len(prior_fps_set & current_fps_set),
             prior_diag_count, current_diag_count,
@@ -9730,14 +9741,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # Matches the spirit of consecutive_zero_patch_rounds: a stretch
         # of progress earns back the budget.
         if loop_counter.get("no_progress_repairs", 0) > 0:
-            _signal = (
-                "fingerprint set" if fps_shrank else "raw diagnostic count"
-            )
+            if fps_advanced:
+                _resolved = sorted(prior_fps_set - current_fps_set)
+                _resolved_preview = ", ".join(_resolved[:3]) + (
+                    f" (+{len(_resolved) - 3} more)"
+                    if len(_resolved) > 3 else ""
+                )
+                _signal_msg = (
+                    "prior fingerprint(s) no longer present: "
+                    + _resolved_preview
+                )
+            else:
+                _signal_msg = "raw diagnostic count shrank"
             logger.info(
-                "[repair_node] Prior repair shrank %s (fps prior=%d → "
+                "[repair_node] Progress signal — %s (fps prior=%d → "
                 "current=%d; count prior=%d → current=%d). Resetting "
                 "no_progress_repairs from %d to 0.",
-                _signal,
+                _signal_msg,
                 len(prior_fps_set), len(current_fps_set),
                 prior_diag_count, current_diag_count,
                 loop_counter["no_progress_repairs"],

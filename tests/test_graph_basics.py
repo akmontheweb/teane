@@ -1129,28 +1129,51 @@ class TestRawCountProgress:
         prior_fps = {"RuntimeError::real edgar http call"}
         current_fps = {"RuntimeError::real edgar http call"}
         prior_count, current_count = 10, 9
-        fps_shrank = bool(prior_fps - current_fps)
+        fps_advanced = bool(prior_fps - current_fps)
         count_shrank = (
             prior_count > 0
             and current_count > 0
             and current_count < prior_count
         )
-        assert fps_shrank is False
+        assert fps_advanced is False
         assert count_shrank is True
-        assert (fps_shrank or count_shrank) is True
+        assert (fps_advanced or count_shrank) is True
+
+    def test_fps_identity_flip_credits_progress_even_when_cardinality_unchanged(self):
+        """Prior failure resolved, downstream failure surfaced by the
+        same fix. Sets are both singletons but the identity changed —
+        prior_fps - current_fps is {A}, so at least one prior fingerprint
+        is no longer present. That's real progress, not a stall.
+
+        Historical bug: the log copy called this "shrank fingerprint set"
+        even though sizes were equal. The name ``fps_advanced`` and the
+        rewritten log message capture the actual semantic: the prior set
+        moved forward, whether or not it got smaller."""
+        prior_fps = {"AssertionError::form-type-slash"}
+        current_fps = {"ModuleNotFoundError::pytest-asyncio"}
+        prior_count, current_count = 1, 1
+        fps_advanced = bool(prior_fps - current_fps)
+        count_shrank = (
+            prior_count > 0
+            and current_count > 0
+            and current_count < prior_count
+        )
+        assert fps_advanced is True
+        assert count_shrank is False
+        assert (fps_advanced or count_shrank) is True
 
     def test_count_static_is_not_progress(self):
-        """No fingerprint shrinkage AND no count shrinkage → no progress."""
+        """No fingerprint advance AND no count shrinkage → no progress."""
         prior_fps = {"RuntimeError::x"}
         current_fps = {"RuntimeError::x"}
         prior_count, current_count = 4, 4
-        fps_shrank = bool(prior_fps - current_fps)
+        fps_advanced = bool(prior_fps - current_fps)
         count_shrank = (
             prior_count > 0
             and current_count > 0
             and current_count < prior_count
         )
-        assert (fps_shrank or count_shrank) is False
+        assert (fps_advanced or count_shrank) is False
 
     def test_count_growth_is_not_progress(self):
         """A round that LEAVES MORE diagnostics than it started with is a

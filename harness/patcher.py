@@ -1342,6 +1342,20 @@ class TextPatcher(BasePatcher):
             )
             # No match even after normalization — fall through to closest-match suggestion.
             suggestion = _find_closest_match(original, search)
+            # Cross-file grep: if the LLM's search text lives in another
+            # file (usually a same-basename sibling), tell it so instead
+            # of letting it spin against the wrong target for N rounds.
+            sibling_hits = _find_search_in_other_files(
+                self.workspace_root, filepath, search,
+            )
+            sibling_tail = _format_sibling_hits(sibling_hits, filepath)
+            if sibling_hits:
+                logger.info(
+                    "[patcher:text] REPLACE_BLOCK search miss on %s — but "
+                    "distinctive line found in %d other file(s): %s",
+                    filepath, len(sibling_hits),
+                    ", ".join(f"{p}:{ln}" for p, ln in sibling_hits),
+                )
             return PatchResult(
                 success=False,
                 file=filepath,
@@ -1356,6 +1370,7 @@ class TextPatcher(BasePatcher):
                     f"replace (WITHOUT the line-number prefix `  N| `) into "
                     f"your next REPLACE_BLOCK's `search:`.\n"
                     f"Current file content (around closest match):\n{suggestion}"
+                    f"{sibling_tail}"
                 ),
             )
         if n_matches > 1:
@@ -1546,11 +1561,18 @@ class TextPatcher(BasePatcher):
         # For text patcher, anchor is used as a plain substring search
         anchor_idx = original.find(anchor)
         if anchor_idx == -1:
+            sibling_hits = _find_search_in_other_files(
+                self.workspace_root, filepath, anchor,
+            )
+            sibling_tail = _format_sibling_hits(sibling_hits, filepath)
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.INSERT_AT_BLOCK,
-                error=f"Anchor '{anchor[:60]}...' not found in {filepath}.",
+                error=(
+                    f"Anchor '{anchor[:60]}...' not found in {filepath}."
+                    f"{sibling_tail}"
+                ),
             )
 
         if placement == Placement.BEFORE:
@@ -2710,6 +2732,147 @@ def _list_stem_siblings(missing_path: str, limit: int = 6) -> list[str]:
         return out
     except OSError:
         return []
+
+
+# Directories and file extensions used by the cross-file search-block finder.
+# Skip build artifacts, VCS metadata, and vendored deps — they inflate scan
+# time and never contain the LLM's intended edit target.
+_CROSS_FILE_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", "dist", "build", ".next", ".nuxt", "target", ".cache",
+    "htmlcov", ".coverage", "site-packages",
+})
+_CROSS_FILE_TEXT_EXTS = frozenset({
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc",
+    ".cpp", ".hpp", ".cs", ".swift", ".sh", ".bash", ".zsh",
+    ".md", ".txt", ".rst", ".yaml", ".yml", ".json", ".toml",
+    ".ini", ".cfg", ".conf", ".env", ".html", ".css", ".scss",
+    ".sql", ".graphql", ".proto", ".dockerfile",
+})
+
+
+def _pick_distinctive_line(search: str) -> Optional[str]:
+    """Pick a distinctive single line from ``search`` for a workspace grep.
+
+    Prefers the longest non-boilerplate line so the sibling-file hit list
+    stays specific (grep on ``}`` or ``return`` produces useless noise).
+    Returns ``None`` if the search block has no line worth searching for.
+    """
+    trivial = {
+        "{", "}", "(", ")", "[", "]", ":", ",", ";",
+        "pass", "return", "break", "continue", "else:", "try:", "finally:",
+        "});", "};", "});", "});",
+    }
+    candidates: list[str] = []
+    for raw in search.splitlines():
+        line = raw.strip()
+        if len(line) < 12:
+            continue
+        if line in trivial:
+            continue
+        if line.startswith("#") or line.startswith("//"):
+            continue
+        candidates.append(line)
+    if not candidates:
+        return None
+    candidates.sort(key=len, reverse=True)
+    # Cap at 200 chars — the needle just has to be distinctive enough to
+    # identify a candidate line, not literally reproduce the search block.
+    return candidates[0][:200]
+
+
+def _find_search_in_other_files(
+    workspace_root: str,
+    target_file: str,
+    search: str,
+    *,
+    max_hits: int = 3,
+    max_files_scanned: int = 3000,
+) -> list[tuple[str, int]]:
+    """When a REPLACE_BLOCK search misses, grep the workspace for a
+    distinctive line from ``search`` and return hits in files OTHER than
+    ``target_file``.
+
+    This catches the common "LLM confused two same-basename files" failure
+    (e.g. ``tests/test_edgar.py`` vs ``tests/unit/backend/test_edgar.py``)
+    where every retry rejects because the search text lives in the sibling.
+    """
+    needle = _pick_distinctive_line(search)
+    if needle is None:
+        return []
+
+    try:
+        target_abs = os.path.abspath(os.path.join(workspace_root, target_file))
+    except (TypeError, ValueError):
+        return []
+
+    hits: list[tuple[str, int]] = []
+    files_scanned = 0
+
+    for dirpath, dirnames, filenames in os.walk(workspace_root):
+        dirnames[:] = [d for d in dirnames if d not in _CROSS_FILE_SKIP_DIRS]
+        for fname in filenames:
+            if files_scanned >= max_files_scanned:
+                return hits
+            ext = os.path.splitext(fname)[1].lower()
+            if ext and ext not in _CROSS_FILE_TEXT_EXTS:
+                continue
+            path = os.path.join(dirpath, fname)
+            try:
+                if os.path.abspath(path) == target_abs:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            files_scanned += 1
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for lineno, line in enumerate(fh, start=1):
+                        if needle in line:
+                            try:
+                                rel = os.path.relpath(path, workspace_root)
+                            except ValueError:
+                                rel = path
+                            hits.append((rel, lineno))
+                            if len(hits) >= max_hits:
+                                return hits
+                            break
+            except OSError:
+                continue
+    return hits
+
+
+def _format_sibling_hits(
+    hits: list[tuple[str, int]], target_file: str,
+) -> str:
+    """Format cross-file grep hits into a REPLACE_BLOCK error tail.
+
+    Ranks same-basename siblings first — those are almost always the
+    intended target when the LLM has confused two similarly-named files.
+    """
+    if not hits:
+        return ""
+    target_base = os.path.basename(target_file)
+    same_basename = [h for h in hits if os.path.basename(h[0]) == target_base]
+    other = [h for h in hits if h not in same_basename]
+    lines = [f"  - {path}:{lineno}" for path, lineno in (same_basename + other)]
+    intro = (
+        "\n\nHOWEVER, your distinctive search text WAS found in other file(s):\n"
+        + "\n".join(lines)
+    )
+    if same_basename:
+        intro += (
+            f"\nNote: {os.path.basename(same_basename[0][0])} matches the "
+            f"basename of your target ({target_base}) — you may have picked "
+            f"the wrong path. Re-emit REPLACE_BLOCK against the correct file."
+        )
+    else:
+        intro += (
+            "\nIf you meant to edit one of those, re-emit REPLACE_BLOCK "
+            "against the correct path."
+        )
+    return intro
 
 
 def _find_closest_match(text: str, search: str, context: int = 20) -> str:

@@ -9646,6 +9646,106 @@ def _repair_budget_warning(total_repairs: int, cap: int) -> Optional[str]:
     )
 
 
+def _detect_fixation_files(
+    loop_counter: dict[str, Any],
+    *,
+    threshold: int = 3,
+    window: int = 5,
+) -> list[tuple[str, int]]:
+    """Return files edited in ≥``threshold`` of the last ``window`` rounds.
+
+    Reads :func:`_record_file_modification_history`'s per-file entries.
+    A round counts if the entry recorded a successful, non-no-op patch
+    (i.e. the LLM actually changed the file that round). Returned list
+    is ``(path, rounds_touched)`` sorted by rounds_touched descending;
+    empty when nothing crosses the threshold.
+
+    The window/threshold defaults are chosen so a legitimate 2-round
+    incremental fix on one file never trips this signal — 3+ rounds on
+    the same file with the loop stalled is the fixation shape the
+    caller is looking for.
+    """
+    hist_raw = loop_counter.get("file_modification_history")
+    if not isinstance(hist_raw, dict) or not hist_raw:
+        return []
+    latest_round = 0
+    for entries in hist_raw.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, (list, tuple)) and entry:
+                try:
+                    r = int(entry[0])
+                    if r > latest_round:
+                        latest_round = r
+                except (TypeError, ValueError):
+                    continue
+    if latest_round <= 0:
+        return []
+    lower = max(1, latest_round - window + 1)
+    out: list[tuple[str, int]] = []
+    for path, entries in hist_raw.items():
+        if not isinstance(path, str) or not isinstance(entries, list):
+            continue
+        rounds: set[int] = set()
+        for entry in entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 4:
+                continue
+            try:
+                rnd = int(entry[0])
+            except (TypeError, ValueError):
+                continue
+            success = bool(entry[2])
+            no_op = bool(entry[3])
+            if not success or no_op:
+                continue
+            if lower <= rnd <= latest_round:
+                rounds.add(rnd)
+        if len(rounds) >= threshold:
+            out.append((path, len(rounds)))
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def _format_fixation_breaker_message(
+    fixated: list[tuple[str, int]],
+) -> str:
+    """Compose the fixation-breaker system message.
+
+    Names the fixated file(s) with round counts and steers the LLM
+    toward the code the failing test invokes. Empty when the fixated
+    list is empty; single-file phrasing when there's exactly one.
+    """
+    if not fixated:
+        return ""
+    top = fixated[:3]
+    if len(top) == 1:
+        path, count = top[0]
+        subject = f"`{path}` (edited in {count} recent rounds)"
+    else:
+        subject = "these files (edited in the recent rounds shown): " + ", ".join(
+            f"`{path}` ×{count}" for path, count in top
+        )
+    return (
+        "[Fixation-breaker] You have been repeatedly editing "
+        f"{subject}, but the failing-test count is not going down. "
+        "The bug is very likely NOT in the file(s) you keep patching. "
+        "For this round, do the following BEFORE emitting any patch:\n"
+        "  1. Look at the `Code under test` section (if present) — the "
+        "production symbols named there are what the failing test "
+        "actually invokes. The bug is probably in one of those "
+        "definitions, not in the test or the file you keep touching.\n"
+        "  2. Walk the callers section for the file(s) above. If a "
+        "caller passes different inputs than the test expects, the "
+        "caller — not the file above — is where to patch.\n"
+        "  3. If after tracing you still believe the fix belongs in a "
+        "file above, name a CONCRETE, DIFFERENT hypothesis than the "
+        "previous rounds. Repeating the same-shape edit will not "
+        "converge; emit READ_FILE against a plausible sibling instead "
+        "and stop this round if nothing else is warranted."
+    )
+
+
 async def repair_node(state: AgentState) -> dict[str, Any]:
     """
     Node 4: The Fixer.
@@ -10519,6 +10619,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         promoted_codes=set(state.get("promoted_codes_next_round") or []),
         emit_structured_payload=_emit_structured_payload,
     )
+    # Fix 3 — when a diagnostic points at a test file, surface the
+    # PRODUCTION symbols the test invokes near the failing line. Pytest
+    # tracebacks for direct assertions (``assert x in y``) contain no
+    # non-test frame, so the repair LLM defaults to patching the test.
+    # Grep-verified pointers to the code-under-test bias the LLM toward
+    # fixing the implementation instead.
+    error_summary += _format_production_symbols_under_test(
+        errors, state.get("workspace_path", os.getcwd()),
+    )
 
     gateway = get_gateway()
     if gateway is None:
@@ -10991,6 +11100,34 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
                 pass
+
+        # Fix 4 — fixation-breaker. When the same file has been edited
+        # in ≥3 recent rounds AND the loop has stalled (no_progress ≥2),
+        # the LLM has committed to a wrong-file hypothesis. Inject an
+        # authoritative system message that names the fixated file(s)
+        # and pushes the model to widen the blast radius. Session
+        # cec4d124 burned 9 rounds patching a test file when the bug was
+        # in a production dedup — the modification history was in the
+        # prompt but no signal read it out as "you are stuck on this."
+        _fixated = _detect_fixation_files(
+            loop_counter, threshold=3, window=5,
+        )
+        if _fixated and _no_progress_for_warning >= 2:
+            fixation_warning = _format_fixation_breaker_message(_fixated)
+            if fixation_warning:
+                messages.append(MessageDict(
+                    role="system", content=fixation_warning,
+                ))
+                try:
+                    from harness.observability import emit_event as _emit_fix
+                    _emit_fix(
+                        "repair_fixation_breaker",
+                        fixated_files=[f for f, _ in _fixated],
+                        no_progress_repairs=_no_progress_for_warning,
+                        total_repairs=total_repairs,
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
 
         # Phase 2.2 — inject the reflection verdict as an authoritative
         # system message ahead of the repair prompt. The model that just
@@ -12405,6 +12542,20 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
         )
         state_dict["budget_remaining_usd"] = new_budget
         if summary:
+            # Ground the LLM's "missing X" claims against the workspace.
+            # Prior sessions (2026-07-06 cec4d124) had summaries citing
+            # symbols as missing when they had been added earlier in the
+            # same repair loop. Append a harness correction note when a
+            # claim is contradicted by evidence — do NOT rewrite the LLM
+            # text, so the operator sees both hypothesis and rebuttal.
+            workspace_root = state.get("workspace_path", os.getcwd())
+            correction = _verify_hitl_summary_claims(summary, workspace_root)
+            if correction:
+                summary = summary.rstrip() + "\n\n" + correction
+                logger.info(
+                    "[human_intervention_node] LLM escalation summary "
+                    "contradicted by grep evidence — correction appended.",
+                )
             state_dict["node_state"]["hitl_escalation_summary"] = summary
             logger.info(
                 "[human_intervention_node] LLM escalation summary attached (%d chars).",
@@ -12578,6 +12729,184 @@ def _build_hitl_escalation_summary_prompt(
 
 
 # ---------------------------------------------------------------------------
+# HITL escalation-summary claim grounding
+# ---------------------------------------------------------------------------
+
+# LLM escalation summaries occasionally cite symbols as "missing" or
+# "undefined" that were actually added earlier in the same repair loop
+# — the summary text carries stale round-1 framing forward. We grep the
+# workspace for each cited symbol and, if it's present, append a
+# harness-authored correction so the operator sees hypothesis + rebuttal
+# without the summary being silently rewritten.
+
+# Patterns cover the common LLM phrasings. Each group captures the
+# suspected-missing identifier; we filter to identifier-shaped tokens
+# afterwards to keep noise out (e.g. "the missing 'file'" doesn't grep).
+_HITL_CLAIM_PATTERNS = (
+    re.compile(
+        r"missing\s+(?:function|method|class|module|import|attribute|"
+        r"symbol|definition|name|helper|decorator|fixture)\s+"
+        r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]\s+"
+        r"(?:is\s+)?(?:missing|not\s+defined|undefined|"
+        r"does\s+not\s+exist|is\s+never\s+defined)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:no\s+such|cannot\s+find|could\s+not\s+find|failed\s+to\s+find|"
+        r"unable\s+to\s+find)\s+"
+        r"(?:function|method|class|module|attribute|symbol|import|name)?\s*"
+        r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:add|define|implement|introduce|create)\s+"
+        r"(?:the\s+)?(?:missing\s+)?"
+        r"(?:function|method|class|module|helper)?\s*"
+        r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"undefined\s+(?:reference\s+to|symbol|name)?\s*"
+        r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]",
+        re.IGNORECASE,
+    ),
+)
+
+# Filter list: obvious non-symbol identifiers the LLM tends to backtick
+# incidentally. Keep short — over-filtering hides real claims.
+_HITL_CLAIM_STOPWORDS = frozenset({
+    "true", "false", "none", "null", "self", "cls", "this",
+    "return", "yield", "pass", "async", "await",
+    "file", "path", "line", "test", "tests", "error", "warning",
+    "todo", "fixme", "xxx", "note",
+})
+
+# Directories / extensions to skip during the workspace grep — mirrors
+# the patcher's cross-file scanner.
+_HITL_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", "dist", "build", ".next", ".nuxt", "target", ".cache",
+    "htmlcov", "site-packages",
+})
+_HITL_TEXT_EXTS = frozenset({
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc",
+    ".cpp", ".hpp", ".cs", ".swift",
+})
+
+
+def _extract_hitl_claimed_symbols(summary: str) -> list[str]:
+    """Return identifier-shaped tokens the LLM summary claims are missing/undefined."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for pattern in _HITL_CLAIM_PATTERNS:
+        for match in pattern.finditer(summary):
+            symbol = match.group(1)
+            if not symbol:
+                continue
+            base = symbol.split(".")[0]
+            if not base or not (base[0].isalpha() or base[0] == "_"):
+                continue
+            if base.lower() in _HITL_CLAIM_STOPWORDS:
+                continue
+            if len(base) < 3:
+                continue
+            if symbol not in seen:
+                seen.add(symbol)
+                ordered.append(symbol)
+    return ordered
+
+
+def _grep_symbol_in_workspace(
+    workspace_root: str, symbol: str,
+    *, max_hits: int = 3, max_files_scanned: int = 3000,
+) -> list[tuple[str, int]]:
+    """Return workspace hits for ``symbol`` as a word-boundary match.
+
+    Matches definitions AND references — a hit is enough to contradict a
+    "does not exist" claim; the operator can judge whether the location is
+    the intended definition.
+    """
+    base = symbol.split(".")[0]
+    if not base:
+        return []
+    pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(base) + r"(?![A-Za-z0-9_])")
+    hits: list[tuple[str, int]] = []
+    files_scanned = 0
+    for dirpath, dirnames, filenames in os.walk(workspace_root):
+        dirnames[:] = [d for d in dirnames if d not in _HITL_SKIP_DIRS]
+        for fname in filenames:
+            if files_scanned >= max_files_scanned:
+                return hits
+            ext = os.path.splitext(fname)[1].lower()
+            if ext and ext not in _HITL_TEXT_EXTS:
+                continue
+            path = os.path.join(dirpath, fname)
+            files_scanned += 1
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for lineno, line in enumerate(fh, start=1):
+                        if pattern.search(line):
+                            try:
+                                rel = os.path.relpath(path, workspace_root)
+                            except ValueError:
+                                rel = path
+                            hits.append((rel, lineno))
+                            if len(hits) >= max_hits:
+                                return hits
+                            break
+            except OSError:
+                continue
+    return hits
+
+
+def _verify_hitl_summary_claims(
+    summary: str, workspace_root: str,
+) -> str:
+    """Grep the workspace for symbols the summary claims are missing.
+
+    Returns a correction paragraph to append to the summary (or "" if
+    every claim was consistent with the workspace). The correction lists
+    each contradicted symbol with up to 3 file:line hits so the operator
+    can verify at a glance.
+    """
+    if not summary or not summary.strip():
+        return ""
+    claimed = _extract_hitl_claimed_symbols(summary)
+    if not claimed:
+        return ""
+    # Cap at 5 symbols per summary — beyond that the correction dwarfs
+    # the summary and the LLM's diagnosis is probably too noisy to salvage.
+    claimed = claimed[:5]
+    contradicted: list[tuple[str, list[tuple[str, int]]]] = []
+    for symbol in claimed:
+        try:
+            hits = _grep_symbol_in_workspace(workspace_root, symbol)
+        except OSError:
+            continue
+        if hits:
+            contradicted.append((symbol, hits))
+    if not contradicted:
+        return ""
+    lines = [
+        "[HARNESS CORRECTION — the LLM summary above cites symbols as "
+        "missing/undefined, but grep found them in the workspace. These "
+        "claims are likely stale (added earlier in the repair loop and "
+        "not re-checked). Treat them as invalid; the real root cause is "
+        "probably elsewhere.]",
+    ]
+    for symbol, hits in contradicted:
+        hit_str = ", ".join(f"{p}:{ln}" for p, ln in hits)
+        lines.append(f"  - `{symbol}` is present at: {hit_str}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 5. Helper Utilities
 # ---------------------------------------------------------------------------
 
@@ -12738,6 +13067,250 @@ def _format_structured_diagnostic_payload(
         "above, use this view. Both views show the same underlying data._\n"
         f"```json\n{body}\n```"
     )
+
+
+# ---------------------------------------------------------------------------
+# Production-symbols-under-test hint (Fix 3)
+# ---------------------------------------------------------------------------
+
+# Path fragments and suffixes that identify test files across languages.
+# We treat "the failing frame is in one of these" as a signal to include
+# the code-under-test pointer, since pytest/vitest/etc. often present the
+# assertion at the test-file line with no production frame in the tail.
+_TEST_FILE_FRAGMENTS: tuple[str, ...] = (
+    "/tests/", "\\tests\\", "/test/", "\\test\\",
+    "/__tests__/", "\\__tests__\\", "/spec/", "\\spec\\",
+)
+_TEST_FILE_BASENAME_PATTERN = re.compile(
+    r"(?:^|[/\\])(?:test_[^/\\]+|[^/\\]+_test|[^/\\]+\.test|[^/\\]+\.spec)"
+    r"\.(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt)$",
+    re.IGNORECASE,
+)
+
+# Common identifiers that appear near a failing assertion but aren't
+# production-code symbols worth pointing the LLM at. Kept short —
+# over-filtering hides real usage.
+_TEST_NEUTRAL_IDENTIFIERS: frozenset[str] = frozenset({
+    # Python / pytest
+    "assert", "assertEqual", "assertTrue", "assertFalse", "assertRaises",
+    "pytest", "unittest", "mock", "Mock", "MagicMock", "AsyncMock",
+    "patch", "monkeypatch", "tmp_path", "capsys", "caplog", "fixture",
+    "parametrize", "raises", "approx", "warns", "skip", "skipif",
+    "mark", "usefixtures", "asyncio",
+    # JS / vitest / jest
+    "describe", "it", "test", "expect", "beforeAll", "beforeEach",
+    "afterAll", "afterEach", "vi", "jest", "toBe", "toEqual",
+    "toHaveBeenCalled", "toContain", "toMatch",
+    # Language keywords + common builtins that leak into windows
+    "None", "True", "False", "self", "cls", "this", "await", "async",
+    "def", "class", "return", "yield", "for", "while", "with",
+    "int", "str", "list", "dict", "set", "tuple", "float", "bool",
+    "len", "range", "print", "type", "isinstance", "hasattr",
+    "getattr", "setattr", "map", "filter", "sorted", "reversed",
+    "sum", "min", "max", "any", "all", "abs", "round",
+    "results", "result", "value", "values", "data", "actual",
+    "expected", "output", "input", "response", "request", "client",
+})
+
+
+def _is_test_file(path: str) -> bool:
+    """True when ``path`` looks like a test file (any supported language)."""
+    if not path:
+        return False
+    p = path.replace("\\", "/")
+    if any(frag.replace("\\", "/") in p for frag in _TEST_FILE_FRAGMENTS):
+        return True
+    if _TEST_FILE_BASENAME_PATTERN.search(path):
+        return True
+    return False
+
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _extract_identifiers_near_line(
+    source: str, line: int, *, radius: int = 12,
+) -> list[str]:
+    """Return identifiers appearing within ±``radius`` lines of ``line``.
+
+    Ordered by first appearance in the window; identifiers in
+    :data:`_TEST_NEUTRAL_IDENTIFIERS` are dropped so the caller sees
+    likely production-code names, not pytest scaffolding.
+    """
+    if not source or line < 1:
+        return []
+    lines = source.splitlines()
+    if not lines:
+        return []
+    start = max(0, line - 1 - radius)
+    end = min(len(lines), line - 1 + radius + 1)
+    window = "\n".join(lines[start:end])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in _IDENTIFIER_RE.finditer(window):
+        ident = match.group(0)
+        if len(ident) < 3:
+            continue
+        if ident in _TEST_NEUTRAL_IDENTIFIERS:
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        ordered.append(ident)
+    return ordered
+
+
+# Filesystem filters mirror the patcher's cross-file scanner. Repeating
+# the constants (rather than importing) keeps graph.py free of a
+# patcher-side coupling for a single helper.
+_PROD_SCAN_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", "dist", "build", ".next", ".nuxt", "target", ".cache",
+    "htmlcov", "site-packages",
+})
+_PROD_SCAN_TEXT_EXTS = frozenset({
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".kt", ".rb", ".php",
+})
+
+
+def _grep_production_definitions(
+    workspace_root: str, symbol: str,
+    *, max_hits: int = 2, max_files_scanned: int = 3000,
+) -> list[tuple[str, int, str]]:
+    """Return production-file definition hits for ``symbol``.
+
+    Each hit is ``(rel_path, lineno, kind)`` where ``kind`` is one of
+    ``def``/``class``/``binding``. Excludes files that ``_is_test_file``
+    considers tests, so the returned locations are pointers to the code
+    under test.
+    """
+    if not symbol:
+        return []
+    ident = re.escape(symbol)
+    def_res = (
+        (re.compile(rf"^\s*(?:async\s+)?def\s+{ident}\b"), "def"),
+        (re.compile(rf"^\s*class\s+{ident}\b"), "class"),
+        (re.compile(rf"^(?:export\s+)?(?:async\s+)?function\s+{ident}\b"),
+         "def"),
+        (re.compile(rf"^(?:export\s+)?(?:const|let|var)\s+{ident}\s*="),
+         "binding"),
+        (re.compile(rf"^\s*{ident}\s*=\s*"), "binding"),
+    )
+    hits: list[tuple[str, int, str]] = []
+    files_scanned = 0
+    for dirpath, dirnames, filenames in os.walk(workspace_root):
+        dirnames[:] = [d for d in dirnames if d not in _PROD_SCAN_SKIP_DIRS]
+        for fname in filenames:
+            if files_scanned >= max_files_scanned:
+                return hits
+            ext = os.path.splitext(fname)[1].lower()
+            if ext and ext not in _PROD_SCAN_TEXT_EXTS:
+                continue
+            path = os.path.join(dirpath, fname)
+            try:
+                rel = os.path.relpath(path, workspace_root)
+            except ValueError:
+                rel = path
+            if _is_test_file(rel):
+                continue
+            files_scanned += 1
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for lineno, line in enumerate(fh, start=1):
+                        for regex, kind in def_res:
+                            if regex.match(line):
+                                hits.append((rel, lineno, kind))
+                                if len(hits) >= max_hits:
+                                    return hits
+                                break
+                        else:
+                            continue
+                        break
+            except OSError:
+                continue
+    return hits
+
+
+def _format_production_symbols_under_test(
+    errors: list[DiagnosticObjectDict], workspace_root: str,
+) -> str:
+    """Append production-code pointers when the failing frame is in a test.
+
+    Reads each failing test file at ±12 lines around the reported line,
+    extracts identifiers, and greps for their definitions in production
+    files. Emits a bounded ``## Code under test`` section that biases
+    the repair LLM toward patching the implementation instead of the
+    test — the failure mode observed in session cec4d124 (LLM assumed
+    the test's expectation was wrong when the search dedup in
+    ``EdgarClient.search`` was actually broken).
+    """
+    if not errors or not workspace_root:
+        return ""
+    test_errors: list[DiagnosticObjectDict] = []
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        f = str(err.get("file") or "")
+        line = err.get("line") or 0
+        if not f or not line:
+            continue
+        if _is_test_file(f):
+            test_errors.append(err)
+        if len(test_errors) >= 3:
+            break
+    if not test_errors:
+        return ""
+    sections: list[str] = []
+    for err in test_errors:
+        rel_path = str(err.get("file") or "")
+        line_no = int(err.get("line") or 0)
+        abs_path = os.path.join(workspace_root, rel_path)
+        if not os.path.isfile(abs_path):
+            continue
+        try:
+            with open(abs_path, encoding="utf-8", errors="ignore") as fh:
+                source = fh.read()
+        except OSError:
+            continue
+        idents = _extract_identifiers_near_line(source, line_no)
+        if not idents:
+            continue
+        # Cap the identifiers we grep for so a busy assertion window
+        # doesn't turn into a whole-workspace scan.
+        idents = idents[:6]
+        pointers: list[str] = []
+        for ident in idents:
+            try:
+                hits = _grep_production_definitions(workspace_root, ident)
+            except OSError:
+                continue
+            for hit_path, hit_line, kind in hits:
+                pointers.append(f"  - `{ident}` ({kind}) at {hit_path}:{hit_line}")
+                if len(pointers) >= 6:
+                    break
+            if len(pointers) >= 6:
+                break
+        if pointers:
+            sections.append(
+                f"### {rel_path}:{line_no}\n" + "\n".join(pointers)
+            )
+    if not sections:
+        return ""
+    header = (
+        "\n\n## Code under test (production-code pointers)\n\n"
+        "The failing diagnostics above are located in TEST files. When a "
+        "pytest/vitest/etc. assertion fails directly (e.g. `assert x in "
+        "y`), the traceback shows only the test frame — there is no "
+        "production frame to click through. The pointers below name the "
+        "production symbols the test exercises near the failing line and "
+        "where they are defined. **Default to patching the production "
+        "code, not the test**, unless the test's expectation itself "
+        "contradicts the requirements. Repair loops burn iterations "
+        "when the LLM decides the test is wrong and it isn't.\n"
+    )
+    return header + "\n".join(sections) + "\n"
 
 
 def _format_diagnostics_for_repair(

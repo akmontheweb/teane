@@ -957,17 +957,30 @@ def _try_deps_not_installed(
     if not install_names:
         return None
 
-    # Route through pyproject.toml first when the build command hints
-    # at it — otherwise fall through to requirements.txt.
-    build_cmd = str(diag.get("build_command", "") or "").lower()
-    if "pip install -e" in build_cmd or "pyproject" in build_cmd:
+    # Route on the diag's ``file`` field — set by
+    # ``harness.graph._detect_python_manifest`` to the SAME manifest the
+    # install step reads (root pyproject.toml → root requirements.txt →
+    # first subdir pyproject.toml → first subdir requirements.txt). Prior
+    # code sniffed a ``build_command`` field that the DEPS_NOT_INSTALLED
+    # producer never set, so the pyproject branch was dead and every fix
+    # landed in a root ``requirements.txt`` the install step ignored —
+    # cascading to a 3-round autofix / LLM stall (session on 2026-07-06:
+    # celery missing across 3 attempts even though the autofix "landed"
+    # each round).
+    manifest_hint = str(diag.get("file", "") or "").strip()
+    if manifest_hint.endswith("pyproject.toml"):
         py_result = _try_multiple_deps_pyproject(
-            install_names, workspace_path,
+            install_names, workspace_path, manifest_rel=manifest_hint,
         )
         if py_result is not None:
             return py_result
+        # pyproject.toml on the hint but not on disk (or no
+        # dependencies span) — fall through to requirements.txt.
 
-    manifest_rel = "requirements.txt"
+    if manifest_hint.endswith("requirements.txt"):
+        manifest_rel = manifest_hint
+    else:
+        manifest_rel = "requirements.txt"
     manifest_abs = os.path.join(workspace_path, manifest_rel)
 
     if not os.path.isfile(manifest_abs):
@@ -1025,6 +1038,7 @@ def _try_deps_not_installed(
 
 def _try_multiple_deps_pyproject(
     install_names: list[str], workspace_path: str,
+    *, manifest_rel: str = "pyproject.toml",
 ) -> Optional[PatchBlock]:
     """Batch equivalent of ``_try_missing_dep_pyproject`` for the
     DEPS_NOT_INSTALLED path. Emits a single REPLACE_BLOCK that appends
@@ -1033,8 +1047,12 @@ def _try_multiple_deps_pyproject(
     dependencies list can't be located (pyproject.toml uses a
     non-standard shape) so the caller falls back to
     requirements.txt.
+
+    ``manifest_rel`` picks the target pyproject.toml — defaults to the
+    workspace root but the DEPS_NOT_INSTALLED caller passes a subdir
+    variant (e.g. ``server/pyproject.toml``) when
+    ``_detect_python_manifest`` picked one.
     """
-    manifest_rel = "pyproject.toml"
     manifest_abs = os.path.join(workspace_path, manifest_rel)
     if not os.path.isfile(manifest_abs):
         return None

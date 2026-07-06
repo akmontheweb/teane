@@ -203,3 +203,74 @@ class TestPyprojectBatchAppend:
         assert "flask-cors" in block.replace
         # Duplicate check — ``flask`` still present exactly once.
         assert block.replace.count('"flask"') == 1
+
+
+class TestFileFieldRouting:
+    """Route on the diag's ``file`` field so autofix writes to the SAME
+    manifest the install step reads. Prior routing sniffed a
+    ``build_command`` field the DEPS_NOT_INSTALLED producer never set,
+    so pyproject-based workspaces stalled: autofix would append celery
+    to a root ``requirements.txt`` while the install step ran ``uv pip
+    install -e .`` against pyproject.toml. Multi-round celery-missing
+    stall observed 2026-07-06."""
+
+    def _write_pyproject(self, path, deps_body="") -> None:
+        path.write_text(
+            "[project]\n"
+            'name = "app"\n'
+            "dependencies = [\n"
+            f"{deps_body}"
+            "]\n"
+        )
+
+    def test_pyproject_hint_routes_to_pyproject(self, tmp_path):
+        # Workspace has BOTH pyproject.toml and requirements.txt. The
+        # diag's ``file`` says pyproject, so that's where celery lands.
+        self._write_pyproject(tmp_path / "pyproject.toml")
+        (tmp_path / "requirements.txt").write_text("gunicorn\n")
+        diag = _diag(["celery"])
+        diag["file"] = "pyproject.toml"
+        block = _try_deps_not_installed(diag, str(tmp_path))
+        assert block is not None
+        assert block.file == "pyproject.toml"
+        assert "celery" in block.replace
+
+    def test_subdir_pyproject_hint_routes_to_subdir(self, tmp_path):
+        # Monorepo shape: server/pyproject.toml is the install target.
+        (tmp_path / "server").mkdir()
+        self._write_pyproject(tmp_path / "server" / "pyproject.toml")
+        diag = _diag(["celery"])
+        diag["file"] = "server/pyproject.toml"
+        block = _try_deps_not_installed(diag, str(tmp_path))
+        assert block is not None
+        assert block.file == "server/pyproject.toml"
+        assert "celery" in block.replace
+
+    def test_subdir_requirements_hint_routes_to_subdir(self, tmp_path):
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("gunicorn\n")
+        diag = _diag(["celery"])
+        diag["file"] = "server/requirements.txt"
+        block = _try_deps_not_installed(diag, str(tmp_path))
+        assert block is not None
+        assert block.file == "server/requirements.txt"
+        assert "celery" in block.replace
+
+    def test_pyproject_hint_falls_through_when_file_absent(self, tmp_path):
+        # Hint says pyproject.toml but the file isn't on disk (stale
+        # checkpoint, deleted between diag emission and autofix). Fall
+        # through to requirements.txt at the workspace root.
+        diag = _diag(["celery"])
+        diag["file"] = "pyproject.toml"
+        block = _try_deps_not_installed(diag, str(tmp_path))
+        assert block is not None
+        assert block.file == "requirements.txt"
+
+    def test_missing_file_field_defaults_to_root_requirements(self, tmp_path):
+        # Legacy diag shape without the ``file`` hint — default to
+        # writing a fresh requirements.txt at workspace root.
+        diag = _diag(["celery"])
+        diag.pop("file", None)
+        block = _try_deps_not_installed(diag, str(tmp_path))
+        assert block is not None
+        assert block.file == "requirements.txt"

@@ -5830,6 +5830,59 @@ def _format_test_collection_cascade_section(
     return "\n".join(lines) + "\n"
 
 
+def _format_rewrite_file_noop_directive(rw_noops: dict[str, int]) -> str:
+    """When a file has ≥ 2 consecutive REWRITE_FILE emissions rejected
+    as byte-identical to disk, escalate the "you're in a no-op fixation
+    loop" signal.
+
+    The patcher's per-emission error already says "you emitted what's
+    already there" (see :meth:`TextPatcher.rewrite_file`), but each
+    round the LLM sees only ONE such error and can rationalise it as a
+    one-off. This counter surfaces the persistence — the LLM is told
+    it has tried N REWRITE_FILEs in a row on the same file, none of
+    them changed anything, and its strategy needs to change.
+
+    Session cec4d124 HITL#1 was preceded by 20+ byte-identical
+    REWRITE_FILEs across ~15 files in one repair round; the LLM was
+    convinced the files were correct while the tests kept failing.
+    Neither the patcher's per-file hint nor the diagnostics broke the
+    fixation. This directive is scoped to the exact "I keep saying
+    the file is done" shape — different from
+    ``_format_replace_block_miss_directive`` which targets stale
+    search blocks.
+    """
+    if not rw_noops:
+        return ""
+    stuck = sorted(f for f, n in rw_noops.items() if n >= 2)
+    if not stuck:
+        return ""
+    lines = [
+        "\n## REWRITE_FILE no-op fixation trap",
+        (
+            "You have emitted REWRITE_FILE with byte-identical content "
+            "TWO OR MORE times in a row on the following file(s). Each "
+            "of those was rejected because the content you generated "
+            "matched what was already on disk — the file did not "
+            "change. If the tests are still failing while you keep "
+            "emitting the current content, the bug is NOT in this "
+            "file's current state. Either:\n"
+            "  (a) The failing tests are actually caught by a DIFFERENT "
+            "file — a caller, an import site, a fixture, or a test "
+            "helper. Re-read the failing diagnostic and identify the "
+            "call chain, not just the direct target.\n"
+            "  (b) Your mental model of what this file should contain "
+            "is wrong AND matches what's on disk. Emit a READ_FILE for "
+            "the failing test's assertion + any caller of this file's "
+            "public API, then reason about what SHOULD change.\n"
+            "Do NOT emit another REWRITE_FILE with the same content. "
+            "Affected files (consecutive no-op count in parentheses):"
+        ),
+    ]
+    for f in stuck:
+        lines.append(f"- `{f}` ({rw_noops[f]})")
+    return "\n".join(lines) + "\n"
+
+
 def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     """When a file has ≥ 2 consecutive REPLACE_BLOCK misses, emit a
     directive telling the LLM to break the pattern by using a different
@@ -10635,6 +10688,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     error_summary += _format_replace_block_miss_directive(
         _rb_per_file_raw if isinstance(_rb_per_file_raw, dict) else {}
     )
+    # Sibling directive: REWRITE_FILE no-op fixation. Runs after the
+    # REPLACE_BLOCK section so the two blocks appear back-to-back when
+    # the LLM has both patterns going on the same run.
+    _rw_per_file_raw = loop_counter.get("rewrite_file_no_ops_per_file")
+    error_summary += _format_rewrite_file_noop_directive(
+        _rw_per_file_raw if isinstance(_rw_per_file_raw, dict) else {}
+    )
     # Fix #5: when diagnostics point at test files but the error shape
     # looks like a production-cascade (ImportError / NameError / F821 /
     # ...), prepend a reframe + attach the most likely corresponding
@@ -12227,8 +12287,19 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # operation this round. The next iteration's prompt will direct
         # the LLM to use a different operation on any file at ≥ 2
         # consecutive misses — see _format_replace_block_miss_directive.
+        #
+        # Sibling tracker: ``rewrite_file_no_ops_per_file`` counts
+        # consecutive REWRITE_FILE emissions the patcher rejected as
+        # byte-identical to disk. Session cec4d124 HITL#1 had the LLM
+        # spam 20+ no-op REWRITE_FILEs across ~15 files in a single
+        # round; each individual no-op error already tells the LLM "you
+        # emitted what's already there", but nothing tells it the
+        # pattern is persisting across rounds. This counter drives an
+        # explicit "you're in a no-op fixation loop" directive at ≥ 2.
         _rb_raw = loop_counter.get("replace_block_misses_per_file", {})
         rb_misses: dict[str, int] = dict(_rb_raw) if isinstance(_rb_raw, dict) else {}
+        _rw_raw = loop_counter.get("rewrite_file_no_ops_per_file", {})
+        rw_noops: dict[str, int] = dict(_rw_raw) if isinstance(_rw_raw, dict) else {}
         for r in patch_results:
             op_str = (
                 r.operation.value if hasattr(r.operation, "value") else str(r.operation)
@@ -12241,24 +12312,33 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # ``server/models/__init__.py`` 20+ minutes AFTER a
             # REWRITE_FILE against that same file landed, because the
             # counter still remembered the misses from before the
-            # rewrite. Skip the increment path for rewrite_file too
-            # (there's no such thing as a "rewrite miss" once we're
-            # here — a failed rewrite bubbles up through the normal
-            # patch-failure surface).
+            # rewrite.
             if op_str == "rewrite_file":
                 if r.success and not getattr(r, "no_op", False):
+                    # Real content change — clear both trackers.
                     rb_misses.pop(r.file, None)
+                    rw_noops.pop(r.file, None)
+                elif getattr(r, "no_op", False):
+                    # Byte-identical emit → bump the no-op fixation
+                    # counter. The patcher marked this as failure with
+                    # the "byte-identical" hint; count it so the
+                    # directive can escalate on repeat.
+                    rw_noops[r.file] = rw_noops.get(r.file, 0) + 1
                 continue
             if op_str != "replace_block":
                 continue
             if r.success:
                 rb_misses.pop(r.file, None)
+                # Any successful non-rewrite op on a file means the LLM
+                # broke out of any prior no-op pattern too.
+                rw_noops.pop(r.file, None)
             elif (
                 isinstance(r.error, str)
                 and "not in skill allowlist" not in r.error
             ):
                 rb_misses[r.file] = rb_misses.get(r.file, 0) + 1
         loop_counter["replace_block_misses_per_file"] = rb_misses
+        loop_counter["rewrite_file_no_ops_per_file"] = rw_noops
 
         # Audit §6.4: surface cross-file impact warnings after repair
         # patches too. Best-effort.

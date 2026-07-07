@@ -1342,6 +1342,13 @@ class TextPatcher(BasePatcher):
             )
             # No match even after normalization — fall through to closest-match suggestion.
             suggestion = _find_closest_match(original, search)
+            # Show the LLM the exact delta between what it searched for
+            # and the closest region in the file. When present, this is
+            # the single most actionable signal — it explains WHY the
+            # search missed instead of leaving the LLM to re-derive it
+            # from the raw file window. Empty when the diff would be
+            # misleading (no close match / search too large).
+            diff_prefix = _render_search_miss_diff(original, search)
             # Cross-file grep: if the LLM's search text lives in another
             # file (usually a same-basename sibling), tell it so instead
             # of letting it spin against the wrong target for N rounds.
@@ -1356,6 +1363,7 @@ class TextPatcher(BasePatcher):
                     filepath, len(sibling_hits),
                     ", ".join(f"{p}:{ln}" for p, ln in sibling_hits),
                 )
+            diff_section = f"\n{diff_prefix}\n" if diff_prefix else ""
             return PatchResult(
                 success=False,
                 file=filepath,
@@ -1368,7 +1376,8 @@ class TextPatcher(BasePatcher):
                     f"entire file, or a window around the closest match for "
                     f"larger files). Copy the EXACT lines you want to "
                     f"replace (WITHOUT the line-number prefix `  N| `) into "
-                    f"your next REPLACE_BLOCK's `search:`.\n"
+                    f"your next REPLACE_BLOCK's `search:`."
+                    f"{diff_section}\n"
                     f"Current file content (around closest match):\n{suggestion}"
                     f"{sibling_tail}"
                 ),
@@ -2873,6 +2882,80 @@ def _format_sibling_hits(
             "against the correct path."
         )
     return intro
+
+
+def _render_search_miss_diff(
+    text: str, search: str,
+    *, max_search_lines: int = 30,
+) -> str:
+    """Return a unified-diff view of the LLM's search block vs. the
+    closest matching region of the file, or an empty string when the
+    diff would be uninformative.
+
+    The classic patcher rejection error tells the LLM its search "didn't
+    match" and dumps the current file content. In practice the LLM often
+    already has the file bytes from a prior round but still can't spot
+    the delta between what it typed and what's on disk (session
+    cec4d124: 3 rounds of REPLACE_BLOCK misses on ``tests/test_edgar.py``
+    before HITL escalation). This diff gives it the delta directly —
+    "your search says ``company: Company``, file says ``company_id``" —
+    so it doesn't have to re-derive it from the raw window.
+
+    Skips the diff when:
+      * the search is too large to diff meaningfully (>``max_search_lines``);
+      * no line in the file scores above 0.4 similarity — the "closest"
+        match would be misleading noise, and the caller's line-numbered
+        file window is more useful on its own.
+    """
+    search_lines = search.strip().splitlines()
+    if not search_lines or len(search_lines) > max_search_lines:
+        return ""
+
+    text_lines = text.splitlines()
+    if not text_lines:
+        return ""
+
+    # Anchor on the best-ratio match for the FIRST search line — same
+    # heuristic ``_find_closest_match`` uses. Kept separate so tweaking
+    # one doesn't accidentally rotate the other.
+    first_line = search_lines[0].strip()
+    best_start = -1
+    best_ratio = 0.0
+    for i, line in enumerate(text_lines):
+        ratio = difflib.SequenceMatcher(None, first_line, line.strip()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_start = i
+
+    if best_ratio < 0.4 or best_start < 0:
+        return ""
+
+    # Span the same number of lines as the search block, clamped to the
+    # file. Longer/shorter regions distort the diff — matched line
+    # counts make the delta obvious.
+    span = len(search_lines)
+    region_start = best_start
+    region_end = min(len(text_lines), best_start + span)
+    file_region = text_lines[region_start:region_end]
+
+    # ``ndiff`` produces a per-line comparison with ``- `` / ``+ `` /
+    # ``  `` prefixes that reads well inline — better than unified diff
+    # for tiny regions where hunk headers add noise without value.
+    diff_lines = list(difflib.ndiff(search_lines, file_region))
+    # If every line matches (shouldn't happen since the exact search
+    # didn't match, but paranoid): don't emit noise.
+    if not any(line.startswith(("- ", "+ ")) for line in diff_lines):
+        return ""
+
+    header = (
+        f"Delta between your search block and the closest region in the "
+        f"file (lines {region_start + 1}-{region_end}, similarity "
+        f"{best_ratio:.0%}). ``-`` = your search, ``+`` = current file "
+        f"content; unprefixed lines matched exactly. Fix your search "
+        f"block to reflect the ``+`` lines EXACTLY (including whitespace) "
+        f"before your next REPLACE_BLOCK."
+    )
+    return header + "\n" + "\n".join(diff_lines)
 
 
 def _find_closest_match(text: str, search: str, context: int = 20) -> str:

@@ -249,7 +249,7 @@
     "_test_generation_comment": "Auto-generate stack-specific unit tests for modified source files after patching. enabled=false disables the test_generation_node entirely (the graph still routes through it but it short-circuits). max_iterations caps how many times the LLM may retry generating valid tests before giving up.",
     "test_generation": {
         "enabled": true,
-        "max_iterations": 3
+        "max_iterations": 5
     },
     "_fanout_comment": "Parallel task fan-out across independent workers (used by code-review, doc-review, test variants, discovery follow-ups). max_concurrency caps how many workers run at once; raise on larger machines / hosted-model paths to speed up wide fan-outs, lower to reduce peak RAM or provider rate-limit risk. timeout_seconds is the per-task wall-clock ceiling before an individual worker is cancelled — raise for slow reasoning models, lower to fail-fast on hung workers.",
     "fanout": {

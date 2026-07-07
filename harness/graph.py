@@ -12942,6 +12942,38 @@ def _build_hitl_escalation_summary_prompt(
     # post-mortems. Pulled from compiler_node's snapshot frozen on the
     # first non-zero-exit round; skipped when it duplicates the most
     # recent output (no failure-mode shift). See session db6bfcbe.
+    # Fix G extension — HITL summary path. Mirrors the test-assertion
+    # guardrail in _build_repair_reflection_prompt: when the top compiler
+    # error is a pytest AssertionError inside a test file, the file:line
+    # is the assertion SITE (the anchor), not the fix location. Without
+    # this hint the summariser follows its "cite filenames from the
+    # evidence" instruction literally and recommends editing the test's
+    # assertion to match current behaviour — masking the regression the
+    # loop just failed to fix. Motivating case: FinancialResearch run on
+    # 2026-07-07 where the escalation summary told the operator to change
+    # ``'2024FY'`` → ``'Latest FY'`` in ``test_report_generator.py:64``
+    # when the actual fix belonged in ``report_generator.py``'s
+    # ``_build_metrics_html`` label. Reflection loop had Fix G; the HITL
+    # summariser silently reversed its guidance for the operator.
+    if _top_error_is_test_assertion(errors):
+        test_assertion_hint_block = (
+            "TEST-ASSERTION NOTE — read before writing the recommendation:\n"
+            "  The top persisted error is a pytest assertion inside a test "
+            "file. The file:line above is the assertion SITE (the anchor), "
+            "not where the fix belongs. In almost all cases the fix belongs "
+            "in the implementation module the test exercises — a service, "
+            "model, or helper the test imports and calls. Your recommendation "
+            "MUST point at that implementation file (name it explicitly if "
+            "you can identify it from the test's imports or the substring "
+            "the assertion compared against), NOT at rewriting the test's "
+            "assertion. Only recommend changing the test itself when you "
+            "have strong, specific evidence that the assertion is genuinely "
+            "wrong (bad expectation, typo, off-by-one in fixture data); when "
+            "in doubt, prefer fixing the impl.\n\n"
+        )
+    else:
+        test_assertion_hint_block = ""
+
     first_output = str(node_state.get("first_failure_build_output", "") or "")
     first_cmd = str(node_state.get("first_failure_build_command", "") or "")
     first_round = node_state.get("first_failure_round")
@@ -12987,6 +13019,7 @@ def _build_hitl_escalation_summary_prompt(
         "the recent tail, the FIRST-ROUND error is almost always the real "
         "root cause — later rounds just expose downstream symptoms once the "
         "original problem is bypassed or papered over.\n\n"
+        f"{test_assertion_hint_block}"
         f"Trigger: {trigger_reason}\n"
         f"Repair iterations spent: {loop_counter.get('total_repairs', 0)}\n"
         f"Consecutive zero-patch rounds: {loop_counter.get('consecutive_zero_patch_rounds', 0)}\n"

@@ -3955,6 +3955,103 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # initial response and any continuation cycles above —
             # without it the patcher would only ever see the first
             # truncated slice when finish_reason was "length".
+
+            # READ_FILE inline resolve: if the LLM emitted the DSL
+            # <<<READ_FILE>>> blocks (either alone or alongside patch
+            # blocks), resolve them here without consuming a patching
+            # round. Mirrors repair_node so the format contract in the
+            # system prompt ("READ_FILE does NOT consume a repair-loop
+            # slot") is honoured in patching_node too — otherwise a
+            # legitimate READ_FILE-first turn at story entry (model
+            # has never seen the scoped files) trips
+            # consecutive_zero_patch_rounds and escalates to HITL.
+            from harness.patcher import (
+                parse_patch_blocks as _parse_patch_blocks,
+                parse_read_blocks as _parse_read_blocks,
+                strip_read_blocks as _strip_read_blocks,
+            )
+            _READ_FILE_MAX_RESOLVES = 2
+            for _resolve_round in range(_READ_FILE_MAX_RESOLVES):
+                read_reqs = _parse_read_blocks(combined_response_text)
+                if not read_reqs:
+                    break
+                messages.append(MessageDict(
+                    role="assistant", content=combined_response_text,
+                ))
+                resolution = _resolve_read_blocks(
+                    read_reqs, workspace,
+                    record_hashes_into=tool_files_seen,
+                )
+                messages.append(MessageDict(role="user", content=resolution))
+                logger.info(
+                    "[patching_node] READ_FILE resolved for %d file(s): %s. "
+                    "Re-dispatching without consuming an iteration.",
+                    len(read_reqs), [r[0] for r in read_reqs],
+                )
+                response, new_budget = await _patching_dispatch(
+                    messages, new_budget,
+                )
+                combined_response_text = response.content or ""
+
+            # Forced-patch escape valve: if the post-cap response is
+            # STILL a READ_FILE-only emission with no parseable
+            # patches, spend one more dispatch with an explicit
+            # "no more READ_FILE, patch now" prompt so the model is
+            # forced to commit. Without this, a model that kept
+            # asking for files would burn a whole patching round on
+            # zero patches — the exact stall that trips
+            # consecutive_zero_patch_rounds.
+            _post_cap_reads = _parse_read_blocks(combined_response_text)
+            if _post_cap_reads:
+                _stripped_preview = _strip_read_blocks(combined_response_text)
+                if not _parse_patch_blocks(_stripped_preview):
+                    logger.info(
+                        "[patching_node] READ_FILE cap hit and post-cap "
+                        "response carries %d more READ_FILE block(s) with "
+                        "no patches (%s). Issuing forced-patch retry.",
+                        len(_post_cap_reads),
+                        [r[0] for r in _post_cap_reads],
+                    )
+                    messages.append(MessageDict(
+                        role="assistant", content=combined_response_text,
+                    ))
+                    messages.append(MessageDict(
+                        role="user",
+                        content=(
+                            "[Forced-patch] Your READ_FILE budget for this "
+                            "patching iteration is exhausted. The harness "
+                            "will IGNORE any further READ_FILE blocks. "
+                            "Based on the files you have already been "
+                            "shown above, emit your best-guess patches "
+                            "NOW using REPLACE_BLOCK / CREATE_FILE / "
+                            "DELETE_BLOCK / INSERT_AT_BLOCK only. If you "
+                            "are uncertain, favour the narrowest "
+                            "plausible fix — a near-miss patch is more "
+                            "useful than zero patches. No prose, no "
+                            "READ_FILE, no markdown."
+                        ),
+                    ))
+                    response, new_budget = await _patching_dispatch(
+                        messages, new_budget,
+                    )
+                    combined_response_text = response.content or ""
+                    try:
+                        from harness.observability import emit_event
+                        emit_event(
+                            "patching_forced_patch_retry",
+                            unresolved_read_files=[
+                                r[0] for r in _post_cap_reads
+                            ],
+                            story_id=state.get("current_story_id") or "",
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry must not block
+                        pass
+
+            # Strip any residual READ_FILE blocks so the patcher and
+            # the test-block filter don't try to parse them as
+            # patches, and so commit messages stay clean.
+            combined_response_text = _strip_read_blocks(combined_response_text)
+
             filtered_response, dropped_test_blocks = (
                 _filter_test_blocks_from_patch_response(combined_response_text)
             )
@@ -4130,6 +4227,26 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # excluded) to avoid false escalations while still catching the
         # "LLM re-emitting already-applied patches" masking pattern.
         current_story_id = state.get("current_story_id") or ""
+        # Story-boundary reset for the GLOBAL zero-patch counter.
+        # The per-story counter (``story_zero_patch_rounds[story_key]``)
+        # is naturally fresh when a new story starts, but the global
+        # counter would otherwise carry over — so a single stall on
+        # story N (e.g. a no-op idempotency patch) followed by a
+        # legitimate READ_FILE-first turn on story N+1 (model has
+        # never seen the newly-scoped files) would trip the ≥2
+        # HITL threshold spuriously. Reset here so each story gets
+        # its own two-strike budget on the global counter too. See
+        # graph.py:route_after_patching / cli.py:zero_patch_loop
+        # for the escalation path this feeds.
+        _last_patching_story = loop_counter.get("last_patching_story_id")
+        if (
+            current_story_id
+            and _last_patching_story
+            and _last_patching_story != current_story_id
+        ):
+            loop_counter["consecutive_zero_patch_rounds"] = 0
+        if current_story_id:
+            loop_counter["last_patching_story_id"] = current_story_id
         if real_success_count == 0:
             loop_counter["consecutive_zero_patch_rounds"] = (
                 loop_counter.get("consecutive_zero_patch_rounds", 0) + 1

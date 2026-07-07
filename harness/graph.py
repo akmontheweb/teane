@@ -3987,8 +3987,20 @@ Generate your patches NOW. Only the blocks above. No other text."""
         if not _resp_tool_calls:
             messages.append(MessageDict(role="assistant", content=response.content))
 
-        # Report patch application results
+        # Report patch application results.
+        # ``real_success_count`` excludes resume-safe idempotency no-ops
+        # (patcher returned success=True with no_op=True — file already
+        # at target state). The stall tripwires and the Layer-3
+        # no_progress marker must gate on REAL progress; without this
+        # the LLM can mask a stuck loop by re-emitting already-applied
+        # CREATE_FILE / REPLACE_BLOCK / DELETE_BLOCK patches and the
+        # zero-patch counter never advances (repair_node was fixed for
+        # this at line ~12099; patching_node was the sibling bug).
         success_count = sum(1 for r in patch_results if r.success)
+        no_op_count = sum(
+            1 for r in patch_results if r.success and getattr(r, "no_op", False)
+        )
+        real_success_count = success_count - no_op_count
         fail_count = len(patch_results) - success_count
         # Carve out allowlist rejections from generic failures so the next
         # repair iteration sees the exact paths and reason — without this,
@@ -4018,6 +4030,15 @@ Generate your patches NOW. Only the blocks above. No other text."""
         ][:5]
         if success_count > 0:
             status_msg = f"[System]: Applied {success_count}/{len(patch_results)} patches successfully."
+            if no_op_count > 0:
+                # Mirror repair_node's messaging: the LLM must see that
+                # some/all of its "applied" patches were idempotency
+                # no-ops so it doesn't count them as real progress on
+                # the next round.
+                status_msg += (
+                    f" {no_op_count} were idempotency no-ops (target file "
+                    f"already at expected state — no actual change made)."
+                )
             if fail_count > 0:
                 failed_files = [r.file for r in patch_results if not r.success]
                 status_msg += f" Failed on: {', '.join(failed_files)}."
@@ -4075,12 +4096,15 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # Layer 3 — global no-progress failsafe. Snapshot the budget at
         # the last moment patching produced progress; route_after_patching
         # / route_after_compiler escalate to HITL when spend since that
-        # marker exceeds the threshold.
+        # marker exceeds the threshold. Gate on ``real_success_count``
+        # so idempotency no-ops (LLM re-emitting already-applied patches)
+        # cannot spoof forward progress and rewind the no-progress
+        # marker.
         from harness.no_progress import update_and_check as _np_update_and_check
         _np_update_and_check(
             loop_counter,
             budget_remaining_usd=new_budget,
-            progress_made=(success_count > 0),
+            progress_made=(real_success_count > 0),
             threshold_usd=float(
                 state.get("no_progress_budget_usd") or 1.50
             ),
@@ -4102,10 +4126,11 @@ Generate your patches NOW. Only the blocks above. No other text."""
         #   story_loop_node when every story is vacuous.
         # - Monolithic mode: only the global counter exists.
         #
-        # Both counters reset on a successful patch round to avoid
-        # false escalations triggered by a long-tail single-story stall.
+        # Both counters reset on a REAL successful patch round (no-ops
+        # excluded) to avoid false escalations while still catching the
+        # "LLM re-emitting already-applied patches" masking pattern.
         current_story_id = state.get("current_story_id") or ""
-        if success_count == 0:
+        if real_success_count == 0:
             loop_counter["consecutive_zero_patch_rounds"] = (
                 loop_counter.get("consecutive_zero_patch_rounds", 0) + 1
             )
@@ -4117,10 +4142,14 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # and no amount of retry will get it back on track without either
         # a rewire or operator intervention. Escalates to HITL faster than
         # the generic zero-patch counter — see route_after_compiler.
+        # ``real_success_count`` gates this too so a batch of no-ops +
+        # some allowlist rejections doesn't get spuriously classified as
+        # a real success and reset the counter.
+        _non_success = len(patch_results) - success_count
         all_rejected_by_allowlist = (
-            success_count == 0
+            real_success_count == 0
             and len(patch_results) > 0
-            and len(allowlist_rejections) == fail_count
+            and len(allowlist_rejections) == _non_success
         )
         if all_rejected_by_allowlist:
             loop_counter["consecutive_all_allowlist_rejected_rounds"] = (
@@ -4130,7 +4159,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             loop_counter["consecutive_all_allowlist_rejected_rounds"] = 0
         if current_story_id:
             sz = dict(loop_counter.get("story_zero_patch_rounds", {}) or {})
-            if success_count == 0:
+            if real_success_count == 0:
                 sz[current_story_id] = int(sz.get(current_story_id, 0) or 0) + 1
             else:
                 sz[current_story_id] = 0
@@ -9675,11 +9704,26 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
 # consult to short-circuit to HITL. Any signal of real forward progress
 # (green build, successful code_review re-patch, successful patching
 # round) invalidates them: the loop is by definition NOT stuck any more.
+#
+# ``no_progress_repairs`` sits in this list because ``route_after_
+# compiler`` (line ~14138) escalates to HITL when it reaches
+# ``max_iterations`` — same stale-counter false positive as
+# ``consecutive_zero_patch_rounds`` before commit 5c47b81. Repair_node
+# resets it inline when a round shrinks the fingerprint set, but a
+# green compile / code_review re-patch bypasses repair_node entirely
+# and would otherwise leave the counter at its pre-progress value; on
+# the next compile fail the router re-fires HITL without a repair
+# round ever running.
+# ``cheap_shots_taken`` sits here for the same reason at a smaller
+# scale — see :func:`_reset_stall_tripwires_on_progress` docstring for
+# the cost story.
 _STALL_TRIPWIRE_KEYS: tuple[str, ...] = (
     "consecutive_zero_patch_rounds",
     "consecutive_all_allowlist_rejected_rounds",
     "consecutive_distraction_rounds",
     "consecutive_low_signal_rounds",
+    "no_progress_repairs",
+    "cheap_shots_taken",
 )
 
 
@@ -9701,9 +9745,17 @@ def _reset_stall_tripwires_on_progress(loop_counter: dict[str, Any]) -> None:
 
     Mirrors the reset ``patching_node`` (graph.py ~L4113) and
     ``repair_node`` (graph.py ~L11998) already do inline on
-    ``success_count > 0``; extracted here so the two out-of-loop reset
-    sites (compiler + code_review) share the same key list and rationale
-    and future tripwire additions land in exactly one place.
+    ``real_success_count > 0``; extracted here so the two out-of-loop
+    reset sites (compiler + code_review) share the same key list and
+    rationale and future tripwire additions land in exactly one place.
+
+    ``cheap_shots_taken`` reset here is the "one-and-done cost fix"
+    (audit finding #7): the counter otherwise accumulates across the
+    whole session, so a session that spent 4 cheap rounds on failure
+    #1 immediately escalates to the reasoning model on the first
+    attempt of failure #2 even though the intervening green build
+    proves the earlier stretch of cheap-model burn was resolved. A
+    fresh failure episode should get a fresh cheap-shot budget.
     """
     for key in _STALL_TRIPWIRE_KEYS:
         loop_counter[key] = 0
@@ -17086,18 +17138,44 @@ Generate the patches that address every finding below. Output only the blocks �
         allowed_paths=allowed_paths,
     )
     success_count = sum(1 for r in patch_results if r.success)
-    repatched = success_count > 0
+    no_op_count = sum(
+        1 for r in patch_results if r.success and getattr(r, "no_op", False)
+    )
+    real_success_count = success_count - no_op_count
+    # ``repatched`` gates whether the router re-runs compiler_node. If
+    # every "success" was an idempotency no-op the workspace is
+    # byte-identical to what compiler_node last saw, so re-running the
+    # build would burn ~20s of sandbox time to produce the same result.
+    # Only real content changes count as re-patched.
+    repatched = real_success_count > 0
 
     logger.info(
-        "[code_review] Findings=%d, re-patched=%d/%d files (success=%s).",
-        len(findings), success_count, len(patch_results), repatched,
+        "[code_review] Findings=%d, re-patched=%d/%d files "
+        "(real_success=%d, no_ops=%d, success=%s).",
+        len(findings), success_count, len(patch_results),
+        real_success_count, no_op_count, repatched,
     )
 
     # Successful code_review re-patch is forward progress — reset the
     # router's stall tripwires the same way ``compiler_node`` does on a
-    # green build. See :func:`_reset_stall_tripwires_on_progress`.
-    if success_count > 0:
+    # green build. Gate on ``real_success_count`` (no-ops excluded) so
+    # a reviewer re-patch that lands ONLY idempotent no-ops doesn't
+    # falsely wipe the counters that track a genuine stall.
+    if real_success_count > 0:
         _reset_stall_tripwires_on_progress(loop_counter)
+        # Layer 3 no_progress marker also has to advance on real
+        # forward progress — otherwise the failsafe stays anchored to
+        # the pre-review budget and can trip early on a session that
+        # just landed real changes.
+        from harness.no_progress import update_and_check as _np_update_and_check
+        _np_update_and_check(
+            loop_counter,
+            budget_remaining_usd=new_budget,
+            progress_made=True,
+            threshold_usd=float(
+                state.get("no_progress_budget_usd") or 1.50
+            ),
+        )
 
     # Audit #18 — record any files this node mutated since the last green
     # compile. The router consults this set before terminal exit. Existing
@@ -17124,6 +17202,8 @@ Generate the patches that address every finding below. Output only the blocks �
             "repatched": repatched,
             "findings_count": len(findings),
             "repatch_success": success_count,
+            "repatch_real_success": real_success_count,
+            "repatch_no_ops": no_op_count,
             "repatch_total": len(patch_results),
         },
     }
@@ -19020,12 +19100,23 @@ async def _reset_stale_gate_counters_on_resume(
         return
     values = getattr(state, "values", None) or {}
     loop_counter = dict(values.get("loop_counter", {}) or {})
+    # Kept in sync with :func:`harness.cli._reset_hitl_trip_counters`
+    # (the auto-resume path's equivalent) so a headless auto-resume and
+    # a ``teane resume`` produce the same fresh-repair-budget state.
+    # ``consecutive_all_allowlist_rejected_rounds`` — omitted pre-
+    # 2026-07-07 — would otherwise re-trip route_after_compiler's ≥ 2
+    # HITL guard on the first resumed round.
+    # ``cheap_shots_taken`` — omitted pre-2026-07-07 — would otherwise
+    # burn the reasoning model on round 1 unnecessarily even though
+    # the operator's resume grants a fresh cheap-shot budget.
     gate_keys = (
         "consecutive_zero_patch_rounds",
+        "consecutive_all_allowlist_rejected_rounds",
         "no_progress_repairs",
         "consecutive_distraction_rounds",
         "consecutive_low_signal_rounds",
         "missing_dep_consecutive_same",
+        "cheap_shots_taken",
     )
     before = {k: int(loop_counter.get(k, 0) or 0) for k in gate_keys}
     if not any(before.values()):
@@ -19222,10 +19313,32 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
     # total_repairs = max-1 → one more repair attempt before HITL re-triggers.
     next_total = max(0, max_repair - 1)
 
+    # Preserve the diagnostic trackers that the [r] Resume branch of
+    # hitl_menu_loop deliberately keeps alive across HITL resume
+    # (``replace_block_misses_per_file``,
+    # ``rewrite_file_no_ops_per_file``,
+    # ``judge_persistent_files_last_round``,
+    # ``missing_dep_last_symbol``, ``file_modification_history``, ...).
+    # The pre-2026-07-07 rewind wiped ``loop_counter`` down to the 4
+    # iteration counters, which destroyed those trackers — so a
+    # ``teane resume`` after ``[s] Save & Quit`` started fresh without
+    # the "use a different operation" / persistent-blocker directives
+    # and the LLM's first post-resume round could walk right back into
+    # the same REPLACE_BLOCK/REWRITE_FILE pattern the operator
+    # suspended to escape (sessions 2d0164f0 / 19b28eff called out in
+    # cli.py:2810). ``_reset_iteration_counters`` is the shared helper
+    # both paths now use.
+    from harness.cli import _reset_iteration_counters as _reset_iters
+    prior_loop_counter = values.get("loop_counter") if isinstance(values, dict) else None
+    next_loop_counter = _reset_iters(
+        prior_loop_counter, total_repairs=next_total,
+    )
+
     logger.info(
         "[run_graph] Resume rewind: prior session ended via Save & Quit. "
-        "Clearing hitl_suspend and resetting loop counter (total_repairs=%d) "
-        "so the graph re-enters compiler_node.",
+        "Clearing hitl_suspend and resetting iteration counters "
+        "(total_repairs=%d) so the graph re-enters compiler_node. "
+        "Diagnostic trackers preserved across resume.",
         next_total,
     )
 
@@ -19234,12 +19347,7 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
             config,
             {
                 "node_state": cleared,
-                "loop_counter": {
-                    "patching": 0,
-                    "repair": 0,
-                    "compiler": 0,
-                    "total_repairs": next_total,
-                },
+                "loop_counter": next_loop_counter,
             },
             as_node="human_intervention_node",
         )

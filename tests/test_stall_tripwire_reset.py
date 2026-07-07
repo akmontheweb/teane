@@ -44,28 +44,41 @@ class TestResetHelper:
             "consecutive_all_allowlist_rejected_rounds": 2,
             "consecutive_distraction_rounds": 5,
             "consecutive_low_signal_rounds": 3,
-            # Non-tripwire counters must NOT be touched — the fix is
-            # scoped to "the loop is stuck" signals, not general
-            # bookkeeping like total_repairs / cheap_shots_taken.
+            "no_progress_repairs": 2,
+            "cheap_shots_taken": 3,
+            # Non-tripwire counters must NOT be touched — the reset
+            # scope is "the loop is stuck" signals, not general
+            # bookkeeping like total_repairs or session-wide state.
             "total_repairs": 7,
-            "cheap_shots_taken": 2,
+            "replace_block_misses_per_file": {"foo.py": 2},
         }
         _reset_stall_tripwires_on_progress(loop_counter)
 
         for key in _STALL_TRIPWIRE_KEYS:
             assert loop_counter[key] == 0, f"tripwire {key} not reset"
         assert loop_counter["total_repairs"] == 7
-        assert loop_counter["cheap_shots_taken"] == 2
+        # Diagnostic trackers are preserved: they drive the "use a
+        # different operation" / "no-op fixation" directives whose
+        # value bridges HITL resume — the whole point of not wiping
+        # them (cli.py:2810 rationale). Green build resets the counter
+        # tripwires but not those per-file diagnostic histories.
+        assert loop_counter["replace_block_misses_per_file"] == {"foo.py": 2}
 
-    def test_key_set_covers_the_four_router_tripwires(self):
+    def test_key_set_covers_the_six_router_tripwires(self):
         # Explicit list guards future refactors: if the counter set
         # changes without a corresponding fix to the reset helper, this
-        # test flags the drift.
+        # test flags the drift. Extended 2026-07-07 to include
+        # ``no_progress_repairs`` (route_after_compiler line ~14138
+        # HITL gate) and ``cheap_shots_taken`` (cost-fix so a fresh
+        # failure episode gets a fresh cheap-shot budget) — see audit
+        # findings #3 and #7.
         assert set(_STALL_TRIPWIRE_KEYS) == {
             "consecutive_zero_patch_rounds",
             "consecutive_all_allowlist_rejected_rounds",
             "consecutive_distraction_rounds",
             "consecutive_low_signal_rounds",
+            "no_progress_repairs",
+            "cheap_shots_taken",
         }
 
     def test_absent_keys_are_added_as_zero(self):

@@ -3337,14 +3337,27 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             # choose ``q`` (abandon) so the graph exits with the
             # budget-terminated marker set on state, and cmd_build
             # returns the ``budget_exhausted`` exit code (3).
-            if trigger == "budget_exhausted":
+            # Budget-family triggers: BOTH ``budget_exhausted`` (raw
+            # cap hit mid-dispatch) and ``budget_preflight`` (the
+            # ``BudgetTooLowError`` gate that fires before repair_node
+            # even dispatches — see graph.py where BudgetTooLowError
+            # is raised) must terminate instead of auto-resuming. The
+            # auto-resume path resets HITL trip counters but leaves
+            # ``budget_remaining_usd`` at 0, so the next dispatch/
+            # preflight check re-hits the same wall and the loop
+            # grinds at ~10 events/sec until the process is killed
+            # externally (session 4754c913 for budget_exhausted;
+            # budget_preflight was the sibling gap flagged by the
+            # 2026-07-07 repair-loop audit).
+            if trigger in {"budget_exhausted", "budget_preflight"}:
                 choice = "q"
                 auto_resumed_this_round = False
                 logger.warning(
-                    "[HITL] budget_exhausted in headless mode — "
-                    "terminating instead of auto-resuming (spending "
-                    "more requires an operator to raise "
-                    "token_budget.hard_cap_usd or press [b])."
+                    "[HITL] %s in headless mode — terminating instead "
+                    "of auto-resuming (spending more requires an "
+                    "operator to raise token_budget.hard_cap_usd or "
+                    "press [b]).",
+                    trigger,
                 )
                 node_state["budget_terminated"] = True
                 state["node_state"] = node_state

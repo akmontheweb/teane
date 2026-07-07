@@ -7044,6 +7044,102 @@ _MISSING_MODULE_PATTERNS = (
 )
 
 
+def _promote_module_not_found_diagnostics(
+    diagnostics: list[dict[str, Any]],
+    workspace_path: str,
+    build_command: str,
+) -> int:
+    """Rewrite pytest-surfaced ``ModuleNotFoundError`` / ``ImportError``
+    diagnostics into ``MISSING_DEP`` shape so ``_try_missing_dep``
+    (autofix R4) can consume them without an LLM round.
+
+    Session symptom (user-reported 2026-07-07): pytest hit
+    ``ModuleNotFoundError: No module named 'sqlalchemy'`` while
+    collecting ``backend/core/db.py:9``. The parser stamped the diag as
+    ``error_code=ModuleNotFoundError`` (from the exception type at
+    parser_registry.py:395) with an empty ``missing_symbol``. The
+    compiler_node MISSING_DEP synthesis at line ~9426 is gated on
+    ``not compiler_errors`` — so pytest-surfaced module-miss diags
+    bypass autofix entirely and the LLM handles them, poorly. This
+    promoter fills the gap.
+
+    Broad by design: any top-level module name that is NOT a workspace
+    source directory gets promoted, without an ``_PIP_INSTALLABLE_
+    SYMBOLS`` whitelist gate. Rationale — PyPI resolution failure at
+    ``pip install`` is a strictly better UX than the LLM burning 3
+    rounds patching an unrelated source file because autofix silently
+    skipped its input. Workspace-source names are excluded because
+    those are ``sys.path`` / PYTHONPATH bugs, not dep gaps
+    (see :func:`_missing_module_matches_workspace_source` for the
+    session 3193a24f rationale).
+
+    Mutates ``diagnostics`` in place. Returns the number of diags
+    promoted (0 when nothing matched, for logging).
+    """
+    if not diagnostics:
+        return 0
+    project_names = _project_top_level_names(workspace_path) if workspace_path else set()
+    # Only Python-shaped exceptions carry pip-installable module names.
+    # TypeScript's ``TS2307`` follows a different classifier and Node's
+    # ``Cannot find module`` is handled by autofix R7 (_try_missing_npm_dep).
+    promotable_codes = {"ModuleNotFoundError", "ImportError"}
+    promoted = 0
+    for diag in diagnostics:
+        code = str(diag.get("error_code", "") or "")
+        if code not in promotable_codes:
+            continue
+        message = str(diag.get("message", "") or "")
+        # Extract the missing module name from the standard shape
+        # ``ModuleNotFoundError: No module named 'X'`` or
+        # ``ImportError: cannot import name 'Y' from 'X'``. The first
+        # pattern in _MISSING_MODULE_PATTERNS matches both.
+        match = None
+        for pat in _MISSING_MODULE_PATTERNS:
+            match = pat.search(message)
+            if match:
+                break
+        if not match:
+            continue
+        raw_name = match.group(1).strip()
+        if not raw_name:
+            continue
+        # Top-level segment only. ``sys.path`` resolution keys on the
+        # leading segment, so ``sqlalchemy.orm`` and ``sqlalchemy``
+        # both need ``pip install sqlalchemy`` — and a workspace
+        # source dir ``server/`` matches ``server.app.config`` too.
+        top = raw_name.split(".", 1)[0]
+        if not top:
+            continue
+        # Workspace-source name → PATH/CWD/PYTHONPATH bug, not a dep
+        # miss. Leave the diag alone so the reflection judge and repair
+        # LLM keep the file/line context and steer toward the real
+        # fix (build_command / test-runner CWD / conftest layout).
+        if top in project_names:
+            continue
+        # Promotion: overwrite the exception-type code with MISSING_DEP
+        # and populate the structured fields _try_missing_dep +
+        # route_after_compiler read. File/line stay intact so the
+        # repair prompt still surfaces where the import failed.
+        diag["error_code"] = "MISSING_DEP"
+        diag["missing_symbol"] = top
+        diag["miss_kind"] = "python"
+        diag["build_command"] = build_command
+        # Preserve the original exception type in semantic_context so
+        # nothing downstream that grepped for "ModuleNotFoundError" is
+        # blind — Python's typed exception is useful signal for the
+        # LLM even when we've promoted the diag class.
+        existing_ctx = str(diag.get("semantic_context", "") or "").strip()
+        promo_note = (
+            f"Promoted from {code} (top-level module '{top}' is not a "
+            f"workspace source directory — treating as pip-installable dep)."
+        )
+        diag["semantic_context"] = (
+            f"{existing_ctx}\n{promo_note}" if existing_ctx else promo_note
+        )
+        promoted += 1
+    return promoted
+
+
 def _missing_module_matches_workspace_source(
     diagnostics: list[dict[str, Any]], workspace_path: str,
 ) -> Optional[str]:
@@ -9378,6 +9474,24 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         exit_code,
         len(compiler_errors),
     )
+
+    # Promote pytest-surfaced ``ModuleNotFoundError`` diagnostics to
+    # MISSING_DEP so ``_try_missing_dep`` (autofix R4) can consume them.
+    # The env-misconfig synthesis further down (line ~9426+) is gated
+    # on ``not compiler_errors``, so any test-collection-surface module
+    # miss would otherwise bypass autofix entirely and burn LLM rounds
+    # on a mechanical fix. See :func:`_promote_module_not_found_
+    # diagnostics` for the workspace-source exclusion rationale.
+    if compiler_errors:
+        promoted = _promote_module_not_found_diagnostics(
+            compiler_errors, workspace, build_cmd,
+        )
+        if promoted:
+            logger.info(
+                "[compiler_node] Promoted %d ModuleNotFoundError diagnostic(s) "
+                "to MISSING_DEP so autofix can consume them.",
+                promoted,
+            )
 
     # Detect "sandbox is missing a required runtime" failures and split into
     # two routes:

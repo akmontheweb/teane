@@ -9606,8 +9606,54 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             return_dict["batch_gate_progress"] = _mark_batch_gate(
                 state, "compile_passed",
             )
+        # Green build is definitive proof the previously-stuck state is
+        # unstuck. Wipe the stall tripwires so a downstream
+        # code_review-triggered recompile doesn't re-fire HITL on a stale
+        # counter carried over from before this green pass. See
+        # :func:`_reset_stall_tripwires_on_progress` for the rationale.
+        _reset_stall_tripwires_on_progress(loop_counter)
 
     return return_dict
+
+
+# Keys wiped by :func:`_reset_stall_tripwires_on_progress`. Every counter
+# here is a "how many rounds in a row has this bad pattern persisted"
+# tripwire that ``route_after_compiler`` / ``route_after_patching``
+# consult to short-circuit to HITL. Any signal of real forward progress
+# (green build, successful code_review re-patch, successful patching
+# round) invalidates them: the loop is by definition NOT stuck any more.
+_STALL_TRIPWIRE_KEYS: tuple[str, ...] = (
+    "consecutive_zero_patch_rounds",
+    "consecutive_all_allowlist_rejected_rounds",
+    "consecutive_distraction_rounds",
+    "consecutive_low_signal_rounds",
+)
+
+
+def _reset_stall_tripwires_on_progress(loop_counter: dict[str, Any]) -> None:
+    """Zero the router's stall tripwires in place because forward
+    progress just happened.
+
+    Called by ``compiler_node`` on ``exit_code == 0`` and by
+    ``code_review_node`` when the re-patch pass lands ≥1 real patch.
+    Both events prove the loop is not stuck any more, so the counters
+    that would otherwise short-circuit to HITL should reset.
+
+    Fix for session cec4d124 HITL#4: ``consecutive_zero_patch_rounds``
+    carried its ``2`` across HITL#3 resume → green compile → code_review
+    re-patch (3/3 files) → compile-fail. ``route_after_compiler`` saw
+    the stale ``2`` and escalated to HITL despite the intervening real
+    progress. The reset now fires on both green build and code_review
+    re-patch so the counter cannot survive a period of visible progress.
+
+    Mirrors the reset ``patching_node`` (graph.py ~L4113) and
+    ``repair_node`` (graph.py ~L11998) already do inline on
+    ``success_count > 0``; extracted here so the two out-of-loop reset
+    sites (compiler + code_review) share the same key list and rationale
+    and future tripwire additions land in exactly one place.
+    """
+    for key in _STALL_TRIPWIRE_KEYS:
+        loop_counter[key] = 0
 
 
 def _repair_budget_warning(total_repairs: int, cap: int) -> Optional[str]:
@@ -13877,9 +13923,19 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # specific reason so the operator knows what to fix manually.
     consecutive_zero = int(loop_counter.get("consecutive_zero_patch_rounds", 0))
     if consecutive_zero >= 2 and not has_autofixable:
+        # This counter is reset on every green compile
+        # (``compiler_node`` exit=0 branch) and on every successful
+        # code_review re-patch (see ``code_review_node``), so seeing
+        # ≥2 here means the last two patcher-touching rounds both
+        # landed zero real patches AND no green compile intervened —
+        # a genuine stall, not a stale counter carried over from
+        # earlier in the session. See session cec4d124 for the
+        # scenario the resets were added to fix.
         logger.warning(
-            "[router] %d consecutive repair iteration(s) landed zero patches. "
-            "Loop is stuck; routing to HITL early (saves %d remaining iteration(s)).",
+            "[router] Last %d patching/repair round(s) landed zero real "
+            "patches AND the current diagnostics have no autofix path. "
+            "Routing to HITL early (saves %d remaining repair iteration(s)) "
+            "— further LLM rounds on this stall would just burn budget.",
             consecutive_zero, max(0, max_iterations - total_repairs),
         )
         return _transition("human_intervention_node")
@@ -16956,6 +17012,12 @@ Generate the patches that address every finding below. Output only the blocks �
         "[code_review] Findings=%d, re-patched=%d/%d files (success=%s).",
         len(findings), success_count, len(patch_results), repatched,
     )
+
+    # Successful code_review re-patch is forward progress — reset the
+    # router's stall tripwires the same way ``compiler_node`` does on a
+    # green build. See :func:`_reset_stall_tripwires_on_progress`.
+    if success_count > 0:
+        _reset_stall_tripwires_on_progress(loop_counter)
 
     # Audit #18 — record any files this node mutated since the last green
     # compile. The router consults this set before terminal exit. Existing

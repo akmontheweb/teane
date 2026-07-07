@@ -3447,7 +3447,21 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             # so the build kept hitting "missing pip" and ping-ponging
             # straight back to HITL.
             _refresh_session_config_into_state(state)
-            logger.info("[HITL] Developer chose to resume. Loop counter reset to 2. Routing to compiler_node.")
+            # The "2" refers to ``total_repairs`` — the seed value passed
+            # to ``_reset_iteration_counters`` so the next compile has
+            # one repair attempt remaining before the ``max_patch_repair_
+            # iterations`` cap re-fires HITL. Diagnostic trackers
+            # (``consecutive_zero_patch_rounds``, per-file miss counts,
+            # etc.) are deliberately preserved so the repair LLM still
+            # gets the "use a different operation" directive; those are
+            # reset to 0 by the next green compile or successful
+            # code_review re-patch (see ``compiler_node`` /
+            # ``code_review_node``).
+            logger.info(
+                "[HITL] Developer chose to resume. Iteration counters reset "
+                "(total_repairs=2 — one more repair attempt before HITL "
+                "re-fires). Routing to compiler_node."
+            )
             return state
 
         elif choice == "e":
@@ -3466,7 +3480,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 node_state["hitl_awaiting_input"] = False
                 node_state["hitl_resolved"] = True
                 state["node_state"] = node_state
-                logger.info("[HITL] Hint injected. Loop counter reset to 1. Resuming.")
+                logger.info(
+                    "[HITL] Hint injected. Iteration counters reset "
+                    "(total_repairs=1 — two repair attempts before HITL "
+                    "re-fires). Resuming."
+                )
                 return state
 
         elif choice == "m":

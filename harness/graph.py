@@ -6257,6 +6257,48 @@ def _pre_patch_screen(
                 ))
                 continue
 
+        # Guard 4 — empty-file target. REPLACE_BLOCK / DELETE_BLOCK against
+        # a file with essentially no content (only whitespace) can never
+        # produce a unique match — every "empty line" the search anchors
+        # on is identical, so the patcher's uniqueness check rejects it.
+        # Session cec4d124 (2026-07-07) burned 45 repair rounds trying to
+        # REPLACE_BLOCK an empty pyproject.toml with `[tool.uv]` config,
+        # cycling between "matched N times" and re-emitting the same
+        # blank-line search. The LLM's own reasoning noted the dead-end
+        # but the DSL kept steering it back to REPLACE_BLOCK.
+        if b.operation in _SEARCH_OPS:
+            abs_target = os.path.join(workspace_path, file_key)
+            try:
+                # Cheap to read since we already know the file exists (it
+                # was READ_FILEd earlier this round for the screen to
+                # reach this point). Cap at 4KB — anything larger is
+                # definitionally not "essentially empty".
+                with open(abs_target, "r", encoding="utf-8", errors="replace") as _f:
+                    _sample = _f.read(4096)
+            except OSError:
+                _sample = ""
+            # "Essentially empty" = <20 chars after stripping all whitespace.
+            # Threshold picked so a couple of stray characters (a lone
+            # comment marker, a shebang) don't trigger, but a file that's
+            # just blank lines / trivial whitespace does.
+            if len(_sample.strip()) < 20 and os.path.isfile(abs_target):
+                rejections.append(PatchResult(
+                    success=False,
+                    file=file_key,
+                    operation=b.operation,
+                    error=(
+                        f"[screen:empty-file] `{file_key}` is essentially "
+                        f"empty (< 20 non-whitespace chars). REPLACE_BLOCK "
+                        f"and DELETE_BLOCK cannot succeed against an empty "
+                        f"file — there is no anchor text, so any search "
+                        f"either matches nothing or matches every blank "
+                        f"line ambiguously. This patch was REJECTED. Emit "
+                        f"<<<REWRITE_FILE>>> for `{file_key}` with the "
+                        f"complete desired content instead."
+                    ),
+                ))
+                continue
+
         kept.append(b)
 
     return kept, rejections

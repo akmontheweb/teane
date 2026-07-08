@@ -3398,8 +3398,14 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     state.get("hitl_auto_resume_cap") or _HITL_AUTO_RESUME_CAP
                 )
                 if _resumes_taken >= _cap:
-                    choice = "q"
-                    auto_resumed_this_round = False
+                    # Direct-abandon: bypass the ``[q]`` handler's
+                    # confirmation prompt. In headless mode the confirm
+                    # channel returns False by default, so falling through
+                    # to ``elif choice == "q":`` would just cancel the
+                    # abandon and re-enter this cap-check on the next
+                    # ``while True:`` iteration — a tight loop that spams
+                    # this WARNING millions of times per second (session
+                    # cec4d124 hit 18M repetitions in ~10 minutes).
                     logger.warning(
                         "[HITL] Auto-resume cap reached (%d/%d) for "
                         "trigger '%s' in headless mode — terminating "
@@ -3411,7 +3417,23 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         _resumes_taken, _cap, trigger,
                     )
                     node_state["hitl_auto_resume_cap_hit"] = True
+                    node_state["hitl_abandon"] = True
+                    node_state["hitl_active"] = False
+                    node_state["hitl_awaiting_input"] = False
                     state["node_state"] = node_state
+                    try:
+                        from harness.observability import log_failure as _lf
+                        _lf(
+                            "hitl_gate_blocked",
+                            trigger=trigger,
+                            session_id=state.get("session_id", ""),
+                            loop_counter=loop_counter.get("total_repairs", 0),
+                            modified_files=len(modified_files),
+                            reason="auto_resume_cap_hit",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return state
                 else:
                     choice = "r"
                     auto_resumed_this_round = True

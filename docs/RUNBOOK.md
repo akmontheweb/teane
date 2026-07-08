@@ -29,7 +29,7 @@ ordered by frequency, not severity.
 ```
 [resume] Checkpoint for session '<id>' is corrupted: ...
   Options:
-    - Start a fresh session with `teane run -w <ws> -p '<prompt>'`.
+    - Start a fresh session with `teane build -w <ws> -p '<prompt>'` (or `teane patch` for brownfield).
     - Restore checkpoints.db from a known-good backup.
     - Run `teane purge --session-id <id>` to drop only this session.
 ```
@@ -57,7 +57,7 @@ Choose one of three paths, in order of preference:
 2. **Drop only the broken session, keep all others** (`teane purge` also removes the rotated JSONL log files for the session):
    ```bash
    teane purge --session-id <id>
-   teane run -w <ws> -p "<original prompt>"   # start fresh
+   teane build -w <ws> -p "<original prompt>"   # start fresh (or `teane patch`)
    ```
 3. **Last resort, nuke everything**:
    ```bash
@@ -206,7 +206,7 @@ ps -p <PID>          # is the PID still alive?
   ```
 - **Holder dead, lock stale**:
   ```bash
-  teane run -w <ws> -p "<prompt>" --force-lock
+  teane build -w <ws> -p "<prompt>" --force-lock   # same flag on `teane patch`
   ```
   `--force-lock` releases the stale lock and acquires a fresh one. It
   logs a WARNING so the override is visible in the session record.
@@ -379,7 +379,7 @@ teane schedule validate
 
 ### Fix
 - **Daemon not running:** Start it (`teane schedule run`). The daemon
-  does not auto-launch on `teane run`; it's a separate process.
+  does not auto-launch on `teane build` / `teane patch`; it's a separate process.
 - **`schedule.enabled` is `false`:** Flip to `true` in
   `config/config.json` and restart the daemon.
 - **Job marked `enabled: false`:** Flip to `true` on the per-job entry
@@ -576,7 +576,7 @@ print('exists:', os.path.isfile(memory_file_path(ws, cfg)))
 ### Symptom
 
 The web dashboard's status / live page keeps showing a session in the
-"running" state long after the `teane run` subprocess actually exited.
+"running" state long after the run subprocess actually exited.
 Most common cause: the child was killed with `SIGKILL` (which the
 parent's watcher thread can't trap via `proc.wait`), or the dashboard
 process itself was hard-restarted.
@@ -658,7 +658,7 @@ actually prevent a clean boot once removed.
 
 ### Symptom
 
-Long-lived dashboards that spawn many `teane run` subprocesses
+Long-lived dashboards that spawn many build/patch subprocesses
 ("Run now" / "Run resume" / scheduled one-shot jobs) eventually start
 hitting `OSError: [Errno 24] Too many open files` from inside the
 spawn path.
@@ -697,7 +697,7 @@ image picks the host value at start — bump it on the host or set
 
 ### Symptom
 
-`teane run`, `resume`, `doctor`, `metrics`, `purge`, or any other
+`teane build`, `patch`, `resume`, `doctor`, `metrics`, `purge`, or any other
 subcommand exits immediately with a multi-line error to stderr that
 ends with `exit code 2`. No log file, no checkpoint, no LLM call —
 the harness refused to start because strict config validation found a
@@ -750,6 +750,138 @@ python -m json.tool <teane_root>/config/config.json > /dev/null
 The dashboard's Configure Harness page runs the same validator and
 shows the same error inline, so non-CLI operators can fix and save
 without leaving the browser.
+
+---
+
+## 18. Diagnostics gate silent or flagging the wrong things
+
+### Symptom
+
+Type errors that should have been caught before the compile only
+surface at `compiler_node` (gate silent) — or the opposite: the gate
+routes to repair for errors that pre-date the session (baseline not
+suppressing), burning repair rounds on brownfield code nobody touched.
+
+### Diagnose
+
+```bash
+# Every gate pass logs one structured event — status, tool list,
+# new-vs-baseline counts, baseline mode, elapsed:
+grep '"event": "diagnostics_gate"' ~/.harness/logs/<session>.jsonl | tail -5
+
+# Gate contributes nothing when no checker is on PATH:
+which pyright mypy tsc
+
+# Baseline mode matters: "worktree" = exact HEAD diff;
+# "created-only" = degraded (non-git workspace or worktree failure) —
+# only session-created files can flag, pre-existing files never do.
+```
+
+Key fields: `status: "skipped"` → no applicable checker (install one);
+`timed_out: ["tsc"]` recurring → large TS project blowing
+`diagnostics.timeout_seconds` (raise it, or accept the gate skipping
+TS — fail-open by design); `baseline: 0` with `new` unexpectedly high
+on brownfield → baseline capture failed, check the log for
+`diag_baseline` worktree errors.
+
+### Fix
+
+- **Gate silent:** install `pyright` (`pip install pyright`) and/or
+  `typescript` (`npm i -g typescript`). Per-tool kill switches live in
+  `config.json` `diagnostics.tools`.
+- **Pre-existing errors flagged:** confirm the workspace is a git repo
+  with a clean HEAD to baseline against; `git worktree list` should be
+  empty of stale `diag_baseline_*` entries (`git worktree prune`).
+- **Gate → repair ping-pong:** bounded by `diagnostics.max_rounds`
+  (default 2) on top of the shared repair cap — if you see more than
+  `max_rounds` consecutive `diagnostics_node → repair_node` transitions
+  in the `node_transition` events, that's a bug, file it.
+- **Disable entirely:** `"diagnostics": {"enabled": false}`.
+
+---
+
+## 19. Learned rule is wrong — post-mortem note poisoning the planner
+
+### Symptom
+
+After a failed session, every subsequent run on the same repo plans
+around a `[learned-rule:<trigger>]` hypothesis that is wrong or stale
+(visible in the planner context under "Prior session memory for this
+repository").
+
+### Diagnose
+
+```bash
+# Active + retired rules for this repo (16-char id from the workspace):
+grep -n "learned-rule" ~/.harness/memory/<repo_id>.md
+
+# Which sessions wrote / skipped / retired rules:
+grep -E '"event": "(post_mortem_written|post_mortem_skipped|post_mortem_rules_retired)"' \
+  ~/.harness/logs/*.jsonl
+```
+
+### Fix
+
+- **Normal case — no action:** any clean (exit-0) run on the repo
+  retires ALL active rules automatically
+  (`post_mortem.retire_on_clean_run`, default true). One green run and
+  the poison is gone.
+- **Immediate manual removal:** edit
+  `~/.harness/memory/<repo_id>.md` and delete the `- Notes:` line
+  carrying the bad rule (or rewrite its tag to
+  `[learned-rule(retired):...]` — retired rules are kept for forensics
+  but treated as inactive).
+- **Stop generating rules:** `"post_mortem": {"enabled": false}`.
+- Rules are deliberately framed as "Hypothesis from failed run <sid>"
+  and capped at one line — if you see multi-line or heading-bearing
+  notes, the sanitizer has a bug; file it.
+
+---
+
+## 20. LSP pool didn't start on a brownfield run
+
+### Symptom
+
+`teane patch` runs fine but navigation stays on heuristics: no
+`lsp__find_references` section in the planner prompt, `lsp_fallback`
+events in the log, or the startup log says
+`[cli:lsp] no servers started`.
+
+### Diagnose
+
+```bash
+# The start event lists what launched and WHY anything was skipped:
+grep '"event": "lsp_pool_started"' ~/.harness/logs/<session>.jsonl
+# skipped reasons you'll see:
+#   "pyright-langserver not on PATH"      → install it
+#   "no .venv/venv at workspace root..."  → env-health probe refused
+#   "no node_modules at workspace root"   → npm install first
+
+# Binaries present?
+which pyright-langserver typescript-language-server
+
+# Remember the gate conditions: pool ONLY starts when
+#   flow != "build"  AND  flow ∈ lsp.enabled_flows (default patch/test)
+#   AND the workspace stack tags include python/typescript/node.
+```
+
+### Fix
+
+- **Probe refused Python:** create the venv the repo's deps live in
+  (`python -m venv .venv && .venv/bin/pip install -r requirements.txt`)
+  — the probe exists because a server without resolvable imports
+  returns unresolved-import garbage. If your deps are system-wide, set
+  `"lsp": {"python_require_venv": false}`.
+- **Probe refused TS:** run `npm install` in the workspace so
+  `node_modules` exists; ensure a root `tsconfig.json`.
+- **Server died mid-session:** expected degradation — one warning log,
+  then every consumer falls back to the DependencyGraph for the rest
+  of the session (no auto-restart in Phase 1). Re-run the session to
+  get a fresh pool.
+- **Wrong expectations on greenfield:** by design `teane build` never
+  starts the pool; greenfield half-built projects make LSP results
+  worse than the heuristics.
+- **Disable entirely:** `"lsp": {"enabled": false}`.
 
 ---
 

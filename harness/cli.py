@@ -223,7 +223,7 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
                 return False
         else:
             logger.error(
-                "[lock] Workspace %s is locked by another live `teane run` "
+                "[lock] Workspace %s is locked by another live teane session "
                 "session. Refusing to start so the two don't clobber each "
                 "other's patches.\n"
                 "  Wait for the other session to finish, or pass --force-lock "
@@ -5769,7 +5769,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             "To proceed:\n"
             "  1. Create the folder if it does not exist.\n"
             "  2. Add one or more .txt / .md / .pdf files describing the changes.\n"
-            "  3. Re-run `teane run`.\n\n"
+            "  3. Re-run the same teane target.\n\n"
             "If you are starting a fresh build, pass --new-build true\n"
             "instead — that flow uses `product_spec_dir` and skips this\n"
             "check.\n",
@@ -7079,7 +7079,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             logger.error(
                 "[resume] Checkpoint for session '%s' is corrupted: %s\n"
                 "  Options:\n"
-                "    - Start a fresh session with `teane run -r %s -p '<prompt>'`.\n"
+                "    - Start a fresh session with `teane build -w %s -p '<prompt>'` (or `teane patch` for brownfield).\n"
                 "    - Restore checkpoints.db from a known-good backup.\n"
                 "    - Run `teane purge --session-id %s` to drop only this session.",
                 args.session_id, exc, workspace_path, args.session_id,
@@ -7096,7 +7096,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
                 "[resume] Checkpoint for session '%s' has an incompatible schema: %s\n"
                 "  Options:\n"
                 "    - Upgrade or downgrade the harness to match the checkpoint's version.\n"
-                "    - Start a fresh session with `teane run -r %s -p '<prompt>'`.\n"
+                "    - Start a fresh session with `teane build -w %s -p '<prompt>'` (or `teane patch` for brownfield).\n"
                 "    - Run `teane purge --session-id %s` to drop only this session.",
                 args.session_id, exc, workspace_path, args.session_id,
             )
@@ -7379,7 +7379,7 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
     if head_result.returncode != 0:
         return "warn", (
             f"git repo at {workspace_path} has no commits yet (unborn HEAD); "
-            "make an initial commit before 'teane run' to enable speculative repair"
+            "make an initial commit before running teane to enable speculative repair"
         )
     return "pass", f"git repo detected at {workspace_path}"
 

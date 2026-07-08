@@ -2,11 +2,20 @@
 
 *Refreshed from current codebase state. Companion to `SPEC_ARCHITECTURE.md`.*
 
+> **Terminology note (FR-072):** the legacy `teane run` verb has been split
+> into four targets — `build` / `patch` / `deploy` / `test`. Older FR texts
+> below that say `teane run` describe the shared engine now invoked through
+> those targets: read `teane run --new-build true` as `teane build`,
+> `--new-build false` as `teane patch`, and `--deploy-dev true` as
+> `teane deploy`. The bare-invocation setup wizard (FR-047) now triggers on
+> bare `teane build` / `teane patch`. Historical acceptance criteria are
+> preserved as written for traceability.
+
 ---
 
 ## 1. Executive Summary
 
-Teane is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--deploy-dev`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, and cross-model speculative repair escalation. The supported stack is locked: backend is Python (FastAPI / Flask / Django) OR Java (Spring Boot); web is React + TypeScript + TailwindCSS, Vite-built. Any other stack is rejected at config-load time.
+Teane is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield, `teane build`) OR a folder of change-request files (brownfield, `teane patch`, agile or waterfall), generates precise code patches via LLMs, verifies them through sandboxed builds — with a static diagnostics gate (FR-075) catching type errors before every compile — and OPTIONALLY brings the app up locally as a docker-compose dev environment (`teane deploy`) and exercises it end-to-end with Playwright (`teane test`, FR-073), whose failures feed back into `teane patch` as change requests. Failed runs distill learned rules into per-repo memory (FR-076); brownfield runs get language-server-backed semantic navigation (FR-077). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, and cross-model speculative repair escalation. The supported stack is locked: backend is Python (FastAPI / Flask / Django) OR Java (Spring Boot); web is React + TypeScript + TailwindCSS, Vite-built. Any other stack is rejected at config-load time.
 
 ---
 
@@ -589,12 +598,68 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
   - Given `story_keys = ["STORY-B", "STORY-A"]` with the same dep, `validate_batches` returns an error containing "must come BEFORE its dependent".
   - Given STORY-A is `planned` and STORY-B (deps `["STORY-A"]`) is also `planned`, `_next_story_in_batch` returns STORY-A; once STORY-A is `done`, the next call returns STORY-B.
 
+### FR-072: Four-Target CLI Surface (`build` / `patch` / `deploy` / `test`)
+- **Description:** The CLI MUST expose four primary targets replacing the legacy `run` verb, each pinning `args.flow` before delegating to the shared engine: `teane build` (greenfield; `flow="build"`, `new_build=True`, workspace reset), `teane patch` (brownfield reconcile; `flow="patch"`, `new_build=False`, consumes `change_requests/*` files; `--agile` engages story decomposition on the same flow), `teane deploy` (`flow="deploy"`; artifact synthesis + dev container + health-check sign-off), and `teane test` (`flow="test"`; see FR-073). `_resolve_cli_exit_code` MUST return deterministic exit codes for automation: `0` clean, `1` partial success, `2` config error, `3` budget exhausted, `4` infrastructure failure — so `teane build && teane deploy` chains behave correctly in CI.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `teane patch --agile true`, `args.flow == "patch"` is pinned BEFORE agile resolution, and story decomposition runs on the patch flow.
+  - Given a session terminated by budget exhaustion, the process exit code is `3` (not a generic `1`).
+  - Given a config with an unknown top-level key, the process exits `2` before any LLM call.
+
+### FR-073: End-to-End Test Target (`teane test`)
+- **Description:** `teane test` MUST run Playwright end-to-end tests against the deployed compose stack (`harness/test_target.py`, generation in `harness/playwright_gen.py`). A prerequisite gate MUST verify a prior clean tracked flow via `flow_state.record_flow_completion` before tests run. Every e2e failure MUST be emitted as a `CR-DEFECT-*` change-request file (`harness/test_defects.py`) consumable by a subsequent `teane patch` run — closing the build → deploy → test → patch loop without operator authorship.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given no prior clean build/patch/deploy flow for the workspace, `teane test` refuses with a clear prerequisite message.
+  - Given a failing e2e scenario, a `CR-DEFECT-*.txt` file appears in the change-requests folder with reproduction context.
+  - Given `teane patch` runs after a failed `teane test`, the defect files are ingested as change requests.
+
+### FR-074: Spec Reconciler (Authoritative Requirement IDs)
+- **Description:** In story mode, `spec_reconciler_node` (`harness/spec_reconciler.py`) MUST treat `SPEC_REQUIREMENTS.md` as the sole authority for feature/story IDs: decomposition output is reconciled against the spec, LLM output is consumed ONLY as `scope_files` enrichment, dropped enabler stories are recovered, and structural parent traceability (`story_satisfies_req`) is repopulated. `traceability_block` escalation cycles MUST be capped.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given an LLM decomposition that renames or invents requirement IDs, the reconciled stories carry ONLY IDs present in `SPEC_REQUIREMENTS.md`.
+  - Given an enabler story omitted by the LLM pass, reconciliation restores it with parent linkage.
+  - Given repeated traceability blocks, the cycle cap routes to HITL instead of looping.
+
+### FR-075: Static Diagnostics Gate (Type-Checkers in the Repair Loop)
+- **Description:** A read-only `diagnostics_node` (`harness/diagnostics_gate.py`) MUST run between `lintgate_node` and `compiler_node` (and on the `repair_node` re-entry edge), executing fast CLI type-checkers over the batch's files plus their reverse-dependency closure: pyright (`--outputjson`, mypy fallback) for Python and `tsc --noEmit` for TS/TSX. Java is exempt (the build IS its type check). Pre-existing brownfield diagnostics MUST be suppressed via a detached HEAD-worktree fingerprint baseline keyed to the HEAD SHA (batch commits invalidate it); only NEW error-severity diagnostics route to `repair_node`, emitted through the existing `compiler_errors` channel with the mandatory `_rotate_diag_fingerprints_delta` rotation. `route_after_diagnostics` MUST never escalate to HITL (escalation stays single-sourced in `route_after_compiler`) and MUST be doubly bounded (shared `total_repairs` cap + per-compile-cycle `diagnostics.max_rounds`, default 2). Every infrastructure failure (missing tool, timeout, non-git workspace) MUST fail open to `compiler_node`.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a patch introducing a type error in a session-created file, the gate emits it as a NEW diagnostic and routes to `repair_node` before any compile.
+  - Given a pre-existing type error at HEAD that merely shifted lines under a patch, the baseline suppresses it (line-insensitive fingerprints).
+  - Given `diagnostics_rounds_since_compile > max_rounds`, the router falls through to `compiler_node` unconditionally.
+
+### FR-076: Automated Failure Post-Mortems (HITL Learning Loop)
+- **Description:** When a HITL breakpoint fires, `human_intervention_node` MUST emit a `hitl_fired` observability event and stage a distilled `[learned-rule:<trigger>] fp=<hash>` note in `state["post_mortem_note"]` (`harness/post_mortem.py`); the cli finalize path MUST be the single writer, appending the note to per-repo memory via `append_session_note(extra_notes=...)` (auto-injected into the next run's planner prompt), generating a note for failed runs that never reached HITL, and fingerprint-deduping repeat failure classes. LLM distillation MUST run on a synthetic budget floor (`post_mortem.max_cost_usd`, default $0.10) so it works when the session budget is exhausted, with a deterministic per-trigger template fallback so the loop never no-ops. Any clean (exit-0) run MUST retire all active rules (`[learned-rule(retired):...]`) — a green run proves the failure class no longer bites, and stale rules poison future prompts.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a headless run abandoned at the auto-resume cap, the staged rule still reaches the repo memory file.
+  - Given the same failure class in two consecutive sessions, the second session's note is skipped as a duplicate (`post_mortem_skipped` event).
+  - Given a subsequent clean run, previously active rules are tag-rewritten to retired and no longer injected as active guidance.
+
+### FR-077: LSP Semantic Navigation (Brownfield, Phase 1)
+- **Description:** For brownfield flows only (`flow != "build"`, `lsp.enabled_flows` default `["patch","test"]`), the harness MUST start an LSP client pool (`harness/lsp_client.py`; pyright-langserver for Python, typescript-language-server for TS/TSX; jdtls deferred to Phase 2) gated by an environment-health probe: Python requires a `.venv`/`venv` at the workspace root (override `lsp.python_require_venv=false`); TypeScript requires `tsconfig.json` AND `node_modules`. The pool MUST power (a) planner tools `lsp__find_references` / `lsp__go_to_definition` via `<<<LSP_CALL ...>>>` blocks, and (b) three harness prefetch sites — diagnostics-gate impact expansion, repair-prompt caller maps, change-request impact augment — each with three-tier fallback (LSP → `DependencyGraph` → nothing). Greenfield behaviour MUST stay byte-identical (no pool, no prompt section). No auto-restart: a dead server degrades silently to heuristics; nothing about the pool lives in `AgentState` (checkpoint/resume-safe).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `teane build` on any workspace, no LSP process is spawned and the system prompt contains no LSP section.
+  - Given `teane patch` on a Python workspace without a venv, the pool skips the server with a probe reason in the `lsp_pool_started` event and all three sites use `DependencyGraph`.
+  - Given a healthy pool whose server dies mid-session, subsequent prefetches return empty/None without raising and the skills answer with a polite error string.
+
+### FR-078: Unattended-Run Hardening (Auto-Resume Cap + Anti-Drift Screens)
+- **Description:** To keep headless runs from burning budget in loops: (1) consecutive headless HITL auto-resumes MUST be capped, with direct-abandon at the cap instead of ping-ponging through the `[q]` confirm; (2) a pre-patch anti-drift screen MUST reject patch blocks before application when they trip `[screen:over-cap]` (>3 surgical edits to one file per turn), `[screen:stuck-reread]` (edits against a stale file view after consecutive REPLACE_BLOCK misses), or `[screen:repeat-search]` (a search hash already rejected); (3) the patcher MUST reject `REPLACE_BLOCK`/`DELETE_BLOCK` operations against essentially-empty files (Guard 4).
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a headless session hitting the auto-resume cap, the run abandons directly with `hitl_gate_blocked` logged, without an interactive confirm round-trip.
+  - Given a fourth surgical edit to the same file in one turn, the screen rejects it with `[screen:over-cap]` before the patcher runs.
+  - Given a `REPLACE_BLOCK` against an empty file, the patch is rejected with a Guard-4 error instead of a silent no-op loop.
+
 ---
 
 ## 3. System Scope
 
 ### In-Scope
-- CLI interface with 12 subcommand families (`run`, `resume`, `chat`, `status`, `doctor`, `purge`, `metrics`, `gh {issue, pr-create, pr-comment}`, `index {build, status, clear}`, `schedule {run, list, validate, once, history}`, `dashboard`, `cache clear`) plus `--version`
+- CLI interface with four primary targets (`build`, `patch`, `deploy`, `test` — FR-072) plus supporting subcommand families (`resume`, `chat`, `status`, `doctor`, `pre-flight`, `audit`, `purge`, `metrics`, `gh {issue, pr-create, pr-comment}`, `index {build, status, clear}`, `schedule {run, list, validate, once, history}`, `dashboard`/`web`, `cache clear`) and `--version`
 - LangGraph-based agent graph with 20+ nodes
 - Multi-provider LLM gateway (DeepSeek, Anthropic, OpenAI, Ollama)
 - Hierarchical JSON configuration with deep merge + recursive typo detection

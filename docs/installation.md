@@ -42,9 +42,17 @@ Each step below has a snippet for each track. Read the one that matches your mac
 
 On Windows, **WSL2 is recommended** because the harness was developed Linux-first and every code path is exercised on Linux in CI. **Windows native is best-effort**: it works for the common flows, but `unshare` does not exist on native Windows, so Docker Desktop is required for sandbox isolation.
 
-### What's new since v1.0
+### What's new (current release)
 
-The biggest operator-facing changes since the layered-config era:
+- **Four-target CLI** — the legacy `run` verb is split into `teane build` (greenfield: wipes the workspace except `product_spec/` and `.git/`, resets to a clean base branch; pair with `--yes` for unattended automation), `teane patch` (brownfield: reads change-request files from `change_requests/`; add `--agile true` for story-decomposition mode), `teane deploy` (compose synthesis + dev container + health checks), and `teane test` (Playwright e2e against the deployed stack; failures land as `CR-DEFECT-*` files that the next `teane patch` consumes). The old `--new-build` flag is gone — the target choice IS the mode. Exit codes are deterministic for CI chaining: 0 clean, 1 partial, 2 config error, 3 budget exhausted, 4 infrastructure failure.
+- **Static diagnostics gate** — after every patch round, pyright/mypy (Python) and `tsc` (TS/TSX) run read-only BEFORE the compile; new type errors are repaired in-loop. Pre-existing brownfield errors are baseline-suppressed. Install the checkers from §7 to enable; missing tools degrade silently.
+- **HITL learning loop** — failed runs and HITL escalations write a one-line `[learned-rule:*]` hypothesis into per-repo memory (`~/.harness/memory/`), injected into the next run's planner. A clean run retires all active rules automatically.
+- **Brownfield LSP navigation** — `teane patch`/`test` can spawn pyright-langserver / typescript-language-server for ground-truth find-references (see §7 → LSP servers). Greenfield never starts them.
+- **Unattended-run hardening** — headless HITL auto-resume cap with direct-abandon, pre-patch anti-drift screens, and empty-file patch guards keep hands-off runs from burning budget in loops.
+
+### What's new since v1.0 (older milestones)
+
+The biggest operator-facing changes since the layered-config era (bullets below predate the four-target CLI split — read `teane run --new-build true` as `teane build` and `--new-build false` as `teane patch`):
 
 - **Single canonical config** — the harness now reads exactly one file: `<repo>/config/config.json`. There is no `~/.harness/config.json`, no per-workspace `.harness_config.json`, no shipped `harness/cli.json` defaults. Strict validation rejects unknown keys, wrong types, missing required fields, and missing API key env vars at startup — before any LLM call. A legacy `.harness_config.json` left in a workspace logs one INFO line and is otherwise ignored. See §8.
 - **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of spec files (`.txt`, `.md`, `.pdf`) describing the product to build. `.pdf` bodies are extracted via `pypdf`. `teane doctor` and `teane run` both refuse to start when the key is missing, malformed, or the folder is empty.
@@ -324,6 +332,37 @@ If `gitleaks` is missing, the harness falls back to a regex-based Python secret 
 | `prettier` (JS / TS / TSX / JSON / MD — covers React + Tailwind) | `npm install -g prettier` |
 | `google-java-format` (Java) | download the jar from [google/google-java-format releases](https://github.com/google/google-java-format/releases) |
 
+### Type checkers (recommended — power the static diagnostics gate)
+
+The diagnostics gate (`diagnostics_node`, config section `diagnostics`) runs
+fast read-only type checks after every patch round, BEFORE the expensive
+compile — new type errors get repaired in-loop instead of burning a build.
+With none of these installed the gate silently contributes nothing
+(fail-open); the run still works, just with later/coarser error signal.
+
+| Tool | Install | Notes |
+|------|---------|-------|
+| `pyright` (Python — preferred) | `pip install pyright` (or `npm install -g pyright`) | Structured `--outputjson` diagnostics |
+| `mypy` (Python — fallback) | `pip install mypy` | Used only when pyright isn't on PATH |
+| `tsc` (TypeScript / TSX) | `npm install -g typescript` | Run as `tsc --noEmit` against the nearest `tsconfig.json` |
+
+Java needs nothing here: the Maven/Gradle build itself is Java's type check.
+
+### LSP servers (optional — brownfield semantic navigation)
+
+For brownfield flows (`teane patch` / `teane test`), the harness can spawn
+language servers for ground-truth find-references / go-to-definition
+(config section `lsp`; see FR-077). Servers only start when the workspace
+can resolve imports — Python needs a `.venv`/`venv` at the workspace root
+(or set `lsp.python_require_venv=false`), TypeScript needs `tsconfig.json`
+AND an installed `node_modules`. Missing servers degrade silently to the
+tree-sitter dependency-graph heuristics; `teane build` never starts them.
+
+| Tool | Install |
+|------|---------|
+| `pyright-langserver` (Python) | ships with `pip install pyright` |
+| `typescript-language-server` (TS / TSX) | `npm install -g typescript-language-server typescript` |
+
 ### GitHub CLI (optional — required for `teane gh` subcommands)
 
 The `teane gh issue` / `pr-create` / `pr-comment` subcommands shell out to the [`gh` CLI](https://cli.github.com/). Install once and authenticate; the harness never stores tokens.
@@ -457,10 +496,10 @@ The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `
 
 ### Workspace single-writer lock
 
-Every `teane run` and `teane resume` acquires an exclusive lock on `<workspace>/.harness_session.lock`. A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
+Every run (`teane build` / `patch` / `deploy` / `test`) and `teane resume` acquires an exclusive lock on `<workspace>/.harness_session.lock`. A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
 
 ```bash
-teane run -w <workspace> -p "<prompt>" --force-lock
+teane build -w <workspace> -p "<prompt>" --force-lock
 ```
 
 `--force-lock` releases the stale lock and acquires a fresh one, logging a WARNING so the override is visible in the session record. The lock is implemented via `fcntl.flock` on Linux/macOS/WSL2 (advisory) and `msvcrt.locking` on Windows native (mandatory) — both dispatched through `harness/_filelock.py`. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
@@ -547,7 +586,7 @@ Pick a throwaway git repo and drop a one-line spec under `product_spec/` (the ha
 git clone https://github.com/octocat/Hello-World.git sample
 mkdir -p sample/product_spec
 echo "List the top-level files in this repository." > sample/product_spec/SPEC.txt
-teane run -w ./sample -p "list the top-level files" --new-build false
+teane patch -w ./sample -p "list the top-level files"
 ```
 
 The harness will:
@@ -559,7 +598,7 @@ The harness will:
 
 A successful smoke test exits 0. Inspect the run with `teane status --session-id <id>` or by tailing the JSONL log file. After the run, `teane metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.
 
-**Bare `teane run`** with no flags drops into the interactive wizard described in §0.1 of the "What's new" notes — it walks API keys, workspace, prompt, `--git`, `--new-build`, and `--spec-discovery`, then hands off to `cmd_run` or `cmd_resume`. The wizard never persists anything.
+**Bare `teane build` / `teane patch`** with no `-w`/`-p` flags drops into the interactive wizard — it walks API keys, workspace, prompt, `--git`, and `--spec-discovery` (the greenfield-vs-brownfield choice is already made by the target you invoked), then hands off to the engine or `cmd_resume`. The wizard never persists anything.
 
 For diagnostics on a stuck or failed run, start with [`docs/RUNBOOK.md`](RUNBOOK.md).
 
@@ -577,9 +616,9 @@ For unattended runs (CI, scheduled jobs, services):
 
 ### Linux (systemd)
 
-`harness` ships three persistent processes you might want to systemd-ify: a one-shot `teane run`, the schedule daemon, and the web dashboard. Each runs the venv's `harness` console script. `HOME` must be set on every unit so `~/.harness/` path expansion works.
+`harness` ships three persistent processes you might want to systemd-ify: a one-shot build/patch run, the schedule daemon, and the web dashboard. Each runs the venv's `harness` console script. `HOME` must be set on every unit so `~/.harness/` path expansion works.
 
-One-shot run (equivalent to the operator typing `teane run`):
+One-shot run (equivalent to the operator typing `teane patch`):
 ```ini
 [Service]
 Environment=HOME=/srv/harness
@@ -587,7 +626,7 @@ Environment=CI=true
 Environment=HARNESS_AUTO_APPROVE=true
 Environment=ANTHROPIC_API_KEY=sk-...
 WorkingDirectory=/srv/harness/workspace
-ExecStart=/srv/harness/.venvs/teane/bin/teane run -w . -p "..." --new-build false
+ExecStart=/srv/harness/.venvs/teane/bin/teane patch -w . -p "..."
 ```
 
 Scheduled-job daemon (`teane schedule run` — fires `schedule.jobs` from
@@ -725,7 +764,7 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 | `llm_silent` (HITL fires immediately) | Three consecutive empty responses from the LLM provider (`EmptyLLMResponseError`). | Check the provider's status page; retry, or route the affected node to a different model via `model_routing`. |
 | `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — pin `sandbox.docker_image` explicitly to a per-stack image. |
 | `[FAIL] api keys (live)` despite a key being set | Doctor checks env vars AND the `models["<key>"].api_key` config field. The FAIL detail line names which location is empty and what the live ping returned (`HTTP 401`, `HTTP 404`, …). | Set the key in `{PROVIDER}_API_KEY` env var (preferred) or in `config/config.json` under `models."<key>".api_key`. |
-| `lock held by PID <n>` at startup | A prior `teane run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `teane run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
+| `lock held by PID <n>` at startup | A prior run exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then re-run with `--force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
 
 ### Linux
 
@@ -755,7 +794,7 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 
 ## 14. Next Steps
 
-- `harness <subcommand> --help` — every flag of `teane run`, `resume`, `status`, `doctor`, `purge`, `metrics`, `web start/stop`, `schedule run/list/validate/once/history`, `chat`, `index build/status/clear`, `gh issue/pr-create/pr-comment`, `cache clear`.
+- `harness <subcommand> --help` — every flag of `teane build`, `patch`, `deploy`, `test`, `resume`, `status`, `doctor`, `purge`, `metrics`, `web start/stop`, `schedule run/list/validate/once/history`, `chat`, `index build/status/clear`, `gh issue/pr-create/pr-comment`, `cache clear`.
 - [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) — full `config/config.json` schema.
 - [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md) — graph topology and module map.
 - [docs/RUNBOOK.md](RUNBOOK.md) — mid-session failure recipes for operators.

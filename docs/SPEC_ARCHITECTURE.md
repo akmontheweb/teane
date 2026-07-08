@@ -2,6 +2,10 @@
 
 *Refreshed from current codebase state. Companion to `SPEC_REQUIREMENTS.md`.*
 
+> **Terminology note (FR-072):** the legacy `teane run` verb is split into
+> `build` / `patch` / `deploy` / `test` (see §5.60). Older decision texts
+> that mention `teane run` describe the shared engine those targets invoke.
+
 ---
 
 ## 1. System Context (C4 Level 1)
@@ -369,6 +373,28 @@ harness/
 │   ├── add_oneshot_job / list_pending_oneshot_jobs / mark_oneshot_consumed
 │   ├── save_run_preset / list_run_presets / delete_run_preset
 │   └── append_audit / list_audit
+├── diagnostics_gate.py   # Static diagnostics gate — read-only type-checkers between lintgate and compiler (FR-075)
+│   ├── diagnostics_node()        # pyright/mypy (Python) + tsc --noEmit (TS/TSX) over batch files + reverse-dep closure
+│   ├── capture_baseline()        # Detached HEAD-worktree fingerprint baseline (brownfield suppression, keyed to HEAD sha)
+│   ├── detect_checkers() / run_checker() / diagnostic_fingerprint()
+│   └── _expand_with_impacted_lsp()  # LSP tier of impact expansion; None → DependencyGraph fallback (FR-077)
+├── post_mortem.py        # Automated failure post-mortems — the HITL learning loop (FR-076)
+│   ├── generate_post_mortem()    # JUDGMENT-model distillation on a synthetic budget floor; deterministic template fallback
+│   ├── deterministic_rule() / sanitize_rule() / rule_fingerprint() / parse_rule_note() / already_recorded()
+│   └── retire_learned_rules()    # Clean run retires all active [learned-rule:*] notes
+├── lsp_client.py         # Brownfield LSP navigation pool (FR-077) — Content-Length JSON-RPC clone of mcp_client.py
+│   ├── StdioLspClient            # initialize/initialized handshake; 3-way msg classification (answers server→client requests)
+│   ├── LspClientPool             # Tag-selected servers behind probe_workspace_health (venv / tsconfig+node_modules)
+│   ├── set_active_pool / get_active_pool  # Module accessor — nothing in AgentState (resume-safe)
+│   ├── find_references_by_symbol / find_definition_by_symbol / callers_of_file
+│   ├── register_lsp_skills()     # lsp__find_references / lsp__go_to_definition ToolSkills
+│   └── parse_lsp_blocks()        # <<<LSP_CALL tool="..." symbol="...">>> DSL (planner tool loop)
+├── spec_reconciler.py    # Story-mode requirement-ID authority (FR-074)
+│   └── spec_reconciler_node()    # SPEC_REQUIREMENTS.md is authoritative; LLM output = scope_files enrichment only
+├── test_target.py        # `teane test` — Playwright e2e vs deployed compose stack (FR-073)
+├── playwright_gen.py     # E2E scenario generation for the test target (FR-073)
+├── test_defects.py       # e2e failures → CR-DEFECT-* change-request files consumable by `teane patch` (FR-073)
+├── flow_state.py         # Cross-flow completion markers (`teane test` prereq gate reads these)
 └── web_forms.py          # Form schema derivation (FR-064)
     ├── FormField / FormSection / FormParseError
     ├── kind_for_type_tuple    # bool→checkbox, int/float→number, list/dict→JSON textarea
@@ -442,6 +468,10 @@ harness/
 10. lintgate_node → ruff / prettier / google-java-format on modified files
                   │
                   ▼
+10b. diagnostics_node (FR-075) — read-only type-checkers, HEAD-baseline diffed
+    │  NEW type errors (within caps) → repair_node   # fixed BEFORE the compile
+    │  clean / capped / fail-open
+                  ▼
 11. compiler_node → SandboxExecutor → backend.run(auto-wired build command)
                   │
            ┌──────┴──────┐
@@ -449,15 +479,16 @@ harness/
            ▼              ▼
 12. security_scan_node   13. repair_node → LLM (repair_primary, thinking)
     │                          │
-    │ clean? ──yes──▶          ├── lintgate_node
+    │ clean? ──yes──▶          ├── diagnostics_node (cheap re-check, read-only)
     │                          │
     │ findings?                ├── compiler_node (re-verify)
     │   │                      │
-    │   ▼                      │  repairs < 3 → loop to repair_node
-    │ patching_node            │  repairs >= 3 → human_intervention_node
-    │   │                      │                 │
-    │   ▼                      │                 ├── [hint] → repair_node
-    │ lintgate → compiler      │                 ├── [manual] → compiler_node
+    │   ▼                      │  repairs < cap → loop to repair_node
+    │ patching_node            │  repairs >= cap → human_intervention_node
+    │   │                      │                 │ (emits hitl_fired + stages
+    │   ▼                      │                 │  post_mortem_note, FR-076)
+    │ lintgate → diagnostics   │                 ├── [hint] → repair_node
+    │          → compiler      │                 ├── [manual] → compiler_node
     │                          │                 ├── [resume] → compiler_node
     │                          │                 └── [abandon] → END
     │                          │
@@ -1047,6 +1078,54 @@ A pre-existing bug fix landed alongside: `DependencyGraph._scan_file` used to sk
 
 **Trade-off**: Validation rejection now triggers a deterministic-batching fallback. The LLM batch proposal is generally better at grouping but the deterministic backup is correct by construction — fall-back is a small quality dip on a rare error path.
 
+### 5.57 Static Diagnostics Gate (FR-075)
+
+**Decision**: A read-only `diagnostics_node` (`harness/diagnostics_gate.py`) sits between `lintgate_node` and `compiler_node`, and on the `repair_node` re-entry edge (safe there precisely because it never rewrites files, unlike lintgate whose reformatting would break SEARCH/REPLACE anchors). It runs pyright (`--outputjson`; mypy text fallback) on Python and `tsc --noEmit --pretty false` on TS/TSX over the batch's files plus their reverse-dependency closure, parses output into the existing `DiagnosticObject` shape (new `PyrightJSONParser`/`MypyParser` in `parser_registry.py`), and suppresses pre-existing brownfield errors via a detached HEAD-worktree fingerprint baseline (line/column-insensitive fingerprints; keyed to the HEAD SHA so `batch_commit_node` advancing HEAD moves the "pre-existing" frontier). NEW error-severity diagnostics are emitted through `compiler_errors` with the mandatory `_rotate_diag_fingerprints_delta` rotation, so `repair_node`, autofix, and the reflection judge consume them with zero new code. `route_after_diagnostics` never escalates to HITL and is doubly bounded (shared `total_repairs` cap + `diagnostics.max_rounds` per compile cycle, reset by `compiler_node` and `batch_commit_node`). Java is exempt: javac needs the full Maven/Gradle classpath, so the build IS Java's type check.
+
+**Rationale**: `repair_loop_limit` and `persistent_build_failure` are the top HITL triggers. A type error caught in ~1s at the gate is repaired in-loop instead of burning a minutes-scale compile round (or escalating). Reusing the `compiler_errors` channel means the entire existing repair machinery — deterministic autofix spans included — works on gate output unchanged.
+
+**Trade-off**: One extra checker pass per patch/repair round, and a stricter checker than the build can flag things the build tolerates on greenfield (bounded by `max_rounds: 2`). Whole-project `tsc` may exceed its timeout on large repos — fail-open by design; the gate then contributes nothing for TS and the event log says so loudly.
+
+### 5.58 HITL Learning Loop — Automated Failure Post-Mortems (FR-076)
+
+**Decision**: `human_intervention_node` emits `hitl_fired` (closing the console/headless observability gap) and stages a distilled one-line `[learned-rule:<trigger>] fp=<hash>` hypothesis in `state["post_mortem_note"]` before the menu loop, so headless direct-abandon paths carry it out. The cli finalize path (`_post_mortem_finalize`) is the single writer: it generates a note for failed runs that never reached HITL, fingerprint-dedupes repeat classes, appends via `append_session_note(extra_notes=...)` (per-repo memory, auto-injected into the next run's planner prompt), and on any exit-0 run retires ALL active rules (`[learned-rule(retired):...]`). Distillation runs on the cheap JUDGMENT model with a synthetic budget floor (`post_mortem.max_cost_usd`, $0.10) so it works when the session budget is exhausted; a deterministic per-trigger template guarantees the loop never no-ops. Rules pass a sanitizer (fence/heading strip — a note must not be able to forge a `## Session` memory section — single-line collapse, 600-char cap) and are framed as "Hypothesis from failed run <sid>".
+
+**Rationale**: Automates the manual post-mortem discipline (incident cec4d124 → auto-resume cap + anti-drift screen) so every escalation makes the harness monotonically harder to trip. Retire-on-clean-run bounds the poisoning risk of injecting LLM output into future prompts: a wrong rule survives at most until the first green run.
+
+**Trade-off**: Planner-only injection in v1 — repair-class rules don't reach the repair prompt (its live state is usually richer; the hook point is documented for v2 if cross-session repeat failures prove otherwise). One extra cheap LLM call per failed session.
+
+### 5.59 Brownfield LSP Navigation Pool (FR-077)
+
+**Decision**: `harness/lsp_client.py` is a deliberate section-for-section clone of the MCP client (same subprocess lifecycle, pending-future correlation, shutdown/atexit semantics — the cli pool registry is duck-typed over both) with protocol-level divergences: Content-Length framing, the `initialize`/`initialized` handshake, three-way message classification (server→client requests like `workspace/configuration` MUST be answered or pyright stalls), `didOpen`/`didClose` brackets around positional queries, and a one-shot per-client readiness grace that also covers `references` (servers index asynchronously — the first cross-file query can legitimately return empty). Servers: pyright-langserver + typescript-language-server, selected by workspace stack tags and gated by an environment-health probe (Python: `.venv`/`venv` present; TS: `tsconfig.json` + `node_modules`) because builds run in Docker and a dep-less host server returns unresolved-import garbage. Brownfield only (`flow != "build"`); consumers: two planner ToolSkills via `<<<LSP_CALL>>>` blocks plus three harness prefetch sites (gate impact expansion, repair caller maps, CR impact augment), each with three-tier fallback LSP → `DependencyGraph` → nothing. Nothing about the pool lives in `AgentState`; no auto-restart.
+
+**Rationale**: Brownfield change requests are dominated by blast-radius questions, exactly where the tree-sitter `DependencyGraph` is weakest (500-file scan cap, stem-match false positives). LSP is authoritative there and its weaknesses (half-built greenfield projects) never apply because greenfield never starts it. jdtls is deferred to Phase 2 — it can't be spawned as a plain `--stdio` binary, and its payoff for this harness is diagnostics (already covered for Java by the compiler), not navigation.
+
+**Trade-off**: On `teane resume` the checkpointed prompt and actual pool availability can disagree — fail-open in both directions (skills answer with a polite error; an unadvertised pool still serves harness prefetch). Persistent servers add ~1 process per language per session, bounded by session-scoped lifecycle + atexit backstop.
+
+### 5.60 Four-Target CLI + Closed-Loop E2E Testing (FR-072 / FR-073)
+
+**Decision**: The legacy `run` verb is split into four targets that pin `args.flow` before delegating to the shared engine: `build` (greenfield reset), `patch` (brownfield reconcile; `--agile` optional on the same flow), `deploy` (compose synthesis + health checks), `test` (Playwright e2e against the deployed stack, prereq-gated on a prior clean tracked flow via `flow_state`). E2e failures emit `CR-DEFECT-*` change-request files, making `build → deploy → test → patch` a closed loop with no operator authorship in between. `_resolve_cli_exit_code` maps outcomes to deterministic exit codes (0/1/2/3/4) for CI chaining.
+
+**Rationale**: `flow` is now the single dimension the harness branches on for target-specific behavior (deployment edges, test prereqs, brownfield-only subsystems like the LSP pool) — orthogonal to agile/waterfall, which toggles story decomposition within a flow.
+
+**Trade-off**: Four entry points share one engine (`cmd_run`), so target-specific pinning must happen before delegation — a new target must pin `flow` first or inherit build semantics.
+
+### 5.61 Spec Reconciler — Requirement-ID Authority (FR-074)
+
+**Decision**: `spec_reconciler_node` treats `SPEC_REQUIREMENTS.md` as the sole authority for feature/story IDs in story mode. LLM decomposition output is consumed ONLY as `scope_files` enrichment; IDs are reconciled against the spec, dropped enabler stories are recovered, `story_satisfies_req` parent traceability is repopulated structurally, and `traceability_block` escalation cycles are capped.
+
+**Rationale**: LLMs rename and invent requirement IDs under paraphrase pressure; every downstream traceability join (TRACEABILITY.md, batch sealing, the end-of-session audit) breaks silently when IDs drift. Structural reconciliation makes drift impossible rather than detectable.
+
+**Trade-off**: A genuinely new requirement surfaced mid-decomposition is forced through a spec update instead of being minted ad-hoc — deliberate friction.
+
+### 5.62 Unattended-Run Hardening (FR-078)
+
+**Decision**: Three layers added after headless budget-drain incidents: (1) consecutive headless HITL auto-resumes are capped, with direct-abandon at the cap (no `[q]` confirm ping-pong); (2) a pre-patch anti-drift screen rejects patch blocks before application on `[screen:over-cap]` / `[screen:stuck-reread]` / `[screen:repeat-search]` signatures; (3) patcher Guard 4 rejects `REPLACE_BLOCK`/`DELETE_BLOCK` against essentially-empty files.
+
+**Rationale**: Every HITL that fires unattended is either a budget drain or a stalled session (see the north-star: hands-off operation). These guards convert the observed loop-fixation classes from "diagnosed after N wasted rounds" to "rejected pre-flight" — enforcement over advice.
+
+**Trade-off**: Pre-flight rejection can occasionally block a legitimate unusual edit pattern; the screens emit reason-tagged errors so the LLM can adapt within the same round rather than silently retrying.
+
 ---
 
 ## 6. Data Model Overview
@@ -1097,8 +1176,17 @@ AgentState
 ├── deployment_defaults: dict[str, Any]     # Org-wide policy from config.json deployment_defaults section (FR-048); empty when absent
 ├── sandbox_config: dict[str, Any]          # config["sandbox"] threaded into state (P0)
 ├── lintgate_config: dict[str, Any]         # config["lintgate"] threaded into state
-└── deployment_config: dict[str, Any]       # config["deployment"] threaded into state
+├── deployment_config: dict[str, Any]       # config["deployment"] threaded into state
+├── flow: str                               # "build"|"patch"|"deploy"|"test" — pinned by the CLI target (FR-072)
+├── diagnostics_config: dict[str, Any]      # config["diagnostics"] — gate knobs (FR-075)
+├── diagnostics_baseline: dict[str, Any]    # {commit, mode, fingerprints} HEAD-worktree baseline cache (FR-075)
+├── post_mortem_config: dict[str, Any]      # config["post_mortem"] — learning-loop knobs (FR-076)
+└── post_mortem_note: str                   # [learned-rule:*] note staged by human_intervention_node; cli finalize is the single writer (FR-076)
 ```
+
+The brownfield LSP pool (FR-077) deliberately stores NOTHING in `AgentState`
+— graph code reaches it via `lsp_client.get_active_pool()`, so checkpoint
+resume simply cold-starts (or skips) a fresh pool.
 
 ### 6.2 Checkpoint Schema (SQLite)
 

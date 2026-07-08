@@ -736,6 +736,15 @@ class DockerBackend(SandboxBackend):
         # _ensure_cache_volumes; failed-to-create volumes fall back to the
         # read-only host bind so the build can still cold-fill from the host
         # cache (better than no cache at all).
+        # Track cache paths that did NOT get a writable volume mount so
+        # we can inject fallback ``*_CACHE_DIR`` env vars pointing at
+        # /tmp/*-cache. Without this, an unavailable /cache/uv (volume-
+        # create failed AND no host bind path) leaves the builder image's
+        # ENV UV_CACHE_DIR=/cache/uv pointing at the read-only root FS,
+        # and the LLM burns entire repair loops trying to redirect uv via
+        # pyproject.toml edits (session cec4d124, 2026-07-07 — 45 rounds
+        # against an empty pyproject.toml).
+        _cache_paths_needing_env_fallback: list[str] = []
         for cache_path in cache_mounts:
             expanded = os.path.expanduser(cache_path)
             expanded_mount = _docker_mount_path(expanded)
@@ -754,6 +763,12 @@ class DockerBackend(SandboxBackend):
                 # ensure failed → fall through to the read-only host bind.
             if os.path.isdir(expanded):
                 cmd.extend(["-v", f"{expanded_mount}:{expanded_mount}:ro"])
+            else:
+                # Neither a writable named volume nor a readable host bind.
+                # The path is on the container's read-only root FS, so any
+                # tool that tries to write there fails opaquely. Queue an
+                # env override.
+                _cache_paths_needing_env_fallback.append(expanded)
 
         # Set working directory (same Windows path conversion as the mount).
         cmd.extend(["-w", _docker_mount_path(workspace_path)])
@@ -771,6 +786,11 @@ class DockerBackend(SandboxBackend):
         defaults = self._default_pyc_env()
         if run_as_host_user:
             defaults.update(self._default_user_mode_env())
+        # Cache-fallback env vars for any /cache/* path that didn't get a
+        # writable mount. See loop above.
+        defaults.update(
+            self._cache_fallback_env(_cache_paths_needing_env_fallback)
+        )
         merged_env = {**defaults, **extra_env}
         for key, value in merged_env.items():
             cmd.extend(["-e", f"{key}={value}"])
@@ -901,6 +921,35 @@ class DockerBackend(SandboxBackend):
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": "/tmp/pycache",
         }
+
+    # Fallback cache-dir env-var mapping for /cache/* paths that couldn't
+    # be mounted writable. The builder image's ENV sets each tool's cache
+    # var to the corresponding /cache/* path — when that path lands on
+    # the read-only root FS (no volume, no host bind), we must override
+    # to a writable tmpfs path or the tool errors out opaquely.
+    _CACHE_PATH_ENV_MAP: dict[str, tuple[str, str]] = {
+        "/cache/pip": ("PIP_CACHE_DIR", "/tmp/pip-cache"),
+        "/cache/uv": ("UV_CACHE_DIR", "/tmp/uv-cache"),
+        "/cache/npm": ("npm_config_cache", "/tmp/npm-cache"),
+    }
+
+    @classmethod
+    def _cache_fallback_env(cls, missing_cache_paths: list[str]) -> dict[str, str]:
+        """Return env-var overrides for cache paths that didn't get a
+        writable mount. See ``_CACHE_PATH_ENV_MAP`` for the mapping.
+
+        Absent input → empty dict. Unknown paths are ignored (no mapping
+        entry). Callers merge the result into ``defaults`` at build time
+        so ``extra_env`` still wins.
+        """
+        out: dict[str, str] = {}
+        for path in missing_cache_paths or ():
+            entry = cls._CACHE_PATH_ENV_MAP.get(path)
+            if entry is None:
+                continue
+            var, fallback = entry
+            out[var] = fallback
+        return out
 
     def _wrap_shell_cmd_with_ownership_restore(
         self, shell_cmd: str, workspace_path: str,

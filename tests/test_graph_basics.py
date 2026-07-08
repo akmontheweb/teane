@@ -2056,13 +2056,14 @@ class TestPatchingNodeContinuation:
 
         captured: dict = {}
 
-        async def fake_apply(content, ws, existing, allowed_paths=None):
-            captured["content"] = content
+        async def fake_apply(blocks, ws, existing, allowed_paths=None, **kwargs):
+            captured["blocks"] = list(blocks)
+            captured["files"] = [b.file for b in blocks]
             return [], []
 
         import harness.patcher as patcher_mod
         monkeypatch.setattr(
-            patcher_mod, "process_llm_patch_output", fake_apply,
+            patcher_mod, "apply_patch_blocks", fake_apply,
         )
 
         state = {
@@ -2085,10 +2086,10 @@ class TestPatchingNodeContinuation:
         assert "backend/a.py" in continuation_msgs[-2]["content"]
         assert continuation_msgs[-1]["role"] == "user"
         assert "hit the output token cap" in continuation_msgs[-1]["content"]
-        # The patcher saw BOTH chunks concatenated — without this the
-        # frontend CREATE_FILE block would never reach disk.
-        assert "backend/a.py" in captured["content"]
-        assert "frontend/index.js" in captured["content"]
+        # The patcher saw BOTH chunks parsed and concatenated — without
+        # this the frontend CREATE_FILE block would never reach disk.
+        assert "backend/a.py" in captured["files"]
+        assert "frontend/index.js" in captured["files"]
         # Node returned cleanly with both files in modified_files
         # provided by the fake apply (empty here — we only assert
         # the call shape).
@@ -2115,14 +2116,22 @@ class TestPatchingNodeContinuation:
 
         captured: dict = {}
 
-        async def fake_apply(content, ws, existing, allowed_paths=None):
-            captured["content"] = content
+        # The pathological test uses non-block content ("chunk1"...),
+        # so nothing parses to a PatchBlock. Assert on the concatenated
+        # text handed to parse_patch_blocks via a shim on the parse fn.
+        import harness.patcher as patcher_mod
+        original_parse = patcher_mod.parse_patch_blocks
+
+        def fake_parse(text):
+            captured["content"] = text
+            return original_parse(text)
+
+        monkeypatch.setattr(patcher_mod, "parse_patch_blocks", fake_parse)
+
+        async def fake_apply(blocks, ws, existing, allowed_paths=None, **kwargs):
             return [], []
 
-        import harness.patcher as patcher_mod
-        monkeypatch.setattr(
-            patcher_mod, "process_llm_patch_output", fake_apply,
-        )
+        monkeypatch.setattr(patcher_mod, "apply_patch_blocks", fake_apply)
 
         state = {
             "messages": [{"role": "system", "content": "you are a patcher"}],
@@ -2137,6 +2146,6 @@ class TestPatchingNodeContinuation:
 
         # 6 = initial + 5 continuation cycles. No more.
         assert len(dispatches) == 6
-        # All six chunks reached the patcher.
+        # All six chunks reached the patcher via the concatenated text.
         assert "chunk1" in captured["content"]
         assert "chunk6" in captured["content"]

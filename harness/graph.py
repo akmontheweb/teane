@@ -3639,7 +3639,7 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
 
     try:
         from harness.gateway import NodeRole
-        from harness.patcher import apply_patch_blocks, process_llm_patch_output
+        from harness.patcher import apply_patch_blocks
 
         messages = list(state.get("messages", []))
         budget = state.get("budget_remaining_usd", 2.00)
@@ -4065,13 +4065,35 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 )
             # Apply patches to disk using the same allowlist we surfaced to the
             # LLM above — keeps the LLM's expectation and the patcher's enforcement
-            # in lockstep.
-            patch_results, modified_files = await process_llm_patch_output(
-                filtered_response,
+            # in lockstep. Runs through the pre-patch anti-drift screen first
+            # so intra-turn over-cap / stuck-file / repeat-search blocks are
+            # rejected before the patcher wastes work on them.
+            from harness.patcher import (
+                parse_patch_blocks as _parse_patch_blocks_for_screen,
+                apply_patch_blocks as _apply_patch_blocks_screened,
+            )
+            _blocks_parsed = _parse_patch_blocks_for_screen(filtered_response)
+            _blocks_kept, _screen_rejections = _pre_patch_screen(
+                _blocks_parsed, loop_counter, tool_files_seen, workspace,
+            )
+            if _screen_rejections:
+                logger.info(
+                    "[patching_node:screen] %d block(s) rejected pre-flight "
+                    "(%s).",
+                    len(_screen_rejections),
+                    ", ".join(sorted({r.file for r in _screen_rejections})),
+                )
+            patch_results, modified_files = await _apply_patch_blocks_screened(
+                _blocks_kept,
                 workspace,
                 existing_modified,
                 allowed_paths=allowed_paths,
+                files_seen_by_llm=tool_files_seen,
             )
+            _update_search_history_post_patch(
+                _blocks_kept, patch_results, loop_counter,
+            )
+            patch_results = list(_screen_rejections) + list(patch_results)
 
         # Append the LLM response to messages (the original, unfiltered,
         # so the LLM's own history reflects what it actually emitted).
@@ -6064,6 +6086,294 @@ def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     for f in stuck:
         lines.append(f"- `{f}` (consecutive REPLACE_BLOCK misses: {rb_misses[f]})")
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Pre-patch screen — three guards against the "LLM patching against a stale
+# mental model" failure mode that cost the FinancialResearch session 19 HITL
+# trips and $1.03 in 2 hours (session cec4d124, 2026-07-07):
+#
+#   1. INTRA-TURN OVER-CAP  — if the LLM emits > _MAX_EDITS_PER_FILE_PER_TURN
+#      REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK ops against the SAME
+#      file in one response, reject all of them for that file. Multiple
+#      surgical patches against one file inside one turn is a strong signal
+#      the mental model is stale (later blocks are computed assuming the
+#      earlier ones landed on a snapshot the LLM has, which is unreliable).
+#      Direct the model to REWRITE_FILE (the full-file escape hatch) or
+#      split across turns with READ_FILE between them.
+#
+#   2. STUCK-FILE READ_FILE GATE — for any file already at ≥ 2 consecutive
+#      REPLACE_BLOCK misses (``stuck_files_awaiting_reread`` = keys of
+#      ``replace_block_misses_per_file`` at n ≥ 2), refuse any further
+#      REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK / INSERT_AT_LINE /
+#      REPLACE_LINE_RANGE against it unless the LLM's current view of the
+#      file (``files_seen_by_llm[path]`` sha256) matches on-disk. In other
+#      words: mental-model must be verified fresh before another attempt.
+#      READ_FILE resolution updates ``files_seen_by_llm`` so an LLM that
+#      emits <<<READ_FILE>>> for the stuck file gets past this gate on
+#      the re-dispatch.
+#
+#   3. REPEAT-SEARCH DETECTOR — reject a REPLACE_BLOCK / DELETE_BLOCK whose
+#      ``search:`` hashes to a value already rejected against that file in
+#      a prior turn. Byte-identical resubmissions are the pattern-repetition
+#      failure mode: the model committed to a wrong search block and is
+#      cycling. History lives on ``loop_counter['rejected_search_hashes']``
+#      as ``{file_path: [hash, ...]}``, capped at 10 per file to bound
+#      memory. Cleared on any successful patch against the file (mental
+#      model demonstrably good again).
+#
+# The screen returns (kept_blocks, rejection_results) so
+# ``apply_patch_blocks`` runs on the filtered set and the rejections still
+# reach the LLM via the standard PatchResult → status-message pipeline.
+# ---------------------------------------------------------------------------
+
+_MAX_EDITS_PER_FILE_PER_TURN = 3
+_REJECTED_SEARCH_HISTORY_CAP = 10
+
+
+def _pre_patch_screen(
+    blocks: "list[Any]",
+    loop_counter: dict[str, Any],
+    files_seen_by_llm: dict[str, str],
+    workspace_path: str,
+) -> tuple[list, list]:
+    """Filter ``blocks`` against the three anti-drift guards described above.
+
+    Returns ``(kept_blocks, screen_rejections)``.  ``screen_rejections`` is a
+    list of :class:`PatchResult`-shaped objects (success=False) that the
+    caller prepends to the patcher's own results so the LLM sees the
+    rejection reason on its next round.
+    """
+    from harness.patcher import PatchResult, OperationType
+
+    _EDIT_OPS = {
+        OperationType.REPLACE_BLOCK,
+        OperationType.DELETE_BLOCK,
+        OperationType.INSERT_AT_BLOCK,
+        OperationType.INSERT_AT_LINE,
+        OperationType.REPLACE_LINE_RANGE,
+    }
+    _SEARCH_OPS = {
+        OperationType.REPLACE_BLOCK,
+        OperationType.DELETE_BLOCK,
+    }
+
+    rb_misses_raw = loop_counter.get("replace_block_misses_per_file") or {}
+    stuck_files = {
+        f for f, n in rb_misses_raw.items()
+        if isinstance(n, int) and n >= 2
+    } if isinstance(rb_misses_raw, dict) else set()
+
+    rejected_hashes_raw = loop_counter.get("rejected_search_hashes") or {}
+    rejected_hashes: dict[str, set[str]] = (
+        {k: set(v) for k, v in rejected_hashes_raw.items()
+         if isinstance(v, (list, tuple, set))}
+        if isinstance(rejected_hashes_raw, dict) else {}
+    )
+
+    # Count surgical edits per file for the over-cap check. REWRITE_FILE
+    # and CREATE_FILE are the two whole-file operations — they're the
+    # remediation the over-cap check is trying to steer toward, so they
+    # don't count toward the cap themselves.
+    edits_per_file: dict[str, int] = {}
+    for b in blocks:
+        if b.operation in _EDIT_OPS:
+            edits_per_file[b.file] = edits_per_file.get(b.file, 0) + 1
+
+    kept: list = []
+    rejections: list = []
+
+    for b in blocks:
+        file_key = b.file
+
+        # Guard 1 — intra-turn over-cap.
+        if (
+            b.operation in _EDIT_OPS
+            and edits_per_file.get(file_key, 0) > _MAX_EDITS_PER_FILE_PER_TURN
+        ):
+            rejections.append(PatchResult(
+                success=False,
+                file=file_key,
+                operation=b.operation,
+                error=(
+                    f"[screen:over-cap] You emitted "
+                    f"{edits_per_file[file_key]} surgical edits (REPLACE_"
+                    f"BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK / _LINE / "
+                    f"_LINE_RANGE) against `{file_key}` in a single turn. "
+                    f"Cap is {_MAX_EDITS_PER_FILE_PER_TURN}: multiple "
+                    f"surgical edits on one file in one round routinely "
+                    f"fail because later blocks are computed against a "
+                    f"snapshot invalidated by the earlier ones. All "
+                    f"surgical edits for `{file_key}` were REJECTED. "
+                    f"Next round: either emit a single "
+                    f"<<<REWRITE_FILE>>> with the full desired content, "
+                    f"OR emit <<<READ_FILE>>> first and split the edits "
+                    f"across multiple turns."
+                ),
+            ))
+            continue
+
+        # Guard 2 — stuck-file READ_FILE gate.
+        if b.operation in _EDIT_OPS and file_key in stuck_files:
+            seen_hash = files_seen_by_llm.get(file_key) or ""
+            current_hash = _sha256_file(workspace_path, file_key)
+            if not seen_hash or seen_hash != current_hash:
+                rejections.append(PatchResult(
+                    success=False,
+                    file=file_key,
+                    operation=b.operation,
+                    error=(
+                        f"[screen:stuck-reread] `{file_key}` is REPLACE_"
+                        f"BLOCK-stuck ({rb_misses_raw[file_key]} "
+                        f"consecutive misses) AND your current view of "
+                        f"it is not fresh. This patch was REJECTED. Emit "
+                        f"<<<READ_FILE>>> for `{file_key}` in your NEXT "
+                        f"response — that will re-dispatch you with the "
+                        f"authoritative on-disk content, at which point "
+                        f"your surgical edits (or a REWRITE_FILE) will "
+                        f"be accepted."
+                    ),
+                ))
+                continue
+
+        # Guard 3 — repeat-search detector.
+        if b.operation in _SEARCH_OPS and b.search:
+            h = _hash_search_block(b.search)
+            if h in rejected_hashes.get(file_key, set()):
+                rejections.append(PatchResult(
+                    success=False,
+                    file=file_key,
+                    operation=b.operation,
+                    error=(
+                        f"[screen:repeat-search] The `search:` block for "
+                        f"this patch is byte-identical to a search we "
+                        f"already rejected against `{file_key}` in a "
+                        f"prior round. Pattern-repetition detected — "
+                        f"this patch was REJECTED without running. Emit "
+                        f"<<<READ_FILE>>> for `{file_key}` to reset your "
+                        f"mental model, then write a DIFFERENT search "
+                        f"block, or switch to <<<REWRITE_FILE>>>."
+                    ),
+                ))
+                continue
+
+        kept.append(b)
+
+    return kept, rejections
+
+
+def _sha256_file(workspace_path: str, rel_path: str) -> str:
+    """Return sha256 hex of the file at ``workspace_path/rel_path``, or
+    empty string when the file is missing or unreadable. Used by the
+    stuck-file READ_FILE gate to compare on-disk state against the
+    ``files_seen_by_llm`` snapshot."""
+    import hashlib
+    abs_path = os.path.join(workspace_path, rel_path)
+    try:
+        h = hashlib.sha256()
+        with open(abs_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _hash_search_block(search: str) -> str:
+    """Return a stable hash of a REPLACE_BLOCK/DELETE_BLOCK search body.
+
+    Uses raw sha256 — no whitespace normalisation. Two search blocks that
+    differ only by trailing whitespace are treated as distinct attempts;
+    that's deliberate. The repeat-search detector's purpose is to catch
+    the "the LLM re-emitted the EXACT same rejected patch" degenerate
+    case, not to make judgment calls about semantic equivalence.
+    """
+    import hashlib
+    return hashlib.sha256(search.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _update_search_history_post_patch(
+    blocks_attempted: "list[Any]",
+    patch_results: "list[Any]",
+    loop_counter: dict[str, Any],
+) -> None:
+    """Post-patcher bookkeeping for Guard 3 — repeat-search detector.
+
+    ``PatchResult`` doesn't carry the original ``search:`` text back, so
+    we take the block list that was handed to the patcher (which does)
+    and pair block-with-result by index.
+
+    Two updates per turn:
+
+    1. **Clear on success** — any successful, non-no-op surgical patch
+       against a file clears that file's rejected-search history. The
+       LLM demonstrably has a good mental model of the file again;
+       whatever it emits next round starts with a fresh slate.
+    2. **Add on search-miss** — for each REPLACE_BLOCK / DELETE_BLOCK
+       that failed with a real search-miss error (``Search block not
+       found`` or ``matched N``), append the search hash to
+       ``rejected_search_hashes[file]``. Byte-identical retries in a
+       later turn get caught by the pre-flight screen.
+
+    Bounded at ``_REJECTED_SEARCH_HISTORY_CAP`` per file so a pathological
+    session cannot balloon state indefinitely; oldest hashes drop first.
+    Screen-driven rejections (``[screen:*]`` errors) are ignored — those
+    aren't LLM mental-model failures, just harness pre-flight blocks.
+    """
+    from harness.patcher import OperationType
+
+    _SEARCH_OPS = {OperationType.REPLACE_BLOCK, OperationType.DELETE_BLOCK}
+    _SURGICAL_OPS = {
+        OperationType.REPLACE_BLOCK,
+        OperationType.DELETE_BLOCK,
+        OperationType.INSERT_AT_BLOCK,
+        OperationType.INSERT_AT_LINE,
+        OperationType.REPLACE_LINE_RANGE,
+    }
+
+    hist_raw = loop_counter.get("rejected_search_hashes") or {}
+    hist: dict[str, list[str]] = (
+        {k: list(v) for k, v in hist_raw.items()
+         if isinstance(v, (list, tuple, set))}
+        if isinstance(hist_raw, dict) else {}
+    )
+
+    # Two-pass: clears first (any success wipes the file's history) so a
+    # late REPLACE_BLOCK failure on the same file doesn't spuriously
+    # re-populate history that a successful earlier patch just cleared.
+    for r in patch_results:
+        if (
+            r.success
+            and r.operation in _SURGICAL_OPS
+            and not getattr(r, "no_op", False)
+        ):
+            hist.pop(r.file, None)
+
+    for block, result in zip(blocks_attempted, patch_results):
+        if result.success:
+            continue
+        if block.operation not in _SEARCH_OPS:
+            continue
+        err = result.error or ""
+        # Screen rejections are not LLM mental-model failures.
+        if err.startswith("[screen:"):
+            continue
+        if not any(marker in err for marker in (
+            "Search block not found",
+            "matched",  # covers "matched 2 nodes" / "matched N times"
+        )):
+            continue
+        h = _hash_search_block(block.search or "")
+        if not h:
+            continue
+        lst = hist.setdefault(block.file, [])
+        if h in lst:
+            continue
+        lst.append(h)
+        if len(lst) > _REJECTED_SEARCH_HISTORY_CAP:
+            del lst[:len(lst) - _REJECTED_SEARCH_HISTORY_CAP]
+
+    loop_counter["rejected_search_hashes"] = hist
 
 
 def _extract_wider_context_from_failure(failure: Any) -> tuple[str, Optional[str]]:
@@ -11275,7 +11585,6 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
 
     try:
         from harness.gateway import NodeRole
-        from harness.patcher import process_llm_patch_output
 
         # Use the autofix-augmented messages list so the LLM sees the
         # "we already fixed X" system message and doesn't re-fix.
@@ -12275,14 +12584,37 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         enforce_read = bool(
             getattr(gw_cfg, "enforce_read_before_edit", False)
         )
-        patch_results, modified_files = await process_llm_patch_output(
-            patch_payload,
+        # Pre-patch anti-drift screen. Filters batches the LLM cannot
+        # possibly land against a stale mental model: intra-turn over-cap,
+        # stuck-file-without-fresh-view, and byte-identical repeat search
+        # blocks. See ``_pre_patch_screen`` for the full rationale.
+        from harness.patcher import parse_patch_blocks, apply_patch_blocks
+        _blocks_parsed = parse_patch_blocks(patch_payload)
+        _blocks_kept, _screen_rejections = _pre_patch_screen(
+            _blocks_parsed, loop_counter, files_seen_by_llm, workspace,
+        )
+        if _screen_rejections:
+            logger.info(
+                "[repair_node:screen] %d block(s) rejected pre-flight "
+                "(%s).",
+                len(_screen_rejections),
+                ", ".join(sorted({r.file for r in _screen_rejections})),
+            )
+        patch_results, modified_files = await apply_patch_blocks(
+            _blocks_kept,
             workspace,
             existing_modified,
             allowed_paths=allowed_paths,
             files_seen_by_llm=files_seen_by_llm,
             enforce_read_before_edit=enforce_read,
         )
+        # Post-patch bookkeeping for the repeat-search detector.
+        _update_search_history_post_patch(
+            _blocks_kept, patch_results, loop_counter,
+        )
+        # Merge screen rejections so the LLM sees them in the next round's
+        # status message alongside the patcher's own results.
+        patch_results = list(_screen_rejections) + list(patch_results)
 
         # Append the LLM response to messages
         messages.append(MessageDict(role="assistant", content=response.content))

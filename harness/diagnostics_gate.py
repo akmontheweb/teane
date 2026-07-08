@@ -368,6 +368,53 @@ def _expand_with_impacted(
     return out
 
 
+async def _expand_with_impacted_lsp(
+    files: list[str], workspace_path: str,
+) -> Optional[list[str]]:
+    """LSP tier of the impact expansion (Site A). ``None`` means "fall
+    back to the DependencyGraph tier" — returned on any unavailability,
+    error, or when the servers found no callers at all, so a partial or
+    empty LSP answer can never mask the heuristic below it."""
+    try:
+        from harness.lsp_client import callers_of_file, get_active_pool
+        pool = get_active_pool()
+        if pool is None or not pool.healthy():
+            return None
+        ws = os.path.abspath(workspace_path)
+        budget = min(float(getattr(pool.config, "prefetch_budget_seconds", 20.0)), 10.0)
+        deadline = time.monotonic() + budget
+        caller_rels: set[str] = set()
+        for f in files[:10]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            caller_map = await callers_of_file(
+                pool, _norm_rel(f, ws), budget_seconds=min(4.0, remaining),
+            )
+            caller_rels.update(caller_map.keys())
+        if not caller_rels:
+            return None
+        # Same post-filter and return shape as the sync heuristic tier.
+        seen = {_norm_rel(f, ws) for f in files}
+        out = list(files)
+        extra = 0
+        for rel in sorted(caller_rels):
+            if extra >= _MAX_IMPACTED_EXTRA:
+                break
+            abs_f = os.path.join(ws, rel)
+            if rel in seen or os.path.splitext(rel)[1].lower() not in _GATE_EXTS:
+                continue
+            if not os.path.isfile(abs_f):
+                continue
+            seen.add(rel)
+            out.append(abs_f)
+            extra += 1
+        return out
+    except Exception as exc:  # noqa: BLE001 — fail-open by contract
+        logger.debug("[diagnostics_gate] LSP impact expansion failed: %s", exc)
+        return None
+
+
 async def diagnostics_node(state: dict[str, Any]) -> dict[str, Any]:
     """Read-only type-check gate between lintgate_node and compiler_node.
 
@@ -403,7 +450,19 @@ async def diagnostics_node(state: dict[str, Any]) -> dict[str, Any]:
         return {"node_state": node_state}
 
     if (cfg.get("scope") or "impacted") == "impacted":
-        scoped = _expand_with_impacted(scoped, ws)
+        expanded = await _expand_with_impacted_lsp(scoped, ws)
+        if expanded is None:
+            # Only emit the fallback event when a pool exists but could
+            # not serve — greenfield (no pool at all) would be pure noise.
+            try:
+                from harness.lsp_client import get_active_pool
+                if get_active_pool() is not None:
+                    emit_event("lsp_fallback", site="diagnostics_gate",
+                               reason="unavailable_or_empty")
+            except Exception:  # noqa: BLE001
+                pass
+            expanded = _expand_with_impacted(scoped, ws)
+        scoped = expanded
 
     session_id = str(state.get("session_id") or "nosession")[:8]
     scratch_dir = os.path.join(tempfile.gettempdir(), f"teane_diag_{session_id}")

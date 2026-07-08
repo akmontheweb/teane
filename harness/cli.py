@@ -527,6 +527,11 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # (pyright/mypy for Python, tsc for TS/TSX). Default on, fail-open.
     # See harness/diagnostics_gate.py.
     "diagnostics",
+    # LSP client pool for semantic navigation — brownfield flows only
+    # (patch/test). pyright-langserver / typescript-language-server behind
+    # an environment-health probe; DependencyGraph stays the fallback.
+    # See harness/lsp_client.py.
+    "lsp",
     # Automated failure post-mortems — the HITL learning loop. On HITL or
     # failed exit, a [learned-rule:<trigger>] note lands in per-repo
     # memory and reaches the next run's planner. See harness/post_mortem.py.
@@ -627,6 +632,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "diagnostics": frozenset({
         "enabled", "timeout_seconds", "max_rounds", "scope", "tools",
+    }),
+    "lsp": frozenset({
+        "enabled", "enabled_flows", "request_timeout_seconds",
+        "python_require_venv", "prefetch_budget_seconds",
     }),
     "post_mortem": frozenset({
         "enabled", "max_cost_usd", "retire_on_clean_run",
@@ -5541,6 +5550,82 @@ async def _maybe_start_mcp_pool(
     return pool
 
 
+async def _maybe_start_lsp_pool(
+    config: dict[str, Any],
+    workspace_path: str,
+    flow: str,
+) -> Optional[Any]:
+    """Start the brownfield LSP navigation pool when ``lsp.enabled`` and
+    the flow qualifies (never ``build`` — greenfield stays byte-identical).
+
+    Registers the ``lsp__*`` navigation skills and publishes the pool via
+    :func:`harness.lsp_client.set_active_pool` for graph-side prefetch.
+    Reuses the MCP pool registry for drain + atexit cleanup (duck-typed:
+    ``.shutdown()`` coroutine and ``.clients`` of objects carrying
+    ``_proc``). Failures log and return ``None`` — LSP is additive; the
+    DependencyGraph heuristics remain the fallback tier everywhere.
+    """
+    try:
+        from harness.lsp_client import (
+            LspClientPool, LspPoolConfig, register_lsp_skills, set_active_pool,
+        )
+    except Exception as exc:  # noqa: BLE001 — LSP optional
+        logger.debug("[cli:lsp] import failed: %s", exc)
+        return None
+    pool_cfg = LspPoolConfig.from_config(config)
+    if not pool_cfg.enabled:
+        return None
+    if flow == "build" or flow not in pool_cfg.enabled_flows:
+        logger.debug("[cli:lsp] flow %r not lsp-enabled; pool not started.", flow)
+        return None
+    try:
+        from harness.impact import _detect_workspace_stack
+        workspace_tags = _detect_workspace_stack(workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[cli:lsp] workspace stack detection failed: %s", exc)
+        workspace_tags = set()
+    if not ({"python", "typescript", "node"} & workspace_tags):
+        logger.info("[cli:lsp] no LSP-capable stack detected; pool not started.")
+        return None
+    pool = LspClientPool(pool_cfg, workspace_path)
+    try:
+        await pool.start(workspace_tags)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli:lsp] pool start failed: %s", exc)
+        try:
+            await pool.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    try:
+        from harness.observability import emit_event
+        emit_event(
+            "lsp_pool_started",
+            flow=flow,
+            servers=sorted(pool.clients.keys()),
+            skipped=pool.skipped,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    if not pool.clients:
+        logger.info(
+            "[cli:lsp] no servers started (skipped: %s) — navigation stays "
+            "on heuristics.", pool.skipped,
+        )
+        return None
+    try:
+        register_lsp_skills(pool)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli:lsp] skill registration failed: %s", exc)
+    set_active_pool(pool)
+    _register_pool_for_shutdown(pool)
+    logger.info(
+        "[cli:lsp] pool up for flow %r: %s (skipped: %s)",
+        flow, sorted(pool.clients.keys()), pool.skipped or "none",
+    )
+    return pool
+
+
 # ---------------------------------------------------------------------------
 # 3. Subcommand Handlers
 # ---------------------------------------------------------------------------
@@ -5772,6 +5857,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # the subprocesses down on a clean exit; Ctrl-C is handled by the
     # outer asyncio cancel path which also triggers the same shutdown.
     _mcp_pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)
+    # Brownfield-only LSP navigation pool (no-op for flow="build").
+    _lsp_pool = await _maybe_start_lsp_pool(
+        config, workspace_path, flow=getattr(args, "flow", "build"),
+    )  # noqa: F841 — drained via the shared pool registry
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
@@ -6937,6 +7026,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     # the subprocesses down on a clean exit; Ctrl-C is handled by the
     # outer asyncio cancel path which also triggers the same shutdown.
     _mcp_pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)
+    # Brownfield-only LSP navigation pool (no-op for flow="build").
+    _lsp_pool = await _maybe_start_lsp_pool(
+        config, workspace_path, flow=getattr(args, "flow", "build"),
+    )  # noqa: F841 — drained via the shared pool registry
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config

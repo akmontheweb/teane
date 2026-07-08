@@ -366,6 +366,14 @@
             }
         ]
     },
+    "_lsp_comment": "Language Server Protocol client pool for semantic navigation (harness/lsp_client.py) — BROWNFIELD flows only (enabled_flows, default patch/test; the build flow never starts it, keeping greenfield byte-identical). Spawns pyright-langserver (Python) / typescript-language-server (TS/TSX) as stdio subprocesses when the workspace passes an environment-health probe: Python needs a .venv or venv dir at the workspace root (set python_require_venv=false to override, e.g. system-site deps); TypeScript needs tsconfig.json AND node_modules (builds run in Docker, so host-side deps may legitimately be absent — a server without resolvable imports returns garbage, so we skip instead). Powers the planner's <<<LSP_CALL>>> tools (lsp__find_references / lsp__go_to_definition) and semantic upgrades to the diagnostics gate + repair prompts, with the tree-sitter DependencyGraph as the fallback tier everywhere. prefetch_budget_seconds bounds harness-side reference prefetches per repair round. No auto-restart: a dead server degrades silently to heuristics for the rest of the session. jdtls (Java) is deferred to Phase 2 — see harness/lsp_client.py docstring.",
+    "lsp": {
+        "enabled": true,
+        "enabled_flows": ["patch", "test"],
+        "request_timeout_seconds": 15,
+        "python_require_venv": true,
+        "prefetch_budget_seconds": 20
+    },
     "_skills_comment": "Runtime-extensible skill loader. user_skills_dir is the path the SkillRegistry walks at startup; each *.py file under it is imported and may call harness.skills.register(MySkill(...)) to add a ToolSkill / PipelineSkill / SubAgentSkill that the planner can invoke, OR harness.web_tools.register_backend(name, factory) to plug in an alternative web-search backend (Tavily, Brave, SerpAPI, in-house) without forking the harness. Failures (syntax error, missing import) are logged and skipped \u2014 one bad file doesn't take down startup. Default ~/.harness/user_skills (named to disambiguate from the bundled markdown scaffolds at harness/skills/ inside the installed package). Existing installs that still have *.py files at the legacy ~/.harness/skills path keep working: the loader falls back to that path when the new default is empty and logs a one-time deprecation INFO.",
     "skills": {
         "user_skills_dir": "~/.harness/user_skills"

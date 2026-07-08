@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Iterable, Literal, Optional, cast
 
 from typing_extensions import TypedDict
@@ -1472,6 +1473,25 @@ def _render_core_languages_directive(config: Optional[dict[str, Any]] = None) ->
     )
 
 
+# Injected into the system prompt ONLY when the brownfield LSP pool is up
+# (see the lsp_block gate in _build_system_prompt). Values MUST be shown
+# quoted — the block parser only matches quoted kwargs.
+_LSP_DSL_PROMPT_SECTION = """## Code Navigation Tools (planning turns only)
+This brownfield workspace has live language-server navigation. During
+PLANNING turns you may emit these blocks to get ground-truth answers
+instead of guessing from file reads:
+
+<<<LSP_CALL tool="find_references" symbol="UserService" file="server/services/user.py">>>
+<<<LSP_CALL tool="go_to_definition" symbol="save_order">>>
+
+- `symbol` is a plain function/class/constant name — no line numbers.
+- `file` is an optional workspace-relative hint to disambiguate.
+- Results return as a follow-up message; at most a few calls per turn.
+- Use find_references BEFORE changing any shared signature or renaming —
+  it lists every caller you must keep consistent.
+"""
+
+
 def _build_system_prompt(
     workspace_path: str,
     build_command: str,
@@ -1612,6 +1632,24 @@ def _build_system_prompt(
 
     core_languages_directive = _render_core_languages_directive(config)
 
+    # --- LSP navigation tools (brownfield sessions only) ---
+    # Gated on the live pool accessor rather than an AgentState flag: the
+    # cli starts the pool (flow != "build") BEFORE create_initial_state
+    # builds this prompt, and greenfield never has a pool — so greenfield
+    # prompts stay byte-identical. The section is decided once per session
+    # (prefix-cache anchored); a mid-session server death degrades via the
+    # skill's error string, not prompt mutation. On resume the checkpointed
+    # prompt and actual pool availability can disagree — fail-open both
+    # ways (skill answers politely / pool goes unused).
+    lsp_block = ""
+    try:
+        from harness.lsp_client import get_active_pool as _get_lsp_pool
+        _lsp_pool = _get_lsp_pool()
+        if _lsp_pool is not None and _lsp_pool.healthy():
+            lsp_block = _LSP_DSL_PROMPT_SECTION
+    except Exception:  # noqa: BLE001 — prompt build must never break on LSP
+        pass
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
 {core_languages_directive}
@@ -1620,7 +1658,7 @@ def _build_system_prompt(
 
 ## Directory Structure (snapshot at invocation)
 {tree}
-{layout_block}{inventory_block}{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}{style_guides if style_guides else ""}
+{layout_block}{inventory_block}{lsp_block}{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}{style_guides if style_guides else ""}
 ## Build Command
 {build_command}
 
@@ -3222,16 +3260,29 @@ async def _run_tool_loop(
         parse_mcp_blocks = None  # type: ignore[assignment]
         strip_mcp_blocks = None  # type: ignore[assignment]
 
+    # LSP navigation blocks (brownfield sessions). Same best-effort
+    # contract as MCP: an unregistered lsp__* skill (greenfield — the
+    # pool never started) falls into the "not registered" notice path.
+    try:
+        from harness.lsp_client import parse_lsp_blocks, strip_lsp_blocks
+    except Exception:  # noqa: BLE001 — LSP is optional
+        parse_lsp_blocks = None  # type: ignore[assignment]
+        strip_lsp_blocks = None  # type: ignore[assignment]
+
     def _all_blocks(text: str) -> list[Any]:
         out = list(parse_tool_blocks(text))
         if parse_mcp_blocks is not None:
             out.extend(parse_mcp_blocks(text))
+        if parse_lsp_blocks is not None:
+            out.extend(parse_lsp_blocks(text))
         return out
 
     def _strip_all_blocks(text: str) -> str:
         text = strip_tool_blocks(text)
         if strip_mcp_blocks is not None:
             text = strip_mcp_blocks(text)
+        if strip_lsp_blocks is not None:
+            text = strip_lsp_blocks(text)
         return text
 
     current_content = initial_response_content
@@ -6807,6 +6858,7 @@ _CR_EXTRA_FILE_CAP = 6
 
 def _cr_impact_augment(
     state: "AgentState", diag_files: list[str],
+    lsp_callers: Optional[list[str]] = None,
 ) -> list[str]:
     """Return additional file paths to surface to the repair LLM when
     in change-request mode (Phase L).
@@ -6854,19 +6906,31 @@ def _cr_impact_augment(
                     extras.append(rel)
                     seen.add(rel)
 
-        # Immediate callers of every diagnostic file.
+        # Immediate callers of every diagnostic file. LSP tier first
+        # (Site C): a prefetched caller list is language-server ground
+        # truth and already workspace-relative; None/empty → the
+        # DependencyGraph heuristic runs unchanged.
         if len(extras) < _CR_EXTRA_FILE_CAP:
-            callers = graph_obj.immediate_callers_of(
-                list(diag_files), top_k=_CR_EXTRA_FILE_CAP,
-            )
-            for fp in callers:
-                if len(extras) >= _CR_EXTRA_FILE_CAP:
-                    break
-                rel = os.path.relpath(fp, workspace)
-                if rel in seen:
-                    continue
-                extras.append(rel)
-                seen.add(rel)
+            if lsp_callers:
+                for rel in lsp_callers:
+                    if len(extras) >= _CR_EXTRA_FILE_CAP:
+                        break
+                    if rel in seen:
+                        continue
+                    extras.append(rel)
+                    seen.add(rel)
+            else:
+                callers = graph_obj.immediate_callers_of(
+                    list(diag_files), top_k=_CR_EXTRA_FILE_CAP,
+                )
+                for fp in callers:
+                    if len(extras) >= _CR_EXTRA_FILE_CAP:
+                        break
+                    rel = os.path.relpath(fp, workspace)
+                    if rel in seen:
+                        continue
+                    extras.append(rel)
+                    seen.add(rel)
     except Exception as exc:  # noqa: BLE001 — never block repair
         logger.debug(
             "[repair_node] CR impact augment skipped: %s", exc,
@@ -8548,10 +8612,94 @@ def _grep_imported_names(
     return names
 
 
+async def _prefetch_lsp_caller_maps(
+    files: Iterable[str],
+    workspace_path: str,
+) -> dict[str, dict[str, set[str]]]:
+    """LSP-backed caller maps for the repair-prompt formatter (Site B).
+
+    Returns ``{rel_file: {caller_rel: {symbols}}}`` — empty dict when the
+    brownfield pool is absent/unhealthy or anything fails, in which case
+    the formatter's DependencyGraph path runs unchanged (a per-file miss
+    also falls back for that file only). Deadline-bounded so a slow or
+    wedged server costs at most one budget window per repair round.
+    """
+    try:
+        from harness.lsp_client import callers_of_file, get_active_pool
+        pool = get_active_pool()
+        if pool is None or not pool.healthy():
+            return {}
+        ws = os.path.abspath(workspace_path)
+        deadline = time.monotonic() + float(
+            getattr(pool.config, "prefetch_budget_seconds", 20.0),
+        )
+        out: dict[str, dict[str, set[str]]] = {}
+        for f in files:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            rel = os.path.relpath(f, ws) if os.path.isabs(f) else f
+            rel = rel.replace(os.sep, "/")
+            caller_map = await callers_of_file(
+                pool, rel, budget_seconds=min(10.0, remaining),
+            )
+            if caller_map:
+                out[rel] = caller_map
+        return out
+    except Exception as exc:  # noqa: BLE001 — prefetch is best-effort
+        logger.debug("[repair_node] LSP caller-map prefetch failed: %s", exc)
+        try:
+            from harness.observability import emit_event
+            emit_event("lsp_fallback", site="repair_caller_map", reason=str(exc))
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
+
+async def _prefetch_lsp_immediate_callers(
+    files: Iterable[str],
+    workspace_path: str,
+) -> Optional[list[str]]:
+    """LSP-backed immediate callers for the CR impact augment (Site C).
+
+    Returns workspace-relative caller paths, or ``None`` when the pool
+    is unavailable / errored / found nothing — ``None`` tells
+    ``_cr_impact_augment`` to use its DependencyGraph path.
+    """
+    try:
+        from harness.lsp_client import callers_of_file, get_active_pool
+        pool = get_active_pool()
+        if pool is None or not pool.healthy():
+            return None
+        ws = os.path.abspath(workspace_path)
+        deadline = time.monotonic() + 8.0
+        callers: set[str] = set()
+        for f in files:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            rel = os.path.relpath(f, ws) if os.path.isabs(f) else f
+            rel = rel.replace(os.sep, "/")
+            caller_map = await callers_of_file(
+                pool, rel, budget_seconds=min(4.0, remaining),
+            )
+            callers.update(caller_map.keys())
+        return sorted(callers) if callers else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[repair_node] LSP CR-caller prefetch failed: %s", exc)
+        try:
+            from harness.observability import emit_event
+            emit_event("lsp_fallback", site="cr_impact_augment", reason=str(exc))
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
 def _format_workspace_context_for_files(
     files: Iterable[str],
     workspace_path: str,
     loop_counter: dict[str, Any],
+    lsp_caller_maps: Optional[dict[str, dict[str, set[str]]]] = None,
 ) -> str:
     """Build a compact per-file context block for the repair prompt.
 
@@ -8672,35 +8820,43 @@ def _format_workspace_context_for_files(
             # populated directly. Both paths merged so a Java file (via
             # symbol match) and a Python package init (via module
             # match) both surface callers.
-            caller_map: dict[str, set[str]] = {}
-            for symbol, dep_files in graph._dependents.items():  # noqa: SLF001
-                if symbol not in symbols_here:
-                    continue
-                for df in dep_files:
-                    if df == resolved:
+            # LSP tier (brownfield): a prefetched caller map for this file
+            # is language-server ground truth — use it verbatim and skip
+            # the heuristic reconstruction. Missing/empty entry → the
+            # DependencyGraph tier below runs unchanged for this file.
+            _lsp_entry = (lsp_caller_maps or {}).get(_rel(resolved)) or {}
+            caller_map: dict[str, set[str]] = {
+                c: set(s) for c, s in _lsp_entry.items()
+            }
+            if not caller_map:
+                for symbol, dep_files in graph._dependents.items():  # noqa: SLF001
+                    if symbol not in symbols_here:
                         continue
-                    caller_map.setdefault(df, set()).add(symbol)
-            # Python package fallback — resolve callers via the
-            # module's dotted path when the symbol-based lookup found
-            # nothing (or missed __init__.py).
-            if resolved.endswith(".py"):
-                module_variants = _dotted_module_names_for_file(
-                    workspace_path, resolved,
-                )
-                for mod in module_variants:
-                    dep_files = graph._dependents.get(mod, set())  # noqa: SLF001
                     for df in dep_files:
                         if df == resolved:
                             continue
-                        # Best-effort symbol attribution: re-parse the
-                        # caller's imports to figure out which symbols
-                        # it pulls from this module.
-                        syms = _grep_imported_names(df, mod, workspace_path)
-                        caller_map.setdefault(df, set()).update(syms)
+                        caller_map.setdefault(df, set()).add(symbol)
+                # Python package fallback — resolve callers via the
+                # module's dotted path when the symbol-based lookup found
+                # nothing (or missed __init__.py).
+                if resolved.endswith(".py"):
+                    module_variants = _dotted_module_names_for_file(
+                        workspace_path, resolved,
+                    )
+                    for mod in module_variants:
+                        dep_files = graph._dependents.get(mod, set())  # noqa: SLF001
+                        for df in dep_files:
+                            if df == resolved:
+                                continue
+                            # Best-effort symbol attribution: re-parse the
+                            # caller's imports to figure out which symbols
+                            # it pulls from this module.
+                            syms = _grep_imported_names(df, mod, workspace_path)
+                            caller_map.setdefault(df, set()).update(syms)
             if caller_map:
                 section.append("**Files that import from here:**")
                 for caller, syms in sorted(caller_map.items())[:_WORKSPACE_CTX_MAX_CALLERS]:
-                    caller_rel = _rel(caller)
+                    caller_rel = _rel(caller) if os.path.isabs(caller) else caller
                     section.append(
                         f"  - `{caller_rel}` imports: "
                         f"{', '.join(sorted(syms))}"
@@ -11143,8 +11299,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # shared utilities the CR touched + immediate callers of
             # any failing file. The repair LLM otherwise sees only the
             # failing test/file and would not realise a shared util
-            # the CR amended is the root cause.
-            cr_extra = _cr_impact_augment(state, diag_files)
+            # the CR amended is the root cause. Callers come from the
+            # brownfield LSP pool when it's up (ground truth), else the
+            # DependencyGraph heuristic inside the augment.
+            _lsp_cr_callers: Optional[list[str]] = None
+            if state.get("change_request_mode"):
+                _lsp_cr_callers = await _prefetch_lsp_immediate_callers(
+                    diag_files, workspace_path,
+                )
+            cr_extra = _cr_impact_augment(
+                state, diag_files, lsp_callers=_lsp_cr_callers,
+            )
             # Fix #2 — first-party-import prefetch. For every failing
             # test file, parse its imports and pre-attach the workspace
             # modules it depends on (recursively bounded by depth=2).
@@ -11297,8 +11462,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             if len(_cross_round_files) >= _CROSS_ROUND_CTX_CAP:
                 break
         if _cross_round_files:
+            _lsp_maps = await _prefetch_lsp_caller_maps(
+                _cross_round_files, workspace_path,
+            )
             _cross_ctx = _format_workspace_context_for_files(
                 _cross_round_files, workspace_path, loop_counter,
+                lsp_caller_maps=_lsp_maps or None,
             )
             if _cross_ctx.strip():
                 error_summary += _cross_ctx
@@ -12217,10 +12386,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # cross-checked against the dep graph. Best-effort:
                 # helper swallows dep-graph build failures.
                 try:
+                    _lsp_maps_b = await _prefetch_lsp_caller_maps(
+                        _persistent_files_set, _workspace_for_banner,
+                    )
                     _ws_ctx = _format_workspace_context_for_files(
                         _persistent_files_set,
                         _workspace_for_banner,
                         loop_counter,
+                        lsp_caller_maps=_lsp_maps_b or None,
                     )
                     if _ws_ctx.strip():
                         reflection_banner_lines.append(_ws_ctx)

@@ -144,6 +144,16 @@ INSTALL_RECIPES: dict[str, dict[str, str]] = {
         "macos": "npm install -g typescript",
         "windows": "npm install -g typescript",
     },
+    "pyright-langserver": {
+        "linux": "pip install pyright   # langserver binary ships with the pyright package",
+        "macos": "pip install pyright   # langserver binary ships with the pyright package",
+        "windows": "pip install pyright",
+    },
+    "typescript-language-server": {
+        "linux": "npm install -g typescript-language-server typescript",
+        "macos": "npm install -g typescript-language-server typescript",
+        "windows": "npm install -g typescript-language-server typescript",
+    },
 }
 
 
@@ -644,6 +654,11 @@ _TYPECHECK_TOOLS = (
     ("tsc", "TypeScript type check (diagnostics gate)"),
 )
 
+_LSP_TOOLS = (
+    ("pyright-langserver", "LSP semantic navigation — Python (brownfield lsp pool)"),
+    ("typescript-language-server", "LSP semantic navigation — TS/TSX (brownfield lsp pool)"),
+)
+
 
 def _probe_optional_binary(tool: str, feature: str, section: str) -> CheckResult:
     """Generic 'is this binary on PATH?' probe used by the language /
@@ -682,6 +697,10 @@ def probe_formatters() -> list[CheckResult]:
 
 def probe_typecheckers() -> list[CheckResult]:
     return [_probe_optional_binary(t, f, "RECOMMENDED") for t, f in _TYPECHECK_TOOLS]
+
+
+def probe_lsp_servers() -> list[CheckResult]:
+    return [_probe_optional_binary(t, f, "OPTIONAL") for t, f in _LSP_TOOLS]
 
 
 def probe_gh_cli() -> CheckResult:
@@ -783,6 +802,7 @@ def run_all(*, platform_override: Optional[str] = None,
         results.extend(probe_security_scanners())
         results.extend(probe_formatters())
         results.extend(probe_typecheckers())
+        results.extend(probe_lsp_servers())
 
         # Optional.
         results.append(probe_gh_cli())

@@ -3,7 +3,14 @@ repos:
     hooks:
       - id: pytest-regression
         name: pytest regression pack (480 tests)
-        entry: python -m pytest tests/ -q --tb=short
+        # `env -u GIT_INDEX_FILE …` strips the git env vars pre-commit
+        # exports when it stashes unstaged changes. Without this, any
+        # test that shells out to `git commit` inside a tmpdir inherits
+        # the parent repo's stash index and fails with cryptic
+        # "invalid object … Error building trees" — a purely
+        # hook-time artefact, not a real regression.
+        entry: env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE
+          python -m pytest tests/ -q --tb=short
         language: system
         types: [python]
         pass_filenames: false

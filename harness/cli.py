@@ -2060,6 +2060,23 @@ _HITL_FLAGS: dict[str, bool] = {}
 # review cycle but does catch a hung loop.
 MAX_GATEKEEPER_REFINES = 5
 
+# Per-session cap on consecutive headless HITL auto-resumes for
+# loop-stuck triggers (repair_loop_limit, persistent_build_failure,
+# zero_patch_loop, no_progress_failsafe, low_signal_verdict_loop, etc.).
+# The auto-resume path in ``hitl_menu_loop`` calls
+# ``_reset_hitl_trip_counters`` so the same guards don't re-fire
+# immediately — but the *underlying failure* is unchanged in headless
+# mode (no operator did anything between iterations), so the guards
+# accumulate to threshold again after a handful of rounds and HITL
+# re-fires. Every trip also spends an LLM escalation-summary call, so
+# an uncapped loop drains budget until it hits 0 (session cec4d124
+# fired 19 HITLs in ~2 hours before the operator killed the process
+# manually). This cap gives ``_reset_hitl_trip_counters`` a few shots
+# to genuinely unstick the loop and then terminates cleanly. Operators
+# can override via ``state['hitl_auto_resume_cap']`` when a long-tail
+# recovery legitimately needs more headroom.
+_HITL_AUTO_RESUME_CAP = 3
+
 # The five HITL gates the resolver knows about. Tuples of
 # (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
 # and the config-tree validation stay aligned. New gates added here
@@ -3362,12 +3379,51 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 node_state["budget_terminated"] = True
                 state["node_state"] = node_state
             else:
-                choice = "r"
-                auto_resumed_this_round = True
-                logger.info(
-                    "[HITL] Repair menu auto-resumed "
-                    "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
+                # Per-session cap on consecutive headless auto-resumes.
+                # See ``_HITL_AUTO_RESUME_CAP`` at module top for the
+                # rationale. ``_reset_hitl_trip_counters`` (called
+                # below when we DO auto-resume) doesn't touch this
+                # counter, so it survives across resumes and eventually
+                # forces a clean terminate instead of an unbounded
+                # budget-drain loop when the underlying failure isn't
+                # recoverable in headless mode.
+                _lc_for_cap = state.get("loop_counter")
+                if not isinstance(_lc_for_cap, dict):
+                    _lc_for_cap = {}
+                    state["loop_counter"] = _lc_for_cap
+                _resumes_taken = int(
+                    _lc_for_cap.get("hitl_auto_resumes_taken", 0) or 0
                 )
+                _cap = int(
+                    state.get("hitl_auto_resume_cap") or _HITL_AUTO_RESUME_CAP
+                )
+                if _resumes_taken >= _cap:
+                    choice = "q"
+                    auto_resumed_this_round = False
+                    logger.warning(
+                        "[HITL] Auto-resume cap reached (%d/%d) for "
+                        "trigger '%s' in headless mode — terminating "
+                        "instead of looping. No operator can act on "
+                        "this in a headless session; further "
+                        "auto-resumes would just burn budget on repeat "
+                        "escalation-summary calls without changing the "
+                        "underlying failure.",
+                        _resumes_taken, _cap, trigger,
+                    )
+                    node_state["hitl_auto_resume_cap_hit"] = True
+                    state["node_state"] = node_state
+                else:
+                    choice = "r"
+                    auto_resumed_this_round = True
+                    _lc_for_cap["hitl_auto_resumes_taken"] = (
+                        _resumes_taken + 1
+                    )
+                    logger.info(
+                        "[HITL] Repair menu auto-resumed "
+                        "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE "
+                        "/ no TTY). Auto-resume %d/%d for this session.",
+                        _resumes_taken + 1, _cap,
+                    )
         else:
             # Structured envelope for remote UIs (the dashboard's HITL
             # panel). The console path prints these above the prompt; the

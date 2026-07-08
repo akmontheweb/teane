@@ -200,6 +200,21 @@ class AgentState(TypedDict, total=False):
     # ubuntu:22.04 and "adapting" the configured python:3.12-slim away).
     sandbox_config: dict[str, Any]
     lintgate_config: dict[str, Any]
+    # Diagnostics-gate config (``diagnostics`` section of config.json:
+    # {enabled, timeout_seconds, max_rounds, scope, tools}). Read by
+    # diagnostics_node and route_after_diagnostics.
+    diagnostics_config: dict[str, Any]
+    # Learning-loop config (``post_mortem`` section of config.json:
+    # {enabled, max_cost_usd, retire_on_clean_run}) and the staged rule
+    # note produced by human_intervention_node. The cli finalize path is
+    # the single writer of the note into repo memory.
+    post_mortem_config: dict[str, Any]
+    post_mortem_note: str
+    # Cached HEAD-worktree baseline for the diagnostics gate:
+    # {"commit": sha, "mode": "worktree", "fingerprints": [...]}. Keyed to
+    # the HEAD sha so batch commits invalidate it. MUST be declared here —
+    # LangGraph drops undeclared keys on the node-hop.
+    diagnostics_baseline: dict[str, Any]
     deployment_config: dict[str, Any]
     # Per-call LLM dispatch parameters loaded from the ``llm_dispatch``
     # section of config.json. Nodes read
@@ -9537,6 +9552,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     loop_counter = state.get("loop_counter", {})
     loop_counter = dict(loop_counter)
     loop_counter["compiler"] = loop_counter.get("compiler", 0) + 1
+    # A compile marks the end of a diagnostics-gate cycle — reset the
+    # per-cycle bound so the next patch round gets fresh gate rounds.
+    loop_counter["diagnostics_rounds_since_compile"] = 0
     # Audit #18 — when the router sent us back here purely to re-verify
     # post-green mutations (no failure to repair, just defence-in-depth),
     # record that this final-verify slot has now been spent. The router
@@ -13302,6 +13320,26 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     state_dict["node_state"]["hitl_active"] = True
     state_dict["node_state"]["hitl_awaiting_input"] = True
 
+    # Observability: the webhook channel emits hitl_pending, but the
+    # console/headless paths historically emitted nothing when the
+    # breakpoint fired — making "HITLs per run" invisible in the JSONL.
+    # Emitted before the menu loop so headless auto-resume/abandon paths
+    # are covered too.
+    try:
+        from harness.observability import emit_event as _emit_event
+        _emit_event(
+            "hitl_fired",
+            trigger=trigger_reason,
+            session_id=str(state.get("session_id") or ""),
+            budget_remaining_usd=budget_remaining,
+            total_repairs=int(
+                (state.get("loop_counter") or {}).get("total_repairs", 0)
+            ),
+            modified_files=len(state.get("modified_files") or []),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break HITL
+        pass
+
     # LLM-judgment kill-switched escalation summary (#1). For loop-stuck
     # triggers — repair limit, persistent failure, or no-progress
     # tripwires — generate a one-paragraph operator briefing that
@@ -13343,6 +13381,39 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
             logger.info(
                 "[human_intervention_node] LLM escalation summary attached (%d chars).",
                 len(summary),
+            )
+
+    # Learning loop (Hook A): distill this failure into a durable rule and
+    # STAGE it in state — the cli finalize path is the single writer, so a
+    # run that HITLs and then fails records exactly one note. Staged before
+    # the menu loop so the headless direct-abandon and [q] paths carry the
+    # note out without any cli-side involvement. Fail-open: a post-mortem
+    # problem must never break the HITL breakpoint itself.
+    post_mortem_cfg: dict[str, Any] = dict(state.get("post_mortem_config") or {})
+    if post_mortem_cfg.get("enabled", True) and not state_dict.get("post_mortem_note"):
+        try:
+            from harness.post_mortem import generate_post_mortem
+            note, pm_cost = await generate_post_mortem(
+                state_dict,
+                trigger=trigger_reason,
+                escalation_summary=state_dict["node_state"].get(
+                    "hitl_escalation_summary"
+                ),
+                config=post_mortem_cfg,
+            )
+            state_dict["post_mortem_note"] = note
+            if pm_cost > 0:
+                state_dict["budget_remaining_usd"] = (
+                    float(state_dict.get("budget_remaining_usd") or 0.0) - pm_cost
+                )
+            logger.info(
+                "[human_intervention_node] Post-mortem rule staged "
+                "(%d chars, $%.4f).", len(note), pm_cost,
+            )
+        except Exception as pm_exc:  # noqa: BLE001
+            logger.warning(
+                "[human_intervention_node] Post-mortem staging failed: %s",
+                pm_exc,
             )
 
     # Delegate to the CLI layer's interactive menu loop.
@@ -14453,6 +14524,80 @@ def _format_diagnostics_for_repair(
 # ---------------------------------------------------------------------------
 # 6. Conditional Edge: Compiler → Next Node
 # ---------------------------------------------------------------------------
+
+def route_after_diagnostics(state: AgentState) -> Literal["repair_node", "compiler_node"]:
+    """
+    Conditional edge router executed after diagnostics_node (the read-only
+    type-checker gate between lintgate and compiler).
+
+    Routes to repair_node ONLY when the gate found NEW (non-baseline)
+    diagnostics AND every repair-loop guard passes; otherwise falls through
+    to compiler_node unconditionally. This router NEVER escalates to HITL —
+    all escalation stays single-sourced in route_after_compiler, which runs
+    right after the compile this router falls through to.
+
+    Loop-risk ranking (graph loop-back audit convention): LOW. The
+    diagnostics → repair → diagnostics cycle is doubly bounded: the global
+    ``total_repairs`` cap shared with route_after_compiler, plus the
+    per-compile-cycle ``diagnostics_rounds_since_compile`` counter
+    (incremented by diagnostics_node when it emits, reset by compiler_node
+    and batch_commit_node). Once either cap trips, the exit edge to
+    compiler_node is unconditional.
+    """
+    node_state: dict[str, Any] = state.get("node_state", {}) or {}
+    diag: dict[str, Any] = node_state.get("diagnostics", {}) or {}
+    loop_counter: dict[str, Any] = state.get("loop_counter", {}) or {}
+    budget_remaining: float = state.get("budget_remaining_usd", 0.0)
+    new_count = int(diag.get("new") or 0)
+
+    def _transition(dest: Literal["repair_node", "compiler_node"]) -> Literal["repair_node", "compiler_node"]:
+        try:
+            from harness.observability import emit_event
+            emit_event("node_transition",
+                       from_node="diagnostics_node", to_node=dest,
+                       new_diagnostics=new_count,
+                       diagnostics_rounds=int(
+                           loop_counter.get("diagnostics_rounds_since_compile") or 0),
+                       budget_remaining_usd=budget_remaining)
+        except Exception:  # noqa: BLE001
+            pass
+        return dest
+
+    # "partial" (one checker timed out, another found errors) still counts:
+    # the errors that WERE found are real regardless of the sibling timeout.
+    if diag.get("status") not in ("ok", "partial") or new_count <= 0:
+        return _transition("compiler_node")
+
+    if budget_remaining <= 0.0:
+        return _transition("compiler_node")
+
+    from harness.no_progress import tripped as _np_tripped
+    if _np_tripped(loop_counter):
+        return _transition("compiler_node")
+
+    gw = get_gateway()
+    max_iterations: int = (
+        int(getattr(gw.config, "max_patch_repair_iterations", 5))
+        if gw is not None else 3
+    )
+    if int(loop_counter.get("total_repairs", 0)) >= max_iterations:
+        return _transition("compiler_node")
+
+    diag_cfg: dict[str, Any] = state.get("diagnostics_config", {}) or {}
+    max_rounds = int(diag_cfg.get("max_rounds", 2))
+    if int(loop_counter.get("diagnostics_rounds_since_compile") or 0) > max_rounds:
+        logger.warning(
+            "[router] Diagnostics gate hit max_rounds=%d without converging "
+            "— falling through to compiler_node.", max_rounds,
+        )
+        return _transition("compiler_node")
+
+    logger.info(
+        "[router] Diagnostics gate found %d new diagnostic(s) — routing to "
+        "repair_node before the compile.", new_count,
+    )
+    return _transition("repair_node")
+
 
 def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node"]:
     """
@@ -19010,6 +19155,11 @@ def build_graph() -> Any:
     from harness.lintgate import lintgate_node as _lintgate_node
     graph.add_node("lintgate_node", _lintgate_node)  # type: ignore[type-var]
 
+    # Register the read-only diagnostics gate (type-checkers) that sits
+    # between lintgate and compiler — see harness/diagnostics_gate.py.
+    from harness.diagnostics_gate import diagnostics_node as _diagnostics_node
+    graph.add_node("diagnostics_node", _diagnostics_node)  # type: ignore[type-var]
+
     # Register speculative node for multi-variant branching
     from harness.speculative import speculate_node as _speculate_node
     graph.add_node("speculative_node", _speculate_node)  # type: ignore[type-var]
@@ -19471,7 +19621,18 @@ def build_graph() -> Any:
             "human_intervention_node": "human_intervention_node",
         },
     )
-    graph.add_edge("lintgate_node", "compiler_node")
+    # Lintgate flows through the read-only diagnostics gate; the gate
+    # routes to repair on NEW type errors (cheap, seconds) before the
+    # expensive compiler/test run, else falls through to compiler.
+    graph.add_edge("lintgate_node", "diagnostics_node")
+    graph.add_conditional_edges(
+        "diagnostics_node",
+        route_after_diagnostics,
+        {
+            "repair_node": "repair_node",
+            "compiler_node": "compiler_node",
+        },
+    )
 
     # =====================================================================
     # Compiler → repair loop + security gate
@@ -19540,9 +19701,13 @@ def build_graph() -> Any:
         },
     )
 
-    # After repair, go directly to compiler (skip lintgate to avoid reformatting
-    # the file between repair attempts, which would break SEARCH/REPLACE matching).
-    graph.add_edge("repair_node", "compiler_node")
+    # After repair, re-enter via the diagnostics gate — it is READ-ONLY so
+    # the historical reason for bypassing lintgate here (reformatting breaks
+    # SEARCH/REPLACE matching between repair attempts) does not apply. Each
+    # repair round gets a seconds-cheap type re-check before the
+    # minutes-scale compile; when clean (or capped) the gate falls through
+    # to compiler_node unconditionally.
+    graph.add_edge("repair_node", "diagnostics_node")
 
     # =====================================================================
     # Deployment discovery pipeline (after security scan clean):
@@ -20011,6 +20176,8 @@ async def run_graph(
     skip_discovery: bool = False,
     is_resume: bool = False,
     lintgate_config: Optional[dict[str, Any]] = None,
+    diagnostics_config: Optional[dict[str, Any]] = None,
+    post_mortem_config: Optional[dict[str, Any]] = None,
     deployment_config: Optional[dict[str, Any]] = None,
     deployment_defaults: Optional[dict[str, Any]] = None,
     sandbox_config: Optional[dict[str, Any]] = None,
@@ -20096,6 +20263,10 @@ async def run_graph(
     # them via state.get("lintgate_config", {}) etc.
     if lintgate_config is not None:
         initial_state["lintgate_config"] = lintgate_config
+    if diagnostics_config is not None:
+        initial_state["diagnostics_config"] = diagnostics_config
+    if post_mortem_config is not None:
+        initial_state["post_mortem_config"] = post_mortem_config
     if deployment_config is not None:
         initial_state["deployment_config"] = deployment_config
     if deployment_defaults is not None:

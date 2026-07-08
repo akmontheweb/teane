@@ -12,6 +12,7 @@ to register and look up diagnostic parsers at runtime.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -598,6 +599,103 @@ class TypeScriptParser(BaseLanguageParser):
         return diagnostics
 
 
+class PyrightJSONParser(BaseLanguageParser):
+    """
+    Parses ``pyright --outputjson`` output.
+
+    Pyright emits a single JSON document with a ``generalDiagnostics`` array;
+    positions are 0-indexed (converted to the 1-indexed convention every
+    other parser uses). ``information``-severity entries are dropped —
+    they are hints, not actionable diagnostics. Malformed or truncated
+    JSON yields ``[]`` (fail-open: the diagnostics gate must never block
+    a run on parser trouble).
+    """
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        try:
+            payload = json.loads(raw_output)
+        except (TypeError, ValueError):
+            return []
+        entries = payload.get("generalDiagnostics") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            return []
+        diagnostics: list[DiagnosticObject] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            severity = str(entry.get("severity", "error")).lower()
+            if severity not in ("error", "warning"):
+                continue
+            start = (entry.get("range") or {}).get("start") or {}
+            try:
+                line = int(start.get("line", 0)) + 1
+                column = int(start.get("character", 0)) + 1
+            except (TypeError, ValueError):
+                line, column = 1, 1
+            # Pyright message bodies are often multi-line: headline first,
+            # indented elaboration below. Keep the headline as the message
+            # and fold the rest into semantic_context like the text parsers.
+            raw_msg = str(entry.get("message", "")).strip()
+            first, _, rest = raw_msg.partition("\n")
+            diagnostics.append(DiagnosticObject(
+                file=str(entry.get("file", "")),
+                line=line,
+                column=column,
+                severity=severity,
+                error_code=str(entry.get("rule") or "pyright"),
+                message=first.strip(),
+                semantic_context=rest.strip(),
+            ))
+        return diagnostics
+
+
+class MypyParser(BaseLanguageParser):
+    """
+    Parses mypy text output.
+
+    Expects mypy run with ``--show-column-numbers --show-error-codes
+    --no-error-summary --no-color-output``; the optional-column group keeps
+    the regex tolerant of older mypy that omits columns. ``note:`` lines are
+    folded into the preceding diagnostic's semantic_context (mypy uses them
+    for "possible overload variants" style elaboration); a note with no
+    preceding diagnostic is dropped.
+    """
+
+    _PATTERN = re.compile(
+        r'^(?P<file>[^:\n]+\.pyi?):(?P<line>\d+):(?:(?P<col>\d+):)?\s*'
+        r'(?P<sev>error|warning|note):\s*(?P<msg>.*?)(?:\s+\[(?P<code>[a-z0-9-]+)\])?$'
+    )
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        diagnostics: list[DiagnosticObject] = []
+        for raw_line in raw_output.splitlines():
+            m = MypyParser._PATTERN.match(raw_line.strip())
+            if not m:
+                continue
+            severity = m.group("sev")
+            if severity == "note":
+                if diagnostics:
+                    prev = diagnostics[-1]
+                    note = m.group("msg")
+                    prev.semantic_context = (
+                        f"{prev.semantic_context}\nnote: {note}".strip()
+                        if prev.semantic_context else f"note: {note}"
+                    )
+                continue
+            diagnostics.append(DiagnosticObject(
+                file=m.group("file"),
+                line=int(m.group("line")),
+                column=int(m.group("col")) if m.group("col") else 0,
+                severity=severity,
+                error_code=m.group("code") or "mypy",
+                message=m.group("msg"),
+                semantic_context="",
+            ))
+        return diagnostics
+
+
 class GenericParser(BaseLanguageParser):
     """
     Fallback generic diagnostic parser for compilers without structured output.
@@ -658,6 +756,10 @@ _PARSER_REGISTRY: dict[str, type[BaseLanguageParser]] = {
     "gradle": JavaParser,
     "gradlew": JavaParser,
     "javac": JavaParser,
+    # Python type-checkers (diagnostics gate; also matched when a user's
+    # build_command invokes them directly).
+    "pyright": PyrightJSONParser,
+    "mypy": MypyParser,
     # TypeScript toolchain — tsc and frameworks that ultimately run tsc.
     "tsc": TypeScriptParser,
     "ts-node": TypeScriptParser,

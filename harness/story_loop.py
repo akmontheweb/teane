@@ -973,6 +973,7 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         "patching", "repair", "compiler", "total_repairs",
         "review_spec", "review_code",
         "consecutive_zero_patch_rounds", "missing_dep_consecutive_same",
+        "diagnostics_rounds_since_compile",
     ):
         loop_counter[key] = 0
     # Layer 2 / Layer 3 — per-story zero-patch tally and the global

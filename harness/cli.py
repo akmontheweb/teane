@@ -523,6 +523,14 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # auto-defaulted (Python / React+TS+Tailwind). Any other value
     # is a configuration error and the harness refuses to start.
     "core_languages",
+    # Read-only type-checker gate between lintgate and compiler
+    # (pyright/mypy for Python, tsc for TS/TSX). Default on, fail-open.
+    # See harness/diagnostics_gate.py.
+    "diagnostics",
+    # Automated failure post-mortems — the HITL learning loop. On HITL or
+    # failed exit, a [learned-rule:<trigger>] note lands in per-repo
+    # memory and reaches the next run's planner. See harness/post_mortem.py.
+    "post_mortem",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -616,6 +624,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "lintgate": frozenset({
         "format_modified_files",
         "strict_missing_formatter",
+    }),
+    "diagnostics": frozenset({
+        "enabled", "timeout_seconds", "max_rounds", "scope", "tools",
+    }),
+    "post_mortem": frozenset({
+        "enabled", "max_cost_usd", "retire_on_clean_run",
     }),
     "logging": frozenset({
         "level", "log_dir", "json_stderr", "langsmith",
@@ -5365,6 +5379,7 @@ def _append_repo_memory_safely(
     modified_files: list[str],
     exit_code: int,
     config: dict[str, Any],
+    extra_notes: Optional[str] = None,
 ) -> None:
     """Append a one-line session entry to the per-repo memory file.
 
@@ -5384,9 +5399,85 @@ def _append_repo_memory_safely(
             modified_files=modified_files,
             exit_code=exit_code,
             cfg=mem_cfg,
+            extra_notes=extra_notes,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[cli] repo memory append skipped: %s", exc)
+
+
+async def _post_mortem_finalize(
+    final_state: dict[str, Any],
+    exit_code: int,
+    config: dict[str, Any],
+    workspace_path: str,
+) -> str:
+    """Learning-loop finalize (Hook B — the single write decision point).
+
+    Returns the ``[learned-rule:...]`` note to append to repo memory via
+    ``extra_notes`` ("" = nothing to record). Clean runs record nothing and
+    retire every active rule instead — a green run is proof the recorded
+    failure classes no longer bite. Failed runs use the note staged by
+    human_intervention_node when present, else generate one here (covers
+    failed runs that never reached HITL). Duplicate failure classes are
+    fingerprint-deduped against the existing memory file.
+
+    Fail-open like every other post-mortem surface: any exception logs
+    and returns "" so finalization is never blocked.
+    """
+    try:
+        from harness import post_mortem
+        from harness.repo_memory import RepoMemoryConfig, read_repo_memory
+
+        pm_cfg: dict[str, Any] = dict(config.get("post_mortem") or {})
+        mem_cfg = RepoMemoryConfig.from_config(config)
+
+        if exit_code == 0:
+            if pm_cfg.get("retire_on_clean_run", True):
+                retired = post_mortem.retire_learned_rules(workspace_path, mem_cfg)
+                if retired:
+                    from harness.observability import emit_event
+                    emit_event("post_mortem_rules_retired", count=retired)
+            return ""
+
+        note = str(final_state.get("post_mortem_note") or "").strip()
+        deterministic = False
+        cost = 0.0
+        if not note and pm_cfg.get("enabled", True):
+            trigger = (
+                str((final_state.get("node_state") or {}).get("hitl_trigger") or "")
+                or f"exit_{exit_code}"
+            )
+            note, cost = await post_mortem.generate_post_mortem(
+                final_state,
+                trigger=trigger,
+                escalation_summary=None,
+                config=pm_cfg,
+            )
+            deterministic = cost == 0.0
+        if not note:
+            return ""
+
+        parsed = post_mortem.parse_rule_note(note)
+        if parsed is not None:
+            trigger, fp = parsed
+            existing = read_repo_memory(workspace_path, mem_cfg)
+            if post_mortem.already_recorded(existing, trigger, fp):
+                from harness.observability import emit_event
+                emit_event("post_mortem_skipped", reason="duplicate",
+                           trigger=trigger, fingerprint=fp)
+                return ""
+        from harness.observability import emit_event
+        emit_event(
+            "post_mortem_written",
+            trigger=parsed[0] if parsed else "unknown",
+            rule_chars=len(note),
+            cost_usd=cost,
+            deterministic=deterministic,
+        )
+        return note
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[cli] post-mortem finalize skipped: %s", exc)
+        return ""
 
 
 async def _maybe_start_mcp_pool(
@@ -6244,6 +6335,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
             story_batch_size=getattr(args, "story_batch_size", 5),
             story_repair_cap=getattr(args, "story_repair_cap", 3),
             lintgate_config=config.get("lintgate", {}),
+            diagnostics_config=config.get("diagnostics", {}),
+            post_mortem_config=config.get("post_mortem", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
@@ -6392,6 +6485,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # `teane run` against this workspace sees the prior outcome in
     # the planner context. Wrapped: failures must not change the
     # exit code.
+    pm_note = await _post_mortem_finalize(
+        final_state, exit_code, config, workspace_path,
+    )
     _append_repo_memory_safely(
         workspace_path=workspace_path,
         session_id=session_id,
@@ -6399,6 +6495,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         modified_files=modified_files,
         exit_code=exit_code,
         config=config,
+        extra_notes=pm_note or None,
     )
 
     # Record completion marker so `teane test`'s prereq gate can see this
@@ -6983,6 +7080,8 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             # re-enter at requirements_discovery from round 1.
             is_resume=True,
             lintgate_config=config.get("lintgate", {}),
+            diagnostics_config=config.get("diagnostics", {}),
+            post_mortem_config=config.get("post_mortem", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
@@ -7031,6 +7130,9 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     await checkpointer.conn.close()
     await _drain_mcp_pools()
+    pm_note = await _post_mortem_finalize(
+        final_state, exit_code, config, workspace_path,
+    )
     _append_repo_memory_safely(
         workspace_path=workspace_path,
         session_id=args.session_id,
@@ -7038,6 +7140,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         modified_files=modified_files,
         exit_code=exit_code,
         config=config,
+        extra_notes=pm_note or None,
     )
     return _resolve_cli_exit_code(
         graph_exit_code=exit_code,

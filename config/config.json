@@ -211,6 +211,24 @@
         "format_modified_files": false,
         "strict_missing_formatter": false
     },
+    "_post_mortem_comment": "Automated failure post-mortems (harness/post_mortem.py — the HITL learning loop). On a HITL breakpoint or a failed exit, the harness distills a one-line [learned-rule:<trigger>] hypothesis into the per-repo memory file, which is auto-injected into the next run's planner prompt. max_cost_usd is a small reserved allowance so the note still gets distilled by the cheap JUDGMENT model when the main session budget is exhausted (budget_exhausted is itself a key trigger); with no LLM available a deterministic template rule is recorded instead. retire_on_clean_run=true retires all active rules once a run on this repo exits clean — a green run proves the failure class no longer bites, and stale rules would poison future prompts. Duplicate failure classes are fingerprint-deduped.",
+    "post_mortem": {
+        "enabled": true,
+        "max_cost_usd": 0.10,
+        "retire_on_clean_run": true
+    },
+    "_diagnostics_comment": "Read-only type-checker gate between lintgate_node and compiler_node (harness/diagnostics_gate.py). Runs pyright (mypy fallback) on Python and `tsc --noEmit` on TS/TSX over the batch's files plus their reverse-dependency closure (scope=impacted; set scope=modified to skip the closure). Pre-existing diagnostics are baseline-suppressed via a detached HEAD-worktree fingerprint diff, so only NEW type errors route to repair_node before the expensive compile. Java is deliberately not covered: javac needs the full build classpath, so compiler_node IS the Java type check. Fail-open: a missing/timed-out/crashed checker contributes nothing and the run proceeds. max_rounds bounds consecutive diagnostics→repair bounces per compile cycle (on top of the shared total_repairs cap).",
+    "diagnostics": {
+        "enabled": true,
+        "timeout_seconds": 120,
+        "max_rounds": 2,
+        "scope": "impacted",
+        "tools": {
+            "pyright": true,
+            "mypy": true,
+            "tsc": true
+        }
+    },
     "_security_comment": "Security-scan gate policy (loaded by SecurityScanPolicy.from_config in harness/security.py). block_on / warn_on / ignore_below partition findings by severity; the harness routes block_on findings to repair_node and only logs warn_on. scanners selects which of {gitleaks, bandit, semgrep, trivy} actually run. allowlist_rules silently drops findings whose rule_id matches — use this to suppress noisy or false-positive rules that the LLM cannot meaningfully fix (e.g. a ws:// example inside a markdown spec that the patcher's allowlist forbids editing anyway, creating an infinite repair loop). max_findings_to_route_to_repair caps the number of findings handed to the repair LLM in one round so a 200-finding semgrep run doesn't drown the dispatch. hard_ceiling_multiplier is the runaway-loop tripwire on security-fix attempts: the router lets security repair run up to `max_sec_attempts × hard_ceiling_multiplier` rounds before force-routing to HITL (default 3 → 3× the primary sec-attempt cap). Raise for projects with dense findings that legitimately need many rounds; lower to fail-fast on false-positive spam. The CommandValidator (allowed_commands / blocked_patterns / allow_all_commands / allow_network_in_build) shares this block; only its defaults are documented in harness/security.py.",
     "security": {
         "block_on": ["critical", "high"],

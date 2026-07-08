@@ -133,6 +133,17 @@ INSTALL_RECIPES: dict[str, dict[str, str]] = {
         "macos": "brew install shellcheck",
         "windows": "scoop install shellcheck",
     },
+    "pyright": {
+        "linux": "pip install pyright   # or: npm install -g pyright",
+        "macos": "pip install pyright   # or: npm install -g pyright",
+        "windows": "pip install pyright",
+    },
+    "mypy": {"linux": "pip install mypy", "macos": "pip install mypy", "windows": "pip install mypy"},
+    "tsc": {
+        "linux": "npm install -g typescript",
+        "macos": "npm install -g typescript",
+        "windows": "npm install -g typescript",
+    },
 }
 
 
@@ -627,6 +638,12 @@ _FORMATTER_TOOLS = (
     ("shellcheck", "shell lint"),
 )
 
+_TYPECHECK_TOOLS = (
+    ("pyright", "Python type check (diagnostics gate)"),
+    ("mypy", "Python type check fallback (diagnostics gate)"),
+    ("tsc", "TypeScript type check (diagnostics gate)"),
+)
+
 
 def _probe_optional_binary(tool: str, feature: str, section: str) -> CheckResult:
     """Generic 'is this binary on PATH?' probe used by the language /
@@ -661,6 +678,10 @@ def probe_security_scanners() -> list[CheckResult]:
 
 def probe_formatters() -> list[CheckResult]:
     return [_probe_optional_binary(t, f, "RECOMMENDED") for t, f in _FORMATTER_TOOLS]
+
+
+def probe_typecheckers() -> list[CheckResult]:
+    return [_probe_optional_binary(t, f, "RECOMMENDED") for t, f in _TYPECHECK_TOOLS]
 
 
 def probe_gh_cli() -> CheckResult:
@@ -761,6 +782,7 @@ def run_all(*, platform_override: Optional[str] = None,
         results.append(probe_posix_sh())
         results.extend(probe_security_scanners())
         results.extend(probe_formatters())
+        results.extend(probe_typecheckers())
 
         # Optional.
         results.append(probe_gh_cli())

@@ -2511,6 +2511,7 @@ async def _maybe_judgment_llm(
     budget_remaining_usd: float,
     purpose: str,
     enabled: bool,
+    escalate_to_reasoning: bool = False,
 ) -> tuple[Optional[str], float]:
     """Cheap one-shot LLM-judgment call shared by the four kill-switched
     judgment additions (HITL escalation summary, patcher rejection
@@ -2531,6 +2532,17 @@ async def _maybe_judgment_llm(
     A $0.01 floor is enforced on top of the gateway's hard guardrail —
     judgment calls are cheap (~$0.001) but a 0-budget call would still
     raise inside ``Gateway.dispatch``.
+
+    Fix C — ``escalate_to_reasoning=True`` routes this call through
+    ``NodeRole.REPAIR`` instead of ``NodeRole.JUDGMENT``. REPAIR runs
+    the same model but WITH the config's ``repair_mode`` thinking
+    setting engaged. Used by the repair-reflection call site when the
+    cheap judge has said DISTRACTION twice in a row — a smarter second
+    opinion catches the "LLM is right, judge was wrong" case where the
+    LLM's file choice is a plausible upstream cause the cheap judge
+    dismissed. Costs ~$0.03/round when triggered; the caller gates on
+    ``consecutive_distraction_rounds >= 2`` so it only fires in
+    demonstrably stuck loops.
     """
     if not enabled:
         return None, budget_remaining_usd
@@ -2542,9 +2554,10 @@ async def _maybe_judgment_llm(
     try:
         from harness.gateway import NodeRole
         messages = [{"role": "user", "content": prompt}]
+        _role = NodeRole.REPAIR if escalate_to_reasoning else NodeRole.JUDGMENT
         response, new_budget = await gw.dispatch(
             messages=messages,
-            role=NodeRole.JUDGMENT,
+            role=_role,
             budget_remaining_usd=budget_remaining_usd,
         )
         content = (response.content or "").strip()
@@ -7054,6 +7067,12 @@ _REREAD_INJECTION_CAP = 5
 # "1-patch-per-round" pattern; capping at 3 keeps the prompt bounded
 # while still covering the diagnostic hot-spots.
 _CROSS_ROUND_CTX_CAP = 3
+# Fix B — WORKING_HYPOTHESIS verdict streak cap. On the Nth consecutive
+# WORKING_HYPOTHESIS, the reflection loop promotes to DISTRACTION so an
+# upstream-theory bet can't camp indefinitely against the HITL cap.
+# 2 is the sweet spot: one round to test the theory, one to refine it,
+# then either it lands or the harness treats it as a real distraction.
+_WORKING_HYPOTHESIS_STREAK_CAP = 2
 _PREFLIGHT_FILE_CHAR_CAP = 6000
 _PREFLIGHT_SECTION_CHAR_CAP = 24000
 
@@ -8666,6 +8685,8 @@ def _build_repair_reflection_prompt(
     install_failure_likely: bool = False,
     path_wiring_module: Optional[str] = None,
     build_output_tail: str = "",
+    judge_disagreement_history: Optional[list[dict[str, Any]]] = None,
+    judge_ignored_streak: int = 0,
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -8914,6 +8935,71 @@ def _build_repair_reflection_prompt(
             "make these errors go away.\n\n"
         ) if install_failure_likely else ""
 
+    # Fix A — judge-disagreement history block. When the repair LLM has
+    # patched files disjoint from the judge's named blocker for 2+ rounds
+    # running, the reflection prompt names the recurring divergence and
+    # asks the judge to reconsider whether the LLM's file could be a
+    # plausible upstream cause. Without this, the judge repeats DISTRACTION
+    # indefinitely against a plausible upstream fix (finsearch STORY-038
+    # loop: 3 rounds of edgar_client.py patches while judge named the test
+    # file, ended in HITL).
+    disagreement_block = ""
+    if (
+        judge_ignored_streak >= 2
+        and isinstance(judge_disagreement_history, list)
+        and judge_disagreement_history
+    ):
+        # Render only the last 3 rounds of disagreement — older signal is
+        # dominated by what happened recently.
+        _hist_lines: list[str] = []
+        for entry in judge_disagreement_history[-3:]:
+            if not isinstance(entry, dict):
+                continue
+            rnd = entry.get("round", "?")
+            jf = entry.get("judge_files") or []
+            lf = entry.get("llm_files") or []
+            _hist_lines.append(
+                f"  - round {rnd}: judge named {jf}; LLM patched {lf}"
+            )
+        # Aggregate file lists across the streak for the ``real_blocker``
+        # suggestion line.
+        _all_judge: list[str] = []
+        _all_llm: list[str] = []
+        for entry in judge_disagreement_history:
+            if not isinstance(entry, dict):
+                continue
+            for f in entry.get("judge_files") or []:
+                if isinstance(f, str) and f and f not in _all_judge:
+                    _all_judge.append(f)
+            for f in entry.get("llm_files") or []:
+                if isinstance(f, str) and f and f not in _all_llm:
+                    _all_llm.append(f)
+        disagreement_block = (
+            "\nREPAIR LLM'S RECURRING FILE CHOICE — read carefully:\n"
+            f"For the last {judge_ignored_streak} round(s) the repair LLM "
+            "has patched files DIFFERENT from the ones you (the judge) "
+            "named as the blocker:\n"
+            + "\n".join(_hist_lines) + "\n"
+            "Two scenarios are possible: (a) the LLM is failing to fix "
+            "the right thing, OR (b) the LLM's file choice is a legitimate "
+            "upstream cause you haven't considered. Before verdicting "
+            "DISTRACTION again, ask yourself: could a fault at "
+            f"{_all_llm} plausibly propagate to the failure at "
+            f"{_all_judge}? "
+            "If yes — even without direct proof, e.g. because the LLM's "
+            "file is imported by (or otherwise called from) the failing "
+            "code path — return verdict ``WORKING_HYPOTHESIS`` instead. "
+            "``WORKING_HYPOTHESIS`` tells the harness the LLM is testing "
+            "a plausible upstream theory; the harness will let it finish "
+            "(bounded at 2 consecutive rounds) instead of counting a "
+            "DISTRACTION strike against the HITL cap. Only verdict "
+            "DISTRACTION when the LLM's files are demonstrably UNRELATED "
+            "to the failing subsystem (wrong domain / wrong stack / "
+            "obvious cosmetics). When in doubt, prefer "
+            "WORKING_HYPOTHESIS — the harness's 2-round cap self-corrects "
+            "faster than three rounds of DISTRACTION-then-HITL.\n\n"
+        )
+
     # Fix G — test-assertion hint. Fires only when the top persisted error
     # is a pytest assertion failure whose location is inside a test file.
     # Zero effect on compile/import errors — those never trigger it. Asks
@@ -8959,6 +9045,7 @@ def _build_repair_reflection_prompt(
         f"New (introduced by this round's patches):\n{new_block}\n\n"
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
         f"{tail_block}"
+        f"{disagreement_block}"
         f"{path_wiring_hint_block}"
         f"{install_hint_block}"
         f"{test_assertion_hint_block}"
@@ -8996,10 +9083,12 @@ def _build_repair_reflection_prompt(
         f"{_generic_fallback_rule}"
         "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
         "fences. Shape:\n"
-        '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION", '
+        '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION" '
+        '| "WORKING_HYPOTHESIS", '
         '"real_blocker": "<one-sentence description grounded in the '
         'file:line locations above, OR the literal insufficient-data '
-        'sentence shown in the grounding rules>", '
+        'sentence shown in the grounding rules; may be empty when '
+        'verdict=PROGRESS or verdict=WORKING_HYPOTHESIS>", '
         '"recommendation": "<one short imperative sentence for the next '
         'repair LLM, e.g. \\"Edit src/services/AuthService.ts lines '
         '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
@@ -10126,12 +10215,20 @@ def _parse_repair_reflection_verdict(
     if not isinstance(parsed, dict):
         return None
     verdict = str(parsed.get("verdict", "")).strip().upper()
-    if verdict not in {"PROGRESS", "DISTRACTION", "REGRESSION"}:
+    # Fix B — WORKING_HYPOTHESIS is a new "hold judgement, let the LLM
+    # finish testing its upstream theory" verdict. Accepted here so the
+    # downstream repair loop treats it as a bounded PROGRESS-like state
+    # (no consecutive-distraction tick, no HITL escalation) for at most
+    # 2 rounds. See ``_maybe_promote_working_hypothesis_to_distraction``
+    # for the third-round cap.
+    if verdict not in {"PROGRESS", "DISTRACTION", "REGRESSION", "WORKING_HYPOTHESIS"}:
         return None
     real_blocker = str(parsed.get("real_blocker", "")).strip()
     recommendation = str(parsed.get("recommendation", "")).strip()
-    if not real_blocker and verdict != "PROGRESS":
-        # PROGRESS verdicts can omit the blocker; the other two need it.
+    if not real_blocker and verdict not in {"PROGRESS", "WORKING_HYPOTHESIS"}:
+        # PROGRESS and WORKING_HYPOTHESIS verdicts can omit the blocker
+        # (the judge is signalling "trust the LLM's current direction");
+        # DISTRACTION / REGRESSION must name it.
         return None
     # Escape-hatch placeholder guard — mirror of the prompt-side change.
     # If the LLM shipped the literal ``<file>`` (or the ``<no location>``
@@ -12010,6 +12107,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "errors are missing-module / unresolved-import). "
                     "Judge prompt will include the install-failure hint."
                 )
+            # Fix A — pass the accumulated judge-vs-LLM disagreement
+            # history so the reflection prompt can escalate to a
+            # WORKING_HYPOTHESIS ask when the LLM has consistently
+            # patched a different file than the judge named. Empty on
+            # PROGRESS rounds (cleared upstream), so the block only
+            # renders on the second consecutive disagreement.
+            _judge_disagreement_history_raw = loop_counter.get(
+                "judge_disagreement_history",
+            )
+            _judge_disagreement_history = (
+                _judge_disagreement_history_raw
+                if isinstance(_judge_disagreement_history_raw, list)
+                else []
+            )
+            _judge_ignored_streak = int(
+                loop_counter.get("judge_ignored_streak", 0) or 0
+            )
             reflection_prompt = _build_repair_reflection_prompt(
                 prior_diagnostics_count=len(prior_fps_set),
                 current_diagnostics_count=len(current_fps_set),
@@ -12023,12 +12137,32 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     state.get("node_state", {}).get("last_build_output", "")
                     or ""
                 ),
+                judge_disagreement_history=_judge_disagreement_history,
+                judge_ignored_streak=_judge_ignored_streak,
             )
+            # Fix C — escalate the reflection judge to the reasoning
+            # model at the moment its cheap-mode verdict is most likely
+            # to be wrong. Two consecutive DISTRACTION verdicts means
+            # either (a) the LLM is genuinely stuck, in which case the
+            # smarter judge produces the same DISTRACTION cheaper than
+            # HITL, or (b) the cheap judge misread a plausible upstream
+            # fix as DISTRACTION, in which case the reasoning judge is
+            # what unblocks the loop. Either way, ~$0.03 well spent.
+            _reflection_escalate = int(
+                loop_counter.get("consecutive_distraction_rounds", 0) or 0
+            ) >= 2
+            if _reflection_escalate:
+                logger.info(
+                    "[repair_node] Escalating reflection judge to reasoning "
+                    "model (consecutive_distraction_rounds=%d).",
+                    loop_counter.get("consecutive_distraction_rounds", 0),
+                )
             verdict_raw, new_budget = await _maybe_judgment_llm(
                 prompt=reflection_prompt,
                 budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
                 purpose="repair_reflection",
                 enabled=True,
+                escalate_to_reasoning=_reflection_escalate,
             )
             # Persist the (possibly reduced) budget back to state so the
             # main repair dispatch sees the up-to-date number.
@@ -12088,10 +12222,63 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # and escalates to HITL when it saturates.
                 _v = reflection_verdict["verdict"]
                 _low_signal = _reflection_verdict_is_low_signal(reflection_verdict)
-                if _v in {"DISTRACTION", "REGRESSION"} and not _low_signal:
+                # Fix B — WORKING_HYPOTHESIS: judge is deferring on a
+                # plausible upstream fix. Does NOT tick the distraction
+                # counter (that would race us to HITL against a bet the
+                # judge itself asked us to give the LLM room to test).
+                # Bounded at ``_WORKING_HYPOTHESIS_STREAK_CAP`` (2 by
+                # default): a third consecutive WORKING_HYPOTHESIS is
+                # promoted to DISTRACTION so the LLM can't camp on an
+                # upstream theory indefinitely.
+                if _v == "WORKING_HYPOTHESIS":
+                    # The judge accepted the LLM/judge disagreement as a
+                    # plausible upstream fix — Fix A did its job.
+                    # Clear the tracker so a subsequent DISTRACTION on a
+                    # NEW disagreement starts fresh (streak counter must
+                    # not carry over into an unrelated future stuck loop).
+                    loop_counter["judge_ignored_streak"] = 0
+                    loop_counter.pop("judge_disagreement_history", None)
+                    _wh_streak = int(
+                        loop_counter.get("working_hypothesis_streak", 0) or 0
+                    ) + 1
+                    if _wh_streak > _WORKING_HYPOTHESIS_STREAK_CAP:
+                        # Cap hit — treat as DISTRACTION going forward.
+                        # Reset the WH streak so a future genuine
+                        # WORKING_HYPOTHESIS gets its full budget after
+                        # the LLM course-corrects.
+                        loop_counter["working_hypothesis_streak"] = 0
+                        loop_counter["consecutive_distraction_rounds"] = (
+                            loop_counter.get("consecutive_distraction_rounds", 0) + 1
+                        )
+                        # Mutate the verdict so downstream (banner,
+                        # seeder, routing) sees DISTRACTION consistently.
+                        reflection_verdict["verdict"] = "DISTRACTION"
+                        _v = "DISTRACTION"
+                        logger.warning(
+                            "[repair_node] WORKING_HYPOTHESIS streak hit "
+                            "cap (%d) — promoting to DISTRACTION. "
+                            "consecutive_distraction_rounds=%d.",
+                            _WORKING_HYPOTHESIS_STREAK_CAP,
+                            loop_counter["consecutive_distraction_rounds"],
+                        )
+                    else:
+                        loop_counter["working_hypothesis_streak"] = _wh_streak
+                        # Hold the distraction counter steady — this
+                        # verdict explicitly asked us NOT to escalate.
+                        logger.info(
+                            "[repair_node] WORKING_HYPOTHESIS (streak=%d/%d) "
+                            "— judge is deferring on a plausible upstream "
+                            "fix; consecutive_distraction_rounds held at %d.",
+                            _wh_streak, _WORKING_HYPOTHESIS_STREAK_CAP,
+                            loop_counter.get("consecutive_distraction_rounds", 0),
+                        )
+                elif _v in {"DISTRACTION", "REGRESSION"} and not _low_signal:
                     loop_counter["consecutive_distraction_rounds"] = (
                         loop_counter.get("consecutive_distraction_rounds", 0) + 1
                     )
+                    # A non-WH DISTRACTION/REGRESSION resets any prior
+                    # WH streak — the judge is back to naming a target.
+                    loop_counter["working_hypothesis_streak"] = 0
                     logger.info(
                         "[repair_node] consecutive_distraction_rounds=%d "
                         "(verdict=%s).",
@@ -14259,19 +14446,47 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 if not _attempted_judge_files:
                     loop_counter["judge_ignored_last_round"] = True
                     loop_counter["judge_named_files_last_round"] = _judge_named_now
-                    loop_counter["judge_round_touched_files"] = sorted({
+                    _llm_touched = sorted({
                         r.file for r in patch_results
                         if getattr(r, "success", False)
                         and not getattr(r, "no_op", False)
                         and r.file
                     })
+                    loop_counter["judge_round_touched_files"] = _llm_touched
+                    # Fix A — streak counter + rolling history for the
+                    # reflection prompt. When the LLM and judge disagree on
+                    # the target for 2+ rounds running, the next
+                    # reflection prompt asks the judge to reconsider
+                    # whether the LLM's chosen file could be a plausible
+                    # upstream cause of the failure the judge points at.
+                    # Without this the judge repeats DISTRACTION indefinitely
+                    # (finsearch STORY-038 loop: 3 rounds → HITL cap).
+                    loop_counter["judge_ignored_streak"] = int(
+                        loop_counter.get("judge_ignored_streak", 0) or 0
+                    ) + 1
+                    _hist_raw = loop_counter.get("judge_disagreement_history")
+                    _hist: list[dict[str, Any]] = (
+                        list(_hist_raw) if isinstance(_hist_raw, list) else []
+                    )
+                    _hist.append({
+                        "round": int(loop_counter.get("total_repairs", 0) or 0),
+                        "judge_files": list(_judge_named_now),
+                        "llm_files": list(_llm_touched),
+                    })
+                    # Cap at last 3 rounds — the reflection prompt only
+                    # renders the trailing window; older entries are
+                    # noise.
+                    if len(_hist) > 3:
+                        _hist = _hist[-3:]
+                    loop_counter["judge_disagreement_history"] = _hist
                     logger.warning(
                         "[repair_node] Judge-ignored: round %d patched %s "
-                        "but judge named %s. Next round's banner will "
+                        "but judge named %s. Streak=%d. Next round's banner will "
                         "escalate.",
                         loop_counter.get("total_repairs", 0),
                         loop_counter["judge_round_touched_files"] or "(none)",
                         _judge_named_now,
+                        loop_counter["judge_ignored_streak"],
                     )
                     try:
                         from harness.observability import emit_event as _emit_ji
@@ -14301,6 +14516,12 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     loop_counter.pop("judge_ignored_last_round", None)
                     loop_counter.pop("judge_named_files_last_round", None)
                     loop_counter.pop("judge_round_touched_files", None)
+                    # Fix A — LLM complied → break the streak. History is
+                    # kept for one more round for the audit trail then aged
+                    # out; the reflection prompt gates rendering on
+                    # streak >= 2 so a solitary post-compliance entry
+                    # doesn't leak into the next round's prompt.
+                    loop_counter["judge_ignored_streak"] = 0
         else:
             # PROGRESS verdict or no verdict — clear any stale flags so the
             # next round doesn't get a phantom "you ignored the judge"
@@ -14308,6 +14529,8 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             loop_counter.pop("judge_ignored_last_round", None)
             loop_counter.pop("judge_named_files_last_round", None)
             loop_counter.pop("judge_round_touched_files", None)
+            loop_counter["judge_ignored_streak"] = 0
+            loop_counter.pop("judge_disagreement_history", None)
 
         # Per-file modification history — surfaces into the repair
         # prompt via ``_format_workspace_context_for_files`` so the LLM

@@ -1892,11 +1892,18 @@ content:
 <<<END_REWRITE_FILE>>>
 ```
 
-REWRITE_FILE overwrites an existing file wholesale. Only use it when the
-JUDGE'S VERDICT banner explicitly says "You MAY now emit REWRITE_FILE
-on X" — that flag fires only after the SAME file:line has been the
-blocker for 3+ rounds and surgical REPLACE_BLOCKs have demonstrably
-failed to converge. For everyday edits, use REPLACE_BLOCK.
+REWRITE_FILE overwrites an existing file wholesale. Use it when EITHER:
+  - the JUDGE'S VERDICT banner explicitly says "You MAY now emit
+    REWRITE_FILE on X" (fires when the SAME file:line has been the
+    blocker for 3+ rounds), OR
+  - the "## REPLACE_BLOCK pattern-repetition trap — REWRITE_FILE
+    UNLOCKED" section names the file (fires at ≥2 consecutive
+    REPLACE_BLOCK misses on the same file). Both grants are equivalent
+    — either one authorises REWRITE_FILE for the named files this
+    turn. The ≥2-miss grant is the escape hatch for stuck-file loops
+    where REPLACE_BLOCK searches keep missing (session 6177bcec
+    terminated at the HITL cap because this grant did not exist).
+For everyday edits, use REPLACE_BLOCK.
 
 Because REWRITE_FILE clobbers the file, you MUST supply the COMPLETE
 corrected contents (imports, every class, every def, every existing
@@ -6300,6 +6307,19 @@ def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     pattern with an explicit "use a different operation" instruction
     breaks the loop deterministically.
 
+    Session 6177bcec (finsearch, ``tests/test_filings.py``) took this
+    further: DELETE_BLOCK + INSERT_AT_BLOCK / CREATE_FILE also require
+    surgical anchors, so a file whose LLM-mental-model has drifted
+    beyond recovery kept failing every surgical variant. REWRITE_FILE
+    is the escape hatch designed for exactly that case — it doesn't
+    search, it clobbers — but the system prompt gates it behind a
+    "JUDGE'S VERDICT banner says you MAY". The judge never granted it
+    for a stuck REPLACE_BLOCK loop, so the LLM never emitted REWRITE
+    _FILE, so the run terminated at the HITL cap with $7.45/$10 unused.
+    Explicit grant here closes that gap: at ≥2 REPLACE_BLOCK misses the
+    directive unlocks REWRITE_FILE for the named files. The stuck-
+    target router tripwire at ≥3 misses still fires as a backstop.
+
     Returns empty string when no file is in the danger zone.
     """
     if not rb_misses:
@@ -6307,18 +6327,32 @@ def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     stuck = sorted(f for f, n in rb_misses.items() if n >= 2)
     if not stuck:
         return ""
+    stuck_list = ", ".join(f"`{f}`" for f in stuck)
     lines = [
-        "\n## REPLACE_BLOCK pattern-repetition trap",
+        "\n## REPLACE_BLOCK pattern-repetition trap — REWRITE_FILE UNLOCKED",
         (
             "You have failed REPLACE_BLOCK on the following file(s) TWO "
             "OR MORE times in a row. Your next attempt MUST NOT use "
-            "REPLACE_BLOCK for any of these files. Instead use either:\n"
-            "  (a) `DELETE_BLOCK` to remove the offending lines + "
-            "`INSERT_AT_BLOCK` to put the corrected lines back, OR\n"
-            "  (b) `DELETE_BLOCK` on the entire current content of the "
+            "REPLACE_BLOCK for any of these files. You have THREE options — "
+            "(a) is the surest escape hatch and is recommended:\n"
+            f"  (a) **REWRITE_FILE — now UNLOCKED for {stuck_list}.** "
+            "Emit ONE `REWRITE_FILE` per stuck file with the COMPLETE "
+            "corrected file contents (imports, every class, every def, "
+            "every existing test). REWRITE_FILE doesn't search — it "
+            "clobbers — so it can't miss the way REPLACE_BLOCK has been "
+            "missing. This grant overrides the system prompt's default "
+            "'only when the judge banner says so' constraint; the "
+            "≥2-miss condition IS the grant. Post-patch parse validation "
+            "still runs, so a syntactically broken REWRITE_FILE rolls "
+            "back cleanly — the surgical path is not safer here, it's "
+            "just less reliable.\n"
+            "  (b) `DELETE_BLOCK` to remove the offending lines + "
+            "`INSERT_AT_BLOCK` to put the corrected lines back.\n"
+            "  (c) `DELETE_BLOCK` on the entire current content of the "
             "file + `CREATE_FILE` with the new full content.\n"
-            "Either path forces a different patcher code path that won't "
-            "miss the way your REPLACE_BLOCK search has. Affected files:"
+            "Any of these forces a different patcher code path that "
+            "won't miss the way your REPLACE_BLOCK search has. Prefer "
+            "(a) — it's what this grant is for. Affected files:"
         ),
     ]
     for f in stuck:

@@ -5376,6 +5376,39 @@ class TestPriorPatchFailureSurfacing:
         assert "INSERT_AT_BLOCK" in out
         assert "CREATE_FILE" in out
 
+    def test_replace_block_miss_directive_unlocks_rewrite_file(self):
+        # Session 6177bcec terminated at HITL cap because the ≥2-miss
+        # directive nudged the LLM toward DELETE_BLOCK / INSERT_AT_BLOCK /
+        # CREATE_FILE but did NOT unlock REWRITE_FILE — the actual escape
+        # hatch for stuck-file loops. The system-prompt default gates
+        # REWRITE_FILE behind a "judge banner says so" phrase that never
+        # fires for REPLACE_BLOCK-miss patterns. The ≥2-miss directive
+        # must now grant it explicitly so the LLM has a byte-anchor-free
+        # escape.
+        from harness.graph import _format_replace_block_miss_directive
+        out = _format_replace_block_miss_directive({
+            "tests/test_filings.py": 3,
+        })
+        assert "REWRITE_FILE" in out, (
+            "≥2-miss directive must unlock REWRITE_FILE; the surgical "
+            "operations alone don't rescue a file whose LLM mental model "
+            "has drifted beyond recovery"
+        )
+        assert "UNLOCKED" in out, (
+            "The directive must be an explicit grant, not a suggestion — "
+            "otherwise the LLM defers to the system-prompt default that "
+            "gates REWRITE_FILE behind the judge banner"
+        )
+        assert "tests/test_filings.py" in out
+        # Recommendation ordering: REWRITE_FILE should be presented as
+        # option (a) — the primary escape hatch, not a footnote.
+        rw_idx = out.index("REWRITE_FILE")
+        db_idx = out.index("DELETE_BLOCK")
+        assert rw_idx < db_idx, (
+            "REWRITE_FILE grant must appear ABOVE the DELETE_BLOCK "
+            "alternatives so it reads as the recommended path"
+        )
+
     def test_replace_block_miss_directive_silent_under_threshold(self):
         from harness.graph import _format_replace_block_miss_directive
         # 1 miss → no directive (one miss is normal, not stuck).

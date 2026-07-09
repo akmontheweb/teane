@@ -3455,6 +3455,18 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 _cap = int(
                     state.get("hitl_auto_resume_cap") or _HITL_AUTO_RESUME_CAP
                 )
+                # Per-trigger frequency so the termination banner (and
+                # post-mortems) can point at WHICH failure classes ate
+                # the auto-resume budget, not just the trigger that
+                # happened to fire last. Dict lives on loop_counter so
+                # it survives checkpoint round-trips.
+                _per_trigger_raw = _lc_for_cap.get(
+                    "hitl_auto_resumes_per_trigger"
+                )
+                _per_trigger: dict[str, int] = (
+                    dict(_per_trigger_raw)
+                    if isinstance(_per_trigger_raw, dict) else {}
+                )
                 if _resumes_taken >= _cap:
                     # Direct-abandon: bypass the ``[q]`` handler's
                     # confirmation prompt. In headless mode the confirm
@@ -3474,6 +3486,63 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         "underlying failure.",
                         _resumes_taken, _cap, trigger,
                     )
+                    # Loud termination banner to stderr — the previous
+                    # single-line WARNING was buried in verbose output
+                    # and the finsearch session 5f65a887 operator had
+                    # to reconstruct "why did the process exit" from
+                    # log-tail archaeology. Give the exit reason a
+                    # multi-line banner with the trigger frequency
+                    # summary, session context, and copy-pasteable
+                    # recovery hints.
+                    _session_id = str(state.get("session_id") or "unknown")
+                    _total_repairs = int(
+                        loop_counter.get("total_repairs", 0) or 0
+                    )
+                    _budget_left = float(
+                        state.get("budget_remaining_usd") or 0.0
+                    )
+                    _sorted_trigs = sorted(
+                        _per_trigger.items(),
+                        key=lambda kv: (-int(kv[1] or 0), kv[0]),
+                    )
+                    _trig_lines = [
+                        f"  {name:<40s} {count:>3d} auto-resume(s)"
+                        for name, count in _sorted_trigs
+                    ] or ["  (no per-trigger accounting recorded)"]
+                    _banner = (
+                        "\n"
+                        + "=" * 78 + "\n"
+                        + "TERMINATED — HITL auto-resume cap "
+                        f"{_resumes_taken}/{_cap} exhausted (headless "
+                        "mode)\n"
+                        + "=" * 78 + "\n"
+                        + f"Session:              {_session_id}\n"
+                        + f"Last trigger:         {trigger}\n"
+                        + f"Total repairs:        {_total_repairs}\n"
+                        + f"Budget remaining:     ${_budget_left:.4f}\n"
+                        + "\n"
+                        + "Auto-resumes by trigger:\n"
+                        + "\n".join(_trig_lines) + "\n"
+                        + "\n"
+                        + "Recovery options:\n"
+                        + "  1. Rerun with -y removed and a TTY so the "
+                        "HITL menu is interactive.\n"
+                        + "  2. Rerun with `--hitl-repair true` to opt "
+                        "into interactive repair (still non-blocking\n"
+                        + "     for other gates).\n"
+                        + "  3. Raise the cap via config: set "
+                        "`hitl.auto_resume_cap: 10` in config.json (or\n"
+                        + "     pass the equivalent). Higher caps trade "
+                        "budget for recovery slack.\n"
+                        + "  4. Inspect the workspace at the state "
+                        f"above and manually address the '{trigger}'\n"
+                        + "     failure, then rerun `teane patch`.\n"
+                        + "=" * 78 + "\n"
+                    )
+                    try:
+                        print(_banner, file=sys.stderr, flush=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                     node_state["hitl_auto_resume_cap_hit"] = True
                     node_state["hitl_abandon"] = True
                     node_state["hitl_active"] = False
@@ -3488,6 +3557,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                             loop_counter=loop_counter.get("total_repairs", 0),
                             modified_files=len(modified_files),
                             reason="auto_resume_cap_hit",
+                            per_trigger_frequency=dict(_per_trigger),
                         )
                     except Exception:  # noqa: BLE001
                         pass
@@ -3498,11 +3568,17 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     _lc_for_cap["hitl_auto_resumes_taken"] = (
                         _resumes_taken + 1
                     )
+                    _per_trigger[trigger] = int(
+                        _per_trigger.get(trigger, 0) or 0
+                    ) + 1
+                    _lc_for_cap["hitl_auto_resumes_per_trigger"] = _per_trigger
                     logger.info(
                         "[HITL] Repair menu auto-resumed "
                         "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE "
-                        "/ no TTY). Auto-resume %d/%d for this session.",
-                        _resumes_taken + 1, _cap,
+                        "/ no TTY). Auto-resume %d/%d for this session "
+                        "(trigger '%s' cumulative: %d).",
+                        _resumes_taken + 1, _cap, trigger,
+                        _per_trigger[trigger],
                     )
         else:
             # Structured envelope for remote UIs (the dashboard's HITL

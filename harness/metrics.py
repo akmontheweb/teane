@@ -58,6 +58,14 @@ _TOOL_CALL_FAILED_EVENT = "tool_call_failed"
 # the system prompt is anchored at messages[0] and never mutated after.
 _SYSTEM_PROMPT_BUILT_EVENT = "system_prompt_built"
 
+# Emitted by compiler_node at the end of every repair cycle. Carries the
+# full ``loop_counter`` dict so post-mortem consumers can see stall-tracking
+# counters (consecutive_zero_patch_rounds, replace_block_misses_per_file,
+# cheap_shots_taken, total_repairs, ...) as a timeline. Aggregation keeps
+# the latest snapshot (final loop state) and element-wise peaks of scalar
+# integer counters (how close each tripwire got to firing).
+_LOOP_COUNTER_SNAPSHOT_EVENT = "loop_counter_snapshot"
+
 # Default sliding window used by the recent-burn-rate calculation. Ten
 # minutes is short enough to see a runaway session in near-real-time but
 # long enough to smooth across the spiky per-call cost pattern.
@@ -89,6 +97,15 @@ class SessionMetrics:
     tool_error_count: dict[str, int] = field(default_factory=dict)
     system_prompt_chars: int = 0
     system_prompt_lines: int = 0
+    # Latest ``loop_counter`` observed via loop_counter_snapshot events
+    # (compiler_node emits one per repair cycle). The final entry is the
+    # end-of-session state; useful for reconstructing "did we terminate
+    # while a tripwire was hot?" without replaying the whole graph.
+    loop_counter_final: dict[str, Any] = field(default_factory=dict)
+    # Element-wise max of scalar-int fields seen across all snapshots.
+    # Answers "how close did we get to the HITL threshold this session?"
+    # for the stall-tracking counters that reset on progress.
+    loop_counter_peak: dict[str, int] = field(default_factory=dict)
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
     recent_burn_rate_usd_per_min: float = 0.0
@@ -137,6 +154,8 @@ class SessionMetrics:
             "tool_error_rates": {k: round(v, 6) for k, v in self.tool_error_rates().items()},
             "system_prompt_chars": self.system_prompt_chars,
             "system_prompt_lines": self.system_prompt_lines,
+            "loop_counter_final": dict(self.loop_counter_final),
+            "loop_counter_peak": dict(self.loop_counter_peak),
             "first_ts": self.first_ts.isoformat() if self.first_ts else None,
             "last_ts": self.last_ts.isoformat() if self.last_ts else None,
             "recent_burn_rate_usd_per_min": round(self.recent_burn_rate_usd_per_min, 6),
@@ -348,6 +367,25 @@ def aggregate_session(
                 ts = _parse_ts(rec.get("ts"))
                 if ts is not None:
                     _update_ts_range(metrics, ts)
+            elif event == _LOOP_COUNTER_SNAPSHOT_EVENT:
+                snapshot = rec.get("loop_counter")
+                if isinstance(snapshot, dict):
+                    # Latest-wins for the final snapshot.
+                    metrics.loop_counter_final = dict(snapshot)
+                    # Element-wise max for scalar-int fields. Skip
+                    # nested dicts (replace_block_misses_per_file etc.)
+                    # and non-numeric values (last-symbol strings) —
+                    # peaks are only meaningful for the tripwire scalars.
+                    for k, v in snapshot.items():
+                        if isinstance(v, bool):
+                            continue
+                        if isinstance(v, int):
+                            prev = metrics.loop_counter_peak.get(k, 0)
+                            if v > prev:
+                                metrics.loop_counter_peak[k] = v
+                ts = _parse_ts(rec.get("ts"))
+                if ts is not None:
+                    _update_ts_range(metrics, ts)
 
     metrics.recent_burn_rate_usd_per_min = _compute_burn_rate(
         window_records,
@@ -469,8 +507,29 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
         f"  Burn rate ({metrics.recent_window_minutes}m): ${metrics.recent_burn_rate_usd_per_min:.4f}/min",
         f"  Budget (hard cap):   ${hard_cap_usd:.2f} — ${remaining:.4f} remaining",
         f"  Projected exhaust:   {proj_label}",
-        "=" * 60,
     ]
+    # Loop-health line: surface the "how close to HITL" tripwires and
+    # cumulative repair activity so operators can see stall pressure at
+    # a glance. Only emitted when a snapshot was actually observed.
+    if metrics.loop_counter_final or metrics.loop_counter_peak:
+        loop_bits: list[str] = []
+        final = metrics.loop_counter_final
+        peak = metrics.loop_counter_peak
+        if "total_repairs" in final:
+            loop_bits.append(f"repairs={final.get('total_repairs', 0)}")
+        if "consecutive_zero_patch_rounds" in peak:
+            loop_bits.append(
+                f"peak_zero_patch_rounds={peak['consecutive_zero_patch_rounds']}"
+            )
+        if "no_progress_repairs" in peak:
+            loop_bits.append(f"peak_no_progress={peak['no_progress_repairs']}")
+        if "cheap_shots_taken" in peak:
+            loop_bits.append(f"peak_cheap_shots={peak['cheap_shots_taken']}")
+        if "consecutive_low_signal_rounds" in peak:
+            loop_bits.append(f"peak_low_signal={peak['consecutive_low_signal_rounds']}")
+        if loop_bits:
+            lines.append(f"  Loop health:         {', '.join(loop_bits)}")
+    lines.append("=" * 60)
     return "\n".join(lines)
 
 

@@ -82,6 +82,25 @@ def _system_prompt_built(ts: str, chars: int, lines: int, tree_lines: int = 0) -
     }
 
 
+def _loop_counter_snapshot(
+    ts: str,
+    loop_counter: dict,
+    *,
+    exit_code: int = 0,
+    n_diagnostics: int = 0,
+) -> dict:
+    return {
+        "ts": ts,
+        "level": "INFO",
+        "logger": "harness.events",
+        "msg": "",
+        "event": "loop_counter_snapshot",
+        "loop_counter": loop_counter,
+        "exit_code": exit_code,
+        "n_diagnostics": n_diagnostics,
+    }
+
+
 _FIXED_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -294,6 +313,98 @@ class TestSystemPromptSize:
         m = aggregate_session("sess-prompt", str(tmp_path), now=_FIXED_NOW)
         assert m.system_prompt_chars == 8_000
         assert m.system_prompt_lines == 80
+
+
+class TestLoopCounterSnapshot:
+
+    def test_latest_snapshot_wins_and_scalar_peak_tracked(self, tmp_path):
+        from harness.metrics import aggregate_session
+        log = tmp_path / "sess-loop.jsonl"
+        _write_jsonl(str(log), [
+            _loop_counter_snapshot(
+                "2026-06-10T11:55:00+00:00",
+                {
+                    "total_repairs": 2,
+                    "consecutive_zero_patch_rounds": 1,
+                    "cheap_shots_taken": 1,
+                    "replace_block_misses_per_file": {"a.py": 1},
+                    "missing_dep_last_symbol": "requests",
+                },
+            ),
+            _loop_counter_snapshot(
+                "2026-06-10T11:56:00+00:00",
+                {
+                    # Peak of consecutive_zero_patch_rounds — this is
+                    # the "how close did we get to HITL?" reading.
+                    "total_repairs": 4,
+                    "consecutive_zero_patch_rounds": 3,
+                    "cheap_shots_taken": 2,
+                    "replace_block_misses_per_file": {"a.py": 2, "b.py": 1},
+                    "missing_dep_last_symbol": "flask",
+                },
+            ),
+            _loop_counter_snapshot(
+                "2026-06-10T11:57:00+00:00",
+                {
+                    # Green build resets the streak to 0 — final snapshot
+                    # shows current state, peak preserves the earlier max.
+                    "total_repairs": 5,
+                    "consecutive_zero_patch_rounds": 0,
+                    "cheap_shots_taken": 2,
+                    "replace_block_misses_per_file": {},
+                    "missing_dep_last_symbol": "",
+                },
+                exit_code=0,
+            ),
+        ])
+        m = aggregate_session("sess-loop", str(tmp_path), now=_FIXED_NOW)
+        # Latest-wins for the final snapshot.
+        assert m.loop_counter_final["total_repairs"] == 5
+        assert m.loop_counter_final["consecutive_zero_patch_rounds"] == 0
+        assert m.loop_counter_final["missing_dep_last_symbol"] == ""
+        # Element-wise peak of scalar-int fields.
+        assert m.loop_counter_peak["total_repairs"] == 5
+        assert m.loop_counter_peak["consecutive_zero_patch_rounds"] == 3
+        assert m.loop_counter_peak["cheap_shots_taken"] == 2
+        # Nested dicts (replace_block_misses_per_file) skipped from peak.
+        assert "replace_block_misses_per_file" not in m.loop_counter_peak
+        # Non-numeric strings skipped from peak.
+        assert "missing_dep_last_symbol" not in m.loop_counter_peak
+
+    def test_snapshot_appears_in_jsonable_and_format_human(self, tmp_path):
+        from harness.metrics import (
+            aggregate_session, format_human,
+        )
+        log = tmp_path / "sess-loop2.jsonl"
+        _write_jsonl(str(log), [
+            _loop_counter_snapshot(
+                "2026-06-10T11:55:00+00:00",
+                {"total_repairs": 3, "consecutive_zero_patch_rounds": 2},
+            ),
+        ])
+        m = aggregate_session("sess-loop2", str(tmp_path), now=_FIXED_NOW)
+        out = m.to_jsonable()
+        assert out["loop_counter_final"] == {
+            "total_repairs": 3, "consecutive_zero_patch_rounds": 2,
+        }
+        assert out["loop_counter_peak"] == {
+            "total_repairs": 3, "consecutive_zero_patch_rounds": 2,
+        }
+        report = format_human(m, hard_cap_usd=2.00)
+        assert "Loop health:" in report
+        assert "repairs=3" in report
+        assert "peak_zero_patch_rounds=2" in report
+
+    def test_no_snapshot_leaves_empty_dicts_and_no_loop_health_line(self, tmp_path):
+        from harness.metrics import aggregate_session, format_human
+        log = tmp_path / "sess-loop3.jsonl"
+        _write_jsonl(str(log), [
+            _llm_call("2026-06-10T11:55:00+00:00", 0.10),
+        ])
+        m = aggregate_session("sess-loop3", str(tmp_path), now=_FIXED_NOW)
+        assert m.loop_counter_final == {}
+        assert m.loop_counter_peak == {}
+        assert "Loop health:" not in format_human(m, hard_cap_usd=2.00)
 
 
 class TestPrometheusNewMetrics:

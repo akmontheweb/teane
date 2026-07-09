@@ -10720,6 +10720,25 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         # :func:`_reset_stall_tripwires_on_progress` for the rationale.
         _reset_stall_tripwires_on_progress(loop_counter)
 
+    # Emit the loop_counter as an observability event so post-mortem grep
+    # of ~/.harness/logs/<session>.jsonl surfaces the stall-tracking
+    # counters (consecutive_zero_patch_rounds, replace_block_misses_per_file,
+    # cheap_shots_taken, total_repairs, ...) without having to reconstruct
+    # them from bump-site log lines. Compiler_node is the natural per-round
+    # heartbeat — it fires between every patch+repair cycle, so the LAST
+    # snapshot in a session is close to final state and INTERMEDIATE ones
+    # form a timeline the metrics aggregator can consume.
+    try:
+        from harness.observability import emit_event as _emit_lc_snap
+        _emit_lc_snap(
+            "loop_counter_snapshot",
+            loop_counter=dict(loop_counter),
+            exit_code=exit_code,
+            n_diagnostics=len(compiler_errors),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break the graph
+        pass
+
     return return_dict
 
 

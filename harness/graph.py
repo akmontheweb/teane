@@ -7067,6 +7067,58 @@ _REREAD_INJECTION_CAP = 5
 # "1-patch-per-round" pattern; capping at 3 keeps the prompt bounded
 # while still covering the diagnostic hot-spots.
 _CROSS_ROUND_CTX_CAP = 3
+# Improvement 1 — bootstrap-tool classifier for the same_missing_dep
+# HITL trigger. Symbols that name entries in this set genuinely can't be
+# fixed from inside the loop (they belong in the sandbox image); regular
+# pip / npm packages (sqlalchemy, pandas, httpx, etc.) get a different
+# HITL message directing the operator at their manifest topology. Kept
+# narrow — anything not on this list is treated as an installable
+# package. Session finsearch/STORY-038-batch: 'sqlalchemy' hit this
+# trigger with the bootstrap message, misleading the operator into
+# rebuilding the image when the real fix was a manifest topology tweak.
+_BOOTSTRAP_TOOLS: frozenset[str] = frozenset({
+    # Python bootstrap
+    "pip", "uv", "poetry", "hatch", "setuptools", "wheel", "virtualenv",
+    "python", "python3",
+    # Node / JS bootstrap
+    "node", "nodejs", "npm", "yarn", "pnpm", "npx",
+    # Build tooling that ships with the image, not with the workspace
+    "make", "cmake", "gcc", "g++", "clang", "ld",
+    # Version control / container runtimes
+    "git", "hg", "svn", "docker", "podman", "buildah",
+    # Language runtimes / package managers we don't ship
+    "cargo", "rustc", "go", "java", "javac", "mvn", "maven", "gradle",
+    "ruby", "gem", "bundler",
+})
+
+
+def _is_bootstrap_tool(symbol: str) -> bool:
+    """True when the missing symbol names something that would live in
+    the sandbox image, not in a project manifest. Used by the
+    ``same_missing_dep_limit`` HITL trigger to pick between the two
+    guidance messages. Normalisation: lowercase + strip common
+    version / path suffixes so ``pip3.11``, ``pip`` and ``/usr/bin/pip``
+    all collapse to ``pip``."""
+    if not isinstance(symbol, str):
+        return False
+    name = symbol.strip().lower()
+    if not name:
+        return False
+    # Scoped npm packages (``@types/node``, ``@babel/core``) are ALWAYS
+    # regular packages — never bootstrap. Bail before path stripping so
+    # ``@types/node`` doesn't collapse to ``node``.
+    if name.startswith("@"):
+        return False
+    # Drop leading path segments (``/usr/bin/pip`` → ``pip``).
+    name = name.rsplit("/", 1)[-1]
+    # Drop trailing version glyphs (``pip3.11`` → ``pip``, ``python3`` → ``python``).
+    import re as _re
+    name = _re.sub(r"[\d.]+$", "", name)
+    # Drop suffix arch/tag (``gcc-12`` → ``gcc``).
+    name = name.split("-", 1)[0]
+    return name in _BOOTSTRAP_TOOLS
+
+
 # Fix B — WORKING_HYPOTHESIS verdict streak cap. On the Nth consecutive
 # WORKING_HYPOTHESIS, the reflection loop promotes to DISTRACTION so an
 # upstream-theory bet can't camp indefinitely against the HITL cap.
@@ -11416,6 +11468,78 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         # error shape) — reset so a future MISSING_DEP starts fresh.
         loop_counter["missing_dep_consecutive_same"] = 0
         loop_counter["missing_dep_last_symbol"] = ""
+
+    # Improvement 3 — pre-emptive build_command rewire for regular pip
+    # packages. When the same missing-package symbol recurs 2 rounds AND
+    # (a) it's not a bootstrap tool AND (b) we haven't already rewired
+    # this session AND (c) re-detecting from the workspace produces a
+    # different (usually better-covering) build_command, swap it in
+    # place. The next compile uses the new command; if the missing dep
+    # is genuinely absent from every manifest the streak keeps ticking
+    # and the same_missing_dep_limit HITL fires as before.
+    #
+    # Rationale: the HITL trigger already had auto-rewire, but only
+    # AFTER hitting the streak cap and forcing an auto-resume — costing
+    # 3 wasted repair rounds (~$0.1-$0.2 of budget) before the fix
+    # applied. Firing at streak==2 skips the HITL entirely for the
+    # common manifest-topology case (finsearch STORY-038: workspace
+    # had root pyproject.toml + server/requirements.txt, build_command
+    # only installed the latter; sqlalchemy lived in the former).
+    #
+    # Belt-and-suspenders with Path A (``_detect_default_build_command``
+    # already unions all workspace manifests as the install prefix), for
+    # cases where the LLM patches the manifest topology mid-session so
+    # the initial detection went stale.
+    _preemptive_used = bool(loop_counter.get("preemptive_rewire_used", False))
+    if (
+        primary_missing_dep_symbol
+        and loop_counter["missing_dep_consecutive_same"] >= 2
+        and not _preemptive_used
+        and not _is_bootstrap_tool(primary_missing_dep_symbol)
+    ):
+        try:
+            from harness.cli import _detect_default_build_command
+            _is_greenfield = bool(state.get("flow") == "build")
+            _redetected = _detect_default_build_command(
+                workspace, is_greenfield=_is_greenfield,
+            )
+        except Exception as _rewire_exc:  # noqa: BLE001
+            logger.debug(
+                "[compiler_node:preemptive_rewire] re-detection failed: %s",
+                _rewire_exc,
+            )
+            _redetected = None
+        if (
+            isinstance(_redetected, str)
+            and _redetected.strip()
+            and _redetected != build_cmd
+        ):
+            logger.warning(
+                "[compiler_node:preemptive_rewire] Missing package %r has "
+                "recurred %d rounds. Re-detection produced a different "
+                "build_command that better covers workspace manifests. "
+                "Swapping BEFORE the same_missing_dep HITL fires. old=%r "
+                "new=%r",
+                primary_missing_dep_symbol,
+                loop_counter["missing_dep_consecutive_same"],
+                build_cmd, _redetected,
+            )
+            build_cmd = _redetected
+            loop_counter["preemptive_rewire_used"] = True
+            # Reset the streak so the next compile gets a clean shot with
+            # the new build_command. If the rewire doesn't help, the
+            # streak ticks back up and the HITL fires at 3 as before.
+            loop_counter["missing_dep_consecutive_same"] = 0
+            try:
+                from harness.observability import emit_event as _emit_rw
+                _emit_rw(
+                    "compiler_preemptive_rewire",
+                    symbol=primary_missing_dep_symbol,
+                    old_command=str(state.get("build_command", "") or "")[:400],
+                    new_command=_redetected[:400],
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     # Sandbox CommandValidator block — the build command itself was
     # refused before any subprocess ran. The validator config (allowed_
@@ -16592,15 +16716,44 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         last_symbol = str(
             loop_counter.get("missing_dep_last_symbol", "") or "?"
         )
-        logger.warning(
-            "[router] Missing dependency '%s' has recurred %d times in a "
-            "row despite landed patches. The deterministic-autofix bypass "
-            "cannot resolve it from inside the loop — the sandbox image "
-            "almost certainly does not ship the bootstrap tool (`%s`). "
-            "Routing to HITL: fix the docker_image (sandbox.docker_image "
-            "in config.json or your project's build_command), then resume.",
-            last_symbol, consecutive_same_dep, last_symbol,
-        )
+        # Improvement 1 — split HITL guidance by symbol class. Bootstrap
+        # tools genuinely can't be fixed from inside the loop (they belong
+        # in the sandbox image). Regular pip / npm packages usually
+        # indicate a workspace-manifest topology mismatch (workspace has
+        # deps at path A but build_command installs from path B) and the
+        # LLM CAN fix them if pointed at the right lever. Same HITL
+        # trigger, different actionable message.
+        if _is_bootstrap_tool(last_symbol):
+            logger.warning(
+                "[router] Missing dependency '%s' has recurred %d times in a "
+                "row despite landed patches. This is a BOOTSTRAP TOOL — it "
+                "belongs in the sandbox image, not the workspace manifest. "
+                "The deterministic-autofix bypass cannot resolve it from "
+                "inside the loop. Routing to HITL: fix the docker_image "
+                "(sandbox.docker_image in config.json or your project's "
+                "build_command), then resume.",
+                last_symbol, consecutive_same_dep,
+            )
+        else:
+            logger.warning(
+                "[router] Missing package '%s' has recurred %d times in a "
+                "row despite landed patches. This is a REGULAR PIP / NPM "
+                "PACKAGE — not a bootstrap tool. The most common cause is "
+                "workspace-manifest topology mismatch: the workspace has "
+                "multiple dep manifests (root pyproject.toml + root "
+                "requirements.txt + subdir requirements.txt) but the "
+                "build_command only installs from a subset. Routing to "
+                "HITL. Operator: (1) grep the workspace for every "
+                "requirements.txt / pyproject.toml / package.json / "
+                "Pipfile / setup.py, (2) confirm '%s' appears in at least "
+                "one of them, (3) confirm the build_command installs from "
+                "THAT manifest (uv pip install -e . OR uv pip install -r "
+                "<manifest> — whichever contains the package). Auto-resume "
+                "will retry with the harness's auto-detected build_command "
+                "which typically includes both '-e .' AND every top-level "
+                "requirements.txt.",
+                last_symbol, consecutive_same_dep, last_symbol,
+            )
         return _transition("human_intervention_node")
 
     if total_repairs >= max_iterations and has_autofixable:

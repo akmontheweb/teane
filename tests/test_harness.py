@@ -4885,9 +4885,17 @@ class TestMakefileBuildTargetDetection:
         # Without a `build:` target the Makefile is ignored; we use the
         # manifest-based command directly. uv pip install replaces plain
         # pip — same semantics, much faster, persistent cache volume.
+        # Path A (Improvement 3-alt) unions all workspace Python manifests
+        # into the install prefix and appends a defensive
+        # ``uv pip install pytest`` — harmless when pytest is pre-baked
+        # into the sandbox image but keeps host-runs working. Assert on
+        # the required substrings instead of exact string equality so the
+        # composer can grow additional steps without breaking this test.
         from harness.graph import _uv_venv_prefix
         from harness.cli import _PYTEST_RUN
-        assert cmd == f"{_uv_venv_prefix()} && uv pip install -e . && {_PYTEST_RUN}"
+        assert _uv_venv_prefix() in cmd
+        assert "uv pip install -e ." in cmd
+        assert cmd.endswith(f" && {_PYTEST_RUN}")
 
     def test_makefile_with_build_target_still_returns_make_build(self, tmp_path):
         from harness.cli import _detect_default_build_command

@@ -1996,10 +1996,33 @@ def _detect_default_build_command(
     # uv pip install is preferred over plain pip — same manifest semantics,
     # 10-30× faster on cold caches, hits the harness-managed /cache/uv
     # volume across runs. uv is pre-baked into the sandbox builder image.
-    if has("pyproject.toml"):
-        dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
-        return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
-    if has("requirements.txt"):
+    #
+    # Path A — install the UNION of every Python manifest in the workspace
+    # (root pyproject/requirements + every first-level subdir's
+    # requirements/pyproject/requirements-dev) rather than only the root
+    # manifest. Structurally prevents the "manifest topology mismatch"
+    # class of bug (finsearch STORY-038: sqlalchemy was in
+    # root/requirements.txt but the build_command only installed
+    # server/requirements.txt). Composed via
+    # ``_compose_prod_smoke_install_step`` — the same helper the prod-
+    # smoke check already uses, so install-time behaviour is aligned
+    # across both entry points. The chain includes an ending
+    # ``uv pip install pytest`` which harmlessly no-ops when pytest is
+    # already installed by an earlier step.
+    if has("pyproject.toml") or has("requirements.txt"):
+        try:
+            from harness.graph import _compose_prod_smoke_install_step
+            _union_install = _compose_prod_smoke_install_step(workspace_path)
+        except Exception:  # noqa: BLE001 — composer is best-effort; fall through on any failure
+            _union_install = None
+        if _union_install:
+            return f"{_union_install} && {_PYTEST_RUN}"
+        # Fallback: composer returned None despite root manifest existing
+        # (transient FS error, symlink loop). Use the historical narrow
+        # install so the build can at least attempt to run.
+        if has("pyproject.toml"):
+            dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
+            return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
         dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
         return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && {_PYTEST_RUN}"
     # Java — Maven first, then Gradle (wrapper if present).

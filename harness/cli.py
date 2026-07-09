@@ -809,6 +809,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # planner sees (tail of file) so the system message stays small.
     "memory": frozenset({
         "enabled", "dir", "max_bytes", "inject_max_bytes",
+        "compact_after", "compact_keep_recent",
     }),
     # Scheduled-job daemon. enabled toggles the entire feature; jobs is
     # the list of {name, schedule, workspace, prompt, on_success,
@@ -1017,6 +1018,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "memory.dir": (str,),
     "memory.max_bytes": (int,),
     "memory.inject_max_bytes": (int,),
+    "memory.compact_after": (int,),
+    "memory.compact_keep_recent": (int,),
     "schedule.enabled": (bool,),
     "schedule.jobs": (list,),
     "schedule.history_db": (str,),

@@ -237,4 +237,143 @@ def test_from_config_parses_section():
 def test_from_config_defaults_when_section_missing():
     cfg = RepoMemoryConfig.from_config({})
     assert cfg.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Compaction (audit #24)
+# ---------------------------------------------------------------------------
+
+def _make_verbose_session(sid: str, iteration: int, n_files: int = 8) -> dict:
+    """Build a session-append payload with enough files + a Notes line to
+    exercise the compaction stripper (which drops indented file bullets +
+    ``- Notes:`` lines from older sections).
+    """
+    return {
+        "session_id": sid,
+        "prompt_summary": f"iteration {iteration} — building some feature",
+        "modified_files": [f"src/file_{iteration}_{k}.py" for k in range(n_files)],
+        "exit_code": 0,
+        "extra_notes": (
+            f"[learned-rule:iter_{iteration}] Some hypothesis text that would "
+            f"normally survive across sessions."
+        ),
+    }
+
+
+def test_compaction_strips_old_file_lists_and_notes(tmp_path):
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    # compact_after tuned low so the second append trips compaction on
+    # the first (older) section. keep_recent=1 → only the just-written
+    # section is spared.
+    cfg = RepoMemoryConfig(
+        dir=str(tmp_path / "mem"),
+        max_bytes=1_000_000,       # generous so FIFO trim never fires
+        inject_max_bytes=1_000_000,
+        compact_after=500,
+        compact_keep_recent=1,
+    )
+    append_session_note(workspace, cfg=cfg, **_make_verbose_session("s000", 0))
+    append_session_note(workspace, cfg=cfg, **_make_verbose_session("s001", 1))
+    content = read_repo_memory(workspace, cfg)
+    # First session's file bullets and Notes must have been stripped.
+    assert "src/file_0_0.py" not in content
+    assert "[learned-rule:iter_0]" not in content
+    # Recent (just-written) session keeps everything.
+    assert "src/file_1_0.py" in content
+    assert "[learned-rule:iter_1]" in content
+    # Prompt + Status + Modified count for the older session are preserved.
+    assert "iteration 0" in content
+    assert "8 file(s) modified" in content  # count survives; list doesn't
+
+
+def test_compaction_below_threshold_is_a_no_op(tmp_path):
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    # Threshold high enough that neither append trips compaction.
+    cfg = RepoMemoryConfig(
+        dir=str(tmp_path / "mem"),
+        max_bytes=1_000_000,
+        inject_max_bytes=1_000_000,
+        compact_after=100_000,
+        compact_keep_recent=1,
+    )
+    append_session_note(workspace, cfg=cfg, **_make_verbose_session("s000", 0))
+    append_session_note(workspace, cfg=cfg, **_make_verbose_session("s001", 1))
+    content = read_repo_memory(workspace, cfg)
+    # Both sessions keep their file lists — nothing was compacted.
+    assert "src/file_0_0.py" in content
+    assert "src/file_1_0.py" in content
+    assert "[learned-rule:iter_0]" in content
+    assert "[learned-rule:iter_1]" in content
+
+
+def test_compaction_is_idempotent_on_already_compact_section(tmp_path):
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    cfg = RepoMemoryConfig(
+        dir=str(tmp_path / "mem"),
+        max_bytes=1_000_000,
+        inject_max_bytes=1_000_000,
+        compact_after=500,
+        compact_keep_recent=1,
+    )
+    # Three appends: after append #2, session #0 gets compacted. After
+    # append #3, sessions #0 AND #1 are outside the recent window; #0
+    # is already compact so only #1 has verbose bullets to strip. This
+    # exercises the "seen_any_verbose" gate that prevents double-counting.
+    for i in range(3):
+        append_session_note(workspace, cfg=cfg, **_make_verbose_session(f"s{i:03d}", i))
+    content = read_repo_memory(workspace, cfg)
+    # Old sections (#0 and #1) have no file lists.
+    assert "src/file_0_0.py" not in content
+    assert "src/file_1_0.py" not in content
+    # #0's Prompt still survives.
+    assert "iteration 0" in content
+    # Most recent session (#2) is intact.
+    assert "src/file_2_0.py" in content
+    assert "[learned-rule:iter_2]" in content
+
+
+def test_compaction_emits_event(tmp_path, caplog):
+    import logging as _logging
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    cfg = RepoMemoryConfig(
+        dir=str(tmp_path / "mem"),
+        max_bytes=1_000_000,
+        inject_max_bytes=1_000_000,
+        compact_after=500,
+        compact_keep_recent=1,
+    )
+    append_session_note(workspace, cfg=cfg, **_make_verbose_session("s000", 0))
+    with caplog.at_level(_logging.INFO, logger="harness.events"):
+        append_session_note(workspace, cfg=cfg, **_make_verbose_session("s001", 1))
+    # Look for the structured event record.
+    compaction_records = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "memory_compaction_fired"
+    ]
+    assert compaction_records, "expected a memory_compaction_fired event"
+    rec = compaction_records[0]
+    assert getattr(rec, "sections_compacted", 0) >= 1
+    assert getattr(rec, "bytes_before", 0) > getattr(rec, "bytes_after", 0)
+    assert getattr(rec, "bytes_reclaimed", -1) > 0
+
+
+def test_compaction_from_config_parses_knobs():
+    cfg = RepoMemoryConfig.from_config({
+        "memory": {
+            "compact_after": 12345,
+            "compact_keep_recent": 7,
+        },
+    })
+    assert cfg.compact_after == 12345
+    assert cfg.compact_keep_recent == 7
+
+
+def test_compaction_defaults_when_knobs_missing():
+    cfg = RepoMemoryConfig.from_config({"memory": {}})
+    assert cfg.compact_after == 60_000
+    assert cfg.compact_keep_recent == 3
     assert cfg.dir == "~/.harness/memory"

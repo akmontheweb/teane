@@ -378,12 +378,14 @@
     "skills": {
         "user_skills_dir": "~/.harness/user_skills"
     },
-    "_memory_comment": "Per-repository session memory. When enabled=true (default), the planner reads the prior-session log (~/.harness/memory/<repo_id>.md) at the start of every teane run and injects the most recent entries as system context, and cmd_run appends a fresh entry on exit. Repo identity = SHA-256 of `git remote get-url origin` if available, else the workspace path. max_bytes caps the file itself (FIFO trim drops oldest sections). inject_max_bytes caps what the planner sees on each run.",
+    "_memory_comment": "Per-repository session memory. When enabled=true (default), the planner reads the prior-session log (~/.harness/memory/<repo_id>.md) at the start of every teane run and injects the most recent entries as system context, and cmd_run appends a fresh entry on exit. Repo identity = SHA-256 of `git remote get-url origin` if available, else the workspace path. max_bytes caps the file itself (FIFO trim drops oldest sections). inject_max_bytes caps what the planner sees on each run. compact_after (bytes) is the threshold that triggers deterministic in-place compaction of older sections BEFORE the FIFO trim runs — file-list bullets and Notes lines are stripped from every section outside the compact_keep_recent newest so the recent window (learned-rule notes on the last few runs) stays fully visible. Compaction emits a `memory_compaction_fired` event to ~/.harness/logs/<sid>.jsonl.",
     "memory": {
         "enabled": true,
         "dir": "~/.harness/memory",
         "max_bytes": 100000,
-        "inject_max_bytes": 8000
+        "inject_max_bytes": 8000,
+        "compact_after": 60000,
+        "compact_keep_recent": 3
     },
     "_github_comment": "GitHub integration. Subcommands (teane gh issue / pr-create / pr-comment) shell out to the `gh` CLI; auth is whatever `gh auth status` shows. Set gh_path to point at a non-PATH `gh` binary if needed. default_owner + default_repo supply the fallback when a CLI / web flow creates a PR without specifying a repo explicitly \u2014 see harness.github_integration.default_repo().",
     "github": {

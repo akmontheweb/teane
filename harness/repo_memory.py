@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MEMORY_DIR = "~/.harness/memory"
 _DEFAULT_MAX_BYTES = 100_000  # ~25K tokens — small enough to inject as context
 _DEFAULT_MAX_INJECT_BYTES = 8_000  # cap on what we read back as planner context
+# Compaction threshold — when the on-disk file exceeds this many bytes,
+# the append path deterministically shrinks older sections in place
+# (strip file-list bullets + Notes lines) before the FIFO trim runs.
+# Set to 60% of max_bytes so compaction fires well before the FIFO
+# would start dropping content entirely. Sessions inside the
+# ``compact_keep_recent`` window are never touched.
+_DEFAULT_COMPACT_AFTER = 60_000
+_DEFAULT_COMPACT_KEEP_RECENT = 3
 
 
 @dataclass
@@ -72,6 +80,13 @@ class RepoMemoryConfig:
     # Smaller than max_bytes because file content includes full history;
     # injection only needs the recent tail.
     inject_max_bytes: int = _DEFAULT_MAX_INJECT_BYTES
+    # Compaction knobs. compact_after is the byte threshold that fires
+    # deterministic in-place shrinking of older sections BEFORE the FIFO
+    # trim runs. compact_keep_recent is the count of newest sections
+    # spared from compaction (so recent activity, including learned-rule
+    # notes, stays fully visible to the planner).
+    compact_after: int = _DEFAULT_COMPACT_AFTER
+    compact_keep_recent: int = _DEFAULT_COMPACT_KEEP_RECENT
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "RepoMemoryConfig":
@@ -82,6 +97,12 @@ class RepoMemoryConfig:
             max_bytes=int(section.get("max_bytes", _DEFAULT_MAX_BYTES)),
             inject_max_bytes=int(
                 section.get("inject_max_bytes", _DEFAULT_MAX_INJECT_BYTES)
+            ),
+            compact_after=int(
+                section.get("compact_after", _DEFAULT_COMPACT_AFTER)
+            ),
+            compact_keep_recent=int(
+                section.get("compact_keep_recent", _DEFAULT_COMPACT_KEEP_RECENT)
             ),
         )
 
@@ -190,7 +211,69 @@ _HEADER_TEMPLATE = (
     "# teane session memory\n"
     "<!-- Append-only log of past sessions on this repository. -->\n"
     "<!-- Trimmed FIFO at memory.max_bytes; oldest sections drop first. -->\n"
+    "<!-- Older sections deterministically compacted at memory.compact_after. -->\n"
 )
+
+
+def _compact_old_sections(
+    text: str, *, keep_recent: int,
+) -> tuple[str, int, int, int]:
+    """Deterministically shrink sections older than the ``keep_recent`` newest.
+
+    For each older section, keep only the heading + Prompt bullet +
+    Status bullet + Modified-file COUNT line; drop the indented file-list
+    bullets, the ``... (N more)`` continuation, and the ``- Notes:`` line.
+    Sections in the recent window are left untouched so learned-rule notes
+    on the last few runs stay visible to the planner.
+
+    Idempotent: an already-compacted section has no verbose bullets and
+    passes through unchanged. Returns ``(compacted_text,
+    sections_compacted, bytes_before, bytes_after)``.
+    """
+    bytes_before = len(text.encode("utf-8"))
+    parts = text.split("\n## ")
+    if len(parts) <= 1:
+        return text, 0, bytes_before, bytes_before
+    head = parts[0]
+    sections = parts[1:]
+    # Everything except the last ``keep_recent`` is fair game. keep_recent<=0
+    # means "compact everything except the newest 1" so we always preserve
+    # at least the most recent full section — callers can't accidentally
+    # nuke every detail with a zero.
+    keep_from_end = max(1, keep_recent)
+    if len(sections) <= keep_from_end:
+        return text, 0, bytes_before, bytes_before
+    cutoff = len(sections) - keep_from_end
+
+    compacted_sections: list[str] = []
+    sections_compacted = 0
+    for i, sec in enumerate(sections):
+        if i >= cutoff:
+            compacted_sections.append(sec)
+            continue
+        lines = sec.split("\n")
+        # First line is the heading tail (e.g. "Session xxx — <ts>").
+        kept_lines: list[str] = [lines[0]]
+        seen_any_verbose = False
+        for line in lines[1:]:
+            stripped = line.strip()
+            # Drop indented file-list bullets ("  - path/to/file.py"),
+            # the "... (N more)" continuation ("  - ... (N more)"),
+            # and the top-level "- Notes: ..." line. Keep the top-level
+            # "- Prompt:", "- Status:", "- Modified:" lines.
+            if line.startswith("  - "):
+                seen_any_verbose = True
+                continue
+            if stripped.startswith("- Notes:"):
+                seen_any_verbose = True
+                continue
+            kept_lines.append(line)
+        if seen_any_verbose:
+            sections_compacted += 1
+        compacted_sections.append("\n".join(kept_lines))
+
+    rebuilt = head + "\n## " + "\n## ".join(compacted_sections)
+    return rebuilt, sections_compacted, bytes_before, len(rebuilt.encode("utf-8"))
 
 
 def append_session_note(
@@ -277,6 +360,37 @@ def append_session_note(
             if not prior:
                 prior = _HEADER_TEMPLATE
             combined = prior + section
+            # Deterministic compaction fires BEFORE the FIFO trim so we
+            # reclaim bytes without losing entire sections. When it
+            # doesn't reclaim enough to stay under ``max_bytes`` the
+            # trim below catches whatever remains.
+            if len(combined.encode("utf-8")) > cfg.compact_after:
+                combined, n_compacted, before_b, after_b = (
+                    _compact_old_sections(
+                        combined, keep_recent=cfg.compact_keep_recent,
+                    )
+                )
+                if n_compacted > 0:
+                    try:
+                        from harness.observability import (
+                            emit_event as _emit_compaction,
+                        )
+                        _emit_compaction(
+                            "memory_compaction_fired",
+                            path=_redact_home(path),
+                            sections_compacted=n_compacted,
+                            bytes_before=before_b,
+                            bytes_after=after_b,
+                            bytes_reclaimed=before_b - after_b,
+                            compact_after=cfg.compact_after,
+                            keep_recent=cfg.compact_keep_recent,
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry never breaks the write
+                        pass
+                    logger.info(
+                        "[repo_memory] compacted %d older section(s): %d → %d bytes.",
+                        n_compacted, before_b, after_b,
+                    )
             combined = _trim_to_max_bytes(combined, cfg.max_bytes)
             _atomic_write_text(path, combined)
     except OSError as exc:

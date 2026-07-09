@@ -7056,6 +7056,50 @@ _REREAD_INJECTION_CAP = 5
 _CROSS_ROUND_CTX_CAP = 3
 _PREFLIGHT_FILE_CHAR_CAP = 6000
 _PREFLIGHT_SECTION_CHAR_CAP = 24000
+
+# Path segments that indicate a file lives inside a dependency tree, NOT
+# in the user's workspace source. Tracebacks routinely surface
+# site-packages / node_modules files (e.g. `httpx/_models.py` when a
+# request raises); injecting them as "workspace context" leaks
+# third-party source into the repair prompt and produces empty
+# "### /tmp/venv/.../foo.py" sections since the DependencyGraph can't
+# resolve them. Mirrors ``_HITL_SKIP_DIRS`` / ``_SMOKE_CHECK_SKIP_DIRS``
+# where they overlap on dependency dirs. Used by
+# ``_is_workspace_source_path`` — the gate on any file we surface to the
+# repair LLM as "workspace context".
+_DEPENDENCY_PATH_SEGMENTS = frozenset({
+    "site-packages", "node_modules", ".venv", "venv", "env",
+    ".tox", ".nox", ".pyenv", ".yarn", ".pnpm-store",
+    "vendor", "bower_components",
+})
+
+
+def _is_workspace_source_path(path: str, workspace_path: str) -> bool:
+    """Return True when ``path`` is a workspace source file the LLM should
+    see as its own project code. Rejects paths outside ``workspace_path``
+    (typically absolute paths surfaced by tracebacks from within a venv)
+    and paths that traverse any ``_DEPENDENCY_PATH_SEGMENTS`` directory
+    (venv / node_modules / vendor caches even when co-located under the
+    workspace root). Called at the collection sites that assemble prompt
+    context — cross-round injection, preflight file-content injection —
+    so third-party source can't leak into the LLM's mental model."""
+    if not isinstance(path, str) or not path.strip():
+        return False
+    # Normalise to compare against workspace_path. Relative paths are
+    # assumed to be workspace-relative (that's the harness convention);
+    # absolute paths must live under workspace_path.
+    if os.path.isabs(path):
+        try:
+            rel = os.path.relpath(path, workspace_path)
+        except ValueError:  # e.g. Windows different drives
+            return False
+        if rel.startswith(".."):
+            return False
+    else:
+        rel = path
+    # Any dependency segment in the (relative) path disqualifies it.
+    parts = os.path.normpath(rel).split(os.sep)
+    return not any(seg in _DEPENDENCY_PATH_SEGMENTS for seg in parts)
 # When the persistent-blocker directive fires on a file, ordinary preflight
 # caps (300 lines / 6000 chars) truncate large files so the LLM can only
 # see the head and cannot compose a REPLACE_BLOCK that spans the failing
@@ -8121,6 +8165,260 @@ _MISSING_MODULE_PATTERNS = (
     re.compile(r"[Nn]o module named ['\"]?([\w\.]+)"),
     re.compile(r"[Cc]annot find module ['\"]([\w\.@/\-]+)"),
 )
+
+
+async def _maybe_pytest_debug_rerun(
+    executor: Any,
+    diagnostics: list[dict[str, Any]],
+    loop_counter: dict[str, Any],
+    build_cmd: str,
+) -> None:
+    """Layer 3b — gated debug re-run for a nodeid that has resisted Layer
+    1+2+isolation for multiple rounds.
+
+    Gate (BOTH must hold):
+
+    * ``_nodeid_streak >= 3`` for the same failing nodeid. Two rounds are
+      normal transient churn; three consecutive rounds against the same
+      test with the same repair loop is the fingerprint of stuck.
+    * ``consecutive_distraction_rounds >= 1``. The reflection judge has
+      flagged DISTRACTION or REGRESSION at least once, meaning the repair
+      LLM's file choice keeps disagreeing with what the judge thinks is
+      the blocker. Without this signal, three same-nodeid rounds might
+      just be a slow-converging fix (LLM is progressing but not done);
+      the distraction signal means it's actively spinning.
+
+    Re-runs that nodeid alone with ``TEANE_DIAGNOSTICS_MODE=debug`` set
+    in the environment. The teane_diagnostics plugin sees the mode and
+    turns on three additional collectors (pre-call locals snapshot,
+    non-destructive response body cache, unhandled asyncio task capture)
+    that are too expensive or too invasive for every run but land the
+    long-tail signal for stuck loops.
+
+    Cost: one extra pytest invocation per stuck nodeid, cached in
+    ``loop_counter["_layer3_debug_cache"]`` so successive rounds reuse
+    the enrichment without paying again.
+    """
+    pytest_failures = [
+        d for d in diagnostics
+        if isinstance(d, dict) and d.get("pytest_nodeid")
+    ]
+    if len(pytest_failures) != 1:
+        return
+    failure = pytest_failures[0]
+    nodeid = str(failure.get("pytest_nodeid") or "")
+    if not nodeid:
+        return
+
+    # Gate: streak on the same nodeid.
+    streak_raw = loop_counter.get("_nodeid_streak")
+    streak: dict[str, int] = streak_raw if isinstance(streak_raw, dict) else {}
+    if streak.get(nodeid, 0) < 3:
+        return
+
+    # Gate: reflection has flagged distraction/regression at least once.
+    if int(loop_counter.get("consecutive_distraction_rounds", 0) or 0) < 1:
+        return
+
+    # Cache — avoid a second re-run for a nodeid we've already enriched.
+    cache_raw = loop_counter.get("_layer3_debug_cache")
+    cache: dict[str, str] = cache_raw if isinstance(cache_raw, dict) else {}
+    loop_counter["_layer3_debug_cache"] = cache
+
+    if nodeid in cache:
+        cached_output = cache[nodeid]
+    else:
+        # Debug flags: verbose, uncaptured, dev mode. Debug flag on the
+        # plugin comes through env, not command args, so the operator can
+        # tune it without editing build_cmd string manipulation.
+        debug_cmd = f"{build_cmd} -p no:cacheprovider -s --tb=long -v {nodeid}"
+        # Env layered on top of any per-executor env — the plugin's
+        # ``pytest_configure`` flip TEANE_DIAGNOSTICS_MODE to 'debug' and
+        # keeps ``PYTHONDEVMODE=1`` on so asyncio warnings surface.
+        debug_env = {
+            "TEANE_DIAGNOSTICS_MODE": "debug",
+            "PYTHONDEVMODE": "1",
+        }
+        try:
+            debug_result = await executor.run(debug_cmd, extra_env=debug_env)
+        except TypeError:
+            # Older SandboxExecutor signature — no extra_env kwarg. Fall
+            # back to setting the env vars in the shell command directly.
+            wrapped = (
+                f"TEANE_DIAGNOSTICS_MODE=debug PYTHONDEVMODE=1 {debug_cmd}"
+            )
+            try:
+                debug_result = await executor.run(wrapped)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[compiler_node:debug_rerun] executor.run raised for %s: %s",
+                    nodeid, exc,
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[compiler_node:debug_rerun] executor.run raised for %s: %s",
+                nodeid, exc,
+            )
+            return
+
+        # Extract just the [teane-debug] lines — the enrichment payload —
+        # from the raw output. Everything else (test collection, pytest
+        # header) is noise for this purpose.
+        raw = getattr(debug_result, "raw_output", "") or ""
+        debug_lines = [
+            ln for ln in raw.splitlines()
+            if ln.strip().startswith("[teane-debug]")
+        ]
+        cached_output = "\n".join(debug_lines[:60])  # cap
+        cache[nodeid] = cached_output
+        logger.info(
+            "[compiler_node:debug_rerun] Ran %s in debug mode: captured %d "
+            "enrichment line(s).",
+            nodeid, len(debug_lines),
+        )
+
+    if not cached_output.strip():
+        return
+
+    hint = (
+        "\n\n[HARNESS LAYER 3 DEBUG ENRICHMENT]\n"
+        f"This test failed {streak.get(nodeid, 0)} rounds in a row on the "
+        "same nodeid AND the reflection judge has flagged the repair LLM "
+        "as DISTRACTED/REGRESSING. The harness re-ran the test with "
+        "additional collectors turned on. Below is the extra runtime "
+        "context (pre-call locals, unhandled asyncio task exceptions, "
+        "non-destructively-cached response bodies) that ordinary pytest "
+        "output would not have surfaced:\n"
+        + cached_output
+    )
+    failure["semantic_context"] = (str(failure.get("semantic_context") or "") + hint)
+
+
+async def _maybe_pytest_isolation_rerun(
+    executor: Any,
+    diagnostics: list[dict[str, Any]],
+    loop_counter: dict[str, Any],
+    build_cmd: str,
+) -> None:
+    """Detect single-anomalous-pytest-failure runs and annotate the diagnostic
+    with a shared-state-pollution hint when the failing test passes in
+    isolation.
+
+    Rationale: when the full suite produces exactly ONE pytest FAILED
+    entry (with a full ``file::TestClass::test_method`` nodeid) but the
+    same test PASSES when run alone, the endpoint / logic under test is
+    NOT the bug — some earlier test has left a mutation on shared state
+    that only breaks this one. Prompted by the finsearch STORY-038
+    repair-loop that burned 5+ rounds because the LLM kept patching
+    ``server/edgar_client.py`` (the endpoint) while the real cause was
+    a ``@functools.lru_cache`` singleton binding an ``httpx.AsyncClient``
+    to a per-test asyncio loop. The reflection judge kept returning
+    DISTRACTION with no way to name the real culprit; the harness had no
+    signal to suggest one either.
+
+    Contract:
+
+    * NOOP unless exactly one diagnostic in ``diagnostics`` carries a
+      ``pytest_nodeid``. Broad regressions (multiple failures) may share
+      a root cause that isolation doesn't reveal, and running N extra
+      pytest invocations per compile is not free.
+    * The isolation command is the ORIGINAL ``build_cmd`` with the pytest
+      nodeid appended as a positional arg. pytest's positional args are
+      test selectors, so the appended nodeid supersedes any collection
+      done by the earlier args and only that one test executes.
+    * ``-p no:cacheprovider`` is appended too so the re-run doesn't
+      pollute ``.pytest_cache``. Order matters: the nodeid must come
+      LAST so it's still treated as a positional selector.
+    * Results are cached in ``loop_counter["_isolation_rerun_cache"]``
+      keyed by nodeid so subsequent compile rounds don't re-pay on the
+      same repeating failure. The hint is still re-attached to the
+      current diagnostic from cache — repair_node sees the same rich
+      context every round without another sandbox invocation.
+    """
+    pytest_failures = [
+        d for d in diagnostics
+        if isinstance(d, dict) and d.get("pytest_nodeid")
+    ]
+    if len(pytest_failures) != 1:
+        return
+    failure = pytest_failures[0]
+    nodeid = str(failure.get("pytest_nodeid") or "")
+    if not nodeid:
+        return
+
+    # Track how many compile rounds in a row the same nodeid has been the
+    # single failing test. This counter feeds ``_maybe_pytest_debug_rerun``'s
+    # gate — the debug re-run needs to know the LLM is genuinely stuck on
+    # THIS test, not just that some test is failing. Reset happens
+    # implicitly: a compile with 0 or >1 failures early-returns above,
+    # leaving the streak dict untouched. When a different nodeid becomes
+    # the single failure, its entry starts at 1 while the previous
+    # nodeid's stale value never gets read again.
+    streak_raw = loop_counter.get("_nodeid_streak")
+    streak: dict[str, int] = streak_raw if isinstance(streak_raw, dict) else {}
+    streak[nodeid] = int(streak.get(nodeid, 0)) + 1
+    loop_counter["_nodeid_streak"] = streak
+
+    cache_raw = loop_counter.get("_isolation_rerun_cache")
+    cache: dict[str, bool] = (
+        cache_raw if isinstance(cache_raw, dict) else {}
+    )
+    loop_counter["_isolation_rerun_cache"] = cache
+
+    if nodeid in cache:
+        passed_alone = cache[nodeid]
+    else:
+        # Append the nodeid as a positional selector. Positional args in
+        # ``python -m pytest`` are test selectors — appending overrides
+        # the implicit collection root without touching the flag list.
+        iso_cmd = f"{build_cmd} -p no:cacheprovider {nodeid}"
+        try:
+            iso_result = await executor.run(iso_cmd)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[compiler_node:isolation] executor.run raised for %s: %s",
+                nodeid, exc,
+            )
+            return
+        passed_alone = int(getattr(iso_result, "exit_code", 1) or 1) == 0
+        cache[nodeid] = passed_alone
+        logger.info(
+            "[compiler_node:isolation] Re-ran %s alone: %s. "
+            "Suite exit was non-zero on this same test.",
+            nodeid,
+            "PASSED (shared-state pollution signal)"
+            if passed_alone else "FAILED (real bug in the test's own code)",
+        )
+
+    if not passed_alone:
+        return
+
+    hint = (
+        "\n\n[HARNESS ISOLATION SIGNAL — HIGHEST PRIORITY]\n"
+        f"Test `{nodeid}` PASSES when run alone (verified this round in "
+        "the same sandbox) but FAILS in the full suite. This is the "
+        "fingerprint of TEST-ORDERING POLLUTION: the code under test is "
+        "NOT the bug — an earlier test leaves shared mutable state that "
+        "breaks this one.\n"
+        "Common culprits — check these BEFORE editing the endpoint / "
+        "function this test targets:\n"
+        "  • Module-level ``@functools.lru_cache`` or global singletons "
+        "that own an open connection / client / event-loop-bound object.\n"
+        "  • ``httpx.AsyncClient`` (or any asyncio primitive) created in "
+        "one test's event loop and reused in the next — pytest-asyncio "
+        "creates a fresh loop per test unless you set "
+        "``asyncio_default_test_loop_scope = session`` in pytest.ini.\n"
+        "  • Class-level or module-level fixtures that mutate on first "
+        "use and don't reset (``ClassVar`` counters, in-memory caches).\n"
+        "  • FastAPI lifespan / conftest teardown that CLOSES a shared "
+        "resource which the next test then tries to reuse.\n"
+        "Fix the shared state (usually pytest.ini or conftest.py or the "
+        "module that owns the singleton) — do NOT edit the endpoint or "
+        "the test itself unless you can prove the shared-state theory is "
+        "wrong."
+    )
+    failure["semantic_context"] = (str(failure.get("semantic_context") or "") + hint)
 
 
 def _promote_module_not_found_diagnostics(
@@ -10819,6 +11117,42 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         exit_code,
         len(compiler_errors),
     )
+    # Isolation re-run — when the build produced exactly ONE pytest test
+    # failure (with a full nodeid), re-run that test alone in the same
+    # sandbox. A test that PASSES in isolation but FAILS in the suite is
+    # the fingerprint of shared-state pollution (module-level singletons,
+    # ``@lru_cache`` clients, asyncio-loop-scoped transports, mutable
+    # conftest fixtures). Without this signal the repair LLM keeps
+    # patching the endpoint under test — where the bug is NOT — and the
+    # reflection judge keeps flagging DISTRACTION because the fix must
+    # touch shared state elsewhere. Cost: one extra pytest invocation
+    # (~2-5s) gated on the strict "exactly 1 failure" filter so it can't
+    # fan out on broad regressions. Results cached in loop_counter so
+    # subsequent compile rounds don't re-pay if the nodeid recurs.
+    if exit_code != 0 and compiler_errors:
+        try:
+            await _maybe_pytest_isolation_rerun(
+                executor, compiler_errors, loop_counter, build_cmd,
+            )
+        except Exception as _iso_exc:  # noqa: BLE001
+            logger.debug(
+                "[compiler_node:isolation] enrichment skipped due to error: %s",
+                _iso_exc,
+            )
+        # Layer 3b — heavier debug re-run, gated on same-nodeid streak +
+        # reflection-flagged distraction. Runs AFTER the isolation
+        # helper so ``_nodeid_streak`` is up to date. If the isolation
+        # step already attached a pollution hint, Layer 3b still fires
+        # (they attach to the same diagnostic; both bodies are useful).
+        try:
+            await _maybe_pytest_debug_rerun(
+                executor, compiler_errors, loop_counter, build_cmd,
+            )
+        except Exception as _dbg_exc:  # noqa: BLE001
+            logger.debug(
+                "[compiler_node:debug_rerun] enrichment skipped due to error: %s",
+                _dbg_exc,
+            )
     # Non-zero exit with an empty parser output is the ambiguous case: the
     # router will consult autofix pattern detection (pip conflict, env
     # misconfig, cd-missing, no-tests-collected) before dispatching to
@@ -12074,12 +12408,26 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # root cause behind the 100-run failure streak on session 2d0164f0.
     if not error_summary:
         diag_files: list[str] = []
+        _diag_dropped_dep: list[str] = []
         for e in errors or []:
             f = (e.get("file") or "").strip() if isinstance(e, dict) else ""
             if not f or f == "<sandbox>" or f == "<test_runner>":
                 continue
+            # Drop tracebacks pointing at third-party source (site-packages,
+            # node_modules, vendored deps). Injecting httpx/_models.py or
+            # similar as "diagnostic file" wastes prompt budget on library
+            # code the LLM can't patch anyway.
+            if not _is_workspace_source_path(f, workspace_path):
+                _diag_dropped_dep.append(f)
+                continue
             if f not in diag_files:
                 diag_files.append(f)
+        if _diag_dropped_dep:
+            logger.debug(
+                "[repair_node] Preflight: dropped %d dependency/out-of-workspace "
+                "diagnostic path(s): %s",
+                len(_diag_dropped_dep), _diag_dropped_dep,
+            )
         if diag_files:
             diag_cap, _ = _repair_file_caps(state)
             # Phase L — in CR mode, augment the diagnostic file list
@@ -12239,16 +12587,29 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _recent_modified.add(str(_f))
         _cross_round_files: list[str] = []
         _seen_cr: set[str] = set()
+        _cr_dropped_dep: list[str] = []
         # Prefer files in the current diagnostic set — they're where
         # the LLM is about to work — then top up with recently
         # modified paths that might carry stale mental-model bits.
+        # Filter out venv / site-packages / node_modules entries that
+        # tracebacks routinely surface — the LLM should never see a
+        # third-party library as "workspace context".
         for _f in list(diag_files) + sorted(_recent_modified):
             if _f in _seen_cr:
                 continue
             _seen_cr.add(_f)
+            if not _is_workspace_source_path(_f, workspace_path):
+                _cr_dropped_dep.append(_f)
+                continue
             _cross_round_files.append(_f)
             if len(_cross_round_files) >= _CROSS_ROUND_CTX_CAP:
                 break
+        if _cr_dropped_dep:
+            logger.debug(
+                "[repair_node] Cross-round context: dropped %d "
+                "dependency/out-of-workspace path(s): %s",
+                len(_cr_dropped_dep), _cr_dropped_dep,
+            )
         if _cross_round_files:
             _lsp_maps = await _prefetch_lsp_caller_maps(
                 _cross_round_files, workspace_path,

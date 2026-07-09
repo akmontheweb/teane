@@ -179,6 +179,32 @@ class PythonParser(BaseLanguageParser):
     # ``AssertionError``; without them the diagnostic collapses to just the
     # exception type and the LLM has to guess what the value was.
     _PYTEST_E_BARE_PATTERN = re.compile(r'^E\s+(?P<body>\S.*)$')
+    # Pytest per-failure block header (``--tb=long``):
+    #   ____________ TestClass.test_method ____________
+    # We use this to reset the ``pending_locals`` buffer so a stray
+    # ``x = 1`` line from an earlier test can't leak into the next
+    # failure's context.
+    _PYTEST_FAILURE_HEADER_PATTERN = re.compile(
+        r'^_{3,}\s+\S.*?\S\s+_{3,}$'
+    )
+    # Pytest ``--showlocals`` dump line at column 0:
+    #   ``resp       = <Response [500 Internal Server Error]>``
+    #   ``client     = <httpx.AsyncClient object at 0x7f...>``
+    # These are frame-local values at the failing frame — for HTTP tests
+    # they surface the response object, for dict comparisons they dump
+    # the full expected/actual structures. Constrained to column 0 (no
+    # leading whitespace) so this doesn't accidentally swallow source
+    # code lines from the ``--tb=long`` snippet (those are indented by 4).
+    # The name must be a valid Python identifier; disqualifies path-like
+    # tokens (``tests/foo.py``) and pytest summary rows.
+    _PYTEST_LOCAL_PATTERN = re.compile(
+        r'^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s{1,}=\s(?P<value>.+)$'
+    )
+    # Cap on ``--showlocals`` lines captured per failure block. Test
+    # frames rarely have more than 6-8 real locals; a cap keeps the
+    # semantic_context bounded on pathological cases (a debug fixture
+    # that stashes 50 items into ``self``).
+    _MAX_LOCAL_LINES = 10
     # Embedded ``File "path", line N`` inside a bare-E body — emitted by
     # pytest when the exception is a SyntaxError (or similar compile-time
     # error) whose real location is the user file being parsed, not the
@@ -191,8 +217,12 @@ class PythonParser(BaseLanguageParser):
     #   FAILED tests/foo.py::test_x - AssertionError: assert ...
     #   ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'x'
     # ERROR rows omit the "::test" suffix (collection-time failures).
+    # ``nodeid_tail`` captures the ``::TestClass::test_method`` suffix so
+    # ``_parse_pytest_summary`` can preserve the full pytest node id for
+    # downstream isolation re-runs (compiler_node uses it to detect
+    # test-ordering pollution).
     _PYTEST_SUMMARY_PATTERN = re.compile(
-        r'^(?P<kind>FAILED|ERROR)\s+(?P<file>[^\s:]+\.py)(?:::\S+)?\s+-\s+'
+        r'^(?P<kind>FAILED|ERROR)\s+(?P<file>[^\s:]+\.py)(?P<nodeid_tail>::\S+)?\s+-\s+'
         r'(?P<rest>.+)$'
     )
     # Conftest header pytest prints before the short frame:
@@ -295,14 +325,83 @@ class PythonParser(BaseLanguageParser):
         # on tests that print large diffs (``assert big_dict == other_dict``).
         pending_e_bare: list[str] = []
         _MAX_E_BARE_LINES = 8
+        # Buffer ``--showlocals`` dumps between the failure-block header and
+        # the terminal fail-line. Pytest emits these as unindented
+        # ``name = <repr>`` lines both before the code snippet (parent-
+        # frame locals like ``self``) and after the ``E`` lines (failing-
+        # frame locals). Both variants are useful; we merge them by name.
+        pending_locals: dict[str, str] = {}
+        # Buffer ``[teane] ...`` lines emitted by the Layer 2 pytest plugin
+        # (``harness/pytest_plugins/teane_diagnostics.py``). The plugin
+        # renders shape-aware detail for known types (httpx.Response body,
+        # subprocess.CompletedProcess streams, exception chains) which no
+        # ``--showlocals`` output would surface on its own. Bounded by
+        # ``_MAX_TEANE_LINES`` so a runaway renderer can't overwhelm the
+        # diagnostic prompt.
+        pending_teane: list[str] = []
+        _MAX_TEANE_LINES = 60
+        # The Layer 2 plugin emits ``[teane] ...`` lines (runtime object
+        # detail) and the Layer 3b debug mode emits ``[teane-debug] ...``
+        # lines (pre-call fixture snapshot, unhandled asyncio task
+        # exceptions). We accept both markers here — the ``[teane`` prefix
+        # tightly identifies plugin output while leaving room for future
+        # buckets (``[teane-lsp]``, etc.) without another parser round.
+        _TEANE_LINE_PREFIX = "[teane"
+        _TEANE_SECTION_HEADER = "runtime object detail (harness enrichment):"
+        # Pytest's ``--tb=long`` renders the terminal ``file:line: ErrorType``
+        # BEFORE the plugin's ``addsection`` output — so the diagnostic gets
+        # emitted (and buffers reset) while the ``[teane]`` lines are still
+        # incoming. We keep a reference to the most-recent diagnostic within
+        # the current failure block and graft late-arriving ``[teane]`` lines
+        # onto its ``semantic_context`` rather than dropping them.
+        last_emitted: Optional[DiagnosticObject] = None
 
-        def _fmt_e_bare(bare_lines: list[str], src: Optional[str]) -> str:
+        def _attach_teane_line(diag: DiagnosticObject, raw_line: str) -> None:
+            # ``raw_line`` is the marker-stripped body (caller passes the
+            # slice past ``] ``). Header is added once per diagnostic so
+            # multiple ``[teane...]`` buckets land under the same section.
+            current = diag.semantic_context or ""
+            if _TEANE_SECTION_HEADER in current:
+                diag.semantic_context = current + "\n  " + raw_line
+                return
+            sep = "\n" if current else ""
+            diag.semantic_context = (
+                current + sep + _TEANE_SECTION_HEADER + "\n  " + raw_line
+            )
+
+        def _fmt_context(
+            bare_lines: list[str],
+            src: Optional[str],
+            locals_map: dict[str, str],
+            teane_lines: list[str],
+        ) -> str:
             parts: list[str] = []
             if src:
                 parts.append(f"failing source: {src}")
             if bare_lines:
                 joined = "\n  ".join(bare_lines)
                 parts.append(f"assertion-rewrite:\n  {joined}")
+            if locals_map:
+                # Deterministic order — sort so successive rounds produce
+                # byte-identical context, which lets the cross-round
+                # fingerprint deduper and cache_control prefix stay stable.
+                joined = "\n  ".join(
+                    f"{name} = {value}"
+                    for name, value in sorted(locals_map.items())
+                )
+                parts.append(f"locals at failure frame:\n  {joined}")
+            if teane_lines:
+                # Strip the ``[teane...] `` marker from each line before
+                # rendering — the marker was for the parser, not the LLM.
+                # Match ``[teane] `` and ``[teane-<bucket>] `` variants.
+                def _strip_marker(ln: str) -> str:
+                    if not ln.startswith(_TEANE_LINE_PREFIX):
+                        return ln
+                    close = ln.find("] ")
+                    return ln[close + 2:] if close != -1 else ln
+                stripped_teane = [_strip_marker(ln) for ln in teane_lines]
+                joined = "\n  ".join(stripped_teane)
+                parts.append(f"{_TEANE_SECTION_HEADER}\n  {joined}")
             return "\n".join(parts)
 
         def _recover_user_frame_from_e_bare(
@@ -325,6 +424,22 @@ class PythonParser(BaseLanguageParser):
         for line in lines:
             stripped = line.rstrip()
             bare = stripped.strip()
+
+            # Failure-block header — a new failure begins here; reset the
+            # buffers that must not leak from the previous block. Locals
+            # dumped BEFORE the code snippet (e.g. ``self = <...>``) still
+            # belong to this failure, so we reset here rather than on the
+            # first local line.
+            if PythonParser._PYTEST_FAILURE_HEADER_PATTERN.match(bare):
+                pending_locals = {}
+                pending_teane = []
+                pending_e = None
+                pending_e_bare = []
+                pending_failing_src = None
+                last_frame = None
+                conftest_path = None
+                last_emitted = None
+                continue
 
             header = PythonParser._CONFTEST_HEADER_PATTERN.match(bare)
             if header:
@@ -357,8 +472,10 @@ class PythonParser(BaseLanguageParser):
                     # Promote the first bare line into the message so the
                     # judge/repair prompts don't show a bare exception type.
                     msg = f"{term_type}: {pending_e_bare[0]}"
-                ctx = _fmt_e_bare(pending_e_bare, pending_failing_src)
-                diags.append(DiagnosticObject(
+                ctx = _fmt_context(
+                    pending_e_bare, pending_failing_src, pending_locals, pending_teane,
+                )
+                diag = DiagnosticObject(
                     file=term.group("file"),
                     line=int(term.group("line")),
                     column=0,
@@ -366,11 +483,15 @@ class PythonParser(BaseLanguageParser):
                     error_code=term_type,
                     message=msg,
                     semantic_context=ctx,
-                ))
+                )
+                diags.append(diag)
+                last_emitted = diag
                 last_frame = None
                 pending_e = None
                 pending_e_bare = []
                 pending_failing_src = None
+                pending_locals = {}
+                pending_teane = []
                 continue
 
             e_line = PythonParser._PYTEST_E_PATTERN.match(stripped)
@@ -387,8 +508,10 @@ class PythonParser(BaseLanguageParser):
                 else:
                     # No frame yet — wait for the terminal fail line to pair us.
                     continue
-                ctx = _fmt_e_bare(pending_e_bare, pending_failing_src)
-                diags.append(DiagnosticObject(
+                ctx = _fmt_context(
+                    pending_e_bare, pending_failing_src, pending_locals, pending_teane,
+                )
+                diag = DiagnosticObject(
                     file=file_path,
                     line=lineno,
                     column=0,
@@ -396,14 +519,41 @@ class PythonParser(BaseLanguageParser):
                     error_code=e_line.group("type"),
                     message=f"{e_line.group('type')}: {e_line.group('msg')}",
                     semantic_context=ctx,
-                ))
+                )
+                diags.append(diag)
+                last_emitted = diag
                 last_frame = None
                 conftest_path = None
                 pending_e = None
                 pending_e_bare = []
                 pending_failing_src = None
+                pending_locals = {}
+                pending_teane = []
                 continue
 
+            # ``[teane...] ...`` marker line from the Layer 2 plugin
+            # (``[teane]``) or Layer 3b debug mode (``[teane-debug]``).
+            # Two arrival patterns:
+            #  1. BEFORE the diagnostic is emitted (rare — plugin runs at
+            #     ``call`` phase; --tb=long normally emits the terminal
+            #     fail-line first). Buffered so the emission grafts them in.
+            #  2. AFTER the terminal fail-line (the common case — pytest's
+            #     ``addsection`` output sits UNDER the fail-line). Grafted
+            #     onto ``last_emitted`` in-place so the LLM sees the runtime
+            #     detail on the same diagnostic that carries the assertion.
+            if bare.startswith(_TEANE_LINE_PREFIX):
+                close = bare.find("] ")
+                if close != -1:
+                    body = bare[close + 2:]
+                    if last_emitted is not None:
+                        _attach_teane_line(last_emitted, body)
+                        continue
+                # Buffered fallback (no diagnostic yet or malformed marker):
+                # keep the raw line so the emission-time _fmt_context can
+                # strip the marker uniformly.
+                if len(pending_teane) < _MAX_TEANE_LINES:
+                    pending_teane.append(bare)
+                continue
             # Bare ``E   ...`` line without an ``ErrorType:`` prefix —
             # assertion-rewrite output. Buffer it; it will be attached to
             # whichever diagnostic emits next (terminal fail-line or typed
@@ -417,6 +567,19 @@ class PythonParser(BaseLanguageParser):
                     continue
                 if len(pending_e_bare) < _MAX_E_BARE_LINES:
                     pending_e_bare.append(body)
+                continue
+
+            # ``--showlocals`` dump — column-0 ``name = <repr>`` line.
+            # Match strictly on ``stripped`` (unindented). Test-source code
+            # lines from the ``--tb=long`` snippet are indented by ≥4 spaces
+            # and get filtered out here; assertion-rewrite lines start with
+            # ``E`` and are caught above; summary rows contain file paths
+            # that fail the identifier pattern. Cap the map at
+            # ``_MAX_LOCAL_LINES`` so a debug fixture stashing 50 items on
+            # ``self`` can't blow the diagnostic prompt.
+            local = PythonParser._PYTEST_LOCAL_PATTERN.match(stripped)
+            if local and len(pending_locals) < PythonParser._MAX_LOCAL_LINES:
+                pending_locals[local.group("name")] = local.group("value").rstrip()
                 continue
         return diags
 
@@ -437,6 +600,11 @@ class PythonParser(BaseLanguageParser):
                 # Bare-assert form ("assert 1 == 2") with no ErrorType prefix.
                 error_type = "AssertionError" if m.group("kind") == "FAILED" else "Error"
                 message = rest
+            # Preserve the full pytest node id when present. Collection-time
+            # errors ("ERROR tests/conftest.py - ...") lack the ``::test``
+            # tail — those aren't re-runnable in isolation and stay blank.
+            nodeid_tail = m.group("nodeid_tail") or ""
+            full_nodeid = m.group("file") + nodeid_tail if nodeid_tail else ""
             diags.append(DiagnosticObject(
                 file=m.group("file"),
                 line=0,
@@ -445,6 +613,7 @@ class PythonParser(BaseLanguageParser):
                 error_code=error_type,
                 message=message,
                 semantic_context="",
+                pytest_nodeid=full_nodeid,
             ))
         return diags
 
@@ -456,6 +625,12 @@ class PythonParser(BaseLanguageParser):
         carry the exact line. When both surface the same failure, we keep
         the one with the line number and prefer the message that isn't just
         the error type repeated.
+
+        ``pytest_nodeid`` is only populated by ``_parse_pytest_summary``
+        (the failure-block form uses a bare ``file:line`` frame with no
+        ``::test`` tail), so whenever we discard a summary entry in favour
+        of the richer block entry we transfer the nodeid across — losing
+        it would kill the isolation re-run downstream.
         """
         by_key: dict[tuple[str, str], DiagnosticObject] = {}
         for d in diags:
@@ -466,9 +641,16 @@ class PythonParser(BaseLanguageParser):
                 continue
             # Prefer the entry with a concrete line number.
             if d.line and not existing.line:
+                if existing.pytest_nodeid and not d.pytest_nodeid:
+                    d.pytest_nodeid = existing.pytest_nodeid
                 by_key[key] = d
             elif d.line == existing.line and len(d.message) > len(existing.message):
+                if existing.pytest_nodeid and not d.pytest_nodeid:
+                    d.pytest_nodeid = existing.pytest_nodeid
                 by_key[key] = d
+            elif not existing.pytest_nodeid and d.pytest_nodeid:
+                # The kept entry loses out on the nodeid otherwise; graft it.
+                existing.pytest_nodeid = d.pytest_nodeid
         return list(by_key.values())
 
     @staticmethod

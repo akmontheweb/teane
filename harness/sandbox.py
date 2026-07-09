@@ -42,6 +42,79 @@ from harness import _platform
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Teane pytest diagnostics plugin — Layer 2 of the diagnostic enrichment
+# stack (Layer 1 is parser-side ``--showlocals`` capture). This plugin
+# lives inside the harness source tree at
+# ``harness/pytest_plugins/teane_diagnostics.py`` and is exposed to every
+# sandboxed build via env vars — no workspace-side file needed.
+# ---------------------------------------------------------------------------
+
+_TEANE_PLUGIN_HOST_DIR: str = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "pytest_plugins")
+)
+_TEANE_PLUGIN_MODULE_NAME: str = "teane_diagnostics"
+# Container-side mount target for Docker. Chosen under /opt so it can't
+# collide with a workspace directory the operator may already have.
+_TEANE_PLUGIN_CONTAINER_DIR: str = "/opt/teane_pytest_plugins"
+
+
+def _teane_diagnostics_available() -> bool:
+    """True when the plugin file is on disk. False in stripped-down
+    installs (single-file bundles, minimal test harnesses) — cleanly
+    disables the injection without a hard failure."""
+    return os.path.isfile(
+        os.path.join(_TEANE_PLUGIN_HOST_DIR, f"{_TEANE_PLUGIN_MODULE_NAME}.py")
+    )
+
+
+def _teane_diagnostics_injection_enabled() -> bool:
+    """Harness-side kill switch. Off when the operator sets
+    ``TEANE_DIAGNOSTICS_INJECT`` on the host process to a falsy value
+    (``0`` / ``off`` / ``false`` / ``no`` / ``disabled``). Default: on.
+
+    This is distinct from the plugin's own escape hatches (which run
+    INSIDE the sandbox, after the plugin has already been imported). If
+    the plugin file itself somehow becomes broken (bad edit, stripped
+    install, incompatible pytest version), the operator can flip this
+    env var and every backend stops injecting the plugin path — the
+    sandbox goes back to pre-Layer-2 behaviour without touching config
+    files or reinstalling.
+    """
+    raw = os.environ.get("TEANE_DIAGNOSTICS_INJECT", "").strip().lower()
+    return raw not in {"0", "off", "false", "no", "disabled"}
+
+
+def _apply_teane_diagnostics_env(
+    env: dict[str, str], container_path: str,
+) -> None:
+    """Extend ``env`` in place with the two vars pytest needs to find and
+    load the teane_diagnostics plugin. Called AFTER the defaults →
+    extra_env merge so the addition composes with any operator-supplied
+    ``PYTHONPATH`` / ``PYTEST_ADDOPTS`` rather than being clobbered by
+    it. See the DockerBackend + BareBackend wiring for the pattern.
+
+    * ``PYTHONPATH`` — prepend so ``import teane_diagnostics`` resolves
+      first; the operator's path suffix remains reachable.
+    * ``PYTEST_ADDOPTS`` — append (with a leading space) so operator
+      addopts (e.g. speculative's ``-o cache_dir=...``) come first and
+      the plugin flag composes at the tail. Idempotent — a second call
+      won't inject the ``-p`` flag twice.
+
+    Callers must gate on ``_teane_diagnostics_available()`` and
+    ``_teane_diagnostics_injection_enabled()`` BEFORE invoking this
+    helper. Both are cheap and orthogonal, but bundling them here would
+    hide the intent at the call site.
+    """
+    existing_pypath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{container_path}:{existing_pypath}" if existing_pypath else container_path
+    )
+    existing_addopts = env.get("PYTEST_ADDOPTS", "")
+    if f"-p {_TEANE_PLUGIN_MODULE_NAME}" not in existing_addopts:
+        env["PYTEST_ADDOPTS"] = existing_addopts + f" -p {_TEANE_PLUGIN_MODULE_NAME}"
+
+
 # The harness's kitchen-sink builder image. One image with every toolchain
 # the supported stacks need (Python 3.11 + pip + venv + uv + pytest +
 # pytest-cov + pytest-xdist, Java JDK 21 + Maven + Gradle, Node 20 LTS +
@@ -105,6 +178,15 @@ class DiagnosticObject:
     error_code: str = ""
     message: str = ""
     semantic_context: str = ""
+    # Full pytest node id (``tests/foo.py::TestBar::test_baz``) when the
+    # diagnostic was extracted from a pytest FAILED summary row. Populated
+    # by ``PythonParser._parse_pytest_summary`` and consumed by
+    # ``compiler_node``'s isolation re-run — a single anomalous test that
+    # PASSES on its own but FAILS in the full suite is the fingerprint of
+    # shared-state pollution (module-level singletons, ``@lru_cache``
+    # across event loops, class-level fixtures). The re-run needs the
+    # nodeid to invoke only that test. Empty for non-pytest diagnostics.
+    pytest_nodeid: str = ""
     suggested_fix: Optional["FixSuggestion"] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -117,6 +199,8 @@ class DiagnosticObject:
             "message": self.message,
             "semantic_context": self.semantic_context,
         }
+        if self.pytest_nodeid:
+            out["pytest_nodeid"] = self.pytest_nodeid
         if self.suggested_fix is not None:
             out["suggested_fix"] = {
                 "replacement": self.suggested_fix.replacement,
@@ -799,6 +883,24 @@ class DockerBackend(SandboxBackend):
             self._cache_fallback_env(_cache_paths_needing_env_fallback)
         )
         merged_env = {**defaults, **extra_env}
+        # Teane pytest diagnostics plugin — Layer 2. Injects POST-MERGE so
+        # our contributions compose with (not clobber) any operator env
+        # override — e.g. speculative sets ``PYTEST_ADDOPTS=-o cache_dir=...``
+        # per variant, and we need our ``-p teane_diagnostics`` to
+        # coexist. Bind-mounts the plugin dir read-only into the container.
+        # Skipped entirely when the plugin file isn't on disk (stripped
+        # installs) or the operator turned off injection via env
+        # ``TEANE_DIAGNOSTICS_INJECT=off`` (host-side kill switch). The
+        # plugin is inert against non-pytest builds (Java, npm) — pytest
+        # never runs to load it — so cost of the injection is one -v arg
+        # and two env vars per sandbox invocation.
+        if _teane_diagnostics_available() and _teane_diagnostics_injection_enabled():
+            cmd.extend([
+                "-v",
+                f"{_docker_mount_path(_TEANE_PLUGIN_HOST_DIR)}"
+                f":{_TEANE_PLUGIN_CONTAINER_DIR}:ro",
+            ])
+            _apply_teane_diagnostics_env(merged_env, _TEANE_PLUGIN_CONTAINER_DIR)
         for key, value in merged_env.items():
             cmd.extend(["-e", f"{key}={value}"])
 
@@ -1031,7 +1133,15 @@ class BareBackend(SandboxBackend):
         # exposed one on PATH, else ``cmd /c "cd /d <path> && <cmd>"``.
         cmd = _platform.shell_argv(command, workdir=workspace_path)
         logger.info("[sandbox:bare] Running without isolation (bare subprocess).")
-        return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=extra_env)
+        # Layer 2 pytest diagnostics plugin — no mount step needed in the
+        # bare backend because the child process shares the host FS and
+        # can import from the plugin's host path directly. Same helper as
+        # the docker path so the plugin file, injection logic, and parser
+        # stay in sync across backends. Same host-side kill switch.
+        merged_env = dict(extra_env or {})
+        if _teane_diagnostics_available() and _teane_diagnostics_injection_enabled():
+            _apply_teane_diagnostics_env(merged_env, _TEANE_PLUGIN_HOST_DIR)
+        return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=merged_env)
 
 
 # ---------------------------------------------------------------------------

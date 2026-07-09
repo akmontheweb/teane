@@ -6033,16 +6033,43 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     "prompt and proceeding with the reset."
                 )
             else:
+                from harness.hitl import _auto_approve as _hitl_auto_approve
                 from harness.hitl import get_channel as _get_channel
+                # Autonomy-first: auto-approve mode (CI=true,
+                # HARNESS_AUTO_APPROVE=true, or non-TTY stdin) auto-declines
+                # a `default=False` confirm(). Without this branch, a
+                # non-interactive `teane build` silently exits after 10s of
+                # subsystem init with no hint that `-y` was the missing flag.
+                # Fail early instead, and point at the exact fix.
+                if _hitl_auto_approve():
+                    print(
+                        "\nerror: `teane build` needs -y/--yes to auto-"
+                        "approve the destructive workspace reset when "
+                        "running non-interactively (CI=true, "
+                        "HARNESS_AUTO_APPROVE=true, non-TTY stdin, or "
+                        "--hitl-* false). Re-run with `-y` appended:\n"
+                        "\n"
+                        "  teane build -w <workspace> -p \"<prompt>\" ... -y\n"
+                        "\n"
+                        "The listing above shows exactly what -y would "
+                        "delete. If you don't want those entries wiped, "
+                        "back them up first or use `teane patch` instead.",
+                        file=sys.stderr,
+                    )
+                    logger.warning(
+                        "[new_build] Auto-approve declined the reset "
+                        "(missing -y). Exiting."
+                    )
+                    return 1
                 confirmed = _get_channel().confirm(
                     "Proceed with the destructive --new-build reset above?",
                     default=False,
                 )
                 if not confirmed:
                     print(
-                        "\n--new-build reset cancelled. Re-run without "
-                        "--new-build true (or fix the workspace state) "
-                        "before retrying.",
+                        "\n--new-build reset cancelled. Re-run with `-y` to "
+                        "auto-approve, or back up the entries above and try "
+                        "again.",
                         file=sys.stderr,
                     )
                     logger.warning(
@@ -6778,12 +6805,20 @@ def _resolve_generate_specs(args: argparse.Namespace, *, workspace_path: str) ->
     return None
 
 
-def _resolve_reuse_docs(workspace_path: str) -> bool:
+def _resolve_reuse_docs(
+    workspace_path: str,
+    reuse_specs_override: Optional[bool] = None,
+) -> bool:
     """Decide whether `teane build` should preserve docs/ and skip spec regen.
 
     Semantics:
-      - If ``docs/SPEC_REQUIREMENTS.md`` is absent → False (nothing to
-        reuse; the normal reset + synthesis flow runs).
+      - If ``reuse_specs_override`` is set (from ``--reuse-specs true|false``)
+        → honor it verbatim; the CLI flag wins over both prompts and the
+        non-TTY default. When the override is `true` but no spec marker
+        exists, drop to False (nothing to reuse) with a clear log line
+        so the operator isn't misled by the flag they passed.
+      - Else if ``docs/SPEC_REQUIREMENTS.md`` is absent → False (nothing
+        to reuse; the normal reset + synthesis flow runs).
       - Else if stdin is not a TTY → True (non-interactive default:
         reuse so eval sweeps stop paying the spec-generation LLM cost
         on every run).
@@ -6793,12 +6828,25 @@ def _resolve_reuse_docs(workspace_path: str) -> bool:
     the destructive-reset confirmation, not this reuse choice.
     """
     spec_marker = os.path.join(workspace_path, "docs", "SPEC_REQUIREMENTS.md")
+    if reuse_specs_override is not None:
+        if reuse_specs_override and not os.path.exists(spec_marker):
+            logger.info(
+                "[build] --reuse-specs true, but %s does not exist — "
+                "specs will be generated from scratch.", spec_marker,
+            )
+            return False
+        logger.info(
+            "[build] --reuse-specs %s (CLI override).",
+            str(reuse_specs_override).lower(),
+        )
+        return bool(reuse_specs_override)
     if not os.path.exists(spec_marker):
         return False
     if not sys.stdin.isatty():
         logger.info(
             "[build] Non-interactive run: %s exists — reusing docs/ "
-            "(skipping spec regeneration).", spec_marker,
+            "(skipping spec regeneration). Pass `--reuse-specs false` to "
+            "force regeneration.", spec_marker,
         )
         return True
     from harness.hitl import get_channel as _get_channel
@@ -6847,7 +6895,10 @@ async def cmd_build(args: argparse.Namespace) -> int:
     # preserving the folder without skipping regen would just overwrite
     # what we preserved, and skipping regen without preserving the
     # folder would leave nothing to read.
-    args.reuse_docs = _resolve_reuse_docs(workspace_path)
+    args.reuse_docs = _resolve_reuse_docs(
+        workspace_path,
+        reuse_specs_override=getattr(args, "reuse_specs", None),
+    )
     return await cmd_run(args)
 
 
@@ -9884,6 +9935,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip the workspace-reset confirmation prompt. Build is always "
             "destructive; use -y in CI or when you're sure."
+        ),
+    )
+    build_parser.add_argument(
+        "--reuse-specs",
+        type=_bool_choice,
+        default=None,
+        metavar="true|false",
+        dest="reuse_specs",
+        help=(
+            "Override the docs/ reuse decision. `true` preserves an "
+            "existing docs/SPEC_REQUIREMENTS.md across the --new-build "
+            "reset (skip spec regeneration); `false` forces spec "
+            "regeneration even when specs exist. Defaults to interactive "
+            "prompt on a TTY, reuse-if-present when non-interactive."
         ),
     )
     _add_hitl_buildpatch(build_parser)

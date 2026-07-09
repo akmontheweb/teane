@@ -2515,8 +2515,19 @@ class Gateway:
             ) from e
         messages = redact_messages(messages)
 
-        # Anchor system prompt at messages[0] for prefix caching
-        messages = ensure_prefix_cache_anchor(list(messages))
+        # Anchor system prompt at messages[0] for prefix caching. Skip
+        # the anchor check for JUDGMENT — those calls intentionally ship
+        # one-shot user-only prompts (see ``_maybe_judgment_llm``); the
+        # anchor warning would fire on every one of them without any
+        # actionable signal (prefix caching wouldn't help a ~440-token
+        # one-shot even if it did fire). CODE_REVIEWER is skipped for
+        # the same reason drift tracking is skipped below: every review
+        # dispatch feeds a different diff-under-review, so the warning
+        # would fire on every call with no cache-recoverable prefix.
+        if role not in (NodeRole.JUDGMENT, NodeRole.CODE_REVIEWER):
+            messages = ensure_prefix_cache_anchor(list(messages))
+        else:
+            messages = list(messages)
 
         # Prefix-stability drift detection. The first 2 messages of every
         # request should be byte-stable across calls in the same role
@@ -2529,6 +2540,16 @@ class Gateway:
         # prompts that vary by purpose, so prefix drift is the norm and
         # tracking it just produces noise warnings. Skip the whole
         # detector for that role.
+        #
+        # CODE_REVIEWER dispatches take a different diff-under-review on
+        # every call by design — the reviewer's input IS the modified
+        # files. Session 6177bcec cache_prefix_drift events for
+        # code_reviewer showed the divergence sitting inside the file
+        # snapshots (declarative_base vs DeclarativeBase, db.commit vs
+        # db.flush, requirements.txt vs server/services/filing_index.py
+        # — each one legitimate content churn). Same argument as
+        # JUDGMENT: no bucket split fixes content-unique input, so track
+        # drift on the reviewer role produces noise without signal.
         try:
             from harness.observability import get_active_session_id, emit_event
             _sid = get_active_session_id() or "unknown"
@@ -2536,7 +2557,7 @@ class Gateway:
             _sid = "unknown"
             emit_event = None  # type: ignore[assignment]
         try:
-            if role == NodeRole.JUDGMENT:
+            if role in (NodeRole.JUDGMENT, NodeRole.CODE_REVIEWER):
                 raise _SkipDriftDetection
             _prefix_hash = hash_stable_prefix(
                 messages, n_stable=2, tools=effective_tools,
@@ -2607,7 +2628,7 @@ class Gateway:
             except Exception:  # noqa: BLE001
                 pass
         except _SkipDriftDetection:
-            pass  # JUDGMENT role intentionally skips drift tracking.
+            pass  # JUDGMENT + CODE_REVIEWER intentionally skip drift tracking.
         except Exception as exc:  # noqa: BLE001 — drift telemetry must never block dispatch
             logger.debug("[gateway] prefix drift check skipped: %s", exc)
 

@@ -12865,6 +12865,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             state.get("workspace_path", "") or ""
         )
         _persistence_bypass_grounds = False
+        # Default cache-family bucket for this repair dispatch. Overridden
+        # inside the focused-reflection branch below when the judge names a
+        # persistent blocker and we swap to the "You are the repair LLM"
+        # framer — that framer's system prompt does NOT match the main
+        # repair bucket's prefix, so it belongs in its own drift bucket.
+        _repair_cache_family = "repair:main"
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
@@ -13279,6 +13285,16 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _focused.append(_last_assistant_msg)
             _before = len(messages)
             messages = _focused
+            # cache_family scopes drift tracking so the focused-reflection
+            # repair prefix (system[0]=SRS, system[1]="You are the repair
+            # LLM. Your only job this turn...") does NOT collide with the
+            # main repair bucket (whose message[1] is the original planning
+            # user prompt "Build finsearch web application ..."). Session
+            # 6177bcec logged repair drift at first_diff_line=3600 with
+            # excerpts alternating between "user|Build finsearch..." and
+            # "system|You are the repair LLM..." — cross-family churn, not
+            # a real leak. Split the bucket.
+            _repair_cache_family = "repair:focused_reflection"
             logger.info(
                 "[repair_node] %s verdict — rebuilt repair messages: %d → %d "
                 "(dropped SRS + chatter; led with judge banner; judge_files=%s, "
@@ -13403,6 +13419,10 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # Use the non-mutating model_override path so concurrent dispatches
         # don't see each other's transient config mutations and exceptions
         # don't leave gateway.config in an inconsistent state.
+        # cache_family reflects whether the focused-reflection branch above
+        # rebuilt ``messages`` with the "You are the repair LLM" framer —
+        # that framer's system prompt does NOT match the main-repair
+        # bucket's prefix, so it needs its own drift bucket.
         async def _dispatch_repair(
             cur_messages: list[MessageDict], cur_budget: float,
         ) -> tuple[Any, float]:
@@ -13412,11 +13432,13 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     role=NodeRole.REPAIR,
                     budget_remaining_usd=cur_budget,
                     model_override=escalation_model,
+                    cache_family=_repair_cache_family,
                 )
             return await gateway.dispatch(
                 messages=list(cur_messages),
                 role=NodeRole.REPAIR,
                 budget_remaining_usd=cur_budget,
+                cache_family=_repair_cache_family,
             )
 
         workspace = state.get("workspace_path", os.getcwd())
@@ -18866,10 +18888,20 @@ Generate the patches that address every finding below. Output only the blocks �
     ]
 
     try:
+        # cache_family scopes drift tracking so the code-review repatch
+        # (system prompt: "You are a senior software engineer. Apply the
+        # reviewer's feedback...") does NOT collide with the main
+        # patching_node bucket (whose system prompt is the workspace SRS).
+        # Session 6177bcec logged first_diff_line=1 offset=7 drift events
+        # every reviewer round because both callsites reported role=patching
+        # with different system prompts — every transition looked like a
+        # provider cache leak. Family split isolates the buckets.
+        _CODE_REPATCH_FAMILY = "patching:code_review_repatch"
         repatch_response, new_budget = await gateway.dispatch(
             messages=repatch_messages,
             role=NodeRole.PATCHING,
             budget_remaining_usd=new_budget,
+            cache_family=_CODE_REPATCH_FAMILY,
         )
 
         async def _code_repatch_dispatch(msgs, budget_remaining):
@@ -18877,6 +18909,7 @@ Generate the patches that address every finding below. Output only the blocks �
                 messages=list(msgs),
                 role=NodeRole.PATCHING,
                 budget_remaining_usd=budget_remaining,
+                cache_family=_CODE_REPATCH_FAMILY,
             )
 
         repatch_response, new_budget, _code_repatch_chunks = await _continue_on_length(

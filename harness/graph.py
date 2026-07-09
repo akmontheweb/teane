@@ -10112,11 +10112,29 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             )
             exit_code = 0
 
+    # ``compiler_errors`` here is the raw stderr-parser output; the count
+    # may grow below via ``_promote_module_not_found_diagnostics`` re-tags
+    # or synthesized entries from pip-resolution / env-misconfig detection.
+    # Prod-smoke and link-check short-circuit BEFORE this line, so their
+    # diagnostics never appear here — the qualifier keeps the log honest.
     logger.info(
-        "[compiler_node] Build finished with exit code %d. %d diagnostic(s) extracted.",
+        "[compiler_node] Build finished with exit code %d. "
+        "Stderr parser extracted %d fresh diagnostic(s) "
+        "(before promotion/synthesis).",
         exit_code,
         len(compiler_errors),
     )
+    # Non-zero exit with an empty parser output is the ambiguous case: the
+    # router will consult autofix pattern detection (pip conflict, env
+    # misconfig, cd-missing, no-tests-collected) before dispatching to
+    # repair, and if none match, repair fires against an empty
+    # ``compiler_errors`` — inspect the raw build output for a parser gap.
+    if exit_code != 0 and not compiler_errors:
+        logger.warning(
+            "[compiler_node] Non-zero exit with no parsed diagnostics; "
+            "autofix pattern detection will decide routing before the "
+            "repair LLM sees anything."
+        )
 
     # Promote pytest-surfaced ``ModuleNotFoundError`` diagnostics to
     # MISSING_DEP so ``_try_missing_dep`` (autofix R4) can consume them.

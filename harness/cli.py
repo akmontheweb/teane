@@ -168,6 +168,38 @@ def _make_git_guardian(workspace_path: str) -> Any:
 _WORKSPACE_LOCK_HANDLES: dict[str, Any] = {}
 
 
+def _clear_workspace_lock_pids_atexit() -> None:
+    """Truncate every acquired ``.harness_session.lock`` on process exit.
+
+    The OS-level ``fcntl.flock`` is released automatically when the file
+    handle is GC'd or the process dies, but the ``pid=NNN`` diagnostic
+    line stays behind. Any observer (dashboard, operator, next-run
+    inspection) reading that file after we exit sees a phantom holder
+    that no longer exists. Clearing the pid line here keeps the file's
+    contents in sync with actual ownership.
+
+    Best-effort: we swallow every error. This runs during interpreter
+    shutdown where stdlib modules may already be partially torn down,
+    and a lock-cleanup failure must never turn a clean exit into a
+    traceback that overwrites the operator's real error.
+    """
+    for _, fh in list(_WORKSPACE_LOCK_HANDLES.items()):
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _WORKSPACE_LOCK_HANDLES.clear()
+
+
+atexit.register(_clear_workspace_lock_pids_atexit)
+
+
 def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
     """Acquire an exclusive lock on the workspace.
 
@@ -6940,6 +6972,33 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     _set_git_enabled(bool(getattr(args, "git", True)))
 
     config = discover_config(workspace_path)
+
+    # Bind the active session_id immediately so any pre-graph dispatches
+    # (e.g. checkpoint health-check helpers, future hooks) and the in-graph
+    # dispatches that follow all stamp the correct session into
+    # ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt filenames. See the
+    # matching call in cmd_run.
+    from harness.observability import set_active_session_id
+    set_active_session_id(args.session_id)
+
+    # Configure structured logging / per-session log file. Without this,
+    # the root logger only carries the module-import StreamHandler, so
+    # every INFO/DEBUG/ERROR emitted during resume goes to console only
+    # and never lands in ~/.harness/logs/<session>.jsonl — leaving
+    # `teane metrics`, the dashboard, and any post-hoc log grep blind
+    # to the entire resumed run. Mirror cmd_run's block verbatim.
+    from harness.observability import configure_logging
+    log_cfg = config.get("logging", {})
+    configure_logging(
+        session_id=args.session_id,
+        log_dir=log_cfg.get("log_dir", "~/.harness/logs"),
+        level=log_cfg.get("level", "INFO"),
+        langsmith_enabled=bool(log_cfg.get("langsmith", False)),
+        json_stderr=bool(log_cfg.get("json_stderr", False)),
+        max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
+        backup_count=int(log_cfg.get("backup_count", 5)),
+    )
+
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
@@ -6958,14 +7017,6 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         logger.error("No checkpoint found for session '%s'.", args.session_id)
         await checkpointer.conn.close()
         return 1
-
-    # Bind the active session_id immediately so any pre-graph dispatches
-    # (e.g. checkpoint health-check helpers, future hooks) and the in-graph
-    # dispatches that follow all stamp the correct session into
-    # ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt filenames. See the
-    # matching call in cmd_run.
-    from harness.observability import set_active_session_id
-    set_active_session_id(args.session_id)
 
     build_command = resolve_build_command(config, workspace_path)
     token_budget = config.get("token_budget", {})

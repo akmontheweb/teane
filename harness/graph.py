@@ -657,7 +657,28 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # Dependency manifests — must be in the static set so the LLM can
     # CREATE them (e.g. add pytest after env_misconfig HITL), not just
     # amend existing ones via the requirements*.txt scan below.
-    "requirements.txt",
+    "requirements.txt", "requirements-dev.txt", "constraints.txt",
+    # Python package managers beyond pip (Pipenv, Poetry, uv, PDM). These
+    # ship a canonical manifest + lockfile pair at workspace root; the
+    # LLM emits them fresh on greenfield when the operator's build/test
+    # cmd points at one of these tools.
+    "Pipfile", "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock", "pdm.lock",
+    ".python-version",
+    # Python quality tooling — mypy / ruff / flake8 / black / isort /
+    # coverage / pre-commit. Each ships in one canonical filename that
+    # the LLM will try to CREATE the first time the diagnostics gate
+    # nudges the repair loop to add lint config. Without static seeding,
+    # every first-time CREATE landed in the allowlist rejection log.
+    "mypy.ini", ".mypy.ini",
+    "ruff.toml", ".ruff.toml",
+    ".flake8",
+    ".isort.cfg",
+    ".coveragerc",
+    ".pylintrc",
+    ".pre-commit-config.yaml",
+    "pyrightconfig.json",
     # Build orchestration — the per-stack makefile_*.md skills instruct
     # the LLM to emit a Makefile so `make build` runs against a real
     # target instead of the noisy late-bind adaptation in speculative.py
@@ -670,28 +691,98 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # before the build could repair.
     "package.json", "package-lock.json",
     "npm-shrinkwrap.json",
+    "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "pnpm-workspace.yaml", "lerna.json", "turbo.json", "nx.json",
     "tsconfig.json", "tsconfig.base.json",
+    "tsconfig.node.json", "tsconfig.app.json", "tsconfig.build.json",
+    "tsconfig.eslint.json", "tsconfig.paths.json",
     ".npmrc", ".nvmrc", ".node-version",
+    ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs",
+    # React + TS + Tailwind + Vite tool configs (canonical filenames).
+    # ``_is_node_config_file`` catches these via the ``.config.*`` and
+    # ``tsconfig`` families, but only when the file is already on disk
+    # (``_append_runtime_root_entries`` scans os.listdir). Greenfield
+    # session 6177bcec hit ``[patcher] Skill allowlist rejected patch to
+    # jest.config.cjs`` on the LLM's first CREATE — the file didn't
+    # exist yet so the pattern scan never ran. Seeding the concrete
+    # names below lets the LLM author every canonical config on round 1
+    # while still leaning on the pattern scan for exotic variants.
+    "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs",
+    "vite-env.d.ts", "vitest.config.ts", "vitest.config.js",
+    "vitest.config.mjs", "vitest.config.cjs",
+    "tailwind.config.ts", "tailwind.config.js",
+    "tailwind.config.mjs", "tailwind.config.cjs",
+    "postcss.config.ts", "postcss.config.js",
+    "postcss.config.mjs", "postcss.config.cjs",
+    "jest.config.ts", "jest.config.js", "jest.config.mjs", "jest.config.cjs",
+    "jest.setup.ts", "jest.setup.js",
+    "playwright.config.ts", "playwright.config.js",
+    "playwright.config.mjs", "playwright.config.cjs",
+    "cypress.config.ts", "cypress.config.js",
+    "cypress.config.mjs", "cypress.config.cjs",
+    "next.config.ts", "next.config.js", "next.config.mjs", "next.config.cjs",
+    "rollup.config.ts", "rollup.config.js",
+    "rollup.config.mjs", "rollup.config.cjs",
+    "webpack.config.ts", "webpack.config.js",
+    "webpack.config.mjs", "webpack.config.cjs",
+    "svelte.config.ts", "svelte.config.js", "svelte.config.mjs",
+    "astro.config.ts", "astro.config.js", "astro.config.mjs",
+    "nuxt.config.ts", "nuxt.config.js",
+    # Vite / CRA / Next entry HTML — CREATE'd once on scaffold and
+    # then edited via REPLACE_BLOCK. Rejection here would block the
+    # frontend build before compilation could start.
+    "index.html",
+    # Java build files — Maven + Gradle canonical layouts. Diagnostics
+    # gate excludes Java (build = type check) per project memory but
+    # the LLM still needs to CREATE these to bootstrap the module.
+    "pom.xml",
+    "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts",
+    "gradle.properties", "gradle-wrapper.properties",
+    "gradlew", "gradlew.bat",
     # Container deployment — Dockerfile and docker-compose files must be
     # in the allowlist for deployment discovery and synthesis to work.
     # The deployment phase may generate or modify these, and repair nodes
-    # may need to adjust them for build fixes.
-    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "Caddyfile", ".dockerignore",
+    # may need to adjust them for build fixes. ``compose.yml`` /
+    # ``compose.yaml`` are the newer Docker Compose v2 preferred names.
+    "Dockerfile", "Dockerfile.dev", "Dockerfile.prod",
+    "docker-compose.yml", "docker-compose.yaml",
+    "docker-compose.override.yml", "docker-compose.override.yaml",
+    "docker-compose.dev.yml", "docker-compose.prod.yml",
+    "compose.yml", "compose.yaml",
+    "Caddyfile", "nginx.conf",
+    ".dockerignore",
+    # Process/deployment manifests seen on Heroku/Render/Railway/Fly.io
+    "Procfile", "fly.toml", "render.yaml", "railway.toml", "vercel.json",
+    "netlify.toml", "app.yaml",
     # Common dev-experience dotfiles. The runtime root scan only picks
     # these up when they already exist on disk, so a fresh greenfield
     # rejected the LLM's first attempt to CREATE them ("[patcher] Skill
     # allowlist rejected patch to .eslintrc.json / .prettierrc /
     # .env.example"). Seeding them statically lets the LLM author
     # idiomatic configs on round 1.
+    ".env", ".env.local",
+    ".env.development", ".env.development.local",
+    ".env.production", ".env.production.local",
+    ".env.test", ".env.test.local",
     ".env.example", ".env.sample", ".env.template",
     ".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
     ".eslintrc.yaml", ".eslintrc.yml", ".eslintignore",
     ".prettierrc", ".prettierrc.json", ".prettierrc.js",
+    ".prettierrc.cjs", ".prettierrc.mjs",
     ".prettierrc.yaml", ".prettierrc.yml", ".prettierignore",
     ".babelrc", ".babelrc.json", ".babelrc.js",
+    "babel.config.js", "babel.config.cjs", "babel.config.mjs",
+    "babel.config.ts", "babel.config.json",
+    ".stylelintrc", ".stylelintrc.json", ".stylelintrc.js",
+    ".stylelintrc.cjs", ".stylelintrc.yaml", ".stylelintrc.yml",
     ".editorconfig", ".gitattributes",
     ".browserslistrc",
+    ".lintstagedrc", ".lintstagedrc.json", ".lintstagedrc.js",
+    "commitlint.config.js", "commitlint.config.cjs",
+    ".huskyrc", ".huskyrc.json",
+    # Docs / repo hygiene the LLM may CREATE alongside the scaffold
+    "README.md", "LICENSE", "CHANGELOG.md",
 })
 
 
@@ -3784,6 +3875,16 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
                 "paths). Production code only — tests are deferred to the "
                 "next phase.\n\n"
             )
+        # Inject the existing-on-disk inventory so the LLM stops emitting
+        # ``CREATE_FILE`` for paths a prior batch already scaffolded.
+        # ``repair_node`` gets this block for free via its error_summary
+        # workspace-inventory pass, but a first-pass patching dispatch had
+        # no visibility into batch N-1's files — session 6177bcec had the
+        # LLM re-CREATE App.tsx / SearchBar.tsx / CompanyCard.tsx three
+        # rounds running before the rejection message routed it into a
+        # repair loop. Empty string on greenfield iteration 1 (nothing on
+        # disk yet), so this is a pure improvement.
+        existing_files_preamble = _build_existing_files_preamble(state)
 
         # Change-request mode: prepend a CR-N attribution block so the
         # patching LLM tags each modified function / class / new file with
@@ -3836,7 +3937,7 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
             "this without your help.\n\n"
         )
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + arch_preamble + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + existing_files_preamble + cr_preamble + story_preamble + arch_preamble + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -3874,6 +3975,7 @@ Quality: Write modular, production-ready code with proper error handling, type h
 Generate your patches NOW. Only the blocks above. No other text."""
         _TOOL_USE_REMINDER = (
             allowlist_preamble
+            + existing_files_preamble
             + cr_preamble
             + story_preamble
             + _IMPORT_CONVENTION_RULE
@@ -7204,21 +7306,36 @@ _EOS_REPAIR_INVENTORY_CAP = 150
 # usual Docker/Make plumbing).
 _CRITICAL_CONFIG_BASENAMES = frozenset({
     # Python
-    "requirements.txt", "requirements-dev.txt", "pyproject.toml",
-    "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock", "poetry.lock",
-    "uv.lock",
+    "requirements.txt", "requirements-dev.txt", "constraints.txt",
+    "pyproject.toml", "setup.py", "setup.cfg",
+    "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock", "pdm.lock",
+    "mypy.ini", "ruff.toml", ".ruff.toml", ".flake8",
+    "pytest.ini", "conftest.py", "tox.ini",
     # Java
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
     "settings.gradle.kts", "gradle.properties", "gradlew", "gradlew.bat",
     # Node / React / TS / Vite / Tailwind
-    "package.json", "package-lock.json", "tsconfig.json", "tsconfig.node.json",
-    "vite.config.ts", "vite.config.js", "tailwind.config.js",
-    "tailwind.config.ts", "postcss.config.js", "postcss.config.cjs",
-    ".eslintrc.json", ".eslintrc.cjs", ".prettierrc",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "tsconfig.json", "tsconfig.node.json", "tsconfig.app.json",
+    "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs",
+    "vitest.config.ts", "vitest.config.js",
+    "tailwind.config.js", "tailwind.config.ts",
+    "tailwind.config.mjs", "tailwind.config.cjs",
+    "postcss.config.js", "postcss.config.cjs",
+    "postcss.config.ts", "postcss.config.mjs",
+    "jest.config.js", "jest.config.cjs", "jest.config.ts", "jest.config.mjs",
+    "playwright.config.ts", "playwright.config.js",
+    "index.html",
+    ".eslintrc.json", ".eslintrc.cjs", ".eslintrc.js",
+    ".prettierrc", ".prettierrc.json", ".prettierrc.cjs",
+    "babel.config.js", "babel.config.cjs",
     # Build / container plumbing
-    "Makefile", "makefile", "GNUmakefile", "Dockerfile",
+    "Makefile", "makefile", "GNUmakefile",
+    "Dockerfile", "Dockerfile.dev", "Dockerfile.prod",
     "docker-compose.yml", "docker-compose.yaml",
-    ".env", ".env.example", ".gitignore",
+    "compose.yml", "compose.yaml", "Caddyfile", "nginx.conf",
+    ".env", ".env.local", ".env.development", ".env.production",
+    ".env.example", ".gitignore",
 })
 
 
@@ -16440,6 +16557,57 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
         "skip_discovery": False,
         **extra_state,
     }
+
+
+_PATCHING_INVENTORY_CAP = 120
+
+
+def _build_existing_files_preamble(state: "AgentState") -> str:
+    """Return a preamble that lists files already on disk in this session
+    so the LLM stops CREATE_FILE-ing paths that already exist.
+
+    The single most common patch-rejection cascade in patching_node is the
+    LLM emitting ``CREATE_FILE`` for a path that a prior batch already
+    scaffolded (App.tsx, main.py, SearchBar.tsx, etc.). ``repair_node``
+    already surfaces this via its "Files currently in workspace" block
+    (see the workspace-inventory section around line 12436), but
+    ``patching_node``'s initial dispatch had no visibility into the
+    workspace state — so batch N's first attempt kept re-creating batch
+    N-1's files, only learning of the collision AFTER the round burned.
+    This preamble closes the gap: same list, in the patching preamble,
+    with the CREATE→REPLACE_BLOCK directive above it.
+
+    Uses ``state["modified_files"]`` as the inventory (files this session
+    has touched). Critical config basenames are prepended so a
+    Tailwind/Vite/Docker config that scrolled out of a large inventory
+    still stays visible. Empty string when the list is empty — greenfield
+    iteration 1 has no inventory yet, so the block would just be noise.
+    """
+    inventory = sorted({
+        p for p in (state.get("modified_files") or []) if p
+    })
+    if not inventory:
+        return ""
+    critical = [p for p in inventory if _is_critical_config_path(p)]
+    rest = [p for p in inventory if not _is_critical_config_path(p)]
+    ordered = critical + rest
+    shown = ordered[:_PATCHING_INVENTORY_CAP]
+    extra = max(0, len(ordered) - _PATCHING_INVENTORY_CAP)
+    listing = "\n".join(f"  - {p}" for p in shown)
+    overflow = f"\n  - (+ {extra} more not shown)" if extra else ""
+    return (
+        "[FILES ALREADY ON DISK — DO NOT CREATE_FILE ANY OF THESE]\n"
+        "The following paths were scaffolded earlier in this session and "
+        "exist on disk with real content. **CREATE_FILE on any of them "
+        "will be REJECTED** by the patcher ('File already exists with "
+        "different content') — use REPLACE_BLOCK / DELETE_BLOCK / "
+        "INSERT_AT_BLOCK to modify them, or leave them alone. If you "
+        "need to see current bytes before editing, emit a READ_FILE "
+        "block (does NOT consume a patching iteration) and the harness "
+        "will splice the current content into your next dispatch. Any "
+        "OTHER path (not listed here) may be a fresh CREATE_FILE.\n"
+        f"{listing}{overflow}\n\n"
+    )
 
 
 def _build_change_request_preamble(state: AgentState, phase: str) -> str:

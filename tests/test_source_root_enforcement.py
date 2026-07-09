@@ -181,18 +181,45 @@ class TestBuildPatcherAllowlist:
                 f"{expected} missing — runtime scan should have picked it up"
             )
 
-    def test_unseeded_node_config_files_not_added_when_absent(self, tmp_path):
+    def test_unseeded_exotic_node_configs_not_added_when_absent(self, tmp_path):
         # The runtime scan must not invent allowlist entries for configs
-        # that aren't on disk AND aren't in the static seed set — the
-        # static set covers canonical filenames the LLM commonly creates
-        # on a fresh greenfield (`.eslintrc.json`, `.prettierrc`, etc.),
-        # but open-ended families like `*.config.{cjs,mjs,ts}` are still
-        # gated on disk presence so broadening doesn't weaken the guard.
+        # that aren't on disk AND aren't in the static seed set. The
+        # static set covers the canonical config filenames for the
+        # supported React+TS+Tailwind+Vite stack (jest / vite / tailwind
+        # / postcss / vitest / playwright / cypress / next / rollup /
+        # webpack / svelte / astro / nuxt configs in all four extension
+        # variants), so those DO greenfield-CREATE without needing the
+        # runtime scan — session 6177bcec hit the `jest.config.cjs`
+        # rejection because the pattern-scan-only path was greenfield-
+        # blind. Files that neither match the static seed nor exist on
+        # disk still stay out; guard doesn't broaden to arbitrary
+        # ``*.config.*`` writes at workspace root.
         _seed_node_workspace(tmp_path)
         allowlist = _build_patcher_allowlist(str(tmp_path))
         assert allowlist is not None
-        for absent in ("jest.config.cjs", "vite.config.ts"):
-            assert absent not in allowlist
+        # Exotic / project-specific tool configs — pattern-matched by
+        # ``_is_node_config_file`` but NOT in the static seed. Absent
+        # from disk, they must stay out.
+        for absent in (
+            "mystery-tool.config.js",
+            "custom-runner.config.cjs",
+            "internal-linter.config.ts",
+        ):
+            assert absent not in allowlist, (
+                f"{absent} snuck in without being on disk — runtime scan "
+                f"must remain disk-gated for non-canonical configs"
+            )
+        # Canonical stack configs, on the other hand, MUST be present in
+        # the static seed so greenfield CREATE succeeds (this is the
+        # bug 6177bcec exercised).
+        for canonical in (
+            "jest.config.cjs", "vite.config.ts", "tailwind.config.js",
+            "postcss.config.js", "playwright.config.ts",
+        ):
+            assert canonical in allowlist, (
+                f"{canonical} missing from static seed — greenfield "
+                f"CREATE_FILE will be rejected on the LLM's first turn"
+            )
 
 
 # ---------------------------------------------------------------------------

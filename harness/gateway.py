@@ -134,7 +134,7 @@ class LLMResponse:
 @dataclass
 class ModelSpec:
     """Specification for a model including cost rates and context window limits."""
-    provider: str  # "deepseek", "anthropic", "openai", "ollama"
+    provider: str  # "deepseek", "anthropic", "openai", "google", "ollama"
     model_id: str
     context_window: int  # maximum tokens the model accepts
     input_cost_per_1m: float  # cost per 1M input tokens in USD
@@ -451,6 +451,27 @@ class ProviderEmbeddedError(RuntimeError):
     def __init__(self, message: str, *, payload: dict[str, Any] | None = None):
         super().__init__(message)
         self.payload = payload or {}
+
+
+class HarnessConfigError(BaseException):
+    """Fatal configuration error — must NOT be caught by node-level
+    ``except Exception`` blocks.
+
+    Inherits from ``BaseException`` (like ``KeyboardInterrupt`` and
+    ``SystemExit``) so it bypasses the catch-all ``except Exception``
+    handlers scattered across ``graph.py`` nodes. Those handlers
+    intentionally swallow errors to keep the graph moving through
+    transient failures — but a config error (unregistered provider,
+    unknown model) will fail identically on every retry and every next
+    story. Left uncaught, the outer runner terminates the run with a
+    clean traceback the operator can act on instead of watching the
+    story_loop burn through the batch producing zero patches.
+
+    Origin: 2026-07-09 incident where ``provider: "google"`` in
+    config.json (no GoogleProvider registered) caused patching_node to
+    swallow the ValueError from ``create_provider`` and story_loop_node
+    to churn through STORY-002/003/004 emitting the same traceback.
+    """
 
 
 def _parse_json_response(response: Any) -> dict[str, Any]:
@@ -1071,6 +1092,34 @@ class OpenAIProvider(BaseLLM):
 # 6. Ollama (Local) Provider Implementation
 # ---------------------------------------------------------------------------
 
+class GoogleProvider(OpenAIProvider):
+    """Google Gemini via its OpenAI-compatible endpoint.
+
+    Piggybacks on OpenAIProvider — Gemini exposes chat.completions at
+    ``https://generativelanguage.googleapis.com/v1beta/openai/`` with the
+    same Bearer-auth wire shape. The only real delta is the API-key env
+    var: Google's own docs use ``GEMINI_API_KEY``; ``GOOGLE_API_KEY`` is
+    also common in gcloud contexts. We honor both.
+    """
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        api_key: Optional[str] = None,
+        ssl_verify: Union[bool, str] = True,
+    ):
+        # Resolution: explicit arg → GEMINI_API_KEY → GOOGLE_API_KEY → config.
+        # BaseLLM would only try GOOGLE_API_KEY (spec.provider.upper() + _API_KEY),
+        # so pre-resolve here.
+        resolved = (
+            api_key
+            or os.environ.get("GEMINI_API_KEY", "")
+            or os.environ.get("GOOGLE_API_KEY", "")
+            or spec.api_key
+        )
+        super().__init__(spec, api_key=resolved, ssl_verify=ssl_verify)
+
+
 class OllamaProvider(BaseLLM):
     """Ollama local inference server using OpenAI-compatible /v1/chat/completions endpoint."""
 
@@ -1150,6 +1199,7 @@ _provider_classes: dict[str, type[BaseLLM]] = {
     "deepseek": DeepSeekProvider,
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
+    "google": GoogleProvider,
     "ollama": OllamaProvider,
 }
 
@@ -1177,14 +1227,14 @@ def create_provider(
     """
     spec = get_model_spec(model_key)
     if spec is None:
-        raise ValueError(
+        raise HarnessConfigError(
             f"Model '{model_key}' is not registered. "
-            f"Register it via .harness_config.json 'models' section or gateway.register_model()."
+            f"Register it via config/config.json 'models' section or gateway.register_model()."
         )
     provider_name = spec.provider
     cls = _provider_classes.get(provider_name)
     if cls is None:
-        raise ValueError(
+        raise HarnessConfigError(
             f"Unknown provider '{provider_name}' for model '{model_key}'. "
             f"Supported providers: {list(_provider_classes.keys())}"
         )

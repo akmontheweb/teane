@@ -10827,6 +10827,55 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 exit_code,
             )
 
+    # Last-resort synthesis: exit != 0 but every parser + pattern check
+    # came up empty, AND none of the HITL short-circuit flags fired
+    # (env_misconfig, build_command_blocked, cd_missing, no_tests). Repair
+    # is about to run against an empty ``compiler_errors`` list — the LLM
+    # will be flying blind and the loop will thrash (session 8de42605 burned
+    # ~9 iterations on exactly this shape). Emit a ``RAW_BUILD_STDERR``
+    # synthetic diagnostic carrying the tail of raw_log so the LLM has
+    # SOMETHING to reason about. Not a magic fix — often the underlying
+    # problem is a genuine environment or command issue that repair can't
+    # solve — but it lets the LLM produce an informed HITL-worthy summary
+    # instead of guessing, and it lets the repair-reflection judge see the
+    # actual error text instead of the "insufficient data" sentinel.
+    if (
+        exit_code != 0
+        and not compiler_errors
+        and not node_state.get("env_misconfig")
+        and not node_state.get("build_command_blocked")
+        and not node_state.get("build_command_cd_missing")
+        and not node_state.get("no_tests_collected")
+    ):
+        # Tail-only: pytest / uv / npm etc. can emit thousands of lines and
+        # the LLM's repair context is expensive. The last ~40 non-blank
+        # lines almost always contain the actual failure surface.
+        raw_lines = [ln for ln in (raw_log or "").splitlines() if ln.strip()]
+        tail = "\n".join(raw_lines[-40:]) or "(raw build output was empty)"
+        compiler_errors = [{
+            "file": "<build-command>",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "error_code": "RAW_BUILD_STDERR",
+            "message": (
+                f"Build command exited with code {exit_code} but no parser "
+                f"(stderr, pyright, tsc, prod-smoke, pip-resolution, "
+                f"env-misconfig) extracted a structured diagnostic. Raw "
+                f"tail below — infer the failure from the shell output:\n"
+                f"---\n{tail}\n---"
+            ),
+            "semantic_context": f"Build command: {build_cmd}. Exit code: {exit_code}.",
+            "missing_symbol": "",
+            "build_command": build_cmd,
+        }]
+        logger.warning(
+            "[compiler_node] Synthesized RAW_BUILD_STDERR diagnostic "
+            "(exit=%d, no parsed errors, no HITL short-circuit matched). "
+            "Tail bytes=%d, kept lines=%d.",
+            exit_code, len(tail), len(raw_lines[-40:]),
+        )
+
     # Rotate the survival-tracking fingerprints: yesterday's "current"
     # becomes today's "prior", and the new diagnostics' shape becomes the
     # new "current". repair_node reads ``prior_diag_fingerprints`` to

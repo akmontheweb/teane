@@ -2690,6 +2690,30 @@ class Gateway:
                 # via the observer hook above; one extra record on full
                 # exhaustion is fine — the deque is bounded.
                 self._record_rate_limit_failure()
+                raise
+            # 4xx-except-429: fundamentally a configuration error — auth
+            # failure, unknown model, malformed schema, etc. These will
+            # NEVER succeed on retry, so retry_with_backoff already
+            # bubbled them out. But node-level ``except Exception``
+            # catch-alls (repair_node, patching_node, review_node)
+            # swallow httpx.HTTPStatusError and silently loop back
+            # through the router, which spins the repair budget at
+            # ~15s/round until it exhausts. Translate to
+            # ``HarnessConfigError`` (BaseException) so the loop
+            # aborts and the operator sees the actual error message.
+            # Origin: 2026-07-09 session 8de42605 burned ~9 repair
+            # rounds on a 404 for a mistyped Gemini model ID.
+            if 400 <= status < 500:
+                try:
+                    body = exc.response.text[:800]
+                except Exception:  # noqa: BLE001
+                    body = "<unreadable>"
+                raise HarnessConfigError(
+                    f"Provider {provider.spec.provider!r} returned HTTP {status} "
+                    f"for model {model_key!r}. This is a configuration error "
+                    f"(auth, unknown model, malformed request) — no retry will "
+                    f"help. Response body: {body}"
+                ) from exc
             raise
 
         # Empty-content guard (P1.5). retry_with_backoff handles transport

@@ -76,9 +76,9 @@
             "api_key": "",
             "supports_cache": true
         },
-        "google:gemini-3.1-pro": {
+        "google:gemini-3.1-pro-preview": {
             "provider": "google",
-            "model_id": "gemini-3.1-pro",
+            "model_id": "gemini-3.1-pro-preview",
             "context_window": 128000,
             "input_cost_per_1m": 2.0,
             "output_cost_per_1m": 12.0,
@@ -163,7 +163,7 @@
     "model_routing": {
         "planning_primary": "deepseek:deepseek-v4-pro",
         "planning_mode": "thinking",
-        "planning_fallback": "google:gemini-3.1-pro",
+        "planning_fallback": "google:gemini-3.1-pro-preview",
         "planning_fallback_mode": "thinking",
         "patching_primary": "google:gemini-3.5-flash",
         "patching_mode": "non_thinking",
@@ -171,7 +171,7 @@
         "patching_fallback_mode": "thinking",
         "repair_primary": "deepseek:deepseek-v4-pro",
         "repair_mode": "thinking",
-        "repair_fallback": "google:gemini-3.1-pro",
+        "repair_fallback": "google:gemini-3.1-pro-preview",
         "repair_fallback_mode": "thinking",
         "doc_reviewer_primary": "google:gemini-3.5-flash",
         "doc_reviewer_mode": "non_thinking",

@@ -6,6 +6,17 @@
 - CREATE_FILE must include the full file content with proper imports at the top.
 - Never generate patches that touch more than 3 files in a single response without explicit approval.
 
+### Move Semantics — Two-Sided Fixes
+When a diagnostic says the fix is a **move** or **relocation** — e.g. "move X to the top-level conftest", "this belongs at Y instead of Z", "should be defined in the parent module", "extract this into a shared utility" — the fix has TWO halves and BOTH must land in the SAME round:
+- **Destination:** CREATE_FILE (new path) or REPLACE_BLOCK (existing path) to introduce the content at the target.
+- **Source:** DELETE_BLOCK / REWRITE_FILE / DELETE_FILE to remove the content from the original path.
+
+Only doing the destination leaves the source in violation and the diagnostic re-fires next round, wasting a repair cycle. If the source file becomes empty (or contains only the moved content) after removal, DELETE_FILE it entirely rather than leaving a stub.
+
+Example — pytest error: *"Defining `pytest_plugins` in a non-top-level conftest is no longer supported; move it to the top-level conftest"*:
+- Right: CREATE_FILE `/conftest.py` with the plugin line **AND** REWRITE_FILE or DELETE_FILE `backend/tests/conftest.py`.
+- Wrong: CREATE_FILE `/conftest.py` alone — the offending line still exists at the old path and pytest fails identically.
+
 ### Error Handling
 - All new functions must include try/except blocks for external calls (API, file I/O, database).
 - Return meaningful error messages, not raw exception strings.

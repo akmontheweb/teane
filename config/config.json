@@ -33,7 +33,7 @@
     
     "_token_budget_comment": "Spend caps. hard_cap_usd is the per-session dollar ceiling \u2014 the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window. stages (optional) is a soft per-stage budget split \u2014 maps NodeRole name to a fraction of hard_cap_usd, e.g. {\"planning\":0.2,\"patching\":0.2,\"repair\":0.5,\"doc_reviewer\":0.05,\"code_reviewer\":0.05}. Today this only emits a warning when a stage exceeds its share; hard enforcement is a follow-up.",
     "token_budget": {
-        "hard_cap_usd": 3.0,
+        "hard_cap_usd": 10.0,
         "context_window_threshold_pct": 0.85,
         "stages": {}
     },

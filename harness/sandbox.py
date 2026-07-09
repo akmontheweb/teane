@@ -570,14 +570,21 @@ class DockerBackend(SandboxBackend):
         # create` so failures (out of disk, daemon socket perms) surface
         # with their actual error message before the build starts.
         effective_mounts = list(readonly_cache_mounts or [])
+        # Always layer the builder image's fixed /cache/* paths on top.
+        # These need to reach _build_docker_command even when
+        # ``cache_volumes_enabled`` is False, because the image bakes
+        # ``ENV UV_CACHE_DIR=/cache/uv`` (etc.) and, without a writable
+        # mount or a host bind, the env-fallback loop there is what
+        # redirects them to /tmp/*-cache. Skipping this list entirely
+        # (the previous behaviour when the flag was off) left the env
+        # unchanged and every uv invocation crashed with a Read-only FS
+        # error on ``/cache/uv/CACHEDIR.TAG`` — see the comment below at
+        # ``_cache_paths_needing_env_fallback``.
+        effective_mounts = [
+            p for p in self._DEFAULT_CACHE_VOLUME_PATHS
+            if p not in effective_mounts
+        ] + effective_mounts
         if self.cache_volumes_enabled:
-            # Prepend so the fixed /cache/* paths are always the first
-            # volumes ensured. Operators who also supply
-            # ``readonly_cache_mounts`` get those layered on top.
-            effective_mounts = [
-                p for p in self._DEFAULT_CACHE_VOLUME_PATHS
-                if p not in effective_mounts
-            ] + effective_mounts
             self._ensure_cache_volumes(effective_mounts)
         docker_cmd = self._build_docker_command(
             command,

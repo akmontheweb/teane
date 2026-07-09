@@ -4955,6 +4955,27 @@ _BUILD_OUTPUT_NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # every Python build for two years and aren't actionable.
     re.compile(r"^.*\bpkg_resources is deprecated\b.*$"),
     re.compile(r"^.*\bSetuptoolsDeprecationWarning\b.*$"),
+    # uv/pip install progress noise. Dominates the tail of any Python
+    # build that installs deps: dozens of `+ package==version` lines
+    # (uv sync output), `Downloading ...whl`, `Installing collected
+    # packages: ...`, `Successfully installed ...`. Not actionable —
+    # dependency changes go through requirements.txt / pyproject.toml,
+    # not by "fixing" what pip printed. Filtering here reclaims tail
+    # budget for the actual pytest / compile errors that follow.
+    re.compile(r"^\s*[+~-]\s+[a-zA-Z0-9_.\-]+==[0-9]"),
+    re.compile(r"^Downloading [a-zA-Z0-9_.\-]+.*\.(?:whl|tar\.gz|zip)"),
+    re.compile(r"^\s*Using cached [a-zA-Z0-9_.\-]+.*\.(?:whl|tar\.gz|zip)"),
+    re.compile(r"^Installing collected packages:.*$"),
+    re.compile(r"^Successfully installed .*$"),
+    re.compile(r"^\s*Preparing metadata.*$"),
+    re.compile(r"^\s*Building wheel .*$"),
+    re.compile(r"^\s*Resolved \d+ packages? in .*$"),
+    re.compile(r"^\s*Prepared \d+ packages? in .*$"),
+    re.compile(r"^\s*Installed \d+ packages? in .*$"),
+    re.compile(r"^\s*Audited \d+ packages? in .*$"),
+    # uv's per-package "downloaded"/"built" progress lines.
+    re.compile(r"^\s*Downloaded [a-zA-Z0-9_.\-]+\s+in\s.*$"),
+    re.compile(r"^\s*Built [a-zA-Z0-9_.\-]+\s+in\s.*$"),
 )
 
 
@@ -5067,10 +5088,49 @@ def _slice_build_output_for_repair(
             + "\n".join(unique_causal)
             + "\n--- (end lifted chain) ---\n"
         )
+    # pytest signal extraction. When the log is dominated by upstream
+    # noise (uv/pip install walls, npm bootstrap, compile chatter), the
+    # actual pytest failure lands in the truncated middle and the LLM
+    # sees zero grounding — session 3a9be38f hit this repeatedly, with
+    # the tail showing only ``+ pkg==version`` lines while pytest's
+    # collection error sat in the dropped range. Lift the signal lines
+    # into a preamble the same way Caused-by chains are lifted. Patterns
+    # target pytest short-summary lines, python tracebacks, and
+    # pytest's assert-explain output.
+    pytest_signal_re = re.compile(
+        r"^(?:"
+        r"FAILED\s|"                    # short summary "FAILED tests/foo.py::bar"
+        r"ERROR\s|"                     # short summary "ERROR tests/foo.py::bar"
+        r"E\s{2,}|"                     # pytest assert-detail "E   AssertionError: ..."
+        r">\s{2,}|"                     # pytest ">   " assertion context
+        r"Traceback\s+\(most recent call last\)|"
+        r"\s{2,}File\s+\".+?\",\s+line\s+\d+|"  # traceback frame
+        r"[A-Z]\w+(?:Error|Exception|Warning):\s|"  # bare exception headers
+        r"={3,}\s+(?:short test summary|FAILURES|ERRORS|test session starts)"
+        r")"
+    )
+    pytest_lines: list[str] = []
+    seen_pytest: set[str] = set()
+    for line in cleaned.splitlines():
+        if pytest_signal_re.search(line):
+            key = line.rstrip()
+            if key and key not in seen_pytest:
+                seen_pytest.add(key)
+                pytest_lines.append(key)
+        if len(pytest_lines) >= 40:
+            break
+    pytest_block = ""
+    if pytest_lines:
+        pytest_block = (
+            "--- (pytest signal lines lifted from middle of log) ---\n"
+            + "\n".join(pytest_lines)
+            + "\n--- (end lifted pytest signal) ---\n"
+        )
     return (
         f"{head}\n"
         f"... [truncated {dropped} chars from the middle of {total}-char build log] ...\n"
         f"{causal_block}"
+        f"{pytest_block}"
         f"{tail}"
     )
 
@@ -6197,6 +6257,120 @@ _MAX_EDITS_PER_FILE_PER_TURN = 3
 _REJECTED_SEARCH_HISTORY_CAP = 10
 
 
+def _fold_surgical_edits_to_content(
+    original: str,
+    ordered_blocks: "list[Any]",
+) -> tuple[Optional[str], Optional[str]]:
+    """Apply a sequence of surgical PatchBlock ops to ``original`` in-memory.
+
+    Returns ``(new_content, None)`` if every op applies cleanly, or
+    ``(None, reason)`` if any op fails. Mirrors ``TextPatcher``'s per-op
+    semantics (uniqueness policy, INSERT_AT_BLOCK line-anchoring,
+    line-based ops) so a successful fold produces the same bytes N
+    successful surgical edits would.
+
+    Used by ``_pre_patch_screen`` Guard 1 to auto-convert an over-cap
+    batch of surgical edits into a single REWRITE_FILE instead of
+    rejecting all of them — unblocks the repair loop when the LLM has
+    correctly identified N independent local edits but exceeded the
+    intra-turn cap. When the fold fails (dependent edits with stale
+    snapshots, ambiguous searches, out-of-range line numbers), the
+    caller falls back to the original reject-all behaviour.
+    """
+    from harness.patcher import OperationType, Placement
+
+    content = original
+    for b in ordered_blocks:
+        op = b.operation
+        if op == OperationType.REPLACE_BLOCK:
+            search = b.search
+            policy = (getattr(b, "count", "unique") or "unique").strip().lower()
+            n = content.count(search)
+            if n == 0:
+                if b.replace and b.replace in content:
+                    continue
+                return None, f"REPLACE_BLOCK search not found (op {op.value})"
+            if n > 1 and policy == "unique":
+                return None, f"REPLACE_BLOCK matched {n} times (count=unique)"
+            if policy == "all":
+                content = content.replace(search, b.replace)
+            elif policy == "first":
+                content = content.replace(search, b.replace, 1)
+            else:
+                content = content.replace(search, b.replace)
+        elif op == OperationType.DELETE_BLOCK:
+            search = b.search
+            policy = (getattr(b, "count", "unique") or "unique").strip().lower()
+            n = content.count(search)
+            if n == 0:
+                continue
+            if n > 1 and policy == "unique":
+                return None, f"DELETE_BLOCK matched {n} times (count=unique)"
+            if policy == "all":
+                content = content.replace(search, "")
+            elif policy == "first":
+                content = content.replace(search, "", 1)
+            else:
+                content = content.replace(search, "")
+        elif op == OperationType.INSERT_AT_BLOCK:
+            anchor = b.anchor
+            anchor_idx = content.find(anchor)
+            if anchor_idx == -1:
+                return None, "INSERT_AT_BLOCK anchor not found"
+            if getattr(b, "placement", Placement.AFTER) == Placement.BEFORE:
+                line_start = content.rfind("\n", 0, anchor_idx) + 1
+                insert_point = line_start
+                cwn = b.content.rstrip("\n") + "\n"
+                existing_before = content[max(0, line_start - len(cwn)):line_start]
+                if existing_before == cwn:
+                    continue
+                content = content[:insert_point] + cwn + content[insert_point:]
+            else:
+                line_end = content.find("\n", anchor_idx)
+                if line_end == -1:
+                    line_end = len(content)
+                insert_point = line_end + 1
+                cwn = "\n" + b.content.rstrip("\n")
+                existing_after = content[insert_point:insert_point + len(cwn)]
+                if existing_after == cwn:
+                    continue
+                content = content[:insert_point] + cwn + content[insert_point:]
+        elif op == OperationType.INSERT_AT_LINE:
+            line = int(getattr(b, "line", 0) or 0)
+            if line < 1:
+                return None, f"INSERT_AT_LINE bad line={line}"
+            file_lines = content.splitlines(keepends=True)
+            if line > len(file_lines) + 1:
+                return None, f"INSERT_AT_LINE line={line} past EOF"
+            normalised = b.content.rstrip("\r\n")
+            insert_lines = (normalised + "\n").splitlines(keepends=True) if normalised else []
+            existing_slice = file_lines[line - 1 : line - 1 + len(insert_lines)]
+            if existing_slice == insert_lines:
+                continue
+            new_lines = file_lines[: line - 1] + insert_lines + file_lines[line - 1 :]
+            content = "".join(new_lines)
+        elif op == OperationType.REPLACE_LINE_RANGE:
+            start = int(getattr(b, "line", 0) or 0)
+            end = int(getattr(b, "end_line", 0) or 0)
+            if start < 1 or end < start:
+                return None, f"REPLACE_LINE_RANGE bad range {start}-{end}"
+            file_lines = content.splitlines(keepends=True)
+            if end > len(file_lines):
+                return None, f"REPLACE_LINE_RANGE end={end} past EOF"
+            if b.content == "":
+                replacement_lines: list[str] = []
+            else:
+                normalised = b.content.rstrip("\r\n")
+                replacement_lines = (normalised + "\n").splitlines(keepends=True)
+            new_lines = (
+                file_lines[: start - 1] + replacement_lines + file_lines[end :]
+            )
+            content = "".join(new_lines)
+        else:
+            return None, f"unsupported op for fold: {op.value}"
+    return content, None
+
+
 def _pre_patch_screen(
     blocks: "list[Any]",
     loop_counter: dict[str, Any],
@@ -6246,8 +6420,71 @@ def _pre_patch_screen(
         if b.operation in _EDIT_OPS:
             edits_per_file[b.file] = edits_per_file.get(b.file, 0) + 1
 
+    # Guard 1 auto-fold: for any file exceeding the cap, try applying
+    # the surgical edits sequentially against the current on-disk
+    # content and, if they all land cleanly, replace them with a single
+    # REWRITE_FILE. Independent edits (e.g. add class attr + add method
+    # on same file) succeed here and unblock the round instead of
+    # forcing a HITL escape. Dependent edits with stale mental models
+    # fail the fold and fall back to the original reject-all path so
+    # the LLM still sees the guard fire.
+    over_cap_files = {
+        f for f, n in edits_per_file.items() if n > _MAX_EDITS_PER_FILE_PER_TURN
+    }
+    folded_files: dict[str, "Any"] = {}
+    for file_key in over_cap_files:
+        surgical_ordered = [
+            b for b in blocks
+            if b.file == file_key and b.operation in _EDIT_OPS
+        ]
+        abs_target = os.path.join(workspace_path, file_key)
+        if not os.path.isfile(abs_target):
+            continue
+        try:
+            with open(abs_target, "r", encoding="utf-8", errors="replace") as _f:
+                original = _f.read()
+        except OSError:
+            continue
+        new_content, err = _fold_surgical_edits_to_content(
+            original, surgical_ordered,
+        )
+        if new_content is None:
+            logger.info(
+                "[repair_node:screen] Guard 1 auto-fold DECLINED for `%s` "
+                "(%d surgical edits): %s. Falling back to reject-all.",
+                file_key, len(surgical_ordered), err,
+            )
+            continue
+        if new_content == original:
+            logger.info(
+                "[repair_node:screen] Guard 1 auto-fold SKIPPED for `%s` "
+                "(%d surgical edits): all edits were no-ops on the current "
+                "content. Falling back to reject-all so the LLM sees why.",
+                file_key, len(surgical_ordered),
+            )
+            continue
+        # Synthesise a single REWRITE_FILE PatchBlock. Uses the
+        # existing PatchBlock dataclass so the downstream apply
+        # pipeline treats it as an ordinary rewrite (post-patch parse
+        # validation still runs, so an invalid fold gets rolled back).
+        from harness.patcher import PatchBlock, OperationType as _OT
+        folded_files[file_key] = PatchBlock(
+            operation=_OT.REWRITE_FILE,
+            file=file_key,
+            content=new_content,
+        )
+        logger.info(
+            "[repair_node:screen] Guard 1 auto-fold ACCEPTED for `%s`: "
+            "collapsed %d surgical edits (%s) into a single REWRITE_FILE. "
+            "Sequential in-memory application produced valid content; "
+            "post-patch parse validation will still run.",
+            file_key, len(surgical_ordered),
+            ", ".join(b.operation.value for b in surgical_ordered),
+        )
+
     kept: list = []
     rejections: list = []
+    emitted_folded: set[str] = set()
 
     for b in blocks:
         file_key = b.file
@@ -6257,6 +6494,16 @@ def _pre_patch_screen(
             b.operation in _EDIT_OPS
             and edits_per_file.get(file_key, 0) > _MAX_EDITS_PER_FILE_PER_TURN
         ):
+            # Auto-fold succeeded for this file — emit the synthesised
+            # REWRITE_FILE once (on the first surgical block for this
+            # file) and drop the rest silently. The single REWRITE_FILE
+            # flows through the normal apply pipeline (post-patch parse
+            # validation, hash tracking, etc.).
+            if file_key in folded_files:
+                if file_key not in emitted_folded:
+                    kept.append(folded_files[file_key])
+                    emitted_folded.add(file_key)
+                continue
             rejections.append(PatchResult(
                 success=False,
                 file=file_key,
@@ -6269,12 +6516,15 @@ def _pre_patch_screen(
                     f"Cap is {_MAX_EDITS_PER_FILE_PER_TURN}: multiple "
                     f"surgical edits on one file in one round routinely "
                     f"fail because later blocks are computed against a "
-                    f"snapshot invalidated by the earlier ones. All "
+                    f"snapshot invalidated by the earlier ones. The "
+                    f"harness attempted to auto-fold your edits into a "
+                    f"single REWRITE_FILE but at least one edit could not "
+                    f"be applied against the current on-disk content — "
+                    f"your mental model of this file has drifted. All "
                     f"surgical edits for `{file_key}` were REJECTED. "
-                    f"Next round: either emit a single "
-                    f"<<<REWRITE_FILE>>> with the full desired content, "
-                    f"OR emit <<<READ_FILE>>> first and split the edits "
-                    f"across multiple turns."
+                    f"Next round: emit <<<READ_FILE>>> for `{file_key}` "
+                    f"first, then either a single <<<REWRITE_FILE>>> with "
+                    f"the full desired content or ≤3 surgical edits."
                 ),
             ))
             continue
@@ -11769,21 +12019,32 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if raw_output:
             error_summary += f"\n## Raw Build Output\n```\n{_slice_build_output_for_repair(raw_output)}\n```"
 
-    # Fix D — low-signal escalation. When the judge has returned the
-    # ``insufficient data — investigate <file>`` sentinel on two or more
-    # consecutive rounds, the structured diagnostics alone are not enough
-    # for the repair LLM to converge (session 116667f5: 6 rounds spent
-    # guessing at the value ``session.is_active`` returned because the
-    # bare AssertionError message hid it). Inject the raw build-output
-    # tail alongside the structured summary so the LLM sees the full
-    # pytest traceback (assertion-rewrite lines, ``+  where`` value
-    # explanations, attribute traversals) that the parser cannot reduce
-    # to a single message. Gated on the counter so we don't pay the
-    # extra tokens on healthy sessions where the diagnostics suffice.
+    # Fix D — low-signal escalation. When the reflection judge returns the
+    # ``insufficient data — investigate <file>`` sentinel, the structured
+    # diagnostics alone are not enough for the repair LLM to converge
+    # (session 116667f5: 6 rounds spent guessing at the value
+    # ``session.is_active`` returned because the bare AssertionError
+    # message hid it). Inject the raw build-output tail alongside the
+    # structured summary so the LLM sees the full pytest traceback
+    # (assertion-rewrite lines, ``+  where`` value explanations,
+    # attribute traversals) that the parser cannot reduce to a single
+    # message.
+    #
+    # 2026-07-08 — threshold lowered from 2 to 1. The previous threshold
+    # waited for TWO consecutive low-signal rounds before injecting,
+    # burning the first round on a repair LLM that had already been told
+    # by its own judge that the diagnostics were unusable. The
+    # extra-token cost of a first-round injection is negligible (~2 KB
+    # prompt at ~$0.0004 at DeepSeek pricing) versus the ~$0.001-0.005
+    # LLM cost + compile time of a wasted repair round; even at a 100%
+    # false-positive rate the trade favours injecting immediately. The
+    # HITL escalation gate that also reads ``consecutive_low_signal_rounds``
+    # (via ``max_consecutive_low_signal_rounds``, default 5) is
+    # independent of this threshold.
     _low_signal_streak = int(
         loop_counter.get("consecutive_low_signal_rounds", 0) or 0
     )
-    if errors and _low_signal_streak >= 2:
+    if errors and _low_signal_streak >= 1:
         raw_output = state.get("node_state", {}).get("last_build_output", "")
         if raw_output:
             error_summary += (
@@ -11890,10 +12151,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if use_escalation:
             escalation_model = gateway.config.repair_fallback or gateway.config.planning_fallback
             primary_model = gateway.config.repair_primary
+            # ``cheap_shots_taken`` is the actual count of rounds that
+            # dispatched the cheap model in this HITL cycle. Using
+            # ``total_repairs - 1`` here (the prior behaviour) reported the
+            # iteration index instead, which grew unbounded across the
+            # escalation-only rounds and made the log read as "cheap
+            # failed 10 times" when the cheap model had only run twice.
+            cheap_cap = max(1, max_repair_attempts - 1)
             if escalation_model and escalation_model != primary_model:
                 logger.warning(
-                    "[repair_node] Cheap model failed %d time(s). Escalating to reasoning model: %s",
-                    total_repairs - 1,
+                    "[repair_node] Cheap model exhausted (%d/%d shots this HITL cycle). Escalating to reasoning model: %s",
+                    cheap_shots_taken, cheap_cap,
                     escalation_model,
                 )
                 # Escalated repair will use NodeRole.REPAIR with thinking mode enabled
@@ -11904,17 +12172,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # banner never fires; thinking mode is already enabled for
                 # the repair role via repair_mode config.
                 logger.info(
-                    "[repair_node] %d previous attempt(s) on the cheap model; "
+                    "[repair_node] %d cheap-model shot(s) taken this HITL cycle (cap %d); "
                     "repair_fallback==repair_primary (%s), so re-running same "
                     "model with role=repair (thinking mode honors repair_mode).",
-                    total_repairs - 1, primary_model,
+                    cheap_shots_taken, cheap_cap, primary_model,
                 )
                 use_escalation = False
             else:
                 logger.warning(
-                    "[repair_node] Cheap model failed %d time(s), but no escalation model configured. "
+                    "[repair_node] Cheap model exhausted (%d/%d shots this HITL cycle), but no escalation model configured. "
                     "Continuing with primary repair model.",
-                    total_repairs - 1,
+                    cheap_shots_taken, cheap_cap,
                 )
                 use_escalation = False
         else:
@@ -20164,6 +20432,64 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
     values = getattr(state, "values", None) or {}
     node_state = values.get("node_state", {}) or {}
     suspended_from: Optional[str] = node_state.get("suspended_from")
+
+    # Auto-abandon recovery: the headless HITL cap at cli.py:3443 stamps
+    # ``hitl_abandon=True`` when the auto-resume cap trips, so the router
+    # sends the current run to END. That flag was intended for the user's
+    # explicit [q] Abandon choice — reusing it for the cap-hit path meant
+    # a subsequent ``teane resume`` would immediately re-route to END
+    # (route_after_hitl at line ~19242 checks hitl_abandon), giving the
+    # operator no recovery path even after they've fixed the underlying
+    # cause. If ``hitl_auto_resume_cap_hit`` is set we know the abandon
+    # was environmental, not consensual — treat the resume as a Save &
+    # Quit resume: clear the abandon flag and fall through to the
+    # default hitl_menu rewind below.
+    if node_state.get("hitl_abandon") and node_state.get("hitl_auto_resume_cap_hit"):
+        logger.info(
+            "[run_graph] Resume rewind: prior session auto-abandoned by "
+            "the HITL auto-resume cap. Clearing hitl_abandon and "
+            "hitl_auto_resume_cap_hit; treating resume as a Save & Quit "
+            "recovery so the graph re-enters compiler_node."
+        )
+        node_state = dict(node_state)
+        node_state["hitl_abandon"] = False
+        node_state.pop("hitl_auto_resume_cap_hit", None)
+        # Ensure the default hitl_menu rewind below runs even though the
+        # original run never set hitl_suspend.
+        node_state["hitl_suspend"] = True
+        values["node_state"] = node_state
+        # Reset per-file "stuck" trackers. The default rewind path uses
+        # ``_reset_iteration_counters`` which deliberately PRESERVES
+        # ``replace_block_misses_per_file`` etc. so a [r] Resume keeps
+        # the LLM's cross-round session memory (session 2d0164f0 rationale).
+        # That policy is wrong for the auto-abandon path: the operator's
+        # manual fix outside the harness likely mutated the stuck files,
+        # so the accumulated per-file miss counts are stale. Without
+        # clearing them, the router's REPLACE_BLOCK-stuck check (>=3
+        # misses/file) trips on the first compile after resume and
+        # routes straight back to HITL without giving the repair loop a
+        # single chance — the exact loop session 3a9be38f fell into
+        # after a valid manual fix of edgar.py.
+        prior_lc = values.get("loop_counter") if isinstance(values, dict) else None
+        if isinstance(prior_lc, dict):
+            new_lc = dict(prior_lc)
+            new_lc["replace_block_misses_per_file"] = {}
+            new_lc["rewrite_file_no_ops_per_file"] = {}
+            new_lc["rejected_search_hashes"] = {}
+            new_lc["consecutive_zero_patch_rounds"] = 0
+            new_lc["consecutive_all_allowlist_rejected_rounds"] = 0
+            new_lc["no_progress_repairs"] = 0
+            new_lc["file_modification_history"] = {}
+            values["loop_counter"] = new_lc
+            logger.info(
+                "[run_graph] Resume rewind: auto-abandon path cleared "
+                "per-file stuck trackers (replace_block_misses_per_file, "
+                "rewrite_file_no_ops_per_file, rejected_search_hashes, "
+                "file_modification_history) — operator's manual fix "
+                "invalidated them."
+            )
+        suspended_from = "hitl_menu"
+
     if not node_state.get("hitl_suspend"):
         # Back-compat: pre-fix gatekeeper [s] checkpoints never set
         # hitl_suspend — sniff gatekeeper_action="suspend" so an existing

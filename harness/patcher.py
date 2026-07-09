@@ -2282,8 +2282,22 @@ class TreeSitterPatcher(BasePatcher):
 
     @staticmethod
     def _find_text_nodes(root_node: Any, search_bytes: bytes) -> list[Any]:
-        """Find all nodes in the tree whose text matches the given search bytes."""
+        """Find all nodes in the tree whose text matches the given search bytes.
+
+        Dedups by ``(start_byte, end_byte)``: when a search string is the
+        entire content of a single-statement file, tree-sitter's parse
+        chain (``module`` → ``expression_statement`` → ``assignment``)
+        produces multiple ancestor nodes with byte-identical text at the
+        same range. Semantically that is ONE occurrence, not many —
+        counting each layer inflated ``len(matching)`` and made the
+        uniqueness check emit a false "matched N nodes" rejection that
+        the LLM could not work around (``count: all`` / ``count: first``
+        are meaningless when the "duplicates" are AST ancestors of the
+        same leaf). Two distinct real occurrences always have distinct
+        byte ranges, so range-dedup is the correct invariant.
+        """
         results: list[Any] = []
+        seen_ranges: set[tuple[int, int]] = set()
         cursor = root_node.walk()
         stack: list[Any] = [cursor.node]
 
@@ -2291,7 +2305,10 @@ class TreeSitterPatcher(BasePatcher):
             node = stack.pop()
             node_bytes = node.text if hasattr(node, "text") else b""
             if node_bytes == search_bytes:
-                results.append(node)
+                node_range = (node.start_byte, node.end_byte)
+                if node_range not in seen_ranges:
+                    seen_ranges.add(node_range)
+                    results.append(node)
             for child in reversed(node.children):
                 stack.append(child)
 

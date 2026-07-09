@@ -7979,6 +7979,103 @@ def _missing_module_matches_workspace_source(
     return None
 
 
+def _test_dir_shadows_source_package(
+    workspace_path: str, top_name: str,
+) -> Optional[str]:
+    """When a source-package name is also the name of a directory
+    somewhere under ``tests/``, return the workspace-relative path of
+    the shadowing test directory.
+
+    Used defensively by ``_build_repair_reflection_prompt``: if
+    ``_ensure_test_package_init_chain`` didn't fix the shadow (readonly
+    tree, permissions, unusual layout), the judge's PATH/WIRING hint
+    needs to explicitly warn the LLM that PYTHONPATH edits won't help
+    and the fix is a ``touch <intermediate>/__init__.py`` chain.
+    """
+    if not workspace_path or not top_name:
+        return None
+    tests_root = os.path.join(workspace_path, "tests")
+    if not os.path.isdir(tests_root):
+        return None
+    for dirpath, dirnames, _ in os.walk(tests_root):
+        if top_name in dirnames:
+            return os.path.relpath(
+                os.path.join(dirpath, top_name), workspace_path,
+            )
+    return None
+
+
+def _ensure_test_package_init_chain(workspace_path: str) -> list[str]:
+    """Add missing intermediate ``__init__.py`` files under ``tests/``.
+
+    Prevents a subtle pytest shadow-collision: when a test file lives at
+    ``tests/A/B/test_x.py`` with ``tests/A/B/__init__.py`` present but
+    ``tests/A/__init__.py`` MISSING, pytest's rootdir walk stops at
+    ``tests/A/`` (the first ancestor without ``__init__.py``) and treats
+    ``B`` as a top-level package. It then prepends ``tests/A/`` to
+    ``sys.path``. If a top-level workspace source directory shares the
+    name ``B``, later ``import B.something`` calls resolve to
+    ``tests/A/B/`` instead — which of course has no such submodule, so
+    every test collection fails with ``ModuleNotFoundError: No module
+    named 'B.something'``.
+
+    The reflection judge mis-reads this shape as "workspace root not on
+    sys.path" and steers repair toward ``pytest.ini`` / ``conftest.py``
+    / PYTHONPATH — none of which fix a shadow. Session fr-agile-20260709
+    burned every repair iteration on this misdiagnosis.
+
+    This walker is idempotent: it only creates files that are truly
+    absent. Called from ``compiler_node`` before the sandbox build, so
+    the failure mode is never reached in the first place.
+
+    Returns the list of created files (empty when nothing was missing).
+    """
+    tests_root = os.path.join(workspace_path, "tests")
+    if not os.path.isdir(tests_root):
+        return []
+    # Find every directory under ``tests/`` that has an ``__init__.py``.
+    # For each, walk up to (but excluding) ``tests_root`` and confirm
+    # every ancestor also has an ``__init__.py``.
+    created: list[str] = []
+    dirs_with_init: set[str] = set()
+    for dirpath, _, filenames in os.walk(tests_root):
+        if "__init__.py" in filenames:
+            dirs_with_init.add(dirpath)
+    # Which intermediate ancestors need an __init__.py?
+    needed: set[str] = set()
+    for d in dirs_with_init:
+        parent = os.path.dirname(d)
+        # Walk up until we exit tests/ or find a dir without an __init__.py.
+        while parent and parent != tests_root and parent.startswith(tests_root):
+            if parent not in dirs_with_init:
+                needed.add(parent)
+            parent = os.path.dirname(parent)
+    # ``tests_root`` itself must have an __init__.py so pytest's rootdir
+    # walk climbs all the way to workspace root instead of stopping at
+    # the first init-less ancestor.
+    if os.path.isdir(tests_root) and not os.path.isfile(
+        os.path.join(tests_root, "__init__.py")
+    ) and dirs_with_init:
+        needed.add(tests_root)
+    for missing_dir in sorted(needed):
+        init_path = os.path.join(missing_dir, "__init__.py")
+        try:
+            with open(init_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "# Auto-created to keep pytest's rootdir walk anchored "
+                    "at the workspace root — prevents a top-level package "
+                    "name from being shadowed by a same-named tests/** dir.\n"
+                )
+            created.append(os.path.relpath(init_path, workspace_path))
+        except OSError as exc:
+            logger.debug(
+                "[compiler_node] Could not create %s: %s. "
+                "Skipping — the shadow may still trip pytest.",
+                init_path, exc,
+            )
+    return created
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -8150,13 +8247,47 @@ def _build_repair_reflection_prompt(
     # source directory to requirements.txt (a nonsensical fix that
     # burned three rounds in session 3193a24f).
     if path_wiring_module:
+        # Before recommending PYTHONPATH/CWD fixes, check whether the
+        # missing package is being shadowed by a same-named directory
+        # under tests/. That's a subtly different failure mode: PYTHONPATH
+        # and pytest.ini pythonpath directives don't help because the
+        # SHADOW package IS on sys.path — it just doesn't have the
+        # submodule the test is asking for. Fix requires either an
+        # __init__.py chain repair or a rename.
+        shadow_hint = ""
+        try:
+            shadow_dir = _test_dir_shadows_source_package(
+                # Called only when path_wiring_module is set, so the
+                # workspace directory has already been validated by
+                # _missing_module_matches_workspace_source's os.path.isdir
+                # gate. Re-derive it via cwd here — the prompt builder
+                # doesn't currently carry workspace_path in its signature,
+                # so we conservatively skip the shadow check on any error.
+                os.getcwd(), path_wiring_module,
+            )
+        except Exception:  # noqa: BLE001
+            shadow_dir = None
+        if shadow_dir:
+            shadow_hint = (
+                "    - **SHADOW COLLISION DETECTED**: there is a directory "
+                f"``{shadow_dir}`` under ``tests/`` with the same top-level "
+                f"name as the source package ``{path_wiring_module}``. If "
+                "any intermediate ancestor between ``tests/`` and that "
+                "directory lacks an ``__init__.py``, pytest's rootdir walk "
+                f"prepends ``{os.path.dirname(shadow_dir)}`` to sys.path "
+                f"and later ``import {path_wiring_module}.X`` resolves "
+                "to the tests/ shadow instead of the real source package. "
+                "Recommend the fix ``touch <every intermediate tests/**/"
+                "__init__.py>`` — NOT a PYTHONPATH edit.\n"
+            )
         path_wiring_hint_block = (
             "\nPATH/WIRING FAILURE HINT — read before answering:\n"
             f"  The missing module ``{path_wiring_module}`` EXISTS as a "
             "top-level workspace source directory (the harness checked). "
             "The manifest is fine — the failure is in the test-runner "
             "invocation:\n"
-            "    - pytest may be running from a subdir "
+            + shadow_hint
+            + "    - pytest may be running from a subdir "
             f"(e.g. ``cd {path_wiring_module} && pytest``) so tests "
             f"importing ``from {path_wiring_module}.X`` cannot resolve "
             f"the top-level ``{path_wiring_module}`` package on "
@@ -10197,6 +10328,39 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             "/usr/local/lib/node_modules on the container's root FS: %s",
             build_cmd,
         )
+
+    # Ensure the tests/ package tree has a complete __init__.py chain so
+    # pytest's rootdir walk anchors at the workspace root. Without this
+    # a nested test dir named after a top-level source package (e.g.
+    # tests/unit/backend/ vs workspace/backend/) shadows the real one
+    # and every `from backend.core import ...` fails with a spurious
+    # ModuleNotFoundError. Idempotent — creates only truly-missing files.
+    try:
+        created_init_files = _ensure_test_package_init_chain(workspace)
+    except Exception as exc:  # noqa: BLE001 — defensive; must never crash the build
+        logger.debug(
+            "[compiler_node] test-package init-chain repair failed: %s. "
+            "Falling through to the build.", exc,
+        )
+        created_init_files = []
+    if created_init_files:
+        logger.info(
+            "[compiler_node] Created %d missing __init__.py file(s) to "
+            "prevent pytest shadow-collision: %s",
+            len(created_init_files),
+            ", ".join(created_init_files[:5])
+            + (f" (+{len(created_init_files) - 5} more)"
+               if len(created_init_files) > 5 else ""),
+        )
+        try:
+            from harness.observability import emit_event as _emit_shadow_fix
+            _emit_shadow_fix(
+                "test_package_init_chain_repaired",
+                files_created=created_init_files,
+                count=len(created_init_files),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never break the build
+            pass
 
     # Pre-build link check: every relative import in JS/TS/Python source
     # must resolve to an existing file. Catches the failure mode where

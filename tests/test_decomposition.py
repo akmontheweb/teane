@@ -329,6 +329,60 @@ def test_validate_rejects_duplicate_keys():
 # Fence stripping
 # ---------------------------------------------------------------------------
 
+def test_scope_files_js_under_frontend_root_rewritten_to_tsx(caplog):
+    payload = _payload_with_one_feature([
+        {
+            "story_key": "STORY-001",
+            "title": "Add search bar",
+            "acceptance_criteria": ["renders"],
+            "scope_files": [
+                "client/src/components/SearchBar.js",
+                "frontend/src/pages/Home.jsx",
+                "server/api/search.py",
+                "jest.config.js",
+                "webpack.config.js",
+            ],
+        },
+    ])
+    caplog.set_level("WARNING", logger="harness.decomposition")
+    _, stories = decomposition._validate_stories_payload(payload)
+    assert stories[0]["scope_files"] == [
+        "client/src/components/SearchBar.tsx",
+        "frontend/src/pages/Home.tsx",
+        "server/api/search.py",
+        "jest.config.js",
+        "webpack.config.js",
+    ]
+    warned = [r for r in caplog.records if "stack-enforce" in r.getMessage()]
+    assert len(warned) == 2, warned
+
+
+def test_scope_files_tsx_untouched():
+    payload = _payload_with_one_feature([
+        {
+            "story_key": "STORY-001",
+            "title": "already TS",
+            "acceptance_criteria": ["ok"],
+            "scope_files": ["client/src/components/SearchBar.tsx"],
+        },
+    ])
+    _, stories = decomposition._validate_stories_payload(payload)
+    assert stories[0]["scope_files"] == ["client/src/components/SearchBar.tsx"]
+
+
+def test_scope_files_monorepo_marker_rewritten():
+    payload = _payload_with_one_feature([
+        {
+            "story_key": "STORY-001",
+            "title": "monorepo component",
+            "acceptance_criteria": ["ok"],
+            "scope_files": ["packages/web/src/components/Foo.js"],
+        },
+    ])
+    _, stories = decomposition._validate_stories_payload(payload)
+    assert stories[0]["scope_files"] == ["packages/web/src/components/Foo.tsx"]
+
+
 def test_strip_json_fence_handles_fenced():
     raw = "```json\n{\"a\": 1}\n```"
     assert decomposition.strip_json_fence(raw) == '{"a": 1}'

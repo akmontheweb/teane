@@ -48,6 +48,91 @@ LLM that fans out into a large synthetic story set from a small CR file.
 A single CR that materially exceeds this bound should be split.
 """
 
+
+_FRONTEND_PATH_ROOTS = (
+    "client/", "frontend/", "web/", "ui/", "webapp/", "app/src/",
+)
+"""Path prefixes that indicate a file lives in the web frontend.
+
+Used by :func:`_enforce_stack_on_scope_files` to decide whether a `.js`/
+`.jsx` entry in ``scope_files`` should be rewritten to `.tsx` — the
+supported web stack is React + TypeScript + Tailwind, so plain JS/JSX
+under these roots is always a stack violation, but the same extensions
+elsewhere (``webpack.config.js``, ``.eslintrc.js``, ``jest.config.js``)
+are legitimate config and left untouched.
+"""
+
+_FRONTEND_PATH_MARKERS = (
+    "/src/components/", "/src/pages/", "/src/hooks/", "/src/routes/",
+    "/src/features/", "/src/lib/",
+)
+"""Substrings that mark a path as living inside a frontend source tree
+even when the top-level root isn't one of the ``_FRONTEND_PATH_ROOTS``
+(e.g. a monorepo layout that puts the web app at ``packages/web/src/…``).
+"""
+
+
+def _looks_like_frontend_source(path: str) -> bool:
+    p = path.lstrip("./").replace("\\", "/")
+    if any(p.startswith(root) for root in _FRONTEND_PATH_ROOTS):
+        return True
+    return any(marker in ("/" + p) for marker in _FRONTEND_PATH_MARKERS)
+
+
+def _rewrite_js_to_tsx(path: str) -> Optional[str]:
+    """If ``path`` is a plain-JS component/test under a frontend source
+    tree, return the TypeScript equivalent (``.tsx``). Otherwise None.
+
+    The rewrite is deliberately narrow — it only touches ``.js``/``.jsx``
+    under paths that clearly belong to the frontend, so backend Python
+    trees and root-level config files (``jest.config.js``,
+    ``webpack.config.js``) pass through untouched.
+    """
+    lower = path.lower()
+    if not (lower.endswith(".js") or lower.endswith(".jsx")):
+        return None
+    if not _looks_like_frontend_source(path):
+        return None
+    stem_end = -3 if lower.endswith(".js") else -4
+    return path[:stem_end] + ".tsx"
+
+
+def _enforce_stack_on_scope_files(
+    story_key: str,
+    scope: list[str],
+) -> list[str]:
+    """Normalise LLM-emitted scope_files so the locked web stack (React
+    + TypeScript + Tailwind, enforced elsewhere via the system prompt)
+    can't be silently violated by a `.js`/`.jsx` entry.
+
+    Why: the system prompt tells the LLM plain JavaScript is forbidden,
+    but the constraint is soft — repeated real-world runs have shown the
+    planner still emitting ``client/src/components/SearchBar.js`` and
+    ``tests/test_searchbar.js`` in scope_files, which the patcher then
+    happily writes as JSX-in-JS. Downstream ``jest``/``pyright`` gates
+    reject them and the run burns budget in the repair loop instead of
+    catching the drift at decomposition time.
+
+    Only frontend-source paths are rewritten; root-level ``*.js`` config
+    (webpack, jest, eslint, prettier) is passed through unchanged. When
+    a rewrite fires we log the story key + before/after so post-mortems
+    can trace which story tried to violate the stack.
+    """
+    rewritten: list[str] = []
+    for entry in scope:
+        target = _rewrite_js_to_tsx(entry)
+        if target is None:
+            rewritten.append(entry)
+            continue
+        logger.warning(
+            "[decomposition] stack-enforce: %s scope_files entry %r "
+            "rewritten to %r — plain JS/JSX is forbidden in the "
+            "React + TypeScript + Tailwind stack.",
+            story_key, entry, target,
+        )
+        rewritten.append(target)
+    return rewritten
+
 MAX_FEATURES_PER_PASS = 8
 """Soft-ish cap on features per decomposition pass. The decomposition
 LLM is asked to keep features at sprint-scale (one or more vertical
@@ -731,7 +816,9 @@ def _validate_augment_payload(
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
             "depends_on": deps_str,
-            "scope_files": [str(x) for x in scope],
+            "scope_files": _enforce_stack_on_scope_files(
+                key, [str(x) for x in scope],
+            ),
             "external_ref": s.get("external_ref") or None,
         })
     _check_depends_on_acyclic(
@@ -806,7 +893,9 @@ def _validate_stories_payload(
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
             "depends_on": deps_str,
-            "scope_files": [str(x) for x in scope],
+            "scope_files": _enforce_stack_on_scope_files(
+                key, [str(x) for x in scope],
+            ),
             "external_ref": s.get("external_ref") or None,
         })
     _check_depends_on_acyclic(

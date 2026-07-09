@@ -165,7 +165,7 @@
         "planning_mode": "thinking",
         "planning_fallback": "google:gemini-3.1-pro-preview",
         "planning_fallback_mode": "thinking",
-        "patching_primary": "google:gemini-3.5-flash",
+        "patching_primary": "deepseek:deepseek-v4-flash",
         "patching_mode": "non_thinking",
         "patching_fallback": "deepseek:deepseek-v4-pro",
         "patching_fallback_mode": "thinking",

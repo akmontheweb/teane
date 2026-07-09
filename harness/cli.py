@@ -1111,6 +1111,19 @@ _VALID_SELECTION_STRATEGIES: frozenset[str] = frozenset({
 _LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
 
 
+def _suggest_model_key(bad_value: str, known_keys) -> str:
+    """Return a ' Did you mean X?' hint when the operator dropped the provider
+    prefix on a model key. Model keys are 'provider:model_id'; a bare
+    'model_id' with an unambiguous provider match is the common typo. Returns
+    an empty string when no confident single match exists."""
+    if not isinstance(bad_value, str) or ":" in bad_value:
+        return ""
+    matches = [k for k in known_keys if isinstance(k, str) and k.split(":", 1)[-1] == bad_value]
+    if len(matches) == 1:
+        return f" Did you mean '{matches[0]}'? (Model keys must include the provider prefix, e.g. 'deepseek:deepseek-v4-flash'.)"
+    return ""
+
+
 # Locked core technology selection. Backend may be Python or Java
 # (Spring Boot). The web stack is anchored on the React + TypeScript +
 # TailwindCSS trio: all three MUST be present in
@@ -1330,18 +1343,20 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
             )
             continue
         if val not in models:
+            hint = _suggest_model_key(val, models.keys())
             errors.append(
                 f"'model_routing.{field}' references unknown model "
-                f"'{val}'. Declare it under 'models' or pick one of: "
+                f"'{val}'.{hint} Declare it under 'models' or pick one of: "
                 f"{sorted(models.keys())}"
             )
 
     for field in _OPTIONAL_ROUTING_FIELDS:
         val = routing.get(field, "")
         if isinstance(val, str) and val.strip() and val not in models:
+            hint = _suggest_model_key(val, models.keys())
             errors.append(
                 f"'model_routing.{field}' is set to '{val}' but no model "
-                f"by that key exists in 'models'. Either declare it or "
+                f"by that key exists in 'models'.{hint} Either declare it or "
                 f"set the field to an empty string to disable."
             )
 

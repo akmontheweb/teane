@@ -4237,6 +4237,16 @@ Generate your patches NOW. Only the blocks above. No other text."""
             )
         messages.append(MessageDict(role="system", content=status_msg))
 
+        # Mark every successfully-modified file as stuck so the next
+        # LLM edit against it hits guard 2 in ``_pre_patch_screen``
+        # and requires a fresh READ_FILE first. Catches the "LLM
+        # patched a file, files_seen_by_llm still has pre-patch hash,
+        # next edit uses stale mental model" trap that hit finsearch
+        # session 5f65a887 on pyproject.toml. Universal — no file-
+        # type list to maintain.
+        if modified_files:
+            _mark_files_modified(loop_counter, modified_files)
+
         # Audit §6.4: surface a cross-file impact warning so the LLM
         # sees downstream files that reference modified symbols and
         # can update them in the same turn. The module ships an
@@ -6214,6 +6224,60 @@ def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     return "\n".join(lines) + "\n"
 
 
+_FILES_MODIFIED_LOOP_KEY = "files_modified_this_session"
+"""Key on ``loop_counter`` for the set of file paths that have been
+mutated on-disk during the current session (patcher writes, autofix
+promotions, cross-story patches, formatter runs, human intervention
+edits, etc.). Any file in this set is treated as always-stuck by
+``_pre_patch_screen`` so guard 2 forces a fresh READ_FILE before the
+LLM is allowed to REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK it
+again — regardless of file type. Root-cause fix for the finsearch
+session 5f65a887 (2026-07-09) that spent ~12 minutes ping-ponging on
+``pyproject.toml`` REPLACE_BLOCK misses before terminating on the
+HITL auto-resume cap, and generalises to every "external mutation
+invalidated the LLM's mental model" case.
+
+The set is JSON-persisted as a list in ``loop_counter`` so it survives
+checkpoint round-trips; it converts back to a set at read time.
+"""
+
+
+def _mark_files_modified(
+    loop_counter: dict[str, Any],
+    files: "Iterable[str]",
+) -> None:
+    """Record ``files`` as modified-this-session so guard 2 forces a
+    fresh READ_FILE before the next LLM edit against any of them.
+
+    Idempotent — set semantics. Call sites (successful patches,
+    autofix promotions, formatter runs, code-review re-patches,
+    human-intervention edits) all funnel through here so the
+    stale-view detection stays consistent regardless of which
+    subsystem did the write.
+    """
+    if not files:
+        return
+    raw = loop_counter.get(_FILES_MODIFIED_LOOP_KEY)
+    current: set[str] = (
+        set(raw) if isinstance(raw, (list, tuple, set)) else set()
+    )
+    for f in files:
+        if isinstance(f, str) and f:
+            current.add(f)
+    # Persist as sorted list — deterministic JSON serialisation for
+    # checkpoint replay and easier post-mortem diffs.
+    loop_counter[_FILES_MODIFIED_LOOP_KEY] = sorted(current)
+
+
+def _get_files_modified(loop_counter: dict[str, Any]) -> set[str]:
+    """Read the modified-this-session set from ``loop_counter``.
+    Companion to :func:`_mark_files_modified`."""
+    raw = loop_counter.get(_FILES_MODIFIED_LOOP_KEY)
+    if isinstance(raw, (list, tuple, set)):
+        return {f for f in raw if isinstance(f, str) and f}
+    return set()
+
+
 # ---------------------------------------------------------------------------
 # Pre-patch screen — three guards against the "LLM patching against a stale
 # mental model" failure mode that cost the FinancialResearch session 19 HITL
@@ -6399,10 +6463,55 @@ def _pre_patch_screen(
     }
 
     rb_misses_raw = loop_counter.get("replace_block_misses_per_file") or {}
-    stuck_files = {
+    stuck_files: set[str] = {
         f for f, n in rb_misses_raw.items()
         if isinstance(n, int) and n >= 2
     } if isinstance(rb_misses_raw, dict) else set()
+
+    # Guard 2 extension — universal "any file modified this session
+    # is stuck until the LLM re-reads it". Populated by
+    # ``_mark_files_modified`` at every write site (patcher success,
+    # autofix promotion, formatter run, code-review re-patch, human-
+    # intervention edit). No file-type enumeration needed — Java's
+    # pom.xml, React's package.json + vite.config.ts, Tailwind's
+    # tailwind.config.js, and every source file are all covered by
+    # the same rule. Guard 2 compares files_seen_by_llm[path] vs
+    # disk sha256: if the LLM has READ_FILE'd since the mutation,
+    # the seen hash matches disk and the guard passes; otherwise it
+    # rejects with the "READ_FILE first" directive.
+    modified_this_session = _get_files_modified(loop_counter)
+    modified_edit_targets: set[str] = set()
+    for b in blocks:
+        if b.operation not in _EDIT_OPS:
+            continue
+        if b.file in modified_this_session:
+            modified_edit_targets.add(b.file)
+    if modified_edit_targets:
+        stuck_files |= modified_edit_targets
+        logger.debug(
+            "[repair_node:screen] %d modified-this-session file(s) "
+            "targeted by edits — guard 2 will require fresh READ_FILE: %s",
+            len(modified_edit_targets),
+            sorted(modified_edit_targets)[:10],
+        )
+
+    # Belt-and-suspenders — any file the LLM claims to have seen but
+    # whose on-disk sha256 has since diverged is treated as stuck too.
+    # Catches write sites that haven't been threaded through
+    # ``_mark_files_modified`` (custom skills, out-of-band edits) and
+    # any human-intervention manual edits that bypass the harness's
+    # tracked writes. Only scans files the LLM has actually seen, so
+    # cost is O(files_seen). Redundant when the modified-set already
+    # covers the file — union semantics keep stuck_files stable.
+    externally_mutated: set[str] = set()
+    for path, seen_hash in files_seen_by_llm.items():
+        if not seen_hash:
+            continue
+        current_hash = _sha256_file(workspace_path, path)
+        if current_hash and current_hash != seen_hash:
+            externally_mutated.add(path)
+    if externally_mutated:
+        stuck_files |= externally_mutated
 
     rejected_hashes_raw = loop_counter.get("rejected_search_hashes") or {}
     rejected_hashes: dict[str, set[str]] = (
@@ -6534,20 +6643,41 @@ def _pre_patch_screen(
             seen_hash = files_seen_by_llm.get(file_key) or ""
             current_hash = _sha256_file(workspace_path, file_key)
             if not seen_hash or seen_hash != current_hash:
+                # Reason varies: n consecutive REPLACE_BLOCK misses,
+                # modified-this-session (patcher/autofix/formatter/
+                # cross-story write), or on-disk sha256 divergence
+                # from what the LLM saw. Surface whichever applied so
+                # the LLM has a specific frame to correct against.
+                _miss_n = rb_misses_raw.get(file_key) if isinstance(rb_misses_raw, dict) else None
+                if isinstance(_miss_n, int) and _miss_n >= 2:
+                    _reason = (
+                        f"REPLACE_BLOCK-stuck ({_miss_n} consecutive "
+                        f"misses) AND your current view of it is not "
+                        f"fresh"
+                    )
+                elif file_key in modified_this_session:
+                    _reason = (
+                        "modified in this session (by a prior patch, "
+                        "autofix, formatter, or cross-story write) "
+                        "and your current view of it is not fresh"
+                    )
+                else:
+                    _reason = (
+                        "mutated on disk since you last saw it — "
+                        "your current view of it is not fresh"
+                    )
                 rejections.append(PatchResult(
                     success=False,
                     file=file_key,
                     operation=b.operation,
                     error=(
-                        f"[screen:stuck-reread] `{file_key}` is REPLACE_"
-                        f"BLOCK-stuck ({rb_misses_raw[file_key]} "
-                        f"consecutive misses) AND your current view of "
-                        f"it is not fresh. This patch was REJECTED. Emit "
-                        f"<<<READ_FILE>>> for `{file_key}` in your NEXT "
-                        f"response — that will re-dispatch you with the "
-                        f"authoritative on-disk content, at which point "
-                        f"your surgical edits (or a REWRITE_FILE) will "
-                        f"be accepted."
+                        f"[screen:stuck-reread] `{file_key}` is "
+                        f"{_reason}. This patch was REJECTED. Emit "
+                        f"<<<READ_FILE>>> for `{file_key}` in your "
+                        f"NEXT response — that will re-dispatch you "
+                        f"with the authoritative on-disk content, at "
+                        f"which point your surgical edits (or a "
+                        f"REWRITE_FILE) will be accepted."
                     ),
                 ))
                 continue
@@ -11727,6 +11857,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         for afr in applied_fixes:
             if afr.file not in autofix_modified_files:
                 autofix_modified_files.append(afr.file)
+        # Autofix writes to disk without going through the LLM — mark
+        # every autofixed file as stuck so a subsequent LLM edit hits
+        # guard 2 and re-reads it. Without this, the LLM's mental
+        # model still reflects the pre-autofix content.
+        _mark_files_modified(
+            loop_counter, [afr.file for afr in applied_fixes],
+        )
         sys_msg = autofix_system_message(applied_fixes)
         if sys_msg:
             autofix_messages.append({"role": "system", "content": sys_msg})
@@ -13363,6 +13500,11 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         _update_search_history_post_patch(
             _blocks_kept, patch_results, loop_counter,
         )
+        # Mark successfully-modified files as stuck (universal stale-
+        # view defense) so the LLM's next edit against any of them
+        # requires a fresh READ_FILE.
+        if modified_files:
+            _mark_files_modified(loop_counter, modified_files)
         # Merge screen rejections so the LLM sees them in the next round's
         # status message alongside the patcher's own results.
         patch_results = list(_screen_rejections) + list(patch_results)

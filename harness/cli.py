@@ -3825,6 +3825,7 @@ async def synthesize_requirements(
             role=NodeRole.PLANNING,
             budget_remaining_usd=2.00,
             log_label="requirements",
+            cache_family="planning:requirements_synthesis",
         )
     except Exception as exc:
         raise RuntimeError(f"LLM synthesis failed: {exc}") from exc
@@ -3874,6 +3875,7 @@ async def _dispatch_with_continuation(
     budget_remaining_usd: float,
     log_label: str,
     max_continuations: int = 3,
+    cache_family: Optional[str] = None,
 ) -> tuple[str, float]:
     """Dispatch a planning-role completion that may exceed the model's
     per-call ``max_tokens``. When the LLM signals
@@ -3896,6 +3898,7 @@ async def _dispatch_with_continuation(
             messages=working,
             role=role,
             budget_remaining_usd=budget,
+            cache_family=cache_family,
         )
         chunk = response.content or ""
         chunks.append(chunk)
@@ -4057,6 +4060,7 @@ async def synthesize_architecture(
             role=NodeRole.PLANNING,
             budget_remaining_usd=2.00,
             log_label="architecture",
+            cache_family="planning:architecture_synthesis",
         )
     except Exception as exc:
         raise RuntimeError(f"LLM architecture synthesis failed: {exc}") from exc
@@ -4320,6 +4324,7 @@ async def synthesize_installation(
             role=NodeRole.PLANNING,
             budget_remaining_usd=1.00,
             log_label="installation",
+            cache_family="planning:installation_synthesis",
         )
     except Exception as exc:
         raise RuntimeError(f"LLM installation synthesis failed: {exc}") from exc
@@ -4387,6 +4392,7 @@ updated SPEC_REQUIREMENTS.md document."""
         role=NodeRole.PLANNING,
         budget_remaining_usd=2.00,
         log_label="requirements:refine",
+        cache_family="planning:requirements_refine",
     )
 
     content = content_raw.strip()

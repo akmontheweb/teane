@@ -1161,6 +1161,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             messages=call_messages,
             role=NodeRole.PLANNING,
             budget_remaining_usd=budget,
+            cache_family="planning:story_decomposition",
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[decomposition] gateway dispatch failed: %s", exc)
@@ -1255,6 +1256,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                     messages=repair_messages,
                     role=NodeRole.PLANNING,
                     budget_remaining_usd=budget,
+                    cache_family="planning:decomposition_repair",
                 )
                 repaired_raw = strip_json_fence(
                     getattr(response, "content", "") or ""

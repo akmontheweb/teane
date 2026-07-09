@@ -347,6 +347,7 @@ async def _llm_propose(
             messages=messages,
             role=NodeRole.PLANNING,
             budget_remaining_usd=budget_remaining_usd,
+            cache_family="planning:batch_sizing",
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[batch_sizing] gateway dispatch failed: %s", exc)

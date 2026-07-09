@@ -2319,6 +2319,7 @@ class Gateway:
         force_local: bool = False,
         model_override: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
+        cache_family: Optional[str] = None,
         **llm_kwargs: Any,
     ) -> tuple[LLMResponse, float]:
         """
@@ -2334,6 +2335,17 @@ class Gateway:
                 escalation (e.g., repair attempt 3 → reasoning model) instead
                 of mutating gateway.config, which would race in concurrent
                 dispatches and leak state on exception.
+            cache_family: Fine-grained bucket for prefix-drift accounting.
+                Defaults to ``role.value``. Callsites that legitimately
+                share a role but NOT a system prompt (e.g. the ~5+ distinct
+                planning entrypoints — requirements synth, architecture
+                synth, story decomposition, batch planning, spec review)
+                should each pass a distinct string like
+                ``"planning:requirements_synthesis"``. The drift detector
+                keys on ``(session_id, cache_family)`` instead of
+                ``(session_id, role.value)``, so between-family drift stops
+                producing false-positive warnings and remaining drift within
+                a family is load-bearing signal (a real cache leak).
             **llm_kwargs: Additional parameters passed to the provider's chat_completion.
 
         Returns:
@@ -2529,13 +2541,26 @@ class Gateway:
             _prefix_hash = hash_stable_prefix(
                 messages, n_stable=2, tools=effective_tools,
             )
-            _drift_key = (_sid, role.value)
+            # cache_family lets callsites that share a role but NOT a
+            # system prompt (planning is the loudest offender — 5+ entry
+            # points with distinct prompts) each occupy their own drift
+            # bucket, so between-family drift stops looking like a cache
+            # leak. Falls back to role.value so untouched callsites keep
+            # their current behaviour.
+            _drift_family = cache_family or role.value
+            _drift_key = (_sid, _drift_family)
             _last_hash = self._prefix_hashes.get(_drift_key)
             if _last_hash is not None and _last_hash != _prefix_hash:
+                _family_note = (
+                    f" family={_drift_family}"
+                    if cache_family is not None
+                    else ""
+                )
                 logger.warning(
-                    "[gateway] cache prefix drift role=%s session=%s prev=%s now=%s "
-                    "— auto-cache will miss this call.",
-                    role.value, _sid[:8] if _sid else "?",
+                    "[gateway] cache prefix drift role=%s%s session=%s "
+                    "prev=%s now=%s — auto-cache will miss this call.",
+                    role.value, _family_note,
+                    _sid[:8] if _sid else "?",
                     _last_hash[:8], _prefix_hash[:8],
                 )
                 # Phase 3(b) — diff the prefix against the prior snapshot
@@ -2563,6 +2588,7 @@ class Gateway:
                         emit_event(
                             "cache_prefix_drift",
                             role=role.value,
+                            cache_family=_drift_family,
                             session_id=_sid,
                             prev_hash=_last_hash[:8],
                             now_hash=_prefix_hash[:8],

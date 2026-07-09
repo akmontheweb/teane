@@ -272,6 +272,108 @@ async def test_gateway_emits_cache_prefix_drift_on_second_call(monkeypatch):
     assert drift_events, f"expected cache_prefix_drift event; got {events}"
 
 
+@pytest.mark.asyncio
+async def test_gateway_cache_family_isolates_drift_buckets(monkeypatch):
+    """Two dispatches with the same role but distinct ``cache_family``
+    strings must NOT fire drift — they're separate buckets. Two
+    dispatches with the same ``cache_family`` and a mutated prefix
+    must still fire drift within that family."""
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_emit(name: str, **fields: Any) -> None:
+        events.append((name, fields))
+
+    monkeypatch.setattr("harness.observability.emit_event", _fake_emit)
+    monkeypatch.setattr(
+        "harness.observability.get_active_session_id", lambda: "sid-cf-1234"
+    )
+
+    register_model("stub:cf-test", ModelSpec(
+        provider="stub", model_id="cf-test", context_window=128_000,
+        input_cost_per_1m=0.5, output_cost_per_1m=1.0,
+        api_base_url="", api_key="x",
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:cf-test",
+        patching_primary="stub:cf-test",
+        repair_primary="stub:cf-test",
+    )
+    gw = Gateway(cfg)
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="cf-test", context_window=128_000,
+            input_cost_per_1m=0.5, output_cost_per_1m=1.0,
+            api_base_url="", api_key="x",
+        )
+        api_key = "x"
+
+        async def chat_completion(self, **_kwargs: Any) -> LLMResponse:
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1, model_name="stub:cf-test", cost_usd=0.0),
+                model="stub:cf-test",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:cf-test"] = _Stub()  # type: ignore[assignment]
+
+    # Two PLANNING dispatches with different families + different
+    # prefixes — no drift because the families isolate them.
+    await gw.dispatch(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "requirements prompt"},
+        ],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=2.00,
+        cache_family="planning:requirements_synthesis",
+    )
+    await gw.dispatch(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "architecture prompt"},
+        ],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=2.00,
+        cache_family="planning:architecture_synthesis",
+    )
+    assert not [name for name, _ in events if name == "cache_prefix_drift"], (
+        "cross-family calls must not trigger drift"
+    )
+
+    # Two dispatches sharing the same family with a mutated prefix →
+    # drift fires (real cache leak within a family).
+    await gw.dispatch(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "requirements prompt v1"},
+        ],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=2.00,
+        cache_family="planning:requirements_refine",
+    )
+    await gw.dispatch(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "requirements prompt v2"},
+        ],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=2.00,
+        cache_family="planning:requirements_refine",
+    )
+    within_family = [
+        fields for name, fields in events
+        if name == "cache_prefix_drift"
+        and fields.get("cache_family") == "planning:requirements_refine"
+    ]
+    assert within_family, (
+        f"within-family drift must still fire; got events={events}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Config plumbing
 # ---------------------------------------------------------------------------

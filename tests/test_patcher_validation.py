@@ -40,6 +40,65 @@ def test_validate_syntax_skips_non_validated_extensions():
     assert _validate_syntax("app.ts", "function() {") is None
 
 
+# Finsearch session 44c5e194 root cause E4: LLM repair corrupted
+# requirements.txt to ``lxml==6.1.0.`` (trailing dot). Post-patch
+# validator now catches invalid PEP 508 requirement lines and rolls
+# back the patch instead of shipping the corruption to pip.
+
+def test_validate_requirements_txt_ok():
+    content = (
+        "# core deps\n"
+        "fastapi>=0.100.0\n"
+        "sqlalchemy[asyncio]==2.0.30\n"
+        "lxml==6.1.0\n"
+        "pytest; python_version >= '3.10'\n"
+        "-r requirements-base.txt\n"
+    )
+    assert _validate_syntax("requirements.txt", content) is None
+
+
+def test_validate_requirements_txt_rejects_trailing_dot_version():
+    # The exact corruption from the finsearch session — LLM patched
+    # requirements.txt and left an extra dot after the version.
+    content = "lxml==6.1.0.\n"
+    err = _validate_syntax("requirements.txt", content)
+    assert err is not None
+    assert "Invalid requirement" in err
+    assert "line 1" in err
+    assert "lxml==6.1.0." in err
+
+
+def test_validate_requirements_dev_and_test_also_checked():
+    # The validator covers requirements-dev.txt and requirements-test.txt
+    # under the same rule, since they use identical PEP 508 syntax.
+    err = _validate_syntax("requirements-dev.txt", "pytest==\n")
+    assert err is not None and "Invalid requirement" in err
+    err = _validate_syntax("requirements-test.txt", "coverage==\n")
+    assert err is not None and "Invalid requirement" in err
+
+
+def test_validate_requirements_ignores_comments_and_flags():
+    # Comments, blank lines, and pip flags (-r, -e, -c, --extra-index-url)
+    # must not be parsed as requirements.
+    content = (
+        "# leading comment\n"
+        "\n"
+        "-r requirements-base.txt\n"
+        "-e .\n"
+        "--extra-index-url https://example.com/simple\n"
+        "-c constraints.txt\n"
+        "requests>=2.0\n"
+    )
+    assert _validate_syntax("requirements.txt", content) is None
+
+
+def test_validate_requirements_txt_only_by_basename():
+    # A file that happens to end in .txt but isn't a pip manifest is
+    # not validated (the check keys on basename == requirements*.txt).
+    content = "not a requirement at all\n"
+    assert _validate_syntax("notes.txt", content) is None
+
+
 class TestPostPatchValidation:
     @pytest.mark.asyncio
     async def test_create_file_valid_python_succeeds(self):

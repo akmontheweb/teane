@@ -25,7 +25,9 @@ up a full repair-loop fixture.
 from __future__ import annotations
 
 from harness.graph import (
+    _hypothesis_fingerprint,
     _reflection_verdict_is_low_signal,
+    _same_hypothesis_streak,
 )
 
 
@@ -146,3 +148,64 @@ class TestFallbackDiagnosticsForJudgeInput:
                 continue
             picked.append(err)
         assert picked == []
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis fingerprint / streak — C1+C2 (finsearch session 44c5e194)
+# ---------------------------------------------------------------------------
+
+class TestHypothesisFingerprint:
+    """Finsearch session 44c5e194 root causes C1/C2: the reflection
+    kept flip-flopping COMPLETED ↔ FAILED for 6+ rounds on
+    ``tests/test_ingestion.py:71``, and later burned 12 consecutive
+    rounds blaming "pytest running from a subdir." Each round's
+    verdict carried a PROGRESS label so ``consecutive_distraction_rounds``
+    reset every time. The fingerprint helpers detect same-hypothesis
+    fixation independent of the verdict label."""
+
+    def test_fingerprint_extracts_workspace_files(self, tmp_path):
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "auth.py").write_text("x\n")
+        v = {
+            "verdict": "DISTRACTION",
+            "real_blocker": "server/auth.py fails at line 42",
+            "recommendation": "edit server/auth.py to add the missing arg",
+        }
+        fp = _hypothesis_fingerprint(v, str(tmp_path))
+        assert fp == frozenset({"server/auth.py"})
+
+    def test_fingerprint_empty_for_low_signal_verdict(self, tmp_path):
+        v = {
+            "verdict": "DISTRACTION",
+            "real_blocker": "insufficient data — investigate the flow",
+            "recommendation": "",
+        }
+        # No file references — fingerprint is empty and callers must
+        # treat as "no hypothesis signal".
+        assert _hypothesis_fingerprint(v, str(tmp_path)) == frozenset()
+
+    def test_streak_grows_with_intersecting_fingerprints(self):
+        current = frozenset({"a.py", "b.py"})
+        recent = [["a.py"], ["a.py", "c.py"], ["b.py"]]
+        # Three prior rounds all share at least one file — streak=3.
+        assert _same_hypothesis_streak(current, recent) == 3
+
+    def test_streak_breaks_at_first_non_intersecting(self):
+        current = frozenset({"a.py"})
+        # b.py in the middle breaks the chain, so only the most recent
+        # 1 counts.
+        recent = [["a.py"], ["b.py"], ["a.py"]]
+        assert _same_hypothesis_streak(current, recent) == 1
+
+    def test_streak_zero_when_current_empty(self):
+        assert _same_hypothesis_streak(frozenset(), [["a.py"]]) == 0
+
+    def test_streak_zero_when_no_prior(self):
+        assert _same_hypothesis_streak(frozenset({"a.py"}), []) == 0
+
+    def test_streak_breaks_on_empty_prior(self):
+        # An empty prior fingerprint (low-signal round in the middle)
+        # breaks the chain — the LLM had no coherent target that round.
+        current = frozenset({"a.py"})
+        recent = [["a.py"], [], ["a.py"]]
+        assert _same_hypothesis_streak(current, recent) == 1

@@ -84,6 +84,31 @@ def _write_spec(workspace: str) -> str:
     return spec_path
 
 
+def test_spec_drift_logged_as_warning(caplog):
+    """Finsearch session 44c5e194 root cause B1: LLM stories with no
+    spec match used to be an INFO log the run silently ignored.
+    Bumped to WARNING with actionable text — the operator can act on
+    it before burning hours on a build with orphaned scope."""
+    import logging
+    from harness.spec_reconciler import _match_llm_to_spec
+
+    caplog.set_level(logging.WARNING, logger="harness.spec_reconciler")
+    spec = [
+        {"story_key": "STORY-001", "title": "Real spec story"},
+    ]
+    llm = [
+        {"story_key": "STORY-001", "title": "Real spec story"},
+        {"story_key": "STORY-999", "title": "Hallucinated feature"},
+    ]
+    _match_llm_to_spec(spec, llm)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("SPEC DRIFT" in r.message for r in warnings), warnings
+    joined = " ".join(r.getMessage() for r in warnings)
+    assert "STORY-999" in joined
+    assert "Hallucinated" in joined
+
+
 def test_reconciler_writes_story_satisfies_req_edges(isolated_state_db, tmp_path):
     """The identity link — story ``STORY-001`` satisfies requirement
     ``STORY-001`` — must be written for every spec-authored story.

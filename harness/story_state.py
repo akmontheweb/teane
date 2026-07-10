@@ -1948,6 +1948,70 @@ def record_commit(
     conn.commit()
 
 
+def rollback_unlinked_done_stories(
+    conn: sqlite3.Connection,
+    workspace: str,
+    session_id: str,
+) -> list[str]:
+    """Downgrade every ``done`` story that has zero ``file_links`` to
+    ``blocked`` with a defect, and return the list of story_keys touched.
+
+    Called when the traceability gate forces END with a non-zero exit
+    code: the session terminated because the story→req/AC links couldn't
+    be built, so any story sealed ``done`` without a single associated
+    file is decorative — it can't have delivered anything real. Leaving
+    it ``done`` in state.db causes TRACEABILITY.md to be regenerated
+    with a green row that lies about session outcome.
+
+    Finsearch session ``44c5e194`` root cause A6: the router already
+    exits cleanly to prevent the ciod ``523e86a7`` ping-pong loop, but
+    stale ``done`` rows survived and TRACEABILITY.md kept showing every
+    story green even though the run failed. This helper closes that gap.
+
+    Empty batches now block their own stories at seal time
+    (:func:`seal_batch_atomically`) — this rollback is the safety net
+    for stories linked to no file even though the batch was non-empty
+    (planner scope drift, batches where the emitted files didn't
+    intersect any story's scope, etc.).
+    """
+    now = _utcnow_iso()
+    rows = conn.execute(
+        "SELECT s.id, s.story_key FROM stories s "
+        "WHERE s.workspace = ? AND s.status = 'done' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM file_links f WHERE f.story_id = s.id"
+        ")",
+        (workspace,),
+    ).fetchall()
+    if not rows:
+        return []
+    keys: list[str] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for sid, key in rows:
+            conn.execute(
+                "UPDATE stories SET status = 'blocked' WHERE id = ?",
+                (sid,),
+            )
+            conn.execute(
+                "INSERT INTO defects(workspace, story_id, session_id, "
+                "severity, summary, created_at, status) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'open')",
+                (workspace, sid, session_id, "traceability_rollback",
+                 "Story was sealed ``done`` but has zero file_links. "
+                 "The traceability gate then failed the session; "
+                 "downgrading to ``blocked`` so TRACEABILITY.md "
+                 "reflects actual outcome instead of a false-positive "
+                 "green row.", now),
+            )
+            keys.append(key)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return keys
+
+
 def seal_batch_atomically(
     conn: sqlite3.Connection,
     *,
@@ -1958,7 +2022,8 @@ def seal_batch_atomically(
     committed_sha: Optional[str],
     batch_commit_message: Optional[str],
     session_id: str,
-) -> list[str]:
+    batch_files: Optional[list[tuple[str, str]]] = None,
+) -> tuple[list[str], int]:
     """Seal a batch in a single SQLite transaction.
 
     Crash-mid-commit safety: previously batch_commit_node called
@@ -1973,12 +2038,31 @@ def seal_batch_atomically(
     helper — it can't be rolled back, so it happens first; the resulting
     SHA is then stamped here together with everything else.
 
-    Returns the list of ``story_key`` values that this call transitioned
-    from a non-terminal status to ``done``.
+    ``batch_files`` is ``[(path, kind), ...]`` for every file this batch
+    touched — used to populate ``file_links`` for every constituent
+    story so TRACEABILITY.md can attribute code. Batch mode bypasses
+    ``story_complete_node`` (the per-story linker), so without this the
+    ``file_links`` table stays empty for every batch-mode run. Attribution
+    is batch-granular rather than per-story — the honest lower bound.
+
+    ``batch_files`` also gates story→done transitions: a batch that
+    produced zero files can't have delivered any story, so any
+    still-``planned``/``in_progress`` story in it is parked ``blocked``
+    with a defect instead of sealed ``done``. Prior behavior silently
+    marked such stories ``done``, hiding empty batches from traceability.
+
+    Returns ``(done_keys, blocked_count_after_seal)`` — the story keys
+    that this call transitioned to ``done``, and the final blocked count
+    (which may exceed the caller-supplied ``blocked_count`` when this
+    seal parks stories itself because ``batch_files`` was empty).
     """
     done_keys: list[str] = []
     now = _utcnow_iso()
-    batch_status = "complete" if blocked_count == 0 else "complete_with_blocks"
+    files = list(batch_files or [])
+    # An empty batch cannot have delivered anything — park the stories
+    # instead of sealing them. seal_batch continues so the batch row still
+    # advances (otherwise the planner would re-pick the same batch forever).
+    empty_batch = len(files) == 0
     try:
         conn.execute("BEGIN IMMEDIATE")
         for key, _title, status in stories_in_batch:
@@ -1991,6 +2075,23 @@ def seal_batch_atomically(
             if row is None:
                 continue
             sid = row[0]
+            if empty_batch:
+                conn.execute(
+                    "UPDATE stories SET status = 'blocked' "
+                    "WHERE workspace = ? AND story_key = ?",
+                    (workspace, key),
+                )
+                conn.execute(
+                    "INSERT INTO defects(workspace, story_id, session_id, "
+                    "severity, summary, created_at, status) "
+                    "VALUES(?, ?, ?, ?, ?, ?, 'open')",
+                    (workspace, sid, session_id, "empty_batch_seal",
+                     f"Batch {batch_id} sealed with zero modified files — "
+                     "no code was produced for this story. "
+                     "Traceability has nothing to link.", now),
+                )
+                blocked_count += 1
+                continue
             conn.execute(
                 "UPDATE stories SET status = 'done', completed_at = ? "
                 "WHERE workspace = ? AND story_key = ?",
@@ -2003,6 +2104,33 @@ def seal_batch_atomically(
             )
             done_keys.append(key)
 
+        # file_links: batch-granular attribution. Every file the batch
+        # touched links to every story in the batch (both done and any
+        # that were already in terminal state going in). link_file uses
+        # INSERT OR IGNORE at the (story_id, path, kind) unique key so
+        # re-seals are idempotent.
+        for key, _title, _status in stories_in_batch:
+            row = conn.execute(
+                "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+                (workspace, key),
+            ).fetchone()
+            if row is None:
+                continue
+            sid = row[0]
+            for path, kind in files:
+                conn.execute(
+                    "INSERT INTO file_links"
+                    "(workspace, story_id, path, kind, batch_id) "
+                    "VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(story_id, path, kind) DO UPDATE SET "
+                    "batch_id = excluded.batch_id, "
+                    "workspace = excluded.workspace",
+                    (workspace, sid, path, kind, batch_id),
+                )
+
+        batch_status = (
+            "complete" if blocked_count == 0 else "complete_with_blocks"
+        )
         if committed_sha:
             conn.execute(
                 "UPDATE batches SET status = ?, completed_at = ?, "
@@ -2025,7 +2153,7 @@ def seal_batch_atomically(
     except Exception:
         conn.rollback()
         raise
-    return done_keys
+    return done_keys, blocked_count
 
 
 # ---------------------------------------------------------------------------

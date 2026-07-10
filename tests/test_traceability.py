@@ -337,6 +337,55 @@ class TestRouteAfterInstallationDoc:
         }
         assert route_after_installation_doc(state) == END
 
+    def test_end_at_cap_rolls_back_unlinked_done_stories(self, tmp_path):
+        """Finsearch session 44c5e194 root cause A6: the router
+        correctly forces END to break the headless loop, but state.db
+        was left with sealed-but-unlinked stories still ``done``.
+        Router must call the rollback helper before returning END so
+        the persisted state matches session outcome."""
+        from harness.graph import (
+            route_after_installation_doc,
+            TRACEABILITY_BLOCK_CYCLE_CAP,
+        )
+        from harness import story_state
+        from langgraph.graph import END
+
+        ws = tmp_path / "ws-app"
+        ws.mkdir()
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "test", name="Test")
+            keys = story_state.create_stories(conn, app, [
+                {"title": "linked", "feature": "test"},
+                {"title": "unlinked", "feature": "test"},
+            ])
+            for k in keys:
+                story_state.mark_done(conn, app, k)
+            story_state.link_file(
+                conn, app, keys[0], "src/a.py", "code",
+            )
+        finally:
+            conn.close()
+
+        state = {
+            "workspace_path": str(ws),
+            "session_id": "sess-42",
+            "node_state": {"traceability_blocked": True},
+            "loop_counter": {
+                "traceability_block_cycles": TRACEABILITY_BLOCK_CYCLE_CAP,
+            },
+        }
+        assert route_after_installation_doc(state) == END
+
+        # unlinked story downgraded, linked story preserved.
+        conn = story_state.open_story_db()
+        try:
+            assert story_state.get_story(conn, app, keys[0])["status"] == "done"
+            assert story_state.get_story(conn, app, keys[1])["status"] == "blocked"
+        finally:
+            conn.close()
+
     def test_cycle_counter_ignored_when_not_blocked(self):
         # If the audit is clean this pass, the cycle counter should
         # NOT force END prematurely — a fresh clean pass wins.

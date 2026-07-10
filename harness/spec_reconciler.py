@@ -280,13 +280,33 @@ def _match_llm_to_spec(
             )
 
     if llm_unused:
-        logger.info(
-            "[spec_reconciler] %d LLM stories had no spec match (drift signal): %s",
-            len(llm_unused),
-            ", ".join(
-                f"{s['story_key']}={s['title']!r}" for s in llm_unused[:5]
-            ),
+        # Finsearch session 44c5e194 root cause B1: this was an INFO
+        # log and got ignored. Bump to WARNING and be explicit about
+        # what the operator should check — either SPEC_REQUIREMENTS.md
+        # is missing rows the planner invented, or the planner
+        # hallucinated stories that shouldn't have been created.
+        # Either way, the run will produce features that no story
+        # attribution can point at.
+        first5 = ", ".join(
+            f"{s['story_key']}={s['title']!r}" for s in llm_unused[:5]
         )
+        logger.warning(
+            "[spec_reconciler] SPEC DRIFT: %d LLM-invented story(s) "
+            "have no counterpart in SPEC_REQUIREMENTS.md — the planner "
+            "hallucinated them, or the spec is missing rows. Either "
+            "add them to docs/SPEC_REQUIREMENTS.md (with feature + "
+            "acceptance criteria) or fix the planner prompt before "
+            "the next run. First 5: %s",
+            len(llm_unused), first5,
+        )
+        # Full list at DEBUG for the operator digging in later.
+        if len(llm_unused) > 5:
+            logger.debug(
+                "[spec_reconciler] full drift list: %s",
+                ", ".join(
+                    f"{s['story_key']}={s['title']!r}" for s in llm_unused
+                ),
+            )
     return by_key
 
 

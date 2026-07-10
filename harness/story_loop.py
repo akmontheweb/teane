@@ -953,7 +953,11 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         # never leave the batch row ``running`` with stories already
         # marked ``done`` — on resume, batch_planner_node would have
         # seen inconsistent state.
-        done_keys = story_state.seal_batch_atomically(
+        # Per-file (path, kind) for traceability attribution. batch_files
+        # is a plain list of rel paths from state; classify each so
+        # TRACEABILITY.md can split "code" vs "test" vs "doc" columns.
+        classified_files = [(p, _classify_file(p)) for p in batch_files]
+        done_keys, blocked_count = story_state.seal_batch_atomically(
             conn,
             workspace=workspace,
             batch_id=batch_id,
@@ -962,6 +966,7 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
             committed_sha=committed_sha,
             batch_commit_message=batch_message,
             session_id=session_id,
+            batch_files=classified_files,
         )
     finally:
         conn.close()

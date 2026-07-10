@@ -1937,7 +1937,7 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
             "allowlist_rules": ["python.lang.security.audit.formatted-sql-query"],
             "max_findings_to_route_to_repair": 10,
             "gitleaks_path": "", "bandit_path": "", "semgrep_path": "", "trivy_path": "",
-            "sast_timeout_seconds": 15,
+            "sast_timeout_seconds": 60,
             "trivy_timeout_seconds": 60,
             "max_security_fix_attempts": 2
           }
@@ -1949,7 +1949,12 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     workspace_path = state.get("workspace_path", os.getcwd())
-    timeout_sec = int(sec_cfg.get("sast_timeout_seconds", 15))
+    # Finsearch session 44c5e194 root cause E3: semgrep timed out at
+    # 15s on a workspace with ~30 files, leaving the security scan
+    # INCOMPLETE. Bumped default to 60s to give scanners a realistic
+    # budget on non-trivial workspaces; operators can lower via
+    # ``security.sast_timeout_seconds`` if latency matters more.
+    timeout_sec = int(sec_cfg.get("sast_timeout_seconds", 60))
     trivy_timeout = int(sec_cfg.get("trivy_timeout_seconds", 60))
     policy = SecurityScanPolicy.from_config(sec_cfg)
 

@@ -187,3 +187,108 @@ def test_pip_resolution_conflict_matches_actual_log():
         "tail\n"
     )
     assert gr._is_pip_resolution_conflict(raw_output, "pip install -r requirements.txt")
+
+
+# ---------------------------------------------------------------------------
+# _update_sticky_create_rejections — D1 (finsearch session 44c5e194)
+# ---------------------------------------------------------------------------
+
+class TestStickyCreateRejections:
+    """Finsearch session 44c5e194 root cause D1: the LLM emitted
+    CREATE_FILE for existing files 15+ times because the rejection
+    memory lived only in ``node_state['patch_failures']`` (round-N-1
+    only). The sticky accumulator persists across every round of the
+    session until the LLM proves re-orientation by successfully
+    modifying the file with a non-CREATE op."""
+
+    def test_new_rejection_added_to_sticky_set(self):
+        state = {"sticky_create_rejections": []}
+        failures = [
+            {
+                "file": "server/models.py",
+                "operation": "create_file",
+                "error": "File already exists with different content: server/models.py",
+            },
+        ]
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == ["server/models.py"]
+
+    def test_pre_existing_rejections_preserved(self):
+        state = {
+            "sticky_create_rejections": ["server/database.py", "server/main.py"],
+        }
+        failures = [
+            {
+                "file": "server/models.py",
+                "operation": "create_file",
+                "error": "File already exists with different content: ...",
+            },
+        ]
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == ["server/database.py", "server/main.py", "server/models.py"]
+
+    def test_dedup_when_same_file_rejected_again(self):
+        state = {"sticky_create_rejections": ["server/main.py"]}
+        failures = [
+            {
+                "file": "server/main.py",
+                "operation": "create_file",
+                "error": "File already exists ...",
+            },
+        ]
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == ["server/main.py"]
+
+    def test_successful_modification_clears_sticky(self):
+        # The LLM has now used replace_block / insert_at_block on
+        # server/main.py — no more need to nag about it.
+        state = {"sticky_create_rejections": ["server/main.py", "server/db.py"]}
+        out = gr._update_sticky_create_rejections(
+            state, [], this_round_modified=["server/main.py"],
+        )
+        assert out == ["server/db.py"]
+
+    def test_ignores_non_create_failures(self):
+        # A REPLACE_BLOCK "search not found" failure is a different
+        # bug — don't add to the create-rejection set.
+        state = {"sticky_create_rejections": []}
+        failures = [
+            {
+                "file": "server/x.py",
+                "operation": "replace_block",
+                "error": "Search block not found ...",
+            },
+        ]
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == []
+
+    def test_ignores_create_failures_without_already_exists_message(self):
+        # E.g. an allowlist rejection routed via patch_failures — has
+        # operation=create_file but not the "already exists" phrase.
+        state = {"sticky_create_rejections": []}
+        failures = [
+            {
+                "file": "outside/root.py",
+                "operation": "create_file",
+                "error": "path not in allowlist",
+            },
+        ]
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == []
+
+    def test_tolerates_missing_state_key(self):
+        # Fresh session: state has no sticky_create_rejections yet.
+        out = gr._update_sticky_create_rejections({}, [], [])
+        assert out == []
+
+    def test_tolerates_malformed_failure_entries(self):
+        state = {"sticky_create_rejections": []}
+        failures = [
+            "not a dict",
+            {"file": "", "operation": "create_file", "error": "already exists"},
+            {"operation": "create_file", "error": "already exists"},  # no file
+            None,
+        ]
+        # None of these should be added.
+        out = gr._update_sticky_create_rejections(state, failures, [])
+        assert out == []

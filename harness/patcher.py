@@ -63,11 +63,12 @@ def _validate_syntax(filepath: str, content: str) -> Optional[str]:
     """Return an error-message string when ``content`` doesn't parse for
     the language implied by ``filepath``, otherwise None.
 
-    Deliberately narrow: only Python and JSON, since those are the two
-    formats where a bad patch reliably wedges the whole build (SyntaxError
-    at collect time; malformed manifest at install time). Extending to
-    TS/JS would require ``tsc``/``node`` in the harness runtime, which
-    we don't guarantee.
+    Deliberately narrow: only Python, JSON, and requirements.txt —
+    formats where a bad patch reliably wedges the whole build
+    (SyntaxError at collect time; malformed manifest at install time;
+    unparseable version specifier at pip resolve). Extending to TS/JS
+    would require ``tsc``/``node`` in the harness runtime, which we
+    don't guarantee.
     """
     if filepath.endswith(".py"):
         try:
@@ -86,6 +87,37 @@ def _validate_syntax(filepath: str, content: str) -> Optional[str]:
             return None
         except json.JSONDecodeError as e:
             return f"JSONDecodeError at line {e.lineno}: {e.msg}"
+    # Finsearch session 44c5e194 root cause E4: a repair patch corrupted
+    # requirements.txt to ``lxml==6.1.0.`` (trailing dot). Reflection
+    # caught it 90 minutes later, past the HITL budget. Rolling back
+    # invalid requirement lines at patch time forces the LLM to emit a
+    # valid version specifier on the next turn instead of burning
+    # rounds on the install failure.
+    base = os.path.basename(filepath).lower()
+    if base in ("requirements.txt", "requirements-dev.txt", "requirements-test.txt"):
+        try:
+            from packaging.requirements import Requirement, InvalidRequirement
+        except ImportError:
+            # packaging isn't guaranteed in the harness runtime.
+            # Skip validation rather than block patches on our own
+            # missing dep.
+            return None
+        for lineno, raw in enumerate(content.splitlines(), start=1):
+            stripped = raw.strip()
+            if not stripped or stripped.startswith(("#", "-r ", "--", "-e ", "-c ")):
+                # Blank, comment, or a pip flag like -r reqs-base.txt / -e .
+                continue
+            # Environment markers like `pkg==1; python_version>="3.10"`
+            # are handled by Requirement itself.
+            try:
+                Requirement(stripped)
+            except InvalidRequirement as e:
+                return (
+                    f"Invalid requirement at line {lineno}: {stripped!r} "
+                    f"({e}). Every non-comment line must be a valid PEP 508 "
+                    "requirement — no trailing dots on versions, no "
+                    "half-typed specifiers."
+                )
     return None
 
 

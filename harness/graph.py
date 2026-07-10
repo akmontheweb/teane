@@ -582,6 +582,52 @@ def _extend_batch_scope(
     return out
 
 
+def _update_sticky_create_rejections(
+    state: "AgentState",
+    this_round_failures: list[dict[str, Any]],
+    this_round_modified: list[str],
+) -> list[str]:
+    """Accumulate and return the session-scoped list of files where
+    the patcher has rejected a ``CREATE_FILE`` with the "file already
+    exists" refusal.
+
+    Finsearch session 44c5e194 root cause D1: the LLM emitted
+    ``CREATE_FILE`` for files already on disk 15+ times across many
+    rounds. The patcher correctly refused each time, but the memory
+    lived only in ``node_state["patch_failures"]`` — which is
+    round-N-1 only. By round 5 the LLM had lost the memory of the
+    round-2 rejection and re-tried the same shape.
+
+    This helper keeps a session-scoped accumulator (top-level state,
+    not node_state) so the repair prompt can render a "sticky"
+    reminder every round until the LLM successfully modifies the
+    file via a NON-create operation (which proves it has re-oriented).
+
+    ``this_round_modified`` is the current-round list of successfully-
+    touched files — any file in the sticky set that gets modified
+    this round is REMOVED (the LLM used replace_block / insert_at_block
+    correctly; no more need to nag).
+    """
+    prior = list(state.get("sticky_create_rejections") or [])
+    seen: set[str] = set(prior)
+    for f in this_round_failures or []:
+        if not isinstance(f, dict):
+            continue
+        op = str(f.get("operation") or "").lower()
+        err = str(f.get("error") or "").lower()
+        path = str(f.get("file") or "").strip()
+        if not path:
+            continue
+        if op == "create_file" and "already exists" in err:
+            if path not in seen:
+                seen.add(path)
+                prior.append(path)
+    # Drop paths the LLM successfully modified this round — it has
+    # learned to use the correct operation.
+    modified_set = set(this_round_modified or [])
+    return [p for p in prior if p not in modified_set]
+
+
 def _batch_gate_passed(
     state: "AgentState", gate: str,
 ) -> bool:
@@ -4585,6 +4631,11 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # the disk read. Empty dict here means "no §11 block on
             # disk" — re-loading would just hit the same miss.
             "arch_summary": resolved_arch_summary,
+            # Sticky per-session record of CREATE_FILE rejections. See
+            # `_update_sticky_create_rejections`.
+            "sticky_create_rejections": _update_sticky_create_rejections(
+                state, patch_failures, modified_files,
+            ),
             "node_state": {
                 "current_node": "patching",
                 "patch_complete": True,
@@ -9224,6 +9275,59 @@ def _build_repair_reflection_prompt(
     )
 
 
+def _hypothesis_fingerprint(
+    verdict: dict[str, str], workspace_path: str,
+) -> frozenset[str]:
+    """Return a stable fingerprint of the *target* the reflection
+    verdict is naming — the set of workspace-relative file paths in
+    the ``real_blocker`` + ``recommendation`` text.
+
+    Used by the same-hypothesis fixation detector (finsearch session
+    44c5e194 root causes C1/C2): when a PROGRESS verdict names the
+    same file(s) as the last several verdicts, the LLM is oscillating
+    on the same wrong hypothesis (COMPLETED ↔ FAILED at
+    ``test_ingestion.py:71``, or 12 rounds blaming
+    ``pytest-runs-from-subdir``) — not making real progress. The
+    fingerprint is a frozenset so equality/subset checks are cheap and
+    hashable for storing in ``loop_counter``.
+
+    Empty fingerprint when the verdict names no files under workspace
+    (e.g. the ``insufficient data`` sentinel, or a pure-prose blocker
+    that references no code). Callers must treat empty as "no signal"
+    — do not compare empty fingerprints for match.
+    """
+    files = _verdict_referenced_files(verdict, workspace_path)
+    return frozenset(files)
+
+
+def _same_hypothesis_streak(
+    current_fp: frozenset[str],
+    recent_fps: list[list[str]],
+) -> int:
+    """Given the current hypothesis fingerprint and the last-N
+    fingerprints (stored as sorted lists in loop_counter for JSON
+    round-tripping), return the number of consecutive prior rounds
+    whose fingerprint intersects ``current_fp``.
+
+    Intersection (not equality) is the right test: verdict N might
+    reference ``a.py, b.py`` and verdict N+1 only ``a.py`` — that's
+    still the same hypothesis narrowing, not a new one. Two verdicts
+    that name entirely different files break the streak.
+    """
+    if not current_fp:
+        return 0
+    streak = 0
+    for prev in reversed(recent_fps):
+        prev_set = frozenset(prev or ())
+        if not prev_set:
+            break
+        if current_fp & prev_set:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 def _reflection_verdict_is_low_signal(verdict: dict[str, str]) -> bool:
     """Return True when the reflection verdict's ``real_blocker`` is the
     prompt's ``insufficient data`` escape-hatch sentinel — i.e. the judge
@@ -11882,14 +11986,65 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         exit_code, raw_log, build_cmd,
     ):
         has_source = _workspace_has_source_files(workspace)
-        if has_source:
+        # Finsearch session 44c5e194 root cause A2: the "fold to success"
+        # carve-out is legitimate for genuine greenfield rounds (no tests
+        # have ever been generated), but once test_generation_node has
+        # emitted anything, "no tests collected" means the runner isn't
+        # seeing them — an import error, a wrong CWD, a broken conftest,
+        # PYTHONPATH drift, etc. That's a real failure the repair LLM
+        # can address. Folding to success there sealed every batch of the
+        # 12-hour finsearch build as green while producing ~1/5 of the
+        # spec.
+        generated_tests = list(state.get("generated_tests") or [])
+        test_gen_iters = int(
+            (state.get("loop_counter") or {}).get("test_generation", 0) or 0
+        )
+        tests_expected = bool(generated_tests) or test_gen_iters > 0
+        if has_source and not tests_expected:
             logger.warning(
                 "[compiler_node] Test runner reported no tests collected "
-                "(exit=%d) but workspace has source files — treating as "
+                "(exit=%d) but workspace has source files and "
+                "test_generation has not run yet — treating as "
                 "success and advancing the graph.",
                 exit_code,
             )
             exit_code = 0
+        elif has_source and tests_expected:
+            # Surface as a real diagnostic so repair sees it.
+            logger.error(
+                "[compiler_node] Test runner reported no tests collected "
+                "(exit=%d) BUT test_generation has run "
+                "(iters=%d, generated=%d file(s)) — the runner isn't "
+                "collecting the tests we emitted. Routing to repair.",
+                exit_code, test_gen_iters, len(generated_tests),
+            )
+            compiler_errors = [{
+                "file": "<test-runner>",
+                "line": 0,
+                "column": 0,
+                "severity": "error",
+                "error_code": "TESTS_NOT_COLLECTED",
+                "message": (
+                    f"Test runner exited with code {exit_code} and reported "
+                    "no tests collected, but test_generation has already "
+                    f"emitted {len(generated_tests)} test file(s) across "
+                    f"{test_gen_iters} iteration(s). The runner is not "
+                    "seeing the tests we wrote. Common causes: PYTHONPATH "
+                    "doesn't include the workspace root; conftest import "
+                    "fails; test files outside pytest's testpaths; broken "
+                    "package layout (missing __init__.py); tests run from "
+                    "the wrong CWD. Fix pytest.ini / pyproject.toml "
+                    "[tool.pytest.ini_options] testpaths, add a conftest.py "
+                    "at the workspace root, or correct the build command."
+                ),
+                "semantic_context": (
+                    f"Build command: {build_cmd}. Exit code: {exit_code}. "
+                    f"Emitted test files: {generated_tests[:5]}"
+                ),
+                "missing_symbol": "",
+                "build_command": build_cmd,
+            }]
+            node_state["tests_not_collected"] = True
         else:
             # Preserved for the router's HITL branch. `no_tests_has_source`
             # stays False so the router picks the "empty workspace" path.
@@ -12675,14 +12830,62 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         loop_counter["consecutive_low_signal_rounds"],
                     )
                 else:  # PROGRESS — earn back the budget.
-                    if loop_counter.get("consecutive_distraction_rounds", 0) > 0:
-                        logger.info(
-                            "[repair_node] Reflection verdict PROGRESS; "
-                            "resetting consecutive_distraction_rounds from "
-                            "%d to 0.",
-                            loop_counter["consecutive_distraction_rounds"],
+                    # Finsearch session 44c5e194 root causes C1/C2: a
+                    # PROGRESS verdict that keeps naming the SAME file(s)
+                    # as the last few rounds is not real progress — the
+                    # LLM is oscillating on one wrong hypothesis (12
+                    # rounds all blaming "pytest running from subdir",
+                    # or COMPLETED/FAILED flip-flops on
+                    # test_ingestion.py:71). Track the hypothesis
+                    # fingerprint (referenced-files set) and don't reset
+                    # the distraction counter when the current
+                    # fingerprint overlaps recent ones.
+                    _ws_hp = state.get("workspace_path") or ""
+                    _fp = _hypothesis_fingerprint(reflection_verdict, _ws_hp)
+                    _recent_raw = loop_counter.get(
+                        "recent_hypothesis_fingerprints", []
+                    ) or []
+                    _recent: list[list[str]] = [
+                        list(r) for r in _recent_raw if isinstance(r, list)
+                    ]
+                    _streak = _same_hypothesis_streak(_fp, _recent)
+                    # Rolling window of 5 last fingerprints — enough to
+                    # detect the 6-round COMPLETED/FAILED oscillation and
+                    # the 12-round pytest-subdir loop without blowing up
+                    # state.
+                    if _fp:
+                        _recent = _recent[-4:] + [sorted(_fp)]
+                        loop_counter["recent_hypothesis_fingerprints"] = _recent
+                    loop_counter["same_hypothesis_streak"] = _streak
+                    if _streak >= 2:
+                        # Two prior rounds of the same hypothesis + a
+                        # PROGRESS verdict targeting the same files = the
+                        # LLM is stuck on this narrative. Preserve the
+                        # distraction budget; do not reset. When the
+                        # streak clears the streak counter naturally
+                        # falls to 0 and the next PROGRESS resets as
+                        # normal.
+                        logger.warning(
+                            "[repair_node] PROGRESS verdict but same "
+                            "hypothesis (streak=%d, files=%s) — "
+                            "treating as continued fixation. "
+                            "consecutive_distraction_rounds held at %d.",
+                            _streak, sorted(_fp),
+                            loop_counter.get(
+                                "consecutive_distraction_rounds", 0,
+                            ),
                         )
-                    loop_counter["consecutive_distraction_rounds"] = 0
+                    else:
+                        if loop_counter.get(
+                            "consecutive_distraction_rounds", 0,
+                        ) > 0:
+                            logger.info(
+                                "[repair_node] Reflection verdict PROGRESS; "
+                                "resetting consecutive_distraction_rounds from "
+                                "%d to 0.",
+                                loop_counter["consecutive_distraction_rounds"],
+                            )
+                        loop_counter["consecutive_distraction_rounds"] = 0
                     # Bug B fix — a PROGRESS verdict that is ITSELF low-signal
                     # (the judge said "insufficient data — no diagnostic
                     # locations available") is NOT progress. It's the judge
@@ -13380,6 +13583,27 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # Without this the loop just retries the same broken search block.
     error_summary += _format_prior_patch_failures(prior_patch_failures)
 
+    # Sticky CREATE_FILE-rejection reminder (D1). The prior-patch-failures
+    # block is round-N-1 only; ``sticky_create_rejections`` persists across
+    # rounds so the LLM can't forget a rejection from 4 rounds ago and
+    # re-emit the same CREATE_FILE. The set is cleared per-path as soon as
+    # the LLM successfully uses a non-CREATE op on that file.
+    _sticky = list(state.get("sticky_create_rejections") or [])
+    if _sticky:
+        error_summary += (
+            "\n## STICKY: files with prior CREATE_FILE rejections\n"
+            "The patcher has already rejected `CREATE_FILE` on these "
+            "files earlier in this session — the files ALREADY EXIST. "
+            "Do NOT emit `CREATE_FILE` for any of them this round. Use "
+            "`REPLACE_BLOCK`, `INSERT_AT_BLOCK`, or `DELETE_BLOCK` "
+            "against the current content shown in the file-content "
+            "section:\n"
+            + "\n".join(f"- {p}" for p in _sticky[:30])
+        )
+        if len(_sticky) > 30:
+            error_summary += f"\n- (+ {len(_sticky) - 30} more)"
+        error_summary += "\n"
+
     # Workspace inventory: the single biggest cause of stuck repair loops is
     # the LLM CREATE_FILE-ing files that already exist (from the initial
     # patching pass or from a salvaged speculative variant). The patcher
@@ -13752,10 +13976,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # cec4d124 burned 9 rounds patching a test file when the bug was
         # in a production dedup — the modification history was in the
         # prompt but no signal read it out as "you are stuck on this."
+        #
+        # Finsearch session 44c5e194 root cause C3: the ``>= 2``
+        # threshold was too generous — the LLM cycled the same wrong
+        # hypothesis for 12 rounds because it kept making PROGRESS on
+        # the fingerprint count (each patch changed the failing-diag
+        # shape) while never solving the actual bug.
+        # ``same_hypothesis_streak`` (finsearch C1/C2) surfaces this
+        # directly: when the LLM's *narrative* has stayed the same for
+        # 3+ rounds we should fire the breaker even if no_progress is
+        # low, because "same narrative" is a stronger fixation signal
+        # than "no fingerprint shrink."
         _fixated = _detect_fixation_files(
             loop_counter, threshold=3, window=5,
         )
-        if _fixated and _no_progress_for_warning >= 2:
+        _hyp_streak = int(
+            loop_counter.get("same_hypothesis_streak", 0) or 0
+        )
+        _fixation_grounds = (
+            (_fixated and _no_progress_for_warning >= 2)
+            or (_fixated and _hyp_streak >= 3)
+        )
+        if _fixation_grounds:
             fixation_warning = _format_fixation_breaker_message(_fixated)
             if fixation_warning:
                 messages.append(MessageDict(
@@ -15132,6 +15374,10 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # round's list — which is intentional: each request is
             # consumed-on-use, not stacked.
             "promoted_codes_next_round": list(promoted_for_next),
+            # Sticky per-session CREATE_FILE rejection accumulator (D1).
+            "sticky_create_rejections": _update_sticky_create_rejections(
+                state, patch_failures, modified_files,
+            ),
             "node_state": {
                 **(state.get("node_state") or {}),
                 "current_node": "repair",
@@ -20397,8 +20643,51 @@ def route_after_installation_doc(state: AgentState) -> str:
             "376 iterations here before manual kill).",
             cycles, TRACEABILITY_BLOCK_CYCLE_CAP,
         )
+        _rollback_unlinked_before_end(state)
         return END
     return "human_intervention_node"
+
+
+def _rollback_unlinked_before_end(state: AgentState) -> None:
+    """Downgrade any ``done`` stories with zero file_links to
+    ``blocked`` before the router forces END.
+
+    Finsearch session 44c5e194 root cause A6: the router exit is
+    correct (prevents a 376-iteration headless loop), but state.db
+    was left with every story ``done`` even though the session
+    failed. TRACEABILITY.md was then regenerated as all-green
+    against that stale state. Rolling back unlinked-done stories to
+    ``blocked`` makes the persisted state honest before the
+    traceability_node re-render.
+
+    Best-effort — failure here must not prevent the END return.
+    """
+    workspace_path = state.get("workspace_path") or ""
+    if not workspace_path:
+        return
+    try:
+        from harness import story_state as _story_state
+        workspace = _story_state.app_name_for_workspace(workspace_path)
+        session_id = state.get("session_id", "") or ""
+        conn = _story_state.open_story_db()
+        try:
+            keys = _story_state.rollback_unlinked_done_stories(
+                conn, workspace, session_id,
+            )
+        finally:
+            conn.close()
+        if keys:
+            logger.warning(
+                "[router] traceability rollback: downgraded %d "
+                "unlinked done story(s) to blocked before END: %s",
+                len(keys), ", ".join(keys),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[router] traceability rollback raised (%s) — "
+            "continuing to END without DB downgrade.",
+            exc,
+        )
 
 
 # Ciod session 523e86a7 (2026-07-04) hit 376 iterations of the
@@ -22356,6 +22645,53 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
         )
 
 
+def _warn_if_commits_will_be_no_ops(
+    workspace_path: str,
+    decomposition_enabled: bool,
+    commit_on_story: bool,
+) -> None:
+    """Warn once at session start when batch commits will be silent no-ops.
+
+    Finsearch session ``44c5e194`` root cause A5: with
+    ``agile_defaults.commit_on_story=false`` (the default) or a non-git
+    workspace, ``batch_commit_node`` silently proceeds without any git
+    commit. Every batch stamps ``committed_sha=NULL`` in state.db, the
+    ``commits`` table stays empty, and TRACEABILITY.md's commit column
+    is a permanent "—". If the session later crashes or the DB gets
+    rolled back, there is no git checkpoint to recover to. Warn once at
+    session start with an actionable hint — auto-init is too aggressive
+    for a linter-style warning path.
+
+    Skipped when ``decomposition_enabled`` is False (single-shot runs
+    don't go through the batch commit path) or ``workspace_path`` is
+    empty (early planning-only invocations).
+    """
+    if not (decomposition_enabled and workspace_path):
+        return
+    is_repo = os.path.isdir(os.path.join(workspace_path, ".git"))
+    if not is_repo:
+        logger.warning(
+            "[commit] workspace %r is not a git repository. Batch "
+            "commits will be no-ops, ``committed_sha`` will stay "
+            "NULL, and TRACEABILITY.md will have no commit column. "
+            "Run `git init && git add . && git commit -m 'baseline'` "
+            "in the workspace before starting to get per-batch "
+            "commits and a rollback point.",
+            workspace_path,
+        )
+    elif not commit_on_story:
+        logger.warning(
+            "[commit] workspace %r is a git repo but "
+            "``agile_defaults.commit_on_story`` is false in config. "
+            "batch_commit_node will not run ``git commit`` between "
+            "batches — no per-batch SHA stamps and no rollback "
+            "point on failure. Set "
+            "``agile_defaults.commit_on_story: true`` in config.json "
+            "to enable.",
+            workspace_path,
+        )
+
+
 async def run_graph(
     *,
     workspace_path: str,
@@ -22422,6 +22758,10 @@ async def run_graph(
         session_id = str(uuid.uuid4())
     if thread_id is None:
         thread_id = session_id  # Use session_id as thread_id for simplicity
+
+    _warn_if_commits_will_be_no_ops(
+        workspace_path, decomposition_enabled, commit_on_story,
+    )
 
     # Build initial state
     initial_state = create_initial_state(

@@ -15,6 +15,7 @@ from harness.graph import (
     _PIP_INSTALLABLE_SYMBOLS,
     _env_misconfig_hint,
     _is_env_misconfig,
+    _warn_if_commits_will_be_no_ops,
     compiler_node,
     route_after_compiler,
 )
@@ -351,6 +352,152 @@ class TestCompilerNodeShortCircuit:
 
         assert result["exit_code"] == 1
         assert "env_misconfig" not in result["node_state"]
+
+
+# ---------------------------------------------------------------------------
+# compiler_node — pytest exit 5 "no tests collected" carve-out (A2)
+# ---------------------------------------------------------------------------
+
+class TestNoTestsCollectedCarveOut:
+    """Finsearch session 44c5e194 root cause A2: compiler_node used to
+    fold pytest exit 5 to success whenever the workspace had source
+    files. That's legitimate for genuine early greenfield rounds, but
+    once test_generation has run, "no tests collected" means the runner
+    isn't seeing our tests — a real failure. The narrow greenfield
+    carve-out only lifts when test_generation has never fired."""
+
+    @pytest.mark.asyncio
+    async def test_greenfield_exit_5_still_folds_to_success(
+        self, stub_sandbox, tmp_path,
+    ):
+        # test_generation counter is 0, no generated_tests — this is a
+        # legitimate greenfield round. Preserve the old fold-to-success
+        # so we don't over-correct.
+        (tmp_path / "src.py").write_text("x = 1\n")
+        stub_sandbox(5, "no tests ran in 0.01s\n")
+        state = {
+            "workspace_path": str(tmp_path),
+            "build_command": "python3 -m pytest -q",
+            "allow_network": False,
+            "sandbox_config": {"docker_image": "python:3.12-slim"},
+            "loop_counter": {"test_generation": 0},
+            "generated_tests": [],
+        }
+        result = await compiler_node(state)
+        assert result["exit_code"] == 0
+        assert "tests_not_collected" not in result["node_state"]
+
+    @pytest.mark.asyncio
+    async def test_post_testgen_exit_5_surfaces_diagnostic(
+        self, stub_sandbox, tmp_path,
+    ):
+        # test_generation has run and emitted files, yet the runner
+        # still says no tests collected → the tests aren't being
+        # collected (PYTHONPATH, conftest, testpaths mismatch, etc.).
+        # This must become a repair-eligible diagnostic, not a silent
+        # pass.
+        (tmp_path / "src.py").write_text("x = 1\n")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_thing.py").write_text(
+            "def test_thing():\n    assert True\n",
+        )
+        stub_sandbox(5, "no tests ran in 0.01s\n")
+        state = {
+            "workspace_path": str(tmp_path),
+            "build_command": "python3 -m pytest -q",
+            "allow_network": False,
+            "sandbox_config": {"docker_image": "python:3.12-slim"},
+            "loop_counter": {"test_generation": 3},
+            "generated_tests": ["tests/test_thing.py"],
+        }
+        result = await compiler_node(state)
+        assert result["exit_code"] == 5
+        assert result["node_state"].get("tests_not_collected") is True
+        assert len(result["compiler_errors"]) == 1
+        diag = result["compiler_errors"][0]
+        assert diag["error_code"] == "TESTS_NOT_COLLECTED"
+        # Message must actionably point at the common causes.
+        msg = diag["message"].lower()
+        assert "pythonpath" in msg or "testpaths" in msg or "conftest" in msg
+
+    @pytest.mark.asyncio
+    async def test_testgen_iterated_but_zero_emit_still_surfaces(
+        self, stub_sandbox, tmp_path,
+    ):
+        # Edge case: test_generation_node ran but emitted 0 tests (the
+        # `test_generation_zero_emit` HITL trigger pattern). Even with
+        # empty generated_tests, the fact that test_generation has run
+        # AT ALL means we're past greenfield — exit 5 shouldn't pass.
+        (tmp_path / "src.py").write_text("x = 1\n")
+        stub_sandbox(5, "no tests ran in 0.01s\n")
+        state = {
+            "workspace_path": str(tmp_path),
+            "build_command": "python3 -m pytest -q",
+            "allow_network": False,
+            "sandbox_config": {"docker_image": "python:3.12-slim"},
+            "loop_counter": {"test_generation": 5},
+            "generated_tests": [],
+        }
+        result = await compiler_node(state)
+        assert result["exit_code"] == 5
+        assert result["node_state"].get("tests_not_collected") is True
+
+
+# ---------------------------------------------------------------------------
+# _warn_if_commits_will_be_no_ops — session-start commit config warning (A5)
+# ---------------------------------------------------------------------------
+
+class TestCommitNoOpWarning:
+    """Finsearch session 44c5e194 root cause A5: with the default
+    ``commit_on_story=false`` or a non-git workspace, batch commits
+    silently no-op. Warn once at session start so the operator sees it
+    before burning hours on a run with no rollback point."""
+
+    def test_warns_when_workspace_not_a_git_repo(self, caplog, tmp_path):
+        # No .git dir; commit_on_story=True is still a no-op.
+        import logging
+        caplog.set_level(logging.WARNING, logger="harness.graph")
+        _warn_if_commits_will_be_no_ops(
+            str(tmp_path), decomposition_enabled=True, commit_on_story=True,
+        )
+        assert any(
+            "not a git repository" in r.message for r in caplog.records
+        ), caplog.records
+
+    def test_warns_when_repo_present_but_flag_off(self, caplog, tmp_path):
+        import logging
+        (tmp_path / ".git").mkdir()
+        caplog.set_level(logging.WARNING, logger="harness.graph")
+        _warn_if_commits_will_be_no_ops(
+            str(tmp_path), decomposition_enabled=True, commit_on_story=False,
+        )
+        assert any(
+            "commit_on_story" in r.message and "false" in r.message
+            for r in caplog.records
+        ), caplog.records
+
+    def test_no_warn_when_repo_present_and_flag_on(self, caplog, tmp_path):
+        import logging
+        (tmp_path / ".git").mkdir()
+        caplog.set_level(logging.WARNING, logger="harness.graph")
+        _warn_if_commits_will_be_no_ops(
+            str(tmp_path), decomposition_enabled=True, commit_on_story=True,
+        )
+        assert not any(
+            "[commit]" in r.message for r in caplog.records
+        )
+
+    def test_no_warn_when_decomposition_disabled(self, caplog, tmp_path):
+        # Single-shot runs don't go through the batch commit path, so
+        # the warn is irrelevant noise there.
+        import logging
+        caplog.set_level(logging.WARNING, logger="harness.graph")
+        _warn_if_commits_will_be_no_ops(
+            str(tmp_path), decomposition_enabled=False, commit_on_story=False,
+        )
+        assert not any(
+            "[commit]" in r.message for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

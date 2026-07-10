@@ -123,7 +123,9 @@ class TestStoryMarking:
     def test_marks_all_pending_stories_done(self, tmp_path: Path):
         ws = str(tmp_path)
         bid, keys = _seed_batch(ws)
-        out = batch_commit_node(_state(ws, bid))
+        out = batch_commit_node(
+            _state(ws, bid, batch_modified_files=["src/a.py"])
+        )
 
         assert out["node_state"]["batch_id"] == bid
         assert out["node_state"]["marked_done"] == len(keys)
@@ -151,7 +153,9 @@ class TestStoryMarking:
         finally:
             conn.close()
 
-        out = batch_commit_node(_state(ws, bid))
+        out = batch_commit_node(
+            _state(ws, bid, batch_modified_files=["src/a.py"])
+        )
         assert out["node_state"]["marked_done"] == 2  # STORY-001 + STORY-003
         assert out["node_state"]["blocked_count"] == 1
 
@@ -166,7 +170,9 @@ class TestStoryMarking:
     def test_batch_status_complete_when_no_blocks(self, tmp_path: Path):
         ws = str(tmp_path)
         bid, _ = _seed_batch(ws)
-        batch_commit_node(_state(ws, bid))
+        batch_commit_node(
+            _state(ws, bid, batch_modified_files=["src/a.py"])
+        )
         conn = story_state.open_story_db()
         try:
             row = conn.execute(
@@ -208,16 +214,92 @@ class TestStoryMarking:
         finally:
             conn.close()
 
-        batch_commit_node(_state(ws, bid))
+        batch_commit_node(
+            _state(ws, bid, batch_modified_files=["src/a.py"])
+        )
 
         conn = story_state.open_story_db()
         try:
             row = conn.execute(
-                "SELECT status FROM defects ORDER BY id DESC LIMIT 1"
+                "SELECT status FROM defects "
+                "WHERE severity = 'compile' ORDER BY id DESC LIMIT 1"
             ).fetchone()
         finally:
             conn.close()
         assert row[0] == "resolved"
+
+    def test_empty_batch_parks_stories_blocked_not_done(
+        self, tmp_path: Path,
+    ):
+        """A batch that touched zero files cannot have delivered any
+        story — every pending story should be parked ``blocked`` with a
+        defect explaining the empty seal. Prior behavior silently marked
+        such stories done (finsearch session 44c5e194 root cause A4)."""
+        ws = str(tmp_path)
+        bid, keys = _seed_batch(ws)
+        out = batch_commit_node(_state(ws, bid, batch_modified_files=[]))
+
+        assert out["node_state"]["marked_done"] == 0
+        assert out["node_state"]["blocked_count"] == len(keys)
+
+        app = _app(ws)
+        conn = story_state.open_story_db()
+        try:
+            for k in keys:
+                assert (
+                    story_state.get_story(conn, app, k)["status"] == "blocked"
+                ), (
+                    f"{k} should be blocked, not done — the batch produced "
+                    "no files"
+                )
+            defect_rows = conn.execute(
+                "SELECT severity FROM defects WHERE session_id = 'sess-1'"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert all(
+            d[0] == "empty_batch_seal" for d in defect_rows
+        ), defect_rows
+        assert len(defect_rows) == len(keys)
+
+    def test_batch_files_populate_file_links(self, tmp_path: Path):
+        """Batch-mode runs bypass story_complete_node (the per-story
+        linker). seal_batch_atomically must link every batch file to
+        every story so TRACEABILITY.md attribution isn't 0/0. Root cause
+        A1 from finsearch session 44c5e194."""
+        ws = str(tmp_path)
+        bid, keys = _seed_batch(ws)
+        batch_commit_node(_state(
+            ws, bid,
+            batch_modified_files=[
+                "server/api/auth.py",
+                "tests/test_auth.py",
+                "docs/AUTH.md",
+            ],
+        ))
+
+        app = _app(ws)
+        conn = story_state.open_story_db()
+        try:
+            rows = conn.execute(
+                "SELECT s.story_key, f.path, f.kind, f.batch_id "
+                "FROM file_links f "
+                "JOIN stories s ON s.id = f.story_id "
+                "WHERE s.workspace = ? ORDER BY s.story_key, f.path",
+                (app,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        # Every story × every file — batch-granular attribution.
+        assert len(rows) == len(keys) * 3, rows
+        kinds_by_path = {r[1]: r[2] for r in rows}
+        assert kinds_by_path["server/api/auth.py"] == "code"
+        assert kinds_by_path["tests/test_auth.py"] == "test"
+        assert kinds_by_path["docs/AUTH.md"] == "doc"
+        # Every row stamped with this batch_id — post-hoc joins can
+        # attribute compile errors back to the owning batch.
+        assert all(r[3] == bid for r in rows)
 
 
 class TestStateReset:
@@ -268,7 +350,10 @@ class TestGitCommit:
         # non-fatal, batch still seals, SHA is None.
         ws = str(tmp_path)
         bid, _ = _seed_batch(ws)
-        out = batch_commit_node(_state(ws, bid, commit_on_story=True))
+        out = batch_commit_node(_state(
+            ws, bid, commit_on_story=True,
+            batch_modified_files=["src/a.py"],
+        ))
         assert out["node_state"]["committed_sha"] is None
         # Stories still marked done — commit failure shouldn't block sealing.
         app = _app(ws)

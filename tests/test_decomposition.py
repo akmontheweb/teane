@@ -333,8 +333,15 @@ def test_scope_files_js_under_frontend_root_rewritten_to_tsx(caplog):
     payload = _payload_with_one_feature([
         {
             "story_key": "STORY-001",
-            "title": "Add search bar",
-            "acceptance_criteria": ["renders"],
+            # Title / ACs cover every scope_files entry's domain word so
+            # the B2 cross-domain guard keeps them all — this test is
+            # about the JS→TSX rewrite, not the domain check.
+            "title": "Add SearchBar and Home page",
+            "acceptance_criteria": [
+                "SearchBar renders", "Home page renders",
+                "search API returns results",
+                "jest and webpack config compile",
+            ],
             "scope_files": [
                 "client/src/components/SearchBar.js",
                 "frontend/src/pages/Home.jsx",
@@ -361,8 +368,8 @@ def test_scope_files_tsx_untouched():
     payload = _payload_with_one_feature([
         {
             "story_key": "STORY-001",
-            "title": "already TS",
-            "acceptance_criteria": ["ok"],
+            "title": "SearchBar in TypeScript",
+            "acceptance_criteria": ["SearchBar renders"],
             "scope_files": ["client/src/components/SearchBar.tsx"],
         },
     ])
@@ -374,13 +381,251 @@ def test_scope_files_monorepo_marker_rewritten():
     payload = _payload_with_one_feature([
         {
             "story_key": "STORY-001",
-            "title": "monorepo component",
-            "acceptance_criteria": ["ok"],
+            "title": "Foo component in monorepo",
+            "acceptance_criteria": ["Foo renders"],
             "scope_files": ["packages/web/src/components/Foo.js"],
         },
     ])
     _, stories = decomposition._validate_stories_payload(payload)
     assert stories[0]["scope_files"] == ["packages/web/src/components/Foo.tsx"]
+
+
+# ---------------------------------------------------------------------------
+# B2 — cross-domain scope_files guard (finsearch session 44c5e194)
+# ---------------------------------------------------------------------------
+
+class TestCrossDomainScopeGuard:
+    """Finsearch session 44c5e194 root cause B2: planner assigned
+    STORY-032 "Source Traceability" (feature "PDF & CSV Export") to
+    ``server/services/forecast.py`` — a file that neither exists nor
+    shares any domain word with the story or feature. The deterministic
+    guard filters cross-domain entries at planning time so the patcher
+    never operates on hallucinated scope."""
+
+    def test_drops_cross_domain_entry(self, caplog):
+        # The finsearch pattern, exactly: story about traceability,
+        # scope pointing at forecast.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Source Traceability",
+            "acceptance_criteria": [
+                "Chart footnotes cite the source filing",
+                "CSV export includes source_url column",
+            ],
+            "scope_files": [
+                "server/services/forecast.py",
+                "server/exporters/csv.py",
+            ],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        # forecast.py dropped (no shared domain word); csv.py kept
+        # (shares "csv" with the acceptance criterion).
+        assert stories[0]["scope_files"] == ["server/exporters/csv.py"]
+        warned = [
+            r for r in caplog.records if "cross-domain drop" in r.getMessage()
+        ]
+        assert any("forecast.py" in r.getMessage() for r in warned)
+
+    def test_keeps_entry_matching_story_title(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "User can register with email",
+            "acceptance_criteria": ["POST /register returns 201"],
+            "scope_files": [
+                "src/auth/register.py",
+                "tests/test_register.py",
+            ],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        # Both entries share "register" with title/ACs.
+        assert stories[0]["scope_files"] == [
+            "src/auth/register.py", "tests/test_register.py",
+        ]
+
+    def test_keeps_entry_matching_feature_name(self):
+        # Story title / ACs don't mention "billing" but the feature
+        # name does — that's enough context.
+        payload = {
+            "features": [{
+                "feature_key": "billing",
+                "name": "Subscription billing",
+                "description": "Stripe integration",
+            }],
+            "stories": [{
+                "story_key": "STORY-001",
+                "feature": "billing",
+                "title": "Charge card",
+                "requirement_keys": ["FR-001"],
+                "acceptance_criteria": ["stripe.Charge.create returns id"],
+                "scope_files": ["src/billing/charge.py"],
+            }],
+        }
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == ["src/billing/charge.py"]
+
+    def test_keeps_entry_matching_camelcase_component(self):
+        # Path has `SearchBar.tsx` (camelCase); title says
+        # "SearchBar" — both should tokenize to {search, bar}.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Add SearchBar component",
+            "acceptance_criteria": ["SearchBar renders"],
+            "scope_files": ["client/src/components/SearchBar.tsx"],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "client/src/components/SearchBar.tsx",
+        ]
+
+    def test_short_title_falls_through(self):
+        # A very short story title with no non-generic words
+        # (e.g. "Login") means we can't build a context — trust the
+        # planner rather than nuke every entry.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "GO",  # 2-char, filtered as too short
+            "acceptance_criteria": ["ok"],
+            "scope_files": ["src/anything/at_all.py"],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        # Fall-through — nothing to compare against, keep everything.
+        assert stories[0]["scope_files"] == ["src/anything/at_all.py"]
+
+
+class TestScopePathTokens:
+    def test_extracts_domain_word_and_filters_generic(self):
+        # server/services/*/py: all generic; "forecast" is the domain word.
+        assert decomposition._scope_path_tokens(
+            "server/services/forecast.py"
+        ) == {"forecast"}
+
+    def test_splits_camel_case(self):
+        assert decomposition._scope_path_tokens(
+            "client/src/components/SearchBar.tsx"
+        ) == {"search", "bar"}
+
+    def test_splits_snake_and_hyphen(self):
+        assert decomposition._scope_path_tokens(
+            "tests/test_source_traceability.py"
+        ) == {"source", "traceability"}
+
+    def test_drops_short_tokens(self):
+        # "db", "id", "js" are all < 3 chars → dropped.
+        assert decomposition._scope_path_tokens(
+            "src/db/id.js"
+        ) == set()
+
+
+class TestContextTokens:
+    def test_extracts_from_title_and_camel(self):
+        assert decomposition._context_tokens(
+            "Add SearchBar",
+        ) == {"add", "search", "bar"}
+
+    def test_flattens_acceptance_criteria_list(self):
+        assert decomposition._context_tokens(
+            "T", ["metric returns 200", "metric is TTM"],
+        ) == {"metric", "returns", "200", "ttm"}
+
+
+class TestWorkspaceFileTreeHint:
+    def test_returns_empty_for_missing_dir(self, tmp_path):
+        assert decomposition._build_workspace_file_tree_hint(
+            str(tmp_path / "does-not-exist"),
+        ) == ""
+
+    def test_returns_empty_for_empty_workspace(self, tmp_path):
+        assert decomposition._build_workspace_file_tree_hint(str(tmp_path)) == ""
+
+    def test_lists_real_files_alphabetically(self, tmp_path):
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "main.py").write_text("x\n")
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "App.tsx").write_text("x\n")
+        out = decomposition._build_workspace_file_tree_hint(str(tmp_path))
+        assert "## Current workspace file tree" in out
+        assert "- client/App.tsx" in out
+        assert "- server/main.py" in out
+        # Sort order: client < server
+        assert out.index("client/App.tsx") < out.index("server/main.py")
+
+    def test_prunes_noise_directories(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "keep.py").write_text("x\n")
+        for noise in ("node_modules", "__pycache__", ".git", "dist"):
+            (tmp_path / noise).mkdir()
+            (tmp_path / noise / "junk.py").write_text("y\n")
+        out = decomposition._build_workspace_file_tree_hint(str(tmp_path))
+        assert "keep.py" in out
+        assert "node_modules" not in out
+        assert "__pycache__" not in out
+        assert ".git" not in out
+        assert "dist" not in out
+
+    def test_caps_at_max_files_with_footer(self, tmp_path):
+        for i in range(15):
+            (tmp_path / f"f{i:02}.py").write_text("x\n")
+        out = decomposition._build_workspace_file_tree_hint(
+            str(tmp_path), max_files=5,
+        )
+        # 10 hidden → footer says (+10 more not shown)
+        assert "10 more not shown" in out
+        # Only the first 5 alphabetical entries appear.
+        assert "- f00.py" in out
+        assert "- f04.py" in out
+        assert "- f05.py" not in out
+
+
+class TestB2PromptEdits:
+    """The prompt edits themselves (#1, #2, #3): verify the shipped
+    prompt strings carry the new language, so a doc-review or prompt
+    regression would catch a re-introduction of the old wording."""
+
+    def test_initial_prompt_says_empty_is_default(self):
+        p = decomposition._build_decomposition_prompt(
+            "# spec", "", "/tmp/ws", known_req_keys={"FR-001"},
+        )
+        assert "Empty ``scope_files`` (``[]``) is the right default" in p
+
+    def test_initial_prompt_names_domain_consistency_rule(self):
+        p = decomposition._build_decomposition_prompt(
+            "# spec", "", "/tmp/ws", known_req_keys={"FR-001"},
+        )
+        assert "MUST share a domain word" in p
+        # The finsearch example is called out by name so future edits
+        # to the prompt keep the concrete illustration.
+        assert "Source Traceability" in p
+        assert "forecast.py" in p
+
+    def test_initial_prompt_includes_empty_example(self):
+        p = decomposition._build_decomposition_prompt(
+            "# spec", "", "/tmp/ws", known_req_keys={"FR-001"},
+        )
+        assert '"scope_files": []' in p
+
+    def test_augment_prompt_says_empty_is_default(self):
+        p = decomposition._build_decomposition_augment_prompt(
+            existing_features=[], existing_stories=[],
+            spec_requirements="# spec", spec_architecture="",
+            workspace_path="/tmp/ws-empty",
+            known_req_keys={"FR-001"},
+        )
+        assert "empty ``[]`` is the right default" in p
+
+    def test_augment_prompt_includes_workspace_tree_when_present(
+        self, tmp_path,
+    ):
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "auth.py").write_text("x\n")
+        p = decomposition._build_decomposition_augment_prompt(
+            existing_features=[], existing_stories=[],
+            spec_requirements="# spec", spec_architecture="",
+            workspace_path=str(tmp_path),
+            known_req_keys={"FR-001"},
+        )
+        assert "## Current workspace file tree" in p
+        assert "server/auth.py" in p
 
 
 def test_strip_json_fence_handles_fenced():

@@ -1090,3 +1090,77 @@ def test_purge_state_db_all_no_db_returns_zeros(tmp_path, monkeypatch):
     monkeypatch.setenv("TEANE_STATE_DB", str(tmp_path / "does-not-exist.db"))
     counts = purge_state_db_all()
     assert all(v == 0 for v in counts.values())
+
+
+# ---------------------------------------------------------------------------
+# rollback_unlinked_done_stories — traceability rollback safety net (A6)
+# ---------------------------------------------------------------------------
+
+def test_rollback_unlinked_done_stories_downgrades_only_unlinked(conn, app):
+    """Finsearch session 44c5e194 root cause A6: when the traceability
+    gate forces END with non-zero exit, done-but-unlinked stories must
+    be downgraded to blocked so TRACEABILITY.md reflects the failure
+    instead of a false-positive green row."""
+    from harness.story_state import rollback_unlinked_done_stories
+
+    keys = _create_stories(conn, app, [
+        {"title": "A"}, {"title": "B"}, {"title": "C"},
+    ])
+    # Mark all done, but only STORY-002 gets a file_link.
+    for k in keys:
+        mark_done(conn, app, k)
+    link_file(conn, app, "STORY-002", "src/b.py", "code")
+
+    rolled = rollback_unlinked_done_stories(conn, app, session_id="sess-1")
+    assert sorted(rolled) == ["STORY-001", "STORY-003"]
+
+    # STORY-002 stays done; the other two flip to blocked.
+    assert get_story(conn, app, "STORY-001")["status"] == "blocked"
+    assert get_story(conn, app, "STORY-002")["status"] == "done"
+    assert get_story(conn, app, "STORY-003")["status"] == "blocked"
+
+    # Defects recorded with the expected severity so post-run inspection
+    # can group them.
+    defs = conn.execute(
+        "SELECT severity, story_id FROM defects "
+        "WHERE session_id = 'sess-1' AND status = 'open'"
+    ).fetchall()
+    assert len(defs) == 2
+    assert all(d[0] == "traceability_rollback" for d in defs)
+
+
+def test_rollback_unlinked_done_stories_noop_when_all_linked(conn, app):
+    from harness.story_state import rollback_unlinked_done_stories
+
+    keys = _create_stories(conn, app, [{"title": "A"}, {"title": "B"}])
+    for k in keys:
+        mark_done(conn, app, k)
+        link_file(conn, app, k, f"src/{k.lower()}.py", "code")
+
+    assert rollback_unlinked_done_stories(conn, app, "sess-1") == []
+    for k in keys:
+        assert get_story(conn, app, k)["status"] == "done"
+
+
+def test_rollback_leaves_non_done_stories_alone(conn, app):
+    """Planned / in_progress / blocked stories are outside scope — the
+    rollback only touches ``done`` rows that lack file_links."""
+    from harness.story_state import rollback_unlinked_done_stories
+
+    keys = _create_stories(conn, app, [
+        {"title": "planned"}, {"title": "wip"}, {"title": "blocked"},
+        {"title": "done-linked"}, {"title": "done-unlinked"},
+    ])
+    mark_in_progress(conn, app, keys[1])
+    mark_blocked(conn, app, keys[2])
+    mark_done(conn, app, keys[3])
+    link_file(conn, app, keys[3], "src/x.py", "code")
+    mark_done(conn, app, keys[4])
+
+    rolled = rollback_unlinked_done_stories(conn, app, "sess-1")
+    assert rolled == [keys[4]]
+    # Every other story is untouched.
+    assert get_story(conn, app, keys[0])["status"] == "planned"
+    assert get_story(conn, app, keys[1])["status"] == "in_progress"
+    assert get_story(conn, app, keys[2])["status"] == "blocked"
+    assert get_story(conn, app, keys[3])["status"] == "done"

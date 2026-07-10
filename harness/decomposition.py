@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,224 @@ def _enforce_stack_on_scope_files(
         )
         rewritten.append(target)
     return rewritten
+
+
+# Finsearch session 44c5e194 root cause B2: cross-domain hallucination
+# in scope_files. Planner assigned STORY-032 "Source Traceability"
+# (under feature "PDF & CSV Export") to
+# ``server/services/forecast.py`` — a file that neither exists nor
+# shares any domain word with the story or its feature. The result
+# was patching against a nonsense scope, then A6 downgrade at end of
+# session. Filtering cross-domain entries at planning time saves the
+# whole downstream cascade.
+
+# Very short/generic path components that don't count as "domain words"
+# for cross-domain checking. Adding ``tests`` here means
+# ``tests/test_foo.py`` doesn't get credit for the shared token
+# "tests" — the actual domain word must be in the ``foo`` part.
+_SCOPE_GENERIC_TOKENS = frozenset({
+    # File-type / structural
+    "src", "lib", "test", "tests", "spec", "specs", "unit",
+    "integration", "e2e", "fixtures", "conftest",
+    # Stack roots (already stack-checked separately)
+    "server", "client", "backend", "frontend", "web", "webapp",
+    "app", "api", "ui", "www", "public", "static", "assets",
+    # Layer roles
+    "service", "services", "route", "routes", "router", "routers",
+    "controller", "controllers", "model", "models", "schema",
+    "schemas", "util", "utils", "helper", "helpers", "core",
+    "common", "shared", "component", "components", "page", "pages",
+    "hook", "hooks", "feature", "features",
+    # Tooling / infra
+    "config", "settings", "env", "dockerfile", "docker", "compose",
+    "makefile", "readme", "index", "main", "setup", "init",
+    # Trivially-short
+    "a", "b", "c", "d",
+    # File extensions (never carry domain meaning)
+    "js", "ts", "py", "md", "json", "yaml", "yml", "tsx", "jsx",
+    "css", "scss", "html", "toml", "ini", "cfg", "sh", "sql", "svg",
+    "png", "jpg", "gif",
+})
+
+
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _split_camel(word: str) -> list[str]:
+    """Split a CamelCase / mixedCase identifier into its constituent
+    words. ``SearchBar`` → ``["Search", "Bar"]``, ``XMLParser`` →
+    ``["XML", "Parser"]``, ``foo`` → ``["foo"]``.
+    """
+    return _CAMEL_SPLIT_RE.split(word)
+
+
+def _scope_path_tokens(path: str) -> set[str]:
+    """Return the set of lowercased domain tokens extracted from a
+    workspace-relative path, skipping generic structural words.
+
+    A token is a hyphen/underscore/dot/CamelCase-separated word from
+    any path component. ``server/services/forecast.py`` yields
+    ``{"forecast"}`` (server, services, py all filtered as generic).
+    ``client/src/components/SearchBar.tsx`` yields
+    ``{"search", "bar"}`` (camelCase split). ``tests/test_source_traceability.py``
+    yields ``{"source", "traceability"}``.
+    """
+    normalized = path.replace("\\", "/")
+    # Strip the leading ./
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    tokens: set[str] = set()
+    for component in normalized.split("/"):
+        # Split on non-alphanumeric so `test_foo-bar.py` → test, foo, bar, py
+        for raw in re.split(r"[^A-Za-z0-9]+", component):
+            if not raw:
+                continue
+            # Then split each fragment on camelCase boundaries so
+            # `SearchBar` becomes `search` + `bar`. Without this the
+            # cross-domain check misses common component naming
+            # conventions.
+            for piece in _split_camel(raw):
+                lo = piece.lower()
+                if not lo or lo in _SCOPE_GENERIC_TOKENS:
+                    continue
+                if len(lo) < 3:
+                    # `db`, `id`, `js` etc. — too weak a signal.
+                    continue
+                tokens.add(lo)
+    return tokens
+
+
+def _context_tokens(*text_sources: Any) -> set[str]:
+    """Extract lowercased domain tokens from arbitrary text (story
+    title, feature name, acceptance criteria). Applies the same
+    generic-word filter and camelCase split as
+    :func:`_scope_path_tokens` so a title "SearchBar in TypeScript"
+    tokenizes to ``{search, bar, typescript}`` — symmetric with the
+    path tokens for ``client/src/components/SearchBar.tsx``. Without
+    symmetric splitting, a valid domain-consistent scope_files entry
+    gets falsely dropped."""
+    tokens: set[str] = set()
+    for src in text_sources:
+        if src is None:
+            continue
+        if isinstance(src, (list, tuple, set)):
+            for item in src:
+                tokens.update(_context_tokens(item))
+            continue
+        text = str(src)
+        for raw in re.split(r"[^A-Za-z0-9]+", text):
+            if not raw:
+                continue
+            for piece in _split_camel(raw):
+                lo = piece.lower()
+                if not lo or lo in _SCOPE_GENERIC_TOKENS:
+                    continue
+                if len(lo) < 3:
+                    continue
+                tokens.add(lo)
+    return tokens
+
+
+def _drop_cross_domain_scope_files(
+    story_key: str,
+    scope: list[str],
+    *,
+    story_title: str,
+    feature_name: str,
+    feature_key: str,
+    acceptance_criteria: Optional[list[str]] = None,
+) -> list[str]:
+    """Drop ``scope_files`` entries that share no domain token with the
+    story title, feature name / key, or acceptance-criteria text.
+
+    An entry is kept when its path tokens intersect the context tokens.
+    A wrong hint is worse than an empty list — see B2 in
+    ``docs/finsearch_run_issues.md``. Every drop logs the story key +
+    dropped entry + tokens on each side so post-mortems can trace
+    which planner call hallucinated the scope.
+
+    Empty ``story_title`` (validated non-empty by the caller) or
+    genuinely no context tokens → fall through unchanged rather than
+    silently drop everything (we want signal, not paranoia).
+    """
+    if not scope:
+        return []
+    ctx = _context_tokens(
+        story_title, feature_name, feature_key, acceptance_criteria,
+    )
+    if not ctx:
+        # No context words to compare against — planner is on its own,
+        # trust the LLM. This happens on very short story titles like
+        # "Login" where every token is either generic or under 3 chars.
+        return scope
+    kept: list[str] = []
+    for entry in scope:
+        path_tokens = _scope_path_tokens(entry)
+        if not path_tokens or (path_tokens & ctx):
+            kept.append(entry)
+            continue
+        logger.warning(
+            "[decomposition] cross-domain drop: %s scope_files entry "
+            "%r shares no domain word with story title/feature/ACs "
+            "(path tokens=%s, context tokens=%s) — dropping. Re-add "
+            "at implement time if this was intentional.",
+            story_key, entry,
+            sorted(path_tokens), sorted(ctx),
+        )
+    return kept
+
+
+def _build_workspace_file_tree_hint(
+    workspace_path: str,
+    *,
+    max_files: int = 200,
+) -> str:
+    """Return a compact bullet-list of workspace files for insertion into
+    the planner prompt, or empty string when there's nothing useful to
+    show (greenfield / missing directory).
+
+    Used by the augment planner path so brownfield / CR runs stop
+    hallucinating file paths (finsearch B2 pattern: STORY-032 was
+    assigned ``server/services/forecast.py`` — a file that never
+    existed on disk). Greenfield runs skip this — the tree is empty
+    and the planner needs to invent the layout.
+
+    Excludes common noise (node_modules, __pycache__, .git, .venv,
+    dist, build, coverage). Caps at ``max_files`` alphabetical entries
+    with a "(N more)" tail so long trees don't blow the prompt budget.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return ""
+    noise = {
+        "node_modules", "__pycache__", ".git", ".venv", "venv",
+        "dist", "build", "coverage", ".pytest_cache", ".mypy_cache",
+        ".ruff_cache", "target", "out", ".next", ".nuxt", ".turbo",
+        "htmlcov", ".idea", ".vscode",
+    }
+    workspace_abs = os.path.abspath(workspace_path)
+    collected: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(workspace_abs):
+        # Prune noise dirs in-place so os.walk skips them.
+        dirnames[:] = [d for d in dirnames if d not in noise and not d.startswith(".")]
+        for fn in filenames:
+            if fn.startswith(".") and fn not in ("Dockerfile", "Makefile"):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                rel = os.path.relpath(full, workspace_abs).replace("\\", "/")
+            except ValueError:
+                continue
+            collected.append(rel)
+    if not collected:
+        return ""
+    collected.sort()
+    shown = collected[:max_files]
+    extra = max(0, len(collected) - max_files)
+    lines = ["## Current workspace file tree (real paths — use these, don't invent)"]
+    lines.extend(f"- {p}" for p in shown)
+    if extra:
+        lines.append(f"- (+ {extra} more not shown)")
+    return "\n".join(lines) + "\n"
 
 MAX_FEATURES_PER_PASS = 8
 """Soft-ish cap on features per decomposition pass. The decomposition
@@ -315,8 +534,19 @@ A good story:
 - Has 1–4 concrete acceptance criteria that a behavioral test can
   exercise against the public surface (CLI command, HTTP endpoint,
   library function, UI route).
-- Names the files it expects to touch in ``scope_files`` when you
-  have a high-confidence guess.
+- **Empty ``scope_files`` (``[]``) is the right default.** Only include
+  a path when you can defend it — an acceptance criterion literally
+  names the file, OR the file already exists on disk under a name the
+  ACs uniquely determine. A wrong guess is worse than an empty list:
+  the patcher discovers real paths at implement time, but a bogus
+  scope_files hint locks it onto a nonsense file and burns repair
+  budget. **Every ``scope_files`` entry MUST share a domain word with
+  the story title, its feature name, or one of its acceptance
+  criteria** — a story titled "Source Traceability" cannot point at
+  ``server/services/forecast.py`` (forecast is not a word in source,
+  traceability, or its feature). Entries that share no domain word
+  are silently dropped by the deterministic guard downstream; save
+  yourself the round-trip and leave those out.
 - Declares hard dependencies on prior stories in ``depends_on``.
   Independent stories run in parallel, so omit deps where genuinely
   optional. Use the ``story_key`` strings you assign (STORY-001,
@@ -359,10 +589,32 @@ no commentary:
       ],
       "depends_on": [],
       "scope_files": ["src/auth/register.py", "tests/test_register.py"]
+    }},
+    {{
+      "story_key": "STORY-002",
+      "feature": "auth",
+      "title": "Password reset via email",
+      "description": "1-2 sentence summary of intent.",
+      "requirement_keys": [{req_example}],
+      "acceptance_criteria": [
+        "POST /password-reset sends a reset email",
+        "Reset link expires after 24 hours"
+      ],
+      "depends_on": ["STORY-001"],
+      "scope_files": []
     }}
   ],
   "summary": "1-line description of the decomposition shape"
 }}
+
+Note the two ``scope_files`` shapes above:
+
+* STORY-001 names ``register.py`` because the ACs literally describe
+  ``POST /register`` behavior — the file's domain is unambiguous.
+* STORY-002 leaves ``scope_files`` empty because "password reset via
+  email" could land in ``auth/reset.py``, ``auth/password.py``,
+  ``auth/email.py``, etc. — the planner isn't the right place to
+  decide the layout when the ACs don't fix it. Empty is honest.
 
 ## Constraints
 
@@ -457,6 +709,13 @@ def _build_decomposition_augment_prompt(
     if spec_architecture:
         spec_block += "\n\n## SPEC_ARCHITECTURE.md (current)\n\n" + spec_architecture
 
+    # Finsearch session 44c5e194 root cause B2: augment mode is
+    # brownfield — the workspace has a real file tree, so scope_files
+    # entries should point at REAL paths. Feeding a compact listing
+    # into the prompt stops the planner from inventing paths that
+    # sound plausible ("server/services/forecast.py") but don't exist.
+    workspace_tree_block = _build_workspace_file_tree_hint(workspace_path)
+
     return f"""You are an Agile delivery planner in **augment mode**.
 
 The workspace at ``{workspace_path}`` already has features and stories
@@ -471,6 +730,8 @@ to propose ONLY new work that fills gaps the existing set doesn't cover.
 ## Existing stories
 
 {existing_block}
+
+{workspace_tree_block}
 
 ## What to do
 
@@ -507,11 +768,20 @@ Output STRICT JSON in this exact shape — no markdown, no code fence:
       "requirement_keys": [{req_example}],
       "acceptance_criteria": ["..."],
       "depends_on": [],
-      "scope_files": ["src/..."]
+      "scope_files": []
     }}
   ],
   "summary": "1-line description of the delta"
 }}
+
+``scope_files``: **empty ``[]`` is the right default.** Only include a
+path when the acceptance criteria literally name it OR the file already
+exists on disk in the tree above under a name the ACs uniquely
+determine. Every entry MUST share a domain word with the story title,
+the feature name, or an acceptance criterion — cross-domain entries
+(e.g. a story titled "Source Traceability" pointing at
+``server/services/forecast.py``) are silently dropped by the guard
+downstream.
 
 Constraints:
 - AT MOST {MAX_STORIES_PER_AUGMENT_PASS} new stories per pass. A change
@@ -769,6 +1039,14 @@ def _validate_augment_payload(
     features_cleaned = _validate_features_payload(data, allow_empty=True)
     if not stories:
         return features_cleaned, []
+    # Feature lookup for the cross-domain scope-file guard (B2). Maps
+    # feature_key → feature dict. Augment mode only has NEW features
+    # in the payload; stories that reference an existing feature_key
+    # (from prior runs) fall through with feature_name="" — the
+    # feature_key itself is still passed as context.
+    _feature_lookup: dict[str, dict[str, Any]] = {
+        f["feature_key"]: f for f in features_cleaned
+    }
     # Runaway-guard for the CR augment path. Initial decomposition is
     # uncapped and reconciled downstream; augment mode has no reconciler
     # net (it preserves ``done`` history), so we bound the LLM here.
@@ -816,8 +1094,18 @@ def _validate_augment_payload(
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
             "depends_on": deps_str,
-            "scope_files": _enforce_stack_on_scope_files(
-                key, [str(x) for x in scope],
+            "scope_files": _drop_cross_domain_scope_files(
+                key,
+                _enforce_stack_on_scope_files(
+                    key, [str(x) for x in scope],
+                ),
+                story_title=title.strip(),
+                feature_name=(
+                    _feature_lookup.get(feature, {}).get("name", "")
+                    if feature else ""
+                ),
+                feature_key=feature or "",
+                acceptance_criteria=[str(x) for x in ac],
             ),
             "external_ref": s.get("external_ref") or None,
         })
@@ -854,6 +1142,10 @@ def _validate_stories_payload(
     if not isinstance(stories, list) or not stories:
         raise ValueError("'stories' must be a non-empty list")
 
+    # Feature lookup for the cross-domain scope-file guard (B2).
+    _feature_lookup: dict[str, dict[str, Any]] = {
+        f["feature_key"]: f for f in features_cleaned
+    }
     seen_keys: set[str] = set()
     cleaned: list[dict[str, Any]] = []
     story_keys_in_order: list[str] = []
@@ -893,8 +1185,18 @@ def _validate_stories_payload(
             "acceptance_criteria": [str(x) for x in ac],
             "requirement_keys": req_keys,
             "depends_on": deps_str,
-            "scope_files": _enforce_stack_on_scope_files(
-                key, [str(x) for x in scope],
+            "scope_files": _drop_cross_domain_scope_files(
+                key,
+                _enforce_stack_on_scope_files(
+                    key, [str(x) for x in scope],
+                ),
+                story_title=title.strip(),
+                feature_name=(
+                    _feature_lookup.get(feature, {}).get("name", "")
+                    if feature else ""
+                ),
+                feature_key=feature or "",
+                acceptance_criteria=[str(x) for x in ac],
             ),
             "external_ref": s.get("external_ref") or None,
         })

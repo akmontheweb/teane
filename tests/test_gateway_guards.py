@@ -281,3 +281,60 @@ async def test_session_tracker_reflects_empty_retry_tail():
     # downstream consumers (state-mirror aggregators, log lines,
     # debug dumps) see the same truthful number.
     assert response.usage.cost_usd == pytest.approx(0.0009, rel=1e-6)
+
+
+class TestOllamaLocalKeyNormalization:
+    """Bug (2026-07-10): session 44c5e194's post-resume run crashed
+    inside ``_get_provider`` with ``HarnessConfigError: Model
+    'ollama:ollama:qwen2.5-coder:14b' is not registered.`` The config
+    already stored ``ollama_local_model = "ollama:qwen2.5-coder:14b"``
+    (matching the shape of every other ``model_routing.*_primary``
+    value) and the code naively prepended ``ollama:`` on top,
+    producing the double-prefixed key. Both call sites now go
+    through ``_normalized_ollama_local_key`` which strips a leading
+    ``ollama:`` before adding the canonical one.
+    """
+
+    def _make_gateway(self, ollama_local_model: str) -> Gateway:
+        cfg = GatewayConfig(
+            planning_primary="stub:fast",
+            patching_primary="stub:fast",
+            repair_primary="stub:fast",
+            ollama_local_model=ollama_local_model,
+        )
+        return Gateway(cfg)
+
+    def test_bare_config_value_gets_one_prefix(self):
+        # Original / documented shape: bare model id, no provider prefix.
+        gw = self._make_gateway("qwen2.5-coder:14b")
+        assert gw._normalized_ollama_local_key() == "ollama:qwen2.5-coder:14b"
+
+    def test_prefixed_config_value_does_not_double_up(self):
+        # Widely-seen operator shape in the wild (mirrors *_primary keys).
+        # Must NOT become "ollama:ollama:qwen2.5-coder:14b".
+        gw = self._make_gateway("ollama:qwen2.5-coder:14b")
+        assert gw._normalized_ollama_local_key() == "ollama:qwen2.5-coder:14b"
+
+    def test_select_model_force_local_uses_normalized_key(self):
+        # select_model(force_local=True) is the first of two crash sites.
+        gw = self._make_gateway("ollama:qwen2.5-coder:14b")
+        key = gw.select_model(NodeRole.PATCHING, force_local=True)
+        assert key == "ollama:qwen2.5-coder:14b"
+        assert not key.startswith("ollama:ollama:")
+
+    def test_select_model_bare_value_still_produces_valid_key(self):
+        gw = self._make_gateway("qwen2.5-coder:14b")
+        key = gw.select_model(NodeRole.PATCHING, force_local=True)
+        assert key == "ollama:qwen2.5-coder:14b"
+
+    def test_whitespace_around_prefix_tolerated(self):
+        # Prefixed then space accidentally landed. Also normalize.
+        gw = self._make_gateway("ollama:  qwen2.5-coder:14b  ")
+        assert gw._normalized_ollama_local_key() == "ollama:qwen2.5-coder:14b"
+
+    def test_empty_config_value_produces_bare_prefix(self):
+        # Preserves the pre-fix semantic ("ollama:") so the outer guard
+        # in dispatch (which checks for empty ollama_local_model) still
+        # short-circuits before we ever try to look this key up.
+        gw = self._make_gateway("")
+        assert gw._normalized_ollama_local_key() == "ollama:"

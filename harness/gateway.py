@@ -2217,6 +2217,24 @@ class Gateway:
             await provider.close()
         self._providers.clear()
 
+    def _normalized_ollama_local_key(self) -> str:
+        """Return the ``ollama:<model>`` key for the configured local
+        fallback, tolerating an already-prefixed config value.
+
+        Operators sometimes write ``ollama_local_model:
+        "ollama:qwen2.5-coder:14b"`` (matching the shape of every other
+        model_routing.* value) instead of the bare ``"qwen2.5-coder:14b"``.
+        Naively prepending ``ollama:`` produced ``ollama:ollama:...``,
+        which the provider registry rejects as unregistered and crashes
+        the graph inside ``_get_provider`` (session 44c5e194 hit this on
+        the budget-low fallback path). Strip any leading ``ollama:`` and
+        prepend a single, canonical one so both config shapes work.
+        """
+        raw = (self.config.ollama_local_model or "").strip()
+        if raw.startswith("ollama:"):
+            raw = raw[len("ollama:"):].lstrip()
+        return f"ollama:{raw}"
+
     def select_model(self, role: NodeRole, force_local: bool = False) -> str:
         """
         Select the appropriate model for a given node role based on config.
@@ -2229,7 +2247,7 @@ class Gateway:
             The canonical model key to use.
         """
         if force_local or self.config.force_local_only:
-            return f"ollama:{self.config.ollama_local_model}"
+            return self._normalized_ollama_local_key()
 
         if role == NodeRole.PLANNING:
             return self.config.planning_primary
@@ -2409,7 +2427,7 @@ class Gateway:
                     "[gateway] Budget low ($%.4f). Switching to local Ollama to preserve remaining budget.",
                     budget_remaining_usd,
                 )
-                model_key = f"ollama:{self.config.ollama_local_model}"
+                model_key = self._normalized_ollama_local_key()
                 force_local = True
                 thinking = False
 

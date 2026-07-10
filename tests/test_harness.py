@@ -4113,6 +4113,78 @@ class TestAgentState:
         assert lc["batch_index"] == 4
 
     @pytest.mark.asyncio
+    async def test_resume_reset_clears_test_generation_and_hitl_budget(self):
+        """2026-07-10 fix: session 44c5e194's resume tripped
+        test_generation_max_iterations immediately because the
+        checkpointed counter was 7 (past cap 5). Also
+        hitl_auto_resumes_taken was at cap so termination was
+        instant. Confirm both classes are reset."""
+        from harness.graph import _reset_stale_gate_counters_on_resume
+        from unittest.mock import AsyncMock, MagicMock
+        fake_state = MagicMock()
+        fake_state.values = {
+            "loop_counter": {
+                "test_generation": 7,
+                "test_generation_zero_emit": 2,
+                "hitl_auto_resumes_taken": 3,
+                "hitl_auto_resumes_per_trigger": {
+                    "env_misconfig:test_generation_max_iterations": 1,
+                    "zero_patch_loop:2": 2,
+                },
+                "total_repairs": 12,  # preserved — hard ceiling
+            }
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+        await _reset_stale_gate_counters_on_resume(
+            compiled, {"configurable": {"thread_id": "t"}}
+        )
+        compiled.aupdate_state.assert_awaited_once()
+        args = compiled.aupdate_state.await_args.args
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        updates = kwargs.get("values", args[1] if len(args) > 1 else {})
+        lc = updates["loop_counter"]
+        # The counters that caused the immediate retrip are cleared.
+        assert lc["test_generation"] == 0
+        assert lc["test_generation_zero_emit"] == 0
+        assert lc["hitl_auto_resumes_taken"] == 0
+        # Per-trigger dict cleared too — one exhausted trigger from the
+        # prior run must not carry into the fresh budget.
+        assert lc["hitl_auto_resumes_per_trigger"] == {}
+        # total_repairs still bounds runaway across resumes.
+        assert lc["total_repairs"] == 12
+
+    @pytest.mark.asyncio
+    async def test_resume_reset_fires_when_only_per_trigger_dict_has_entries(self):
+        """Edge case: all-zero gate counters BUT a populated
+        hitl_auto_resumes_per_trigger dict (e.g. checkpoint written
+        just as the session hit HITL for the first time). The helper
+        must still write — otherwise a stale per-trigger tally
+        survives into the fresh run and my Fix 1 cap would treat it
+        as pre-consumed budget."""
+        from harness.graph import _reset_stale_gate_counters_on_resume
+        from unittest.mock import AsyncMock, MagicMock
+        fake_state = MagicMock()
+        fake_state.values = {
+            "loop_counter": {
+                "hitl_auto_resumes_per_trigger": {"some_trigger": 1},
+                "total_repairs": 3,
+            }
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+        await _reset_stale_gate_counters_on_resume(
+            compiled, {"configurable": {"thread_id": "t"}}
+        )
+        compiled.aupdate_state.assert_awaited_once()
+        args = compiled.aupdate_state.await_args.args
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        updates = kwargs.get("values", args[1] if len(args) > 1 else {})
+        assert updates["loop_counter"]["hitl_auto_resumes_per_trigger"] == {}
+
+    @pytest.mark.asyncio
     async def test_reset_stale_gate_counters_noop_when_all_zero(self):
         """When the gate counters are already zero (e.g. after the
         suspend-rewind ran a hard reset just before this helper), the

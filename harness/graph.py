@@ -22008,16 +22008,43 @@ async def _reset_stale_gate_counters_on_resume(
         "consecutive_low_signal_rounds",
         "missing_dep_consecutive_same",
         "cheap_shots_taken",
+        # 2026-07-10 fix — session 44c5e194 resume tripped
+        # test_generation_max_iterations IMMEDIATELY on re-entry
+        # because the checkpointed counter was already at 7 (past
+        # cap 5). Same class of bug the older gate keys above hit:
+        # the counter that tripped the pre-resume HITL is still
+        # tripped after the resume unless we reset it here. The
+        # operator's `teane resume` is the manual intervention that
+        # signals "give the LLM fresh shots" — matching how
+        # ``patching`` / ``repair`` / ``compiler`` are already
+        # refreshed via _reset_iteration_counters on the auto-resume
+        # path.
+        "test_generation",
+        "test_generation_zero_emit",
+        # And the auto-resume budget itself — the operator's
+        # decision to invoke resume from the CLI IS the manual
+        # intervention. The auto-resume slack was designed to bound
+        # runaway drain WITHIN a single run; it shouldn't carry
+        # across an operator's re-invocation.
+        "hitl_auto_resumes_taken",
     )
     before = {k: int(loop_counter.get(k, 0) or 0) for k in gate_keys}
-    if not any(before.values()):
+    # Also clear the per-trigger dict, which mirrors the session
+    # counter above. Any state carrying entries is stale on resume.
+    per_trigger_stale = bool(
+        loop_counter.get("hitl_auto_resumes_per_trigger")
+    )
+    if not any(before.values()) and not per_trigger_stale:
         return
     for k in gate_keys:
         loop_counter[k] = 0
+    if per_trigger_stale:
+        loop_counter["hitl_auto_resumes_per_trigger"] = {}
     logger.info(
-        "[run_graph] Resume: zeroing stale gate counters %s so the operator's "
-        "explicit resume gets a fresh repair budget. total_repairs preserved.",
-        before,
+        "[run_graph] Resume: zeroing stale gate counters %s (per_trigger "
+        "cleared=%s) so the operator's explicit resume gets a fresh "
+        "repair budget. total_repairs preserved.",
+        before, per_trigger_stale,
     )
     try:
         await compiled_graph.aupdate_state(

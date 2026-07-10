@@ -5960,23 +5960,29 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # args.prompt, args.git, args.new_build, and args.spec_discovery before we
     # continue — OR, when the operator picks "resume existing session",
     # sets args.session_id and tells us to hand off to cmd_resume instead.
-    # Half-bare (one flag set, the other missing) is the same error as
-    # today — argparse won't catch it now that we dropped required=True,
-    # so we enforce both-or-neither here explicitly.
+    # --prompt/-p is optional: product_spec/ (build) and change_requests/*.txt
+    # (patch) are the authoritative source of the task. --workspace/-w
+    # alone is a valid invocation. Only reject prompt-without-workspace,
+    # since we can't infer where to run.
     workspace_given = getattr(args, "workspace", None) is not None
     prompt_given = getattr(args, "prompt", None) is not None
     if not workspace_given and not prompt_given:
         from harness.wizard import run_setup_wizard
         if run_setup_wizard(args) == "resume":
             return await cmd_resume(args)
-    elif workspace_given ^ prompt_given:
-        missing = "--prompt/-p" if not prompt_given else "--workspace/-w"
+    elif not workspace_given:
         print(
-            f"\nerror: {missing} is required when the other is given. "
-            f"To use the interactive setup, omit BOTH flags.\n",
+            "\nerror: --workspace/-w is required when --prompt/-p is given. "
+            "To use the interactive setup, omit BOTH flags.\n",
             file=sys.stderr,
         )
         return 2
+
+    # Normalize a missing prompt to empty string so downstream slicing /
+    # logging paths don't need None-guards. product_spec/ or
+    # change_requests/*.txt supplies the actual task description.
+    if getattr(args, "prompt", None) is None:
+        args.prompt = ""
 
     workspace_path = os.path.abspath(args.workspace)
     if not os.path.isdir(workspace_path):
@@ -10085,7 +10091,11 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument(
                 "--prompt", "-p",
                 default=None,
-                help="The engineering task description.",
+                help=(
+                    "Optional engineering task description. product_spec/ "
+                    "(build) and change_requests/*.txt (patch) are the "
+                    "authoritative source; -p is redundant when those exist."
+                ),
             )
         p.add_argument(
             "--verbose", "-v",

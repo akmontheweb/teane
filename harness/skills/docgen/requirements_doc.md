@@ -2,6 +2,16 @@
 
 {AGILE_MODE_DIRECTIVE}
 
+## Output language
+
+**All generated content MUST be written in English.** Do not translate section
+headings, field labels, table headers, requirement text, acceptance criteria,
+or narrative into any other language regardless of the source notes' language,
+model preference, or precedent from prior calls. Product names, code
+identifiers, and technical terms retain their original casing; everything else
+is English prose. Non-English output fails the trust-boundary check and the
+run is aborted.
+
 ## Role in the pipeline
 
 This skill governs the **requirements** step of the teane build pipeline. The

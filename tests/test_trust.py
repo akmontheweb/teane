@@ -428,6 +428,34 @@ class TestValidateSynthesizedSpec:
         assert any("STORY-011B" in e for e in errors)
         assert any("FR-014.2" in e for e in errors)
 
+    def test_english_spec_with_smart_punctuation_passes(self):
+        # Real English SPEC_REQUIREMENTS.md content routinely uses em
+        # dashes, smart quotes, arrows — those must not trip the
+        # language-drift guard. See 2026-07-10 finsearch incident: the
+        # sibling Japanese-output regression is covered below.
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# SEC Filing Intelligence Platform — Requirements\n\n"
+            "**Vision:** turn 10-K/10-Q filings into research reports.\n"
+            "Success → 3 minutes end-to-end, 95%+ accuracy, NPS ≥ 40.\n"
+        ) * 20
+        _, errors = validate_synthesized_spec(content)
+        assert errors == []
+
+    def test_japanese_spec_rejected_as_language_drift(self):
+        # 2026-07-10 finsearch incident: English input, Japanese output.
+        # The trust boundary must catch full-document translation before
+        # the file lands in the workspace.
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# SECファイリング分析プラットフォーム — 要求仕様\n\n"
+            "**ビジョン:** 投資家、アナリスト、ファイナンス専門家が、"
+            "公開されているSEC提出書類を、AI強化された包括的な"
+            "企業調査レポートへと迅速に変換できるようにする。\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert any("non-ASCII" in e and "drifted" in e for e in errors)
+
 
 # ---------------------------------------------------------------------------
 # 7. safe_subprocess_env

@@ -3941,6 +3941,19 @@ _REQUIREMENTS_USER_TRAILER = (
 )
 
 
+_REQUIREMENTS_OUTPUT_LANGUAGE_SUFFIX = (
+    "\n\n---\n\n"
+    "## MANDATORY OUTPUT LANGUAGE\n\n"
+    "The synthesised SPEC_REQUIREMENTS.md MUST be written in English. "
+    "Do not translate section headings, field labels, table headers, "
+    "requirement text, acceptance criteria, or narrative into any other "
+    "language regardless of the source notes' language or the model's own "
+    "preference. Product names and code identifiers keep their original "
+    "form; everything else is English prose. Non-English output is rejected "
+    "by the trust boundary and aborts the run.\n"
+)
+
+
 def _load_requirements_doc_prompt(*, agile: bool, workspace_path: Optional[str] = None) -> str:
     """Resolve the requirements_doc system prompt with the agile-mode
     directive substituted in.
@@ -3950,10 +3963,16 @@ def _load_requirements_doc_prompt(*, agile: bool, workspace_path: Optional[str] 
     requirements_doc.md`` and the loader picks it first. The
     ``{AGILE_MODE_DIRECTIVE}`` placeholder is replaced based on the
     ``agile`` flag — see ``docgen_prompts.apply_agile_directive``.
+
+    The English-output directive is appended unconditionally so that
+    workspace prompt overrides still enforce it — the trust boundary
+    (``validate_synthesized_spec``) rejects non-English output regardless,
+    and this suffix keeps the prompt and the guard in sync.
     """
     from harness import docgen_prompts
     body = docgen_prompts.load("requirements_doc", workspace_path)
-    return docgen_prompts.apply_agile_directive(body, agile=agile)
+    body = docgen_prompts.apply_agile_directive(body, agile=agile)
+    return body + _REQUIREMENTS_OUTPUT_LANGUAGE_SUFFIX
 
 
 async def synthesize_requirements(

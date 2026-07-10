@@ -397,6 +397,16 @@ def validate_blueprint_json(content: str) -> tuple[dict[str, Any], list[str]]:
 
 _MAX_SPEC_BYTES = 256 * 1024  # 256 KB
 
+# Non-ASCII code-point ratio cap. An English SPEC_REQUIREMENTS.md with the
+# usual smart-quote / em-dash / arrow flourishes stays well under 1%
+# non-ASCII. When a planning model drifts and renders the whole document
+# in Japanese / Chinese / Arabic / etc. (see 2026-07-10 finsearch incident:
+# input spec was English, output was 100% Japanese) the ratio jumps past
+# 30% instantly. 5% leaves headroom for legitimate Unicode punctuation
+# without missing a full-document translation.
+_MAX_SPEC_NON_ASCII_RATIO = 0.05
+_NON_ASCII_SAMPLE_LEN = 80
+
 # Requirement-ID families declared by the requirements_doc skill's "ID
 # numbering convention" section. Every valid ID in each family is
 # ``<PREFIX>-<zero-padded integer>`` — no letter suffix, no decimal, no
@@ -426,6 +436,8 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
       - No NUL bytes or C0 control chars (except LF, CR, TAB)
       - Within the 256 KB length cap
       - No requirement IDs with letter suffixes or decimal extensions
+      - Non-ASCII ratio under 5% (catches planning-model language drift —
+        an English input yielding a Japanese/Chinese/etc. spec)
 
     Returns:
         (validated_content, errors)
@@ -472,6 +484,26 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
             "spec contains requirement IDs with letter suffixes or decimal "
             "extensions — every ID must be <PREFIX>-<zero-padded integer> "
             f"with no extension: {sample}{overflow}"
+        )
+
+    # Language-drift guard. Fires when the planning model renders the
+    # whole document in a non-Latin script even though the input notes
+    # and skill prompt are English. See 2026-07-10 finsearch incident:
+    # docs/SPEC_REQUIREMENTS.md came back 100% Japanese from an English
+    # product spec. The skill prompt now pins the output language, and
+    # this check is the enforcement backstop.
+    non_ascii = sum(1 for ch in content if ord(ch) >= 0x80)
+    if non_ascii and (non_ascii / len(content)) > _MAX_SPEC_NON_ASCII_RATIO:
+        first_idx = next(i for i, ch in enumerate(content) if ord(ch) >= 0x80)
+        sample = content[
+            max(0, first_idx - 10) : first_idx + _NON_ASCII_SAMPLE_LEN
+        ]
+        ratio_pct = (non_ascii / len(content)) * 100
+        errors.append(
+            f"spec is {ratio_pct:.1f}% non-ASCII (cap "
+            f"{_MAX_SPEC_NON_ASCII_RATIO * 100:.0f}%) — planning model likely "
+            f"drifted to a non-English language. First non-ASCII segment: "
+            f"{sample!r}"
         )
 
     return content, errors

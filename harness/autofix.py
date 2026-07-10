@@ -156,6 +156,10 @@ async def apply_autofixes(
             if candidate is not None:
                 fix_kind = "dep"
         if candidate is None:
+            candidate = _try_missing_init_py(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "init_py"
+        if candidate is None:
             candidate = _try_missing_npm_dep(diag, workspace_path)
             if candidate is not None:
                 fix_kind = "npm_dep"
@@ -903,6 +907,89 @@ def _try_missing_dep(
 _DEPS_NOT_INSTALLED_LIST_RE = re.compile(
     r"Missing:\s*([^.\n]+?)\.\s*", re.IGNORECASE,
 )
+
+
+# ---------------------------------------------------------------------------
+# R4c — Missing ``__init__.py`` for a Python package directory
+# ---------------------------------------------------------------------------
+
+# Same regex as harness.graph._MODULE_NAME_RE — re-derived here to avoid a
+# circular import at module load time (autofix is imported by graph).
+_MODULE_NOT_FOUND_NAME_RE = re.compile(
+    r"No module named ['\"]([a-zA-Z_][\w.]*)['\"]"
+)
+
+
+def _try_missing_init_py(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Create the missing ``__init__.py`` for a Python package directory
+    when a ``ModuleNotFoundError`` on a project-side module names a path
+    that exists on disk as a directory but has no init marker.
+
+    Fires when session 44c5e194 hit reflection_distraction_loop:3 with
+    ``ModuleNotFoundError: No module named 'server.middleware'`` — the
+    workspace had ``server/middleware/rate_limit.py`` on disk (created
+    by STORY-NFR-015) but no ``server/middleware/__init__.py``. Five
+    repair turns bounced around the problem because the LLM kept
+    patching import statements instead of noticing the missing marker.
+    Deterministic, zero-token fix.
+
+    Contract:
+      1. error_code must start with ``PROD_IMPORT_SMOKE:ModuleNotFoundError``
+         (the classifier's tag for project-side missing modules).
+      2. The message must carry ``No module named 'X.Y.Z'`` for some
+         dotted path.
+      3. Every prefix ``X/``, ``X/Y/`` down to but not including the
+         final component must exist as a directory in the workspace.
+      4. The DEEPEST prefix that exists as a directory must be missing
+         its ``__init__.py`` — that's the one we create. If more than
+         one level is missing, we intentionally emit only the deepest;
+         the next smoke check re-fires this autofix on the next-shallower
+         miss, without spending an LLM turn on either.
+
+    Returns a CREATE_FILE PatchBlock for an empty ``__init__.py`` when
+    the conditions match. Returns None otherwise (falls through to the
+    LLM repair path unchanged).
+    """
+    error_code = str(diag.get("error_code", "") or "")
+    if not error_code.startswith("PROD_IMPORT_SMOKE:ModuleNotFoundError"):
+        return None
+    message = str(diag.get("message", "") or "")
+    match = _MODULE_NOT_FOUND_NAME_RE.search(message)
+    if not match:
+        return None
+    dotted = match.group(1).strip()
+    parts = [p for p in dotted.split(".") if p]
+    if len(parts) < 2:
+        # A bare top-level name (``No module named 'foo'``) doesn't get
+        # an ``__init__.py`` at the workspace root — that's not what
+        # would fix it. Only nested packages qualify.
+        return None
+    # Walk from deepest prefix backward. The FIRST prefix that exists
+    # on disk as a directory AND lacks ``__init__.py`` is the miss we
+    # create. Deepest-first so the failing import gets unblocked in a
+    # single autofix; nothing prevents the caller from re-running us
+    # on the next round if a shallower level is missing too.
+    for depth in range(len(parts), 0, -1):
+        prefix = os.path.join(*parts[:depth])
+        abs_dir = os.path.join(workspace_path, prefix)
+        if not os.path.isdir(abs_dir):
+            continue
+        init_rel = os.path.join(prefix, "__init__.py").replace(os.sep, "/")
+        abs_init = os.path.join(workspace_path, init_rel)
+        if os.path.isfile(abs_init):
+            # This level already has its marker — deeper problem is
+            # somewhere else. Keep walking outward.
+            continue
+        # We found a directory on disk missing its ``__init__.py``.
+        return PatchBlock(
+            operation=OperationType.CREATE_FILE,
+            file=init_rel,
+            content="",
+        )
+    return None
 
 
 def _try_deps_not_installed(

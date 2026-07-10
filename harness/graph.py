@@ -10209,6 +10209,130 @@ def _related_test_files(
     return matches
 
 
+def _reconcile_repair_directives(
+    banner_lines: list[str],
+    reflection_verdict: dict[str, Any],
+    workspace_path: str,
+) -> tuple[list[str], list[str]]:
+    """Post-process the assembled repair banner to enforce cross-block
+    invariants that no single directive generator can enforce on its own.
+
+    Rationale: the repair banner is assembled by 6+ independently-authored
+    directive blocks (REQUIRED ACTION / MUST MODIFY / PERSISTENT BLOCKER /
+    ESCAPE HATCH / FAN-OUT / etc.). Each block was engineered in isolation
+    to fix a specific past-session bug. Each block, alone, is defensively
+    correct. They collide because no arbitrator harmonises them — a class
+    of failure documented in the finsearch STORY-038 round-23 dump where
+    REQUIRED ACTION named ``server/main.py`` but MUST MODIFY excluded it,
+    FAN-OUT threatened termination if the LLM didn't shotgun all 6 files,
+    and ESCAPE HATCH was offered on a test file while ``server/main.py``
+    (also a persistent blocker) got no escape.
+
+    This function is the arbitrator. It runs AFTER every block has been
+    appended to ``banner_lines``, scans the lines by known prefixes, and
+    rewrites any that violate cross-block invariants. Pure — no side
+    effects, no mutations of arguments, no external state. Fail-safe —
+    every string operation is guarded so a malformed line falls through
+    to the unchanged output.
+
+    Invariants enforced:
+
+    * **MUST_MODIFY ⊇ REQUIRED_ACTION-referenced files.** If the judge's
+      ``recommendation`` names a workspace file that exists on disk and
+      is a source (not test) path, that file MUST appear in MUST MODIFY.
+      Duplicates the augmentation done by ``_effective_judge_named_files``
+      (Fix #1) — kept here as a safety net for future call sites that
+      compute ``judge_named_files`` without going through the seeder.
+
+    * **FAN-OUT downgrade when REQUIRED_ACTION is present.** If a
+      "REQUIRED ACTION:" line is present and a legacy "FAN-OUT:" line is
+      still present (the pre-Fix-#4 form threatening termination for
+      shotgun failure), rewrite the FAN-OUT line to its advisory form.
+      Safety net for the same reason as above.
+
+    Returns ``(new_banner_lines, corrections_log)`` where
+    ``corrections_log`` is a list of one-line human-readable strings
+    naming each invariant that had to be repaired — surfaced to logging
+    and the ``prompt_reconciler_correction`` observability event so a
+    post-mortem can trace which subsystem's output needed correction.
+    """
+    lines = list(banner_lines)
+    corrections: list[str] = []
+
+    # --- gather signals from the verdict + banner ---
+    recommendation = str(reflection_verdict.get("recommendation") or "").strip()
+    has_required_action = bool(recommendation)
+
+    # Which files does the REQUIRED ACTION mention that exist on disk?
+    required_action_files: list[str] = []
+    if has_required_action and workspace_path:
+        try:
+            required_action_files = _verdict_referenced_files(
+                {"recommendation": recommendation, "real_blocker": ""},
+                workspace_path,
+            )
+        except Exception:  # noqa: BLE001 — best-effort augmentation
+            required_action_files = []
+        # Only keep non-test paths — test files come through MUST MODIFY
+        # via the compiler_errors intersection and don't need arbitration.
+        required_action_files = [
+            f for f in required_action_files
+            if not (_is_test_path(f) or _TEST_FILENAME_RE.search(f.replace(os.sep, "/")))
+        ]
+
+    # --- Invariant 1: MUST MODIFY ⊇ REQUIRED_ACTION-referenced files ---
+    if required_action_files:
+        _mm_prefix = "YOUR PATCHES THIS ROUND MUST MODIFY at least one of: "
+        for i, line in enumerate(lines):
+            if not line.startswith(_mm_prefix):
+                continue
+            tail = line[len(_mm_prefix):]
+            current_files = [f.strip() for f in tail.split(",") if f.strip()]
+            missing = [f for f in required_action_files if f not in current_files]
+            if missing:
+                new_list = current_files + missing
+                lines[i] = _mm_prefix + ", ".join(new_list)
+                corrections.append(
+                    f"MUST MODIFY augmented with {missing} "
+                    "(present in REQUIRED ACTION but missing from seed)"
+                )
+            break
+
+    # --- Invariant 2: FAN-OUT downgrade when REQUIRED ACTION is present ---
+    if has_required_action:
+        # Recognise the harsh legacy form. The Fix #4 advisory form starts
+        # with "Fan-out context (advisory):" so it slips past this check.
+        _fanout_prefix = "FAN-OUT:"
+        for i, line in enumerate(lines):
+            if not line.startswith(_fanout_prefix):
+                continue
+            # Try to preserve the "files" list from the original line so the
+            # advisory replacement still names the fan-out set.
+            _files_match = re.search(
+                r"appears across \d+ files:\s*([^.]+)\.", line,
+            )
+            _files_str = _files_match.group(1).strip() if _files_match else ""
+            _code_match = re.search(r"error code (\S+)", line)
+            _code = _code_match.group(1) if _code_match else "same"
+            _files_display = f" ({_files_str})" if _files_str else ""
+            lines[i] = (
+                f"Fan-out context (advisory): error code {_code} also "
+                f"appears in multiple files{_files_display}. "
+                "These share ONE root cause. PRIORITIZE the REQUIRED "
+                "ACTION above; once you land it, extend the SAME fix "
+                "pattern to the other files IF the fix is genuinely "
+                "identical. Do not shotgun unrelated speculative "
+                "changes across all files — one focused fix is "
+                "better than five wrong ones."
+            )
+            corrections.append(
+                "FAN-OUT downgraded to advisory (REQUIRED ACTION present)"
+            )
+            break
+
+    return lines, corrections
+
+
 def _shared_root_cause_fanout(
     compiler_errors: list[dict[str, Any]],
     *,
@@ -13991,6 +14115,44 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "single response — patching one per round is treated "
                         "as no progress and will terminate the loop."
                     )
+            # Prompt-assembly reconciler — enforce cross-block invariants
+            # AFTER every generator has appended its directive. Safety net
+            # for the class of bug documented in finsearch STORY-038 round
+            # 23 where independently-authored blocks contradicted each
+            # other (REQUIRED ACTION named main.py, MUST MODIFY excluded
+            # it, FAN-OUT threatened termination if the LLM didn't shotgun
+            # the fan-out set). See ``_reconcile_repair_directives`` for
+            # the full invariant list. Pure — never raises, never mutates
+            # inputs; corrections are logged as observability events so a
+            # post-mortem can trace which generator's output needed repair.
+            try:
+                _reconciled, _reconciler_corrections = _reconcile_repair_directives(
+                    reflection_banner_lines,
+                    reflection_verdict,
+                    _workspace_for_banner,
+                )
+                if _reconciler_corrections:
+                    reflection_banner_lines = _reconciled
+                    for _correction in _reconciler_corrections:
+                        logger.info(
+                            "[repair_node] Prompt reconciler correction: %s",
+                            _correction,
+                        )
+                    try:
+                        from harness.observability import emit_event as _emit_pr
+                        _emit_pr(
+                            "prompt_reconciler_correction",
+                            iteration=loop_counter.get("total_repairs", 0),
+                            corrections=_reconciler_corrections,
+                            verdict=reflection_verdict.get("verdict", ""),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as _rc_exc:  # noqa: BLE001
+                logger.debug(
+                    "[repair_node] Prompt reconciler skipped due to error: %s",
+                    _rc_exc,
+                )
             reflection_msg = "\n".join(reflection_banner_lines)
             if ignored_last_round and ignored_files_prev:
                 touched_str = (

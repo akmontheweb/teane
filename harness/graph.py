@@ -3974,12 +3974,21 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
                     _scope_for_preflight.append(_p)
         preflight_section = ""
         if _scope_for_preflight:
-            _files_seen_map = (state.get("node_state") or {}).get(
-                "files_seen_by_llm"
-            )
-            _record_into: Optional[dict[str, str]] = (
-                _files_seen_map if isinstance(_files_seen_map, dict) else None
-            )
+            # Bug B fix (2026-07-10): make sure the dict exists on
+            # state so the preflight hashes actually persist through
+            # _patching_tool_loop's fresh-copy seed. Prior code
+            # bailed to None here on cold-start, so the first
+            # patching call after a new story never populated
+            # files_seen_by_llm from preflight.
+            _ns = state.get("node_state")
+            if not isinstance(_ns, dict):
+                _ns = {}
+                state["node_state"] = _ns
+            _files_seen_map = _ns.get("files_seen_by_llm")
+            if not isinstance(_files_seen_map, dict):
+                _files_seen_map = {}
+                _ns["files_seen_by_llm"] = _files_seen_map
+            _record_into: Optional[dict[str, str]] = _files_seen_map
             _pairs = _collect_workspace_file_content(
                 workspace, _scope_for_preflight,
                 record_hashes_into=_record_into,
@@ -4586,6 +4595,18 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 "allowed_paths": allowed_paths,
                 "zero_rounds": zero_rounds_for_log,
                 "current_story_id": current_story_id,
+                # Bug B fix (2026-07-10): persist the hashes the LLM
+                # was shown so the NEXT patching call's
+                # _pre_patch_screen guard 2 sees them. Without this,
+                # every batch after the first that touches a
+                # previously-modified file gets ALL its patches
+                # rejected pre-flight — files_seen_by_llm was empty on
+                # entry because the return didn't carry it, so
+                # modified_this_session ∩ edit_targets = every target
+                # → all rejected as "READ_FILE first". repair_node
+                # already has this line at graph.py:15125; parity
+                # here closes the gap.
+                "files_seen_by_llm": tool_files_seen,
             },
         }
     except RuntimeError as exc:

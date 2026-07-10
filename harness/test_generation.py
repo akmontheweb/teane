@@ -1183,12 +1183,18 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     )
     preflight_section = ""
     if preflight_targets:
-        _files_seen = (state.get("node_state") or {}).get(
-            "files_seen_by_llm"
-        )
-        _record_into: Optional[dict[str, str]] = (
-            _files_seen if isinstance(_files_seen, dict) else None
-        )
+        # Bug B parity (2026-07-10): initialize the dict so preflight
+        # hashes actually land on state instead of being dropped when
+        # the outer .get() returns None on cold-start.
+        _ns = state.get("node_state")
+        if not isinstance(_ns, dict):
+            _ns = {}
+            state["node_state"] = _ns
+        _files_seen = _ns.get("files_seen_by_llm")
+        if not isinstance(_files_seen, dict):
+            _files_seen = {}
+            _ns["files_seen_by_llm"] = _files_seen
+        _record_into: Optional[dict[str, str]] = _files_seen
         pairs = _collect_workspace_file_content(
             workspace_path, preflight_targets,
             record_hashes_into=_record_into,

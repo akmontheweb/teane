@@ -204,3 +204,38 @@ class TestExternallyMutatedFallback:
         )
         assert len(kept) == 1
         assert rejections == []
+
+
+class TestPatchingNodePersistsFilesSeenByLlm:
+    """Bug B (2026-07-10): patching_node's return did not carry
+    ``files_seen_by_llm`` back onto ``node_state`` — repair_node's
+    parity line at graph.py:15125 was missing here. The next
+    patching call would then read an empty dict, seed a fresh
+    ``tool_files_seen``, and _pre_patch_screen's guard 2 rejected
+    every edit against a previously-modified file. Session
+    44c5e194 batch 85 (STORY-033–037) lost every patch to this
+    across 5 stories.
+    """
+
+    def test_source_contains_files_seen_by_llm_in_return_delta(self):
+        """Static parity check: patching_node's return node_state
+        MUST include ``files_seen_by_llm`` so the next call's
+        _pre_patch_screen sees prior hashes. Failure mode is silent
+        pre-flight rejection of every edit — not the sort of bug
+        pytest-driven integration coverage catches easily."""
+        import inspect
+        from harness.graph import patching_node
+        src = inspect.getsource(patching_node)
+        # There are two shapes of value that would be correct — the
+        # tool-loop-returned local ``tool_files_seen`` (populated by
+        # in-loop READ_FILE tool calls AND by preflight) or the
+        # pattern used in repair_node. Either match — we just want
+        # to catch a regression where the line is dropped again.
+        assert "\"files_seen_by_llm\": tool_files_seen" in src or \
+               "'files_seen_by_llm': tool_files_seen" in src, (
+            "patching_node's return must persist files_seen_by_llm "
+            "back onto node_state — otherwise the next patching call "
+            "loses every hash the LLM has been shown and guard 2 in "
+            "_pre_patch_screen rejects every edit against files "
+            "modified this session."
+        )

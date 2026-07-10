@@ -269,3 +269,24 @@ class TestPhase7TraceabilityAndNonToolchainSymbols:
         text = "\n".join(actions)
         assert "Install the missing tool/package" in text
         assert "pytest" in text
+
+    def test_env_misconfig_zero_emit_does_not_suggest_pip_install(self):
+        """Bug A (2026-07-10): the new `test_generation_zero_emit`
+        symbol (from Fix 2a) was falling through the toolchain
+        branch and producing "pip install test_generation_zero_emit"
+        recovery text. Must now route through the non-toolchain
+        branch with actionable guidance."""
+        state = _base_state(
+            node_state={"env_misconfig_symbol": "test_generation_zero_emit"},
+        )
+        actions = _build_outside_harness_actions(
+            state, "env_misconfig:test_generation_zero_emit",
+        )
+        text = "\n".join(actions)
+        # No nonsensical package-install text
+        assert "Install the missing tool/package" not in text
+        assert "pip install test_generation_zero_emit" not in text
+        # The correct recovery hints are surfaced
+        assert "max_zero_emit_reprompts" in text
+        # And the root-cause pointer to check upstream patcher output
+        assert "patches=N succeed=0" in text or "patcher" in text.lower()

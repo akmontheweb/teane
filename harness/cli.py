@@ -3067,6 +3067,12 @@ def _build_outside_harness_actions(
         "test_generation_max_iterations",
         "llm_api_key",
         "no_source_files",
+        # Fix 2a (2026-07-10) — new sub-cap symbol emitted by
+        # test_generation_node when the LLM returns zero patch blocks
+        # for N consecutive re-prompts. Falls through the toolchain
+        # branch would produce "pip install test_generation_zero_emit"
+        # (nonsense). Handled explicitly below.
+        "test_generation_zero_emit",
     }
 
     # ---- traceability_block (v5 Phase 7 BUG #6) ---------------------
@@ -3150,6 +3156,30 @@ def _build_outside_harness_actions(
                     "the configured `_SOURCE_EXTENSIONS`. If the patcher "
                     "ran but wrote into an unexpected location, inspect "
                     "the recent diff with `git status` / `git diff`."
+                )
+            elif symbol == "test_generation_zero_emit":
+                actions.append(
+                    "The test-generation LLM returned zero patch blocks "
+                    "for `test_generation.max_zero_emit_reprompts` "
+                    "consecutive re-prompts (default 3). This usually "
+                    "means the LLM can't tell what to test — check the "
+                    "prior patching_node output above: if the production "
+                    "code for this batch failed to apply (look for "
+                    "`patches=N succeed=0`), the LLM correctly has "
+                    "nothing to test. Fix the upstream patcher rejection "
+                    "first, then `[r]` Resume."
+                )
+                actions.append(
+                    "If the prod code DID land but the LLM is still "
+                    "silent, `[e]` inject a test hint like `write a "
+                    "test for <function_name> asserting <expected>` — "
+                    "the next re-prompt will see it."
+                )
+                actions.append(
+                    "Or raise the sub-cap for this session by setting "
+                    "`test_generation.max_zero_emit_reprompts` in "
+                    "`config/config.json` (default 3). Higher values "
+                    "trade budget for retries."
                 )
         elif symbol:
             actions.append(

@@ -859,6 +859,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "hitl": frozenset({
         "requirement", "architecture", "repair", "deployment",
         "layout_divergence",
+        # Fix 1 (2026-07-10): per-session and per-trigger auto-resume
+        # caps for headless-mode HITL loop. See ``_HITL_AUTO_RESUME_CAP``
+        # / ``_HITL_AUTO_RESUME_CAP_PER_TRIGGER`` at module top.
+        "auto_resume_cap", "auto_resume_cap_per_trigger",
     }),
     # Agile tuning knobs. batch_size = max stories per dependency batch;
     # commit_on_story = git-commit after each green story; repair_cap =
@@ -903,6 +907,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "hitl.repair": (bool,),
     "hitl.deployment": (bool,),
     "hitl.layout_divergence": (bool,),
+    "hitl.auto_resume_cap": (int,),
+    "hitl.auto_resume_cap_per_trigger": (int,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -2172,6 +2178,18 @@ MAX_GATEKEEPER_REFINES = 5
 # can override via ``state['hitl_auto_resume_cap']`` when a long-tail
 # recovery legitimately needs more headroom.
 _HITL_AUTO_RESUME_CAP = 3
+
+# Per-trigger sub-cap. Session cap is a total budget across ALL
+# triggers; this sub-cap is enforced per-trigger so one exhausted
+# failure class can't burn another's slack. Session
+# 44c5e194-5715-451f-92c6-84362eeb7453 (2026-07-10) tripped the
+# session cap via 1× test_generation_max_iterations + 2× zero_patch_loop:2,
+# leaving the operator no slack for genuinely-different follow-on
+# failures. Defaults to the same value as _HITL_AUTO_RESUME_CAP so
+# raising the session cap alone doesn't quietly let ONE trigger
+# monopolize; operators can override independently via
+# ``state['hitl_auto_resume_cap_per_trigger']``.
+_HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
 
 # The five HITL gates the resolver knows about. Tuples of
 # (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
@@ -3490,8 +3508,30 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 _resumes_taken = int(
                     _lc_for_cap.get("hitl_auto_resumes_taken", 0) or 0
                 )
+                # Cap resolution: explicit state override wins, then
+                # config.json's ``hitl.auto_resume_cap``, then the
+                # module default. Both keys live on the config so the
+                # termination banner's recovery-hint suggestion isn't
+                # hollow.
+                _hitl_config = (
+                    (state.get("harness_config") or {}).get("hitl") or {}
+                )
                 _cap = int(
-                    state.get("hitl_auto_resume_cap") or _HITL_AUTO_RESUME_CAP
+                    state.get("hitl_auto_resume_cap")
+                    or _hitl_config.get("auto_resume_cap")
+                    or _HITL_AUTO_RESUME_CAP
+                )
+                # Fix 1: per-trigger sub-cap. Session cap is the total
+                # auto-resume budget across all triggers; the sub-cap
+                # bounds any SINGLE trigger's contribution so one
+                # exhausted failure class can't monopolize the pool
+                # (session 44c5e194 termination: 1× test_gen +
+                # 2× zero_patch_loop = 3 session cap, leaving no
+                # slack for follow-on triggers).
+                _cap_per_trigger = int(
+                    state.get("hitl_auto_resume_cap_per_trigger")
+                    or _hitl_config.get("auto_resume_cap_per_trigger")
+                    or _HITL_AUTO_RESUME_CAP_PER_TRIGGER
                 )
                 # Per-trigger frequency so the termination banner (and
                 # post-mortems) can point at WHICH failure classes ate
@@ -3505,7 +3545,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     dict(_per_trigger_raw)
                     if isinstance(_per_trigger_raw, dict) else {}
                 )
-                if _resumes_taken >= _cap:
+                _trigger_taken = int(_per_trigger.get(trigger, 0) or 0)
+                _session_cap_hit = _resumes_taken >= _cap
+                _trigger_cap_hit = _trigger_taken >= _cap_per_trigger
+                if _session_cap_hit or _trigger_cap_hit:
                     # Direct-abandon: bypass the ``[q]`` handler's
                     # confirmation prompt. In headless mode the confirm
                     # channel returns False by default, so falling through
@@ -3514,15 +3557,20 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     # ``while True:`` iteration — a tight loop that spams
                     # this WARNING millions of times per second (session
                     # cec4d124 hit 18M repetitions in ~10 minutes).
+                    _cap_reason = (
+                        f"session cap {_resumes_taken}/{_cap}"
+                        if _session_cap_hit else
+                        f"per-trigger cap {_trigger_taken}/"
+                        f"{_cap_per_trigger} for '{trigger}'"
+                    )
                     logger.warning(
-                        "[HITL] Auto-resume cap reached (%d/%d) for "
-                        "trigger '%s' in headless mode — terminating "
-                        "instead of looping. No operator can act on "
-                        "this in a headless session; further "
-                        "auto-resumes would just burn budget on repeat "
-                        "escalation-summary calls without changing the "
-                        "underlying failure.",
-                        _resumes_taken, _cap, trigger,
+                        "[HITL] Auto-resume cap reached (%s) in headless "
+                        "mode — terminating instead of looping. No "
+                        "operator can act on this in a headless session; "
+                        "further auto-resumes would just burn budget on "
+                        "repeat escalation-summary calls without changing "
+                        "the underlying failure.",
+                        _cap_reason,
                     )
                     # Loud termination banner to stderr — the previous
                     # single-line WARNING was buried in verbose output
@@ -3547,15 +3595,23 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         f"  {name:<40s} {count:>3d} auto-resume(s)"
                         for name, count in _sorted_trigs
                     ] or ["  (no per-trigger accounting recorded)"]
+                    _which_cap_line = (
+                        f"Cap tripped:          {_cap_reason}\n"
+                    )
+                    if _session_cap_hit and _trigger_cap_hit:
+                        _which_cap_line = (
+                            f"Cap tripped:          {_cap_reason} "
+                            "(both session AND per-trigger)\n"
+                        )
                     _banner = (
                         "\n"
                         + "=" * 78 + "\n"
-                        + "TERMINATED — HITL auto-resume cap "
-                        f"{_resumes_taken}/{_cap} exhausted (headless "
-                        "mode)\n"
+                        + "TERMINATED — HITL auto-resume cap exhausted "
+                        "(headless mode)\n"
                         + "=" * 78 + "\n"
                         + f"Session:              {_session_id}\n"
                         + f"Last trigger:         {trigger}\n"
+                        + _which_cap_line
                         + f"Total repairs:        {_total_repairs}\n"
                         + f"Budget remaining:     ${_budget_left:.4f}\n"
                         + "\n"
@@ -3568,10 +3624,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         + "  2. Rerun with `--hitl-repair true` to opt "
                         "into interactive repair (still non-blocking\n"
                         + "     for other gates).\n"
-                        + "  3. Raise the cap via config: set "
-                        "`hitl.auto_resume_cap: 10` in config.json (or\n"
-                        + "     pass the equivalent). Higher caps trade "
-                        "budget for recovery slack.\n"
+                        + "  3. Raise the appropriate cap via config: "
+                        f"{'`hitl.auto_resume_cap_per_trigger: 6`' if _trigger_cap_hit else '`hitl.auto_resume_cap: 10`'} "
+                        "in config.json.\n"
+                        + "     Higher caps trade budget for recovery "
+                        "slack.\n"
                         + "  4. Inspect the workspace at the state "
                         f"above and manually address the '{trigger}'\n"
                         + "     failure, then rerun `teane patch`.\n"

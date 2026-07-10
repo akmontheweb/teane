@@ -3956,8 +3956,54 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
             "file is on disk, and the repair loop cannot recover from "
             "this without your help.\n\n"
         )
+        # Fix 5b: preflight the current on-disk bodies of story-scope
+        # files that already exist, so the LLM's first patch attempt
+        # doesn't have to spend an LLM turn on READ_FILE just to
+        # refresh its mental model. Skipped when there's no story scope
+        # (monolithic runs) — the existing READ_FILE fallback still
+        # works and the token overhead of speculative preflight isn't
+        # justified. Only files that already exist are included;
+        # missing scope files are CREATE cases with no stale-model risk.
+        _scope_for_preflight: list[str] = []
+        _story_scope = state.get("story_scope_files") or []
+        if isinstance(_story_scope, list):
+            for _p in _story_scope:
+                if not isinstance(_p, str) or not _p.strip():
+                    continue
+                if os.path.isfile(os.path.join(workspace, _p)):
+                    _scope_for_preflight.append(_p)
+        preflight_section = ""
+        if _scope_for_preflight:
+            _files_seen_map = (state.get("node_state") or {}).get(
+                "files_seen_by_llm"
+            )
+            _record_into: Optional[dict[str, str]] = (
+                _files_seen_map if isinstance(_files_seen_map, dict) else None
+            )
+            _pairs = _collect_workspace_file_content(
+                workspace, _scope_for_preflight,
+                record_hashes_into=_record_into,
+            )
+            preflight_section = _format_preflight_file_content(
+                _pairs,
+                intro=(
+                    "The line-numbered views below are the **actual current "
+                    "bytes** of story-scope files that already exist. Build "
+                    "any REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK "
+                    "against these bytes verbatim (WITHOUT the `  N| ` "
+                    "line-number prefix). Do NOT patch against a remembered "
+                    "version — earlier nodes in this session may have "
+                    "already modified these files."
+                ),
+            )
+            if preflight_section:
+                logger.info(
+                    "[patching_node] Preflight injected current content "
+                    "for %d story-scope file(s): %s",
+                    len(_pairs), ", ".join(p[0] for p in _pairs),
+                )
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + existing_files_preamble + cr_preamble + story_preamble + arch_preamble + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + existing_files_preamble + cr_preamble + story_preamble + arch_preamble + preflight_section + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -3998,6 +4044,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             + existing_files_preamble
             + cr_preamble
             + story_preamble
+            + preflight_section
             + _IMPORT_CONVENTION_RULE
             + "[PATCHING — NATIVE TOOL-USE MODE]\n"
             "The harness has exposed the patch operations as native tools "

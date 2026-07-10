@@ -84,7 +84,12 @@ class TestCapHitBannerAndState:
         # Banner is visually distinct.
         assert "=" * 78 in stderr
         assert "TERMINATED" in stderr
-        assert "HITL auto-resume cap 3/3 exhausted" in stderr
+        # Fix 1 (2026-07-10) split the "N/N exhausted" header into a
+        # dedicated "Cap tripped:" line so the banner can distinguish
+        # session-cap trips from per-trigger-cap trips.
+        assert "HITL auto-resume cap exhausted" in stderr
+        assert "Cap tripped:" in stderr
+        assert "session cap 3/3" in stderr
         # Trigger context.
         assert "zero_patch_loop" in stderr
         assert "persistent_build_failure" in stderr
@@ -144,3 +149,75 @@ class TestPerTriggerFrequency:
         per_trig = result["loop_counter"]["hitl_auto_resumes_per_trigger"]
         assert per_trig.get("zero_patch_loop") == 1
         assert per_trig.get("persistent_build_failure") == 1
+
+
+class TestPerTriggerCap:
+    """Fix 1 (2026-07-10): each trigger has its own auto-resume budget so
+    one exhausted failure class can't monopolize the session pool
+    (session 44c5e194: 1× test_gen + 2× zero_patch_loop = 3 session cap,
+    leaving no slack for follow-on failures). The per-trigger cap
+    defaults to the same value as the session cap so raising the
+    session cap alone doesn't quietly re-open the monopoly hole."""
+
+    def test_per_trigger_cap_trips_before_session_cap(self, monkeypatch):
+        # Session cap raised to 10, per-trigger cap left at default 3.
+        # Trigger A has already burned 3 — this call would be the 4th
+        # for that trigger, so the per-trigger cap must trip and the
+        # banner must name it (not "session cap").
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="zero_patch_loop",
+            resumes_taken=3, cap=10,
+            per_trigger={"zero_patch_loop": 3},
+        )
+        state["hitl_auto_resume_cap_per_trigger"] = 3
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = cli.hitl_menu_loop(state)
+        stderr = buf.getvalue()
+        assert "TERMINATED" in stderr
+        assert "per-trigger cap 3/3 for 'zero_patch_loop'" in stderr
+        # And "session cap 3/10" is NOT what tripped — session still had slack.
+        assert "session cap 3/10" not in stderr
+        # State reflects the abandon.
+        assert result["node_state"]["hitl_auto_resume_cap_hit"] is True
+
+    def test_session_cap_still_trips_when_it_hits_first(self, monkeypatch):
+        # Session cap 3, per-trigger cap 10. Session cap trips first.
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="zero_patch_loop",
+            resumes_taken=3, cap=3,
+            per_trigger={"zero_patch_loop": 2, "other_trigger": 1},
+        )
+        state["hitl_auto_resume_cap_per_trigger"] = 10
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            cli.hitl_menu_loop(state)
+        stderr = buf.getvalue()
+        assert "TERMINATED" in stderr
+        assert "session cap 3/3" in stderr
+        # The per-trigger cap was NOT the thing that tripped.
+        assert "per-trigger cap" not in stderr.split("Recovery options")[0]
+
+    def test_config_dot_key_flows_through_state(self, monkeypatch):
+        # The banner promises `hitl.auto_resume_cap_per_trigger` as a
+        # config lever. Set it on state["harness_config"] (which
+        # create_initial_state populates from config.json) and confirm
+        # the check picks it up rather than falling to the module
+        # default of 3. Trigger has already been auto-resumed 5×;
+        # config cap is 5; so 5 >= 5 trips the per-trigger cap.
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="zero_patch_loop",
+            resumes_taken=6, cap=10,
+            per_trigger={"zero_patch_loop": 5},
+        )
+        state["harness_config"] = {
+            "hitl": {"auto_resume_cap_per_trigger": 5}
+        }
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            cli.hitl_menu_loop(state)
+        stderr = buf.getvalue()
+        assert "per-trigger cap 5/5 for 'zero_patch_loop'" in stderr

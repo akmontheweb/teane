@@ -332,10 +332,16 @@ class TestHappyPath:
         assert (tmp_path / "tests" / "test_calculator.py").is_file()
 
     @pytest.mark.asyncio
-    async def test_no_tests_generated_skips_sandbox_call(
+    async def test_zero_patch_emission_retries_then_trips_hitl(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        # LLM returns nothing parseable → 0 generated tests → skip sandbox
+        # Fix 2a (2026-07-10): when the LLM returns zero patch blocks
+        # that's a prompt-comprehension miss, not a benign "no tests
+        # needed" pass-through. The node retries inline with a stronger
+        # contract (max_zero_emit_reprompts=3 by default). If the LLM
+        # STILL emits nothing, HITL fires with a distinct
+        # env_misconfig symbol so the operator can distinguish this
+        # failure class from the generic max_iterations one.
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def foo(): pass\n")
         stub_gateway("no patch blocks here, just prose")
@@ -348,12 +354,25 @@ class TestHappyPath:
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
         })
-        # No deterministic run happened
+        # No deterministic run happened — we never got past the
+        # zero-emit retry loop.
         assert _StubSandboxExecutor.last_command == ""
-        # Status is a pass with the no_tests_generated reason
-        assert result["node_state"]["test_generation"]["status"] == "passed"
-        assert result["node_state"]["test_generation"]["reason"] == "no_tests_generated"
-        assert route_after_test_generation(result) == "lintgate_node"
+        # Env misconfig HITL fires with the distinct zero_emit symbol
+        # so a post-mortem can see WHICH failure class ate the budget.
+        assert result["node_state"]["env_misconfig"] is True
+        assert (
+            result["node_state"]["env_misconfig_symbol"]
+            == "test_generation_zero_emit"
+        )
+        assert result["exit_code"] == 1
+        # The zero-emit budget is fully consumed but the real
+        # test_generation iteration counter DID NOT advance — that's
+        # the whole point of the sub-counter split.
+        assert result["loop_counter"]["test_generation_zero_emit"] == 3
+        assert "test_generation" not in result["loop_counter"] or \
+            result["loop_counter"]["test_generation"] == 0
+        # Router sends this to human_intervention on env_misconfig.
+        assert route_after_test_generation(result) == "human_intervention_node"
 
 
 # ---------------------------------------------------------------------------
@@ -950,3 +969,222 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
         # Story preamble renders the empty string when no story is set —
         # the prompt has no "Story Scope:" header.
         assert "Story Scope:" not in joined
+
+
+# ---------------------------------------------------------------------------
+# Fix 2c (2026-07-10): the test-gen format reminder must document all four
+# patch block types. Prior to this fix only CREATE_FILE and INSERT_AT_BLOCK
+# were listed, but the LLM sees REPLACE_BLOCK examples in the messages
+# history from patching_node — mismatch caused iter 4 of session 44c5e194
+# to emit 5 REPLACE_BLOCKs that all rejected as "unknown format".
+# ---------------------------------------------------------------------------
+
+class TestFormatReminderDocumentsAllBlockTypes:
+
+    def test_reminder_lists_all_four_patch_ops(self):
+        from harness.test_generation import _PROMPT_FORMAT_REMINDER_BASE
+        assert "<<<CREATE_FILE>>>" in _PROMPT_FORMAT_REMINDER_BASE
+        assert "<<<REPLACE_BLOCK>>>" in _PROMPT_FORMAT_REMINDER_BASE
+        assert "<<<REWRITE_FILE>>>" in _PROMPT_FORMAT_REMINDER_BASE
+        assert "<<<INSERT_AT_BLOCK>>>" in _PROMPT_FORMAT_REMINDER_BASE
+
+    def test_reminder_explains_when_to_use_each_op(self):
+        # The "CHOOSING THE RIGHT BLOCK:" section is what steers the LLM
+        # away from REPLACE_BLOCK-when-file-is-empty (Fix 4 bait).
+        from harness.test_generation import _PROMPT_FORMAT_REMINDER_BASE
+        assert "CHOOSING THE RIGHT BLOCK" in _PROMPT_FORMAT_REMINDER_BASE
+        assert "REWRITE_FILE" in _PROMPT_FORMAT_REMINDER_BASE
+        assert "small" in _PROMPT_FORMAT_REMINDER_BASE.lower()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 (2026-07-10): missing @verifies marker is autofixed deterministically
+# from the current story's AC keys rather than routed to LLM repair. Only
+# markerless files WITHOUT usable story context still route to repair.
+# ---------------------------------------------------------------------------
+
+class TestVerifiesMarkerAutofix:
+
+    def test_marker_line_for_python_uses_hash_lead(self):
+        from harness.test_generation import _marker_line_for
+        line = _marker_line_for("python", ["STORY-3.AC-1", "STORY-3.AC-2"])
+        assert line == "# @verifies: STORY-3.AC-1, STORY-3.AC-2"
+
+    def test_marker_line_for_typescript_uses_slash_lead(self):
+        from harness.test_generation import _marker_line_for
+        line = _marker_line_for("typescript", ["STORY-3.AC-1"])
+        assert line == "// @verifies: STORY-3.AC-1"
+
+    def test_marker_line_for_no_keys_returns_none(self):
+        from harness.test_generation import _marker_line_for
+        assert _marker_line_for("python", []) is None
+
+    def test_marker_line_for_drops_malformed_keys(self):
+        # Bad keys are silently filtered — the persist gate would drop
+        # them downstream anyway, so autofix shouldn't waste I/O
+        # writing them.
+        from harness.test_generation import _marker_line_for
+        assert _marker_line_for("python", ["bogus", "STORY-1.AC-2"]) == (
+            "# @verifies: STORY-1.AC-2"
+        )
+        assert _marker_line_for("python", ["bogus", "also-bad"]) is None
+
+    def test_prepend_marker_writes_at_top_of_file(self, tmp_path):
+        from harness.test_generation import _prepend_verifies_marker
+        f = tmp_path / "test_x.py"
+        f.write_text("def test_x(): pass\n")
+        assert _prepend_verifies_marker(
+            str(f), "# @verifies: STORY-1.AC-1",
+        ) is True
+        body = f.read_text()
+        assert body.startswith("# @verifies: STORY-1.AC-1\n")
+        assert "def test_x()" in body
+
+    def test_prepend_marker_respects_shebang(self, tmp_path):
+        from harness.test_generation import _prepend_verifies_marker
+        f = tmp_path / "run.py"
+        f.write_text("#!/usr/bin/env python3\ndef test_x(): pass\n")
+        _prepend_verifies_marker(str(f), "# @verifies: STORY-1.AC-1")
+        lines = f.read_text().splitlines()
+        assert lines[0] == "#!/usr/bin/env python3"
+        assert lines[1] == "# @verifies: STORY-1.AC-1"
+
+    def test_prepend_marker_idempotent_when_already_present(self, tmp_path):
+        # Autofix is called from a loop; running it twice must not
+        # duplicate the marker (and must not write the file again).
+        from harness.test_generation import _prepend_verifies_marker
+        f = tmp_path / "test_x.py"
+        f.write_text("# @verifies: STORY-1.AC-1\ndef test_x(): pass\n")
+        assert _prepend_verifies_marker(
+            str(f), "# @verifies: STORY-1.AC-1",
+        ) is True
+        body = f.read_text()
+        # Only one marker line in the file
+        assert body.count("@verifies:") == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 5a (2026-07-10): the test-gen user prompt must include the current
+# on-disk bytes of every existing test file the LLM might edit. Without
+# this, REPLACE_BLOCK anchors are built from the LLM's stale mental model
+# (root cause behind iter 4 of session 44c5e194).
+# ---------------------------------------------------------------------------
+
+class TestPreflightInjectionInTestGenPrompt:
+
+    @pytest.mark.asyncio
+    async def test_existing_test_file_body_appears_in_user_prompt(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        # Source file being tested this round.
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+        # A pre-existing test file that shares the conventional name —
+        # the harness must show its current body to the LLM.
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_calc.py").write_text(
+            "# @verifies: STORY-1.AC-1\n"
+            "def test_add_returns_sum():\n"
+            "    from calc import add\n"
+            "    assert add(2, 3) == 5\n"
+        )
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc_extra.py\n"
+            "content:\n"
+            "def test_extra(): pass\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py", "tests/test_calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(
+            m.get("content", "") for m in sent if m.get("role") == "user"
+        )
+        # Preflight section header appears
+        assert "Current Content of Files You Need to Edit" in joined
+        # And carries the ACTUAL test file body (not the LLM's memory of it)
+        assert "test_add_returns_sum" in joined
+        assert "assert add(2, 3) == 5" in joined
+        # Line-numbered rendering (the `  N| ` prefix from _render_file...)
+        assert "1| " in joined or "1|" in joined
+
+
+# ---------------------------------------------------------------------------
+# Fix 2a (2026-07-10) — POSITIVE path: zero-emit retry succeeds on second
+# response. Confirms the counter split: test_generation_zero_emit=1,
+# test_generation=1 (only the successful attempt is counted).
+# ---------------------------------------------------------------------------
+
+class TestZeroEmitRetrySucceeds:
+
+    @pytest.mark.asyncio
+    async def test_reprompt_then_valid_patch_lands_and_counters_split(
+        self, tmp_path, stub_sandbox, monkeypatch,
+    ):
+        # Custom stub gateway that returns different content on each call.
+        # First call: zero patch blocks. Second call: a valid patch.
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "foo.py").write_text("def foo(): return 1\n")
+
+        class _MultiResponseGateway(_StubGateway):
+            def __init__(self):
+                super().__init__("")
+                self._responses = [
+                    "no patch blocks here — just prose",
+                    "<<<CREATE_FILE>>>\n"
+                    "file: tests/test_foo.py\n"
+                    "content:\n"
+                    "# @verifies: STORY-1.AC-1\n"
+                    "def test_foo(): assert True\n"
+                    "<<<END_CREATE_FILE>>>\n",
+                ]
+
+            async def dispatch(self, *, messages, role, budget_remaining_usd, **kwargs):
+                self.dispatched.append({"messages": list(messages), "role": role})
+                idx = min(len(self.dispatched) - 1, len(self._responses) - 1)
+                return _StubResponse(self._responses[idx]), (
+                    budget_remaining_usd - 0.001
+                )
+
+        from harness import graph as graph_mod
+        gw = _MultiResponseGateway()
+        graph_mod.set_gateway(gw)
+        try:
+            stub_sandbox(0, "1 passed")
+            result = await run_test_generation({
+                "workspace_path": str(tmp_path),
+                "modified_files": ["foo.py"],
+                "messages": [],
+                "budget_remaining_usd": 1.5,
+                "token_tracker": {},
+            })
+        finally:
+            graph_mod.set_gateway(None)
+
+        # Two dispatches: the first was the zero-emit re-prompt, the
+        # second landed a real patch.
+        assert len(gw.dispatched) == 2
+        # The zero-emit counter recorded the single retry.
+        assert result["loop_counter"]["test_generation_zero_emit"] == 1
+        # The REAL iteration counter only advanced for the successful
+        # attempt — that's Fix 2a's whole point.
+        assert result["loop_counter"]["test_generation"] == 1
+        # Second dispatch's messages must include the stronger contract
+        # system message pushed after the zero-emit response.
+        second_msgs = gw.dispatched[1]["messages"]
+        stronger_prompt_hits = [
+            m for m in second_msgs
+            if m.get("role") == "system"
+            and "zero PATCH blocks" in m.get("content", "")
+        ]
+        assert stronger_prompt_hits, (
+            "second dispatch must carry the stronger re-prompt system "
+            "message pushed after the first zero-emit response"
+        )

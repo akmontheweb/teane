@@ -179,6 +179,93 @@ def _is_test_file(rel_path: str) -> bool:
     return any(p.search(norm) for p in _TEST_FILE_PATTERNS)
 
 
+# Conventional test-path templates per source stem, used to find existing
+# tests that map to a source file. Includes root-level ``tests/`` (Python
+# canonical), colocated (JS/TS convention), and Java's parallel src/test tree.
+# The stem is substituted for ``{stem}``; the extension for ``{ext}``.
+_TEST_PATH_TEMPLATES_BY_STACK: dict[str, tuple[str, ...]] = {
+    "python": (
+        "tests/test_{stem}.py",
+        "tests/unit/test_{stem}.py",
+        "test/test_{stem}.py",
+    ),
+    "javascript": (
+        "{dir}/{stem}.test.{ext}",
+        "{dir}/{stem}.spec.{ext}",
+        "{dir}/__tests__/{stem}.test.{ext}",
+        "tests/unit/{stem}.test.{ext}",
+    ),
+    "typescript": (
+        "{dir}/{stem}.test.{ext}",
+        "{dir}/{stem}.spec.{ext}",
+        "{dir}/__tests__/{stem}.test.{ext}",
+        "client/tests/unit/{stem}.test.{ext}",
+        "tests/unit/{stem}.test.{ext}",
+    ),
+    "java": (
+        "src/test/java/{dir_no_prefix}/{stem}Test.java",
+        "src/test/java/{dir_no_prefix}/Test{stem}.java",
+    ),
+}
+
+
+def _existing_tests_for_preflight(
+    workspace_path: str,
+    source_files: list[str],
+    modified_files: list[str],
+    primary_stack: str,
+) -> list[str]:
+    """Return workspace-relative paths of existing test files the LLM is
+    about to edit or extend. Two sources, unioned + deduped:
+
+    1. Every entry in ``modified_files`` that ``_is_test_file`` recognises
+       AND exists on disk. These are guaranteed to have drifted since the
+       LLM's mental model — they were touched THIS session by an earlier
+       node — and are the root cause behind iter 4's stale-anchor
+       rejections on session 44c5e194.
+
+    2. Conventional test paths mapped from each source file's stem via
+       ``_TEST_PATH_TEMPLATES_BY_STACK``. Only paths that exist on disk
+       are returned; missing conventional paths mean the LLM will
+       CREATE_FILE for them, not modify — no preflight needed.
+
+    The preflight caller (``_collect_workspace_file_content``) caps at
+    12 files by default, so this list can be over-generous without
+    blowing the prompt budget.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(rel: str) -> None:
+        if not rel or rel in seen:
+            return
+        abs_path = os.path.join(workspace_path, rel)
+        if not os.path.isfile(abs_path):
+            return
+        seen.add(rel)
+        out.append(rel)
+
+    for rel in modified_files:
+        if isinstance(rel, str) and _is_test_file(rel):
+            _add(rel)
+
+    templates = _TEST_PATH_TEMPLATES_BY_STACK.get(primary_stack, ())
+    for src_rel in source_files:
+        if not isinstance(src_rel, str):
+            continue
+        dirname = os.path.dirname(src_rel).replace("\\", "/")
+        stem = os.path.splitext(os.path.basename(src_rel))[0]
+        ext = os.path.splitext(src_rel)[1].lstrip(".").lower()
+        dir_no_prefix = dirname.split("/", 1)[1] if "/" in dirname else dirname
+        for tmpl in templates:
+            candidate = tmpl.format(
+                stem=stem, ext=ext, dir=dirname,
+                dir_no_prefix=dir_no_prefix,
+            )
+            _add(candidate)
+    return out
+
+
 # Directory names that should never be walked for test_generation candidates.
 # Mirrors harness.impact._NEVER_SOURCE_DIRS but kept local to avoid an import
 # cycle (impact also imports test-related state types in some configurations).
@@ -285,6 +372,111 @@ _AC_KEY_RE = re.compile(r"^STORY-\d+\.AC-\d+$")
 # buried at line 800 is almost certainly not what the LLM meant. 50 covers
 # any reasonable preamble depth (docstring + imports + a class header).
 _VERIFIES_SCAN_LINES = 50
+
+
+# Map primary stack → the language-appropriate comment lead for the
+# ``@verifies: STORY-N.AC-N`` marker. Autofix uses this when it needs to
+# prepend a marker deterministically (rather than route to LLM repair).
+_MARKER_COMMENT_LEAD_BY_STACK: dict[str, str] = {
+    "python": "#",
+    "javascript": "//",
+    "typescript": "//",
+    "java": "//",
+}
+
+
+def _marker_line_for(
+    primary_stack: str, ac_keys: list[str],
+) -> Optional[str]:
+    """Render the ``# @verifies: STORY-N.AC-1, STORY-N.AC-2`` line for
+    ``primary_stack``, or ``None`` when no keys are supplied.
+
+    Comment lead is language-aware (Python ``#`` vs JS/TS/Java ``//``).
+    Keys are validated against ``_AC_KEY_RE`` — anything malformed is
+    dropped so the autofix can't inject a marker that will be
+    rejected by ``_persist_verifies_links``.
+    """
+    if not ac_keys:
+        return None
+    lead = _MARKER_COMMENT_LEAD_BY_STACK.get(primary_stack, "#")
+    valid = [k for k in ac_keys if isinstance(k, str) and _AC_KEY_RE.match(k)]
+    if not valid:
+        return None
+    return f"{lead} @verifies: {', '.join(valid)}"
+
+
+def _prepend_verifies_marker(abs_path: str, marker_line: str) -> bool:
+    """Insert ``marker_line`` at the top of the file at ``abs_path``,
+    respecting a shebang / encoding cookie if present. Idempotent — if
+    the same marker (or any ``@verifies:`` line) already exists in the
+    first ``_VERIFIES_SCAN_LINES`` lines, no write happens.
+
+    Returns True on write success (or already-present no-op), False on
+    read/write failure. The autofix caller re-parses the file after we
+    return to confirm the marker is now visible to
+    ``_parse_verifies_marker``.
+    """
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as exc:
+        logger.warning(
+            "[test_generation_node] Autofix could not read %r: %s",
+            abs_path, exc,
+        )
+        return False
+    if _parse_verifies_marker(body):
+        return True
+    lines = body.splitlines(keepends=True)
+    insert_at = 0
+    if lines:
+        first = lines[0].lstrip()
+        if first.startswith("#!"):
+            insert_at = 1
+        elif first.startswith("#") and "coding" in first:
+            insert_at = 1
+    lines.insert(insert_at, marker_line + "\n")
+    try:
+        with open(abs_path, "w", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+    except OSError as exc:
+        logger.warning(
+            "[test_generation_node] Autofix could not write %r: %s",
+            abs_path, exc,
+        )
+        return False
+    return True
+
+
+def _fetch_ac_keys_for_current_story(
+    workspace_path: str, current_story_id: str,
+) -> list[str]:
+    """Look up the AC keys for ``current_story_id`` from ``state.db``.
+    Returns an empty list when the story isn't found or the DB is
+    unavailable — the autofix caller then falls through to the
+    LLM-repair path unchanged. Silent-fail on any error class.
+    """
+    if not current_story_id or not workspace_path:
+        return []
+    try:
+        from harness import story_state as _sst
+        app_name = _sst.app_name_for_workspace(workspace_path)
+        conn = _sst.open_story_db()
+        try:
+            story = _sst.get_story(conn, app_name, current_story_id)
+            if story is None:
+                return []
+            ac_rows = _sst.list_acceptance_criteria(
+                conn, app_name, story["id"],
+            )
+            return [
+                r["ac_key"] for r in ac_rows
+                if isinstance(r.get("ac_key"), str)
+            ]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — autofix is best-effort
+        return []
 
 
 def _persist_verifies_links(
@@ -549,6 +741,20 @@ content:
 <complete file contents>
 <<<END_CREATE_FILE>>>
 
+<<<REPLACE_BLOCK>>>
+file: <workspace-relative path>
+search:
+<exact lines to find — copy verbatim from the preflight "Current Content" section>
+replace:
+<exact replacement lines>
+<<<END_REPLACE_BLOCK>>>
+
+<<<REWRITE_FILE>>>
+file: <workspace-relative path>
+content:
+<complete corrected file contents>
+<<<END_REWRITE_FILE>>>
+
 <<<INSERT_AT_BLOCK>>>
 file: <workspace-relative path>
 anchor: <function or class name>
@@ -556,6 +762,21 @@ placement: before|after
 content:
 <lines to insert>
 <<<END_INSERT_AT_BLOCK>>>
+
+CHOOSING THE RIGHT BLOCK:
+  - CREATE_FILE: the file does NOT yet exist. Rejected if the path is
+    already on disk.
+  - REPLACE_BLOCK: modify a specific region of an EXISTING file. The
+    `search:` block MUST match the current file bytes exactly — copy
+    from the preflight "Current Content" section, WITHOUT the `  N| `
+    line-number prefix.
+  - REWRITE_FILE: the file is small (< ~50 lines) and you want to
+    replace ITS ENTIRE contents. Preferred over REPLACE_BLOCK when the
+    change is pervasive or you're ADDING content that doesn't exist in
+    the file yet (REPLACE_BLOCK's search anchor cannot match content
+    that isn't there).
+  - INSERT_AT_BLOCK: append or prepend lines relative to a named
+    function / class anchor. No line-copying required.
 
 RULES — absolute:
   1. File paths MUST be workspace-relative. Anything starting with '/', '~',
@@ -805,9 +1026,21 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     loop_counter = dict(state.get("loop_counter") or {})
-    loop_counter["test_generation"] = loop_counter.get("test_generation", 0) + 1
     max_iterations = int(cfg.get("max_iterations", 3))
-    if loop_counter["test_generation"] > max_iterations:
+    # Fix 2a: split the entry-time cap check across two counters. The
+    # ``test_generation`` counter is the real-attempt budget; a call
+    # that produces zero patch blocks is a prompt-comprehension miss,
+    # not a test-quality miss, so it's counted against the separate
+    # ``test_generation_zero_emit`` sub-cap instead. Both caps must be
+    # under the ceiling for the LLM to be dispatched again; either can
+    # trip HITL with its own env_misconfig symbol so an operator
+    # (or post-mortem) can distinguish the two failure classes.
+    real_iters = int(loop_counter.get("test_generation", 0) or 0)
+    zero_emit_shots = int(
+        loop_counter.get("test_generation_zero_emit", 0) or 0
+    )
+    zero_emit_cap = int(cfg.get("max_zero_emit_reprompts", 3))
+    if real_iters >= max_iterations:
         logger.warning(
             "[test_generation_node] Max iterations (%d) reached. Routing to HITL.",
             max_iterations,
@@ -827,6 +1060,32 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                 "current_node": "test_generation",
                 "env_misconfig": True,
                 "env_misconfig_symbol": "test_generation_max_iterations",
+            },
+        }
+    if zero_emit_shots >= zero_emit_cap:
+        logger.warning(
+            "[test_generation_node] Zero-emit re-prompt cap (%d) reached. "
+            "Routing to HITL.", zero_emit_cap,
+        )
+        return {
+            "loop_counter": loop_counter,
+            "exit_code": 1,
+            "compiler_errors": [_synth_diag(
+                file="<test_generation>",
+                message=(
+                    f"test_generation LLM emitted zero patch blocks for "
+                    f"{zero_emit_cap} consecutive re-prompts. The model "
+                    "likely lacks context for what to test. Inspect the "
+                    "last messages under debug logging and either supply "
+                    "an explicit test hint or raise "
+                    "test_generation.max_zero_emit_reprompts."
+                ),
+                error_code="ENV_MISCONFIG",
+            )],
+            "node_state": {
+                "current_node": "test_generation",
+                "env_misconfig": True,
+                "env_misconfig_symbol": "test_generation_zero_emit",
             },
         }
 
@@ -904,49 +1163,179 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     )
     if not story_preamble and agile:
         story_preamble = _build_batch_scope_preamble(cast("AgentState", state))
+
+    # Fix 5a: preflight the current on-disk bodies of every existing test
+    # file the LLM might edit. Without this, REPLACE_BLOCK anchors on
+    # test files touched by a prior node in the same session are built
+    # from the LLM's stale mental model and reject with "search miss"
+    # (session 44c5e194 iter 4 lost 5 patches this way). Mirrors the
+    # existing repair_node preflight — the helper existed but was never
+    # wired here.
+    from harness.graph import (
+        _collect_workspace_file_content,
+        _format_preflight_file_content,
+    )
+    preflight_targets = _existing_tests_for_preflight(
+        workspace_path,
+        source_files=source_files,
+        modified_files=modified_files,
+        primary_stack=primary,
+    )
+    preflight_section = ""
+    if preflight_targets:
+        _files_seen = (state.get("node_state") or {}).get(
+            "files_seen_by_llm"
+        )
+        _record_into: Optional[dict[str, str]] = (
+            _files_seen if isinstance(_files_seen, dict) else None
+        )
+        pairs = _collect_workspace_file_content(
+            workspace_path, preflight_targets,
+            record_hashes_into=_record_into,
+        )
+        preflight_section = _format_preflight_file_content(
+            pairs,
+            intro=(
+                "The line-numbered views below are the **actual current "
+                "content** of test files you may need to MODIFY. When you "
+                "emit a REPLACE_BLOCK targeting one of these paths, its "
+                "`search:` block MUST match these bytes exactly (WITHOUT "
+                "the `  N| ` line-number prefix). Do NOT patch against a "
+                "remembered version of the file — the workspace has been "
+                "modified by earlier nodes in this session and your "
+                "memory of it is stale."
+            ),
+        )
+        if preflight_section:
+            logger.info(
+                "[test_generation_node] Preflight injected current content "
+                "for %d existing test file(s): %s",
+                len(pairs), ", ".join(p[0] for p in pairs),
+            )
+
     user_prompt = (
         _build_change_request_preamble(cast("AgentState", state), "tests")
         + arch_preamble
         + story_preamble
+        + preflight_section
         + user_prompt
     )
     messages.append({"role": "user", "content": user_prompt})
 
     budget = float(state.get("budget_remaining_usd", 2.00))
-
-    try:
-        response, new_budget = await gateway.dispatch(
-            messages=list(messages),
-            role=NodeRole.PATCHING,
-            budget_remaining_usd=budget,
-        )
-    except RuntimeError as exc:
-        logger.warning("[test_generation_node] Gateway refused: %s", exc)
-        return {
-            "loop_counter": loop_counter,
-            "node_state": {
-                "current_node": "test_generation",
-                "test_generation": {"status": "gateway_error", "error": str(exc)},
-            },
-        }
-
+    new_budget = budget
     token_tracker = state.get("token_tracker", {})
-    token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
 
-    # --- Apply the patches ---
-    # Constrain test placement to the workspace's source root + the
-    # conventional test directories (mirrors the patching_node enforcement).
-    # When _detect_source_root returns None (flat workspace), allowed_paths
-    # is None and the pre-fix permissive behaviour applies.
+    # --- LLM dispatch + patch application, with zero-emit retry loop ---
+    # Fix 2a: when the LLM produces zero patch blocks it's a prompt-
+    # comprehension miss, not a test-quality miss. Retry inline with
+    # a stronger contract system message. Doesn't count against the
+    # real test_generation iteration cap (that only advances on a
+    # response that yielded ≥1 patch block). The sub-cap
+    # `zero_emit_cap` bounds retries so a stuck LLM still exits.
     from harness.graph import _build_patcher_allowlist
     existing_modified = list(modified_files)
     allowed_paths = _build_patcher_allowlist(workspace_path)
-    patch_results, new_modified = await process_llm_patch_output(
-        response.content,
-        workspace_path,
-        existing_modified,
-        allowed_paths=allowed_paths,
-    )
+    zero_emit_this_call = 0
+    zero_emit_remaining = max(0, zero_emit_cap - zero_emit_shots)
+    patch_results: list = []
+    new_modified: list[str] = []
+    response = None
+    while True:
+        try:
+            response, new_budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=budget,
+            )
+        except RuntimeError as exc:
+            logger.warning("[test_generation_node] Gateway refused: %s", exc)
+            return {
+                "loop_counter": loop_counter,
+                "node_state": {
+                    "current_node": "test_generation",
+                    "test_generation": {
+                        "status": "gateway_error", "error": str(exc),
+                    },
+                },
+            }
+        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        budget = new_budget
+
+        patch_results, new_modified = await process_llm_patch_output(
+            response.content,
+            workspace_path,
+            existing_modified,
+            allowed_paths=allowed_paths,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if len(patch_results) > 0:
+            break
+
+        zero_emit_this_call += 1
+        logger.warning(
+            "[test_generation_node] LLM emitted zero patch blocks "
+            "(re-prompt %d/%d without consuming a test_generation "
+            "iteration).",
+            zero_emit_shots + zero_emit_this_call, zero_emit_cap,
+        )
+        if zero_emit_this_call >= zero_emit_remaining:
+            # Sub-cap exhausted — record consumption and trip HITL via
+            # env_misconfig so the operator sees "model won't emit
+            # tests", not the generic max_iterations one.
+            loop_counter["test_generation_zero_emit"] = (
+                zero_emit_shots + zero_emit_this_call
+            )
+            logger.warning(
+                "[test_generation_node] Zero-emit re-prompt cap (%d) "
+                "reached inline. Routing to HITL.", zero_emit_cap,
+            )
+            return {
+                "messages": messages,
+                "loop_counter": loop_counter,
+                "token_tracker": token_tracker,
+                "budget_remaining_usd": new_budget,
+                "exit_code": 1,
+                "compiler_errors": [_synth_diag(
+                    file="<test_generation>",
+                    message=(
+                        f"test_generation LLM emitted zero patch blocks "
+                        f"for {zero_emit_cap} consecutive re-prompts. "
+                        "The model likely lacks context for what to "
+                        "test. Inspect the last messages under debug "
+                        "logging and either supply an explicit test "
+                        "hint or raise "
+                        "test_generation.max_zero_emit_reprompts."
+                    ),
+                    error_code="ENV_MISCONFIG",
+                )],
+                "node_state": {
+                    "current_node": "test_generation",
+                    "env_misconfig": True,
+                    "env_misconfig_symbol": "test_generation_zero_emit",
+                },
+            }
+        messages.append({
+            "role": "system",
+            "content": (
+                "Your last response contained zero PATCH blocks. You MUST "
+                "emit at least one CREATE_FILE / REWRITE_FILE / "
+                "REPLACE_BLOCK / INSERT_AT_BLOCK targeting a file under "
+                "the language-appropriate test root (tests/ for Python, "
+                "colocated *.test.tsx for TS, src/test/java for Java). "
+                "If you do not know what to test, pick the simplest public "
+                "function in the newest source file shown above and write "
+                "ONE assertion for its happy path."
+            ),
+        })
+
+    # Record any consumed zero-emit budget alongside the successful attempt
+    # so the persistent counter reflects reality across HITL round-trips.
+    if zero_emit_this_call:
+        loop_counter["test_generation_zero_emit"] = (
+            zero_emit_shots + zero_emit_this_call
+        )
 
     # Identify just the newly-applied test files (delta from existing_modified).
     generated_tests: list[str] = []
@@ -971,7 +1360,11 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         len(patch_results), success_count, fail_count, len(generated_tests),
     )
 
-    messages.append({"role": "assistant", "content": response.content})
+    # Real attempt was made — consume a test_generation iteration.
+    # Placed AFTER the zero-patch retry loop so zero-emit re-prompts
+    # don't burn against the real cap.
+    loop_counter["test_generation"] = real_iters + 1
+
     messages.append({
         "role": "system",
         "content": (
@@ -1016,49 +1409,86 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                 marker_keys_by_file[rel] = keys
 
     if marker_missing:
-        diags = [
-            _synth_diag(
-                file=rel,
-                message=(
-                    f"Generated test {rel!r} is missing a `@verifies:` marker. "
-                    "Every generated test file MUST declare which acceptance "
-                    "criteria it verifies, using a comment at the top of the "
-                    "file (within the first 50 lines): "
-                    "`# @verifies: STORY-N.AC-N` (Python) or "
-                    "`// @verifies: STORY-N.AC-N` (JS/TS/Java). Comma-separate "
-                    "multiple ACs. Use AC keys exactly as they appear in the "
-                    "story preamble's `### Acceptance criteria` block."
-                ),
-                error_code="TEST_FAILURE:missing_verifies_marker",
-            )
-            for rel in marker_missing
-        ]
-        logger.warning(
-            "[test_generation_node] %d/%d generated test file(s) missing "
-            "@verifies marker; routing to repair: %s",
-            len(marker_missing), len(generated_tests),
-            ", ".join(marker_missing),
+        # Fix 3: autofix the marker deterministically when we can. The
+        # AC keys are already known from state.db (they're what the
+        # story_preamble renders); prepending a well-formed marker line
+        # is not something worth spending an LLM turn on. Only files
+        # we CAN'T autofix (no current story, malformed AC keys, IO
+        # error) route to LLM repair.
+        current_story_id = str(state.get("current_story_id") or "")
+        ac_keys = _fetch_ac_keys_for_current_story(
+            workspace_path, current_story_id,
         )
-        return {
-            "messages": messages,
-            "modified_files": new_modified,
-            "generated_tests": list(state.get("generated_tests", [])) + generated_tests,
-            "exit_code": 1,
-            "compiler_errors": diags,
-            "token_tracker": token_tracker,
-            "budget_remaining_usd": new_budget,
-            "loop_counter": loop_counter,
-            "node_state": {
-                **(state.get("node_state") or {}),
-                "current_node": "test_generation",
-                "test_generation": {
-                    "status": "missing_verifies_marker",
-                    "primary_stack": primary,
-                    "tests_generated": len(generated_tests),
-                    "markerless_count": len(marker_missing),
+        marker_line = _marker_line_for(primary, ac_keys)
+        autofixed: list[str] = []
+        unfixable: list[str] = []
+        if marker_line:
+            for rel in marker_missing:
+                abs_path = os.path.join(workspace_path, rel)
+                if _prepend_verifies_marker(abs_path, marker_line):
+                    autofixed.append(rel)
+                    marker_keys_by_file[rel] = list(ac_keys)
+                else:
+                    unfixable.append(rel)
+        else:
+            unfixable = list(marker_missing)
+
+        if autofixed:
+            logger.info(
+                "[test_generation_node] Autofix prepended @verifies marker "
+                "on %d file(s) without spending an iteration "
+                "(story=%s, keys=%s): %s",
+                len(autofixed), current_story_id or "?",
+                ", ".join(ac_keys) if ac_keys else "?",
+                ", ".join(autofixed),
+            )
+        if unfixable:
+            diags = [
+                _synth_diag(
+                    file=rel,
+                    message=(
+                        f"Generated test {rel!r} is missing a `@verifies:` marker. "
+                        "Every generated test file MUST declare which acceptance "
+                        "criteria it verifies, using a comment at the top of the "
+                        "file (within the first 50 lines): "
+                        "`# @verifies: STORY-N.AC-N` (Python) or "
+                        "`// @verifies: STORY-N.AC-N` (JS/TS/Java). Comma-separate "
+                        "multiple ACs. Use AC keys exactly as they appear in the "
+                        "story preamble's `### Acceptance criteria` block."
+                    ),
+                    error_code="TEST_FAILURE:missing_verifies_marker",
+                )
+                for rel in unfixable
+            ]
+            logger.warning(
+                "[test_generation_node] %d/%d marker(s) needed LLM repair "
+                "(no story context to autofix from, or write failed); "
+                "routing to repair: %s",
+                len(unfixable), len(marker_missing), ", ".join(unfixable),
+            )
+            return {
+                "messages": messages,
+                "modified_files": new_modified,
+                "generated_tests": list(state.get("generated_tests", [])) + generated_tests,
+                "exit_code": 1,
+                "compiler_errors": diags,
+                "token_tracker": token_tracker,
+                "budget_remaining_usd": new_budget,
+                "loop_counter": loop_counter,
+                "node_state": {
+                    **(state.get("node_state") or {}),
+                    "current_node": "test_generation",
+                    "test_generation": {
+                        "status": "missing_verifies_marker",
+                        "primary_stack": primary,
+                        "tests_generated": len(generated_tests),
+                        "markerless_count": len(unfixable),
+                        "autofixed_count": len(autofixed),
+                    },
                 },
-            },
-        }
+            }
+        # All markers autofixed — fall through to the deterministic
+        # test run without spending an iteration.
 
     # --- Skip deterministic run when no tests landed ---
     if not generated_tests:

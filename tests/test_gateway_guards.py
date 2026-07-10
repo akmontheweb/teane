@@ -132,22 +132,24 @@ async def test_empty_then_recovers_succeeds():
 
 def test_rate_limit_circuit_breaker_opens_after_threshold():
     """P1.9: after the configured number of 429/503 failures inside the
-    rolling window, _circuit_is_open() returns True so dispatch can divert
-    to a local fallback instead of burning retries against a broken provider."""
+    rolling window, _circuit_is_open() returns True for that provider so
+    dispatch can divert to a local fallback instead of burning retries
+    against a broken provider. Updated 2026-07-10: circuit is now
+    per-provider, not global — passing the provider name is required."""
     cfg = GatewayConfig(
         planning_primary="stub:fast",
         patching_primary="stub:fast",
         repair_primary="stub:fast",
     )
     gateway = Gateway(cfg)
-    assert gateway._circuit_is_open() is False
+    assert gateway._circuit_is_open("stub") is False
     # Default threshold is 3; record 2 then check (still closed), then a
     # third should open the circuit on the next check.
-    gateway._record_rate_limit_failure()
-    gateway._record_rate_limit_failure()
-    assert gateway._circuit_is_open() is False
-    gateway._record_rate_limit_failure()
-    assert gateway._circuit_is_open() is True
+    gateway._record_rate_limit_failure("stub")
+    gateway._record_rate_limit_failure("stub")
+    assert gateway._circuit_is_open("stub") is False
+    gateway._record_rate_limit_failure("stub")
+    assert gateway._circuit_is_open("stub") is True
 
 
 @pytest.mark.asyncio
@@ -338,3 +340,71 @@ class TestOllamaLocalKeyNormalization:
         # short-circuits before we ever try to look this key up.
         gw = self._make_gateway("")
         assert gw._normalized_ollama_local_key() == "ollama:"
+
+
+class TestPerProviderCircuitBreakers:
+    """Fix (2026-07-10): session 44c5e194 crashed on a hard graph
+    exit when a Google Gemini rate-limit tripped the (then-global)
+    circuit and diverted the NEXT Deepseek dispatch to Ollama,
+    whose 32K context couldn't hold the 56K prompt. Circuit
+    breakers are now per-provider: a Google 429 only diverts
+    Google-targeted roles; Deepseek and Anthropic dispatches stay
+    on their primaries.
+    """
+
+    def _gw(self) -> Gateway:
+        cfg = GatewayConfig(
+            planning_primary="stub:fast",
+            patching_primary="stub:fast",
+            repair_primary="stub:fast",
+            ollama_local_model="ollama:qwen2.5-coder:14b",
+        )
+        return Gateway(cfg)
+
+    def test_google_burst_does_not_trip_deepseek_circuit(self):
+        gw = self._gw()
+        # Burn Google's threshold. Google's circuit trips…
+        for _ in range(3):
+            gw._record_rate_limit_failure("google")
+        assert gw._circuit_is_open("google") is True
+        # …but Deepseek's is untouched. This is the bug fix's whole point.
+        assert gw._circuit_is_open("deepseek") is False
+        assert gw._circuit_is_open("anthropic") is False
+
+    def test_each_provider_has_independent_failure_counter(self):
+        gw = self._gw()
+        # Two failures per provider — none of them individually enough
+        # to trip the threshold.
+        for p in ("google", "deepseek", "anthropic"):
+            gw._record_rate_limit_failure(p)
+            gw._record_rate_limit_failure(p)
+        for p in ("google", "deepseek", "anthropic"):
+            assert gw._circuit_is_open(p) is False, (
+                f"provider {p!r} tripped from 2 failures; buckets must be"
+                " counted per-provider, not summed together"
+            )
+
+    def test_provider_from_model_key_uses_registry(self):
+        gw = self._gw()
+        assert gw._provider_from_model_key("stub:fast") == "stub"
+
+    def test_provider_from_model_key_falls_back_to_prefix(self):
+        # For an unregistered model_key, split on the first colon so
+        # the circuit still gets a stable bucket name (avoids losing
+        # rate-limit signal when a provider isn't in the test
+        # registry).
+        gw = self._gw()
+        assert (
+            gw._provider_from_model_key("some-unregistered:m")
+            == "some-unregistered"
+        )
+
+    def test_open_provider_does_not_leak_into_ollama_bucket(self):
+        # The circuit for the primary provider going OPEN should NOT
+        # affect the "ollama" bucket — Ollama is the fallback target,
+        # not the failing origin.
+        gw = self._gw()
+        for _ in range(3):
+            gw._record_rate_limit_failure("google")
+        assert gw._circuit_is_open("google") is True
+        assert gw._circuit_is_open("ollama") is False

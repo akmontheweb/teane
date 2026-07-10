@@ -2011,11 +2011,23 @@ class Gateway:
         # failures pile up in a short window, fall the next call back to
         # local Ollama instead of burning retries with no chance of
         # success. Kept in-memory only — resets when the process restarts.
+        #
+        # 2026-07-10 fix: per-provider tracking. Session 44c5e194 exposed
+        # a real bug — Google Gemini free-tier 429s tripped a GLOBAL
+        # circuit, diverting the NEXT Deepseek dispatch (patching) to
+        # Ollama even though Deepseek's own rate-limit was healthy.
+        # Ollama's 32K context couldn't hold the 56K prompt → hard crash.
+        # Splitting per-provider means a Google rate-limit no longer
+        # burns a healthy Deepseek call.
+        from collections import defaultdict as _defaultdict
         from collections import deque as _deque
-        self._rate_limit_failures: "_deque[float]" = _deque(maxlen=64)
+        self._rate_limit_failures: "dict[str, _deque[float]]" = (
+            _defaultdict(lambda: _deque(maxlen=64))
+        )
         self._circuit_window_seconds: float = 300.0   # 5-minute rolling window
         self._circuit_failure_threshold: int = 3       # open after 3 hits in-window
-        self._circuit_open_until: float = 0.0           # epoch seconds; 0 = closed
+        # Per-provider open-until timestamps; 0 (or missing) = closed.
+        self._circuit_open_until: "dict[str, float]" = _defaultdict(float)
         # Per-call dump counters (one monotonic seqno per session). asyncio.Lock
         # serializes increment so concurrent dispatches from speculative
         # variants get distinct filenames.
@@ -2081,35 +2093,62 @@ class Gateway:
             self._providers[model_key] = provider
         return self._providers[model_key]
 
-    def _circuit_is_open(self) -> bool:
-        """Return True when recent 429/503 failures should force a fall-back
-        to local Ollama for the next call. The breaker auto-closes after
+    def _provider_from_model_key(self, model_key: str) -> str:
+        """Return the provider name for ``model_key`` (e.g. ``"deepseek"``,
+        ``"google"``, ``"ollama"``). Falls back to the leading colon-
+        segment of the key when the model isn't in the registry — enough
+        for the circuit breaker's bucket key without depending on the
+        registry always being populated."""
+        spec = _MODEL_REGISTRY.get(model_key)
+        if spec is not None and spec.provider:
+            return str(spec.provider)
+        if ":" in model_key:
+            return model_key.split(":", 1)[0]
+        return model_key or "unknown"
+
+    def _circuit_is_open(self, provider: str) -> bool:
+        """Return True when recent 429/503 failures against ``provider``
+        should force a fall-back to local Ollama for the next call
+        targeting that same provider. Other providers' circuits stay
+        closed regardless. The breaker auto-closes after
         ``_circuit_window_seconds`` of cool-down."""
         import time as _t
         now = _t.monotonic()
-        if self._circuit_open_until and now < self._circuit_open_until:
+        open_until = self._circuit_open_until.get(provider, 0.0)
+        if open_until and now < open_until:
             return True
-        # Trim failures outside the rolling window.
+        # Trim failures outside the rolling window (per-provider).
+        failures = self._rate_limit_failures.get(provider)
+        if failures is None:
+            return False
         window_start = now - self._circuit_window_seconds
-        while self._rate_limit_failures and self._rate_limit_failures[0] < window_start:
-            self._rate_limit_failures.popleft()
-        if len(self._rate_limit_failures) >= self._circuit_failure_threshold:
-            # Open the circuit for the rest of the window plus a short buffer.
-            self._circuit_open_until = now + max(60.0, self._circuit_window_seconds / 2)
+        while failures and failures[0] < window_start:
+            failures.popleft()
+        if len(failures) >= self._circuit_failure_threshold:
+            # Open THIS provider's circuit for the rest of the window
+            # plus a short buffer. Other providers unaffected.
+            self._circuit_open_until[provider] = (
+                now + max(60.0, self._circuit_window_seconds / 2)
+            )
             logger.warning(
-                "[gateway] Rate-limit circuit breaker OPEN: %d failures in last %ds. "
-                "Forcing local fallback until %.0fs from now.",
-                len(self._rate_limit_failures),
+                "[gateway] Rate-limit circuit breaker OPEN for provider "
+                "'%s': %d failures in last %ds. Forcing local fallback "
+                "for %s-targeted roles until %.0fs from now. Other "
+                "providers unaffected.",
+                provider, len(failures),
                 int(self._circuit_window_seconds),
-                self._circuit_open_until - now,
+                provider,
+                self._circuit_open_until[provider] - now,
             )
             return True
         return False
 
-    def _record_rate_limit_failure(self) -> None:
-        """Record a 429/503 failure so the circuit breaker can detect bursts."""
+    def _record_rate_limit_failure(self, provider: str) -> None:
+        """Record a 429/503 failure against ``provider`` so THAT
+        provider's circuit breaker can detect a burst without tripping
+        every other provider along with it."""
         import time as _t
-        self._rate_limit_failures.append(_t.monotonic())
+        self._rate_limit_failures[provider].append(_t.monotonic())
 
     async def _next_dump_seqno(self, session_id: str) -> int:
         """Allocate the next monotonic seqno for ``session_id`` dumps."""
@@ -2390,14 +2429,31 @@ class Gateway:
             )
 
         # P1.9: 429/503 circuit breaker — if recent rate-limit bursts have
-        # piled up, divert this call to local Ollama instead of burning
-        # retries against a degraded provider. We do this BEFORE model
-        # selection so explicit overrides also get diverted (the override
-        # would have hit the same wall).
-        if not force_local and not self.config.force_local_only and self._circuit_is_open():
+        # piled up FOR THE SPECIFIC PROVIDER this role would target,
+        # divert this call to local Ollama. Other providers' calls are
+        # untouched (2026-07-10 fix: session 44c5e194's Google rate-
+        # limit was blowing up Deepseek-role dispatches too).
+        #
+        # We must resolve the tentative model_key BEFORE the circuit
+        # check so we know which provider's bucket to consult. If the
+        # circuit is open for that provider, we then flip force_local
+        # and re-select (which returns the Ollama key).
+        if model_override and not force_local:
+            _tentative_model_key = model_override
+        else:
+            _tentative_model_key = self.select_model(role, force_local=force_local)
+        _tentative_provider = self._provider_from_model_key(_tentative_model_key)
+        if (
+            not force_local
+            and not self.config.force_local_only
+            and _tentative_provider != "ollama"
+            and self._circuit_is_open(_tentative_provider)
+        ):
             logger.warning(
-                "[gateway] Rate-limit circuit OPEN — diverting role=%s to local Ollama.",
-                role.value,
+                "[gateway] Rate-limit circuit OPEN for provider '%s' — "
+                "diverting role=%s to local Ollama. Other providers "
+                "still healthy.",
+                _tentative_provider, role.value,
             )
             force_local = True
 
@@ -2738,12 +2794,20 @@ class Gateway:
         # retry_with_backoff so the breaker can trip on much shorter
         # bursts than the old (3 fully-exhausted dispatches) threshold
         # ever permitted (effectively ~18 actual 429s with max_retries=5).
+        # Per-provider observer binding (2026-07-10): the callback needs
+        # to know WHICH provider took the 429 so it goes into the right
+        # circuit bucket. Bind the current provider name here.
+        _current_provider = provider.spec.provider or self._provider_from_model_key(model_key)
+
+        def _observer() -> None:
+            self._record_rate_limit_failure(_current_provider)
+
         try:
             response = await retry_with_backoff(
                 _call,
                 max_retries=self.config.max_retries,
                 base_delay=self.config.base_delay,
-                rate_limit_observer=self._record_rate_limit_failure,
+                rate_limit_observer=_observer,
             )
         except httpx.HTTPStatusError as exc:
             try:
@@ -2754,7 +2818,7 @@ class Gateway:
                 # _record_rate_limit_failure may have already been called
                 # via the observer hook above; one extra record on full
                 # exhaustion is fine — the deque is bounded.
-                self._record_rate_limit_failure()
+                self._record_rate_limit_failure(_current_provider)
                 raise
             # 4xx-except-429: fundamentally a configuration error — auth
             # failure, unknown model, malformed schema, etc. These will
@@ -2819,7 +2883,7 @@ class Gateway:
                     _call,
                     max_retries=self.config.max_retries,
                     base_delay=self.config.base_delay,
-                    rate_limit_observer=self._record_rate_limit_failure,
+                    rate_limit_observer=_observer,
                 )
                 accumulated_cost += float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
             except Exception as exc:  # noqa: BLE001 — captured below so the

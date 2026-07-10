@@ -27,9 +27,11 @@ and use :func:`getpass.getpass` so keys never echo to the terminal.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import logging
 import os
+import signal
 import sys
 from typing import Any, TYPE_CHECKING
 
@@ -37,6 +39,65 @@ if TYPE_CHECKING:
     from harness.hitl import HitlChannel
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _wizard_signal_handlers():
+    """Install SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers that hard-exit the
+    wizard, then restore the previous handlers.
+
+    HitlChannel's stdin path swallows KeyboardInterrupt and falls back
+    to the default answer, which is fine mid-run but traps the operator
+    inside the wizard — Ctrl+C just advances to the next question. Our
+    handlers raise SystemExit(130), which is not caught by the channel's
+    ``except (EOFError, KeyboardInterrupt)`` block and unwinds cleanly.
+
+    SIGKILL and SIGSTOP are not catchable and are the operator's escape
+    hatch if the wizard is somehow wedged past this point.
+    """
+    def _handler(signum, _frame):
+        sig_name = signal.Signals(signum).name if signum else "signal"
+        print(
+            f"\n\n[teane] Wizard interrupted ({sig_name}). Exiting.\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(130)
+
+    prev: dict[int, Any] = {}
+    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue  # Windows / platform doesn't define this one
+        try:
+            prev[sig] = signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # signal.signal() raises off the main thread or on signals
+            # the kernel refuses handlers for. Best-effort — SIGINT and
+            # SIGTERM will always succeed on the main thread.
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in prev.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+
+_QUIT_TOKENS = frozenset(("q", "quit", "exit"))
+
+
+def _quit_if_requested(raw: str) -> None:
+    """Exit the wizard cleanly when the operator types q / quit / exit.
+
+    Called after every free-text ``channel.notes()`` prompt. Options-based
+    prompts include ``q`` in their allowed values and check the return
+    value directly.
+    """
+    if raw.strip().lower() in _QUIT_TOKENS:
+        print("\n[teane] Quit requested. Exiting wizard.\n", file=sys.stderr)
+        raise SystemExit(130)
 
 
 def run_setup_wizard(args: argparse.Namespace) -> str:
@@ -64,110 +125,120 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
     from harness.cli import ConfigError, load_raw_config
     from harness.hitl import get_channel
 
-    # `teane run` is gone — the operator must have typed `teane build`,
-    # `teane patch`, or `teane deploy`. The wizard adapts to whichever it
-    # was (passed through args.command by the dispatcher).
-    invoked_cmd = getattr(args, "command", "build") or "build"
-    channel = get_channel()
-    if not channel.is_interactive():
+    with _wizard_signal_handlers():
+        # `teane run` is gone — the operator must have typed `teane build`,
+        # `teane patch`, or `teane deploy`. The wizard adapts to whichever
+        # it was (passed through args.command by the dispatcher).
+        invoked_cmd = getattr(args, "command", "build") or "build"
+        channel = get_channel()
+        if not channel.is_interactive():
+            print(
+                f"\nInteractive setup required: `teane {invoked_cmd}` was invoked\n"
+                "with no --workspace or --prompt, but stdin is not a terminal (or\n"
+                "auto-approve is set). Either run from a TTY, or pass --workspace\n"
+                "and --prompt explicitly.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        print()
+        print("=" * 72)
+        print(f"teane {invoked_cmd} — interactive setup")
+        print("=" * 72)
         print(
-            f"\nInteractive setup required: `teane {invoked_cmd}` was invoked\n"
-            "with no --workspace or --prompt, but stdin is not a terminal (or\n"
-            "auto-approve is set). Either run from a TTY, or pass --workspace\n"
-            "and --prompt explicitly.",
-            file=sys.stderr,
+            f"You ran `teane {invoked_cmd}` without any flags. The wizard will\n"
+            "walk you through the minimum settings needed to start. None of your\n"
+            f"answers will be persisted — every bare `teane {invoked_cmd}` re-asks.\n"
+            "\nPress 'q' (or Ctrl+C) at any prompt to quit teane.\n"
         )
-        raise SystemExit(2)
 
-    print()
-    print("=" * 72)
-    print(f"teane {invoked_cmd} — interactive setup")
-    print("=" * 72)
-    print(
-        f"You ran `teane {invoked_cmd}` without any flags. The wizard will\n"
-        "walk you through the minimum settings needed to start. None of your\n"
-        f"answers will be persisted — every bare `teane {invoked_cmd}` re-asks.\n"
-    )
+        # Config is loaded once and reused for the API-key check and for
+        # the checkpoint-db path that the session picker reads.
+        try:
+            config = load_raw_config()
+        except ConfigError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
-    # Config is loaded once and reused for the API-key check and for the
-    # checkpoint-db path that the session picker reads.
-    try:
-        config = load_raw_config()
-    except ConfigError as exc:
-        print(f"\n{exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-
-    # ------------------------------------------------------------------
-    # Step 0: new session vs resume existing session
-    # ------------------------------------------------------------------
-    if _ask_session_mode(channel) == "resume":
-        # Resumed sessions reuse the keys validated by the original run.
-        # If a key has been unset since, cmd_resume's first LLM dispatch
-        # will surface the error — no point re-prompting here.
-        db_path = config.get("persistence", {}).get(
-            "db_path", "~/.harness/checkpoints.db",
-        )
-        args.session_id = _ask_session_id(channel, db_path)
-        return "resume"
-
-    # ------------------------------------------------------------------
-    # Step 1: API key prerequisite check (new sessions only)
-    # ------------------------------------------------------------------
-    _check_and_prompt_api_keys(config)
-
-    # ------------------------------------------------------------------
-    # Steps 2-6: runtime choices, with a summary-confirm loop
-    # ------------------------------------------------------------------
-    while True:
-        workspace = _ask_workspace(channel)
-        prompt = _ask_prompt(channel)
-        git_mode = _ask_git(channel)
-        # The build/patch/deploy commands each pin new_build themselves —
-        # build always resets, patch never resets, deploy never resets.
-        # When the operator invoked the wizard via `teane build`, suggest
-        # checking the workspace shape so they know what they're about to
-        # wipe; when invoked via `teane patch`, no extra prompt.
-        new_build = (invoked_cmd == "build")
-        discover = _ask_discover(channel)
-
-        _print_summary(workspace, prompt, git_mode, new_build, discover)
-        if channel.confirm(f"Run `teane {invoked_cmd}` with these settings?", default=True):
-            break
-        print("\nLet's go through the choices again.\n")
-
-    # Workspace-shape heuristic: warn the operator if the command they
-    # picked doesn't match what's on disk. They can still proceed.
-    try:
-        existing = [
-            n for n in os.listdir(workspace)
-            if n not in (".git", "product_spec") and not n.startswith(".")
-        ]
-        if invoked_cmd == "build" and existing:
-            print(
-                "\n[warn] You picked `build` but the workspace has "
-                f"{len(existing)} entries beyond product_spec/ and .git/. "
-                "Build will WIPE them on confirmation. Consider "
-                "`teane patch` if you meant to make an incremental change."
+        # --------------------------------------------------------------
+        # Step 0: new session vs resume existing session
+        # --------------------------------------------------------------
+        if _ask_session_mode(channel) == "resume":
+            # Resumed sessions reuse the keys validated by the original
+            # run. If a key has been unset since, cmd_resume's first LLM
+            # dispatch will surface the error — no point re-prompting.
+            db_path = config.get("persistence", {}).get(
+                "db_path", "~/.harness/checkpoints.db",
             )
-        elif invoked_cmd == "patch" and not existing:
-            print(
-                "\n[warn] You picked `patch` but the workspace appears "
-                "empty (no source files outside product_spec/). "
-                "Consider `teane build` for a greenfield generation."
-            )
-    except OSError:
-        pass
+            args.session_id = _ask_session_id(channel, db_path)
+            return "resume"
 
-    args.workspace = workspace
-    args.prompt = prompt
-    args.git = git_mode
-    args.new_build = new_build
-    args.spec_discovery = discover
-    # cmd_build pins assume_yes to operator's -y flag; the wizard path is
-    # already an explicit consent so skip the secondary prompt.
-    if new_build:
-        args.assume_yes = True
-    return "run"
+        # --------------------------------------------------------------
+        # Step 1: API key prerequisite check (new sessions only)
+        # --------------------------------------------------------------
+        _check_and_prompt_api_keys(config)
+
+        # --------------------------------------------------------------
+        # Steps 2-6: runtime choices, with a summary-confirm loop
+        # --------------------------------------------------------------
+        while True:
+            workspace = _ask_workspace(channel)
+            prompt = _ask_prompt(channel)
+            git_mode = _ask_git(channel)
+            # The build/patch/deploy commands each pin new_build
+            # themselves — build always resets, patch never resets,
+            # deploy never resets. When the operator invoked the wizard
+            # via `teane build`, suggest checking the workspace shape so
+            # they know what they're about to wipe; when invoked via
+            # `teane patch`, no extra prompt.
+            new_build = (invoked_cmd == "build")
+            discover = _ask_discover(channel)
+
+            _print_summary(workspace, prompt, git_mode, new_build, discover)
+            confirm_choice = channel.prompt(
+                f"Run `teane {invoked_cmd}` with these settings? [y/n/q]",
+                options=["y", "n", "q"], default="y",
+            ).strip().lower()
+            _quit_if_requested(confirm_choice)
+            if confirm_choice == "y":
+                break
+            print("\nLet's go through the choices again.\n")
+
+        # Workspace-shape heuristic: warn the operator if the command
+        # they picked doesn't match what's on disk. They can still
+        # proceed.
+        try:
+            existing = [
+                n for n in os.listdir(workspace)
+                if n not in (".git", "product_spec") and not n.startswith(".")
+            ]
+            if invoked_cmd == "build" and existing:
+                print(
+                    "\n[warn] You picked `build` but the workspace has "
+                    f"{len(existing)} entries beyond product_spec/ and .git/. "
+                    "Build will WIPE them on confirmation. Consider "
+                    "`teane patch` if you meant to make an incremental change."
+                )
+            elif invoked_cmd == "patch" and not existing:
+                print(
+                    "\n[warn] You picked `patch` but the workspace appears "
+                    "empty (no source files outside product_spec/). "
+                    "Consider `teane build` for a greenfield generation."
+                )
+        except OSError:
+            pass
+
+        args.workspace = workspace
+        args.prompt = prompt
+        args.git = git_mode
+        args.new_build = new_build
+        args.spec_discovery = discover
+        # cmd_build pins assume_yes to operator's -y flag; the wizard
+        # path is already an explicit consent so skip the secondary
+        # prompt.
+        if new_build:
+            args.assume_yes = True
+        return "run"
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +295,16 @@ def _ask_session_mode(channel: "HitlChannel") -> str:
 
     Returns ``"run"`` (new) or ``"resume"``. Default is ``"run"`` so a
     user who hits Enter through every prompt gets today's behavior.
+    Typing ``q`` exits the wizard.
     """
     print("\nStep 0: Start a new session or resume an existing one?")
     print("  n = new session (walk through full setup, fresh checkpoint)")
     print("  r = resume existing session (restore from checkpoint by session id)")
+    print("  q = quit teane")
     choice = channel.prompt(
-        "Choose [n/r]", options=["n", "r"], default="n",
+        "Choose [n/r/q]", options=["n", "r", "q"], default="n",
     ).strip().lower()
+    _quit_if_requested(choice)
     return "resume" if choice == "r" else "run"
 
 
@@ -364,7 +438,10 @@ def _ask_session_id(channel: "HitlChannel", db_path: str) -> str:
         )
 
     while True:
-        raw = channel.notes("Session id (or list number)").strip()
+        raw = channel.notes(
+            "Session id (or list number). Type 'q' to quit",
+        ).strip()
+        _quit_if_requested(raw)
         if not raw:
             print("  The session id can't be empty. Try again.")
             continue
@@ -389,8 +466,9 @@ def _ask_workspace(channel: "HitlChannel") -> str:
         print("\nStep 1 of 5: Workspace path (the target repo to operate on).")
         print(f"  Default: {default}")
         raw = channel.notes(
-            "Enter a path, or press Enter to accept the default"
+            "Enter a path, press Enter for default, or 'q' to quit",
         ).strip()
+        _quit_if_requested(raw)
         candidate = raw or default
         resolved = os.path.abspath(os.path.expanduser(candidate))
         if not os.path.isdir(resolved):
@@ -403,7 +481,8 @@ def _ask_prompt(channel: "HitlChannel") -> str:
     while True:
         print("\nStep 2 of 5: Engineering task / prompt.")
         print("  Example: \"Refactor the auth module to use JWT.\"")
-        raw = channel.notes("Enter the task description").strip()
+        raw = channel.notes("Enter the task description (or 'q' to quit)").strip()
+        _quit_if_requested(raw)
         if raw:
             return raw
         print("  The prompt can't be empty. Try again.")
@@ -413,9 +492,11 @@ def _ask_git(channel: "HitlChannel") -> bool:
     print("\nStep 3 of 5: Enable GitGuardian for the workspace?")
     print("  y = true   (GitGuardian stashes / branches / rolls back; requires a git repo)")
     print("  n = false  (skip every git step — pick this if no git repo)")
+    print("  q = quit teane")
     choice = channel.prompt(
-        "Choose [y/n]", options=["y", "n"], default="n",
+        "Choose [y/n/q]", options=["y", "n", "q"], default="n",
     ).strip().lower()
+    _quit_if_requested(choice)
     return choice == "y"
 
 
@@ -425,7 +506,12 @@ def _ask_new_build(channel: "HitlChannel") -> bool:
         "  Deletes every file at the workspace root EXCEPT product_spec/\n"
         "  and .git/. Defaults to no (preserve existing files)."
     )
-    return channel.confirm("New build?", default=False)
+    print("  q = quit teane")
+    choice = channel.prompt(
+        "New build? [y/n/q]", options=["y", "n", "q"], default="n",
+    ).strip().lower()
+    _quit_if_requested(choice)
+    return choice == "y"
 
 
 def _ask_discover(channel: "HitlChannel") -> bool:
@@ -435,7 +521,12 @@ def _ask_discover(channel: "HitlChannel") -> bool:
         "  Q&A before code generation. Recommended for greenfield projects;\n"
         "  skip for incremental patching. Defaults to no."
     )
-    return channel.confirm("Run discovery?", default=False)
+    print("  q = quit teane")
+    choice = channel.prompt(
+        "Run discovery? [y/n/q]", options=["y", "n", "q"], default="n",
+    ).strip().lower()
+    _quit_if_requested(choice)
+    return choice == "y"
 
 
 def _print_summary(

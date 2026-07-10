@@ -693,6 +693,154 @@ async def _awrite(filepath: str, content: str) -> None:
 from harness.trust import safe_resolve as _safe_resolve  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Duplicate-test-root detector
+# ---------------------------------------------------------------------------
+#
+# Motivating failure: finsearch STORY-038 batch had the LLM create two copies
+# of ``test_config.py`` — one at ``tests/unit/config/test_config.py`` and
+# a second at ``server/tests/unit/config/test_config.py`` — with contradictory
+# assertions on ``server.config.database_url``. The repair loop oscillated
+# ``server/config.py`` between the two expected values for 7 rounds before
+# the stuck-file HITL fired.
+#
+# This detector fires at the patcher's CREATE_FILE / REWRITE_FILE entry.
+# When the LLM tries to land a file whose test-scoped path suffix already
+# exists at a different tests root, the patcher rejects with a
+# NEXT-ROUND DIRECTIVE naming both paths so the LLM sees the collision
+# in its next repair round.
+
+# Only fire on files that look like test suites. Everything else can
+# legitimately duplicate across roots (`__init__.py`, `conftest.py`,
+# `README.md`, `.gitignore`).
+_TEST_BASENAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^test_[^/\\]+\.py$"),
+    re.compile(r"^[^/\\]+_test\.py$"),
+    re.compile(r"^[^/\\]+\.test\.[tj]sx?$"),
+    re.compile(r"^[^/\\]+\.spec\.[tj]sx?$"),
+)
+
+# Directory segments that mark a "tests root" — the ancestor whose
+# subtree carries a mirrored test tree.
+_TESTS_ROOT_SEGMENTS: frozenset[str] = frozenset({
+    "tests", "test", "__tests__",
+})
+
+# Directories the workspace walk should NOT descend into. Mirrors
+# ``harness/graph.py``'s ``_HITL_SKIP_DIRS`` so this walk stays fast on
+# realistic monorepos.
+_DUP_CHECK_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", "dist", "build", ".next", ".nuxt", "target", ".cache",
+    "htmlcov", "site-packages",
+})
+
+
+def _is_test_basename(basename: str) -> bool:
+    """True when ``basename`` matches one of the test-file naming patterns
+    the duplicate check applies to. Non-test files skip the check
+    entirely."""
+    return any(p.match(basename) for p in _TEST_BASENAME_PATTERNS)
+
+
+def _extract_test_scoped_suffix(rel_path: str) -> Optional[str]:
+    """Return the substring of ``rel_path`` starting at the leftmost
+    ``tests`` / ``test`` / ``__tests__`` segment. When no such segment
+    is present, returns ``None`` — the path isn't under a tests root
+    and the duplicate check is skipped. Comparison uses ``/`` as the
+    separator regardless of platform so Windows paths match POSIX ones."""
+    parts = re.split(r"[/\\]", rel_path)
+    for i, seg in enumerate(parts):
+        if seg in _TESTS_ROOT_SEGMENTS:
+            return "/".join(parts[i:])
+    return None
+
+
+def _detect_duplicate_test_root(
+    new_rel_path: str, workspace_root: str,
+) -> Optional[str]:
+    """Return a rejection message when ``new_rel_path`` would create a
+    test file that duplicates one already under a DIFFERENT tests root
+    in the same workspace. Returns ``None`` when the check doesn't
+    apply (non-test basename, no tests root in the path) or no match is
+    found.
+
+    Matching rule: the test-scoped path suffix — everything from the
+    leftmost ``tests``/``test``/``__tests__`` segment onward — must be
+    byte-identical between the new path and the existing path, and the
+    two paths must differ only in what comes BEFORE that segment. That's
+    the exact fingerprint of "duplicate test tree under a subdir" (root
+    ``tests/`` vs ``server/tests/``) — the kind that produces
+    contradictory assertions on the same symbol.
+
+    Legitimate duplication across multiple language stacks (e.g. Python
+    ``tests/foo.py`` and Node ``client/tests/foo.spec.ts``) is NOT
+    caught: the basename patterns are language-specific, and the
+    suffixes wouldn't match anyway. Legitimate duplication of non-test
+    files (``__init__.py``, ``conftest.py``, ``README.md``) is skipped
+    at the ``_is_test_basename`` gate.
+    """
+    basename = os.path.basename(new_rel_path)
+    if not _is_test_basename(basename):
+        return None
+    new_suffix = _extract_test_scoped_suffix(new_rel_path)
+    if new_suffix is None:
+        return None
+    if not os.path.isdir(workspace_root):
+        return None
+    # Normalise for suffix comparison — POSIX separators throughout.
+    new_rel_norm = re.sub(r"[/\\]", "/", new_rel_path).lstrip("/")
+    duplicates: list[str] = []
+    for root, dirs, files in os.walk(workspace_root, followlinks=False):
+        # Prune skip dirs in-place so the walk stays cheap.
+        dirs[:] = [d for d in dirs if d not in _DUP_CHECK_SKIP_DIRS]
+        if basename not in files:
+            continue
+        candidate_abs = os.path.join(root, basename)
+        candidate_rel = os.path.relpath(candidate_abs, workspace_root)
+        candidate_norm = re.sub(r"[/\\]", "/", candidate_rel).lstrip("/")
+        if candidate_norm == new_rel_norm:
+            continue  # same path — that's the ``already exists`` case, not a duplicate root
+        candidate_suffix = _extract_test_scoped_suffix(candidate_norm)
+        if candidate_suffix == new_suffix:
+            duplicates.append(candidate_norm)
+        if len(duplicates) >= 3:
+            break  # bound the message payload
+    if not duplicates:
+        return None
+    dup_list = ", ".join(f"`{p}`" for p in duplicates)
+    return (
+        f"DUPLICATE_TEST_ROOT: refusing to land `{new_rel_norm}` because "
+        f"another test file with the same test-scoped path already exists: "
+        f"{dup_list}. The workspace has two mirrored tests trees for the "
+        "same target module — this is a topology bug that produces "
+        "contradictory test expectations and traps the repair loop in a "
+        "REPLACE_BLOCK oscillation on the shared implementation file "
+        "(observed in finsearch STORY-038: 7 rounds toggling "
+        "`server/config.py::database_url` before HITL). "
+        "NEXT-ROUND DIRECTIVE — pick ONE of these three:\n"
+        "  (a) COVERED BY EXISTING FILE. If the existing file at "
+        f"{dup_list} already covers the assertions you wanted this new "
+        "file for, do nothing — no CREATE_FILE, no REWRITE_FILE. Move "
+        "on to the next diagnostic.\n"
+        "  (b) GENUINELY DIFFERENT TESTS — use a different basename or "
+        "path. If your new file tests something different (different "
+        "AC IDs, different scenarios, different subsystem), rename it "
+        "so pytest collects both without the topology collision. "
+        f"Examples: `{new_rel_norm.replace('test_', 'test_env_', 1) if '/test_' in new_rel_norm.replace(os.sep, '/') or new_rel_norm.startswith('test_') else new_rel_norm}` "
+        "(prefix), or move it under a different scope directory that "
+        "makes its purpose obvious. Do NOT re-emit CREATE_FILE with the "
+        "same path — the patcher will reject again.\n"
+        "  (c) INTENTIONAL REPLACEMENT of the older file. If the file "
+        f"at {dup_list} is stale / wrong and you want this new file to "
+        "supersede it, first DELETE_BLOCK the entire contents of the "
+        "existing file (or REWRITE_FILE it to just a comment noting the "
+        "consolidation), then re-emit this CREATE_FILE. Only pick this "
+        "path if you're confident the OLDER file is wrong."
+    )
+
+
 class BasePatcher(ABC):
     """
     Abstract base for all file modification engines.
@@ -819,6 +967,21 @@ class TextPatcher(BasePatcher):
         full_path = self._resolve_safe(filepath, OperationType.CREATE_FILE)
         if isinstance(full_path, PatchResult):
             return full_path
+
+        # Duplicate-test-root check — only fires when the file is a
+        # test-like basename AND its test-scoped suffix already exists
+        # under a DIFFERENT tests root in the workspace. Returns None
+        # (falls through) for every non-test file, every path outside a
+        # tests root, and every non-duplicate. See
+        # ``_detect_duplicate_test_root`` for the full rationale.
+        dup_err = _detect_duplicate_test_root(filepath, self.workspace_root)
+        if dup_err:
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.CREATE_FILE,
+                error=dup_err,
+            )
 
         # Idempotency: if the file already exists with byte-identical content,
         # treat as a successful no-op so a crash-then-resume of the same patch
@@ -952,6 +1115,20 @@ class TextPatcher(BasePatcher):
         full_path = self._resolve_safe(filepath, OperationType.REWRITE_FILE)
         if isinstance(full_path, PatchResult):
             return full_path
+        # Duplicate-test-root check — only applies when this REWRITE_FILE
+        # would create a NEW file (target doesn't yet exist). If the file
+        # already exists, REWRITE_FILE is legitimately modifying it in
+        # place and duplicate-across-roots isn't a concern. See
+        # ``_detect_duplicate_test_root`` for the full rationale.
+        if not os.path.exists(full_path):
+            dup_err = _detect_duplicate_test_root(filepath, self.workspace_root)
+            if dup_err:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.REWRITE_FILE,
+                    error=dup_err,
+                )
         expected = content + "\n"
         if os.path.exists(full_path):
             try:

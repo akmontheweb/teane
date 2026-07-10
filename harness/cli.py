@@ -5146,6 +5146,56 @@ def _print_new_build_preview(
     print("=" * 72, file=sys.stderr)
 
 
+def _docker_wipe(workspace_path: str, entry: str) -> bool:
+    """Delete ``<workspace_path>/<entry>`` from inside a throwaway
+    ``alpine`` container so root-owned residue left by a prior
+    ``teane deploy`` (a compose service that ran without ``user:``)
+    can be cleared without escalating the harness itself.
+
+    Runs ``docker run --rm -v <workspace>:/w alpine rm -rf /w/<entry>``.
+    Times out at 60s so a wedged docker daemon can't stall reset. The
+    bind mount is scoped to the workspace root, and the ``entry`` name
+    is fixed by the parent's ``os.listdir`` result — no path traversal
+    is possible because ``os.listdir`` never returns ``..`` or path
+    separators.
+
+    Returns True on success, False if docker is unavailable or the
+    container exited non-zero. Best-effort — the caller logs and moves
+    on either way.
+    """
+    if not shutil.which("docker"):
+        return False
+    if not entry or "/" in entry or entry in ("", ".", ".."):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{workspace_path}:/w",
+                "alpine", "rm", "-rf", f"/w/{entry}",
+            ],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning(
+            "[new_build] docker-escalated wipe of %s raised: %s", entry, exc,
+        )
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "[new_build] docker-escalated wipe of %s failed (rc=%d): %s",
+            entry, result.returncode, (result.stderr or "").strip(),
+        )
+        return False
+    logger.info(
+        "[new_build] Escalated wipe of %s via alpine container "
+        "(root-owned residue removed).", entry,
+    )
+    return True
+
+
 def _perform_new_build_reset(
     workspace_path: str, spec_dirname: str,
     preserve_docs: bool = False,
@@ -5263,6 +5313,22 @@ def _perform_new_build_reset(
             else:
                 shutil.rmtree(full)
             deleted += 1
+        except PermissionError as exc:
+            # Root-owned residue from a prior `teane deploy` — the compose
+            # stack ran a container without `user:` and its process left
+            # files chowned to uid 0 on the host bind mount. The harness
+            # runs unprivileged, so os.remove/rmtree cannot unlink them.
+            # Escalate through a throwaway alpine container that has real
+            # root inside its own userns and can rm anything on the mount.
+            if _docker_wipe(workspace_path, entry):
+                deleted += 1
+            else:
+                logger.warning(
+                    "[new_build] Could not delete %s: %s "
+                    "(docker escalation unavailable or failed — root-owned "
+                    "residue may remain; run `sudo rm -rf %s` manually).",
+                    entry, exc, full,
+                )
         except OSError as exc:
             logger.warning("[new_build] Could not delete %s: %s", entry, exc)
     logger.info("[new_build] Deleted %d entry/entries from workspace root.", deleted)

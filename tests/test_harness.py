@@ -6478,6 +6478,94 @@ class TestDeployValidation:
         assert 'cpus: "2.0"' in compose
         assert "pids_limit: 500" in compose
 
+    def test_compose_pins_build_context_service_to_host_user(self):
+        # Build-context services must run as the host UID/GID so files
+        # written to bind-mounted workspace subdirs (e.g. ./api:/app)
+        # aren't chowned to root on the host. DB / proxy images keep
+        # their own uid — they use named volumes, not bind mounts.
+        from harness.deploy import _generate_compose_file
+        bp = {
+            "services": {
+                "api": {
+                    "build_context": "./api",
+                    "ports": ["8000:8000"],
+                    "volumes": ["./api:/app"],
+                },
+                "postgres": {
+                    "base_image": "postgres:16-alpine",
+                    "ports": ["5432:5432"],
+                    "volumes": ["postgres-data:/var/lib/postgres"],
+                },
+            }
+        }
+        compose = _generate_compose_file(bp)
+        # api runs as host user
+        api_block = compose.split("  api:")[1].split("\n\n")[0]
+        assert 'user: "${UID:-1000}:${GID:-1000}"' in api_block
+        # postgres keeps the image's own uid — no user: override
+        postgres_block = compose.split("  postgres:")[1].split("\n\n")[0]
+        assert "user:" not in postgres_block
+
+    def test_compose_injects_pyc_suppression_env(self):
+        # Build-context services get PYTHONDONTWRITEBYTECODE=1 and
+        # NODE_NO_WARNINGS=1 unconditionally so runtime imports don't
+        # scatter .pyc files (or noisy Node warnings) under the
+        # host-visible bind mount. DB services don't get either.
+        from harness.deploy import _generate_compose_file
+        bp = {
+            "services": {
+                "api": {
+                    "build_context": "./api",
+                    "ports": ["8000:8000"],
+                },
+                "postgres": {
+                    "base_image": "postgres:16-alpine",
+                    "ports": ["5432:5432"],
+                    "environment_keys_needed": ["POSTGRES_PASSWORD"],
+                },
+            }
+        }
+        compose = _generate_compose_file(bp)
+        api_block = compose.split("  api:")[1].split("\n\n")[0]
+        assert "PYTHONDONTWRITEBYTECODE=1" in api_block
+        assert "NODE_NO_WARNINGS=1" in api_block
+        postgres_block = compose.split("  postgres:")[1].split("\n\n")[0]
+        assert "PYTHONDONTWRITEBYTECODE" not in postgres_block
+
+    def test_env_file_includes_host_uid_gid_when_build_service_present(self):
+        # `.env` must expose the invoking host's UID/GID so the
+        # `${UID:-1000}` substitution in each build-context service's
+        # `user:` block resolves to the real user, not the 1000 fallback.
+        # (Bash does not export UID by default; compose reads it from
+        # the .env file next to the compose YAML.)
+        from harness.deploy import _generate_env_file
+        bp = {
+            "services": {
+                "api": {"build_context": "./api"},
+            }
+        }
+        env = _generate_env_file(bp)
+        assert env.startswith("#") or env.startswith("UID=") or "\nUID=" in env
+        assert "UID=" in env
+        assert "GID=" in env
+
+    def test_env_file_skips_uid_gid_when_no_build_service(self):
+        # A DB-only blueprint has no bind mounts writing files back to
+        # the host — no reason to pin UID.
+        from harness.deploy import _generate_env_file
+        bp = {
+            "services": {
+                "postgres": {
+                    "base_image": "postgres:16-alpine",
+                    "environment_keys_needed": ["POSTGRES_PASSWORD"],
+                }
+            }
+        }
+        env = _generate_env_file(bp)
+        assert "POSTGRES_PASSWORD=changeme" in env
+        assert "UID=" not in env
+        assert "GID=" not in env
+
 
 class TestDeployBlueprint:
 
@@ -6785,6 +6873,25 @@ class TestCLI:
         from harness.cli import build_parser
         parser = build_parser()
         assert parser.prog == "teane"
+
+    def test_docker_wipe_rejects_path_traversal(self):
+        # Defensive: os.listdir never returns "..", but confirm the
+        # helper refuses it anyway so a future caller can't hand it a
+        # bogus entry and rm the wrong directory.
+        from harness.cli import _docker_wipe
+        with tempfile.TemporaryDirectory() as ws:
+            assert _docker_wipe(ws, "..") is False
+            assert _docker_wipe(ws, "a/b") is False
+            assert _docker_wipe(ws, "") is False
+
+    def test_docker_wipe_returns_false_when_docker_absent(self, monkeypatch):
+        # If the operator has no docker, escalation is unavailable and
+        # the helper reports failure without raising — the caller then
+        # logs and moves on.
+        from harness import cli as _cli
+        monkeypatch.setattr(_cli.shutil, "which", lambda name: None)
+        with tempfile.TemporaryDirectory() as ws:
+            assert _cli._docker_wipe(ws, "junk") is False
 
     def test_spec_discovery_off_by_default(self):
         # --spec-discovery (renamed from --discover) defaults to false, so

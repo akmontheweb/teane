@@ -1541,6 +1541,39 @@ class TextPatcher(BasePatcher):
                     ", ".join(f"{p}:{ln}" for p, ln in sibling_hits),
                 )
             diff_section = f"\n{diff_prefix}\n" if diff_prefix else ""
+            # Fix #3 — for SHORT files that missed the REPLACE_BLOCK anchor,
+            # append a hint that suggests REWRITE_FILE. Motivating case:
+            # finsearch STORY-038 round 23. LLM was told
+            # ``server/main.py`` has only 3 defined symbols
+            # (``app, health_check, on_startup``), yet emitted a
+            # REPLACE_BLOCK whose ``search`` contained
+            # ``app.include_router(company_search_router)`` — a line that
+            # doesn't exist in a 20-line file. The generic error message
+            # showed the file content and suggested REPLACE_BLOCK, but
+            # the right op here is REWRITE_FILE: the file is small, the
+            # LLM has the full context, and the fix requires ADDING a
+            # line (not replacing one). Threshold at 80 lines — larger
+            # files should stay on REPLACE_BLOCK to avoid clobbering
+            # unrelated content.
+            _file_line_count = original.count("\n") + (1 if original and not original.endswith("\n") else 0)
+            _rewrite_hint = ""
+            if _file_line_count <= 80:
+                _rewrite_hint = (
+                    f"\n\nREWRITE_FILE HINT: this file is short "
+                    f"({_file_line_count} lines). If your intended change "
+                    "is to ADD content that doesn't exist in the file yet "
+                    "(new import, new function, new decorator call), "
+                    "REPLACE_BLOCK is the wrong op — its search anchor "
+                    "cannot match content that doesn't exist. Emit a "
+                    "REWRITE_FILE for this path with the FULL corrected "
+                    "file body. Format: same as CREATE_FILE, but the "
+                    "block name is REWRITE_FILE / END_REWRITE_FILE. "
+                    "Post-patch parse validation still applies (broken "
+                    "syntax rolls back). If you're modifying an existing "
+                    "line, copy the EXACT current content shown above "
+                    "into your REPLACE_BLOCK's search — do NOT paste the "
+                    "expected-future content as both search and replace."
+                )
             return PatchResult(
                 success=False,
                 file=filepath,
@@ -1557,6 +1590,7 @@ class TextPatcher(BasePatcher):
                     f"{diff_section}\n"
                     f"Current file content (around closest match):\n{suggestion}"
                     f"{sibling_tail}"
+                    f"{_rewrite_hint}"
                 ),
             )
         if n_matches > 1:

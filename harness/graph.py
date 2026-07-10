@@ -9392,6 +9392,44 @@ def _effective_judge_named_files(
     all other cases.
     """
     base_files = _verdict_named_files(verdict, compiler_errors)
+    # Fix #1 — augment ``base_files`` with non-test workspace files the
+    # judge references in ``real_blocker`` / ``recommendation`` but that
+    # don't appear in ``compiler_errors``. Motivating case: finsearch
+    # STORY-038 round 23. The judge's recommendation said "Edit
+    # server/main.py to include the company search router with
+    # app.include_router(search_router, prefix='/api')" — a concrete impl
+    # target — but ``compiler_errors`` only pointed at the failing test
+    # (assertion sites). ``_verdict_named_files`` filters by
+    # ``compiler_errors`` membership, so ``server/main.py`` never made
+    # the MUST-MODIFY list. The banner then told the LLM to touch test
+    # files only. The LLM correctly ignored that constraint and patched
+    # main.py anyway (using a hallucinated REPLACE_BLOCK anchor), and
+    # the judge-ignored gate later penalised it for touching main.py
+    # instead of the test files. Every side of the harness was fighting
+    # every other side.
+    #
+    # ``_verdict_referenced_files`` returns text-mentioned paths that
+    # exist on disk under the workspace, with path-traversal and
+    # extension guards. We union those with ``base_files`` and drop any
+    # test-shaped path to keep the MUST-MODIFY set focused on the fix
+    # target (test files already came in via ``base_files``).
+    if workspace_path:
+        try:
+            referenced = _verdict_referenced_files(verdict, workspace_path)
+        except Exception:  # noqa: BLE001 — best-effort augmentation
+            referenced = []
+        for rel in referenced:
+            if rel in base_files:
+                continue
+            # Skip test files — they're already in ``base_files`` when
+            # they appear in ``compiler_errors``, and adding them here
+            # would just duplicate. The augmentation is for impl paths
+            # the judge names in the recommendation.
+            rel_slash = rel.replace(os.sep, "/")
+            if _is_test_path(rel) or _TEST_FILENAME_RE.search(rel_slash):
+                continue
+            base_files = base_files + [rel]
+
     if not _top_error_is_test_assertion(top_persisted_diagnostics):
         return base_files, None
     impl_file = str(verdict.get("impl_file", "") or "").strip()
@@ -9414,6 +9452,14 @@ def _effective_judge_named_files(
         impl_file.replace(os.sep, "/")
     ):
         return base_files, None
+    # When ``impl_file`` is a valid, on-disk, non-test path, replace
+    # ``base_files`` wholesale — the judge has explicitly named where
+    # the fix belongs, and the LLM should focus on it rather than
+    # spreading edits across tests + impl. The augmentation added
+    # above is DELIBERATELY dropped here: ``impl_file`` is a stronger
+    # signal than a text-scanned reference, and mixing them re-invites
+    # the "LLM rewrites the test to make the assertion pass" bug that
+    # ``impl_file`` was introduced to fix (session 52c16e16-*).
     return [impl_file], impl_file
 
 
@@ -13910,13 +13956,41 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _files_str = ", ".join(_display_files)
                 if _extra:
                     _files_str += f" (+{_extra} more)"
-                reflection_banner_lines.append(
-                    f"FAN-OUT: error code {_code} appears across "
-                    f"{len(_files_list)} files: {_files_str}. They share "
-                    "ONE root cause. Emit patches for ALL of them in this "
-                    "single response — patching one per round is treated "
-                    "as no progress and will terminate the loop."
+                # Fix #4 — when the judge has issued a specific REQUIRED
+                # ACTION (a non-empty ``recommendation`` naming what to
+                # do), soften FAN-OUT so it doesn't override the focused
+                # directive. Motivating case: finsearch STORY-038 round
+                # 23. Judge's REQUIRED ACTION was "Edit server/main.py to
+                # include the company search router". FAN-OUT then told
+                # the LLM to emit patches for ALL 6 fan-out files under
+                # threat of loop termination. The LLM shotgun-patched all
+                # 6, diluting attention from the ONE fix that mattered.
+                # With a REQUIRED ACTION present the fan-out message
+                # becomes advisory — "if the same root cause affects
+                # these siblings, extend your fix to them too" — instead
+                # of a hard constraint that overrides the judge.
+                _has_required_action = bool(
+                    (reflection_verdict.get("recommendation") or "").strip()
                 )
+                if _has_required_action:
+                    reflection_banner_lines.append(
+                        f"Fan-out context (advisory): error code {_code} also "
+                        f"appears in {len(_files_list)} files: {_files_str}. "
+                        "These share ONE root cause. PRIORITIZE the REQUIRED "
+                        "ACTION above; once you land it, extend the SAME fix "
+                        "pattern to the other files IF the fix is genuinely "
+                        "identical. Do not shotgun unrelated speculative "
+                        "changes across all files — one focused fix is "
+                        "better than five wrong ones."
+                    )
+                else:
+                    reflection_banner_lines.append(
+                        f"FAN-OUT: error code {_code} appears across "
+                        f"{len(_files_list)} files: {_files_str}. They share "
+                        "ONE root cause. Emit patches for ALL of them in this "
+                        "single response — patching one per round is treated "
+                        "as no progress and will terminate the loop."
+                    )
             reflection_msg = "\n".join(reflection_banner_lines)
             if ignored_last_round and ignored_files_prev:
                 touched_str = (

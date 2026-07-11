@@ -247,8 +247,13 @@ def _emit_nfr_stubs(
     primary_stack: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Write one stub test file per NFR story into the workspace.
-    Returns ``(rel_paths_written, marker_keys_by_file)`` — the second
+    Returns ``(rel_paths_recorded, marker_keys_by_file)`` — the second
     is directly consumable by :func:`_persist_verifies_links`.
+
+    Idempotent: if a stub file for a story already exists, it is NOT
+    overwritten (respects operator edits). The AC keys still land in
+    ``marker_keys_by_file`` so :func:`_persist_verifies_links` can
+    re-insert the edges — those inserts are themselves idempotent.
 
     Silent on unsupported stacks / missing story rows / IO errors:
     an empty (list, dict) tuple lets the caller fall back to
@@ -286,11 +291,6 @@ def _emit_nfr_stubs(
                 )
                 continue
             ac_pairs = [(ac["ac_key"], ac.get("text", "")) for ac in acs]
-            body = _render_nfr_stub_body(
-                primary_stack, story_key, story.get("title", ""), ac_pairs,
-            )
-            if body is None:
-                continue
             rel_path = _nfr_stub_rel_path(primary_stack, story_key)
             if rel_path is None:
                 continue
@@ -303,6 +303,24 @@ def _emit_nfr_stubs(
                     "[test_generation_node] NFR stub path escapes "
                     "workspace boundary; dropping: %r", rel_path,
                 )
+                continue
+            if os.path.exists(abs_path):
+                # Respect an existing file (operator may have replaced
+                # the stub with a real integration test). Still expose
+                # the AC keys so links get re-persisted from whatever's
+                # on disk.
+                logger.info(
+                    "[test_generation_node] NFR stub for %r already "
+                    "exists at %r — not overwriting; re-persisting "
+                    "verifies links.", story_key, rel_path,
+                )
+                written.append(rel_path)
+                marker_keys_by_file[rel_path] = [k for k, _ in ac_pairs]
+                continue
+            body = _render_nfr_stub_body(
+                primary_stack, story_key, story.get("title", ""), ac_pairs,
+            )
+            if body is None:
                 continue
             try:
                 os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -319,6 +337,92 @@ def _emit_nfr_stubs(
     finally:
         conn.close()
     return written, marker_keys_by_file
+
+
+def backfill_untested_nfr_acs(
+    workspace_path: str,
+) -> tuple[list[str], int, int]:
+    """Sweep state.db for NFR stories whose acceptance criteria have no
+    ``test_verifies_ac`` link, emit skip-stub tests for them, and
+    persist the marker→ac edges.
+
+    Called by ``traceability_node`` before the end-of-batch / end-of-
+    session audit. The in-node ``test_generation_node`` NFR guard only
+    fires when a batch's scope is a fresh NFR story; sessions that
+    sealed the NFR batches before this guard existed (or where the
+    per-story split routed the NFRs through a path that skipped
+    test_generation) leave their AC edges empty. This backfill
+    reconciles those historical gaps at the traceability gate.
+
+    Returns ``(stub_paths, links_inserted, links_dropped)``. Empty
+    tuple + zeros when nothing needs backfilling; safe to call on
+    every batch (idempotent).
+    """
+    from harness.req_ids import STORY_NFR_ID_RE
+    try:
+        from harness import story_state
+        app_name = story_state.app_name_for_workspace(workspace_path)
+        conn = story_state.open_story_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[traceability] NFR backfill skipped (state.db open failed): %s",
+            exc,
+        )
+        return [], 0, 0
+    orphan_story_keys: list[str] = []
+    try:
+        stories = conn.execute(
+            "SELECT id, story_key FROM stories WHERE workspace = ?",
+            (app_name,),
+        ).fetchall()
+        for row in stories:
+            story_id, story_key = int(row[0]), str(row[1])
+            if not STORY_NFR_ID_RE.fullmatch(story_key):
+                continue
+            # Any AC on this story without a test_verifies_ac row?
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM acceptance_criteria ac "
+                "WHERE ac.workspace = ? AND ac.story_id = ? "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM test_verifies_ac tv "
+                "  WHERE tv.workspace = ac.workspace "
+                "    AND tv.ac_id = ac.id"
+                ")",
+                (app_name, story_id),
+            ).fetchone()
+            if missing and int(missing[0]) > 0:
+                orphan_story_keys.append(story_key)
+    finally:
+        conn.close()
+    if not orphan_story_keys:
+        return [], 0, 0
+    from harness.impact import _detect_workspace_stack
+    tags = _detect_workspace_stack(workspace_path) or set()
+    primary = _pick_primary_stack(tags)
+    if primary not in ("python", "typescript"):
+        logger.info(
+            "[traceability] NFR backfill: %d orphan NFR story/stories "
+            "with untested ACs (%s) but no supported stack detected "
+            "(primary=%r) — skipping.",
+            len(orphan_story_keys), ", ".join(orphan_story_keys), primary,
+        )
+        return [], 0, 0
+    stub_paths, stub_markers = _emit_nfr_stubs(
+        workspace_path, orphan_story_keys, primary,
+    )
+    if not stub_paths:
+        return [], 0, 0
+    links_inserted, links_dropped = _persist_verifies_links(
+        workspace_path, stub_markers,
+    )
+    logger.info(
+        "[traceability] NFR backfill: emitted %d stub file(s) for %d "
+        "orphan NFR story/stories (%s) — %d verifies-link(s) inserted, "
+        "%d dropped as unknown.",
+        len(stub_paths), len(orphan_story_keys),
+        ", ".join(orphan_story_keys), links_inserted, links_dropped,
+    )
+    return stub_paths, links_inserted, links_dropped
 
 
 def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:

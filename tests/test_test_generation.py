@@ -17,6 +17,7 @@ from harness.test_generation import (
     _pick_primary_stack,
     _stack_test_command,
     _inside_workspace,
+    backfill_untested_nfr_acs,
     route_after_test_generation,
 )
 # Imported under a non-test_ alias so pytest's auto-collection doesn't try
@@ -876,6 +877,131 @@ class TestVerifiesLinkPersistence:
         # Second call: composite PK → no new insert
         b, _ = _persist_verifies_links(str(ws), {"tests/t.py": [ac_key]})
         assert a == 1 and b == 0
+
+
+# ---------------------------------------------------------------------------
+# NFR AC backfill — called by traceability_node before the end-of-batch audit
+# ---------------------------------------------------------------------------
+
+class TestBackfillUntestedNfrAcs:
+    """2026-07-11 fix — the in-node NFR guard only fires during
+    test_generation for a fresh NFR batch. Sessions whose NFR batches
+    sealed before the guard existed leave AC edges empty and the
+    end-of-session traceability audit blocks. The backfill sweep runs
+    inside traceability_node and closes these historical gaps."""
+
+    @staticmethod
+    def _seed_nfr_story(workspace_path: str, story_key: str, acs: list[str]) -> None:
+        from harness import story_state
+        app = story_state.app_name_for_workspace(workspace_path)
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "nfr-f", name="NFR feature")
+            feat = story_state.get_feature_by_key(conn, app, "nfr-f")
+            cur = conn.execute(
+                "INSERT INTO stories(workspace, story_key, feature_id, title, "
+                "depends_on, scope_files, status, build_kind, created_at) "
+                "VALUES(?, ?, ?, ?, '[]', '[]', 'planned', 'greenfield', ?)",
+                (app, story_key, int(feat["id"]), f"{story_key}",
+                 "2026-07-11T00:00:00+00:00"),
+            )
+            story_state.create_acceptance_criteria(
+                conn, app, int(cur.lastrowid),
+                [
+                    {"ac_key": f"{story_key}.AC-{i + 1}", "text": t, "ordinal": i + 1}
+                    for i, t in enumerate(acs)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_backfill_emits_stubs_for_orphan_nfr_stories(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        # Two NFR stories, both fully orphan; and one regular story with
+        # ACs to prove the backfill does NOT touch it.
+        self._seed_nfr_story(str(tmp_path), "STORY-NFR-001", ["AC one", "AC two"])
+        self._seed_nfr_story(str(tmp_path), "STORY-NFR-004", ["Secrets AC"])
+
+        stub_paths, inserted, dropped = backfill_untested_nfr_acs(str(tmp_path))
+        assert set(stub_paths) == {
+            "tests/nfr/test_story_nfr_001.py",
+            "tests/nfr/test_story_nfr_004.py",
+        }
+        assert inserted == 3
+        assert dropped == 0
+        # Files exist and carry markers.
+        assert (tmp_path / "tests" / "nfr" / "test_story_nfr_001.py").exists()
+        body = (tmp_path / "tests" / "nfr" / "test_story_nfr_001.py").read_text()
+        assert "@verifies: STORY-NFR-001.AC-1" in body
+        assert "@verifies: STORY-NFR-001.AC-2" in body
+
+    def test_backfill_is_idempotent_and_respects_existing_files(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        self._seed_nfr_story(str(tmp_path), "STORY-NFR-004", ["Secrets AC"])
+        # First call writes stub + persists the link.
+        first_paths, first_ins, _ = backfill_untested_nfr_acs(str(tmp_path))
+        assert first_paths == ["tests/nfr/test_story_nfr_004.py"]
+        assert first_ins == 1
+        # Operator replaces the stub with a real integration test.
+        stub = tmp_path / "tests" / "nfr" / "test_story_nfr_004.py"
+        stub.write_text(
+            "# @verifies: STORY-NFR-004.AC-1\n"
+            "def test_real_integration():\n    assert True\n"
+        )
+        # Second call: the AC is now covered by the linked test row, so
+        # the orphan-AC query returns nothing and the sweep no-ops. The
+        # operator's file survives untouched — that's the "respects
+        # existing files" contract even without another persist round.
+        second_paths, second_ins, _ = backfill_untested_nfr_acs(str(tmp_path))
+        assert second_paths == []
+        assert second_ins == 0
+        assert stub.read_text().startswith("# @verifies: STORY-NFR-004.AC-1")
+
+    def test_backfill_survives_partially_linked_story(self, tmp_path):
+        """One AC of a multi-AC NFR story is already linked; the sweep
+        must STILL fire (the story is orphan for the other ACs) and the
+        existing stub file must be respected (not overwritten)."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        self._seed_nfr_story(
+            str(tmp_path), "STORY-NFR-004",
+            ["Secrets AC", "CSRF AC", "SQLi AC"],
+        )
+        # Link only AC-2 via an unrelated test file.
+        _persist_verifies_links(
+            str(tmp_path),
+            {"tests/prior.py": ["STORY-NFR-004.AC-2"]},
+        )
+        # Pre-existing stub file (operator's manual edit).
+        stub = tmp_path / "tests" / "nfr" / "test_story_nfr_004.py"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("# @verifies: STORY-NFR-004.AC-1\n# hand-edited\n")
+
+        paths, inserted, _ = backfill_untested_nfr_acs(str(tmp_path))
+        assert paths == ["tests/nfr/test_story_nfr_004.py"]
+        # Three link rows land — the composite PK is
+        # (workspace, test_path, ac_id), and this stub is a NEW test_path,
+        # so all three ACs are fresh links even though AC-2 already had
+        # a link from tests/prior.py.
+        assert inserted == 3
+        # The operator's hand-edited stub is preserved verbatim — the
+        # backfill did NOT overwrite the file.
+        assert stub.read_text() == (
+            "# @verifies: STORY-NFR-004.AC-1\n# hand-edited\n"
+        )
+
+    def test_backfill_skips_when_no_orphan_nfr_stories(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        # NFR story exists but its AC already has a link.
+        self._seed_nfr_story(str(tmp_path), "STORY-NFR-002", ["Existing AC"])
+        _persist_verifies_links(
+            str(tmp_path),
+            {"tests/prior.py": ["STORY-NFR-002.AC-1"]},
+        )
+        stub_paths, inserted, _ = backfill_untested_nfr_acs(str(tmp_path))
+        assert stub_paths == []
+        assert inserted == 0
 
 
 # ---------------------------------------------------------------------------

@@ -1115,6 +1115,24 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
         from harness.arch_summary import load_arch_summary
         arch_summary_dict = load_arch_summary(workspace_path) or {}
 
+    # NFR AC backfill (2026-07-11): before regenerating the matrix
+    # views or running the audit, sweep for NFR stories whose ACs have
+    # no ``test_verifies_ac`` link and emit ``@pytest.mark.skip`` stubs
+    # for them. The in-node ``test_generation`` NFR guard only fires
+    # when a fresh NFR batch runs; sessions whose NFR batches sealed
+    # before the guard existed (or where the batch topology skipped
+    # test_generation entirely) leave their AC edges empty and the
+    # end-of-session audit blocks. Idempotent — safe to call on every
+    # batch. See test_generation.backfill_untested_nfr_acs for the
+    # policy details.
+    try:
+        from harness.test_generation import backfill_untested_nfr_acs
+        backfill_untested_nfr_acs(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — never block audit on this
+        logger.debug(
+            "[traceability] NFR backfill sweep failed (non-fatal): %s", exc,
+        )
+
     conn = story_state.open_story_db()
     try:
         stories_md, trace_md = story_state.regenerate_markdown_views(

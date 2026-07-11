@@ -22334,6 +22334,18 @@ async def _reset_stale_gate_counters_on_resume(
         # path.
         "test_generation",
         "test_generation_zero_emit",
+        # 2026-07-11 fix — finsearch session 1d4e49b0's second
+        # ``teane resume`` terminated at graph entry because
+        # ``traceability_block_cycles`` was still at cap=2 in the
+        # checkpoint. The router at ``route_after_installation_doc``
+        # fires that cap check before the audit can re-run, so a
+        # resume after fixing the underlying gap (e.g. adding NFR
+        # AC stubs) never gets to re-evaluate — same class of
+        # stale-counter bug the older keys hit. See also
+        # ``_rewind_suspended_checkpoint`` which routes back through
+        # ``human_intervention_node`` so ``route_after_hitl`` re-runs
+        # the audit against the fresh state.
+        "traceability_block_cycles",
         # And the auto-resume budget itself — the operator's
         # decision to invoke resume from the CLI IS the manual
         # intervention. The auto-resume slack was designed to bound
@@ -22458,6 +22470,53 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
                 "invalidated them."
             )
         suspended_from = "hitl_menu"
+
+    # 2026-07-11: Traceability-cap terminal recovery. The prior session
+    # terminated at END because ``route_after_installation_doc`` hit
+    # ``traceability_block_cycles >= TRACEABILITY_BLOCK_CYCLE_CAP`` —
+    # neither hitl_suspend nor hitl_abandon was set (the router bypassed
+    # the HITL menu to prevent the ping-pong loop). The operator's
+    # ``teane resume`` implies they took action outside the harness
+    # (populated story→req links, closed AC gaps, lowered
+    # ``traceability.enforce``, or — in the finsearch case —
+    # test_generation now emits NFR skip-stubs that satisfy the
+    # missing @verifies edges). Rewind by stamping state as if HITL
+    # just resolved with ``trigger=traceability_block`` so
+    # ``route_after_hitl`` re-routes to ``traceability_node`` and the
+    # audit re-runs against the fresh workspace/state.db.
+    if node_state.get("traceability_blocked") and not node_state.get("hitl_suspend"):
+        prior_lc = values.get("loop_counter") if isinstance(values, dict) else {}
+        prior_lc = prior_lc or {}
+        cleared_ns = dict(node_state)
+        cleared_ns.pop("traceability_blocked", None)
+        cleared_ns.pop("traceability_block_cycles", None)
+        cleared_ns["hitl_trigger"] = "traceability_block"
+        cleared_ns["hitl_active"] = False
+        cleared_ns["hitl_awaiting_input"] = False
+        cleared_ns["hitl_resolved"] = True
+        cleared_ns.pop("hitl_abandon", None)
+        cleared_lc = dict(prior_lc)
+        cleared_lc["traceability_block_cycles"] = 0
+        logger.info(
+            "[run_graph] Resume rewind: prior session terminated at END "
+            "on the traceability_block cycle cap. Stamping HITL as "
+            "resolved with trigger=traceability_block so route_after_hitl "
+            "re-routes to traceability_node and the audit re-evaluates."
+        )
+        try:
+            await compiled_graph.aupdate_state(
+                config,
+                {"node_state": cleared_ns, "loop_counter": cleared_lc},
+                as_node="human_intervention_node",
+            )
+        except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+            logger.warning(
+                "[run_graph] Failed to rewind traceability-cap terminal "
+                "checkpoint: %s. Resume will likely no-op; user may need "
+                "a fresh session.",
+                exc,
+            )
+        return
 
     if not node_state.get("hitl_suspend"):
         # Back-compat: pre-fix gatekeeper [s] checkpoints never set

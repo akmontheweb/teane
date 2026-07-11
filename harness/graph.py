@@ -22480,34 +22480,38 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
     # (populated story→req links, closed AC gaps, lowered
     # ``traceability.enforce``, or — in the finsearch case —
     # test_generation now emits NFR skip-stubs that satisfy the
-    # missing @verifies edges). Rewind by stamping state as if HITL
-    # just resolved with ``trigger=traceability_block`` so
-    # ``route_after_hitl`` re-routes to ``traceability_node`` and the
-    # audit re-runs against the fresh workspace/state.db.
+    # missing @verifies edges).
+    #
+    # Rewind strategy: stamp as_node=installation_doc_node (the actual
+    # last-run node — langgraph's aupdate_state(as_node=X) only works
+    # cleanly when X was the last-run node in the checkpoint). KEEP
+    # ``traceability_blocked=True`` and clear the cycle counter so
+    # route_after_installation_doc routes to human_intervention_node
+    # instead of END. The HITL fires immediately, headless auto-resume
+    # (or the operator) routes through route_after_hitl → traceability_node,
+    # and the audit re-runs against the fresh state.
     if node_state.get("traceability_blocked") and not node_state.get("hitl_suspend"):
         prior_lc = values.get("loop_counter") if isinstance(values, dict) else {}
         prior_lc = prior_lc or {}
         cleared_ns = dict(node_state)
-        cleared_ns.pop("traceability_blocked", None)
+        # Keep traceability_blocked=True so route_after_installation_doc
+        # sends us to human_intervention_node (not END).
         cleared_ns.pop("traceability_block_cycles", None)
-        cleared_ns["hitl_trigger"] = "traceability_block"
-        cleared_ns["hitl_active"] = False
-        cleared_ns["hitl_awaiting_input"] = False
-        cleared_ns["hitl_resolved"] = True
         cleared_ns.pop("hitl_abandon", None)
         cleared_lc = dict(prior_lc)
         cleared_lc["traceability_block_cycles"] = 0
         logger.info(
             "[run_graph] Resume rewind: prior session terminated at END "
-            "on the traceability_block cycle cap. Stamping HITL as "
-            "resolved with trigger=traceability_block so route_after_hitl "
-            "re-routes to traceability_node and the audit re-evaluates."
+            "on the traceability_block cycle cap. Stamping "
+            "installation_doc_node as just-completed with cycle counter "
+            "reset so route_after_installation_doc re-routes to HITL and "
+            "auto-resume takes the audit re-eval path."
         )
         try:
             await compiled_graph.aupdate_state(
                 config,
                 {"node_state": cleared_ns, "loop_counter": cleared_lc},
-                as_node="human_intervention_node",
+                as_node="installation_doc_node",
             )
         except Exception as exc:  # noqa: BLE001 — log but don't crash resume
             logger.warning(

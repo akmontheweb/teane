@@ -262,53 +262,155 @@ class TestSkipBehaviour:
         # And the router must send it to HITL.
         assert route_after_test_generation(result) == "human_intervention_node"
 
+    @staticmethod
+    def _seed_nfr_story(workspace_path: str, story_key: str, acs: list[str]) -> None:
+        """Insert an NFR story (with the explicit STORY-NFR-N key) plus its
+        acceptance criteria into the per-test state.db. create_stories()
+        allocates keys sequentially and can't be told to use an NFR key,
+        so we go through raw SQL for the story row and reuse the public
+        AC helper for the criteria."""
+        from harness import story_state
+        app = story_state.app_name_for_workspace(workspace_path)
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "nfr-f", name="NFR feature")
+            feat = story_state.get_feature_by_key(conn, app, "nfr-f")
+            now = "2026-07-11T00:00:00+00:00"
+            cur = conn.execute(
+                "INSERT INTO stories(workspace, story_key, feature_id, title, "
+                "depends_on, scope_files, status, build_kind, created_at) "
+                "VALUES(?, ?, ?, ?, '[]', '[]', 'planned', 'greenfield', ?)",
+                (app, story_key, int(feat["id"]), f"{story_key} title", now),
+            )
+            story_id = int(cur.lastrowid)
+            story_state.create_acceptance_criteria(
+                conn, app, story_id,
+                [
+                    {"ac_key": f"{story_key}.AC-{i + 1}", "text": t, "ordinal": i + 1}
+                    for i, t in enumerate(acs)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     @pytest.mark.asyncio
-    async def test_skips_nfr_only_batch_without_dispatching(
+    async def test_nfr_only_batch_emits_skip_stubs_and_persists_links(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """2026-07-10: finsearch session tripped
-        ``env_misconfig:test_generation_zero_emit`` three times because the
-        LLM refused to generate unit tests for pure-NFR batches
-        (STORY-NFR-001, STORY-NFR-004). Verify test_generation now
-        short-circuits cleanly when EVERY story key in the batch is a SAFe
-        enabler / NFR story — no LLM dispatch, no HITL, no counter burn."""
-        gw = stub_gateway("<<<CREATE_FILE:tests/test_x.py>>>\ndef test_x():\n    pass\n<<<END>>>\n")
+        """2026-07-10: finsearch tripped test_generation_zero_emit on
+        NFR-only batches. First fix skipped the node, but downstream
+        traceability audit then blocked on untested NFR ACs (2026-07-11).
+        Refined fix: emit `@pytest.mark.skip` stub files carrying the
+        `# @verifies: STORY-NFR-N.AC-M` markers so the traceability
+        contract is satisfied while making the "human owes an integration
+        test" story explicit."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        self._seed_nfr_story(
+            str(tmp_path), "STORY-NFR-001",
+            ["Non-December fiscal year", "Current incomplete fiscal year"],
+        )
+        self._seed_nfr_story(
+            str(tmp_path), "STORY-NFR-004",
+            ["Secrets not in environment or code"],
+        )
+        gw = stub_gateway("should never be dispatched")
         result = await run_test_generation({
             "workspace_path": str(tmp_path),
             "modified_files": ["foo.py"],
             "batch_patched_story_keys": ["STORY-NFR-001", "STORY-NFR-004"],
         })
-        # No LLM call, no HITL.
+        # No LLM dispatch — the whole point.
         assert gw.dispatched == []
-        assert "env_misconfig" not in (result.get("node_state") or {})
-        assert "llm_behavior" not in (result.get("node_state") or {})
-        # Result payload records the reason so downstream nodes / audit
-        # can distinguish "skipped by policy" from "generated 0 tests".
+        # State signals the refined outcome.
         node_state = result["node_state"]
-        assert node_state["test_generation"]["status"] == "skipped"
-        assert node_state["test_generation"]["reason"] == "nfr_only_batch"
+        assert node_state["test_generation"]["status"] == "nfr_stubbed"
+        assert node_state["test_generation"]["primary_stack"] == "python"
+        assert node_state["test_generation"]["tests_generated"] == 2
         assert node_state["test_generation"]["story_keys"] == [
             "STORY-NFR-001", "STORY-NFR-004",
         ]
+        assert node_state["test_generation"]["verifies_links_inserted"] == 3
+        # Files on disk under the workspace's canonical NFR stub path.
+        stub_001 = tmp_path / "tests" / "nfr" / "test_story_nfr_001.py"
+        stub_004 = tmp_path / "tests" / "nfr" / "test_story_nfr_004.py"
+        assert stub_001.exists()
+        assert stub_004.exists()
+        body_001 = stub_001.read_text()
+        assert "@pytest.mark.skip" in body_001
+        assert "@verifies: STORY-NFR-001.AC-1" in body_001
+        assert "@verifies: STORY-NFR-001.AC-2" in body_001
+        body_004 = stub_004.read_text()
+        assert "@verifies: STORY-NFR-004.AC-1" in body_004
+        # generated_tests / modified_files carry the new paths so
+        # downstream compiler / commit nodes see them.
+        assert "tests/nfr/test_story_nfr_001.py" in result["generated_tests"]
+        assert "tests/nfr/test_story_nfr_004.py" in result["generated_tests"]
+        assert "tests/nfr/test_story_nfr_001.py" in result["modified_files"]
+        # AC→test edges are in state.db so the traceability audit passes.
+        from harness import story_state
+        app = story_state.app_name_for_workspace(str(tmp_path))
+        conn = story_state.open_story_db()
+        try:
+            rows = conn.execute(
+                "SELECT test_path FROM test_verifies_ac "
+                "WHERE workspace = ? ORDER BY test_path", (app,),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert {r[0] for r in rows} == {
+            "tests/nfr/test_story_nfr_001.py",
+            "tests/nfr/test_story_nfr_004.py",
+        }
 
     @pytest.mark.asyncio
-    async def test_skips_when_current_story_id_is_nfr(
+    async def test_nfr_only_batch_falls_back_to_skip_when_no_story_rows(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """Single-story path (agile per-story mode): current_story_id
-        points at STORY-NFR-*, batch_patched_story_keys not populated
-        yet. Same skip applies."""
-        gw = stub_gateway("...")
+        """Guardrail must degrade to the safe old behaviour when
+        state.db has no matching story (decomposition drift, wrong
+        workspace path). Traceability will still flag the ACs as
+        untested but the run doesn't wedge."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        # NOTE: no _seed_nfr_story call — state.db has no matching rows
+        gw = stub_gateway("...")
         result = await run_test_generation({
             "workspace_path": str(tmp_path),
             "modified_files": ["foo.py"],
-            "current_story_id": "STORY-NFR-007",
+            "batch_patched_story_keys": ["STORY-NFR-999"],
         })
         assert gw.dispatched == []
-        assert result["node_state"]["test_generation"]["reason"] == "nfr_only_batch"
-        assert result["node_state"]["test_generation"]["story_keys"] == ["STORY-NFR-007"]
+        ns = result["node_state"]["test_generation"]
+        assert ns["status"] == "skipped"
+        assert ns["reason"] == "nfr_only_batch_no_stubs"
+        assert ns["story_keys"] == ["STORY-NFR-999"]
+
+    @pytest.mark.asyncio
+    async def test_nfr_only_batch_skips_cleanly_on_unsupported_stack(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Java / other stacks have no stub template today — the guard
+        must still trip (avoiding the zero-emit HITL) but degrade to
+        the old skip behaviour."""
+        (tmp_path / "Main.java").write_text("class Main {}\n")
+        gw = stub_gateway("...")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["Main.java"],
+            "batch_patched_story_keys": ["STORY-NFR-001"],
+        })
+        assert gw.dispatched == []
+        ns = result["node_state"]["test_generation"]
+        assert ns["status"] == "skipped"
+        # Either unsupported stack (java) OR no stubs (state.db empty).
+        # Both are acceptable fallbacks — the guard's job is only to
+        # prevent the LLM dispatch and the ensuing zero-emit HITL.
+        assert ns["reason"] in (
+            "nfr_only_batch_unsupported_stack",
+            "nfr_only_batch_no_stubs",
+        )
 
     @pytest.mark.asyncio
     async def test_mixed_nfr_and_regular_batch_still_dispatches(

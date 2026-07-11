@@ -1029,7 +1029,29 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
     # for every AC. Sweeping at batch-seal time closes that gap —
     # idempotent, best-effort, never fails the seal.
     try:
-        from harness.test_generation import sweep_verifies_links
+        # 2026-07-11 fix — before the sweep, retroactively prepend
+        # ``@verifies:`` markers to test files whose bodies reference a
+        # story informally (e.g. ``# STORY-002: Filing Index...``) but
+        # forgot the exact marker syntax. ``patching_node`` emits many
+        # such test files as part of story scope; they bypass
+        # ``test_generation_node``'s marker gate entirely, so without
+        # this the sweep sees no markers and every AC on those stories
+        # is reported as untested by the audit. Finsearch session
+        # 1d4e49b0: 20/26 untested ACs were on tests with story
+        # mentions in comments but no ``@verifies:`` line.
+        from harness.test_generation import (
+            autofix_markers_by_body_reference,
+            sweep_verifies_links,
+        )
+        af_scanned, af_patched = autofix_markers_by_body_reference(
+            workspace_path,
+        )
+        if af_patched:
+            logger.info(
+                "[batch_commit] @verifies marker autofix by body "
+                "reference: scanned=%d, patched=%d.",
+                af_scanned, af_patched,
+            )
         scanned, inserted, dropped = sweep_verifies_links(workspace_path)
         if inserted or dropped:
             logger.info(

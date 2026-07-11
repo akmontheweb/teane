@@ -898,6 +898,129 @@ def _looks_like_test_file(rel_path: str) -> bool:
     return False
 
 
+# Matches STORY-N or STORY-N.AC-M references anywhere in a comment /
+# docstring / prose. Used by ``autofix_markers_by_body_reference`` to
+# rescue patcher-emitted test files that mention the story informally
+# (e.g. a docstring "STORY-002: Filing Index Construction") but forgot
+# the exact ``@verifies: STORY-N.AC-N`` syntax the audit demands.
+_STORY_REFERENCE_RE = re.compile(
+    r"\bSTORY-(?:NFR-)?\d+(?:\.AC-\d+)?\b"
+)
+
+
+def _stack_from_test_path(rel_path: str) -> str:
+    """Pick the marker comment lead based on the test file's extension.
+    Falls back to Python (# lead) for unknown extensions. Used by the
+    batch-level marker autofix which sees files from both stacks."""
+    ext = os.path.splitext(rel_path)[1].lower()
+    if ext in (".ts", ".tsx"):
+        return "typescript"
+    if ext in (".js", ".jsx"):
+        return "javascript"
+    if ext == ".java":
+        return "java"
+    return "python"
+
+
+def autofix_markers_by_body_reference(workspace_path: str) -> tuple[int, int]:
+    """For every test file lacking a ``@verifies:`` marker, scan its body
+    for ``STORY-N`` mentions in comments / docstrings, look up the
+    referenced ACs in state.db, and prepend a well-formed ``@verifies:``
+    marker. Returns ``(files_scanned, files_patched)``.
+
+    Called at ``batch_commit_node`` before ``sweep_verifies_links`` so
+    patcher-emitted test files (which bypass ``test_generation_node``'s
+    marker gate entirely) get retroactive AC linkage from whatever
+    story they informally reference. Idempotent — files that already
+    carry a valid ``@verifies:`` marker are skipped.
+
+    Root cause fix (2026-07-11, finsearch): ``patching_node`` writes
+    test files as part of a story's scope; those tests bypass
+    ``test_generation_node`` and its ``@verifies:`` autofix. In the
+    finsearch run, 20/26 untested ACs were on tests that DID reference
+    the story in a docstring (``# STORY-002: Filing Index...``) but
+    forgot the ``@verifies:`` line — the sweep saw no markers and the
+    audit correctly reported the ACs as untested.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return (0, 0)
+    try:
+        from harness import story_state
+        app_name = story_state.app_name_for_workspace(workspace_path)
+        conn = story_state.open_story_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[test_generation] marker autofix skipped (state.db open "
+            "failed): %s", exc,
+        )
+        return (0, 0)
+    from harness.req_ids import canonicalize_ac_key, canonicalize_req_key
+    scanned = 0
+    patched = 0
+    story_ac_cache: dict[str, list[str]] = {}
+    try:
+        for root, dirs, files in os.walk(workspace_path):
+            dirs[:] = [d for d in dirs if d not in _SWEEP_IGNORED_DIRS]
+            for name in files:
+                abs_path = os.path.join(root, name)
+                rel = os.path.relpath(abs_path, workspace_path)
+                if not _looks_like_test_file(rel):
+                    continue
+                scanned += 1
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                        body = fh.read()
+                except OSError:
+                    continue
+                if _parse_verifies_marker(body):
+                    continue
+                # Scan only the top of the file — story mentions elsewhere
+                # (e.g. a mocked fixture name that coincidentally matches
+                # the STORY-N pattern) shouldn't drive the inference.
+                head = "\n".join(body.splitlines()[: _VERIFIES_SCAN_LINES])
+                mentions = _STORY_REFERENCE_RE.findall(head)
+                if not mentions:
+                    continue
+                referenced_stories: set[str] = set()
+                specific_acs: set[str] = set()
+                for m in mentions:
+                    if ".AC-" in m:
+                        specific_acs.add(canonicalize_ac_key(m))
+                    else:
+                        referenced_stories.add(canonicalize_req_key(m))
+                ac_keys: set[str] = set(specific_acs)
+                for sk in referenced_stories:
+                    if sk not in story_ac_cache:
+                        story = story_state.get_story(conn, app_name, sk)
+                        if story is None:
+                            story_ac_cache[sk] = []
+                        else:
+                            acs = story_state.list_acceptance_criteria(
+                                conn, app_name, story["id"],
+                            )
+                            story_ac_cache[sk] = [
+                                a["ac_key"] for a in acs
+                                if isinstance(a.get("ac_key"), str)
+                            ]
+                    ac_keys.update(story_ac_cache[sk])
+                if not ac_keys:
+                    continue
+                stack = _stack_from_test_path(rel)
+                marker = _marker_line_for(stack, sorted(ac_keys))
+                if not marker:
+                    continue
+                if _prepend_verifies_marker(abs_path, marker):
+                    patched += 1
+                    logger.info(
+                        "[test_generation] Autofixed @verifies marker on "
+                        "%r via body reference (stack=%s, keys=%s).",
+                        rel, stack, ", ".join(sorted(ac_keys)),
+                    )
+    finally:
+        conn.close()
+    return (scanned, patched)
+
+
 def sweep_verifies_links(workspace_path: str) -> tuple[int, int, int]:
     """Walk the workspace, parse ``@verifies:`` markers from every test
     file, and persist the corresponding ``test_verifies_ac`` edges.

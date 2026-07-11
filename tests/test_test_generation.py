@@ -17,6 +17,7 @@ from harness.test_generation import (
     _pick_primary_stack,
     _stack_test_command,
     _inside_workspace,
+    autofix_markers_by_body_reference,
     backfill_untested_nfr_acs,
     route_after_test_generation,
 )
@@ -1002,6 +1003,136 @@ class TestBackfillUntestedNfrAcs:
         stub_paths, inserted, _ = backfill_untested_nfr_acs(str(tmp_path))
         assert stub_paths == []
         assert inserted == 0
+
+
+# ---------------------------------------------------------------------------
+# @verifies marker autofix by body reference — rescues patcher-emitted tests
+# ---------------------------------------------------------------------------
+
+class TestAutofixMarkersByBodyReference:
+    """2026-07-11 fix — patching_node emits test files as part of a
+    story's scope; those tests bypass test_generation_node's marker
+    gate entirely. The finsearch run left 20/26 untested ACs on tests
+    that DID reference the story in a docstring but forgot the
+    ``@verifies:`` line syntax. This helper rescues them at
+    batch_commit_node before the sweep."""
+
+    @staticmethod
+    def _seed_story(workspace_path: str, story_key: str, acs: list[str]) -> None:
+        from harness import story_state
+        app = story_state.app_name_for_workspace(workspace_path)
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "f", name="F")
+            feat = story_state.get_feature_by_key(conn, app, "f")
+            cur = conn.execute(
+                "INSERT INTO stories(workspace, story_key, feature_id, title, "
+                "depends_on, scope_files, status, build_kind, created_at) "
+                "VALUES(?, ?, ?, ?, '[]', '[]', 'planned', 'greenfield', ?)",
+                (app, story_key, int(feat["id"]), story_key,
+                 "2026-07-11T00:00:00+00:00"),
+            )
+            story_state.create_acceptance_criteria(
+                conn, app, int(cur.lastrowid),
+                [
+                    {"ac_key": f"{story_key}.AC-{i + 1}", "text": t, "ordinal": i + 1}
+                    for i, t in enumerate(acs)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_prepends_python_marker_when_docstring_references_story(self, tmp_path):
+        self._seed_story(str(tmp_path), "STORY-019", ["AC one", "AC two", "AC three"])
+        test_file = tmp_path / "server" / "tests" / "test_ai_service.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text(
+            '"""\n'
+            "Tests for AI service.\n"
+            "\n"
+            "STORY-019: Management Guidance Extraction\n"
+            '"""\n'
+            "def test_x():\n    pass\n"
+        )
+        scanned, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert scanned == 1
+        assert patched == 1
+        body = test_file.read_text()
+        assert body.splitlines()[0].startswith("# @verifies: STORY-019.AC-1")
+        # All three ACs of the referenced story land.
+        assert "STORY-019.AC-2" in body.splitlines()[0]
+        assert "STORY-019.AC-3" in body.splitlines()[0]
+
+    def test_prepends_typescript_marker_when_jsdoc_references_multiple_stories(
+        self, tmp_path,
+    ):
+        self._seed_story(str(tmp_path), "STORY-002", ["a", "b"])
+        self._seed_story(str(tmp_path), "STORY-003", ["c"])
+        test_file = tmp_path / "client" / "src" / "__tests__" / "FilingList.test.tsx"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text(
+            "/** Unit tests.\n"
+            " *\n"
+            " * # STORY-002: Filing Index\n"
+            " * # STORY-003: Date Range\n"
+            " */\n"
+            "it('does something', () => {});\n"
+        )
+        _, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert patched == 1
+        first_line = test_file.read_text().splitlines()[0]
+        assert first_line.startswith("// @verifies: STORY-002.AC-1")
+        # Both stories' ACs get merged into one marker.
+        assert "STORY-003.AC-1" in first_line
+
+    def test_respects_specific_ac_mentions_over_full_story_expansion(self, tmp_path):
+        self._seed_story(str(tmp_path), "STORY-005", ["a", "b", "c"])
+        test_file = tmp_path / "tests" / "test_scoped.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text(
+            "# This only covers STORY-005.AC-2 specifically\n"
+            "def test_y():\n    pass\n"
+        )
+        _, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert patched == 1
+        first_line = test_file.read_text().splitlines()[0]
+        # Only AC-2 is cited — the specific mention wins over full-story
+        # expansion. AC-1 and AC-3 are NOT attached.
+        assert first_line == "# @verifies: STORY-005.AC-2"
+
+    def test_skips_files_already_carrying_markers(self, tmp_path):
+        self._seed_story(str(tmp_path), "STORY-010", ["a"])
+        test_file = tmp_path / "tests" / "test_ok.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text(
+            "# @verifies: STORY-010.AC-1\n# Also references STORY-010\n"
+            "def test_z():\n    pass\n"
+        )
+        _, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert patched == 0
+        # File content untouched.
+        assert test_file.read_text().splitlines()[0] == "# @verifies: STORY-010.AC-1"
+
+    def test_skips_files_with_no_story_reference(self, tmp_path):
+        self._seed_story(str(tmp_path), "STORY-020", ["a"])
+        test_file = tmp_path / "tests" / "test_unrelated.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("def test_a(): assert 1 == 1\n")
+        _, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert patched == 0
+
+    def test_ignores_story_mentions_below_scan_window(self, tmp_path):
+        """A stray STORY-N mention deep in the file body (e.g. a mocked
+        fixture name that happens to match the pattern) shouldn't drive
+        the inference — the marker convention is "top of file"."""
+        self._seed_story(str(tmp_path), "STORY-030", ["a"])
+        test_file = tmp_path / "tests" / "test_deep.py"
+        test_file.parent.mkdir(parents=True)
+        # 60 blank lines, then a story mention. Scan window is 50 lines.
+        test_file.write_text("\n" * 60 + "# STORY-030 in a comment far below.\n")
+        _, patched = autofix_markers_by_body_reference(str(tmp_path))
+        assert patched == 0
 
 
 # ---------------------------------------------------------------------------

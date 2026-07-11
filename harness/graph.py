@@ -22963,6 +22963,26 @@ async def run_graph(
             "[run_graph] Resume mode: invoking with no input update; "
             "the graph will continue from the last checkpointed node."
         )
+        # Repair-loop gates accumulate across rounds, so the value
+        # checkpointed at session-end is often at-or-near a cap. Without
+        # this reset, the first call to route_after_compiler on a
+        # resumed run trips HITL immediately on stale counters — same
+        # trigger as the prior session, no new work executed. Reset
+        # gate counters here so the operator's explicit resume gets a
+        # fresh budget; total_repairs (the hard-ceiling counter) is
+        # preserved so multi-resume sessions still bound out.
+        #
+        # Order matters: this MUST run BEFORE _rewind_suspended_checkpoint.
+        # ``aupdate_state`` calls with an ``as_node=X`` argument queue
+        # the outgoing edge of ``X`` for the next ainvoke; a subsequent
+        # ``aupdate_state`` WITHOUT ``as_node`` clobbers that pending
+        # edge (finsearch 2026-07-11: the traceability-cap rewind
+        # queued traceability_node, then the reset without as_node
+        # cleared it, and the graph short-circuited to END without
+        # running the audit re-eval). Reset uses no ``as_node``, rewind
+        # uses ``as_node=human_intervention_node``, so rewind must run
+        # LAST for its queued edge to survive into the ainvoke call.
+        await _reset_stale_gate_counters_on_resume(compiled_graph, config)
         # Save & Quit ([s] in hitl_menu_loop) routes through route_after_hitl
         # to __end__, leaving the checkpoint at the terminal pseudo-node with
         # node_state.hitl_suspend=True. A naive ainvoke(None) on that
@@ -22974,15 +22994,6 @@ async def run_graph(
         # edge from HITL re-fires and routes to compiler_node — identical
         # to the user having pressed [r] Resume instead of [s] Save & Quit.
         await _rewind_suspended_checkpoint(compiled_graph, config)
-        # Repair-loop gates accumulate across rounds, so the value
-        # checkpointed at session-end is often at-or-near a cap. Without
-        # this reset, the first call to route_after_compiler on a
-        # resumed run trips HITL immediately on stale counters — same
-        # trigger as the prior session, no new work executed. Reset
-        # gate counters here so the operator's explicit resume gets a
-        # fresh budget; total_repairs (the hard-ceiling counter) is
-        # preserved so multi-resume sessions still bound out.
-        await _reset_stale_gate_counters_on_resume(compiled_graph, config)
     else:
         invoke_input = initial_state
 

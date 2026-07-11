@@ -4128,7 +4128,7 @@ class TestAgentState:
                 "test_generation_zero_emit": 2,
                 "hitl_auto_resumes_taken": 3,
                 "hitl_auto_resumes_per_trigger": {
-                    "env_misconfig:test_generation_max_iterations": 1,
+                    "llm_behavior:test_generation_max_iterations": 1,
                     "zero_patch_loop:2": 2,
                 },
                 "total_repairs": 12,  # preserved — hard ceiling

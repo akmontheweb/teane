@@ -228,10 +228,10 @@ class TestPhase7TraceabilityAndNonToolchainSymbols:
         assert "FR-NNN / NFR-XXX-NNN" not in text
         assert "US-NN-NN" not in text
 
-    def test_env_misconfig_max_iterations_does_not_suggest_pip_install(self):
-        state = _base_state(node_state={"env_misconfig_symbol": "test_generation_max_iterations"})
+    def test_llm_behavior_max_iterations_does_not_suggest_pip_install(self):
+        state = _base_state(node_state={"llm_behavior_symbol": "test_generation_max_iterations"})
         actions = _build_outside_harness_actions(
-            state, "env_misconfig:test_generation_max_iterations",
+            state, "llm_behavior:test_generation_max_iterations",
         )
         text = "\n".join(actions)
         # Must NOT tell the operator to pip install a counter name.
@@ -270,17 +270,19 @@ class TestPhase7TraceabilityAndNonToolchainSymbols:
         assert "Install the missing tool/package" in text
         assert "pytest" in text
 
-    def test_env_misconfig_zero_emit_does_not_suggest_pip_install(self):
-        """Bug A (2026-07-10): the new `test_generation_zero_emit`
-        symbol (from Fix 2a) was falling through the toolchain
-        branch and producing "pip install test_generation_zero_emit"
-        recovery text. Must now route through the non-toolchain
-        branch with actionable guidance."""
+    def test_llm_behavior_zero_emit_does_not_suggest_pip_install(self):
+        """Bug A (2026-07-10, reclassified 2026-07-10 evening): the
+        `test_generation_zero_emit` symbol first went through the
+        toolchain branch and produced "pip install
+        test_generation_zero_emit" — Fix 2a moved it under the
+        _NON_TOOLCHAIN_ENV_SYMBOLS gate, but that was a hack (the code
+        itself apologized for grouping LLM refusal with missing tools).
+        Now routed under a dedicated ``llm_behavior:`` trigger family."""
         state = _base_state(
-            node_state={"env_misconfig_symbol": "test_generation_zero_emit"},
+            node_state={"llm_behavior_symbol": "test_generation_zero_emit"},
         )
         actions = _build_outside_harness_actions(
-            state, "env_misconfig:test_generation_zero_emit",
+            state, "llm_behavior:test_generation_zero_emit",
         )
         text = "\n".join(actions)
         # No nonsensical package-install text

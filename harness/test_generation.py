@@ -907,6 +907,51 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     workspace_path: str = state.get("workspace_path", os.getcwd())
+
+    # NFR-only-batch guardrail (2026-07-10): skip test generation when
+    # EVERY story in this batch's scope is a SAFe enabler / NFR story.
+    # NFRs (rate limits, latency budgets, security posture, retention
+    # policies) aren't naturally unit-testable — the LLM reliably refuses
+    # to emit tests for pure NFR scope, burns its zero-emit re-prompt
+    # sub-cap, and trips a HITL the operator can't productively resolve.
+    # The finsearch session at 2026-07-10 21:11 hit this: STORY-NFR-004
+    # patched cleanly (3 patches, 2 succeeded) but test_generation still
+    # zero-emitted through 3 re-prompts → HITL.
+    #
+    # Mixed batches (NFR alongside a regular story) still run — the
+    # regular story gives the LLM something to anchor tests on and NFR
+    # ACs can ride along as ``@verifies:`` citations. This guardrail is
+    # only for the pure-NFR case.
+    from harness.req_ids import STORY_NFR_ID_RE
+    _batch_story_keys: list[str] = []
+    _cur_story = str(state.get("current_story_id") or "")
+    if _cur_story:
+        _batch_story_keys = [_cur_story]
+    else:
+        _batch_story_keys = [
+            str(k) for k in (state.get("batch_patched_story_keys") or []) if k
+        ]
+    if _batch_story_keys and all(
+        STORY_NFR_ID_RE.fullmatch(k) for k in _batch_story_keys
+    ):
+        logger.info(
+            "[test_generation_node] Batch scope is entirely NFR "
+            "story/stories (%s). Unit-test generation is not a fit for "
+            "non-functional requirements; skipping cleanly to avoid a "
+            "predictable zero-emit HITL.",
+            ", ".join(_batch_story_keys),
+        )
+        return {
+            "node_state": {
+                "current_node": "test_generation",
+                "test_generation": {
+                    "status": "skipped",
+                    "reason": "nfr_only_batch",
+                    "story_keys": _batch_story_keys,
+                },
+            },
+        }
+
     # In batch-mode, scope test generation to files this batch touched
     # rather than the cumulative session set. ``_scope_files_for_consumer``
     # falls back to cumulative ``modified_files`` outside batch-mode and
@@ -1054,12 +1099,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                     f"test_generation_node exceeded max_iterations={max_iterations}. "
                     "The last attempt is reflected in the workspace; manual review needed."
                 ),
-                error_code="ENV_MISCONFIG",
+                error_code="LLM_BEHAVIOR",
             )],
             "node_state": {
                 "current_node": "test_generation",
-                "env_misconfig": True,
-                "env_misconfig_symbol": "test_generation_max_iterations",
+                "llm_behavior": True,
+                "llm_behavior_symbol": "test_generation_max_iterations",
             },
         }
     if zero_emit_shots >= zero_emit_cap:
@@ -1080,12 +1125,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                     "an explicit test hint or raise "
                     "test_generation.max_zero_emit_reprompts."
                 ),
-                error_code="ENV_MISCONFIG",
+                error_code="LLM_BEHAVIOR",
             )],
             "node_state": {
                 "current_node": "test_generation",
-                "env_misconfig": True,
-                "env_misconfig_symbol": "test_generation_zero_emit",
+                "llm_behavior": True,
+                "llm_behavior_symbol": "test_generation_zero_emit",
             },
         }
 
@@ -1314,12 +1359,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                         "hint or raise "
                         "test_generation.max_zero_emit_reprompts."
                     ),
-                    error_code="ENV_MISCONFIG",
+                    error_code="LLM_BEHAVIOR",
                 )],
                 "node_state": {
                     "current_node": "test_generation",
-                    "env_misconfig": True,
-                    "env_misconfig_symbol": "test_generation_zero_emit",
+                    "llm_behavior": True,
+                    "llm_behavior_symbol": "test_generation_zero_emit",
                 },
             }
         messages.append({
@@ -1720,13 +1765,15 @@ def route_after_test_generation(state: dict[str, Any]) -> str:
     """Conditional edge router executed after test_generation_node.
 
     Decision matrix:
+        llm_behavior flag set                  → human_intervention_node
+            (covers the "max iterations" cap and the "zero-emit re-prompt" cap)
         env_misconfig flag set                 → human_intervention_node
-            (covers the "no LLM gateway" gate and the "max iterations" cap)
+            (covers the "no LLM gateway" gate and "no source files")
         compiler_errors populated (TEST_FAILURE) → repair_node
         otherwise                              → lintgate_node
     """
     node_state = state.get("node_state", {}) or {}
-    if node_state.get("env_misconfig"):
+    if node_state.get("llm_behavior") or node_state.get("env_misconfig"):
         return "human_intervention_node"
     if state.get("compiler_errors"):
         return "repair_node"

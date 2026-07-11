@@ -262,6 +262,76 @@ class TestSkipBehaviour:
         # And the router must send it to HITL.
         assert route_after_test_generation(result) == "human_intervention_node"
 
+    @pytest.mark.asyncio
+    async def test_skips_nfr_only_batch_without_dispatching(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """2026-07-10: finsearch session tripped
+        ``env_misconfig:test_generation_zero_emit`` three times because the
+        LLM refused to generate unit tests for pure-NFR batches
+        (STORY-NFR-001, STORY-NFR-004). Verify test_generation now
+        short-circuits cleanly when EVERY story key in the batch is a SAFe
+        enabler / NFR story — no LLM dispatch, no HITL, no counter burn."""
+        gw = stub_gateway("<<<CREATE_FILE:tests/test_x.py>>>\ndef test_x():\n    pass\n<<<END>>>\n")
+        (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["foo.py"],
+            "batch_patched_story_keys": ["STORY-NFR-001", "STORY-NFR-004"],
+        })
+        # No LLM call, no HITL.
+        assert gw.dispatched == []
+        assert "env_misconfig" not in (result.get("node_state") or {})
+        assert "llm_behavior" not in (result.get("node_state") or {})
+        # Result payload records the reason so downstream nodes / audit
+        # can distinguish "skipped by policy" from "generated 0 tests".
+        node_state = result["node_state"]
+        assert node_state["test_generation"]["status"] == "skipped"
+        assert node_state["test_generation"]["reason"] == "nfr_only_batch"
+        assert node_state["test_generation"]["story_keys"] == [
+            "STORY-NFR-001", "STORY-NFR-004",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_current_story_id_is_nfr(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Single-story path (agile per-story mode): current_story_id
+        points at STORY-NFR-*, batch_patched_story_keys not populated
+        yet. Same skip applies."""
+        gw = stub_gateway("...")
+        (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["foo.py"],
+            "current_story_id": "STORY-NFR-007",
+        })
+        assert gw.dispatched == []
+        assert result["node_state"]["test_generation"]["reason"] == "nfr_only_batch"
+        assert result["node_state"]["test_generation"]["story_keys"] == ["STORY-NFR-007"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_nfr_and_regular_batch_still_dispatches(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Guardrail is intentionally narrow: mixed batches (NFR alongside
+        a regular story) MUST still run test-gen — the regular story
+        anchors the tests and the NFR ACs can ride along as ``@verifies:``
+        citations."""
+        gw = stub_gateway("<<<CREATE_FILE:tests/test_foo.py>>>\ndef test_foo():\n    from foo import x\n    assert x() == 1\n<<<END>>>\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "foo.py").write_text("def x(): return 1\n")
+        stub_sandbox(0, "1 passed in 0.01s\n")
+        await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["foo.py"],
+            "batch_patched_story_keys": ["STORY-005", "STORY-NFR-002"],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+        # LLM was actually dispatched — the guardrail did NOT skip.
+        assert len(gw.dispatched) >= 1
+
 
 # ---------------------------------------------------------------------------
 # Happy path: LLM emits a CREATE_FILE block, sandbox passes
@@ -340,7 +410,7 @@ class TestHappyPath:
         # needed" pass-through. The node retries inline with a stronger
         # contract (max_zero_emit_reprompts=3 by default). If the LLM
         # STILL emits nothing, HITL fires with a distinct
-        # env_misconfig symbol so the operator can distinguish this
+        # llm_behavior symbol so the operator can distinguish this
         # failure class from the generic max_iterations one.
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def foo(): pass\n")
@@ -357,11 +427,11 @@ class TestHappyPath:
         # No deterministic run happened — we never got past the
         # zero-emit retry loop.
         assert _StubSandboxExecutor.last_command == ""
-        # Env misconfig HITL fires with the distinct zero_emit symbol
+        # LLM-behavior HITL fires with the distinct zero_emit symbol
         # so a post-mortem can see WHICH failure class ate the budget.
-        assert result["node_state"]["env_misconfig"] is True
+        assert result["node_state"]["llm_behavior"] is True
         assert (
-            result["node_state"]["env_misconfig_symbol"]
+            result["node_state"]["llm_behavior_symbol"]
             == "test_generation_zero_emit"
         )
         assert result["exit_code"] == 1
@@ -371,7 +441,7 @@ class TestHappyPath:
         assert result["loop_counter"]["test_generation_zero_emit"] == 3
         assert "test_generation" not in result["loop_counter"] or \
             result["loop_counter"]["test_generation"] == 0
-        # Router sends this to human_intervention on env_misconfig.
+        # Router sends this to human_intervention on llm_behavior.
         assert route_after_test_generation(result) == "human_intervention_node"
 
 

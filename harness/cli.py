@@ -3059,20 +3059,18 @@ def _build_outside_harness_actions(
     actions: list[str] = []
 
     # Symbols that test_generation_node emits via _synth_diag when the
-    # node itself fails (max iterations, missing API key, no source
-    # files). They are NOT pip/npm packages, so the toolchain branch
-    # below would emit nonsense like "install the missing tool/package
-    # `test_generation_max_iterations`". Branch separately.
+    # node itself fails with an actual environment condition (missing
+    # API key, no source files). They are NOT pip/npm packages, so the
+    # toolchain branch below would emit nonsense like "install the
+    # missing tool/package `llm_api_key`". Branch separately.
+    #
+    # Note: test_generation_max_iterations and test_generation_zero_emit
+    # used to live here too. They're LLM-behavior failures (model won't
+    # emit valid tests), not env-config problems, so they now flow
+    # through the ``llm_behavior:<symbol>`` trigger family below.
     _NON_TOOLCHAIN_ENV_SYMBOLS = {
-        "test_generation_max_iterations",
         "llm_api_key",
         "no_source_files",
-        # Fix 2a (2026-07-10) — new sub-cap symbol emitted by
-        # test_generation_node when the LLM returns zero patch blocks
-        # for N consecutive re-prompts. Falls through the toolchain
-        # branch would produce "pip install test_generation_zero_emit"
-        # (nonsense). Handled explicitly below.
-        "test_generation_zero_emit",
     }
 
     # ---- traceability_block (v5 Phase 7 BUG #6) ---------------------
@@ -3116,6 +3114,63 @@ def _build_outside_harness_actions(
             "requirements before they reach prod."
         )
 
+    # ---- llm_behavior:<symbol> ---------------------------------------
+    # LLM-behavior HITL: the test-generation model refused to emit valid
+    # tests (either burned its real-iteration cap or its zero-emit
+    # re-prompt sub-cap). Distinct from env_misconfig — there's nothing
+    # to `pip install` here; the model's own output is the problem.
+    elif trigger.startswith("llm_behavior"):
+        symbol = ""
+        if ":" in trigger:
+            symbol = trigger.split(":", 1)[1].strip()
+        symbol = symbol or str(node_state.get("llm_behavior_symbol", ""))
+        if symbol == "test_generation_max_iterations":
+            actions.append(
+                "The test-generation node hit its max_iterations cap "
+                "(default 2) trying to land valid tests. Inspect the "
+                "last attempt under `tests/` — the LLM may have made "
+                "the same mistake twice. Fix it by hand or raise "
+                "`test_generation.max_iterations` in `config/config.json`."
+            )
+            actions.append(
+                "Common cause: the @verifies marker contract is "
+                "demanding AC keys the LLM doesn't see in its prompt "
+                "context. Check `docs/STORIES.md` for the active "
+                "story's AC keys and confirm they appear in the "
+                "test files under review."
+            )
+        elif symbol == "test_generation_zero_emit":
+            actions.append(
+                "The test-generation LLM returned zero patch blocks "
+                "for `test_generation.max_zero_emit_reprompts` "
+                "consecutive re-prompts (default 3). This usually "
+                "means the LLM can't tell what to test — check the "
+                "prior patching_node output above: if the production "
+                "code for this batch failed to apply (look for "
+                "`patches=N succeed=0`), the LLM correctly has "
+                "nothing to test. Fix the upstream patcher rejection "
+                "first, then `[r]` Resume."
+            )
+            actions.append(
+                "If the prod code DID land but the LLM is still "
+                "silent, `[e]` inject a test hint like `write a "
+                "test for <function_name> asserting <expected>` — "
+                "the next re-prompt will see it."
+            )
+            actions.append(
+                "Or raise the sub-cap for this session by setting "
+                "`test_generation.max_zero_emit_reprompts` in "
+                "`config/config.json` (default 3). Higher values "
+                "trade budget for retries."
+            )
+        else:
+            actions.append(
+                "The LLM refused to emit a valid response and the "
+                "harness exhausted its retry budget. Inject a manual "
+                "hint via `[e]` describing what the model should "
+                "produce, or `[m]` pause for manual edits."
+            )
+
     # ---- env_misconfig:<symbol> --------------------------------------
     # Highest-precision trigger — we know exactly what's missing.
     elif trigger.startswith("env_misconfig"):
@@ -3124,22 +3179,7 @@ def _build_outside_harness_actions(
             symbol = trigger.split(":", 1)[1].strip()
         symbol = symbol or str(node_state.get("env_misconfig_symbol", ""))
         if symbol in _NON_TOOLCHAIN_ENV_SYMBOLS:
-            if symbol == "test_generation_max_iterations":
-                actions.append(
-                    "The test-generation node hit its max_iterations cap "
-                    "(default 2) trying to land valid tests. Inspect the "
-                    "last attempt under `tests/` — the LLM may have made "
-                    "the same mistake twice. Fix it by hand or raise "
-                    "`test_generation.max_iterations` in `config/config.json`."
-                )
-                actions.append(
-                    "Common cause: the @verifies marker contract is "
-                    "demanding AC keys the LLM doesn't see in its prompt "
-                    "context. Check `docs/STORIES.md` for the active "
-                    "story's AC keys and confirm they appear in the "
-                    "test files under review."
-                )
-            elif symbol == "llm_api_key":
+            if symbol == "llm_api_key":
                 actions.append(
                     "No LLM gateway available — the test-generation node "
                     "could not dispatch an LLM call. Set the appropriate "
@@ -3156,30 +3196,6 @@ def _build_outside_harness_actions(
                     "the configured `_SOURCE_EXTENSIONS`. If the patcher "
                     "ran but wrote into an unexpected location, inspect "
                     "the recent diff with `git status` / `git diff`."
-                )
-            elif symbol == "test_generation_zero_emit":
-                actions.append(
-                    "The test-generation LLM returned zero patch blocks "
-                    "for `test_generation.max_zero_emit_reprompts` "
-                    "consecutive re-prompts (default 3). This usually "
-                    "means the LLM can't tell what to test — check the "
-                    "prior patching_node output above: if the production "
-                    "code for this batch failed to apply (look for "
-                    "`patches=N succeed=0`), the LLM correctly has "
-                    "nothing to test. Fix the upstream patcher rejection "
-                    "first, then `[r]` Resume."
-                )
-                actions.append(
-                    "If the prod code DID land but the LLM is still "
-                    "silent, `[e]` inject a test hint like `write a "
-                    "test for <function_name> asserting <expected>` — "
-                    "the next re-prompt will see it."
-                )
-                actions.append(
-                    "Or raise the sub-cap for this session by setting "
-                    "`test_generation.max_zero_emit_reprompts` in "
-                    "`config/config.json` (default 3). Higher values "
-                    "trade budget for retries."
                 )
         elif symbol:
             actions.append(
@@ -3781,6 +3797,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     for _k in (
                         "env_misconfig",
                         "env_misconfig_symbol",
+                        "llm_behavior",
+                        "llm_behavior_symbol",
                         "build_command_blocked",
                         "build_command_blocked_rule",
                         "llm_silent",
@@ -7021,8 +7039,14 @@ def _resolve_cli_exit_code(
         return EXIT_BUDGET_EXHAUSTED
     # Infrastructure signals — the harness can't proceed until
     # someone outside fixes an environmental condition.
+    # ``llm_behavior`` is grouped here too: an LLM-behavior HITL that
+    # was never resolved (e.g. session ended with the model still
+    # refusing to emit tests) is not "clean" and shares the same
+    # exit-code semantics as an env condition — "someone (or something)
+    # outside the harness needs to intervene before another run works."
     infra_flags = (
         "env_misconfig",
+        "llm_behavior",
         "build_command_blocked",
         "build_command_cd_missing",
         "llm_silent",
@@ -7304,9 +7328,32 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         teane resume --session-id my-session-abc123
         teane resume --session-id my-session -r /path/to/repo
     """
-    from harness.storage import HarnessAsyncSqliteSaver
+    from harness.storage import HarnessAsyncSqliteSaver, inspect_session
 
-    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    # Workspace auto-detect: --help promises "auto-detected from checkpoint if
+    # omitted". Read the checkpoint's recorded workspace_path before falling
+    # back to CWD, so the promise holds. Uses the default db_path — a
+    # workspace-scoped persistence.db_path override still requires -w since
+    # we can't discover config without the workspace.
+    if args.workspace:
+        workspace_path = os.path.abspath(args.workspace)
+    else:
+        default_db_path = "~/.harness/checkpoints.db"
+        detected: Optional[str] = None
+        try:
+            summary = await inspect_session(default_db_path, args.session_id)
+            if summary and summary.workspace_path:
+                detected = summary.workspace_path
+        except Exception as exc:  # noqa: BLE001 — best-effort auto-detect
+            logger.debug("[resume] Workspace auto-detect failed: %s", exc)
+        if detected:
+            workspace_path = os.path.abspath(detected)
+            logger.info(
+                "[resume] Workspace auto-detected from checkpoint: %s",
+                workspace_path,
+            )
+        else:
+            workspace_path = os.getcwd()
     if _refuse_if_workspace_is_harness_root(workspace_path):
         return 1
 

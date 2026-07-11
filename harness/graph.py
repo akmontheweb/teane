@@ -15477,6 +15477,9 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
         return "decomposition_validation_failed"
     if node_state.get("decomposition_missing"):
         return "decomposition_missing"
+    if node_state.get("llm_behavior"):
+        sym = node_state.get("llm_behavior_symbol", "")
+        return f"llm_behavior:{sym}" if sym else "llm_behavior"
     if node_state.get("env_misconfig"):
         sym = node_state.get("env_misconfig_symbol", "")
         return f"env_misconfig:{sym}" if sym else "env_misconfig"

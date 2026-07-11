@@ -79,6 +79,13 @@ _TRIGGER_ADVICE: dict[str, str] = {
         "a required tool or dependency was missing from the environment. "
         "Declare it in the dependency manifest in the first patch round"
     ),
+    "llm_behavior": (
+        "the test-generation LLM refused to emit valid patch blocks (either "
+        "exhausted its real-iteration cap or its zero-emit re-prompt sub-cap). "
+        "Ensure the story ships enough source context that the model has "
+        "something concrete to test, or narrow the batch so the eligible "
+        "source set is unambiguous"
+    ),
     "build_command_cd_missing": (
         "the build command referenced a directory that does not exist. "
         "Align the build command with the actual workspace layout"
@@ -137,7 +144,9 @@ def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
     prefix = _trigger_prefix(trigger)
     advice = _TRIGGER_ADVICE.get(prefix, _GENERIC_ADVICE)
     detail = ""
-    if ":" in (trigger or "") and prefix in ("env_misconfig", "build_command_cd_missing"):
+    if ":" in (trigger or "") and prefix in (
+        "env_misconfig", "llm_behavior", "build_command_cd_missing",
+    ):
         detail = f" ({trigger.split(':', 1)[1]})"
     errs = _top_errors(state)
     err_part = ""

@@ -426,6 +426,39 @@ _MALFORMED_REQUIREMENT_ID_RE = re.compile(
 )
 
 
+# Structural heading pattern used by the requirements_doc skill: the four
+# SAFe labels (Epic / Feature / Story / Enabler Story) followed by an
+# identifier token. Captures the token so we can whitelist its prefix
+# against the canonical seven families the harness recognises. See the
+# 2026-07-10 finsearch incident: the planning model rendered an enabler
+# story as ``### Enabler Story: EN-001 — Fiscal Year Window Calculation``
+# — a bespoke ``EN-`` prefix that neither the requirements ingest
+# (``req_ids._HEADING_RE``) nor the reconciler (``spec_reconciler._STORY_RE``)
+# knew how to parse, but which the planner echoed back verbatim as a
+# ``story_key`` and blew up the decomposition validator at HITL.
+_STRUCTURAL_HEADING_RE = re.compile(
+    r"^\s*#{2,6}\s+"
+    r"(?:Epic|Feature|Story|Enabler\s+Story)\s*:\s+"
+    r"(?P<id>[A-Za-z][A-Za-z0-9\-]*[A-Za-z0-9])",
+    re.MULTILINE,
+)
+
+# Canonical requirement-ID families the harness understands end-to-end
+# (see ``harness/req_ids.py`` module docstring). Anything else must be
+# rejected at the trust boundary so the bad spec never lands on disk.
+_KNOWN_STRUCTURAL_ID_RE = re.compile(
+    r"^(?:"
+    r"EPIC-\d{1,4}"
+    r"|FEAT-\d{1,4}"
+    r"|STORY-NFR-\d{1,4}"
+    r"|STORY-\d{1,4}"
+    r"|FR-\d{1,4}"
+    r"|NFR-[A-Z]+-\d{1,4}"
+    r"|US-\d{1,3}-\d{1,3}"
+    r")$"
+)
+
+
 def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
     """
     Validate a synthesised SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md string.
@@ -438,6 +471,10 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
       - No requirement IDs with letter suffixes or decimal extensions
       - Non-ASCII ratio under 5% (catches planning-model language drift —
         an English input yielding a Japanese/Chinese/etc. spec)
+      - Every Epic/Feature/Story/Enabler-Story heading uses an ID from
+        one of the seven canonical families (catches novel prefixes like
+        ``EN-`` that the reconciler and requirements ingest can't parse
+        but the planner still echoes back as ``story_key``)
 
     Returns:
         (validated_content, errors)
@@ -484,6 +521,31 @@ def validate_synthesized_spec(content: str) -> tuple[str, list[str]]:
             "spec contains requirement IDs with letter suffixes or decimal "
             "extensions — every ID must be <PREFIX>-<zero-padded integer> "
             f"with no extension: {sample}{overflow}"
+        )
+
+    # Novel-prefix guard for structural headings. Every Epic/Feature/
+    # Story/Enabler-Story heading in the spec must use an ID from the
+    # seven canonical families the harness parses end-to-end. See the
+    # 2026-07-10 finsearch incident (``EN-001`` for an enabler story
+    # instead of the mandated ``STORY-NFR-001``): the ingest and
+    # reconciler silently skipped it, but the planner echoed it back as
+    # a story_key and blew up the decomposition validator at HITL.
+    normalised = normalize_dashes(content)
+    bad_prefix_ids = [
+        m.group("id")
+        for m in _STRUCTURAL_HEADING_RE.finditer(normalised)
+        if not _KNOWN_STRUCTURAL_ID_RE.match(m.group("id"))
+    ]
+    if bad_prefix_ids:
+        unique = sorted(set(bad_prefix_ids))
+        sample = ", ".join(unique[:5])
+        overflow = f" (+ {len(unique) - 5} more)" if len(unique) > 5 else ""
+        errors.append(
+            "spec contains Epic/Feature/Story headings with unrecognised "
+            "ID prefixes — every ID must belong to one of the seven "
+            "canonical families (EPIC, FEAT, STORY, STORY-NFR, FR, "
+            "NFR-<CAT>, US). Enabler stories use STORY-NFR-NNN, not "
+            f"bespoke prefixes: {sample}{overflow}"
         )
 
     # Language-drift guard. Fires when the planning model renders the

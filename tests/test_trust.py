@@ -442,6 +442,43 @@ class TestValidateSynthesizedSpec:
         _, errors = validate_synthesized_spec(content)
         assert errors == []
 
+    def test_novel_prefix_enabler_story_rejected(self):
+        # 2026-07-10 finsearch incident: skill prompt mandates
+        # STORY-NFR-NNN for enabler stories, but the planning model
+        # invented an "EN-" prefix. The bespoke ID silently drops out
+        # of the requirements ingest AND the reconciler, but the
+        # planner echoes it back as a story_key at decomposition time
+        # and HITLs the run. Catch it before the spec hits disk.
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# Spec\n\n"
+            "## Epic: EPIC-001 — Discovery\n\n"
+            "### Feature: FEAT-001 — Search\n\n"
+            "#### Story: STORY-001 — Ticker lookup\n\n"
+            "### Enabler Story: EN-001 — Fiscal Year Window\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert any(
+            "unrecognised" in e and "EN-001" in e for e in errors
+        ), f"expected EN-001 rejection, got: {errors}"
+
+    def test_canonical_prefixes_all_accepted(self):
+        # Belt-and-suspenders: STORY-NFR (h3 AND h4), STORY, FEAT, EPIC,
+        # FR, NFR-<cat>, and US should all pass. Guards against a
+        # tightening of the whitelist accidentally rejecting a spec
+        # emitted verbatim from the requirements_doc skill.
+        from harness.trust import validate_synthesized_spec
+        content = (
+            "# Spec\n\n"
+            "## Epic: EPIC-001 — Discovery\n\n"
+            "### Feature: FEAT-001 — Search\n\n"
+            "#### Story: STORY-001 — Lookup\n\n"
+            "#### Enabler Story: STORY-NFR-001 — Perf budget\n\n"
+            "### Enabler Story: STORY-NFR-002 — Availability budget\n"
+        )
+        _, errors = validate_synthesized_spec(content)
+        assert errors == [], f"expected no errors, got: {errors}"
+
     def test_japanese_spec_rejected_as_language_drift(self):
         # 2026-07-10 finsearch incident: English input, Japanese output.
         # The trust boundary must catch full-document translation before

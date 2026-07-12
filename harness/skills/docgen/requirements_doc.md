@@ -162,6 +162,23 @@ Scenario: <Negative or edge-case title>
 - [ ] All external dependencies identified
 - [ ] Estimate agreed
 - [ ] No unresolved blocking questions
+
+**Implementation Note:** *(REQUIRED whenever the Story involves data
+operations, API routes, algorithmic steps, integrations, or persistence.
+OMIT for pure-UI or reporting-only Stories.)*
+
+- **Contract:** <function or endpoint signature — e.g. `dedup_filings(filings: List[Filing]) -> List[Filing]` or `POST /filings/index → 200 { filings: [...] }`>
+- **Input:** <field-level types + constraints; cite a concrete example if the product notes provide one>
+- **Output:** <return shape or response schema; specify what "success" looks like on the wire>
+- **Error paths:** <at least one — e.g. "period_end_date is NULL → log and skip", "Redis unavailable → raise EdgarClientException; fall back to local limit">
+- **Module placement:** <path hint from the standard layering (see below); if the product notes don't specify, default it and mark ASM-NNN>
+
+Standard layering (default when product notes are silent): API router
+→ service → repository/parser → model. For this stack the code
+generator expects:
+`server/app/api/<domain>.py` (routes) → `server/app/services/<domain>_service.py`
+(business logic) → `server/app/repositories/<domain>_repository.py`
+(persistence) → `server/app/models/<domain>.py` (schema).
 ````
 
 ### Definition of Done — appended once per Feature
@@ -331,6 +348,39 @@ Every requirement (Story AC or FR) must be unambiguous when read in isolation
 by Phase 3 (architecture) and Phase 4 (code generation). If interpreting a
 requirement needs context from prose elsewhere in the document, inline that
 context in the requirement itself.
+
+### Gate 8 — Code-generation readiness
+Every Story or FR that describes a data operation, API route, algorithmic
+step, external integration, or persistence action MUST carry an
+**Implementation Note** (see the Story template above for the field
+layout). Pure-UI and reporting-only stories may omit it. The note must
+supply, at minimum:
+
+- A concrete function or endpoint signature (types on inputs and outputs).
+- One field-level example — either a real one from the product notes or
+  a synthetic one you clearly label.
+- At least one error / edge path with the expected behaviour ("returns
+  empty list", "raises FooError", "logs and skips", "returns HTTP 429
+  with retry-after header", …).
+- A module-path hint (see the standard-layering block in the Story
+  template). If the product notes don't specify a layout, default to
+  the standard layering and stamp an `ASM-NNN` note so downstream can
+  see it was assumed rather than lifted from the notes.
+
+Rationale: the code-generation LLM at Phase 4 receives the AC / FR text
+verbatim as its task description. Gherkin-only ACs like "Then a table
+is displayed with columns X, Y, Z" carry no function shape, so the
+generator either produces prose or emits code that doesn't align with
+the rest of the codebase. Field observation on a finsearch build:
+STORY-002 (amendment handling), STORY-004 (EDGAR rate limiting), and
+STORY-006 (XBRL dedup) all failed to convert to code precisely because
+their ACs were high-level outcomes without contracts.
+
+Do NOT invent implementation details the product notes don't imply
+(specific libraries, class names, private-method breakdowns). Stick to
+public contracts: signatures, types, error paths, module placement.
+Everything you can't derive from the notes goes under an `ASM-NNN`
+assumption row in §Assumptions and dependencies.
 
 ---
 

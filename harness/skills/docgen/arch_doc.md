@@ -672,18 +672,22 @@ Language-neutral entity definitions. The patching node translates each entry int
 ## Data model
 
 ### User
-| Field         | Type     | Constraints                    | Notes                   |
-|---------------|----------|--------------------------------|-------------------------|
-| id            | UUID     | PK, generated                  |                         |
-| email         | string   | unique, not null, max 254      | RFC 5321 format         |
-| password_hash | string   | not null                       | bcrypt, never returned  |
-| created_at    | datetime | not null, server default now() |                         |
-| updated_at    | datetime | not null, on update now()      |                         |
+_Source: STORY-1 (login), FEAT-1 (identity)_
+
+| Field         | Type     | Constraints                    | Source RSD  | Notes                   |
+|---------------|----------|--------------------------------|-------------|-------------------------|
+| id            | UUID     | PK, generated                  | STORY-1     |                         |
+| email         | string   | unique, not null, max 254      | STORY-1     | RFC 5321 format         |
+| password_hash | string   | not null                       | STORY-1     | bcrypt, never returned  |
+| created_at    | datetime | not null, server default now() | FEAT-1      |                         |
+| updated_at    | datetime | not null, on update now()      | FEAT-1      |                         |
 
 ### [Additional entities derived from RSD]
 ```
 
-Every entity row notes the RSD ID (STORY / FEAT / FR) that drove its inclusion.
+- Every entity carries a `_Source: ..._` italic line naming the RSD IDs that drove its inclusion.
+- Every field row includes a **Source RSD** column citing the specific STORY / FEAT / FR that requires it. When a field originates from a Story's Implementation Note (see requirements_doc §Gate 8), cite the Story ID directly. Fields introduced by a Feature-level AC use the FEAT ID; ISO-29148 fields use FR IDs.
+- For fields that surface in a Story's Implementation Note as an input or output shape (e.g. STORY-2's `dedup_filings(filings: List[Filing])`), also add a "used in `dedup_filings()`" annotation to the Notes column so the code generator can trace the field forward to the function that consumes it.
 
 ---
 
@@ -824,8 +828,14 @@ These gates run inside the LLM as it drafts the document. A failed gate writes t
 | G8   | `ARCH_LAYOUT_DRIFT`           | Brownfield only: §3 layout matches the reconciled baseline or carries an ADR explaining deviation  |
 | G9   | `STACK_SKILL_NOT_REFERENCED`  | The selected `harness/skills/<backend>.md` (and `react.md` when applicable) is named in §3 / §5    |
 | G10  | `NO_PREMATURE_CODE`           | No source files beyond the mandatory structural shapes in §3A/3B/3C and the extraction commands    |
+| G11  | `FIELD_SOURCE_MISSING`        | Every §7 entity has a `_Source: STORY-N · FEAT-N ..._` line AND every field row cites its RSD ID   |
+| G12  | `IMPL_NOTE_CONTRACT_DRIFT`    | Every function or endpoint signature named in a §requirements_doc Implementation Note appears in §6 (endpoint) or is referenced in a §7 Notes column with the exact identifier |
 
 Gate G10 exception: the extraction commands in §3A/3B/3C are shell, not application source, and are permitted.
+
+Gate G11 rationale: without per-field source-story annotation, `patching_node` sees "email: string, RFC 5321 format" but cannot tell which Story or FR requires this column, so a later Story that touches the same entity re-derives the field with a different shape and the two conflict. Field-level `Source RSD` lets the patcher trace every column back to its origin requirement and reject inconsistent introductions.
+
+Gate G12 rationale: Story Implementation Notes and §6 endpoint rows are the two loci the code generator anchors on. If a Story's Implementation Note calls `dedup_filings(filings: List[Filing]) -> List[Filing]` but §6 has no matching endpoint row and §7 doesn't reference the function name in Notes, the patcher gets two different contracts for the same behaviour and picks one at random. Every Implementation Note contract must appear once, in exactly one of §6 (for HTTP-shaped contracts) or §7 Notes (for internal-function contracts).
 
 ---
 

@@ -446,6 +446,83 @@ def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
     assert s["status"] == "in_progress"
 
 
+def test_story_loop_retries_story_on_zero_patch_when_below_cap(workspace: str):
+    """A1 fix (2026-07-11): a patching turn that produced 0 real patches
+    must give the same story another shot with the patcher's rejection
+    feedback in the message trail, up to the ``story_zero_patch_cap``.
+    Before A1, ``patched_keys.append(cur_story_id)`` fired
+    unconditionally, so a 0-patch story was burned from the batch queue
+    on first attempt and the retry budget was dead code. Finsearch
+    STORY-002/003/004 all advanced with 0 patches and never got a
+    retry."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    # First entry — picks STORY-001.
+    out1 = story_loop.story_loop_node(
+        _state(workspace, current_batch_id=batch_id)
+    )
+    assert out1["current_story_id"] == "STORY-001"
+
+    # patching_node ran on STORY-001 with 0 real patches. The just-
+    # finished turn stamps ``node_state.patch_success=0`` on state and
+    # increments ``loop_counter.story_zero_patch_rounds[STORY-001]``.
+    # story_loop must NOT append STORY-001 to patched_keys and must
+    # re-pick it so the LLM gets another shot.
+    out2 = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-001",
+        batch_patched_story_keys=[],
+        node_state={"patch_success": 0, "current_node": "patching"},
+        loop_counter={"story_zero_patch_rounds": {"STORY-001": 1}},
+    ))
+    assert out2["current_story_id"] == "STORY-001"
+    assert out2["batch_patched_story_keys"] == []
+
+
+def test_story_loop_advances_after_zero_patch_cap_hit(workspace: str):
+    """A1: once ``story_zero_patch_rounds[cur_story_id] >= cap``, the
+    story auto-completes and story_loop MUST advance to the next
+    eligible story — the retry loop bounded by the cap prevents an
+    infinite loop for a truly vacuous story."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    # STORY-001 has burned its cap (default 3). Advance.
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-001",
+        batch_patched_story_keys=[],
+        node_state={"patch_success": 0, "current_node": "patching"},
+        loop_counter={"story_zero_patch_rounds": {"STORY-001": 3}},
+    ))
+    assert out["current_story_id"] == "STORY-002"
+    assert "STORY-001" in out["batch_patched_story_keys"]
+
+
+def test_story_loop_advances_when_patch_success_positive(workspace: str):
+    """A1: when patching produced ≥1 real patch, cur_story_id must be
+    marked patched-this-pass and the cursor advances — the retry loop
+    only fires for the 0-success case."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-001",
+        batch_patched_story_keys=[],
+        node_state={"patch_success": 5, "current_node": "patching"},
+    ))
+    assert out["current_story_id"] == "STORY-002"
+    assert out["batch_patched_story_keys"] == ["STORY-001"]
+
+
 def test_story_loop_advances_cursor_after_patching_turn(workspace: str):
     """Regression for the 2026-06-26 session-burning bug. Before the fix,
     ``story_loop_node ⇄ patching_node`` could loop on the same story

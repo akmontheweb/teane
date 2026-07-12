@@ -407,8 +407,23 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
     # bookkeeping (resume should re-patch in_progress stories), and
     # (b) it composes with the existing batch_commit_node reset.
     patched_keys = list(state.get("batch_patched_story_keys") or [])
-    if cur_story_id and cur_story_id not in patched_keys:
-        patched_keys.append(cur_story_id)
+
+    # A1 fix (2026-07-11): read the just-finished patching turn's
+    # ``patch_success`` count so the "should we advance off cur_story_id
+    # or give it a retry?" decision below can be made. The pre-A1 code
+    # unconditionally appended cur_story_id to ``patched_keys`` here,
+    # which meant a story that produced 0 real patches was burned from
+    # the batch queue and _next_story_in_batch never re-picked it — so
+    # the story_zero_patch_cap retry budget was dead code and the
+    # patcher's rejection feedback (echoed in the message trail) went
+    # unused. Finsearch STORY-002/003/004 all advanced with 0 patches
+    # and never got a second shot; STORY-006/008/012 the same. See
+    # patching_node's return payload (graph.py:4622) for the
+    # node_state.patch_success contract.
+    _ns_in = state.get("node_state", {}) or {}
+    _patch_success = int(_ns_in.get("patch_success", 0) or 0)
+    _had_patching_turn = "patch_success" in _ns_in
+
     auto_completed_key: Optional[str] = None
     auto_completed_rounds = 0
     if cur_story_id:
@@ -426,6 +441,28 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             auto_completed_rounds = cur_rounds
             sz.pop(cur_story_id, None)
             loop_counter["story_zero_patch_rounds"] = sz
+
+    # A1 append gate: only mark cur_story_id as "patched this pass" when
+    # we're actually advancing off of it — patching produced real code,
+    # the retry cap just fired, or story_loop was entered without a
+    # patching turn (defensive: matches the pre-A1 behaviour for
+    # resume/re-entry paths where node_state.patch_success is absent).
+    _should_advance = (
+        _patch_success > 0
+        or not _had_patching_turn
+        or auto_completed_key is not None
+    )
+    if cur_story_id and cur_story_id not in patched_keys and _should_advance:
+        patched_keys.append(cur_story_id)
+    elif cur_story_id and not _should_advance:
+        logger.info(
+            "[story_loop] %s produced 0 patches this round "
+            "(zero_patch_rounds=%d/%d); re-picking so the LLM gets "
+            "another shot with the patcher's rejection feedback.",
+            cur_story_id,
+            int(loop_counter.get("story_zero_patch_rounds", {}).get(cur_story_id, 0) or 0),
+            int(state.get("story_zero_patch_cap") or STORY_ZERO_PATCH_CAP),
+        )
 
     conn = story_state.open_story_db()
     try:

@@ -4059,6 +4059,12 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
                 )
         # Inject a format reminder to ensure the LLM outputs patch blocks
         _FORMAT_REMINDER = allowlist_preamble + existing_files_preamble + cr_preamble + story_preamble + arch_preamble + preflight_section + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
+You are in CODE-GENERATION mode. Your response MUST begin with `<<<` — a patch-block
+start marker — with NO preamble whatsoever. No thinking-out-loud paragraph, no "Let me
+analyze…", no markdown ```code fence```, no blank lines before the first `<<<`. Any
+character other than `<<<` at the start will cause the patcher to reject the entire
+response as prose and the story will retry with this same warning.
+
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.

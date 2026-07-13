@@ -19,6 +19,67 @@ import pytest
 # PATCHER TESTS
 # ===========================================================================
 
+class TestSearchBlockCopyRules:
+    """The tightened intro shown alongside every line-numbered file
+    view. Owned by patcher.py (single source of truth); re-exported
+    from graph.py as ``_SEARCH_BLOCK_COPY_RULES`` and inlined by
+    every prompt formatter and patcher rejection message.
+
+    Regression fence: if a future edit weakens the copy contract
+    (removes the whitespace rule, drops the worked example, breaks
+    the identity re-export), the test suite will catch it before it
+    reaches an LLM prompt.
+    """
+
+    def test_names_the_line_number_prefix_verbatim(self):
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        # The literal ``  N| `` marker has to appear so the LLM knows
+        # which prefix to strip. Two leading spaces + N + pipe + space
+        # is the exact patcher-side format.
+        assert "`  N| `" in SEARCH_BLOCK_COPY_RULES
+
+    def test_forbids_stripping_leading_whitespace(self):
+        # Explicit "leading spaces / tabs are part of the file" rule
+        # — the finsearch failure mode was the LLM stripping the
+        # prefix AND the file's real leading whitespace.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        assert "leading spaces" in SEARCH_BLOCK_COPY_RULES
+        assert "leading tabs" in SEARCH_BLOCK_COPY_RULES
+
+    def test_forbids_mid_line_search_starts(self):
+        # Guards against the "start a SEARCH mid-word" drift.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        assert "mid-line" in SEARCH_BLOCK_COPY_RULES
+        assert "mid-word" in SEARCH_BLOCK_COPY_RULES
+
+    def test_carries_worked_example(self):
+        # The prose rules land better with a concrete anchor. The
+        # example is the actual line the finsearch build stumbled on.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        assert "Worked example" in SEARCH_BLOCK_COPY_RULES
+        assert "User-Agent header and are" in SEARCH_BLOCK_COPY_RULES
+        # And it explicitly shows the WRONG search first (mid-line
+        # fragment) with a ``FAIL`` label so the LLM can pattern-match
+        # its own bad drafts against it.
+        assert "FAIL" in SEARCH_BLOCK_COPY_RULES
+
+    def test_hints_at_rewrite_file_escape_hatch(self):
+        # When the intended edit is large, REPLACE_BLOCK is the wrong
+        # tool. The rules point the LLM at REWRITE_FILE so it isn't
+        # boxed in.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        assert "REWRITE_FILE" in SEARCH_BLOCK_COPY_RULES
+
+    def test_graph_re_export_is_identical(self):
+        # graph.py can't import from itself and patcher.py can't
+        # import from graph.py (circular); the re-export is the
+        # bridge. Same object identity guarantees prompt formatters
+        # on either side stay in lockstep.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        from harness.graph import _SEARCH_BLOCK_COPY_RULES
+        assert _SEARCH_BLOCK_COPY_RULES is SEARCH_BLOCK_COPY_RULES
+
+
 class TestPatchBlockParser:
 
     def test_parse_replace_block(self):
@@ -516,6 +577,84 @@ class TestTextPatcher:
             # Original content untouched on disk
             with open(os.path.join(tmpdir, "idem.py")) as f:
                 assert "print('a')" in f.read()
+
+    @pytest.mark.asyncio
+    async def test_create_file_promotes_to_rewrite_when_highly_similar(self):
+        # Class fix from finsearch session 156032347: the LLM re-emits
+        # CREATE_FILE for a same-file test across repair rounds with slight
+        # content tweaks (typical similarity 0.9+). Historically each
+        # re-emit was hard-rejected, forcing the LLM to switch to
+        # REPLACE_BLOCK — which itself failed on search-anchor drift and
+        # eventually tripped the repair_loop_limit HITL. The promotion
+        # path lets the second CREATE_FILE succeed as a REWRITE_FILE when
+        # the LLM's intent is clearly the same conceptual file with
+        # modifications. Post-patch parse validation (exercised in a
+        # separate test) still rolls back broken promotions.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = TextPatcher(tmpdir)
+            # Realistic same-file-tweak: LLM's first CREATE_FILE landed a
+            # test module; the second round re-emits it with the same
+            # imports/structure but a different assertion value.
+            first = (
+                "import pytest\n"
+                "from myapp import compute\n"
+                "\n"
+                "def test_compute_returns_one():\n"
+                "    assert compute() == 1\n"
+            )
+            second = (
+                "import pytest\n"
+                "from myapp import compute\n"
+                "\n"
+                "def test_compute_returns_two():\n"
+                "    assert compute() == 2\n"
+            )
+            r1 = await patcher.create_file("test_compute.py", first)
+            assert r1.success
+            r2 = await patcher.create_file("test_compute.py", second)
+            assert r2.success, (
+                f"expected auto-promotion, got error: {r2.error!r}"
+            )
+            # Operation identity preserved for upstream accounting.
+            from harness.patcher import OperationType
+            assert r2.operation == OperationType.CREATE_FILE
+            # Message must announce the promotion so log traces / metrics
+            # can attribute the write correctly.
+            assert "promoted" in (r2.message or "").lower()
+            # Disk actually holds the SECOND content (that's the point).
+            with open(os.path.join(tmpdir, "test_compute.py")) as f:
+                on_disk = f.read()
+            assert "returns_two" in on_disk
+            assert "compute() == 2" in on_disk
+
+    @pytest.mark.asyncio
+    async def test_create_file_still_rejects_when_dissimilar_content(self):
+        # Safety-side regression for the promotion path. The 0.85
+        # threshold must reject dissimilar content — the LLM emitting
+        # a wholly different implementation at the same path is still
+        # a signal something's wrong (wrong path, hallucinated file),
+        # and blind overwrite would silently clobber real state.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = TextPatcher(tmpdir)
+            existing = (
+                "# EDGAR API client\n"
+                "import httpx\n"
+                "class EdgarClient:\n"
+                "    BASE_URL = \"https://www.sec.gov\"\n"
+            )
+            await patcher.create_file("edgar.py", existing.rstrip("\n"))
+            unrelated = (
+                "# Completely different: rate limiter utilities\n"
+                "class RateLimiter: ...\n"
+            )
+            r = await patcher.create_file("edgar.py", unrelated)
+            assert not r.success
+            assert "different content" in (r.error or "").lower()
+            # Original untouched.
+            with open(os.path.join(tmpdir, "edgar.py")) as f:
+                assert "EdgarClient" in f.read()
 
     @pytest.mark.asyncio
     async def test_replace_block_idempotent_when_already_replaced(self):
@@ -3985,6 +4124,17 @@ class TestAgentState:
             state["node_state"] = {"hitl_trigger": "traceability_block"}
             assert route_after_hitl(state) == "traceability_node"
 
+    def test_hitl_next_node_mapping_matches_router(self):
+        # The CLI's headless-resume log line calls hitl_next_node so its
+        # "Routing to ..." message matches where route_after_hitl actually
+        # sends the graph. This test locks the two into the same table.
+        from harness.graph import hitl_next_node
+        assert hitl_next_node("decomposition_validation_failed") == "decomposition_node"
+        assert hitl_next_node("decomposition_missing") == "decomposition_node"
+        assert hitl_next_node("traceability_block") == "traceability_node"
+        assert hitl_next_node("zero_patch_loop:2") == "compiler_node"
+        assert hitl_next_node("") == "compiler_node"
+
     def test_route_after_hitl_suspend_overrides_trigger(self):
         # Suspend / abandon must beat the trigger-based reroute — the
         # developer asked to exit, not to retry the upstream phase.
@@ -5056,8 +5206,13 @@ class TestClaudeCodeStyleEditPipeline:
         )
         assert "## Current Content of Files You Need to Edit" in rendered
         assert "### `foo.py`" in rendered and "### `bar.py`" in rendered
-        # Default intro warns about the `  N| ` prefix.
-        assert "WITHOUT the `  N| ` line-number prefix" in rendered
+        # Default intro teaches the tightened SEARCH copy contract —
+        # naming the `  N| ` prefix, forbidding mid-line starts, and
+        # showing a worked example against a concrete rejected pattern.
+        assert "Strip ONLY the `  N| ` line-number prefix" in rendered
+        assert "leading spaces" in rendered  # whitespace-must-appear rule
+        assert "mid-line" in rendered        # anti-fragment rule
+        assert "Worked example" in rendered  # concrete miss anchor
 
     def test_b1_preflight_returns_empty_string_when_no_files(self):
         from harness.graph import _format_preflight_file_content

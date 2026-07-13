@@ -873,6 +873,50 @@ def _detect_duplicate_test_root(
     )
 
 
+SEARCH_BLOCK_COPY_RULES = (
+    "IMPORTANT — how to copy from a `  N| ` line-numbered view into a "
+    "SEARCH block:\n"
+    "  - Strip ONLY the `  N| ` line-number prefix. Every other "
+    "character on the line — INCLUDING leading spaces, leading tabs, "
+    "trailing punctuation, and blank lines — is part of the file and "
+    "MUST appear VERBATIM in your SEARCH.\n"
+    "  - Do NOT start a SEARCH mid-line or mid-word. Copy WHOLE lines "
+    "end-to-end; a search that begins after a real line's leading "
+    "whitespace (or after a few words on that line) will not match "
+    "and the patch will be REJECTED.\n"
+    "  - Worked example. If the view shows this line exactly:\n"
+    "        21|         All outgoing requests carry the required "
+    "User-Agent header and are\n"
+    "    then a SEARCH containing `User-Agent header and are` will "
+    "FAIL — it drops the eight leading spaces plus five words. The "
+    "correct SEARCH content for that line is:\n"
+    "        `        All outgoing requests carry the required "
+    "User-Agent header and are`\n"
+    "    (eight leading spaces, full sentence, no `21|` prefix).\n"
+    "  - If a whole-line copy of what you want to replace is more "
+    "than ~10 lines, prefer a single `REWRITE_FILE` over a "
+    "REPLACE_BLOCK — the copy-fidelity risk grows with SEARCH size."
+)
+"""Tightened copy rules for LLM SEARCH-block emission. The single
+source of truth — shared by every path that shows the LLM a
+line-numbered file view: ``graph._resolve_read_blocks``,
+``graph._format_preflight_file_content``,
+``graph._format_current_file_content``, the auto-inject recovery
+wrappers, and the patcher's own SEARCH-miss / CREATE_FILE-collision
+rejection messages.
+
+Empirical trigger: finsearch session finsearch-optB-1783830081
+(2026-07-12) rejected multiple REPLACE_BLOCK edits at ~55% search
+similarity because the LLM emitted mid-line fragments after
+stripping the ``  N| `` prefix AND the file's real leading
+whitespace. The prior intros (``"WITHOUT the `  N| ` prefix"``) did
+not distinguish "strip the prefix" from "strip the leading
+whitespace"; these tightened rules make that boundary explicit and
+give the LLM one worked example against a concrete rejected
+pattern. Owned by patcher.py so ``graph.py`` can import it without
+a circular dependency."""
+
+
 class BasePatcher(ABC):
     """
     Abstract base for all file modification engines.
@@ -1080,6 +1124,57 @@ class TextPatcher(BasePatcher):
                         operation=OperationType.CREATE_FILE,
                         error=str(exc),
                     )
+            # File exists with different-but-similar content — promote
+            # to REWRITE_FILE. In headless story-mode the LLM re-emits
+            # CREATE_FILE for the same test file across repair rounds
+            # (finsearch session 156032347: server/app/tests/test_edgar_
+            # client.py rejected 4 times, test_rate_limiter.py 3 times,
+            # test_company_service.py 3 times — 32 total rejections in
+            # one run). Each rejection burned a repair round while the
+            # LLM's intent was clearly "overwrite this file I already
+            # created earlier." The hard-reject was originally there to
+            # prevent blindly clobbering unrelated operator content;
+            # that safety concern only applies when the on-disk content
+            # is *unrelated* to what the LLM is emitting. A high
+            # similarity ratio (>= 0.85) means the LLM is targeting the
+            # same conceptual file with modifications, and REWRITE_FILE
+            # is the correct escape hatch. Post-patch parse validation
+            # (HybridPatcher._validate_and_maybe_rollback) still fires
+            # on the promoted write, so a syntactically-broken promotion
+            # gets rolled back to `actual` — the safety net doesn't move.
+            #
+            # Threshold 0.85 keeps the existing safety tests rejecting
+            # (max ratio 0.80 among unrelated content in the test suite)
+            # while catching intra-session repairs (typically 0.9+).
+            similarity = difflib.SequenceMatcher(None, actual, expected).ratio()
+            if similarity >= 0.85:
+                logger.info(
+                    "[patcher:text] CREATE_FILE auto-promoted to REWRITE_FILE "
+                    "for %s (content similarity=%.3f >= 0.85). LLM re-emitted "
+                    "same-file content across rounds; post-patch parse "
+                    "validation still applies to catch broken promotions.",
+                    filepath, similarity,
+                )
+                promoted = await self.rewrite_file(filepath, content)
+                if promoted.success:
+                    # Preserve the CREATE_FILE operation identity in the
+                    # result so upstream accounting (patch counters,
+                    # traceability markers) doesn't see this as a
+                    # separately-emitted REWRITE_FILE — from the LLM's
+                    # perspective it still asked for CREATE_FILE.
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.CREATE_FILE,
+                        message=(
+                            f"Promoted CREATE_FILE to REWRITE_FILE "
+                            f"({similarity:.2f} similarity): "
+                            f"{promoted.message or filepath}"
+                        ),
+                        lines_changed=promoted.lines_changed,
+                    )
+                # Fall through to hard-reject on rewrite failure so the
+                # LLM still gets the recovery directive it needs.
             # File exists with different content — surface the FULL
             # current content (line-numbered, whole-file mode when small)
             # so the LLM's next round can emit a REPLACE_BLOCK against
@@ -1103,13 +1198,13 @@ class TextPatcher(BasePatcher):
                     f"emit another CREATE_FILE for this path — the "
                     f"patcher will reject the same shape again. Emit a "
                     f"REPLACE_BLOCK against the current content shown "
-                    f"below (copy the EXACT lines you want to replace, "
-                    f"WITHOUT the line-number prefix `  N| `). If you "
-                    f"intended to add to it, use REPLACE_BLOCK to insert "
-                    f"around an existing anchor line. If your intended "
-                    f"content actually matches what's here, no patch is "
-                    f"needed — move on to the next diagnostic."
-                    f"\n\nCurrent file content:\n{annotated}"
+                    f"below. If you intended to add to it, use "
+                    f"REPLACE_BLOCK to insert around an existing anchor "
+                    f"line. If your intended content actually matches "
+                    f"what's here, no patch is needed — move on to the "
+                    f"next diagnostic.\n\n"
+                    f"{SEARCH_BLOCK_COPY_RULES}\n\n"
+                    f"Current file content:\n{annotated}"
                 ),
             )
 
@@ -1616,9 +1711,8 @@ class TextPatcher(BasePatcher):
                     f"drifted since your mental model of it. Below is the "
                     f"line-numbered current content of the file (either the "
                     f"entire file, or a window around the closest match for "
-                    f"larger files). Copy the EXACT lines you want to "
-                    f"replace (WITHOUT the line-number prefix `  N| `) into "
-                    f"your next REPLACE_BLOCK's `search:`."
+                    f"larger files).\n\n"
+                    f"{SEARCH_BLOCK_COPY_RULES}"
                     f"{diff_section}\n"
                     f"Current file content (around closest match):\n{suggestion}"
                     f"{sibling_tail}"

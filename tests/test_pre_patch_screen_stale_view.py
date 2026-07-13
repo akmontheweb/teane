@@ -83,6 +83,136 @@ class TestMarkFilesModified:
         assert graph._get_files_modified({"unrelated": 5}) == set()
 
 
+class TestFilesSeenPersistence:
+    """Task 11 (2026-07-12): ``files_seen_by_llm`` must survive
+    ``story_loop_node``'s wholesale ``node_state`` replacement so
+    round N+1's ``_pre_patch_screen`` sees the fresh hashes round
+    N's reactive inject wrote. ``loop_counter`` is the persistent
+    home; ``node_state`` is a backwards-compat mirror only.
+    """
+
+    def test_read_prefers_loop_counter_over_node_state(self):
+        state = {
+            "loop_counter": {graph._FILES_SEEN_LOOP_KEY: {"a.py": "hash-a"}},
+            "node_state": {"files_seen_by_llm": {"b.py": "hash-b-stale"}},
+        }
+        assert graph._read_files_seen(state) == {"a.py": "hash-a"}
+
+    def test_read_falls_back_to_node_state(self):
+        # Resume checkpoints written before the loop_counter migration
+        # only had node_state; the fallback keeps them working.
+        state = {"node_state": {"files_seen_by_llm": {"b.py": "hash-b"}}}
+        assert graph._read_files_seen(state) == {"b.py": "hash-b"}
+
+    def test_read_falls_back_when_loop_counter_empty(self):
+        state = {
+            "loop_counter": {graph._FILES_SEEN_LOOP_KEY: {}},
+            "node_state": {"files_seen_by_llm": {"b.py": "hash-b"}},
+        }
+        assert graph._read_files_seen(state) == {"b.py": "hash-b"}
+
+    def test_read_returns_fresh_copy(self):
+        # Callers mutate the returned dict freely (add fresh hashes as
+        # they READ_FILE); those mutations must not leak into state.
+        src = {"a.py": "hash-a"}
+        state = {"loop_counter": {graph._FILES_SEEN_LOOP_KEY: src}}
+        r = graph._read_files_seen(state)
+        r["c.py"] = "hash-c"
+        assert "c.py" not in src
+
+    def test_read_ignores_non_string_entries(self):
+        state = {
+            "loop_counter": {
+                graph._FILES_SEEN_LOOP_KEY: {
+                    "a.py": "hash-a", "b.py": 42, 3: "hash-c", "d.py": None,
+                },
+            },
+        }
+        assert graph._read_files_seen(state) == {"a.py": "hash-a"}
+
+    def test_stash_writes_into_loop_counter(self):
+        lc: dict = {}
+        graph._stash_files_seen(lc, {"a.py": "hash-a"})
+        assert lc[graph._FILES_SEEN_LOOP_KEY] == {"a.py": "hash-a"}
+
+    def test_stash_overwrites_prior_entry(self):
+        # The map is round-N cumulative; the last-writer-wins semantics
+        # match how ``tool_files_seen`` is threaded through a node.
+        lc: dict = {graph._FILES_SEEN_LOOP_KEY: {"a.py": "hash-a"}}
+        graph._stash_files_seen(lc, {"a.py": "hash-a-v2", "b.py": "hash-b"})
+        assert lc[graph._FILES_SEEN_LOOP_KEY] == {
+            "a.py": "hash-a-v2", "b.py": "hash-b",
+        }
+
+    def test_stash_isolates_from_source_mutation(self):
+        # After stashing, the caller's local dict may keep growing;
+        # loop_counter's stored copy must not follow those mutations.
+        lc: dict = {}
+        src = {"a.py": "hash-a"}
+        graph._stash_files_seen(lc, src)
+        src["b.py"] = "hash-b-added-later"
+        assert lc[graph._FILES_SEEN_LOOP_KEY] == {"a.py": "hash-a"}
+
+    def test_survives_node_state_replacement_via_read(self):
+        # End-to-end shape check: patching_node stashes into
+        # loop_counter, an intermediate node returns a fresh node_state
+        # without files_seen_by_llm (LangGraph replaces it wholesale),
+        # next patching call's _read_files_seen still finds the hashes.
+        lc: dict = {}
+        graph._stash_files_seen(lc, {"a.py": "hash-a"})
+        # Simulate story_loop_node's node_state replacement.
+        state = {"loop_counter": lc, "node_state": {"current_node": "story_loop"}}
+        assert graph._read_files_seen(state) == {"a.py": "hash-a"}
+
+
+class TestPartialProgressDemote:
+    """The partial-progress gate demotes rounds where a stray
+    CREATE_FILE succeeds while the story's intended surgical edits
+    were rejected as stuck-reread. Without demotion, story_loop's
+    ``_patch_success > 0`` advance test would mark the story done
+    and the intended edits stay on the floor. Root cause: finsearch
+    STORY-004 ran patches=10 succeed=1 fail=9 (all 9 fails were
+    stuck-reread) and silently advanced.
+    """
+
+    def test_no_real_success_never_demoted(self):
+        # Real zero-patch is already caught by the existing tripwire;
+        # the gate must not double-count it.
+        assert graph._partial_progress_demote(0, 5) is False
+        assert graph._partial_progress_demote(0, 0) is False
+
+    def test_no_stuck_reread_never_demoted(self):
+        # A clean round with real successes and no screen rejections
+        # is exactly what advance is for — leave it alone.
+        assert graph._partial_progress_demote(3, 0) is False
+        assert graph._partial_progress_demote(100, 0) is False
+
+    def test_finsearch_story_004_pattern_demoted(self):
+        # 1 landed / 9 stuck-reread: the canonical silent-gap case.
+        assert graph._partial_progress_demote(1, 9) is True
+
+    def test_ratio_at_threshold_not_demoted(self):
+        # 3 landed / 3 stuck-reread → ratio exactly 0.5 → NOT
+        # demoted (strict less-than). Rationale: half-real progress
+        # is real enough to advance; retry cost would exceed benefit.
+        assert graph._partial_progress_demote(3, 3) is False
+
+    def test_ratio_just_below_threshold_demoted(self):
+        # 2 landed / 3 stuck-reread → ratio 0.4 < 0.5 → demoted.
+        assert graph._partial_progress_demote(2, 3) is True
+
+    def test_ratio_just_above_threshold_not_demoted(self):
+        # 3 landed / 2 stuck-reread → ratio 0.6 > 0.5 → advance.
+        assert graph._partial_progress_demote(3, 2) is False
+
+    def test_custom_ratio_threshold(self):
+        # A caller wanting to be stricter (e.g. 0.8) sees the same
+        # 3-vs-2 case demote instead of advance.
+        assert graph._partial_progress_demote(3, 2, min_ratio=0.8) is True
+        # And more permissive (0.1) keeps the finsearch case as advance.
+        assert graph._partial_progress_demote(1, 9, min_ratio=0.1) is False
+
+
 class TestUniversalModifiedGuard:
     """Any file in ``files_modified_this_session`` is treated as stuck
     regardless of type — no manifest-specific enumeration involved."""
@@ -204,6 +334,66 @@ class TestExternallyMutatedFallback:
         )
         assert len(kept) == 1
         assert rejections == []
+
+
+class TestStuckRereadAutoInjectRecovery:
+    """When guard 2 rejects a batch of surgical edits with
+    ``[screen:stuck-reread]``, ``patching_node`` / ``repair_node``
+    auto-inject the current on-disk content into ``messages`` and
+    refresh ``files_seen_by_llm`` so the LLM's next round is accepted
+    without a round-trip on a READ_FILE the model was too eager to
+    skip. Root cause: finsearch build session finsearch-agile-
+    1783819612 hit the zero_patch_loop:2 tripwire twice on STORY-004
+    because guard 2 rejected edits against files STORY-003 had just
+    created, and the LLM ignored the "READ_FILE first" directive.
+    """
+
+    def test_refreshing_seen_hash_via_resolve_clears_guard_2(self, tmp_path):
+        # Prove the primitive the node relies on: after
+        # ``_resolve_read_blocks(record_hashes_into=files_seen)``, a
+        # second screen call against the same block passes because
+        # files_seen[path] now matches the on-disk sha256.
+        (tmp_path / "server").mkdir()
+        body = "def compute():\n    return 1 + 2\n"
+        (tmp_path / "server" / "svc.py").write_text(body, encoding="utf-8")
+
+        loop_counter: dict = {}
+        graph._mark_files_modified(loop_counter, ["server/svc.py"])
+
+        blocks = [_mk_block(file="server/svc.py")]
+        files_seen: dict[str, str] = {}   # simulates cross-story reset
+
+        # First screen call — guard 2 rejects.
+        kept, rejections = graph._pre_patch_screen(
+            blocks=blocks,
+            loop_counter=loop_counter,
+            files_seen_by_llm=files_seen,
+            workspace_path=str(tmp_path),
+        )
+        assert kept == []
+        assert len(rejections) == 1
+        assert "screen:stuck-reread" in rejections[0].error
+
+        # Auto-inject step (what patching_node / repair_node do inline
+        # after harvesting stuck-reread rejections).
+        injected = graph._resolve_read_blocks(
+            [("server/svc.py", None)],
+            workspace_path=str(tmp_path),
+            record_hashes_into=files_seen,
+        )
+        assert "def compute" in injected
+        assert files_seen.get("server/svc.py") == _sha256(body)
+
+        # Second screen call — guard 2 now passes because seen hash
+        # matches disk. This is what the LLM's next dispatch sees.
+        kept2, rejections2 = graph._pre_patch_screen(
+            blocks=blocks,
+            loop_counter=loop_counter,
+            files_seen_by_llm=files_seen,
+            workspace_path=str(tmp_path),
+        )
+        assert len(kept2) == 1
+        assert rejections2 == []
 
 
 class TestPatchingNodePersistsFilesSeenByLlm:

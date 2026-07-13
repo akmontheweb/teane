@@ -200,6 +200,59 @@ class TestPerTriggerCap:
         # The per-trigger cap was NOT the thing that tripped.
         assert "per-trigger cap" not in stderr.split("Recovery options")[0]
 
+    def test_session_cap_default_is_3x_per_trigger(self):
+        # Class fix from finsearch session 156032347: previously the
+        # module-level session cap and per-trigger cap were both 3, which
+        # meant 3 distinct triggers each spending 1 auto-resume would
+        # trip the session kill-switch before ANY trigger came near its
+        # per-trigger cap. The session cap now defaults to 3× the
+        # per-trigger cap so up to three distinct failure classes can
+        # each exercise their full per-trigger slack before the session
+        # kill-switch fires. Locks that ratio — a future change that
+        # reverts them to equal defeats the point of having two caps.
+        assert cli._HITL_AUTO_RESUME_CAP >= (
+            3 * cli._HITL_AUTO_RESUME_CAP_PER_TRIGGER
+        ), (
+            "session cap must be at least 3× per-trigger cap so multi-"
+            "trigger runs don't trip the session kill-switch before any "
+            "single trigger reaches its own cap"
+        )
+
+    def test_multi_trigger_run_does_not_trip_session_cap_prematurely(
+        self, monkeypatch
+    ):
+        # Simulates the finsearch 156032347 shape: 2× repair_loop_limit
+        # + 1× test_generation_max_iterations previously terminated at
+        # session cap 3/3. With the new default (session cap = 9), the
+        # same shape must auto-resume rather than terminate.
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="test_generation_max_iterations",
+            resumes_taken=3,
+            # Use the module default, not the test's explicit override.
+            cap=cli._HITL_AUTO_RESUME_CAP,
+            per_trigger={
+                "repair_loop_limit": 2,
+                "test_generation_max_iterations": 0,
+            },
+        )
+        # Drop the per-session cap override so the resolver falls to
+        # ``cli._HITL_AUTO_RESUME_CAP`` (the whole point of the test).
+        del state["hitl_auto_resume_cap"]
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            cli.hitl_menu_loop(state)
+        stderr = buf.getvalue()
+        assert "TERMINATED" not in stderr, (
+            "session cap tripped prematurely on the finsearch multi-"
+            "trigger shape — session cap default is too tight"
+        )
+        # And the auto-resume counter advanced (proving we took the
+        # resume branch, not just skipped the check).
+        assert (
+            state["loop_counter"]["hitl_auto_resumes_taken"] == 4
+        )
+
     def test_config_dot_key_flows_through_state(self, monkeypatch):
         # The banner promises `hitl.auto_resume_cap_per_trigger` as a
         # config lever. Set it on state["harness_config"] (which

@@ -2162,6 +2162,15 @@ _HITL_FLAGS: dict[str, bool] = {}
 # review cycle but does catch a hung loop.
 MAX_GATEKEEPER_REFINES = 5
 
+# Per-trigger sub-cap. Bounds any SINGLE trigger's contribution so one
+# exhausted failure class can't monopolize the recovery pool. Session
+# 44c5e194-5715-451f-92c6-84362eeb7453 (2026-07-10) tripped the
+# session cap via 1× test_generation_max_iterations + 2× zero_patch_loop:2,
+# leaving the operator no slack for genuinely-different follow-on
+# failures — this per-trigger cap prevents that shape. Operators can
+# override via ``state['hitl_auto_resume_cap_per_trigger']``.
+_HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
+
 # Per-session cap on consecutive headless HITL auto-resumes for
 # loop-stuck triggers (repair_loop_limit, persistent_build_failure,
 # zero_patch_loop, no_progress_failsafe, low_signal_verdict_loop, etc.).
@@ -2177,19 +2186,19 @@ MAX_GATEKEEPER_REFINES = 5
 # to genuinely unstick the loop and then terminates cleanly. Operators
 # can override via ``state['hitl_auto_resume_cap']`` when a long-tail
 # recovery legitimately needs more headroom.
-_HITL_AUTO_RESUME_CAP = 3
-
-# Per-trigger sub-cap. Session cap is a total budget across ALL
-# triggers; this sub-cap is enforced per-trigger so one exhausted
-# failure class can't burn another's slack. Session
-# 44c5e194-5715-451f-92c6-84362eeb7453 (2026-07-10) tripped the
-# session cap via 1× test_generation_max_iterations + 2× zero_patch_loop:2,
-# leaving the operator no slack for genuinely-different follow-on
-# failures. Defaults to the same value as _HITL_AUTO_RESUME_CAP so
-# raising the session cap alone doesn't quietly let ONE trigger
-# monopolize; operators can override independently via
-# ``state['hitl_auto_resume_cap_per_trigger']``.
-_HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
+#
+# Sized as 3× the per-trigger cap so up to three distinct failure
+# classes can each spend their full per-trigger slack before the
+# session-level kill-switch fires. Previously equal to the per-trigger
+# cap, which defeated the point — with 3 distinct HITL triggers each
+# taking 1 auto-resume the session cap tripped before ANY trigger came
+# close to its own cap. Finsearch session 156032347 (2026-07-13)
+# terminated at 2× repair_loop_limit + 1× test_generation_max_iterations
+# = session cap 3/3, blocking a run that had per-trigger slack remaining
+# on both triggers. Trades a slightly larger budget-drain ceiling in the
+# genuinely-unrecoverable case for headroom in the multi-trigger case
+# that the per-trigger cap already bounds.
+_HITL_AUTO_RESUME_CAP = _HITL_AUTO_RESUME_CAP_PER_TRIGGER * 3
 
 # The five HITL gates the resolver knows about. Tuples of
 # (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
@@ -3825,10 +3834,13 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             # reset to 0 by the next green compile or successful
             # code_review re-patch (see ``compiler_node`` /
             # ``code_review_node``).
+            from harness.graph import hitl_next_node as _hitl_next_node
+            _next_node = _hitl_next_node(str(trigger or ""))
             logger.info(
                 "[HITL] Developer chose to resume. Iteration counters reset "
                 "(total_repairs=2 — one more repair attempt before HITL "
-                "re-fires). Routing to compiler_node."
+                "re-fires). Routing to %s.",
+                _next_node,
             )
             return state
 
@@ -3872,7 +3884,12 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             node_state["hitl_awaiting_input"] = False
             node_state["hitl_resolved"] = True
             state["node_state"] = node_state
-            logger.info("[HITL] Manual edits confirmed. Compiler errors cleared. Resuming to compiler_node.")
+            from harness.graph import hitl_next_node as _hitl_next_node
+            _next_node = _hitl_next_node(str(trigger or ""))
+            logger.info(
+                "[HITL] Manual edits confirmed. Compiler errors cleared. Resuming to %s.",
+                _next_node,
+            )
             return state
 
         elif choice == "b":

@@ -1269,6 +1269,54 @@ Used by ``decomposition_node`` to detect the auto-repair-eligible
 branch."""
 
 
+_TOO_MANY_FEATURES_ERR_PREFIX = "too many features ("
+"""Prefix of the validator error emitted when the payload exceeds
+``MAX_FEATURES_PER_PASS``. Matches the raise site in
+``_validate_features_payload``. Used by ``decomposition_node`` to
+detect the auto-repair-eligible branch — the LLM produced sprint-scale
+line-items instead of feature-scale groupings, which is exactly the
+class of shape drift the narrow-scope repair prompts (cycle,
+unknown_req_key) already handle successfully."""
+
+
+def _build_too_many_features_repair_prompt(
+    raw_json: str, err_msg: str, cap: int,
+) -> str:
+    """Targeted one-shot repair prompt for over-cap feature counts.
+
+    Feeds the planner its own prior payload plus the cap and asks it
+    to merge sibling features until the count is ``<= cap``. Kept
+    narrow on purpose (same contract as the cycle / unknown_req_key
+    repair prompts): edit ONLY the ``features`` array and the
+    ``feature_key`` field on the stories that reference merged-away
+    features. Stories, acceptance_criteria, requirement_keys, and
+    scope_files stay untouched so the merged plan still traces cleanly
+    back to the requirements table.
+    """
+    return (
+        "Your previous decomposition response defined too many features "
+        "to fit one planning pass:\n\n"
+        f"  {err_msg}\n\n"
+        f"Fix the payload by merging sibling features until the count is "
+        f"<= {cap}. Features are sprint-scale user-facing capabilities "
+        "(e.g. \"user authentication\", \"filing search\"), not "
+        "line-items — group stories that share a domain concept, a "
+        "screen, or a workflow into a single feature. When you fold "
+        "feature B into feature A: keep feature A's `feature_key` and "
+        "update every story that previously cited B's `feature_key` to "
+        "cite A's instead. Do NOT remove, rename, or renumber stories; "
+        "do NOT edit acceptance_criteria, requirement_keys, "
+        "depends_on, or scope_files. Edit ONLY the `features` array "
+        "and the `feature_key` field on stories whose feature was "
+        "merged away.\n\n"
+        "Return the COMPLETE corrected payload as a single JSON object "
+        "with exactly the same shape as before. JSON only — no "
+        "commentary, no code fences.\n\n"
+        "Previous payload:\n"
+        f"{raw_json}"
+    )
+
+
 def _build_unknown_req_repair_prompt(
     raw_json: str,
     err_msg: str,
@@ -1537,8 +1585,14 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         exc_str = str(exc)
         cycle_err = exc_str.startswith("depends_on cycle detected:")
         unknown_req_err = _UNKNOWN_REQ_KEY_ERR_MARKER in exc_str
-        if (cycle_err or unknown_req_err) and budget > 0:
-            repair_kind = "cycle" if cycle_err else "unknown_req_key"
+        too_many_features_err = exc_str.startswith(_TOO_MANY_FEATURES_ERR_PREFIX)
+        if (cycle_err or unknown_req_err or too_many_features_err) and budget > 0:
+            if cycle_err:
+                repair_kind = "cycle"
+            elif unknown_req_err:
+                repair_kind = "unknown_req_key"
+            else:
+                repair_kind = "too_many_features"
             logger.warning(
                 "[decomposition] %s — attempting 1-shot %s auto-repair "
                 "(budget=$%.4f).",
@@ -1546,9 +1600,13 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             )
             if cycle_err:
                 repair_prompt = _build_cycle_repair_prompt(raw, exc_str)
-            else:
+            elif unknown_req_err:
                 repair_prompt = _build_unknown_req_repair_prompt(
                     raw, exc_str, known_req_keys,
+                )
+            else:
+                repair_prompt = _build_too_many_features_repair_prompt(
+                    raw, exc_str, MAX_FEATURES_PER_PASS,
                 )
             repair_messages = [
                 system_msg, {"role": "user", "content": repair_prompt},

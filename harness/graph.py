@@ -3261,11 +3261,11 @@ async def _patching_tool_loop(
         **dispatch_kwargs,
     )
 
-    # Seed from any existing node_state.files_seen_by_llm so a resumed
-    # session doesn't lose prior reads.
-    files_seen: dict[str, str] = dict(
-        (state.get("node_state", {}) or {}).get("files_seen_by_llm") or {}
-    )
+    # Seed from the loop_counter home (persists across node_state
+    # replacements — see ``_FILES_SEEN_LOOP_KEY``), falling back to
+    # ``node_state.files_seen_by_llm`` for resume checkpoints written
+    # before the loop_counter migration.
+    files_seen: dict[str, str] = _read_files_seen(state)
 
     if not use_tools or not getattr(response, "tool_calls", None):
         return response, budget, messages, files_seen
@@ -4039,16 +4039,19 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
                 workspace, _scope_for_preflight,
                 record_hashes_into=_record_into,
             )
+            # Task 11 (2026-07-12): also mirror into loop_counter so the
+            # preflight's hashes survive the next node_state
+            # replacement (story_loop / batch_commit / anything on the
+            # zero-patch re-pick path).
+            _stash_files_seen(loop_counter, _files_seen_map)
             preflight_section = _format_preflight_file_content(
                 _pairs,
                 intro=(
                     "The line-numbered views below are the **actual current "
-                    "bytes** of story-scope files that already exist. Build "
-                    "any REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK "
-                    "against these bytes verbatim (WITHOUT the `  N| ` "
-                    "line-number prefix). Do NOT patch against a remembered "
-                    "version — earlier nodes in this session may have "
-                    "already modified these files."
+                    "bytes** of story-scope files that already exist. Do NOT "
+                    "patch against a remembered version — earlier nodes in "
+                    "this session may have already modified these files.\n\n"
+                    + _SEARCH_BLOCK_COPY_RULES
                 ),
             )
             if preflight_section:
@@ -4343,6 +4346,127 @@ Generate your patches NOW. Only the blocks above. No other text."""
                     except Exception:  # noqa: BLE001 — telemetry must not block
                         pass
 
+            # Fix 5d — proactive scope refresh. Before we let the
+            # screen reject the round, dry-run it against the LLM's
+            # parsed blocks: if surgical edits target files the screen
+            # would flag as stuck-reread, inject the current on-disk
+            # content and re-dispatch so the LLM produces landable
+            # edits on THIS round instead of burning it. Complements
+            # the reactive stuck-reread auto-inject downstream — that
+            # one catches whatever slips past this preflight (edit
+            # blocks the model derives after the re-dispatch that
+            # STILL miss the screen), so the two together give us both
+            # a first-round save AND a hard safety net. Fires at most
+            # once per patching_node call (single re-dispatch cap) so
+            # a pathological LLM can't ping-pong on this hook.
+            _preflight_ran = False
+            _preflight_reads = _parse_read_blocks(combined_response_text)
+            if not _preflight_reads:  # skip when LLM already asked
+                _preflight_probe_text = _strip_read_blocks(combined_response_text)
+                _preflight_probe_blocks = _parse_patch_blocks(
+                    _preflight_probe_text,
+                )
+                if _preflight_probe_blocks:
+                    _preflight_kept, _preflight_rejects = _pre_patch_screen(
+                        _preflight_probe_blocks, loop_counter,
+                        tool_files_seen, workspace,
+                    )
+                    _preflight_files: list[str] = []
+                    _preflight_seen: set[str] = set()
+                    for _pr in _preflight_rejects:
+                        _perr = getattr(_pr, "error", "") or ""
+                        if not isinstance(_perr, str):
+                            continue
+                        if "[screen:stuck-reread]" not in _perr:
+                            continue
+                        _pf = getattr(_pr, "file", "") or ""
+                        if not _pf or _pf in _preflight_seen:
+                            continue
+                        if not os.path.isfile(os.path.join(workspace, _pf)):
+                            continue
+                        _preflight_seen.add(_pf)
+                        _preflight_files.append(_pf)
+                    if _preflight_files:
+                        _preflight_injected = _resolve_read_blocks(
+                            [(p, None) for p in _preflight_files],
+                            workspace,
+                            record_hashes_into=tool_files_seen,
+                        )
+                        if _preflight_injected:
+                            messages.append(MessageDict(
+                                role="assistant",
+                                content=combined_response_text,
+                            ))
+                            messages.append(MessageDict(
+                                role="user",
+                                content=(
+                                    "[Auto-injected by harness — "
+                                    "preemptive scope refresh]\nThe "
+                                    "surgical edits in your response "
+                                    "above target file(s) that were "
+                                    "modified earlier in this session "
+                                    "and whose current content you "
+                                    "have not yet been shown. Rather "
+                                    "than let the pre-patch screen "
+                                    "reject them and force a "
+                                    "READ_FILE round-trip, the harness "
+                                    "has inlined the authoritative "
+                                    "on-disk content below. Re-emit "
+                                    "your patch block(s) NOW — follow "
+                                    "the copy rules in the injected "
+                                    "section. Do NOT emit READ_FILE "
+                                    "for these files; this refresh "
+                                    "counts as your read.\n\n"
+                                    + _preflight_injected
+                                ),
+                            ))
+                            logger.info(
+                                "[patching_node] Preemptive scope "
+                                "refresh: %d file(s) auto-injected "
+                                "before screen (%s). Re-dispatching so "
+                                "the LLM can produce landable edits "
+                                "without a rejected round.",
+                                len(_preflight_files), _preflight_files,
+                            )
+                            try:
+                                from harness.observability import emit_event
+                                emit_event(
+                                    "patching_preflight_scope_refresh",
+                                    files=list(_preflight_files),
+                                    story_id=state.get(
+                                        "current_story_id",
+                                    ) or "",
+                                )
+                            except Exception:  # noqa: BLE001 — telemetry must not block
+                                pass
+                            response, new_budget = await _patching_dispatch(
+                                messages, new_budget,
+                            )
+                            combined_response_text = response.content or ""
+                            _preflight_ran = True
+            # Post-preflight READ_FILE mop-up: if the re-dispatched
+            # response asked for MORE files (rare — usually the LLM
+            # commits after seeing injected content), resolve those
+            # inline without spending another patching iteration.
+            # Keeps parity with the pre-preflight READ_FILE loop.
+            if _preflight_ran:
+                for _mop_round in range(_READ_FILE_MAX_RESOLVES):
+                    _mop_reads = _parse_read_blocks(combined_response_text)
+                    if not _mop_reads:
+                        break
+                    messages.append(MessageDict(
+                        role="assistant", content=combined_response_text,
+                    ))
+                    _mop_res = _resolve_read_blocks(
+                        _mop_reads, workspace,
+                        record_hashes_into=tool_files_seen,
+                    )
+                    messages.append(MessageDict(role="user", content=_mop_res))
+                    response, new_budget = await _patching_dispatch(
+                        messages, new_budget,
+                    )
+                    combined_response_text = response.content or ""
+
             # Strip any residual READ_FILE blocks so the patcher and
             # the test-block filter don't try to parse them as
             # patches, and so commit messages stay clean.
@@ -4390,6 +4514,62 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 _blocks_kept, patch_results, loop_counter,
             )
             patch_results = list(_screen_rejections) + list(patch_results)
+            # Fix 5c: harvest stuck-reread rejections and auto-inject
+            # the current on-disk content for those files so the next
+            # dispatch sees the authoritative view without spending a
+            # round on a READ_FILE round-trip. Fires on the same
+            # failure mode as finsearch STORY-004 (files created by an
+            # earlier story of the same batch, memory_cleanse dropped
+            # the content, patcher screen rejected surgical edits with
+            # "modified in this session — must READ_FILE"). Recording
+            # the fresh hashes into ``tool_files_seen`` also clears
+            # Guard 2 so the LLM's next-round edits are accepted.
+            _stuck_reread_files: list[str] = []
+            _seen_stuck: set[str] = set()
+            for _r in _screen_rejections:
+                _err = getattr(_r, "error", "") or ""
+                if not isinstance(_err, str):
+                    continue
+                if "[screen:stuck-reread]" not in _err:
+                    continue
+                _rf = getattr(_r, "file", "") or ""
+                if not _rf or _rf in _seen_stuck:
+                    continue
+                if not os.path.isfile(os.path.join(workspace, _rf)):
+                    continue
+                _seen_stuck.add(_rf)
+                _stuck_reread_files.append(_rf)
+            if _stuck_reread_files:
+                _auto_read_blocks = [(p, None) for p in _stuck_reread_files]
+                _injected = _resolve_read_blocks(
+                    _auto_read_blocks, workspace,
+                    record_hashes_into=tool_files_seen,
+                )
+                if _injected:
+                    messages.append(MessageDict(
+                        role="user",
+                        content=(
+                            "[Auto-injected by harness — stuck-reread "
+                            "recovery]\nYour previous surgical edits "
+                            "against the file(s) below were rejected "
+                            "because the harness had no record of you "
+                            "reading them since they were last "
+                            "modified. Rather than force a READ_FILE "
+                            "round-trip, the harness has inlined their "
+                            "current on-disk content here. Follow the "
+                            "copy rules in the injected section on "
+                            "your next patch attempt. Do NOT emit "
+                            "READ_FILE for these files.\n\n"
+                            + _injected
+                        ),
+                    ))
+                    logger.info(
+                        "[patching_node:screen] Auto-injected current "
+                        "content for %d stuck-reread file(s): %s. "
+                        "files_seen_by_llm refreshed so next round's "
+                        "screen will pass.",
+                        len(_stuck_reread_files), _stuck_reread_files,
+                    )
 
         # Append the LLM response to messages (the original, unfiltered,
         # so the LLM's own history reflects what it actually emitted).
@@ -4417,6 +4597,64 @@ Generate your patches NOW. Only the blocks above. No other text."""
         )
         real_success_count = success_count - no_op_count
         fail_count = len(patch_results) - success_count
+        # Partial-progress gate (2026-07-12): finsearch STORY-004 ran
+        # with patches=10 succeed=1 fail=9 — one stray CREATE_FILE
+        # landed while nine intended REPLACE_BLOCK edits were rejected
+        # by the pre-patch screen as stuck-reread. That single success
+        # was enough to trip story_loop's ``_patch_success > 0``
+        # advance gate, so the story was marked done and the nine
+        # intended edits stayed on the floor. When the round is
+        # dominated by stuck-reread rejections (screen guard 2 fires
+        # heavily), the LLM has effectively made no meaningful
+        # progress on the story's actual work even if a peripheral
+        # CREATE_FILE succeeded. Demoting to zero-patch here forces
+        # a re-pick so the LLM gets another turn with the injected
+        # content, and it also feeds the standard zero-patch tripwire
+        # so a persistently stuck story escalates to HITL or the
+        # per-story cap (``STORY_ZERO_PATCH_CAP``) auto-completes it
+        # instead of accumulating silent gaps across the batch.
+        _stuck_reread_reject_count = sum(
+            1 for r in patch_results
+            if not r.success
+            and isinstance(r.error, str)
+            and "[screen:stuck-reread]" in r.error
+        )
+        if _partial_progress_demote(
+            real_success_count, _stuck_reread_reject_count,
+        ):
+            _pre_demote_real = real_success_count
+            _landable_ratio = _pre_demote_real / (
+                _pre_demote_real + _stuck_reread_reject_count
+            )
+            logger.warning(
+                "[patching_node] Partial-progress gate: %d real "
+                "success(es) but %d stuck-reread rejection(s) "
+                "(ratio %.2f < %.2f). Demoting this round to "
+                "zero-patch so story_loop re-picks the story and "
+                "the LLM gets another turn with the auto-injected "
+                "content instead of the batch silently advancing "
+                "with the intended edits still on the floor.",
+                _pre_demote_real, _stuck_reread_reject_count,
+                _landable_ratio, _PARTIAL_PROGRESS_MIN_RATIO,
+            )
+            real_success_count = 0
+            # ``patch_success`` in the return is derived from
+            # ``success_count`` (includes no-ops but excludes
+            # rejections). Demote it in lock-step so story_loop's
+            # ``_patch_success > 0`` advance test sees a real
+            # zero — otherwise the re-pick decision above stays a
+            # no-op for the wider batch flow.
+            success_count = 0
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    "patching_partial_progress_demoted",
+                    real_successes=_pre_demote_real,
+                    stuck_reread_rejections=_stuck_reread_reject_count,
+                    story_id=state.get("current_story_id") or "",
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
         # Carve out allowlist rejections from generic failures so the next
         # repair iteration sees the exact paths and reason — without this,
         # the LLM keeps re-proposing the same blocked paths.
@@ -4625,6 +4863,13 @@ Generate your patches NOW. Only the blocks above. No other text."""
             f" story={current_story_id}" if current_story_id else "",
         )
 
+        # Task 11 (2026-07-12): park the hashes on loop_counter — the
+        # only channel guaranteed to survive story_loop_node's
+        # node_state replacement. See ``_FILES_SEEN_LOOP_KEY``.
+        # ``node_state`` still carries the map for backwards compat
+        # with tests and any resume checkpoints written before the
+        # migration.
+        _stash_files_seen(loop_counter, tool_files_seen)
         return {
             "messages": messages,
             "modified_files": modified_files,
@@ -4652,17 +4897,12 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 "allowed_paths": allowed_paths,
                 "zero_rounds": zero_rounds_for_log,
                 "current_story_id": current_story_id,
-                # Bug B fix (2026-07-10): persist the hashes the LLM
-                # was shown so the NEXT patching call's
-                # _pre_patch_screen guard 2 sees them. Without this,
-                # every batch after the first that touches a
-                # previously-modified file gets ALL its patches
-                # rejected pre-flight — files_seen_by_llm was empty on
-                # entry because the return didn't carry it, so
-                # modified_this_session ∩ edit_targets = every target
-                # → all rejected as "READ_FILE first". repair_node
-                # already has this line at graph.py:15125; parity
-                # here closes the gap.
+                # Backwards-compat mirror of ``loop_counter``'s
+                # authoritative store — kept so pre-migration
+                # checkpoints, tests that mock node_state, and any
+                # in-flight resume paths continue to work. See the
+                # loop_counter ``_stash_files_seen`` call above and
+                # ``_FILES_SEEN_LOOP_KEY`` for the new home.
                 "files_seen_by_llm": tool_files_seen,
             },
         }
@@ -6552,6 +6792,100 @@ def _get_files_modified(loop_counter: dict[str, Any]) -> set[str]:
     return set()
 
 
+_FILES_SEEN_LOOP_KEY = "files_seen_by_llm"
+"""Key on ``loop_counter`` for the ``{rel_path: sha256}`` map of every
+file the LLM has been shown during this session (READ_FILE resolution
+inside the patching/repair tool loops, plus the
+auto-inject-on-stuck-reread recovery paths). Guard 2 of
+``_pre_patch_screen`` reads this to decide whether the LLM's edit
+proposal is against a fresh mental model or a stale one.
+
+Historically stored only on ``state.node_state.files_seen_by_llm``,
+but LangGraph's default reducer replaces ``node_state`` wholesale
+whenever a node returns one — so any intermediate node whose return
+doesn't re-emit ``files_seen_by_llm`` (e.g. ``story_loop_node``)
+silently drops it, and the next patching call reads back an empty
+dict. Loop_counter is preserved by every node's ``dict(state.get(
+"loop_counter", {}))`` → ``return {"loop_counter": loop_counter}``
+pass-through, so parking the map there closes the persistence gap
+without adding a custom reducer to the state schema.
+
+The finsearch optB run (session finsearch-optB-1783830081, 2026-07-12)
+demonstrated the drop empirically: STORY-005 round 2's preflight
+fired for the same three files as round 1, meaning round 1's
+reactive-inject update to ``files_seen_by_llm`` had not survived
+into round 2. This helper set is the fix.
+"""
+
+
+def _read_files_seen(state: dict[str, Any]) -> dict[str, str]:
+    """Load ``files_seen_by_llm`` from ``loop_counter`` first, with a
+    fallback to ``node_state`` for backwards compatibility with tests
+    and any resume checkpoints written before the loop_counter home
+    was adopted. Returned dict is a fresh copy — callers can mutate
+    freely without touching the source.
+    """
+    lc = state.get("loop_counter", {}) or {}
+    raw = lc.get(_FILES_SEEN_LOOP_KEY)
+    if not isinstance(raw, dict) or not raw:
+        raw = (state.get("node_state", {}) or {}).get(_FILES_SEEN_LOOP_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: v for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, str)
+    }
+
+
+def _stash_files_seen(
+    loop_counter: dict[str, Any], files_seen: dict[str, str],
+) -> None:
+    """Write ``files_seen_by_llm`` into ``loop_counter`` so it survives
+    the next node_state replacement. Node returns still include the
+    map under ``node_state.files_seen_by_llm`` for backwards
+    compatibility, but loop_counter is now the authoritative store.
+    """
+    if not isinstance(loop_counter, dict):
+        return
+    if not isinstance(files_seen, dict):
+        return
+    loop_counter[_FILES_SEEN_LOOP_KEY] = dict(files_seen)
+
+
+_PARTIAL_PROGRESS_MIN_RATIO = 0.5
+"""Threshold for :func:`_partial_progress_demote`. Rounds with a
+landable-vs-stuck ratio below this fall back to zero-patch so
+``story_loop_node``'s ``_patch_success > 0`` advance test re-picks
+the story instead of marking it done with the intended edits
+unmade. Tuned against finsearch STORY-004 (1 landed / 9 stuck →
+ratio 0.10) which advanced silently; higher values would demote
+legitimate incremental turns."""
+
+
+def _partial_progress_demote(
+    real_success_count: int,
+    stuck_reread_reject_count: int,
+    *,
+    min_ratio: float = _PARTIAL_PROGRESS_MIN_RATIO,
+) -> bool:
+    """Decide whether a patching round should be demoted to zero-patch.
+
+    True when the round produced real (non-noop) successes AND the
+    pre-patch screen also rejected stuck-reread edits AND the ratio
+    ``real / (real + stuck)`` fell below ``min_ratio``. Under those
+    conditions the story's actual work is on the floor (the
+    successful patches are almost certainly peripheral CREATE_FILEs)
+    and story_loop should re-pick rather than advance.
+
+    False otherwise — including the "0 real successes" case, which
+    is already zero-patch by definition and needs no separate gate.
+    """
+    if real_success_count <= 0 or stuck_reread_reject_count <= 0:
+        return False
+    denom = real_success_count + stuck_reread_reject_count
+    return (real_success_count / denom) < min_ratio
+
+
 # ---------------------------------------------------------------------------
 # Pre-patch screen — three guards against the "LLM patching against a stale
 # mental model" failure mode that cost the FinancialResearch session 19 HITL
@@ -7413,16 +7747,28 @@ def _format_current_file_content(failures: list[Any]) -> str:
         "\n## Current Content of Files You Need to Edit",
         (
             "Your last response's REPLACE_BLOCK search blocks did not "
-            "match the on-disk content. The line-numbered views below are "
-            "the **actual current content** of each file. Build your next "
-            "REPLACE_BLOCK search by copying lines from here verbatim "
-            "(WITHOUT the `  N| ` line-number prefix). Do NOT invent "
-            "search strings that aren't in the file."
+            "match the on-disk content. The line-numbered views below "
+            "are the **actual current content** of each file. Do NOT "
+            "invent search strings that aren't in the file.\n\n"
+            + _SEARCH_BLOCK_COPY_RULES
         ),
     ]
     for file_ref, wider in seen.items():
         lines.append(f"\n### `{file_ref}`\n```\n{wider}\n```")
     return "\n".join(lines) + "\n"
+
+
+# Re-exported here under the module-private name every prompt
+# formatter in this file uses. The canonical definition lives in
+# ``harness.patcher`` — the module that owns the SEARCH-block contract
+# this teaches — so patcher.py can carry the same guidance in its own
+# CREATE_FILE-collision and REPLACE_BLOCK-miss rejection messages
+# without needing to import from graph.py (which would be a circular
+# dependency, since graph.py imports patcher.py at module-load time).
+# Mid-file placement lets the re-export sit next to the prompt-
+# formatter functions that use it; noqa silences E402 (module-level
+# import not at top) for this documented pattern.
+from harness.patcher import SEARCH_BLOCK_COPY_RULES as _SEARCH_BLOCK_COPY_RULES  # noqa: E402
 
 
 def _format_preflight_file_content(
@@ -7455,11 +7801,10 @@ def _format_preflight_file_content(
     if intro is None:
         intro = (
             "The line-numbered views below are the **actual current "
-            "content** of files you may need to edit. Build any "
-            "REPLACE_BLOCK / DELETE_BLOCK search by copying lines from "
-            "here verbatim (WITHOUT the `  N| ` line-number prefix). Do "
-            "NOT guess at what these files contain — use exactly what "
-            "you see below."
+            "content** of files you may need to edit. Do NOT guess at "
+            "what these files contain — use exactly what you see "
+            "below.\n\n"
+            + _SEARCH_BLOCK_COPY_RULES
         )
     lines = [
         "\n## Current Content of Files You Need to Edit",
@@ -7555,11 +7900,12 @@ def _resolve_read_blocks(
             sections.append(f"{header}\n```\n{rendered}\n```")
     intro = (
         "## READ_FILE results\n"
-        "You requested the current content of the following file(s). Use "
-        "these line-numbered views — WITHOUT the `  N| ` prefix — as the "
-        "source of truth for any REPLACE_BLOCK / DELETE_BLOCK search you "
-        "now write. Do NOT emit another READ_FILE for these same files in "
-        "your next response; just write the patches."
+        "You now have the current content of the following file(s). Use "
+        "these line-numbered views as the source of truth for any "
+        "REPLACE_BLOCK / DELETE_BLOCK search you now write. Do NOT emit "
+        "another READ_FILE for these same files in your next response; "
+        "just write the patches.\n\n"
+        + _SEARCH_BLOCK_COPY_RULES
     )
     return intro + "\n" + "\n".join(sections) + "\n"
 
@@ -13153,10 +13499,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # bytes the LLM has been shown this turn (pre-flight inject + READ_FILE
     # resolves). Used by the patcher's B5 drift detector to reject patches
     # against a file that changed under the LLM's mental model. Seeded from
-    # the prior node_state so multi-iteration sessions accumulate the record.
-    files_seen_by_llm: dict[str, str] = dict(
-        state.get("node_state", {}).get("files_seen_by_llm") or {}
-    )
+    # loop_counter (survives node_state replacement by intermediate nodes)
+    # with node_state fallback for older resume checkpoints.
+    files_seen_by_llm: dict[str, str] = _read_files_seen(state)
     # B1 pre-flight: on iter 1 (or any time there are no prior
     # patch_failures to source the closest-match window from), proactively
     # include line-numbered content for every file the diagnostics point
@@ -13309,9 +13654,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "these yet (or the patcher applied them cleanly with "
                     "no miss), so there is no closest-match window from a "
                     "prior failure to anchor on. Use these line-numbered "
-                    "views — WITHOUT the `  N| ` prefix — as the source of "
-                    "truth for any REPLACE_BLOCK / DELETE_BLOCK search "
-                    "you write."
+                    "views as the source of truth for any REPLACE_BLOCK "
+                    "/ DELETE_BLOCK search you write.\n\n"
+                    + _SEARCH_BLOCK_COPY_RULES
                 ),
             )
     # 2026-07-04 fix — always-on cross-round workspace context.
@@ -14869,11 +15214,108 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         enforce_read = bool(
             getattr(gw_cfg, "enforce_read_before_edit", False)
         )
+        from harness.patcher import parse_patch_blocks, apply_patch_blocks
+        # Fix 5d parity with patching_node — proactive scope refresh.
+        # Dry-run the screen against the LLM's parsed blocks; if any
+        # surgical edits target files the screen would flag as
+        # stuck-reread, inject the current on-disk content and
+        # re-dispatch so the LLM produces landable edits on THIS
+        # round. Complements the reactive stuck-reread auto-inject
+        # downstream. Fires at most once per repair_node call.
+        _repair_preflight_reads = _parse_read_blocks(response.content)
+        if not _repair_preflight_reads:
+            _repair_probe_blocks = parse_patch_blocks(patch_payload)
+            if _repair_probe_blocks:
+                _repair_pf_kept, _repair_pf_rejects = _pre_patch_screen(
+                    _repair_probe_blocks, loop_counter,
+                    files_seen_by_llm, workspace,
+                )
+                _repair_pf_files: list[str] = []
+                _repair_pf_seen: set[str] = set()
+                for _rpr in _repair_pf_rejects:
+                    _rperr = getattr(_rpr, "error", "") or ""
+                    if not isinstance(_rperr, str):
+                        continue
+                    if "[screen:stuck-reread]" not in _rperr:
+                        continue
+                    _rpf = getattr(_rpr, "file", "") or ""
+                    if not _rpf or _rpf in _repair_pf_seen:
+                        continue
+                    if not os.path.isfile(os.path.join(workspace, _rpf)):
+                        continue
+                    _repair_pf_seen.add(_rpf)
+                    _repair_pf_files.append(_rpf)
+                if _repair_pf_files:
+                    _repair_pf_injected = _resolve_read_blocks(
+                        [(p, None) for p in _repair_pf_files],
+                        workspace,
+                        record_hashes_into=files_seen_by_llm,
+                    )
+                    if _repair_pf_injected:
+                        messages.append(MessageDict(
+                            role="assistant", content=response.content,
+                        ))
+                        messages.append(MessageDict(
+                            role="user",
+                            content=(
+                                "[Auto-injected by harness — "
+                                "preemptive scope refresh]\nThe "
+                                "surgical edits in your response "
+                                "above target file(s) that were "
+                                "modified earlier in this session "
+                                "and whose current content you have "
+                                "not yet been shown. Rather than let "
+                                "the pre-patch screen reject them "
+                                "and force a READ_FILE round-trip, "
+                                "the harness has inlined the "
+                                "authoritative on-disk content "
+                                "below. Re-emit your patch block(s) "
+                                "NOW — follow the copy rules in the "
+                                "injected section. Do NOT emit "
+                                "READ_FILE for these files; this "
+                                "refresh counts as your read.\n\n"
+                                + _repair_pf_injected
+                            ),
+                        ))
+                        logger.info(
+                            "[repair_node] Preemptive scope refresh: "
+                            "%d file(s) auto-injected before screen "
+                            "(%s). Re-dispatching so the LLM can "
+                            "produce landable edits without a "
+                            "rejected round.",
+                            len(_repair_pf_files), _repair_pf_files,
+                        )
+                        try:
+                            from harness.observability import emit_event
+                            emit_event(
+                                "repair_preflight_scope_refresh",
+                                files=list(_repair_pf_files),
+                                total_repairs=loop_counter.get(
+                                    "total_repairs", 0,
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001 — telemetry must not block
+                            pass
+                        response, new_budget = await _dispatch_repair(
+                            messages, new_budget,
+                        )
+                        # Re-derive patch_payload from the refreshed
+                        # response so the downstream screen / apply
+                        # runs against the new content.
+                        patch_payload = _strip_read_blocks(response.content)
+                        try:
+                            promoted_extra = _parse_promote_blocks(patch_payload)
+                            patch_payload = _strip_promote_blocks(patch_payload)
+                            if promoted_extra:
+                                for _pex in promoted_extra:
+                                    if _pex not in promoted_for_next:
+                                        promoted_for_next.append(_pex)
+                        except Exception:  # noqa: BLE001
+                            pass
         # Pre-patch anti-drift screen. Filters batches the LLM cannot
         # possibly land against a stale mental model: intra-turn over-cap,
         # stuck-file-without-fresh-view, and byte-identical repeat search
         # blocks. See ``_pre_patch_screen`` for the full rationale.
-        from harness.patcher import parse_patch_blocks, apply_patch_blocks
         _blocks_parsed = parse_patch_blocks(patch_payload)
         _blocks_kept, _screen_rejections = _pre_patch_screen(
             _blocks_parsed, loop_counter, files_seen_by_llm, workspace,
@@ -14905,6 +15347,57 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # Merge screen rejections so the LLM sees them in the next round's
         # status message alongside the patcher's own results.
         patch_results = list(_screen_rejections) + list(patch_results)
+        # Fix 5c parity with patching_node — auto-inject current
+        # content for any stuck-reread file(s) the screen rejected.
+        # Same rationale as graph.py:~4392: skip the READ_FILE
+        # round-trip, refresh files_seen_by_llm so Guard 2 passes
+        # next iteration.
+        _stuck_reread_files: list[str] = []
+        _seen_stuck: set[str] = set()
+        for _r in _screen_rejections:
+            _err = getattr(_r, "error", "") or ""
+            if not isinstance(_err, str):
+                continue
+            if "[screen:stuck-reread]" not in _err:
+                continue
+            _rf = getattr(_r, "file", "") or ""
+            if not _rf or _rf in _seen_stuck:
+                continue
+            if not os.path.isfile(os.path.join(workspace, _rf)):
+                continue
+            _seen_stuck.add(_rf)
+            _stuck_reread_files.append(_rf)
+        if _stuck_reread_files:
+            _auto_read_blocks = [(p, None) for p in _stuck_reread_files]
+            _injected = _resolve_read_blocks(
+                _auto_read_blocks, workspace,
+                record_hashes_into=files_seen_by_llm,
+            )
+            if _injected:
+                messages.append(MessageDict(
+                    role="user",
+                    content=(
+                        "[Auto-injected by harness — stuck-reread "
+                        "recovery]\nYour previous surgical edits "
+                        "against the file(s) below were rejected "
+                        "because the harness had no record of you "
+                        "reading them since they were last modified. "
+                        "Rather than force a READ_FILE round-trip, "
+                        "the harness has inlined their current "
+                        "on-disk content here. Follow the copy rules "
+                        "in the injected section on your next patch "
+                        "attempt. Do NOT emit READ_FILE for these "
+                        "files.\n\n"
+                        + _injected
+                    ),
+                ))
+                logger.info(
+                    "[repair_node:screen] Auto-injected current "
+                    "content for %d stuck-reread file(s): %s. "
+                    "files_seen_by_llm refreshed so next round's "
+                    "screen will pass.",
+                    len(_stuck_reread_files), _stuck_reread_files,
+                )
 
         # Append the LLM response to messages
         messages.append(MessageDict(role="assistant", content=response.content))
@@ -15366,6 +15859,10 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         )
         _emit_per_stage_spend_summary(token_tracker)
 
+        # Task 11 (2026-07-12): park the hashes on loop_counter for
+        # cross-node persistence; see patching_node's matching call
+        # and ``_FILES_SEEN_LOOP_KEY``.
+        _stash_files_seen(loop_counter, files_seen_by_llm)
         return {
             "messages": messages,
             "modified_files": modified_files,
@@ -21438,6 +21935,22 @@ def route_after_deployment(state: AgentState) -> Literal[
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
+def hitl_next_node(trigger: str) -> str:
+    """Map a HITL trigger to the node the router will re-enter on resume.
+
+    Shared by ``route_after_hitl`` and the CLI's headless auto-resume
+    logger so the log line matches the actual routing decision. Prior
+    to this helper the CLI hard-coded "Routing to compiler_node" even
+    when the router was about to jump to ``decomposition_node`` or
+    ``traceability_node``, which confused operators reading the log.
+    """
+    if trigger in ("decomposition_validation_failed", "decomposition_missing"):
+        return "decomposition_node"
+    if trigger == "traceability_block":
+        return "traceability_node"
+    return "compiler_node"
+
+
 def route_after_hitl(state: AgentState) -> Literal[
     "compiler_node", "decomposition_node", "traceability_node", "__end__"
 ]:
@@ -21478,27 +21991,26 @@ def route_after_hitl(state: AgentState) -> Literal[
         return "__end__"
 
     trigger = str(node_state.get("hitl_trigger", "") or "")
-    if trigger in ("decomposition_validation_failed", "decomposition_missing"):
+    next_node = hitl_next_node(trigger)
+    if next_node == "decomposition_node":
         logger.info(
             "[router] HITL resolved (trigger=%s). Routing to decomposition_node "
             "for re-validation — compiler_node would find no source files.",
             trigger,
         )
-        return "decomposition_node"
-    if trigger == "traceability_block":
+    elif next_node == "traceability_node":
         logger.info(
             "[router] HITL resolved (trigger=%s). Routing to traceability_node "
             "— the build was already green when the gate failed.",
             trigger,
         )
-        return "traceability_node"
-
-    logger.info(
-        "[router] HITL resolved (trigger=%s). Routing to compiler_node "
-        "for re-validation.",
-        trigger or "unknown",
-    )
-    return "compiler_node"
+    else:
+        logger.info(
+            "[router] HITL resolved (trigger=%s). Routing to compiler_node "
+            "for re-validation.",
+            trigger or "unknown",
+        )
+    return next_node
 
 
 # ---------------------------------------------------------------------------

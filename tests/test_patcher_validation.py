@@ -313,6 +313,36 @@ class TestPostPatchValidation:
                 assert "existing = 1" in f.read()
 
     @pytest.mark.asyncio
+    async def test_create_file_promotion_rolls_back_broken_syntax(self):
+        # Class fix (finsearch 156032347): CREATE_FILE now auto-promotes
+        # to REWRITE_FILE when the LLM's new content is highly similar
+        # to what's on disk (typical repair-round re-emit shape). The
+        # safety net that makes this move safe is post-patch parse
+        # validation — if the promoted rewrite produces broken syntax,
+        # ``_validate_and_maybe_rollback`` restores the pre-patch
+        # content just like it would for any REWRITE_FILE. This test
+        # locks that invariant so a future patcher change can't
+        # silently drop the rollback and let a broken auto-promotion
+        # land on disk.
+        with tempfile.TemporaryDirectory() as td:
+            clean = "def foo():\n    return 1\n"
+            with open(os.path.join(td, "m.py"), "w") as f:
+                f.write(clean)
+            patcher = HybridPatcher(td)
+            # Second create is highly similar (would promote) but
+            # syntactically broken (missing closing paren).
+            broken_promotion = "def foo(:\n    return 2\n"
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.CREATE_FILE,
+                file="m.py",
+                content=broken_promotion,
+            )])
+            assert results[0].success is False
+            # File must be restored to the pre-patch content.
+            with open(os.path.join(td, "m.py")) as f:
+                assert f.read() == clean
+
+    @pytest.mark.asyncio
     async def test_apply_all_continues_past_validation_rollback(self):
         # A validation-rolled-back block must not stop subsequent blocks
         # from applying — same invariant as

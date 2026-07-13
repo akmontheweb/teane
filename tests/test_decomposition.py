@@ -888,6 +888,84 @@ def test_decomposition_node_unknown_req_key_repair_skipped_when_budget_zero(
     assert len(gw.calls) == 1
 
 
+# ---------------------------------------------------------------------------
+# Too-many-features auto-repair — same 1-shot contract as cycles/unknown-keys
+# ---------------------------------------------------------------------------
+
+def _payload_with_too_many_features() -> str:
+    """A payload that trips MAX_FEATURES_PER_PASS with one-line-item
+    features (finsearch session finsearch-agile-1783819612 hit exactly
+    this: 23 features against the 8-cap)."""
+    p = json.loads(_valid_payload())
+    # Emit MAX_FEATURES_PER_PASS + 1 features so we're strictly over cap.
+    overflow_count = decomposition.MAX_FEATURES_PER_PASS + 1
+    p["features"] = [
+        {"feature_key": f"feat-{i:02d}", "name": f"Feature {i:02d}",
+         "description": "line item"}
+        for i in range(overflow_count)
+    ]
+    return json.dumps(p)
+
+
+def test_decomposition_node_too_many_features_auto_repairs(workspace: str):
+    """Too many features in the first response → 1-shot repair → commit."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_payload_with_too_many_features(), _valid_payload()])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["current_gate"] == "STORIES"
+    assert out["node_state"]["decomposition_complete"] is True
+    assert out["node_state"]["story_count"] == 2
+    assert len(gw.calls) == 2
+    repair_msg = gw.calls[1]["messages"][-1]["content"]
+    assert "too many features" in repair_msg
+    # The repair prompt must name the cap so the LLM knows the target.
+    assert str(decomposition.MAX_FEATURES_PER_PASS) in repair_msg
+    # And it must instruct feature-level merging (not story dropping).
+    assert "merging" in repair_msg or "merge" in repair_msg
+
+
+def test_decomposition_node_too_many_features_repair_failure_routes_to_hitl(
+    workspace: str,
+):
+    """Repair attempt still over-cap → HITL with both errors in message."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([
+        _payload_with_too_many_features(),
+        _payload_with_too_many_features(),
+    ])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    err = out["node_state"]["error"]
+    assert err.startswith("validation:")
+    assert "repair_failed" in err
+    assert len(gw.calls) == 2
+
+
+def test_decomposition_node_too_many_features_repair_skipped_when_budget_zero(
+    workspace: str,
+):
+    """Budget exhausted after first call → no repair attempted."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    gw = _FakeGateway([_payload_with_too_many_features()], budget_after=0.0)
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    assert out["node_state"]["error"].startswith("validation:")
+    assert "repair_failed" not in out["node_state"]["error"]
+    assert len(gw.calls) == 1
+
+
 def test_prompt_constraint_forbids_suffix_extrapolation():
     """Part 2 defense-in-depth: the planner prompt's Constraints block
     must explicitly warn against extrapolating listed keys with

@@ -76,6 +76,67 @@ def test_deterministic_rule_never_empty_on_empty_state():
     assert deterministic_rule("", {})
 
 
+# Signature-specific rules — finsearch session 156032347 (2026-07-13):
+# 5+ repair rounds oscillated on `assert 400 == 422` because FastAPI's
+# Pydantic ValidationError returns 422 by default while the test expected
+# 400. The signature detector prepends a canned rule pointing at the
+# contract decision (install a global handler OR change the assertion)
+# so the next run's planner has direct advice rather than the generic
+# trigger-taxonomy fallback.
+
+
+def test_signature_rule_fastapi_400_vs_422_matches_forward():
+    # `assert 400 == 422` shape — the test expected 400 but got 422.
+    state = _state(compiler_errors=[{
+        "severity": "error",
+        "message": "AssertionError: assert 400 == 422",
+        "file": "server/tests/test_search.py", "line": 42,
+    }])
+    r = deterministic_rule("repair_loop_limit", state)
+    assert r
+    # Canned rule elements — the class fix is that these show up
+    # regardless of trigger.
+    assert "422" in r and "400" in r
+    assert "pydantic" in r.lower() or "ValidationError" in r
+    assert "exception_handler" in r or "global" in r.lower()
+
+
+def test_signature_rule_fastapi_422_vs_400_matches_reverse():
+    # `assert 422 == 400` — same class of bug, opposite operand order.
+    state = _state(compiler_errors=[{
+        "severity": "error",
+        "message": "AssertionError: assert 422 == 400",
+        "file": "server/tests/test_search.py", "line": 42,
+    }])
+    r = deterministic_rule("repair_loop_limit", state)
+    assert "422" in r and "400" in r
+
+
+def test_signature_rule_leads_but_preserves_trigger_advice():
+    # When a signature rule fires, the trigger-taxonomy advice should
+    # still appear as CONTEXT (not vanish) so the memory keeps trace of
+    # what class of run this was.
+    state = _state(compiler_errors=[{
+        "severity": "error",
+        "message": "assert 400 == 422",
+    }])
+    r = deterministic_rule("repair_loop_limit", state)
+    assert "422" in r  # signature rule
+    assert "iteration cap" in r or "repair" in r.lower()  # trigger context
+
+
+def test_signature_rule_does_not_fire_on_unrelated_errors():
+    # A run without the 400/422 pattern must fall back to the generic
+    # trigger-taxonomy path (existing behavior preserved).
+    state = _state(compiler_errors=[{
+        "severity": "error",
+        "message": "ImportError: cannot import name 'foo'",
+    }])
+    r = deterministic_rule("repair_loop_limit", state)
+    # 422 must not appear from the signature rule.
+    assert "422" not in r
+
+
 # ---------------------------------------------------------------------------
 # sanitize_rule
 # ---------------------------------------------------------------------------

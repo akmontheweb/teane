@@ -427,6 +427,122 @@ class TestCrossDomainScopeGuard:
         ]
         assert any("forecast.py" in r.getMessage() for r in warned)
 
+
+class TestCrossTestRootScopeGuard:
+    """Finsearch session 156032347 root cause: LLM emitted
+    ``server/app/services/tests/test_filing_service.py`` on one story
+    while ``server/app/tests/test_filing_service.py`` was already in
+    another story's scope_files. Two mirrored test trees for the same
+    module trap the repair loop in a REPLACE_BLOCK oscillation on the
+    shared implementation file. The patcher's DUPLICATE_TEST_ROOT guard
+    catches this at land time — but by then a codegen round is spent.
+    The decomposition guard pre-filters, saving the round."""
+
+    def test_drops_deeper_test_root_when_shallower_exists(self, caplog):
+        # Both stories name a test file with the same test-scoped
+        # suffix (`tests/test_filing_service.py`) under DIFFERENT test
+        # roots. The deeper (services/tests/) one is dropped; the
+        # shallower (tests/) one is kept.
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Filing service canonical",
+                "acceptance_criteria": [
+                    "Filing service parses EDGAR filings",
+                ],
+                "scope_files": [
+                    "server/app/services/filing_service.py",
+                    "server/app/tests/test_filing_service.py",
+                ],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Filing edge cases",
+                "acceptance_criteria": [
+                    "Filing service handles restatements",
+                ],
+                "scope_files": [
+                    "server/app/services/tests/test_filing_service.py",
+                ],
+            },
+        ])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        by_key = {s["title"]: s for s in stories}
+        # STORY-001 (shallower root) keeps its test file.
+        assert (
+            "server/app/tests/test_filing_service.py"
+            in by_key["Filing service canonical"]["scope_files"]
+        )
+        # STORY-002 (deeper root) lost its cross-root duplicate.
+        assert (
+            "server/app/services/tests/test_filing_service.py"
+            not in by_key["Filing edge cases"]["scope_files"]
+        )
+        warned = [
+            r for r in caplog.records
+            if "cross-test-root drop" in r.getMessage()
+        ]
+        assert any(
+            "server/app/services/tests/test_filing_service.py" in
+            r.getMessage() for r in warned
+        )
+
+    def test_does_not_touch_stories_with_different_test_suffixes(self):
+        # Two stories, both with test files, but DIFFERENT basenames.
+        # Neither collides — both scope_files entries survive.
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Filing service tests",
+                "acceptance_criteria": ["Filings parsed"],
+                "scope_files": [
+                    "server/app/tests/test_filing_service.py",
+                ],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Company service tests",
+                "acceptance_criteria": ["Companies searched"],
+                "scope_files": [
+                    "server/app/tests/test_company_service.py",
+                ],
+            },
+        ])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "server/app/tests/test_filing_service.py",
+        ]
+        assert stories[1]["scope_files"] == [
+            "server/app/tests/test_company_service.py",
+        ]
+
+    def test_non_test_basenames_are_ignored(self):
+        # Two stories, same non-test basename under different roots.
+        # Guard MUST NOT fire — this is legitimate (e.g. two __init__.py
+        # files across sibling packages).
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Auth package init",
+                "acceptance_criteria": ["Auth exports registered"],
+                "scope_files": ["server/app/auth/__init__.py"],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Billing package init",
+                "acceptance_criteria": ["Billing exports registered"],
+                "scope_files": ["server/app/billing/__init__.py"],
+            },
+        ])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "server/app/auth/__init__.py",
+        ]
+        assert stories[1]["scope_files"] == [
+            "server/app/billing/__init__.py",
+        ]
+
     def test_keeps_entry_matching_story_title(self):
         payload = _payload_with_one_feature([{
             "story_key": "STORY-001",

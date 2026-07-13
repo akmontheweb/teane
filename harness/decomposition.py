@@ -251,6 +251,97 @@ def _context_tokens(*text_sources: Any) -> set[str]:
     return tokens
 
 
+# Finsearch session 156032347 root cause: LLM emitted
+# ``server/app/services/tests/test_filing_service.py`` in one story
+# while ``server/app/tests/test_filing_service.py`` was already in
+# another story's scope_files. Two mirrored test trees for the same
+# module → the patcher's DUPLICATE_TEST_ROOT guard fires at land time
+# (2 rejections in the finsearch run), but by then the LLM has already
+# spent a codegen round and the harness has to re-plan. Catching the
+# collision at decomposition time — before any code is emitted — saves
+# the round.
+_TEST_ROOT_SEGMENTS: frozenset[str] = frozenset({
+    "tests", "test", "__tests__",
+})
+_TEST_BASENAME_PATTERNS = (
+    re.compile(r"^test_[^/\\]+\.py$"),
+    re.compile(r"^[^/\\]+_test\.py$"),
+    re.compile(r"^[^/\\]+\.test\.[tj]sx?$"),
+    re.compile(r"^[^/\\]+\.spec\.[tj]sx?$"),
+)
+
+
+def _is_test_scope_basename(basename: str) -> bool:
+    """True when basename matches one of the test-file naming patterns."""
+    return any(p.match(basename) for p in _TEST_BASENAME_PATTERNS)
+
+
+def _extract_test_scope_suffix(rel_path: str) -> Optional[str]:
+    """Return the substring of ``rel_path`` starting at the leftmost
+    ``tests`` / ``test`` / ``__tests__`` segment. When no such segment
+    is present, returns ``None`` — the path isn't under a tests root."""
+    parts = re.split(r"[/\\]", rel_path)
+    for i, seg in enumerate(parts):
+        if seg in _TEST_ROOT_SEGMENTS:
+            return "/".join(parts[i:])
+    return None
+
+
+def _drop_cross_test_root_scope_files_in_decomposition(
+    stories: list[dict[str, Any]],
+) -> None:
+    """In-place: when two stories name the same test-scoped suffix under
+    different tests roots (e.g. ``server/app/tests/test_x.py`` and
+    ``server/app/services/tests/test_x.py``), drop the deeper/nested
+    copy and keep the shallower canonical. Same failure shape as the
+    patcher's DUPLICATE_TEST_ROOT guard, caught pre-emission so the LLM
+    doesn't burn a codegen round on the collision.
+
+    Canonical selection: the shortest path (least-nested tests root)
+    wins. Ties broken by lexical order for determinism.
+    """
+    # For each test-scoped suffix seen in any story's scope_files,
+    # gather (story_index, story_key, full_path) tuples.
+    by_suffix: dict[str, list[tuple[int, str, str]]] = {}
+    for idx, story in enumerate(stories):
+        scope = story.get("scope_files") or []
+        for path in scope:
+            basename = os.path.basename(path)
+            if not _is_test_scope_basename(basename):
+                continue
+            suffix = _extract_test_scope_suffix(path)
+            if suffix is None:
+                continue
+            by_suffix.setdefault(suffix, []).append(
+                (idx, str(story.get("story_key") or f"idx{idx}"), path)
+            )
+
+    for suffix, entries in by_suffix.items():
+        if len(entries) < 2:
+            continue
+        # Canonical = shortest path, break ties lexically.
+        canonical_path = min(
+            (path for _, _, path in entries),
+            key=lambda p: (len(p), p),
+        )
+        for idx, story_key, path in entries:
+            if path == canonical_path:
+                continue
+            # Drop this cross-root entry from the story's scope_files.
+            scope = stories[idx].get("scope_files") or []
+            stories[idx]["scope_files"] = [
+                s for s in scope if s != path
+            ]
+            logger.warning(
+                "[decomposition] cross-test-root drop: %s scope_files "
+                "entry %r duplicates the canonical %r under a different "
+                "tests root (shared test-scoped suffix %r). Only one "
+                "test file per test-scoped path is safe; keeping the "
+                "shallower root, dropping the deeper.",
+                story_key, path, canonical_path, suffix,
+            )
+
+
 def _drop_cross_domain_scope_files(
     story_key: str,
     scope: list[str],
@@ -616,6 +707,25 @@ Note the two ``scope_files`` shapes above:
   ``auth/email.py``, etc. — the planner isn't the right place to
   decide the layout when the ACs don't fix it. Empty is honest.
 
+## Stack invariants
+
+The supported stacks are Python (backend) + React/TypeScript/Tailwind
+(frontend). `scope_files` entries MUST follow the stack extensions:
+
+- Frontend source (paths under `client/`, `frontend/`, `web/`, `ui/`,
+  `webapp/`, `app/src/`, or anything containing `/src/components/`,
+  `/src/pages/`, `/src/hooks/`, `/src/routes/`, `/src/features/`,
+  `/src/lib/`): use `.tsx` for components/tests and `.ts` for hooks/
+  utilities. **Never `.js` or `.jsx`.** Root-level frontend config
+  (`webpack.config.js`, `jest.config.js`, `.eslintrc.js`) is exempt
+  from this rule.
+- Backend source (paths under `server/`, `backend/`, `api/`): use
+  `.py`. Never `.js`/`.ts`.
+- The deterministic guard downstream rewrites `.js`/`.jsx` under
+  frontend paths to `.tsx` and logs a stack-enforce warning naming
+  the story — save the log noise by emitting the right extension the
+  first time.
+
 ## Constraints
 
 - Emit ONE story per user-facing ``#### Story:`` / ``#### Enabler
@@ -782,6 +892,14 @@ the feature name, or an acceptance criterion — cross-domain entries
 (e.g. a story titled "Source Traceability" pointing at
 ``server/services/forecast.py``) are silently dropped by the guard
 downstream.
+
+Stack invariants: frontend source (paths under `client/`, `frontend/`,
+`web/`, `ui/`, `webapp/`, `app/src/`, or containing `/src/components/`,
+`/src/pages/`, `/src/hooks/`, `/src/routes/`, `/src/features/`, or
+`/src/lib/`) MUST use `.tsx` for components/tests and `.ts` for hooks/
+utilities — never `.js` / `.jsx`. Backend source (`server/`, `backend/`,
+`api/`) MUST use `.py`. Root-level frontend config (`webpack.config.js`,
+`jest.config.js`, `.eslintrc.js`) is exempt.
 
 Constraints:
 - AT MOST {MAX_STORIES_PER_AUGMENT_PASS} new stories per pass. A change
@@ -1109,6 +1227,7 @@ def _validate_augment_payload(
             ),
             "external_ref": s.get("external_ref") or None,
         })
+    _drop_cross_test_root_scope_files_in_decomposition(cleaned)
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,
@@ -1200,6 +1319,7 @@ def _validate_stories_payload(
             ),
             "external_ref": s.get("external_ref") or None,
         })
+    _drop_cross_test_root_scope_files_in_decomposition(cleaned)
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,

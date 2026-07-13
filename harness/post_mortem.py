@@ -135,12 +135,70 @@ def _top_errors(state: Mapping[str, Any], limit: int = 3) -> list[dict[str, Any]
     return errors[:limit]
 
 
+# Signature-specific rules. Each entry pairs a regex that matches a
+# well-known assertion-shape or diagnostic-body against a canned
+# forward-looking rule. When ``deterministic_rule`` sees a top-diagnostic
+# message that matches one of these signatures, it prepends the canned
+# rule to the trigger-taxonomy fallback so the learned-rules memory
+# carries the SPECIFIC advice for the observed failure class, not just
+# the generic trigger advice.
+#
+# The finsearch session 156032347 400-vs-422 oscillation (5+ repair
+# rounds, 1 HITL trip on ``server/app/tests/test_company_api.py::test_
+# search_returns_400_on_empty_query``) is the canonical case: FastAPI /
+# Pydantic returns 422 for schema-invalid input, the test asserted 400,
+# and neither side would give. The signature rule tells the next run's
+# planner to either (a) install a global exception handler that maps
+# ValidationError → 400 in the endpoint contract, or (b) update the
+# test to assert 422 — whichever matches the SPEC_REQUIREMENTS.md
+# contract for that endpoint.
+_SIGNATURE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"assert\s+(?:400\s*==\s*422|422\s*==\s*400)|"
+            r"AssertionError.*(?:400\s*==\s*422|422\s*==\s*400)",
+            re.IGNORECASE,
+        ),
+        "For FastAPI endpoints, Pydantic ValidationError yields HTTP 422 "
+        "by default, not 400 — a repair loop that oscillates on `assert "
+        "400 == 422` (or the reverse) is fighting this default. Pick "
+        "ONE contract at planning time: either (a) install a global "
+        "exception_handler(RequestValidationError) that returns 400 on "
+        "the endpoint(s) whose SPEC_REQUIREMENTS.md contract mandates "
+        "400 for invalid input, OR (b) change the test to assert 422 "
+        "when the spec doesn't mandate 400. Do NOT loop the repair "
+        "node on the same assertion — it can't converge without the "
+        "contract decision.",
+    ),
+)
+
+
+def _match_signature_rule(state: Mapping[str, Any]) -> Optional[str]:
+    """When any of the top diagnostics matches a well-known assertion
+    signature, return the canned forward-looking rule for that class.
+    None otherwise — caller falls through to the trigger-taxonomy
+    advice.
+    """
+    for err in _top_errors(state, limit=5):
+        msg = str(err.get("message") or "")
+        if not msg:
+            continue
+        for pattern, rule in _SIGNATURE_RULES:
+            if pattern.search(msg):
+                return rule
+    return None
+
+
 def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
     """Template rule from the trigger taxonomy + top diagnostics.
 
     The no-LLM floor of the learning loop: always returns a non-empty,
-    single-line, forward-looking rule.
+    single-line, forward-looking rule. When a well-known assertion-shape
+    signature matches one of the top diagnostics (e.g. FastAPI 400-vs-
+    422), the signature-specific rule leads and the trigger-taxonomy
+    advice becomes context.
     """
+    signature_rule = _match_signature_rule(state)
     prefix = _trigger_prefix(trigger)
     advice = _TRIGGER_ADVICE.get(prefix, _GENERIC_ADVICE)
     detail = ""
@@ -159,6 +217,11 @@ def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
         err_part = f" Top errors: {codes}."
     build_cmd = str(state.get("build_command") or "").strip()
     cmd_part = f" Build command: `{build_cmd}`." if build_cmd else ""
+    if signature_rule:
+        return sanitize_rule(
+            f"{signature_rule} Context: {advice}{detail}."
+            f"{err_part}{cmd_part}"
+        )
     return sanitize_rule(
         f"In this repo, {advice}{detail}.{err_part}{cmd_part}"
     )

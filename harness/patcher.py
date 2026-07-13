@@ -1374,6 +1374,45 @@ class TextPatcher(BasePatcher):
                 ),
             )
 
+        # Structural-file guard: JSON/YAML/TOML edits via REPLACE_BLOCK
+        # are inherently fragile — one misplaced brace, trailing comma,
+        # or indent shift breaks the whole file, and the LLM's copy
+        # fidelity degrades fast with line count. Finsearch session
+        # 156032347 shipped 2 broken JSON patches (client/tsconfig.test
+        # .json, config/health_score_benchmarks.json) via multi-line
+        # REPLACE_BLOCK — each rolled back correctly but burned a
+        # repair round. Route multi-line structural edits to REWRITE_
+        # FILE instead, where the LLM emits the whole file and the
+        # parser validates it in one shot.
+        #
+        # The 4-line threshold matches the patcher's own SEARCH_BLOCK_
+        # COPY_RULES guidance ("prefer a single REWRITE_FILE over a
+        # REPLACE_BLOCK — the copy-fidelity risk grows with SEARCH
+        # size"): single-value edits (1-3 lines) stay on the fast path,
+        # anything larger goes through the escape hatch.
+        _lower_ext = filepath.lower()
+        if (
+            _lower_ext.endswith((".json", ".yaml", ".yml", ".toml"))
+            and (search.count("\n") >= 4 or replace.count("\n") >= 4)
+        ):
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.REPLACE_BLOCK,
+                error=(
+                    f"REPLACE_BLOCK on {filepath} rejected: multi-line "
+                    f"REPLACE_BLOCK on structural files (JSON/YAML/TOML) "
+                    f"is fragile — a misplaced brace, trailing comma, or "
+                    f"indent shift breaks the whole file and the parser "
+                    f"rolls back the whole patch. Use REWRITE_FILE with "
+                    f"the complete intended file contents instead. Search "
+                    f"had {search.count(chr(10)) + 1} lines; replace had "
+                    f"{replace.count(chr(10)) + 1} lines; the threshold "
+                    f"for structural files is 4 lines. Single-value edits "
+                    f"(e.g. one line changed) still work via REPLACE_BLOCK."
+                ),
+            )
+
         try:
             original = await _aread(full_path)
         except OSError as exc:

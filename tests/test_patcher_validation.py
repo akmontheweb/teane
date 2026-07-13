@@ -313,6 +313,91 @@ class TestPostPatchValidation:
                 assert "existing = 1" in f.read()
 
     @pytest.mark.asyncio
+    async def test_replace_block_on_json_rejects_multiline_edits(self):
+        # Class fix (finsearch 156032347): multi-line REPLACE_BLOCK on
+        # structural files (JSON/YAML/TOML) is fragile — one misplaced
+        # brace or trailing comma breaks the whole file. Finsearch
+        # shipped 2 broken JSON patches in one run (tsconfig.test.json,
+        # health_score_benchmarks.json), each rolled back correctly by
+        # the post-patch validator but burning a repair round. Reject at
+        # the patcher entry point with REWRITE_FILE guidance so the LLM
+        # skips the doomed round entirely.
+        with tempfile.TemporaryDirectory() as td:
+            initial = (
+                "{\n"
+                '  "a": 1,\n'
+                '  "b": 2,\n'
+                '  "c": 3,\n'
+                '  "d": 4\n'
+                "}\n"
+            )
+            with open(os.path.join(td, "cfg.json"), "w") as f:
+                f.write(initial)
+            patcher = HybridPatcher(td)
+            # Search + replace both span 5 lines — well above the 4-line
+            # threshold for structural files.
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.REPLACE_BLOCK,
+                file="cfg.json",
+                search='  "a": 1,\n  "b": 2,\n  "c": 3,\n  "d": 4\n',
+                replace='  "a": 10,\n  "b": 20,\n  "c": 30,\n  "d": 40\n',
+            )])
+            assert results[0].success is False
+            err = (results[0].error or "").lower()
+            assert "structural" in err or "rewrite_file" in err
+            # Original file untouched — reject happens before the write.
+            with open(os.path.join(td, "cfg.json")) as f:
+                assert f.read() == initial
+
+    @pytest.mark.asyncio
+    async def test_replace_block_on_json_allows_small_edits(self):
+        # Single-line REPLACE_BLOCK on JSON stays on the fast path.
+        # Only multi-line edits (>= 4 lines) are gated.
+        with tempfile.TemporaryDirectory() as td:
+            initial = '{\n  "a": 1,\n  "b": 2\n}\n'
+            with open(os.path.join(td, "cfg.json"), "w") as f:
+                f.write(initial)
+            patcher = HybridPatcher(td)
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.REPLACE_BLOCK,
+                file="cfg.json",
+                search='  "a": 1,',
+                replace='  "a": 42,',
+            )])
+            assert results[0].success is True
+            with open(os.path.join(td, "cfg.json")) as f:
+                assert '"a": 42' in f.read()
+
+    @pytest.mark.asyncio
+    async def test_replace_block_on_python_ignores_structural_gate(self):
+        # The structural-file guard MUST NOT catch .py files — Python
+        # REPLACE_BLOCK on a multi-line block is a normal codegen shape.
+        with tempfile.TemporaryDirectory() as td:
+            initial = (
+                "def foo():\n"
+                "    x = 1\n"
+                "    y = 2\n"
+                "    z = 3\n"
+                "    return x + y + z\n"
+            )
+            with open(os.path.join(td, "m.py"), "w") as f:
+                f.write(initial)
+            patcher = HybridPatcher(td)
+            results = await patcher.apply_all([PatchBlock(
+                operation=OperationType.REPLACE_BLOCK,
+                file="m.py",
+                search=(
+                    "    x = 1\n    y = 2\n    z = 3\n"
+                    "    return x + y + z\n"
+                ),
+                replace=(
+                    "    x = 10\n    y = 20\n    z = 30\n"
+                    "    return x * y * z\n"
+                ),
+            )])
+            assert results[0].success is True
+
+    @pytest.mark.asyncio
     async def test_create_file_promotion_rolls_back_broken_syntax(self):
         # Class fix (finsearch 156032347): CREATE_FILE now auto-promotes
         # to REWRITE_FILE when the LLM's new content is highly similar

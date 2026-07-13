@@ -80,6 +80,79 @@ def _refuse_if_workspace_is_harness_root(workspace_path: str) -> bool:
     return True
 
 
+def _refuse_log_inside_workspace(
+    *,
+    workspace_path: str,
+    log_file: Optional[str],
+) -> Optional[str]:
+    """Return an error message when the operator-supplied ``--log`` path
+    (or, on Linux, a shell-redirected stdout target detected via
+    ``/proc/self/fd/1``) resolves under ``workspace_path``.
+
+    ``teane build`` wipes the workspace root at startup (preserving only
+    product_spec/, .git/, optionally docs/). A log file staged inside
+    that root — either via ``--log logs/build.txt`` or a shell redirect
+    like ``teane build ... > logs/build.txt`` — gets deleted BEFORE it
+    can capture the run. The finsearch session 156032347 operator hit
+    this: the redirected log file was silently unlinked and the run
+    became invisible.
+
+    Refuse at CLI-parse time so the operator relocates BEFORE the
+    destructive step. Returning ``None`` means the check passed.
+    """
+    workspace_root = os.path.realpath(os.path.abspath(workspace_path))
+
+    def _resolves_under_workspace(target: str) -> bool:
+        try:
+            abs_target = os.path.realpath(os.path.abspath(target))
+        except (OSError, ValueError):
+            return False
+        try:
+            common = os.path.commonpath([workspace_root, abs_target])
+        except ValueError:
+            return False
+        return common == workspace_root
+
+    if log_file:
+        if _resolves_under_workspace(log_file):
+            return (
+                f"Refusing to run: --log target {log_file!r} resolves "
+                f"inside the workspace {workspace_path!r}, which `teane "
+                f"build` wipes at startup. The log file would be deleted "
+                f"before it could capture the run. Move the log to a "
+                f"path outside the workspace (e.g. /tmp/teane.log or "
+                f"~/logs/teane.log) and re-run."
+            )
+
+    # Best-effort stdout redirection detection on Linux only. On other
+    # platforms /proc/self/fd is absent — we skip silently rather than
+    # raise, so this guard doesn't fire spuriously off-Linux.
+    stdout_target: Optional[str] = None
+    try:
+        stdout_target = os.readlink("/proc/self/fd/1")
+    except (OSError, AttributeError):
+        stdout_target = None
+    if stdout_target and stdout_target.startswith("/"):
+        # Only reject if it's a regular file (redirection target), not
+        # a tty/pipe/socket — those are interactive runs the operator
+        # sees on the terminal and can't accidentally lose to the wipe.
+        try:
+            is_regular = os.path.isfile(stdout_target)
+        except OSError:
+            is_regular = False
+        if is_regular and _resolves_under_workspace(stdout_target):
+            return (
+                f"Refusing to run: stdout appears to be redirected to "
+                f"{stdout_target!r}, which lives inside the workspace "
+                f"{workspace_path!r} that `teane build` wipes at "
+                f"startup. The log file would be deleted before it "
+                f"could capture the run. Redirect to a path outside "
+                f"the workspace (e.g. `> /tmp/teane.log`) or pass "
+                f"`--log /tmp/teane.log` and re-run."
+            )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Version reporting (P2.5)
 # ---------------------------------------------------------------------------
@@ -7222,6 +7295,24 @@ async def cmd_build(args: argparse.Namespace) -> int:
     args.generate_specs = False
     # Resolve --agile from CLI/config; load config first so we can read it.
     workspace_path = os.path.abspath(getattr(args, "workspace", None) or os.getcwd())
+
+    # Wipe-collision guard for --log target and shell-redirected stdout.
+    # `teane build` wipes the workspace root at startup (preserving only
+    # product_spec/, .git/, and optionally docs/). Anything else — a log
+    # file the operator staged under the workspace, or a shell-redirected
+    # stdout target inside the workspace — gets deleted before it can
+    # capture the run. Finsearch session 156032347 (2026-07-13) hit this
+    # exact shape: the operator redirected `>` to a path inside the
+    # workspace, teane wiped it, and the run was invisible until the
+    # operator moved the log outside the workspace and restarted. Refuse
+    # here so the operator relocates BEFORE the destructive step.
+    _wipe_target_guard_error = _refuse_log_inside_workspace(
+        workspace_path=workspace_path,
+        log_file=getattr(args, "log_file", None),
+    )
+    if _wipe_target_guard_error is not None:
+        logger.error("[build] %s", _wipe_target_guard_error)
+        return 1
     try:
         config = _strip_comments(load_raw_config())
     except Exception:  # noqa: BLE001 — cmd_run will re-load + error properly
@@ -10227,6 +10318,21 @@ def build_parser() -> argparse.ArgumentParser:
                 "recovery after a crash; concurrent runs corrupt patches."
             ),
         )
+        p.add_argument(
+            "--log",
+            default=None,
+            dest="log_file",
+            metavar="PATH",
+            help=(
+                "Optional file to receive a copy of the human-readable "
+                "log stream (stderr format). Must resolve OUTSIDE the "
+                "workspace — `teane build` wipes the workspace root at "
+                "startup and would delete a log file placed inside it. "
+                "Prefer this over shell redirection (`2> file.log`) when "
+                "running build in a headless session so the harness can "
+                "guard against the wipe collision."
+            ),
+        )
 
     # HITL gates shared by build / patch (deploy adds only --hitl-deployment).
     def _add_hitl_buildpatch(p: argparse.ArgumentParser) -> None:
@@ -10991,6 +11097,35 @@ def main() -> int:
     if getattr(args, "verbose", False):
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("harness").setLevel(logging.DEBUG)
+
+    # Attach a FileHandler that mirrors the human-readable stderr stream
+    # to the operator's --log path. Attached at dispatch time so it
+    # captures every log line from cmd_* onward, including the wipe-
+    # target guard (build) and the config-load path. The wipe-target
+    # guard in cmd_build refuses to run when the log target is inside
+    # the workspace, so this handler's file is always outside the
+    # doomed root and survives the run.
+    _log_file = getattr(args, "log_file", None)
+    if _log_file:
+        try:
+            _log_dir = os.path.dirname(os.path.abspath(_log_file))
+            if _log_dir:
+                os.makedirs(_log_dir, exist_ok=True)
+            _log_handler = logging.FileHandler(_log_file, mode="a", encoding="utf-8")
+            _log_handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            logging.getLogger().addHandler(_log_handler)
+        except OSError as exc:
+            # Don't halt the run for a log-write failure — the operator
+            # can still see everything on stderr and the JSONL session
+            # log. Just warn once so they know the file wasn't attached.
+            logger.warning(
+                "[cli] --log %r could not be opened for writing (%s); "
+                "continuing without the extra file handler.",
+                _log_file, exc,
+            )
 
     try:
         if args.command == "build":

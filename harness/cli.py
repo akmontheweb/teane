@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from harness import _platform
+from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS
 from harness.spec_files import (
     SPEC_FILE_EXTS,
     list_spec_files,
@@ -2973,6 +2974,16 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     ):
         if key in loop_counter:
             loop_counter[key] = 0
+    # PER_BATCH_CAP_COUNTERS is the canonical registry of caps that
+    # trip HITL (see harness/loop_counter_keys.py). Auto-resume must
+    # zero them or the very trigger that fired HITL trips again on
+    # the next entry and the session ping-pongs to the session cap
+    # (finsearch 156032347: test_generation counter carried 5 across
+    # batch boundary, tripped max_iterations on batch 110's first
+    # entry). Assignment (not ``if key in``) because a zero after
+    # first-time exposure is still the correct state.
+    for key in PER_BATCH_CAP_COUNTERS:
+        loop_counter[key] = 0
     # judge_ignored bookkeeping resets on auto-resume — those flags
     # exist to make the NEXT round's banner escalate ("YOU IGNORED THE
     # JUDGE"), which only makes sense in a single unbroken repair
@@ -3031,9 +3042,15 @@ def _reset_iteration_counters(
       so a different MISSING_DEP after resume starts fresh.
     """
     base = dict(loop_counter or {})
-    base["patching"] = 0
-    base["repair"] = 0
-    base["compiler"] = 0
+    # PER_BATCH_CAP_COUNTERS is the canonical registry of caps that
+    # trip HITL (see harness/loop_counter_keys.py). All three reset
+    # sites — this function, ``_reset_hitl_trip_counters``, and
+    # ``story_loop._batch_commit_node`` — must zero every key in it,
+    # or a resumed batch trips its cap without any real iteration
+    # (finsearch 156032347 batch 110). ``tests/test_reset_registry.py``
+    # enforces the invariant.
+    for key in PER_BATCH_CAP_COUNTERS:
+        base[key] = 0
     base["total_repairs"] = total_repairs
     base["missing_dep_consecutive_same"] = 0
     base["missing_dep_last_symbol"] = ""

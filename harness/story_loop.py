@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from harness import story_state
 from harness.batch_sizing import DETERMINISTIC_BATCH_SIZE as DEFAULT_BATCH_SIZE
+from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS
 
 logger = logging.getLogger(__name__)
 
@@ -1011,9 +1012,13 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
     loop_counter = dict(state.get("loop_counter", {}) or {})
     # Per-batch repair budgets reset between batches. Keys that don't
     # exist yet are tolerated — assignment, not increment.
+    # PER_BATCH_CAP_COUNTERS is the canonical registry (see
+    # harness/loop_counter_keys.py) shared with the two resume paths
+    # in cli.py. Site-specific extras stay listed inline below.
+    for key in PER_BATCH_CAP_COUNTERS:
+        loop_counter[key] = 0
     for key in (
-        "patching", "repair", "compiler", "total_repairs",
-        "review_spec", "review_code",
+        "total_repairs",
         "consecutive_zero_patch_rounds", "missing_dep_consecutive_same",
         "diagnostics_rounds_since_compile",
     ):

@@ -1662,9 +1662,13 @@ def _build_system_prompt(
 
     # Tier 1: Harness skills (harness/skills/*.md) — agent standards +
     # stack-specific skills filtered by `applies_to:` frontmatter.
+    # 8 KB per-file cap matches the style_guides cap and gives
+    # cross-cutting skills (makefile_python's build + coverage rules,
+    # unit_tests_*, etc.) room to breathe. Typical stack loads 3-4
+    # skills so worst-case concatenation stays under 32 KB.
     harness_skills = _load_skills_markdown(
         os.path.join(os.path.dirname(__file__), "skills"),
-        max_file_chars=4000,
+        max_file_chars=8000,
         workspace_tags=workspace_tags,
     )
     if harness_skills:

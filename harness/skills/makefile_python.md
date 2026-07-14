@@ -18,6 +18,9 @@ The harness sandbox pre-installs [`uv`](https://github.com/astral-sh/uv) on the 
 ### Always emit a `Makefile` in your first patch
 Pick the variant matching the dependency manifest you're also creating (or that already exists). Each variant has separate `build:` and `test:` targets plus a `.PHONY:` line, so operators can run `make test` independently.
 
+### Coverage gate (STRICTLY ENFORCED)
+Every `test:` target MUST include `--cov=<pkg>` (one flag per top-level source package — never `--cov=.`) and `--cov-fail-under=70`. `pytest-cov` is pre-installed in the sandbox; do NOT add it to `requirements.txt`. Pytest's own exit code IS the gate — no custom scripts, no stdout grep.
+
 **With `requirements.txt`:**
 ```make
 .PHONY: build test all clean
@@ -26,12 +29,12 @@ build:
 	uv pip install --system -r requirements.txt
 
 test:
-	python3 -m pytest -q
+	python3 -m pytest -q --cov=server --cov-fail-under=70
 
 all: build test
 
 clean:
-	rm -rf __pycache__ .pytest_cache build dist *.egg-info
+	rm -rf __pycache__ .pytest_cache build dist *.egg-info .coverage
 ```
 
 **With `pyproject.toml`** (editable install — covers Poetry, setuptools, hatch, PDM):
@@ -42,12 +45,12 @@ build:
 	uv pip install --system -e .
 
 test:
-	python3 -m pytest -q
+	python3 -m pytest -q --cov=src --cov-fail-under=70
 
 all: build test
 
 clean:
-	rm -rf __pycache__ .pytest_cache build dist *.egg-info
+	rm -rf __pycache__ .pytest_cache build dist *.egg-info .coverage
 ```
 
 **Bare workspace** (no manifest yet — only when you also can't create one):
@@ -59,10 +62,11 @@ build:
 	@true
 
 test:
-	python3 -m pytest -q
+	python3 -m pytest -q --cov=. --cov-fail-under=70
 
 all: build test
 ```
+Substitute `--cov=<pkg>` with your actual source root(s). NEVER omit `--cov` and `--cov-fail-under`; a build that runs zero tests would otherwise report success.
 
 ### Conventions to follow
 - Use TAB indentation inside recipes — Make rejects spaces with `*** missing separator. Stop.`

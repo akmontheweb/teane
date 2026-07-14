@@ -10,6 +10,30 @@ The workspace has `package.json` (any Node project) or `tsconfig.json` (TypeScri
 ### Always emit a `Makefile` in your first patch
 Pick the package manager from lockfile presence: `pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm (the default). For TypeScript, include a typecheck step in `build:`.
 
+### Coverage gate (STRICTLY ENFORCED)
+Every `test:` target MUST run Jest with coverage AND fail if line coverage < 70%. Two pieces of config:
+
+1. In `package.json`, add a `coverageThreshold` block (Jest reads it automatically):
+   ```json
+   {
+     "scripts": { "test": "jest --coverage" },
+     "jest": {
+       "coverageThreshold": { "global": { "lines": 70, "statements": 70 } },
+       "collectCoverageFrom": [
+         "src/**/*.{ts,tsx,js,jsx}",
+         "!src/**/*.d.ts",
+         "!src/**/index.{ts,tsx}",
+         "!src/main.tsx"
+       ]
+     }
+   }
+   ```
+2. Keep the Makefile target as just `npm test` (or `pnpm test`) — Jest itself enforces the threshold via non-zero exit. Do NOT invent alternative gates (grep, custom scripts).
+
+`collectCoverageFrom` is what pins the denominator — without it Jest measures only files touched by tests, which silently hides uncovered modules. Adjust the globs to your `src/` layout; do NOT include test files themselves in the denominator (`!**/*.test.*`).
+
+Vitest projects: the same `--coverage` flag applies (via `@vitest/coverage-v8`); Vitest reads `coverage.thresholds.lines` from `vite.config.ts`.
+
 **Plain Node (no TypeScript):**
 ```make
 .PHONY: build test all clean

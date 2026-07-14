@@ -1236,11 +1236,17 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
             "untested_count": len(report.untested_acs),
         }
         if report.has_failures():
+            # AC coverage is closed by ``teane test`` (Playwright pack
+            # generated against ACs), so the batch-level warning says
+            # so — earlier revisions warned that end-of-session would
+            # block on untested_acs, which is no longer accurate for
+            # build/patch flows.
             logger.warning(
                 "[traceability] batch gaps — reqs %d/%d (%.0f%%), "
                 "ACs %d/%d (%.0f%%); untraced=%d, untested=%d. "
-                "Soft warning at end-of-batch; end-of-session will "
-                "block unless traceability.enforce=false.",
+                "Soft warning at end-of-batch. End-of-session blocks "
+                "only on untraced requirements; AC coverage is closed "
+                "by `teane test` and does not block build/patch.",
                 report.traced_reqs, report.total_reqs,
                 report.req_coverage_pct,
                 report.verified_acs, report.total_acs,

@@ -448,6 +448,107 @@ class TestHarnessConfigPlumbing:
         assert enforce is True
 
 
+class TestReportGapSplit:
+    """The report exposes two independent gap classes: requirement gaps
+    (untraced) and AC-coverage gaps (untested_acs). The end-of-session
+    gate reads them separately so build / patch don't block on AC gaps
+    that only ``teane test`` can close.
+    """
+
+    def test_has_req_gap_true_when_untraced_populated(self):
+        r = TraceabilityReport(
+            spec_path="docs/x.md", total_reqs=1, traced_reqs=0,
+            untraced=[UntracedRequirement(req_id="FR-1", kind="fr")],
+            total_acs=0, verified_acs=0, untested_acs=[],
+        )
+        assert r.has_req_gap() is True
+        assert r.has_ac_gap() is False
+
+    def test_has_ac_gap_true_when_untested_acs_populated(self):
+        r = TraceabilityReport(
+            spec_path="docs/x.md", total_reqs=0, traced_reqs=0,
+            untraced=[], total_acs=1, verified_acs=0,
+            untested_acs=[UntestedCriterion(
+                ac_key="STORY-1.AC-1", story_key="STORY-1", text="c",
+            )],
+        )
+        assert r.has_req_gap() is False
+        assert r.has_ac_gap() is True
+
+    def test_has_failures_is_or_of_both_gaps(self):
+        # Backwards-compat: has_failures() stays the union so any caller
+        # that hasn't split still sees "something's off".
+        r_only_req = TraceabilityReport(
+            spec_path="docs/x.md", total_reqs=1, traced_reqs=0,
+            untraced=[UntracedRequirement(req_id="FR-1", kind="fr")],
+            total_acs=0, verified_acs=0, untested_acs=[],
+        )
+        r_only_ac = TraceabilityReport(
+            spec_path="docs/x.md", total_reqs=0, traced_reqs=0,
+            untraced=[], total_acs=1, verified_acs=0,
+            untested_acs=[UntestedCriterion(
+                ac_key="STORY-1.AC-1", story_key="STORY-1", text="c",
+            )],
+        )
+        r_clean = TraceabilityReport(
+            spec_path="docs/x.md", total_reqs=0, traced_reqs=0,
+            untraced=[], total_acs=0, verified_acs=0, untested_acs=[],
+        )
+        assert r_only_req.has_failures() is True
+        assert r_only_ac.has_failures() is True
+        assert r_clean.has_failures() is False
+
+
+class TestFlowAwareBlockDecision:
+    """End-of-session gate arithmetic — mirrors the logic at
+    installation_doc_node so build / patch pass with AC gaps but
+    ``teane test`` gates on them.
+    """
+
+    @staticmethod
+    def _decide(*, flow: str, enforce: bool,
+                has_req_gap: bool, has_ac_gap: bool) -> tuple[bool, bool]:
+        """Copy of the gate arithmetic in installation_doc_node —
+        change both if either changes."""
+        enforce_reqs = enforce
+        enforce_acs = enforce and flow == "test"
+        return (enforce_reqs and has_req_gap,
+                enforce_acs and has_ac_gap)
+
+    def test_build_flow_blocks_on_req_gap_only(self):
+        block_req, block_ac = self._decide(
+            flow="build", enforce=True,
+            has_req_gap=True, has_ac_gap=True,
+        )
+        assert block_req is True
+        assert block_ac is False  # build never blocks on AC gaps
+
+    def test_patch_flow_blocks_on_req_gap_only(self):
+        block_req, block_ac = self._decide(
+            flow="patch", enforce=True,
+            has_req_gap=False, has_ac_gap=True,
+        )
+        assert block_req is False
+        assert block_ac is False  # patch also never blocks on AC gaps
+
+    def test_test_flow_blocks_on_ac_gap(self):
+        block_req, block_ac = self._decide(
+            flow="test", enforce=True,
+            has_req_gap=False, has_ac_gap=True,
+        )
+        assert block_req is False
+        assert block_ac is True  # test flow IS where AC coverage matters
+
+    def test_enforce_false_disables_both_regardless_of_flow(self):
+        for flow in ("build", "patch", "test"):
+            block_req, block_ac = self._decide(
+                flow=flow, enforce=False,
+                has_req_gap=True, has_ac_gap=True,
+            )
+            assert block_req is False
+            assert block_ac is False
+
+
 # ---------------------------------------------------------------------------
 # TRACEABILITY.md render — Requirements + AC coverage sections
 # ---------------------------------------------------------------------------

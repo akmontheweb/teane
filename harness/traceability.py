@@ -131,9 +131,35 @@ class TraceabilityReport:
         return self.traced_reqs
 
     def has_failures(self) -> bool:
-        """True when either gap set is non-empty. The end-of-session
-        gate uses this to decide whether to block."""
+        """True when either gap set is non-empty. Retained for callers
+        that report both gap classes together; the end-of-session gate
+        splits them via :meth:`has_req_gap` / :meth:`has_ac_gap`.
+        """
         return bool(self.untraced or self.untested_acs)
+
+    def has_req_gap(self) -> bool:
+        """True when at least one requirement lacks a satisfying story.
+
+        Gated in every flow (build / patch / test) — an untraced
+        requirement means the story-planner never covered it, and no
+        downstream ``teane test`` pass can close the gap.
+        """
+        return bool(self.untraced)
+
+    def has_ac_gap(self) -> bool:
+        """True when at least one acceptance criterion lacks a linked
+        test in ``test_verifies_ac``.
+
+        AC coverage is closed by acceptance / Playwright tests written
+        by ``teane test`` — build / patch generate unit tests (linked
+        to code modules), not AC-scoped e2e tests. So this gap is only
+        enforced when ``flow == "test"``. Blocking build / patch on it
+        creates an unfixable auto-resume loop (finsearch session
+        156032347 hit this: 25/124 ACs untested at end-of-build,
+        headless resume ping-pongs through ``traceability_node`` with
+        no way to add markers).
+        """
+        return bool(self.untested_acs)
 
 
 def audit_workspace(

@@ -21009,28 +21009,48 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
                 "traceability", {},
             )
             enforce = bool(tr_cfg.get("enforce", True))
+            # Test / AC coverage is closed by the Playwright pack that
+            # ``teane test`` generates against ACs, so the AC-coverage
+            # portion of the audit ONLY gates when flow == "test".
+            # Build / patch generate unit tests linked to code modules;
+            # they cannot legitimately close AC gaps. Blocking those
+            # flows on ``untested_acs`` produced the unfixable headless
+            # auto-resume loop finsearch session 156032347 ended on.
+            flow = str(state.get("flow") or "")
+            enforce_reqs = enforce
+            enforce_acs = enforce and flow == "test"
+            block_on_reqs = enforce_reqs and report.has_req_gap()
+            block_on_acs = enforce_acs and report.has_ac_gap()
             if report_text:
                 print()
-                if enforce:
+                if block_on_reqs or block_on_acs:
                     print("==================== TRACEABILITY BLOCK ====================")
                     print(report_text)
                     print("Set traceability.enforce=false in .harness_config.json")
                     print("to bypass and ship anyway (NOT RECOMMENDED).")
                     print("==========================================================")
                 else:
-                    print("[traceability advisory — enforce disabled]")
+                    if report.has_ac_gap() and flow != "test":
+                        print(
+                            "[traceability advisory — AC coverage is closed by "
+                            "`teane test`; build/patch report it but do not "
+                            "block]"
+                        )
+                    else:
+                        print("[traceability advisory — enforce disabled]")
                     print(report_text)
                 logger.info(
                     "[traceability] reqs %d/%d (%.0f%%), ACs %d/%d (%.0f%%); "
-                    "untraced=%d, untested=%d; enforce=%s",
+                    "untraced=%d, untested=%d; flow=%s enforce_reqs=%s "
+                    "enforce_acs=%s",
                     report.traced_reqs, report.total_reqs,
                     report.req_coverage_pct,
                     report.verified_acs, report.total_acs,
                     report.ac_coverage_pct,
                     len(report.untraced), len(report.untested_acs),
-                    enforce,
+                    flow or "?", enforce_reqs, enforce_acs,
                 )
-            if enforce:
+            if block_on_reqs or block_on_acs:
                 traceability_blocked = True
     except Exception as exc:  # noqa: BLE001 — audit must never break the run
         logger.debug("[traceability] Audit failed (%s); skipping report.", exc)

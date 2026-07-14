@@ -8521,6 +8521,128 @@ def _doctor_check_config_paths(config: dict[str, Any]) -> list[tuple[str, tuple[
     return rows
 
 
+# Search backends the harness ships built-in, which never need an
+# API key even when named as the ``web_tools.search_backend`` primary.
+# Any name outside this set is user-supplied and expected to declare a
+# working ``api_key_env``.
+_BUILTIN_SEARCH_BACKENDS: frozenset[str] = frozenset({
+    "duckduckgo_lite", "ddg", "duckduckgo",
+})
+
+
+def _doctor_check_env_vars_from_config(
+    config: dict[str, Any],
+) -> list[tuple[str, tuple[str, str]]]:
+    """Scan the config for every ``*_env`` field naming an environment
+    variable the operator must set, and verify each is present.
+
+    LLM provider keys are handled separately by ``_doctor_check_api_keys``.
+    This check covers the non-LLM surface:
+      - ``web_tools.api_key_env`` (Tavily, Brave, etc.) — only when the
+        primary backend is NOT one of the built-in no-key ones.
+      - ``web_tools.backends[*].api_key_env`` — same rule per fallback.
+      - ``mcp.servers[*].api_key_env`` — MCP servers that authenticate.
+      - ``dashboard.token_env`` / ``dashboard.csrf_token_env`` — set
+        only when the operator opts in to authenticated dashboard.
+
+    Returns one row per required env var so the operator sees exactly
+    which one is missing (not a lumped "N env vars missing" tail).
+    """
+    rows: list[tuple[str, tuple[str, str]]] = []
+    # (env_var, feature_label, install_hint)
+    required: list[tuple[str, str, str]] = []
+
+    # --- web_tools primary + fallback chain ---------------------------------
+    web_tools = config.get("web_tools") or {}
+    if web_tools.get("enabled", False):
+        primary = str(web_tools.get("search_backend") or "").strip().lower()
+        primary_env = str(web_tools.get("api_key_env") or "").strip()
+        if primary and primary not in _BUILTIN_SEARCH_BACKENDS and primary_env:
+            required.append((
+                primary_env,
+                f"web_tools primary backend `{primary}`",
+                f'export {primary_env}="..."  # your {primary} API key',
+            ))
+        for backend in (web_tools.get("backends") or []):
+            if not isinstance(backend, dict):
+                continue
+            if not backend.get("enabled", True):
+                continue
+            name = str(backend.get("search_backend") or "").strip().lower()
+            env = str(backend.get("api_key_env") or "").strip()
+            if name and name not in _BUILTIN_SEARCH_BACKENDS and env:
+                label = str(backend.get("name") or name)
+                required.append((
+                    env,
+                    f"web_tools fallback backend `{label}`",
+                    f'export {env}="..."  # your {name} API key',
+                ))
+
+    # --- MCP servers --------------------------------------------------------
+    mcp_cfg = config.get("mcp") or {}
+    if mcp_cfg.get("enabled", False):
+        for server in (mcp_cfg.get("servers") or []):
+            if not isinstance(server, dict):
+                continue
+            env = str(server.get("api_key_env") or "").strip()
+            if not env:
+                continue
+            name = str(server.get("name") or "<unnamed>")
+            required.append((
+                env,
+                f"mcp server `{name}`",
+                f'export {env}="..."  # required by mcp server {name!r}',
+            ))
+
+    # --- Dashboard auth -----------------------------------------------------
+    dashboard = config.get("dashboard") or {}
+    for field, purpose in (
+        ("token_env", "dashboard bearer token"),
+        ("csrf_token_env", "dashboard CSRF token"),
+    ):
+        env = str(dashboard.get(field) or "").strip()
+        if not env:
+            continue
+        required.append((
+            env,
+            f"{purpose} (dashboard.{field})",
+            f'export {env}="..."  # {purpose}',
+        ))
+
+    if not required:
+        return [(
+            "config env vars",
+            ("skip", "no non-LLM env vars declared in config"),
+        )]
+
+    # De-duplicate on env-var name — one row per distinct variable,
+    # accumulating the features that rely on it.
+    grouped: dict[str, list[str]] = {}
+    hints: dict[str, str] = {}
+    for env, feature, hint in required:
+        grouped.setdefault(env, []).append(feature)
+        hints.setdefault(env, hint)
+    for env in sorted(grouped):
+        features = grouped[env]
+        feature_str = "; ".join(features)
+        value = (os.environ.get(env) or "").strip()
+        if value:
+            rows.append((
+                f"env: {env}",
+                ("pass", f"set ({feature_str})"),
+            ))
+        else:
+            rows.append((
+                f"env: {env}",
+                (
+                    "fail",
+                    f"NOT set but required by: {feature_str}. "
+                    f"Fix: {hints[env]}",
+                ),
+            ))
+    return rows
+
+
 def _doctor_check_ollama_daemon(config: dict[str, Any]) -> tuple[str, str]:
     """When any routed model has provider=ollama OR any model in the
     registry is an ollama model, verify the ollama daemon is reachable
@@ -10452,6 +10574,7 @@ async def collect_doctor_results(
         checks.extend(_doctor_check_lsp(config))
         checks.extend(_doctor_check_mcp_commands(config))
         checks.extend(_doctor_check_config_paths(config))
+        checks.extend(_doctor_check_env_vars_from_config(config))
         checks.extend(await _doctor_check_mcp(config))
     else:
         skipped_detail = "skipped — fix the config check above first"

@@ -8207,7 +8207,14 @@ def _format_doctor_line(status: str, label: str, detail: str) -> str:
 
 
 def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
-    """Workspace is a git repo (rev-parse --git-dir) AND HEAD resolves."""
+    """Workspace is a git repo (rev-parse --git-dir) AND HEAD resolves
+    AND ``user.name`` + ``user.email`` are configured.
+
+    Identity fields matter because the harness commits on every batch
+    when ``--git true`` is passed; without them, ``git commit`` fails
+    with "Author identity unknown" and blocks the entire session.
+    Silent failure at graph runtime is worse than a WARN here.
+    """
     import subprocess
     try:
         result = subprocess.run(
@@ -8244,7 +8251,334 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
             f"git repo at {workspace_path} has no commits yet (unborn HEAD); "
             "make an initial commit before running teane to enable speculative repair"
         )
-    return "pass", f"git repo detected at {workspace_path}"
+    # Identity fields — probe both user.name and user.email. Missing
+    # either breaks `git commit` when --git true is passed. Falls back
+    # to global config, so a globally-set identity satisfies this.
+    identity_missing: list[str] = []
+    for field in ("user.name", "user.email"):
+        try:
+            id_result = subprocess.run(
+                ["git", "-C", workspace_path, "config", "--get", field],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            identity_missing.append(f"{field} (probe timed out)")
+            continue
+        if id_result.returncode != 0 or not (id_result.stdout or "").strip():
+            identity_missing.append(field)
+    if identity_missing:
+        joined = " and ".join(identity_missing)
+        return "warn", (
+            f"git repo detected at {workspace_path}, but {joined} is not "
+            f"set — `git commit` will fail during --git true runs. Set: "
+            f"`git config --global user.name \"Your Name\"` and "
+            f"`git config --global user.email you@example.com`"
+        )
+    return "pass", f"git repo detected at {workspace_path} (identity configured)"
+
+
+def _doctor_check_builder_image(config: dict[str, Any]) -> tuple[str, str]:
+    """Verify the configured ``sandbox.docker_image`` exists locally.
+
+    Only meaningful when sandbox will actually use docker AND the image
+    is not a well-known public one (python:*, node:*, eclipse-temurin:*
+    all pull cleanly from Docker Hub). The default ``harness-builder:*``
+    is a custom local build (harness/vendor/Dockerfile.builder) — not
+    on any registry, so an operator on a fresh machine hits "image not
+    found" on the first sandbox run.
+    """
+    sandbox_cfg = config.get("sandbox") or {}
+    backend = (sandbox_cfg.get("backend", "auto") or "auto").lower()
+    if backend not in ("docker", "auto"):
+        return "skip", f"sandbox.backend={backend} (docker image not used)"
+    image = (sandbox_cfg.get("docker_image") or "").strip()
+    if not image:
+        return "skip", "sandbox.docker_image not set"
+    if shutil.which("docker") is None:
+        return "skip", "docker not on PATH (probed elsewhere)"
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "warn", f"probe failed: {type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return "pass", f"{image} present locally"
+    # Distinguish "custom local image" (harness-builder) from "public
+    # registry image" (python:3.12-slim) — the former needs a build
+    # command, the latter will auto-pull on first `docker run`.
+    if image.startswith("harness-builder"):
+        return "fail", (
+            f"{image} not built locally — this is a custom image "
+            f"(harness/vendor/Dockerfile.builder), no registry pull "
+            f"will succeed. Build: `docker build --pull -f "
+            f"harness/vendor/Dockerfile.builder -t {image} "
+            f"harness/vendor/`"
+        )
+    return "warn", (
+        f"{image} not present locally — Docker will attempt registry "
+        f"pull on first sandbox run (may fail on air-gapped hosts). "
+        f"Pre-pull with: `docker pull {image}`"
+    )
+
+
+def _doctor_check_mcp_commands(config: dict[str, Any]) -> list[tuple[str, tuple[str, str]]]:
+    """For each ``mcp.servers[*].command``, verify command[0] is on PATH.
+
+    Complements ``_doctor_check_mcp`` which starts each server and
+    checks tool advertisement — but that requires the binary to be
+    resolvable first. When uvx / npx / a custom server binary is
+    missing, the spawn fails with a vague error; this surfaces the
+    root cause with an actionable install hint.
+    """
+    mcp_cfg = config.get("mcp") or {}
+    if not mcp_cfg.get("enabled", False):
+        return [(
+            "mcp commands",
+            ("skip", "mcp.enabled=false"),
+        )]
+    servers = mcp_cfg.get("servers") or []
+    if not isinstance(servers, list) or not servers:
+        return [(
+            "mcp commands",
+            ("skip", "mcp.enabled=true but no servers configured"),
+        )]
+    rows: list[tuple[str, tuple[str, str]]] = []
+    seen: set[str] = set()
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        name = str(server.get("name") or "<unnamed>")
+        command = server.get("command") or []
+        if not isinstance(command, list) or not command:
+            rows.append((
+                f"mcp {name} command",
+                ("warn", f"malformed command (expected list, got {type(command).__name__})"),
+            ))
+            continue
+        binary = str(command[0])
+        if binary in seen:
+            continue  # dedup common wrappers (npx, uvx)
+        seen.add(binary)
+        install_hint = _MCP_COMMAND_INSTALL_HINTS.get(binary, "")
+        if shutil.which(binary) is None:
+            detail = (
+                f"`{binary}` not on PATH — mcp server '{name}' will "
+                f"fail to spawn"
+            )
+            if install_hint:
+                detail += f" (install: {install_hint})"
+            rows.append((f"mcp: {binary}", ("fail", detail)))
+        else:
+            rows.append((
+                f"mcp: {binary}",
+                ("pass", f"on PATH (used by mcp server '{name}')"),
+            ))
+    return rows
+
+
+# Install hints for the binaries commonly seen as ``mcp.servers[*].command[0]``.
+_MCP_COMMAND_INSTALL_HINTS: dict[str, str] = {
+    "uvx": "pip install uv",
+    "npx": "install Node.js (bundles npx)",
+    "python3": "install Python 3.11+",
+    "python": "install Python 3.11+",
+    "docker": "install Docker Engine",
+}
+
+
+def _doctor_check_config_paths(config: dict[str, Any]) -> list[tuple[str, tuple[str, str]]]:
+    """Validate the path-like fields in the operator's config actually
+    exist / are writable / aren't host-specific leftovers.
+
+    Fields checked:
+      - ``mcp.servers[fs].command[-1]`` — filesystem MCP server root arg
+      - ``deployment_defaults.storage.volume_root``
+      - ``deployment_defaults.storage.backup_path`` (when
+        ``backup_destination`` is not none/s3/gcs/azure_blob)
+      - ``sandbox.readonly_cache_mounts[*]`` — soft warn if missing
+
+    Absolute paths that don't resolve on this host are flagged — this
+    catches the specific class of bug where a colleague's config got
+    committed with their machine's ``/mnt/*`` paths.
+    """
+    rows: list[tuple[str, tuple[str, str]]] = []
+
+    def _looks_host_specific(p: str) -> bool:
+        # Absolute path outside the operator's home dir that doesn't
+        # exist — likely a leftover from another host. ~/... paths are
+        # fine (they expand); /var, /opt, /srv are legitimate on some
+        # hosts; but /mnt/<username>/ or /home/<other>/ almost always is
+        # a leftover.
+        if not p or not os.path.isabs(p):
+            return False
+        home = os.path.expanduser("~")
+        return not p.startswith(home) and not os.path.exists(p)
+
+    def _expand(p: str) -> str:
+        return os.path.expanduser(os.path.expandvars(p or ""))
+
+    # --- MCP filesystem server root -----------------------------------------
+    mcp_cfg = config.get("mcp") or {}
+    if mcp_cfg.get("enabled", False):
+        for server in (mcp_cfg.get("servers") or []):
+            if not isinstance(server, dict):
+                continue
+            command = server.get("command") or []
+            if not (isinstance(command, list) and command
+                    and str(command[0]) == "npx"
+                    and any("server-filesystem" in str(c) for c in command)):
+                continue
+            root_arg = str(command[-1]) if len(command) > 1 else ""
+            expanded = _expand(root_arg)
+            name = str(server.get("name") or "fs")
+            if not root_arg:
+                rows.append((f"mcp: {name} root", ("warn", "no root arg given to filesystem server")))
+                continue
+            if not os.path.isdir(expanded):
+                sev = "fail" if _looks_host_specific(root_arg) else "warn"
+                rows.append((
+                    f"mcp: {name} root",
+                    (
+                        sev,
+                        f"filesystem MCP root `{root_arg}` "
+                        f"(expanded: `{expanded}`) does not exist on "
+                        f"this host — narrow it to your workspace or "
+                        f"remove the fs server from mcp.servers",
+                    ),
+                ))
+            else:
+                rows.append((
+                    f"mcp: {name} root",
+                    ("pass", f"filesystem MCP root `{expanded}` exists"),
+                ))
+
+    # --- Deployment storage paths --------------------------------------------
+    storage = ((config.get("deployment_defaults") or {}).get("storage")) or {}
+    backup_dest = str(storage.get("backup_destination") or "none").lower()
+    for field in ("volume_root", "backup_path"):
+        raw = str(storage.get(field) or "")
+        if not raw:
+            continue
+        # backup_path only relevant when backup_destination is local-ish.
+        if field == "backup_path" and backup_dest in ("none", "s3", "gcs", "azure_blob"):
+            rows.append((
+                f"deploy: {field}",
+                ("skip", f"backup_destination={backup_dest} (host path not used)"),
+            ))
+            continue
+        expanded = _expand(raw)
+        if _looks_host_specific(raw):
+            rows.append((
+                f"deploy: {field}",
+                (
+                    "fail",
+                    f"`{raw}` looks like a host-specific path from "
+                    f"another machine and doesn't exist here — set "
+                    f"deployment_defaults.storage.{field} to a "
+                    f"portable value like `~/.harness/deploy/*` or "
+                    f"an absolute path that exists on this host",
+                ),
+            ))
+        elif os.path.isabs(expanded) and not os.path.isdir(expanded):
+            # Parent-directory writability check — the harness creates
+            # these on first deploy, so missing dir is only a warning if
+            # its parent isn't writable.
+            parent = os.path.dirname(expanded) or "/"
+            if os.path.isdir(parent) and os.access(parent, os.W_OK):
+                rows.append((
+                    f"deploy: {field}",
+                    ("pass", f"`{expanded}` will be created on first deploy (parent writable)"),
+                ))
+            else:
+                rows.append((
+                    f"deploy: {field}",
+                    (
+                        "warn",
+                        f"`{expanded}` does not exist and parent `{parent}` "
+                        f"is not writable — first deploy will fail. "
+                        f"Create the parent or pick a different path.",
+                    ),
+                ))
+        else:
+            rows.append((f"deploy: {field}", ("pass", f"`{expanded}`")))
+
+    # --- Sandbox readonly cache mounts --------------------------------------
+    sandbox_cfg = config.get("sandbox") or {}
+    for mount in (sandbox_cfg.get("readonly_cache_mounts") or []):
+        raw = str(mount)
+        expanded = _expand(raw)
+        if not os.path.isdir(expanded):
+            # Cache mounts are optional performance boosts — the sandbox
+            # skips missing ones cleanly. Log at info-ish severity.
+            rows.append((
+                f"sandbox: cache mount {raw}",
+                ("skip", f"`{expanded}` does not exist (cache mount skipped, no impact)"),
+            ))
+    return rows
+
+
+def _doctor_check_ollama_daemon(config: dict[str, Any]) -> tuple[str, str]:
+    """When any routed model has provider=ollama OR any model in the
+    registry is an ollama model, verify the ollama daemon is reachable
+    at its configured (or default) HTTP endpoint.
+
+    Only fires when ollama is actually referenced — if the config uses
+    exclusively cloud providers, this returns skip and never touches
+    the network.
+    """
+    models_cfg = config.get("models") or {}
+    routing = config.get("model_routing") or {}
+    routed_ollama: list[str] = []
+    routing_keys = (
+        "planning_primary", "planning_fallback",
+        "patching_primary",
+        "repair_primary", "repair_fallback",
+        "doc_reviewer_primary", "doc_reviewer_fallback",
+        "code_reviewer_primary", "code_reviewer_fallback",
+    )
+    for k in routing_keys:
+        v = routing.get(k) or ""
+        if isinstance(v, str) and v.startswith("ollama:"):
+            routed_ollama.append(v)
+    if not routed_ollama:
+        return "skip", "no ollama models in model_routing"
+    # Discover endpoint from the first routed ollama model, falling back
+    # to the default localhost port.
+    endpoint = "http://localhost:11434"
+    for k in routed_ollama:
+        entry = models_cfg.get(k) or {}
+        if isinstance(entry, dict):
+            candidate = str(entry.get("api_base_url") or "").rstrip("/")
+            if candidate:
+                endpoint = candidate.rstrip("/v1").rstrip("/")
+                break
+    # Cheap TCP probe — we only need to know the daemon is listening,
+    # not that it can serve the specific model.
+    import socket as _sock
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 11434
+    except Exception:  # noqa: BLE001
+        host, port = "localhost", 11434
+    try:
+        with _sock.create_connection((host, port), timeout=2.0):
+            pass
+    except (OSError, _sock.timeout) as exc:
+        return "fail", (
+            f"ollama models routed ({', '.join(routed_ollama)}) but "
+            f"daemon at {host}:{port} not reachable ({type(exc).__name__}). "
+            f"Start with `ollama serve` or unset ollama routing"
+        )
+    return "pass", (
+        f"ollama daemon reachable at {host}:{port} "
+        f"({len(routed_ollama)} model(s) routed)"
+    )
 
 
 # Per-provider HTTP probe targets for the live api-keys check. Endpoint
@@ -10112,8 +10446,12 @@ async def collect_doctor_results(
             ("checkpoint db", _doctor_check_checkpoint_db(config)),
             ("patcher mode", _doctor_check_patcher_mode(config)),
         ])
+        checks.append(("sandbox image", _doctor_check_builder_image(config)))
+        checks.append(("ollama daemon", _doctor_check_ollama_daemon(config)))
         checks.extend(_doctor_check_external_tools(config, workspace_path))
         checks.extend(_doctor_check_lsp(config))
+        checks.extend(_doctor_check_mcp_commands(config))
+        checks.extend(_doctor_check_config_paths(config))
         checks.extend(await _doctor_check_mcp(config))
     else:
         skipped_detail = "skipped — fix the config check above first"

@@ -807,6 +807,142 @@ def probe_node() -> CheckResult:
     )
 
 
+def probe_uvx() -> CheckResult:
+    """``uvx`` (bundled with uv) is required for the default MCP fetch
+    server (`uvx mcp-server-fetch`). Also used for other Python-based
+    MCP servers and as a fast alternative to pipx/pip run.
+
+    RECOMMENDED severity — the harness works without MCP, but the
+    shipped config enables MCP by default, so a missing uvx = MCP layer
+    silently disabled with a vague "spawn failed" log line.
+    """
+    feature = "uv/uvx (MCP fetch server, fast pipx alternative)"
+    if shutil.which("uvx") is not None:
+        version = ""
+        try:
+            proc = subprocess.run(
+                ["uvx", "--version"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=3,
+            )
+            version = (proc.stdout or "").strip().splitlines()[:1]
+            version = version[0] if version else ""
+        except (subprocess.TimeoutExpired, OSError):
+            version = ""
+        return CheckResult(
+            name="uvx",
+            status=STATUS_PASS,
+            detail=f"{version or 'installed'} ({feature})",
+            section="RECOMMENDED",
+            feature=feature,
+        )
+    return CheckResult(
+        name="uvx",
+        status=STATUS_WARN,
+        detail=(
+            f"not on PATH ({feature}) — the shipped MCP config uses "
+            f"`uvx mcp-server-fetch` for web fetching; without uvx the "
+            f"fetch MCP server silently fails to spawn"
+        ),
+        install_cmd="pip install uv  (installs both uv and uvx)",
+        section="RECOMMENDED",
+        feature=feature,
+    )
+
+
+def probe_harness_builder_image() -> CheckResult:
+    """When the repo ships a ``harness/vendor/Dockerfile.builder``, warn
+    if the ``harness-builder:latest`` image isn't built locally. This
+    image bundles JDK 21 + Node 20 + Python + uv + Playwright and is the
+    default ``sandbox.docker_image``. First sandbox run fails with
+    "image not found" if it's missing and no registry is configured.
+
+    Sits in SANDBOX section next to the docker + buildx rows.
+    """
+    if shutil.which("docker") is None:
+        return CheckResult(
+            name="harness-builder image",
+            status=STATUS_SKIP,
+            detail="docker not on PATH — image probe skipped",
+            section="SANDBOX",
+        )
+    # Locate the Dockerfile relative to this file. When teane is
+    # installed as a package, the file may not ship — skip in that case.
+    dockerfile = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "vendor", "Dockerfile.builder")
+    )
+    have_dockerfile = os.path.isfile(dockerfile)
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", "harness-builder:latest"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return CheckResult(
+            name="harness-builder image",
+            status=STATUS_WARN,
+            detail=f"probe failed: {type(exc).__name__}: {exc}",
+            section="SANDBOX",
+        )
+    if proc.returncode == 0:
+        return CheckResult(
+            name="harness-builder image",
+            status=STATUS_PASS,
+            detail="built locally (default sandbox.docker_image)",
+            section="SANDBOX",
+        )
+    if have_dockerfile:
+        return CheckResult(
+            name="harness-builder image",
+            status=STATUS_WARN,
+            detail=(
+                "not built locally — the default sandbox.docker_image "
+                "is `harness-builder:latest`; first sandbox run will "
+                "fail with 'image not found' unless you build it or "
+                "override sandbox.docker_image in config"
+            ),
+            install_cmd=(
+                "docker build --pull -f harness/vendor/Dockerfile.builder "
+                "-t harness-builder:latest harness/vendor/"
+            ),
+            section="SANDBOX",
+        )
+    return CheckResult(
+        name="harness-builder image",
+        status=STATUS_SKIP,
+        detail=(
+            "not built locally AND Dockerfile.builder not shipped in "
+            "this install — override sandbox.docker_image in config "
+            "with a public image (e.g. python:3.12-slim)"
+        ),
+        section="SANDBOX",
+    )
+
+
+def probe_curl() -> CheckResult:
+    """``curl`` is used by generated docker-compose health-checks and by
+    a handful of harness-side probe fallbacks. Present on virtually
+    every Linux/macOS host but occasionally missing on stripped-down
+    Windows / container installs. RECOMMENDED — the harness works
+    without curl on the host (health-checks run inside containers) but
+    operators who customise health-checks to hit host URLs need it."""
+    if shutil.which("curl") is not None:
+        return CheckResult(
+            name="curl", status=STATUS_PASS,
+            detail="on PATH (deploy health-checks, harness probes)",
+            section="RECOMMENDED",
+        )
+    return CheckResult(
+        name="curl", status=STATUS_WARN,
+        detail=(
+            "not on PATH — deploy health-checks that call host URLs "
+            "and some harness fallback probes will not run"
+        ),
+        install_cmd=_install_recipe("curl", _detected_platform_name()),
+        section="RECOMMENDED",
+    )
+
+
 def probe_docker_buildx() -> CheckResult:
     """``docker buildx`` is required for multi-stage builds emitted by
     ``teane deploy``'s synthesised Dockerfile + compose. Older Docker
@@ -970,6 +1106,7 @@ def run_all(*, platform_override: Optional[str] = None,
         # Sandbox.
         results.append(probe_docker())
         results.append(probe_docker_buildx())
+        results.append(probe_harness_builder_image())
         if _platform.is_linux():
             results.append(probe_unshare())
         if _platform.is_windows():
@@ -977,6 +1114,8 @@ def run_all(*, platform_override: Optional[str] = None,
 
         # Recommended.
         results.append(probe_posix_sh())
+        results.append(probe_curl())
+        results.append(probe_uvx())
         results.extend(probe_security_scanners())
         results.extend(probe_formatters())
         results.extend(probe_typecheckers())

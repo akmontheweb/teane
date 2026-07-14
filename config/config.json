@@ -369,11 +369,12 @@
             {
                 "name": "fs",
                 "transport": "stdio",
+                "_command_comment": "The last arg is the host directory the LLM can read/write via mcp__fs__* tools. Default '~' grants access to the operator's home dir; the harness expands ~ at load time. Narrow this to a specific workspace root (e.g. '/Users/me/projects/foo' or '${HOME}/projects/foo') to reduce the filesystem-MCP blast radius. NEVER leave as '/' or a system-wide root.",
                 "command": [
                     "npx",
                     "-y",
                     "@modelcontextprotocol/server-filesystem",
-                    "/mnt/data1/akhila/mywork/projects/teane"
+                    "~"
                 ]
             }
         ]
@@ -466,8 +467,8 @@
         },
         "_storage_comment": "Sector 2: DATA & STORAGE PERSISTENCE. Org-wide answers for volume layout, container UID/GID convention, backup destination, and multi-host storage. Stack-specific volume paths (e.g. /var/lib/postgresql/data) are still derived from telemetry — this section captures the policy decisions that wrap them.",
         "storage": {
-            "_volume_root_comment": "Absolute host path under which the harness lays out per-service data directories (e.g. <volume_root>/postgres, <volume_root>/redis). Free text; must be an absolute filesystem path the harness has write access to.",
-            "volume_root": "/mnt/data1/akhila/temp",
+            "_volume_root_comment": "Host path under which the harness lays out per-service data directories (e.g. <volume_root>/postgres, <volume_root>/redis). Default '~/.harness/deploy/volumes' — the harness expands ~ at load time. Override with an absolute path when your host has a dedicated data mount.",
+            "volume_root": "~/.harness/deploy/volumes",
             "_persistence_mode_comment": "How container data is persisted on the host. Possible values: bind (host directory bind-mount) | volume (named Docker volume) | tmpfs (ephemeral RAM, data lost on restart) | none.",
             "persistence_mode": "volume",
             "_container_uid_comment": "Numeric UID the harness asks containers to run as (and chowns bind-mounts to). Integer ≥ 0; 1000 is the typical first non-root user on Linux. Set to match the host operator account that owns volume_root.",
@@ -476,8 +477,8 @@
             "container_gid": 1000,
             "_backup_destination_comment": "Where the backup driver writes service snapshots. Possible values: s3 | gcs | azure_blob | local | none.",
             "backup_destination": "none",
-            "_backup_path_comment": "Destination URI matching backup_destination. Examples: 's3://acme-backups/' for s3, 'gs://acme-backups/' for gcs, 'https://<account>.blob.core.windows.net/<container>/' for azure_blob, '/srv/backups/' for local. Ignored when backup_destination=none.",
-            "backup_path": "/mnt/data1/akhila/temp/backup",
+            "_backup_path_comment": "Destination URI matching backup_destination. Examples: 's3://acme-backups/' for s3, 'gs://acme-backups/' for gcs, 'https://<account>.blob.core.windows.net/<container>/' for azure_blob, '~/.harness/deploy/backup/' or absolute path for local. Ignored when backup_destination=none. Default '~/.harness/deploy/backup' — the harness expands ~ at load time.",
+            "backup_path": "~/.harness/deploy/backup",
             "_multi_host_storage_comment": "Shared storage layer for multi-host deployments. Possible values: none (single-host) | nfs | ceph | glusterfs | longhorn.",
             "multi_host_storage": "none"
         },

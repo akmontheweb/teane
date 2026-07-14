@@ -9193,6 +9193,7 @@ def _build_repair_reflection_prompt(
     build_output_tail: str = "",
     judge_disagreement_history: Optional[list[dict[str, Any]]] = None,
     judge_ignored_streak: int = 0,
+    prior_reflection_verdict: Optional[dict[str, str]] = None,
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -9506,6 +9507,41 @@ def _build_repair_reflection_prompt(
             "faster than three rounds of DISTRACTION-then-HITL.\n\n"
         )
 
+    # Anti-repetition block. Feed the judge its own last-round verdict so
+    # it can textually detect when it's about to emit the same narrative
+    # again — the fixation pattern that finsearch STORY-042 hit (10+
+    # rounds of variations on "session tokens deterministic" without the
+    # repair LLM ever converging). The judge can either (a) pivot the
+    # recommendation to a structurally different approach when the same
+    # real_blocker recurs, or (b) recognise its own previous read was
+    # wrong and return a different real_blocker rooted elsewhere. Empty
+    # when this is the first reflection round (no prior verdict) or when
+    # the prior verdict lacks a real_blocker (PROGRESS or empty).
+    prior_verdict_block = ""
+    if isinstance(prior_reflection_verdict, dict):
+        _pv = prior_reflection_verdict.get("verdict") or ""
+        _pb = (prior_reflection_verdict.get("real_blocker") or "").strip()
+        _pr = (prior_reflection_verdict.get("recommendation") or "").strip()
+        if _pv and _pb:
+            prior_verdict_block = (
+                "\nYOUR PREVIOUS-ROUND VERDICT (anti-repetition check):\n"
+                f"  verdict:        {_pv}\n"
+                f"  real_blocker:   {_pb[:300]}\n"
+                f"  recommendation: {_pr[:300]}\n"
+                "If the current diagnostics would lead you to the SAME "
+                "real_blocker text, that means either (a) the repair LLM "
+                "did NOT act on your last recommendation — this round, "
+                "PIVOT the ``recommendation`` to a STRUCTURALLY DIFFERENT "
+                "approach (a different file, a different fix pattern, "
+                "upstream config or build/test invocation) rather than "
+                "restating the same fix, OR (b) your prior narrative was "
+                "wrong — return a materially different ``real_blocker`` "
+                "rooted in a different subsystem. NEVER verbatim-repeat "
+                "the same ``real_blocker`` + ``recommendation`` pair — "
+                "the harness treats verbatim repetition as evidence of "
+                "judge fixation and will escalate.\n\n"
+            )
+
     # Fix G — test-assertion hint. Fires only when the top persisted error
     # is a pytest assertion failure whose location is inside a test file.
     # Zero effect on compile/import errors — those never trigger it. Asks
@@ -9551,6 +9587,7 @@ def _build_repair_reflection_prompt(
         f"New (introduced by this round's patches):\n{new_block}\n\n"
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
         f"{tail_block}"
+        f"{prior_verdict_block}"
         f"{disagreement_block}"
         f"{path_wiring_hint_block}"
         f"{install_hint_block}"
@@ -12976,6 +13013,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             _judge_ignored_streak = int(
                 loop_counter.get("judge_ignored_streak", 0) or 0
             )
+            # Anti-repetition wiring: feed the judge its OWN last-round
+            # verdict so it can textually detect when it's about to
+            # restate the same narrative. Persisted below after this
+            # round's verdict finalises. Missing on the first repair
+            # round (no prior); the prompt block renders empty then.
+            _prior_reflection = loop_counter.get("last_reflection_verdict")
+            if not isinstance(_prior_reflection, dict):
+                _prior_reflection = None
             reflection_prompt = _build_repair_reflection_prompt(
                 prior_diagnostics_count=len(prior_fps_set),
                 current_diagnostics_count=len(current_fps_set),
@@ -12991,6 +13036,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 ),
                 judge_disagreement_history=_judge_disagreement_history,
                 judge_ignored_streak=_judge_ignored_streak,
+                prior_reflection_verdict=_prior_reflection,
             )
             # Fix C — escalate the reflection judge to the reasoning
             # model at the moment its cheap-mode verdict is most likely
@@ -13271,6 +13317,19 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                # Stash a compact copy of the FINAL verdict so the next
+                # round's reflection prompt can feed it back for anti-
+                # repetition. Length-capped so state stays bounded across
+                # long repair sessions.
+                loop_counter["last_reflection_verdict"] = {
+                    "verdict": str(reflection_verdict.get("verdict") or ""),
+                    "real_blocker": str(
+                        reflection_verdict.get("real_blocker") or ""
+                    )[:500],
+                    "recommendation": str(
+                        reflection_verdict.get("recommendation") or ""
+                    )[:500],
+                }
 
     # Failure-path memory cleanse: from the SECOND repair iteration onward,
     # trim the message list so iteration N's LLM call doesn't carry the bloat

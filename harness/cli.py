@@ -8468,6 +8468,98 @@ def _doctor_workspace_extensions(workspace_path: str) -> set[str]:
     return present
 
 
+# Minimum TypeScript compiler version. tsconfig.json syntax and the
+# tsc CLI surface (--noEmit shape, project references) evolve; the
+# diagnostics_gate contract assumes 5.x-era behaviour. Warn (not fail)
+# below this floor — old tsc + modern config = silent parse failures.
+_MIN_TSC_MAJOR = 5
+
+
+def _probe_tsc_version() -> tuple[str, str, str]:
+    """Return ``(status, version_str, install_hint)`` for the tsc CLI.
+
+    ``status`` follows the doctor convention: ``pass`` when tsc is on
+    PATH at or above :data:`_MIN_TSC_MAJOR`; ``warn`` when it's present
+    but too old (silent tsconfig parse failures) or the version probe
+    itself fails; ``fail`` when the binary is missing entirely.
+    """
+    path = shutil.which("tsc")
+    if path is None:
+        return "fail", "", "npm install -g typescript"
+    try:
+        proc = subprocess.run(
+            ["tsc", "--version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "warn", f"probe failed: {type(exc).__name__}", ""
+    version_raw = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    m = re.search(r"Version\s+(\d+)\.(\d+)", version_raw)
+    if not m:
+        return "warn", version_raw or "unknown", ""
+    try:
+        major = int(m.group(1))
+    except ValueError:
+        return "warn", version_raw, ""
+    if major < _MIN_TSC_MAJOR:
+        return (
+            "warn",
+            f"{version_raw} (below floor {_MIN_TSC_MAJOR}.x — modern "
+            f"tsconfig.json syntax may fail to parse in diagnostics gate)",
+            "npm install -g typescript@latest",
+        )
+    return "pass", version_raw, ""
+
+
+def _doctor_check_lsp(config: dict[str, Any]) -> list[tuple[str, tuple[str, str]]]:
+    """When ``lsp.enabled=true``, verify the language-server binaries
+    the pool will spawn are actually on PATH. Silent fallback to regex
+    extraction is the current failure mode when they're missing — the
+    operator gets no signal that semantic navigation degraded to
+    string matching.
+
+    Returns per-server rows so each binary is called out individually
+    (same UX as the security-scanner + formatter rows). When LSP is
+    disabled, returns a single ``skip`` row for the group.
+    """
+    lsp_cfg = config.get("lsp") or {}
+    if not lsp_cfg.get("enabled", False):
+        return [(
+            "external: lsp servers",
+            ("skip", "lsp.enabled=false (LSP pool not started)"),
+        )]
+    servers = [
+        (
+            "pyright-langserver",
+            "Python LSP navigation",
+            "npm install -g pyright",
+        ),
+        (
+            "typescript-language-server",
+            "TS/TSX LSP navigation",
+            "npm install -g typescript-language-server typescript",
+        ),
+    ]
+    rows: list[tuple[str, tuple[str, str]]] = []
+    for binary, feature, install_hint in servers:
+        if shutil.which(binary) is None:
+            rows.append((
+                f"external: {binary}",
+                (
+                    "warn",
+                    f"not on PATH ({feature}) — lsp.enabled=true but "
+                    f"pool will silently fall back to regex extraction. "
+                    f"Install: {install_hint}",
+                ),
+            ))
+        else:
+            rows.append((
+                f"external: {binary}",
+                ("pass", f"on PATH ({feature})"),
+            ))
+    return rows
+
+
 def _doctor_check_external_tools(
     config: dict[str, Any],
     workspace_path: str,
@@ -8499,21 +8591,53 @@ def _doctor_check_external_tools(
     enabled_scanners = tuple(security_cfg.get("scanners", security._DEFAULT_SCANNERS))
 
     # --- Security scanners ---------------------------------------------------
+    scanners_present = 0
+    scanners_enabled = 0
     for scanner in ("gitleaks", "bandit", "semgrep", "trivy"):
         hint = security.SCANNER_INSTALL_HINTS.get(scanner, "")
         if scanner not in enabled_scanners:
             _append(scanner, "skip", f"not in security.scanners ({list(enabled_scanners)})")
             continue
+        scanners_enabled += 1
         if shutil.which(scanner) is None:
             if scanner == "gitleaks":
                 # Real gitleaks falls back to the in-process regex scanner.
+                # Count as "present" because coverage is preserved.
+                scanners_present += 1
                 _append(scanner, "warn", "not on PATH (Python fallback active)", hint)
             else:
                 # bandit/semgrep/trivy have no in-process fallback — they
                 # are simply skipped when missing, reducing scan coverage.
                 _append(scanner, "warn", "not on PATH (scanner will be skipped)", hint)
         else:
+            scanners_present += 1
             _append(scanner, "pass", "on PATH")
+    # SAST-floor row: if the operator configured scanners but NONE are
+    # actually available (no binary AND no fallback), security scans
+    # will produce empty reports and the operator has no signal that
+    # SAST coverage is zero. Surface this as an explicit row so it can't
+    # be missed among the per-scanner rows.
+    if scanners_enabled > 0 and scanners_present == 0:
+        _append(
+            "sast coverage",
+            "fail",
+            (
+                f"{scanners_enabled} scanner(s) configured in "
+                f"security.scanners but NONE runnable on this host — "
+                f"security scans will produce empty reports"
+            ),
+            "install at least one of the scanners listed above",
+        )
+    elif scanners_enabled > 0:
+        _append(
+            "sast coverage",
+            "pass",
+            (
+                f"{scanners_present}/{scanners_enabled} configured "
+                f"scanner(s) available (incl. Python fallback for "
+                f"gitleaks when missing)"
+            ),
+        )
 
     # --- Sandbox / deployment binaries --------------------------------------
     sandbox_backend = (config.get("sandbox", {}).get("backend", "auto") or "auto").lower()
@@ -8565,10 +8689,63 @@ def _doctor_check_external_tools(
                 "not available but deployment.enabled=true",
                 "install Docker Compose: https://docs.docker.com/compose/install/",
             )
+        # buildx is required for the multi-stage Dockerfiles teane deploy
+        # synthesises. Older Docker installs may have the daemon but not
+        # the buildx CLI plugin — deployment fails late without a good
+        # signal at doctor time.
+        if docker_present and _has_docker_buildx():
+            _append("docker buildx", "pass", "buildx CLI plugin available")
+        elif docker_present:
+            _append(
+                "docker buildx", "fail",
+                "buildx CLI plugin missing but deployment.enabled=true "
+                "(`teane deploy` uses multi-stage builds)",
+                "install Docker Buildx: https://docs.docker.com/build/buildx/install/",
+            )
+        else:
+            _append("docker buildx", "skip", "docker missing (see row above)")
     else:
         _append(
             "docker-compose", "skip",
             "deployment.enabled=false (compose not required)",
+        )
+        _append(
+            "docker buildx", "skip",
+            "deployment.enabled=false (buildx not required)",
+        )
+
+    # --- Type-checker version floor (diagnostics gate) -----------------------
+    # diagnostics_gate.py invokes `tsc --noEmit` for TS files. When tsc
+    # is present but below the version floor, modern tsconfig.json
+    # syntax silently fails to parse — the gate reports zero diagnostics
+    # instead of the real errors. Only surface when the diagnostics gate
+    # is enabled AND tsc is listed in diagnostics.tools (or tools is
+    # unset — treated as "all").
+    diagnostics_cfg = config.get("diagnostics") or {}
+    diagnostics_enabled = bool(diagnostics_cfg.get("enabled", True))
+    diagnostics_tools = diagnostics_cfg.get("tools")
+    tsc_in_tools = (
+        diagnostics_tools is None
+        or "tsc" in [str(t).lower() for t in (diagnostics_tools or [])]
+    )
+    if diagnostics_enabled and tsc_in_tools:
+        tsc_status, tsc_detail, tsc_hint = _probe_tsc_version()
+        if tsc_status == "fail":
+            _append(
+                "tsc version",
+                "warn",
+                "tsc not on PATH — TS files in the workspace will skip "
+                "the diagnostics gate (Python-only projects can ignore)",
+                tsc_hint,
+            )
+        elif tsc_status == "warn":
+            _append("tsc version", "warn", tsc_detail, tsc_hint)
+        else:
+            _append("tsc version", "pass", tsc_detail)
+    else:
+        _append(
+            "tsc version", "skip",
+            "diagnostics gate disabled or tsc excluded from diagnostics.tools",
         )
 
     # --- Formatters / linters from lintgate (per-extension) -----------------
@@ -8601,6 +8778,23 @@ def _has_docker_compose_subcommand() -> bool:
     try:
         result = subprocess.run(
             ["docker", "compose", "version"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=3,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _has_docker_buildx() -> bool:
+    """Detect the ``docker buildx`` CLI plugin. Required for the
+    multi-stage Dockerfiles emitted by ``teane deploy``. Cheap probe;
+    returns False on any error."""
+    if shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "buildx", "version"],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=3,
         )
@@ -9919,6 +10113,7 @@ async def collect_doctor_results(
             ("patcher mode", _doctor_check_patcher_mode(config)),
         ])
         checks.extend(_doctor_check_external_tools(config, workspace_path))
+        checks.extend(_doctor_check_lsp(config))
         checks.extend(await _doctor_check_mcp(config))
     else:
         skipped_detail = "skipped — fix the config check above first"

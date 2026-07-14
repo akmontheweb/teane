@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import re as _re
 import shutil
 import socket
 import subprocess
@@ -631,7 +632,8 @@ def probe_xcode_cli() -> CheckResult:
 # ---------------------------------------------------------------------------
 
 _LANGUAGE_TOOLS = (
-    ("node", "Node.js (MCP servers, prettier, npx)"),
+    # node has its own version-aware probe (probe_node) — MCP servers
+    # need Node 18+, generic presence check is not enough.
     ("java", "Java runtime (Spring Boot / Maven / Gradle)"),
 )
 
@@ -711,11 +713,18 @@ def probe_llm_api_keys() -> list[CheckResult]:
     """Reports which provider env vars are set. INFO-level — pre-flight
     can't know which providers are routed (that's config-dependent and
     a `teane doctor` concern). Useful as a 'what does this machine
-    have wired up?' overview."""
+    have wired up?' overview. Covers every provider recognised by
+    ``harness.trust`` (Anthropic, OpenAI, DeepSeek, Mistral, Google
+    Vertex, Google Generative AI, plus the Tavily web-search backend
+    that ships as a user_skill)."""
     keys = [
         ("ANTHROPIC_API_KEY", "Anthropic Claude"),
         ("OPENAI_API_KEY", "OpenAI GPT"),
         ("DEEPSEEK_API_KEY", "DeepSeek"),
+        ("MISTRAL_API_KEY", "Mistral"),
+        ("GOOGLE_API_KEY", "Google Vertex / Gemini"),
+        ("GOOGLE_GENERATIVE_AI_API_KEY", "Google Generative AI (alt env)"),
+        ("TAVILY_API_KEY", "Tavily web-search (tavily_backend user_skill)"),
     ]
     out: list[CheckResult] = []
     for env_name, provider in keys:
@@ -734,6 +743,174 @@ def probe_llm_api_keys() -> list[CheckResult]:
                 section="ENV",
             ))
     return out
+
+
+# Minimum Node.js version — MCP servers spawned via ``npx -y
+# @modelcontextprotocol/server-*`` require modern Node; the fetch and
+# filesystem servers documented at modelcontextprotocol.io use Node 18+
+# features. Warn (not fail) so operators on older Node still see the
+# ``teane`` binary but know the MCP layer will misbehave.
+_MIN_NODE_MAJOR = 18
+
+
+def probe_node() -> CheckResult:
+    """Version-aware Node.js probe. Replaces the generic optional-binary
+    probe for node so we can enforce ``_MIN_NODE_MAJOR`` — MCP servers
+    (fetch, filesystem, and most community servers) require Node 18+."""
+    tool = "node"
+    feature = "Node.js (MCP servers, prettier, npx)"
+    path = shutil.which(tool)
+    if path is None:
+        return CheckResult(
+            name=tool,
+            status=STATUS_WARN,
+            detail=f"not on PATH ({feature})",
+            install_cmd=_install_recipe(tool, _detected_platform_name()),
+            section="OPTIONAL",
+            feature=feature,
+        )
+    version_raw = ""
+    try:
+        proc = subprocess.run(
+            [tool, "--version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=3,
+        )
+        version_raw = (proc.stdout or "").strip()
+    except (subprocess.TimeoutExpired, OSError):
+        version_raw = ""
+    major = 0
+    m = _re.match(r"v?(\d+)\.", version_raw)
+    if m:
+        try:
+            major = int(m.group(1))
+        except ValueError:
+            major = 0
+    if major and major < _MIN_NODE_MAJOR:
+        return CheckResult(
+            name=tool,
+            status=STATUS_WARN,
+            detail=(
+                f"{version_raw} on PATH ({feature}) — MCP servers "
+                f"require Node {_MIN_NODE_MAJOR}+, this Node is too old; "
+                f"the fetch / filesystem MCP servers will fail to spawn"
+            ),
+            install_cmd=_install_recipe(tool, _detected_platform_name()),
+            section="OPTIONAL",
+            feature=feature,
+        )
+    detail = (
+        f"{version_raw or 'version unknown'} on PATH ({feature})"
+    )
+    return CheckResult(
+        name=tool, status=STATUS_PASS, detail=detail,
+        section="OPTIONAL", feature=feature,
+    )
+
+
+def probe_docker_buildx() -> CheckResult:
+    """``docker buildx`` is required for multi-stage builds emitted by
+    ``teane deploy``'s synthesised Dockerfile + compose. Older Docker
+    installs may have the daemon but not the buildx CLI plugin; report
+    WARN so operators know a deploy will fail until buildx is added."""
+    if shutil.which("docker") is None:
+        return CheckResult(
+            name="docker-buildx",
+            status=STATUS_SKIP,
+            detail="docker not on PATH — buildx probe skipped",
+            section="SANDBOX",
+        )
+    try:
+        proc = subprocess.run(
+            ["docker", "buildx", "version"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return CheckResult(
+            name="docker-buildx",
+            status=STATUS_WARN,
+            detail=f"probe failed: {type(exc).__name__}: {exc}",
+            install_cmd="install Docker Buildx CLI plugin",
+            section="SANDBOX",
+        )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().splitlines()[:1]
+        tail = stderr[0] if stderr else "unknown error"
+        return CheckResult(
+            name="docker-buildx",
+            status=STATUS_WARN,
+            detail=(
+                f"`docker buildx version` failed ({tail}) — `teane deploy` "
+                f"multi-stage builds will fail"
+            ),
+            install_cmd="install Docker Buildx CLI plugin",
+            section="SANDBOX",
+        )
+    version_line = (proc.stdout or "").strip().splitlines()[:1]
+    version = version_line[0] if version_line else "installed"
+    return CheckResult(
+        name="docker-buildx",
+        status=STATUS_PASS,
+        detail=version,
+        section="SANDBOX",
+    )
+
+
+def probe_playwright() -> CheckResult:
+    """``teane test`` synthesises Playwright scenarios and drives them
+    against the deployed compose stack. Playwright is spawned via
+    ``npx playwright``; probe cheaply. WARN when absent — only `teane
+    test` needs this; the core build/patch/deploy loops don't."""
+    feature = "Playwright (teane test scenarios)"
+    npx_path = shutil.which("npx")
+    if npx_path is None:
+        return CheckResult(
+            name="playwright",
+            status=STATUS_WARN,
+            detail=(
+                f"npx not on PATH — cannot check Playwright ({feature}). "
+                f"Install Node.js first"
+            ),
+            install_cmd=_install_recipe("node", _detected_platform_name()),
+            section="RECOMMENDED",
+            feature=feature,
+        )
+    try:
+        proc = subprocess.run(
+            ["npx", "--no-install", "playwright", "--version"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return CheckResult(
+            name="playwright",
+            status=STATUS_WARN,
+            detail=f"probe failed: {type(exc).__name__}: {exc}",
+            install_cmd="npm install -g playwright",
+            section="RECOMMENDED",
+            feature=feature,
+        )
+    if proc.returncode != 0:
+        return CheckResult(
+            name="playwright",
+            status=STATUS_WARN,
+            detail=(
+                "npx cannot resolve `playwright` — `teane test` will need "
+                "to install it on first run (chromium ~120MB)"
+            ),
+            install_cmd="npm install -g playwright && npx playwright install chromium",
+            section="RECOMMENDED",
+            feature=feature,
+        )
+    version_line = (proc.stdout or "").strip().splitlines()[:1]
+    version = version_line[0] if version_line else "installed"
+    return CheckResult(
+        name="playwright",
+        status=STATUS_PASS,
+        detail=f"{version} ({feature})",
+        section="RECOMMENDED",
+        feature=feature,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +969,7 @@ def run_all(*, platform_override: Optional[str] = None,
 
         # Sandbox.
         results.append(probe_docker())
+        results.append(probe_docker_buildx())
         if _platform.is_linux():
             results.append(probe_unshare())
         if _platform.is_windows():
@@ -803,9 +981,11 @@ def run_all(*, platform_override: Optional[str] = None,
         results.extend(probe_formatters())
         results.extend(probe_typecheckers())
         results.extend(probe_lsp_servers())
+        results.append(probe_playwright())
 
         # Optional.
         results.append(probe_gh_cli())
+        results.append(probe_node())
         results.extend(probe_language_toolchains())
 
         # Env (informational).

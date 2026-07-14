@@ -4211,6 +4211,11 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # already executed inside the loop).
         combined_response_text = "\n".join(accumulated_text_chunks)
 
+        # Initialise the parse-miss diagnostic to empty here so the shared
+        # compose_patch_feedback call below never hits an unbound name —
+        # the text-DSL branch below rewrites this; the tool-use branch
+        # produces structured tool_calls and never has a parse miss.
+        _parse_miss_diag = ""
         _resp_tool_calls = getattr(response, "tool_calls", None) or []
         if _resp_tool_calls:
             # Native tool-use path. Convert the LLM's tool calls into
@@ -4674,66 +4679,24 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
                 pass
-        # Carve out allowlist rejections from generic failures so the next
-        # repair iteration sees the exact paths and reason — without this,
-        # the LLM keeps re-proposing the same blocked paths.
-        allowlist_rejections = [
-            {"file": r.file, "operation": r.operation, "reason": r.error}
-            for r in patch_results
-            if not r.success and isinstance(r.error, str)
-            and "not in skill allowlist" in r.error
-        ]
-        # Capture the remaining (non-allowlist) failures so repair_node can
-        # tell the LLM *why* its patches didn't land. Without this the LLM
-        # only sees "Failed: foo.txt" and re-proposes the same bad search
-        # block on the next round.
-        patch_failures = [
-            {
-                "file": r.file,
-                "operation": (
-                    r.operation.value
-                    if hasattr(r.operation, "value") else str(r.operation)
-                ),
-                "error": _store_patch_failure_error(r.error),
-            }
-            for r in patch_results
-            if not r.success and isinstance(r.error, str)
-            and "not in skill allowlist" not in r.error
-        ][:5]
-        if success_count > 0:
-            status_msg = f"[System]: Applied {success_count}/{len(patch_results)} patches successfully."
-            if no_op_count > 0:
-                # Mirror repair_node's messaging: the LLM must see that
-                # some/all of its "applied" patches were idempotency
-                # no-ops so it doesn't count them as real progress on
-                # the next round.
-                status_msg += (
-                    f" {no_op_count} were idempotency no-ops (target file "
-                    f"already at expected state — no actual change made)."
-                )
-            if fail_count > 0:
-                failed_files = [r.file for r in patch_results if not r.success]
-                status_msg += f" Failed on: {', '.join(failed_files)}."
-        else:
-            status_msg = f"[System]: Failed to apply {fail_count} patch(es)."
-            # If the LLM emitted marker openers but nothing parsed, the
-            # ``Failed to apply 0 patch(es).`` message alone gives the
-            # next round zero corrective signal — the LLM re-emits the
-            # same bad shape. Fold the parser's diagnosis in so the
-            # next system message the LLM sees says exactly what went
-            # wrong and how to fix it (finsearch 156032347).
-            if fail_count == 0 and _parse_miss_diag:
-                status_msg = (
-                    f"[System]: Emitted patch marker(s) but zero blocks "
-                    f"landed — the parser could not extract any. "
-                    f"{_parse_miss_diag}"
-                )
-        if allowlist_rejections:
-            rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
-            status_msg += (
-                f"\n[Allowlist] Rejected paths outside the configured layout: "
-                f"{rejected_paths}. Allowed roots: {allowed_paths}."
-            )
+        # Compose the LLM feedback and the two state buckets in one place
+        # so patching_node and repair_node share the same per-file
+        # classification + directive path. Prior to the extraction the two
+        # nodes carried parallel copies and drifted (finsearch 156032347:
+        # patching_node's status_msg was 38 chars "Failed to apply N
+        # patches." with no file names or reasons, so the LLM had no way
+        # to tell a "file missing" failure from a "search miss" and
+        # re-emitted the same bad block every round).
+        from harness.patch_feedback import compose_patch_feedback
+        status_msg, patch_failures, allowlist_rejections = compose_patch_feedback(
+            patch_results,
+            list(allowed_paths or []),
+            _parse_miss_diag or "",
+            prefix="[System]:",
+            success_count=success_count,
+            fail_count=fail_count,
+            no_op_count=no_op_count,
+        )
         messages.append(MessageDict(role="system", content=status_msg))
 
         # Mark every successfully-modified file as stuck so the next
@@ -5751,30 +5714,15 @@ def _collect_manifest_snippets_for_repair(
     return "\n".join(lines) + "\n"
 
 
-# Marker that the patcher emits when a REPLACE_BLOCK search misses and we
-# attach the line-numbered window of current file content around the
-# closest match (see _find_closest_match in harness/patcher.py). When an
-# error contains this marker we MUST NOT truncate it on the way into
-# node_state["patch_failures"] — the wider window can be up to ~2000
-# chars and is the single most useful signal the LLM has for correcting
-# its next search block. Truncating slices the window mid-line and
-# defeats the purpose, which is what hit session 2f2d48cc-...
-_PATCH_ERROR_WIDER_CONTEXT_MARKER = "Current file content (around closest match):"
-
-
-def _store_patch_failure_error(error_text: str) -> str:
-    """Prepare a patcher error message for storage in node_state.
-
-    When the error includes the wider-context window (marker above), return
-    the full text. Otherwise cap at 3000 chars — generous enough for any
-    "regular" error message but bounded so a runaway log line can't blow
-    the state. The previous 800-char cap was tight enough to slice the
-    wider-context window mid-line in iteration N+1's repair prompt.
-    """
-    err = error_text or ""
-    if _PATCH_ERROR_WIDER_CONTEXT_MARKER in err:
-        return err
-    return err[:3000]
+# Marker + storage helper live in harness.patch_feedback so patching_node,
+# repair_node, and this module all reference the same definitions. Kept
+# here as module-level re-exports so pre-existing tests that import them
+# from harness.graph (see tests/test_harness.py::TestPriorPatchFailureSurfacing)
+# continue to work without touching the import site.
+from harness.patch_feedback import (  # noqa: E402 — re-export at former def site
+    _PATCH_ERROR_WIDER_CONTEXT_MARKER,  # noqa: F401 — re-exported for tests
+    _store_patch_failure_error,  # noqa: F401 — re-exported for tests
+)
 
 
 _TEST_DIR_PREFIXES = ("tests/", "test/", "__tests__/")
@@ -15490,52 +15438,37 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 )
             except Exception:  # noqa: BLE001
                 pass
-        # Capture the remaining failures (search-block-not-found,
-        # file-already-exists, etc.) so the *next* repair iteration sees the
-        # full error including the patcher's closest-match suggestion. The
-        # LLM otherwise only sees "Failed: foo.txt" and proposes the same
-        # bad patch again — see the requirements.txt loop in the issue logs.
-        # _store_patch_failure_error keeps wider-context messages whole
-        # (the file-content window the LLM needs to write a correct
-        # SEARCH block) and caps everything else at 3000 chars.
-        patch_failures = [
-            {
-                "file": r.file,
-                "operation": (
-                    r.operation.value
-                    if hasattr(r.operation, "value") else str(r.operation)
+        # Shared post-patcher feedback. Same helper as patching_node so the
+        # LLM sees the same per-file classification tag + corrective
+        # directive whether it's a first-round patch or a repair round.
+        # The prefix carries the repair-attempt counter so the LLM knows
+        # this is a retry, not a fresh dispatch.
+        from harness.patch_feedback import (
+            compose_patch_feedback as _compose_repair_feedback,
+        )
+        status_msg, patch_failures, _repair_allowlist_rejections = (
+            _compose_repair_feedback(
+                patch_results,
+                list(allowed_paths or []),
+                _parse_miss_diag or "",
+                prefix=(
+                    f"[System]: Repair attempt "
+                    f"{loop_counter['total_repairs']}:"
                 ),
-                "error": _store_patch_failure_error(r.error),
-            }
-            for r in patch_results
-            if not r.success and isinstance(r.error, str)
-            and "not in skill allowlist" not in r.error
-        ][:5]
-        status_msg = f"[System]: Repair attempt {loop_counter['total_repairs']}: applied {success_count}/{len(patch_results)} patches."
-        if no_op_count > 0:
-            status_msg += (
-                f" {no_op_count} were idempotency no-ops (target file already "
-                f"at expected state — no actual change made)."
+                success_count=success_count,
+                fail_count=fail_count,
+                no_op_count=no_op_count,
             )
-        if fail_count > 0:
-            failed_files = [r.file for r in patch_results if not r.success]
-            status_msg += f" Failed: {', '.join(failed_files)}."
-        # Parse-miss diagnostic — see rationale at the patching_node
-        # site. When the LLM emitted markers but nothing parsed, the
-        # default status message ("applied 0/0 patches. Failed: ")
-        # gives the next repair round no signal about WHY. Fold in the
-        # parser's finding so the LLM sees the concrete fix directive.
-        if success_count == 0 and fail_count == 0 and _parse_miss_diag:
-            status_msg += (
-                " Emitted patch marker(s) but zero blocks landed — the "
-                f"parser could not extract any. {_parse_miss_diag}"
-            )
-        if allowlist_rejections:
-            rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
-            status_msg += (
-                f"\n[Allowlist] Rejected paths outside the configured layout: "
-                f"{rejected_paths}. Allowed roots: {allowed_paths}."
-            )
+        )
+        # Repair keeps the allowlist_rejections that were already computed
+        # above (line ~15465) — the shared helper recomputes them for its
+        # own status_msg composition, but the caller-side list drives the
+        # patcher_allowlist_rejection telemetry and the
+        # all_rejected_by_allowlist_repair check below, both of which need
+        # the raw list before the helper's dedup / truncation ran. Both
+        # instances derive from the same patch_results so they're
+        # semantically identical; we drop the helper's copy here.
+        del _repair_allowlist_rejections
         messages.append(MessageDict(role="system", content=status_msg))
 
         # Consecutive-zero-patch tripwire: track how many repair rounds in

@@ -4491,8 +4491,27 @@ Generate your patches NOW. Only the blocks above. No other text."""
             from harness.patcher import (
                 parse_patch_blocks as _parse_patch_blocks_for_screen,
                 apply_patch_blocks as _apply_patch_blocks_screened,
+                summarize_parse_miss as _summarize_parse_miss,
             )
             _blocks_parsed = _parse_patch_blocks_for_screen(filtered_response)
+            # Parse-miss diagnostic. When the LLM emitted marker openers
+            # but ``parse_patch_blocks`` returned zero blocks, the LLM
+            # otherwise gets no signal about WHY its output was
+            # discarded and repeats the same bad shape next round
+            # (finsearch 156032347: STORY-014..019 all silently dropped
+            # 600 inline ``content:<body>`` blocks per round, 5 stories
+            # blocked before the auto-resume cap terminated the run).
+            # ``_parse_miss_diag`` is empty when the LLM legitimately
+            # emitted no patch markers — that path keeps the standard
+            # "no patches" messaging.
+            _parse_miss_diag = (
+                _summarize_parse_miss(filtered_response)
+                if not _blocks_parsed else ""
+            )
+            if _parse_miss_diag:
+                logger.warning(
+                    "[patching_node:parser] %s", _parse_miss_diag,
+                )
             _blocks_kept, _screen_rejections = _pre_patch_screen(
                 _blocks_parsed, loop_counter, tool_files_seen, workspace,
             )
@@ -4697,6 +4716,18 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 status_msg += f" Failed on: {', '.join(failed_files)}."
         else:
             status_msg = f"[System]: Failed to apply {fail_count} patch(es)."
+            # If the LLM emitted marker openers but nothing parsed, the
+            # ``Failed to apply 0 patch(es).`` message alone gives the
+            # next round zero corrective signal — the LLM re-emits the
+            # same bad shape. Fold the parser's diagnosis in so the
+            # next system message the LLM sees says exactly what went
+            # wrong and how to fix it (finsearch 156032347).
+            if fail_count == 0 and _parse_miss_diag:
+                status_msg = (
+                    f"[System]: Emitted patch marker(s) but zero blocks "
+                    f"landed — the parser could not extract any. "
+                    f"{_parse_miss_diag}"
+                )
         if allowlist_rejections:
             rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
             status_msg += (
@@ -15317,6 +15348,19 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # stuck-file-without-fresh-view, and byte-identical repeat search
         # blocks. See ``_pre_patch_screen`` for the full rationale.
         _blocks_parsed = parse_patch_blocks(patch_payload)
+        # Parse-miss diagnostic (mirrors the patching_node site). See
+        # rationale there — silent parser drop with zero LLM-visible
+        # feedback is the exact loop that killed finsearch 156032347
+        # STORY-014..019.
+        from harness.patcher import summarize_parse_miss as _summarize_parse_miss
+        _parse_miss_diag = (
+            _summarize_parse_miss(patch_payload)
+            if not _blocks_parsed else ""
+        )
+        if _parse_miss_diag:
+            logger.warning(
+                "[repair_node:parser] %s", _parse_miss_diag,
+            )
         _blocks_kept, _screen_rejections = _pre_patch_screen(
             _blocks_parsed, loop_counter, files_seen_by_llm, workspace,
         )
@@ -15476,6 +15520,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         if fail_count > 0:
             failed_files = [r.file for r in patch_results if not r.success]
             status_msg += f" Failed: {', '.join(failed_files)}."
+        # Parse-miss diagnostic — see rationale at the patching_node
+        # site. When the LLM emitted markers but nothing parsed, the
+        # default status message ("applied 0/0 patches. Failed: ")
+        # gives the next repair round no signal about WHY. Fold in the
+        # parser's finding so the LLM sees the concrete fix directive.
+        if success_count == 0 and fail_count == 0 and _parse_miss_diag:
+            status_msg += (
+                " Emitted patch marker(s) but zero blocks landed — the "
+                f"parser could not extract any. {_parse_miss_diag}"
+            )
         if allowlist_rejections:
             rejected_paths = ", ".join(sorted({str(r["file"]) for r in allowlist_rejections}))
             status_msg += (

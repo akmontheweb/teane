@@ -369,27 +369,42 @@ _TEMPERED_CONTENT = (
 _FIELD_VALUE = r'[^\n]+?'
 
 
+# Body-field separator. The canonical documented shape is
+# ``content:\n<body>`` (newline immediately after the label), and the
+# LLM produces that whenever it has slack. Under output-token pressure
+# it drops the newline and inlines: ``content:<body>``. Historically
+# the regex was ``content:\s*\n`` — that silently dropped every inline
+# block. Finsearch session 156032347 died from this: LLM emitted 600
+# inline ``content:<body>`` blocks under a 32k output cap, the parser
+# returned zero blocks, and stories 014–019 all carried as defects.
+#
+# ``[ \t]*\n?`` accepts both shapes without eating leading whitespace
+# of the body itself (``\s*`` would greedily consume indentation of
+# the file's real content, breaking any file that starts with
+# leading blank lines or indented python/js/ts).
+_BODY_SEP = r'[ \t]*\n?'
+
 _BLOCK_PATTERNS = {
     OperationType.REPLACE_BLOCK: re.compile(
         r'<<<REPLACE_BLOCK>>>\s*\n'
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
-        r'search:\s*\n(?P<search>' + _TEMPERED_CONTENT + r')\n'
-        r'replace:\s*\n(?P<replace>' + _TEMPERED_CONTENT + r')'
+        r'search:' + _BODY_SEP + r'(?P<search>' + _TEMPERED_CONTENT + r')\n'
+        r'replace:' + _BODY_SEP + r'(?P<replace>' + _TEMPERED_CONTENT + r')'
         r'<<<END_REPLACE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.CREATE_FILE: re.compile(
         r'<<<CREATE_FILE>>>\s*\n'
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
-        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'content:' + _BODY_SEP + r'(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_CREATE_FILE>>>',
         re.DOTALL,
     ),
     OperationType.REWRITE_FILE: re.compile(
         r'<<<REWRITE_FILE>>>\s*\n'
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
-        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'content:' + _BODY_SEP + r'(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_REWRITE_FILE>>>',
         re.DOTALL,
     ),
@@ -397,7 +412,7 @@ _BLOCK_PATTERNS = {
         r'<<<DELETE_BLOCK>>>\s*\n'
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
-        r'search:\s*\n(?P<search>' + _TEMPERED_CONTENT + r')'
+        r'search:' + _BODY_SEP + r'(?P<search>' + _TEMPERED_CONTENT + r')'
         r'<<<END_DELETE_BLOCK>>>',
         re.DOTALL,
     ),
@@ -406,7 +421,7 @@ _BLOCK_PATTERNS = {
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'anchor:\s*(?P<anchor>' + _FIELD_VALUE + r')\s*\n'
         r'placement:\s*(?P<placement>before|after)\s*\n'
-        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'content:' + _BODY_SEP + r'(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_INSERT_AT_BLOCK>>>',
         re.DOTALL,
     ),
@@ -425,7 +440,7 @@ _BLOCK_PATTERNS = {
         r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'line:\s*(?P<line>\d+)\s*\n'
         r'(?:hash:\s*(?P<hash>[0-9a-fA-F]+)\s*\n)?'
-        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'content:' + _BODY_SEP + r'(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_INSERT_AT_LINE>>>',
         re.DOTALL,
     ),
@@ -435,11 +450,95 @@ _BLOCK_PATTERNS = {
         r'start_line:\s*(?P<line>\d+)\s*\n'
         r'end_line:\s*(?P<end_line>\d+)\s*\n'
         r'(?:hash:\s*(?P<hash>[0-9a-fA-F]+)\s*\n)?'
-        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'content:' + _BODY_SEP + r'(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_REPLACE_LINE_RANGE>>>',
         re.DOTALL,
     ),
 }
+
+
+# Kinds the parse-miss diagnostic looks for. Kept in sync with
+# ``_BLOCK_PATTERNS`` keys — if a new op type is added above, add its
+# short name here so ``summarize_parse_miss`` can report on it.
+_PARSE_MISS_MARKERS: tuple[str, ...] = (
+    "REPLACE_BLOCK",
+    "CREATE_FILE",
+    "REWRITE_FILE",
+    "DELETE_BLOCK",
+    "INSERT_AT_BLOCK",
+    "INSERT_AT_LINE",
+    "REPLACE_LINE_RANGE",
+)
+
+
+def summarize_parse_miss(llm_output: str) -> str:
+    """Explain a ``parse_patch_blocks(...) == []`` result when patch
+    markers were actually present in the raw output.
+
+    Called by patching / repair paths when ``parse_patch_blocks``
+    returns zero blocks. If the output contains no known ``<<<XYZ>>>``
+    openers at all, returns ``""`` — the LLM legitimately emitted no
+    patches and the caller should log the usual "no patches" line. If
+    openers ARE present, returns a short, LLM-facing string naming
+    what was seen and hinting at the most common cause so the retry
+    prompt can echo it as a directive.
+
+    The two shapes we specifically call out because the LLM has been
+    observed to emit them under output-token pressure and both cause
+    silent parser drops:
+
+      * ``content:<body>`` on the same line (the finsearch 156032347
+        signature — 600/610 blocks dropped this way in one round).
+      * A block opener with no matching closer, cut off by the model's
+        output-token cap (``finish: length``). The tail block's opener
+        counts but its closer never appears.
+
+    The returned string is short by design — it goes into a system
+    message the LLM sees next round, and long context there hurts more
+    than it helps.
+    """
+    counts: dict[str, tuple[int, int]] = {}
+    for name in _PARSE_MISS_MARKERS:
+        opens = llm_output.count(f"<<<{name}>>>")
+        closes = llm_output.count(f"<<<END_{name}>>>")
+        if opens or closes:
+            counts[name] = (opens, closes)
+    if not counts:
+        return ""
+
+    total_opens = sum(o for o, _ in counts.values())
+    total_closes = sum(c for _, c in counts.values())
+    kinds = ", ".join(
+        f"{k}={o}/{c}" for k, (o, c) in sorted(counts.items())
+    )
+    hints: list[str] = []
+    # Unclosed tail block: model hit output-token cap mid-block.
+    if total_opens > total_closes:
+        hints.append(
+            f"{total_opens - total_closes} opener(s) with no matching "
+            "closer — likely truncated by the output-token cap "
+            "(finish=length). Split the batch or use smaller blocks."
+        )
+    # Inline body sniff: closers are all paired but zero blocks parsed.
+    # Almost always the ``content:<body>`` / ``search:<body>`` shape;
+    # sample the first such occurrence for the LLM.
+    inline_sample = ""
+    if total_opens == total_closes and total_opens > 0:
+        # Find first "content:<non-newline>" or "search:<non-newline>"
+        # to give the LLM a concrete example of what to fix.
+        m = re.search(r'(content|search|replace):([^\n]{1,60})', llm_output)
+        if m and m.group(2).strip():
+            inline_sample = f"{m.group(1)}:{m.group(2).strip()[:40]}"
+            hints.append(
+                "Body field starts on the same line as its label — e.g. "
+                f"`{inline_sample}`. Put the body on the LINE AFTER the "
+                "`content:` / `search:` / `replace:` label."
+            )
+    hint_str = " ".join(hints) if hints else (
+        "Markers present but no block parsed — check field order and "
+        "that each block has file/content pairs before its END marker."
+    )
+    return f"Markers seen: {kinds}. {hint_str}"
 
 
 def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:

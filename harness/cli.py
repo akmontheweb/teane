@@ -8553,8 +8553,23 @@ def _doctor_check_env_vars_from_config(
     required: list[tuple[str, str, str]] = []
 
     # --- web_tools primary + fallback chain ---------------------------------
+    # Track whether a keyless / no-API-key fallback is enabled — if so,
+    # missing keys on other web_tools entries downgrade from FAIL to
+    # WARN because the chain will still serve queries (just from the
+    # fallback instead of the preferred backend).
     web_tools = config.get("web_tools") or {}
+    web_has_keyless_fallback = False
     if web_tools.get("enabled", False):
+        # Detect keyless fallback first — informs severity below.
+        for backend in (web_tools.get("backends") or []):
+            if not isinstance(backend, dict):
+                continue
+            if not backend.get("enabled", True):
+                continue
+            fb_name = str(backend.get("search_backend") or "").strip().lower()
+            if fb_name in _BUILTIN_SEARCH_BACKENDS:
+                web_has_keyless_fallback = True
+                break
         primary = str(web_tools.get("search_backend") or "").strip().lower()
         primary_env = str(web_tools.get("api_key_env") or "").strip()
         if primary and primary not in _BUILTIN_SEARCH_BACKENDS and primary_env:
@@ -8632,14 +8647,34 @@ def _doctor_check_env_vars_from_config(
                 ("pass", f"set ({feature_str})"),
             ))
         else:
-            rows.append((
-                f"env: {env}",
-                (
-                    "fail",
-                    f"NOT set but required by: {feature_str}. "
-                    f"Fix: {hints[env]}",
-                ),
-            ))
+            # Downgrade FAIL → WARN when the feature has a working
+            # fallback that doesn't need this key. Currently only the
+            # web_tools chain works this way — if a keyless built-in
+            # backend (duckduckgo_lite / ddg / duckduckgo) is enabled,
+            # a missing web_tools API key means "we'll use DDG instead"
+            # not "we're broken". MCP + dashboard have no such fallback,
+            # so they stay FAIL.
+            web_only = all("web_tools" in f for f in features)
+            if web_only and web_has_keyless_fallback:
+                rows.append((
+                    f"env: {env}",
+                    (
+                        "warn",
+                        f"not set — {feature_str} will silently fall "
+                        f"back to the keyless built-in backend "
+                        f"(duckduckgo_lite). Set it to prefer the "
+                        f"configured backend: {hints[env]}",
+                    ),
+                ))
+            else:
+                rows.append((
+                    f"env: {env}",
+                    (
+                        "fail",
+                        f"NOT set but required by: {feature_str}. "
+                        f"Fix: {hints[env]}",
+                    ),
+                ))
     return rows
 
 

@@ -7,10 +7,12 @@ applies_to: [react, typescript, node]
 ### When this skill applies
 Any React + TypeScript workspace with `package.json` declaring `react` and (typically) `@testing-library/react`. Applies to Vite / Create React App / Next.js projects alike. The sandbox pre-installs `jest`, `@testing-library/react`, `@testing-library/user-event`, `@testing-library/jest-dom`, and `jest-environment-jsdom`.
 
-### Coverage gate (STRICTLY ENFORCED)
-Build/patch succeeds only when Jest exits zero — configured to fail when line coverage < 70%. The `package.json` you emit already carries a `coverageThreshold` block enforcing that (see the makefile_node skill). If under 70%, the compile+repair loop will re-enter this node to write MORE tests — do not lower the threshold.
+### Coverage gate
+The operator's `coverage.enforce` setting decides whether under-threshold builds fail:
+- `coverage.enforce=true` (default) — build/patch succeeds only when Jest exits zero. The `package.json` you emit carries a `coverageThreshold` block; under-threshold trips repair_node to write more tests.
+- `coverage.enforce=false` — coverage is still measured (report generated) but the `coverageThreshold` block is omitted, so the build passes regardless of coverage%.
 
-Aim for coverage BEYOND 70% where reasonable. Prioritize business logic (services, hooks, reducers, utilities) over presentation glue (index.tsx bootstraps, static wrappers).
+The `package.json` you emit already resolves the threshold block correctly for the current operator setting (see the makefile_node skill). Aim for coverage BEYOND {{coverage.min_pct}}% where reasonable. Prioritize business logic (services, hooks, reducers, utilities) over presentation glue (index.tsx bootstraps, static wrappers).
 
 ### What IS a unit test (belongs here)
 - One component / hook / service / util exercised in isolation.

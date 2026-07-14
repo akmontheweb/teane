@@ -1666,10 +1666,54 @@ def _build_system_prompt(
     # cross-cutting skills (makefile_python's build + coverage rules,
     # unit_tests_*, etc.) room to breathe. Typical stack loads 3-4
     # skills so worst-case concatenation stays under 32 KB.
+    #
+    # Skill-time substitutions: operator-configurable values referenced
+    # in shipped skill markdown as ``{{key}}`` markers.
+    # Coverage knobs (FR-080):
+    #   coverage.min_pct  — the numeric threshold. Default 70.
+    #   coverage.enforce  — bool. True: LLM writes the fail-under flag
+    #                       (pytest ``--cov-fail-under=N`` /
+    #                       Jest ``coverageThreshold``) so a build
+    #                       under-threshold exits non-zero and repair
+    #                       loops re-enter to write more tests. False:
+    #                       coverage still measured (report generated)
+    #                       but no gate — the build passes regardless.
+    #                       Default True.
+    _cov_cfg = (config or {}).get("coverage", {}) if isinstance(config, dict) else {}
+    if not isinstance(_cov_cfg, dict):
+        _cov_cfg = {}
+    _cov_min_raw = _cov_cfg.get("min_pct", 70)
+    try:
+        _cov_min = int(_cov_min_raw)
+    except (TypeError, ValueError):
+        _cov_min = 70
+    _cov_enforce = bool(_cov_cfg.get("enforce", True))
+    # Pre-render the exact flag / JSON fragment the LLM should emit
+    # for each stack. Keeps the conditional out of the skill markdown
+    # (the LLM sees the resolved text; no room to misinterpret an
+    # ``if enforce=false`` instruction).
+    _pytest_fail_flag = (
+        f" --cov-fail-under={_cov_min}" if _cov_enforce else ""
+    )
+    _jest_threshold_snippet = (
+        # Trailing comma is inside the string so the surrounding JSON
+        # stays valid in both branches (the following ``"collectCoverageFrom":``
+        # key sits directly after this).
+        '"coverageThreshold": {"global": {"lines": ' + str(_cov_min)
+        + ', "statements": ' + str(_cov_min) + '}}, '
+        if _cov_enforce else ""
+    )
+    skills_substitutions = {
+        "coverage.min_pct": str(_cov_min),
+        "coverage.enforce": "true" if _cov_enforce else "false",
+        "coverage.pytest_fail_flag": _pytest_fail_flag,
+        "coverage.jest_threshold_snippet": _jest_threshold_snippet,
+    }
     harness_skills = _load_skills_markdown(
         os.path.join(os.path.dirname(__file__), "skills"),
         max_file_chars=8000,
         workspace_tags=workspace_tags,
+        substitutions=skills_substitutions,
     )
     if harness_skills:
         harness_skills = f"## Agent Skills & Standards\n{harness_skills}\n"
@@ -1681,6 +1725,7 @@ def _build_system_prompt(
         os.path.join(workspace_path, "skills"),
         max_file_chars=3000,
         workspace_tags=workspace_tags,
+        substitutions=skills_substitutions,
     )
     if project_skills:
         project_skills = f"## Project Skills & Conventions\n{project_skills}\n"
@@ -2170,6 +2215,7 @@ def _load_skills_markdown(
     skills_dir: str,
     max_file_chars: int = 4000,
     workspace_tags: Optional[set[str]] = None,
+    substitutions: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Scan a skills/ directory for .md files and return their concatenated content.
@@ -2182,11 +2228,22 @@ def _load_skills_markdown(
     appears in ``workspace_tags``. Skills with no frontmatter (e.g. the
     universal ``agent-standards.md``) always load.
 
+    When ``substitutions`` is provided, every ``{{key}}`` marker in the
+    loaded body is replaced with the mapped string. Used to inject
+    operator-configurable values (e.g. ``coverage.min_pct``) into the
+    otherwise-static skill markdown; keeps shipped defaults in the
+    skill file while letting ``config.json`` override them at runtime.
+
     Args:
         skills_dir: Absolute path to the skills directory.
         max_file_chars: Maximum characters to read per skill file.
         workspace_tags: Tags returned by ``impact._detect_workspace_stack``.
                         ``None`` disables filtering (legacy behavior).
+        substitutions: Optional ``{key: value}`` mapping applied via
+                        ``body.replace("{{key}}", value)`` on each file's
+                        body. Unmatched markers survive verbatim so the
+                        LLM sees the literal placeholder (visible bug
+                        signal rather than silent drop).
 
     Returns:
         Concatenated markdown content (frontmatter stripped), or empty
@@ -2220,6 +2277,10 @@ def _load_skills_markdown(
                         fname, sorted(applies_to), sorted(workspace_tags),
                     )
                     continue
+
+            if substitutions:
+                for key, value in substitutions.items():
+                    body = body.replace("{{" + key + "}}", value)
 
             if body.strip():
                 parts.append(body)

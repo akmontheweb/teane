@@ -7,10 +7,12 @@ applies_to: [python]
 ### When this skill applies
 Any Python workspace (FastAPI, Django, Flask, plain library, CLI). The sandbox pre-installs `pytest`, `pytest-asyncio`, `pytest-cov`, `pytest-mock`, `freezegun`, and `responses` — do NOT add them to `requirements.txt` unless the project ships outside the sandbox too.
 
-### Coverage gate (STRICTLY ENFORCED)
-Build/patch succeeds only when `pytest --cov-fail-under=70` exits zero. The Makefile you emit already carries `--cov=<pkg> --cov-fail-under=70` (see the makefile_python skill). If coverage is under 70%, the compile+repair loop will re-enter this node to write MORE unit tests — do not lower the threshold.
+### Coverage gate
+The operator's `coverage.enforce` setting decides whether under-threshold builds fail:
+- `coverage.enforce=true` (default) — build/patch succeeds only when `pytest --cov-fail-under={{coverage.min_pct}}` exits zero. Under-threshold trips repair_node to write more tests.
+- `coverage.enforce=false` — coverage is still measured (report generated) but under-threshold does NOT fail the build.
 
-Aim for coverage BEYOND 70% where reasonable: 70% is the floor, not the target. Prioritize business logic (services, extractors, validators) over glue code (config loaders, main.py bootstraps).
+The Makefile you emit already resolves the fail-under flag correctly for the current operator setting (see the makefile_python skill). Aim for coverage BEYOND {{coverage.min_pct}}% where reasonable — {{coverage.min_pct}}% is the floor, not the target. Prioritize business logic (services, extractors, validators) over glue code (config loaders, main.py bootstraps).
 
 ### What IS a unit test (and belongs here)
 - A single function / class / method exercised in isolation with real inputs and mocked I/O (DB, HTTP, filesystem, clock, RNG).

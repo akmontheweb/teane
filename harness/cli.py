@@ -642,6 +642,12 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # failed exit, a [learned-rule:<trigger>] note lands in per-repo
     # memory and reaches the next run's planner. See harness/post_mortem.py.
     "post_mortem",
+    # Coverage gate for generated apps (FR-080). Operator override for the
+    # minimum-line-coverage threshold the LLM writes into each generated
+    # Makefile / package.json test target. Templated into the skills at
+    # system-prompt-build time via {{coverage.min_pct}} substitution
+    # (see graph._load_skills_markdown).
+    "coverage",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -838,6 +844,16 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
     "compiler": frozenset({"run_prod_import_smoke_check", "advisory_exit_codes"}),
+    # Coverage gate for generated apps (FR-080).
+    # min_pct — integer 0-100, default 70. Substituted into every Makefile
+    #   / package.json coverage rule the LLM emits (skills reference it via
+    #   {{coverage.min_pct}}).
+    # enforce — bool, default true. When true the LLM writes the fail-under
+    #   flag (pytest --cov-fail-under, Jest coverageThreshold) so a build
+    #   under threshold exits non-zero and repair_node re-enters to add
+    #   more tests. When false coverage is still measured but the threshold
+    #   flag is omitted — the build passes regardless of coverage%.
+    "coverage": frozenset({"min_pct", "enforce"}),
     # Web research tools. enabled toggles registration of web_fetch +
     # web_search in the SkillRegistry. max_bytes / max_results cap result
     # size. search_backend selects the search provider (only
@@ -1056,6 +1072,9 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.backup_count": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
+    # Coverage gate for generated apps (FR-080). See _KNOWN_NESTED_KEYS.
+    "coverage.min_pct": (int,),
+    "coverage.enforce": (bool,),
     "speculative.enabled": (bool,),
     "speculative.num_variants": (int,),
     "speculative.temperature": (int, float),

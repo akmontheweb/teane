@@ -19,7 +19,7 @@ The harness sandbox pre-installs [`uv`](https://github.com/astral-sh/uv) on the 
 Pick the variant matching the dependency manifest you're also creating (or that already exists). Each variant has separate `build:` and `test:` targets plus a `.PHONY:` line, so operators can run `make test` independently.
 
 ### Coverage gate (STRICTLY ENFORCED)
-Every `test:` target MUST include `--cov=<pkg>` (one flag per top-level source package — never `--cov=.`) and `--cov-fail-under=70`. `pytest-cov` is pre-installed in the sandbox; do NOT add it to `requirements.txt`. Pytest's own exit code IS the gate — no custom scripts, no stdout grep.
+Every `test:` target MUST include `--cov=<pkg>` (one flag per top-level source package — never `--cov=.`) and `{{coverage.pytest_fail_flag}}` (operator-configurable via `coverage.min_pct` in `config.json`; the shipped default is 70). `pytest-cov` is pre-installed in the sandbox; do NOT add it to `requirements.txt`. Pytest's own exit code IS the gate — no custom scripts, no stdout grep.
 
 **With `requirements.txt`:**
 ```make
@@ -29,7 +29,7 @@ build:
 	uv pip install --system -r requirements.txt
 
 test:
-	python3 -m pytest -q --cov=server --cov-fail-under=70
+	python3 -m pytest -q --cov=server{{coverage.pytest_fail_flag}}
 
 all: build test
 
@@ -45,7 +45,7 @@ build:
 	uv pip install --system -e .
 
 test:
-	python3 -m pytest -q --cov=src --cov-fail-under=70
+	python3 -m pytest -q --cov=src{{coverage.pytest_fail_flag}}
 
 all: build test
 
@@ -62,11 +62,11 @@ build:
 	@true
 
 test:
-	python3 -m pytest -q --cov=. --cov-fail-under=70
+	python3 -m pytest -q --cov=.{{coverage.pytest_fail_flag}}
 
 all: build test
 ```
-Substitute `--cov=<pkg>` with your actual source root(s). NEVER omit `--cov` and `--cov-fail-under`; a build that runs zero tests would otherwise report success.
+Substitute `--cov=<pkg>` with your actual source root(s). NEVER omit `--cov` — a build that runs zero tests would otherwise report success. Emit the pytest invocation exactly as shown (including whatever the operator's `coverage.enforce` setting resolved to for the fail-under flag).
 
 ### Conventions to follow
 - Use TAB indentation inside recipes — Make rejects spaces with `*** missing separator. Stop.`

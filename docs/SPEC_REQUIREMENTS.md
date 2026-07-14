@@ -662,13 +662,20 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
   - Given a mixed rejection round (search miss + file missing), the LLM sees a per-file classification tag on each entry, capped at 5 entries.
   - Given `patching_node` and `repair_node` in the same session, both nodes emit status messages via `compose_patch_feedback` — the helper is not duplicated.
 
-### FR-080: 70% Line-Coverage Gate for Generated Apps
-- **Description:** Every stack-specific Makefile skill (`harness/skills/makefile_python.md`, `makefile_node.md`) MUST require the LLM to emit a `test:` target that (a) enables line coverage and (b) fails when total line coverage falls below 70% of the source package(s). Enforcement rides on the tool's own exit code — `pytest --cov=<pkg> --cov-fail-under=70` for Python; Jest `coverageThreshold.global.lines=70` in `package.json` for React/TS. Under-threshold runs make `make test` non-zero, which `compiler_node` routes to `repair_node`; the LLM writes more tests until the gate clears or the repair loop hits its cap. Threshold intentionally hard-coded in the skill text (no config knob in v1) so the LLM sees the same rule on every dispatch. `harness/skills/unit_tests_python.md` and `unit_tests_react.md` MUST tell the LLM what a unit test IS (mocked I/O, sub-millisecond, one behaviour) and IS NOT (e2e journeys — those belong to `teane test`).
+### FR-080: Line-Coverage Gate for Generated Apps (Operator-Configurable)
+- **Description:** Every stack-specific Makefile skill (`harness/skills/makefile_python.md`, `makefile_node.md`) MUST require the LLM to emit a `test:` target that (a) enables line coverage and (b) applies a threshold gate when the operator has opted into enforcement. Two config knobs under `coverage` in `config.json` govern the behaviour:
+  - `coverage.min_pct` — integer 0-100, default 70. The line-coverage percentage the LLM writes into pytest's `--cov-fail-under` flag and Jest's `coverageThreshold.global.{lines,statements}`.
+  - `coverage.enforce` — bool, default true. When true, under-threshold builds exit non-zero (pytest / Jest's own exit code IS the gate) and `compiler_node` routes to `repair_node` to write more tests. When false, coverage is still measured (report generated) but the fail-under flag / `coverageThreshold` block is omitted, so the build passes regardless of coverage%.
+
+  Values are injected into the skill markdown at prompt-build time via `{{coverage.*}}` substitution markers (`{{coverage.min_pct}}`, `{{coverage.pytest_fail_flag}}`, `{{coverage.jest_threshold_snippet}}`). The LLM sees the resolved text — no conditional reasoning required. `harness/skills/unit_tests_python.md` and `unit_tests_react.md` MUST tell the LLM what a unit test IS (mocked I/O, sub-millisecond, one behaviour) and IS NOT (e2e journeys — those belong to `teane test`).
+
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given a Python workspace, the LLM's generated Makefile's `test:` target contains `--cov=<pkg>` AND `--cov-fail-under=70`.
-  - Given a React/TS workspace, the LLM's generated `package.json` `jest` block contains `coverageThreshold.global.lines >= 70`.
-  - Given a build where UTs pass but coverage is 60%, `make test` exits non-zero and the compile→repair loop re-enters to add more tests.
+  - Given `coverage.enforce=true` and `coverage.min_pct=70` (defaults), the LLM's generated Makefile `test:` target contains `--cov=<pkg> --cov-fail-under=70` (Python) or the `coverageThreshold.global.lines=70` block (React/TS).
+  - Given `coverage.enforce=false`, the Makefile still runs coverage but omits the fail-under flag / `coverageThreshold` block; a build with 60% coverage exits zero.
+  - Given `coverage.min_pct=85` and enforce=true, generated Makefiles use `--cov-fail-under=85` and `coverageThreshold.global.lines=85`.
+  - Given a build where UTs pass but coverage is under threshold with enforce=true, `make test` exits non-zero and the compile→repair loop re-enters to add more tests.
+  - Given a malformed `coverage.min_pct` (string, non-integer), the harness falls back to the default 70 without crashing.
 
 ### FR-081: Flow-Aware Traceability Gate (Build/Patch enforce Reqs; Test enforces ACs)
 - **Description:** The end-of-session traceability audit (`installation_doc_node` in `harness/graph.py`; `TraceabilityReport.has_req_gap()` / `.has_ac_gap()` in `harness/traceability.py`) MUST split its enforcement decision by flow: every flow enforces `has_req_gap` (a requirement lacking a satisfying story is a planner failure, always blocking), but AC coverage (`has_ac_gap` — an acceptance criterion lacking a linked `test_verifies_ac` row) is enforced ONLY when `state["flow"] == "test"`. Rationale: unit tests generated during `teane build` / `teane patch` link to code modules; ACs are closed by Playwright tests emitted by `teane test`. Blocking `build`/`patch` on AC coverage produced an unfixable headless auto-resume loop (finsearch session 156032347 — 25/124 ACs untested at end-of-build, `traceability_block` cycled to no effect). The per-batch soft warning in `story_loop.py::traceability_node` MUST reflect the same split ("AC coverage is closed by `teane test` and does not block build/patch"). The `traceability.enforce=false` operator switch continues to short-circuit both.
@@ -884,7 +891,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Max directory depth in tree snapshot:** 4
 - **Max skills file chars:** 8000 (harness) / 3000 (project) — harness cap raised from 4 KB so cross-cutting skills (`makefile_python.md` with the coverage gate, `unit_tests_*.md`) fit without truncation; matches the style-guide cap
 - **Max style_guides file chars:** 8192 (focused) / 24576 (composite) — focused cap raised from 4 KB to give cross-cutting rules (datetime, path handling, package init, concurrency) room to sit alongside the base language guide
-- **Coverage gate (generated apps):** 70% line coverage minimum (hard-coded in `harness/skills/makefile_python.md` and `makefile_node.md`; not operator-configurable in v1)
+- **Coverage gate (generated apps):** operator-configurable via `coverage.min_pct` (int 0-100, default 70) and `coverage.enforce` (bool, default true) in `config.json`; injected into shipped skill markdown at prompt-build time via `{{coverage.*}}` substitution markers
 - **Repair-history prune threshold:** 4 rounds (`DEFAULT_PRUNE_AFTER_ROUND=3` in `harness/repair_context.py`) — from round 4 onward, `repair_node` keeps only `messages[0:2]` + last 6 turns
 - **Repair-history tail size:** 6 messages (`DEFAULT_KEEP_TAIL=6` in `harness/repair_context.py`)
 - **HITL raw build output display:** Last 2000 characters

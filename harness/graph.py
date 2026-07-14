@@ -6322,20 +6322,41 @@ async def _run_prod_import_smoke_check(
         return []
     # Build a Python script that imports each module under try/except so
     # one failure doesn't abort the rest. Failures are printed in a
-    # parseable format the caller can grep.
+    # parseable format the caller can grep. We walk the exception's
+    # traceback to surface the deepest *user-code* frame (skipping the
+    # ``python3 -c`` script itself and stdlib frames) so the diagnostic
+    # carries the real file:line where the failing import lives — without
+    # this, the reflection judge only sees a bare "ImportError: ..." and
+    # emits the "insufficient data — no diagnostic locations available"
+    # sentinel, stalling repair rounds.
     py_lines = [
         "import sys",
+        "import traceback",
+        "import os",
         f"_mods = {modules!r}",
         "_fails = []",
         "for _m in _mods:",
         "    try:",
         "        __import__(_m)",
         "    except BaseException as _e:",
-        "        _fails.append((_m, type(_e).__name__, str(_e)))",
+        "        _tb = traceback.extract_tb(_e.__traceback__)",
+        "        _file, _line = '', 0",
+        "        for _fr in reversed(_tb):",
+        "            _fn = _fr.filename or ''",
+        # Skip the -c script (``<string>``), frozen importlib frames,
+        # anything under the Python stdlib prefix. Everything else is
+        # workspace code — take the deepest such frame.
+        "            if not _fn or _fn == '<string>' or _fn.startswith('<'):",
+        "                continue",
+        "            if _fn.startswith(sys.prefix + os.sep) or _fn.startswith(sys.base_prefix + os.sep):",
+        "                continue",
+        "            _file, _line = _fn, _fr.lineno or 0",
+        "            break",
+        "        _fails.append((_m, type(_e).__name__, _file, _line, str(_e)))",
         "if _fails:",
         "    print('=== PROD_IMPORT_SMOKE_FAILURES ===')",
-        "    for _m, _et, _msg in _fails:",
-        "        print(f'FAIL: {_m}: {_et}: {_msg}')",
+        "    for _m, _et, _f, _ln, _msg in _fails:",
+        "        print(f'FAIL: {_m}: {_et}: {_f}:{_ln}: {_msg}')",
         "    sys.exit(1)",
         "print('=== PROD_IMPORT_SMOKE_OK ===')",
     ]
@@ -6407,13 +6428,32 @@ async def _run_prod_import_smoke_check(
             continue
         if not line.startswith("FAIL:"):
             continue
-        # Parse "FAIL: <module>: <ExceptionType>: <message>"
+        # Parse "FAIL: <module>: <ExceptionType>: <file>:<lineno>: <message>"
+        # (older format without file:lineno: falls back to module-derived
+        # file, line=0). Splitting on ":" with maxsplit=2 gives us the
+        # three top-level fields; the third field then MAY start with
+        # "file:line: " which we parse out separately.
         body = line[len("FAIL:"):].strip()
-        # Split into at most 3 parts
         try:
-            module, exc_type, message = [p.strip() for p in body.split(":", 2)]
+            module, exc_type, tail = [p.strip() for p in body.split(":", 2)]
         except ValueError:
-            module, exc_type, message = body, "ImportError", body
+            module, exc_type, tail = body, "ImportError", body
+        # Try to peel a "<file>:<lineno>: " prefix off the tail. The
+        # traceback walk in the smoke script emits an empty file when it
+        # can't identify a user-code frame — in that case the prefix is
+        # ":0:", which we treat as "no location" and fall back to the
+        # module-derived path.
+        fail_file = ""
+        fail_line = 0
+        message = tail
+        _loc_match = re.match(r"^([^:\s]*):(\d+):\s*(.*)$", tail, re.DOTALL)
+        if _loc_match:
+            fail_file = _loc_match.group(1).strip()
+            try:
+                fail_line = int(_loc_match.group(2))
+            except ValueError:
+                fail_line = 0
+            message = _loc_match.group(3).strip()
         error_code, hint = _classify_smoke_failure(
             module, exc_type, message, project_top,
         )
@@ -6421,14 +6461,27 @@ async def _run_prod_import_smoke_check(
             pkg = error_code.split(":", 1)[1]
             missing_third_party.setdefault(pkg, []).append(module)
             continue
+        # Prefer the traceback-derived user-code file when we have it; the
+        # module-derived synthetic path (`server/app/main.py`) is used as
+        # a fallback for legacy consumers that key on file, but it isn't
+        # always the file that actually broke.
+        if fail_file:
+            try:
+                fail_file = os.path.relpath(fail_file, workspace_path)
+            except ValueError:
+                pass
+            file_for_diag = fail_file
+        else:
+            file_for_diag = module.replace(".", "/") + ".py"
         diagnostics.append({
             "error_code": error_code,
             "message": (
                 f"Production module `{module}` failed to import "
-                f"({exc_type}): {message}{hint}"
+                f"({exc_type}) at {file_for_diag}:{fail_line}: {message}"
+                f"{hint}"
             ),
-            "file": module.replace(".", "/") + ".py",
-            "line": 0,
+            "file": file_for_diag,
+            "line": fail_line,
             "column": 0,
             "severity": "error",
             "semantic_context": "",
@@ -13439,7 +13492,39 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         _recent = _recent[-4:] + [sorted(_fp)]
                         loop_counter["recent_hypothesis_fingerprints"] = _recent
                     loop_counter["same_hypothesis_streak"] = _streak
-                    if _streak >= 2:
+                    # Delta gate: the LLM's PROGRESS verdict is a hypothesis
+                    # about the last round's patches. When the deterministic
+                    # fingerprint delta (fps_advanced or count_shrank) does
+                    # NOT confirm progress, the judge is over-optimistic —
+                    # treat this the same as the same-hypothesis fixation
+                    # case and hold consecutive_distraction_rounds instead
+                    # of resetting it. Without this, an unverified PROGRESS
+                    # resets the distraction counter every round, masking
+                    # the drift the counter is supposed to catch. See
+                    # finsearch session 48c1ca37 where a PROGRESS verdict
+                    # was followed by "no_progress_repairs=1" on the next
+                    # round with fingerprints unchanged (fps 1/1 shared=1,
+                    # count 6/6). Guarded by ``has_meaningful_prior`` so
+                    # the very first repair (no delta to check against)
+                    # still earns the reset.
+                    _delta_confirms_progress = (
+                        not has_meaningful_prior or prior_round_made_progress
+                    )
+                    if _streak < 2 and not _delta_confirms_progress:
+                        logger.warning(
+                            "[repair_node] PROGRESS verdict not confirmed by "
+                            "fingerprint delta (fps prior=%d/current=%d "
+                            "shared=%d; count prior=%d/current=%d). Judge "
+                            "is optimistic; deterministic signal disagrees. "
+                            "consecutive_distraction_rounds held at %d.",
+                            len(prior_fps_set), len(current_fps_set),
+                            len(prior_fps_set & current_fps_set),
+                            prior_diag_count, current_diag_count,
+                            loop_counter.get(
+                                "consecutive_distraction_rounds", 0,
+                            ),
+                        )
+                    elif _streak >= 2:
                         # Two prior rounds of the same hypothesis + a
                         # PROGRESS verdict targeting the same files = the
                         # LLM is stuck on this narrative. Preserve the
@@ -21133,12 +21218,17 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
     _CODE_REVIEW_FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. No explanations, no markdown fences, no text outside the blocks.
 
+[OP-TYPE SEMANTICS — READ BEFORE EMITTING]
+Every file listed in "## Modified Files Snapshot" below ALREADY EXISTS on disk. Never emit CREATE_FILE for a file that appears in the snapshot — the patcher will reject it. Use REPLACE_BLOCK for targeted edits, REWRITE_FILE only when you truly need to replace the entire file, DELETE_BLOCK to remove lines, INSERT_AT_BLOCK to add near an anchor.
+Also: never emit two CREATE_FILE or REWRITE_FILE blocks targeting the same path in one response — the patcher will only apply the first and reject the rest.
+
 Valid blocks:
 <<<CREATE_FILE>>>
 file: path/to/file.ext
 content:
 <complete file contents>
 <<<END_CREATE_FILE>>>
+# Use ONLY for files that do NOT already exist. Reject: any path shown in the snapshot below.
 
 <<<REPLACE_BLOCK>>>
 file: path/to/file.ext
@@ -21147,6 +21237,14 @@ search:
 replace:
 <exact replacement lines>
 <<<END_REPLACE_BLOCK>>>
+# Preferred op for editing existing files. Small, targeted, anchor-aware.
+
+<<<REWRITE_FILE>>>
+file: path/to/file.ext
+content:
+<complete new file contents>
+<<<END_REWRITE_FILE>>>
+# Use for existing files ONLY when replacing >50% of the file, or for structural files (JSON/YAML/TOML) where REPLACE_BLOCK is too fragile.
 
 <<<DELETE_BLOCK>>>
 file: path/to/file.ext

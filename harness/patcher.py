@@ -3548,6 +3548,10 @@ def _classify_patch_failure(error: str) -> str:
         return "path denied"
     if "no patch blocks" in e:
         return "no blocks parsed"
+    if "duplicate" in e and "in this batch" in e:
+        return "duplicate op in batch"
+    if "multi-line replace_block on structural files" in e:
+        return "structural file multiline"
     return "error"
 
 
@@ -3777,6 +3781,46 @@ async def apply_patch_blocks(
         logger.warning(
             "[patcher] Refused harness-internal patch to %s", block.file
         )
+
+    # In-batch dedup for CREATE_FILE / REWRITE_FILE — whole-file ops that are
+    # semantically unique per path. If the LLM emits two such ops for the same
+    # file in one response, only the first can meaningfully land; the second's
+    # bytes are either identical (waste) or contradictory (which one wins is
+    # arbitrary). Reject the duplicates up-front with a directive so the LLM
+    # knows to consolidate on the next round. REPLACE_BLOCK / DELETE_BLOCK /
+    # INSERT_AT_BLOCK are intentionally excluded — multiple such ops per file
+    # are legitimate (edit different regions).
+    _UNIQUE_PER_FILE_OPS = {OperationType.CREATE_FILE, OperationType.REWRITE_FILE}
+    _first_unique_seen: dict[tuple[str, OperationType], int] = {}
+    _deduped: list[PatchBlock] = []
+    for block in other_blocks:
+        if block.operation in _UNIQUE_PER_FILE_OPS:
+            key = (block.file, block.operation)
+            if key in _first_unique_seen:
+                results.append(PatchResult(
+                    success=False,
+                    file=block.file,
+                    operation=block.operation,
+                    error=(
+                        f"duplicate {block.operation.value.upper()} for "
+                        f"{block.file!r} in this batch — the first "
+                        f"{block.operation.value.upper()} for this path "
+                        f"was applied; this one was dropped. Whole-file "
+                        f"ops (CREATE_FILE, REWRITE_FILE) can only land "
+                        f"once per path per batch. If you meant to edit "
+                        f"the file further after creating/rewriting it, "
+                        f"emit a REPLACE_BLOCK / INSERT_AT_BLOCK / "
+                        f"DELETE_BLOCK instead."
+                    ),
+                ))
+                logger.warning(
+                    "[patcher] Dropped duplicate %s for %s in one batch",
+                    block.operation.value.upper(), block.file,
+                )
+                continue
+            _first_unique_seen[key] = 1
+        _deduped.append(block)
+    other_blocks = _deduped
 
     if allowed_paths is not None:
         from harness.trust import is_path_allowed

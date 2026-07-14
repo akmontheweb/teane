@@ -2196,7 +2196,7 @@ class SandboxExecutor:
         logger.info(
             "[sandbox] Executing build with backend=%s: %s",
             self.backend.name,
-            build_command,
+            build_command.replace("\n", "\\n"),
         )
 
         try:

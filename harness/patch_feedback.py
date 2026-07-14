@@ -91,6 +91,20 @@ _DIRECTIVE_BY_TAG: dict[str, str] = {
         "error in the block markers. Re-emit using the exact canonical "
         "`<<<OP>>> ... <<<END_OP>>>` shape."
     ),
+    "duplicate op in batch": (
+        "you emitted two whole-file ops (CREATE_FILE or REWRITE_FILE) for "
+        "the same path in one response. The first was applied; the rest "
+        "were dropped. Consolidate to a single CREATE_FILE / REWRITE_FILE "
+        "per path, or use REPLACE_BLOCK / INSERT_AT_BLOCK / DELETE_BLOCK "
+        "for follow-up edits after the initial write."
+    ),
+    "structural file multiline": (
+        "multi-line REPLACE_BLOCK on JSON/YAML/TOML files is rejected — "
+        "one misplaced brace/comma/indent shift breaks the parser. Emit "
+        "REWRITE_FILE with the complete intended file contents. Only "
+        "single-value (1-3 line) REPLACE_BLOCK on structural files is "
+        "accepted."
+    ),
 }
 _DEFAULT_DIRECTIVE = (
     "read the error text above and adjust the block accordingly."

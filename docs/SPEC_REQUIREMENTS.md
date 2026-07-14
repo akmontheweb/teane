@@ -654,6 +654,39 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
   - Given a fourth surgical edit to the same file in one turn, the screen rejects it with `[screen:over-cap]` before the patcher runs.
   - Given a `REPLACE_BLOCK` against an empty file, the patch is rejected with a Guard-4 error instead of a silent no-op loop.
 
+### FR-079: Per-File Patcher Rejection Feedback to LLM
+- **Description:** `patching_node` and `repair_node` MUST route every post-patcher LLM status message through `harness.patch_feedback.compose_patch_feedback`, which appends per-file `(file, operation, classification-tag): directive` blocks derived from `harness.patcher._classify_patch_failure`. Directive text MUST cover the primary failure classes — `file missing` → "use CREATE_FILE"; `search miss` → "READ_FILE and copy exact bytes"; `ambiguous match` → "add more context"; `rejected: file already exists` → "use REPLACE_BLOCK"; `path denied` / `allowlist denied` → move under allowed prefix; `no blocks parsed` → parser-miss diagnostic. Both nodes MUST share the same helper so future feedback improvements ship in one place; the helper preserves the parse-miss path (`fail_count == 0`) previously introduced by cc9ab6a.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a patcher round that rejects an INSERT_AT_BLOCK on a non-existent file, the next LLM system message contains the file path AND the "use CREATE_FILE" directive.
+  - Given a mixed rejection round (search miss + file missing), the LLM sees a per-file classification tag on each entry, capped at 5 entries.
+  - Given `patching_node` and `repair_node` in the same session, both nodes emit status messages via `compose_patch_feedback` — the helper is not duplicated.
+
+### FR-080: 70% Line-Coverage Gate for Generated Apps
+- **Description:** Every stack-specific Makefile skill (`harness/skills/makefile_python.md`, `makefile_node.md`) MUST require the LLM to emit a `test:` target that (a) enables line coverage and (b) fails when total line coverage falls below 70% of the source package(s). Enforcement rides on the tool's own exit code — `pytest --cov=<pkg> --cov-fail-under=70` for Python; Jest `coverageThreshold.global.lines=70` in `package.json` for React/TS. Under-threshold runs make `make test` non-zero, which `compiler_node` routes to `repair_node`; the LLM writes more tests until the gate clears or the repair loop hits its cap. Threshold intentionally hard-coded in the skill text (no config knob in v1) so the LLM sees the same rule on every dispatch. `harness/skills/unit_tests_python.md` and `unit_tests_react.md` MUST tell the LLM what a unit test IS (mocked I/O, sub-millisecond, one behaviour) and IS NOT (e2e journeys — those belong to `teane test`).
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a Python workspace, the LLM's generated Makefile's `test:` target contains `--cov=<pkg>` AND `--cov-fail-under=70`.
+  - Given a React/TS workspace, the LLM's generated `package.json` `jest` block contains `coverageThreshold.global.lines >= 70`.
+  - Given a build where UTs pass but coverage is 60%, `make test` exits non-zero and the compile→repair loop re-enters to add more tests.
+
+### FR-081: Flow-Aware Traceability Gate (Build/Patch enforce Reqs; Test enforces ACs)
+- **Description:** The end-of-session traceability audit (`installation_doc_node` in `harness/graph.py`; `TraceabilityReport.has_req_gap()` / `.has_ac_gap()` in `harness/traceability.py`) MUST split its enforcement decision by flow: every flow enforces `has_req_gap` (a requirement lacking a satisfying story is a planner failure, always blocking), but AC coverage (`has_ac_gap` — an acceptance criterion lacking a linked `test_verifies_ac` row) is enforced ONLY when `state["flow"] == "test"`. Rationale: unit tests generated during `teane build` / `teane patch` link to code modules; ACs are closed by Playwright tests emitted by `teane test`. Blocking `build`/`patch` on AC coverage produced an unfixable headless auto-resume loop (finsearch session 156032347 — 25/124 ACs untested at end-of-build, `traceability_block` cycled to no effect). The per-batch soft warning in `story_loop.py::traceability_node` MUST reflect the same split ("AC coverage is closed by `teane test` and does not block build/patch"). The `traceability.enforce=false` operator switch continues to short-circuit both.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `flow="build"` and a report with `untested_acs` populated but `untraced` empty, the audit exits clean (no `traceability_block`).
+  - Given `flow="test"` and the same report, the audit blocks via `traceability_block`.
+  - Given any flow with `untraced` populated, the audit blocks regardless of AC coverage.
+  - Given `traceability.enforce=false`, both gates degrade to advisory printout only.
+
+### FR-082: System-Prompt Diet — RSD Prose Stripping + Repair Message Pruning
+- **Description:** Two prompt-diet transforms MUST run to bound the tokens shipped to the LLM without breaking prefix-cache economics: (1) `harness.cli._slim_spec_for_prompt` runs once at spec-load time to strip planner-only fields (`Business driver`, `Success metrics`, `Priority`, `Estimated size`, `Wave`, `Iteration`) from the RSD before it prepends the system prompt, while preserving every code-grounding field (assumptions, story titles, scope, out-of-scope, dependencies, ACs). The transform is applied at both spec-load sites (reuse-docs path AND interactive-review path); the resulting system prompt stays byte-identical across the session so prefix cache survives. (2) `harness.repair_context.prune_repair_messages` runs on every `repair_node` invocation and, when `loop_counter["total_repairs"] > 3`, keeps only `messages[0..2]` (immutable system prompt + initial user task) and the last 6 messages. Everything between is dropped so the LLM stops arguing with its own past assistant turns. Both transforms are surgical and require no config knobs, no state DB additions, and no cache invalidation.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given an agile RSD containing `**Business driver:**` and `**Success metrics:**` blocks, the slimmer removes them and preserves adjacent `**Vision statement:**` and `**Dependencies:**` blocks.
+  - Given a `repair_node` invocation with `total_repairs=1`, the message array is passed through verbatim (full-history mode).
+  - Given a `repair_node` invocation with `total_repairs=5` and a 15-message input, the pruned array is 8 messages long (2 head + 6 tail) and `messages[0:2]` is byte-identical to the pre-prune head (cache anchor preserved).
+
 ---
 
 ## 3. System Scope
@@ -849,7 +882,11 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Default metrics output dir:** `~/.harness/metrics/` (`metrics.metrics_dir`)
 - **Max files per directory in tree snapshot:** 50
 - **Max directory depth in tree snapshot:** 4
-- **Max skills file chars:** 4000 (harness) / 3000 (project)
+- **Max skills file chars:** 8000 (harness) / 3000 (project) — harness cap raised from 4 KB so cross-cutting skills (`makefile_python.md` with the coverage gate, `unit_tests_*.md`) fit without truncation; matches the style-guide cap
+- **Max style_guides file chars:** 8192 (focused) / 24576 (composite) — focused cap raised from 4 KB to give cross-cutting rules (datetime, path handling, package init, concurrency) room to sit alongside the base language guide
+- **Coverage gate (generated apps):** 70% line coverage minimum (hard-coded in `harness/skills/makefile_python.md` and `makefile_node.md`; not operator-configurable in v1)
+- **Repair-history prune threshold:** 4 rounds (`DEFAULT_PRUNE_AFTER_ROUND=3` in `harness/repair_context.py`) — from round 4 onward, `repair_node` keeps only `messages[0:2]` + last 6 turns
+- **Repair-history tail size:** 6 messages (`DEFAULT_KEEP_TAIL=6` in `harness/repair_context.py`)
 - **HITL raw build output display:** Last 2000 characters
 - **Repair prompt raw output fallback:** Last 2000 characters
 - **Token budget context window threshold:** 85% (truncation trigger)

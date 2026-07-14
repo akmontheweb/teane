@@ -192,8 +192,15 @@ harness/
 │   ├── TreeSitterPatcher # AST-aware rewriting
 │   ├── HybridPatcher     # Auto-selects best strategy
 │   ├── _awrite()         # Symlink guard: refuses os.path.islink targets + O_NOFOLLOW (FR-041)
+│   ├── _classify_patch_failure() # Error → short tag (file missing / search miss / ambiguous / …)
 │   ├── parse_patch_blocks() # Extract blocks from LLM text
 │   └── process_llm_patch_output() # Primary integration point
+├── patch_feedback.py     # Shared post-patcher LLM feedback composer (FR-079)
+│   ├── compose_patch_feedback() # Status message + patch_failures + allowlist buckets
+│   ├── _DIRECTIVE_BY_TAG # Per-classification corrective directive text
+│   └── _store_patch_failure_error() # Cap regular errors at 3000 chars; preserve wider-context marker window
+├── repair_context.py     # Repair-loop message-array pruning (FR-082)
+│   └── prune_repair_messages() # Keep msg[0:2] (system + initial task) + last 6 turns from round 4 onward
 ├── security.py           # Lifecycle & security
 │   ├── GitGuardian       # Branch creation, commit, rollback
 │   ├── CommandValidator  # Whitelist/blocklist command scanner
@@ -1125,6 +1132,34 @@ A pre-existing bug fix landed alongside: `DependencyGraph._scan_file` used to sk
 **Rationale**: Every HITL that fires unattended is either a budget drain or a stalled session (see the north-star: hands-off operation). These guards convert the observed loop-fixation classes from "diagnosed after N wasted rounds" to "rejected pre-flight" — enforcement over advice.
 
 **Trade-off**: Pre-flight rejection can occasionally block a legitimate unusual edit pattern; the screens emit reason-tagged errors so the LLM can adapt within the same round rather than silently retrying.
+
+### 5.63 Per-File Patcher Rejection Feedback to LLM (FR-079)
+
+**Decision**: `harness/patch_feedback.py::compose_patch_feedback` composes the post-patcher status message that both `patching_node` and `repair_node` append to `state["messages"]`. It converts every non-allowlist failure into a `(file, operation, tag): directive` line via `harness.patcher._classify_patch_failure` and a static `_DIRECTIVE_BY_TAG` map. Allowlist rejections stay in their own bucket; parse-miss (fail_count==0) still emits the cc9ab6a diagnostic.
+
+**Rationale**: Finsearch session 156032347 stalled 9 stories because the LLM's post-patcher feedback was a bare "Failed to apply N patch(es)." — no filenames, no reasons. The LLM had no signal to switch strategy (e.g. CREATE_FILE when the target didn't exist yet) and re-emitted the same broken block round after round. Centralising the feedback in one helper (a) fixes both nodes at once, and (b) makes future directive additions ship in one commit.
+
+**Trade-off**: Directive text is prescriptive — a novel failure class not in `_DIRECTIVE_BY_TAG` falls back to `_DEFAULT_DIRECTIVE` ("read the error text and adjust"). Extending coverage means adding tag → directive rows as new classifications land in `_classify_patch_failure`.
+
+### 5.64 Flow-Aware Traceability Gate (FR-081)
+
+**Decision**: `harness/traceability.py::TraceabilityReport` exposes `has_req_gap()` and `has_ac_gap()` separately from the union `has_failures()`. The end-of-session gate in `installation_doc_node` gates on `has_req_gap` in every flow but on `has_ac_gap` only when `state["flow"] == "test"`. `has_failures()` retained for backwards compat.
+
+**Rationale**: Unit tests generated during `teane build` / `teane patch` link to code modules; acceptance criteria are closed by Playwright tests emitted by `teane test`. Forcing build/patch to gate on AC coverage produced an unfixable headless auto-resume loop — `traceability_node` re-runs the same audit against unchanged DB state, HITL fires, auto-resume routes back to `traceability_node`. Finsearch 156032347 hit the 2-cycle cap with 25/124 ACs untested; the run exited unsuccessfully despite every UT passing.
+
+**Trade-off**: Build/patch reports "clean exit" even when ACs are untested — an operator relying on the exit code alone misses the coverage delta. Mitigated by the per-batch soft warning and the end-of-session report line noting AC coverage is closed by `teane test`.
+
+### 5.65 System-Prompt Diet (FR-082)
+
+**Decision**: Two independent transforms bound the tokens shipped to the LLM per round without breaking prefix-cache economics:
+
+1. `harness/cli.py::_slim_spec_for_prompt` strips planner-only labels (`Business driver`, `Success metrics`, `Priority`, `Estimated size`, `Wave`, `Iteration`) from the RSD once at load time, before the string prepends the immutable system prompt. Every code-relevant field survives (assumptions, story titles, scope, out-of-scope, dependencies, ACs). Applied at both spec-load sites — the reuse-docs path AND the interactive-review path.
+
+2. `harness/repair_context.py::prune_repair_messages` runs on every `repair_node` invocation. When `loop_counter["total_repairs"] > 3`, it keeps `messages[0:2]` (system + initial user) and the last 6 turns; everything between is dropped.
+
+**Rationale**: Finsearch session 156032347 shipped a 243 KB system prompt on 139 LLM calls (85% overall cache hit). Cache economics hid the raw cost, but the LLM still had to attend over 243k tokens per repair round — attention dilution + fixation on stale assistant turns (STORY-042 spent 10+ rounds arguing with a hallucinated `del _store[key]` branch that only lived in a round-4 assistant message). The slim-spec transform runs once so the cache anchor stays byte-identical; the pruner keeps the anchor pinned at `messages[0:2]` so cache survives across rounds.
+
+**Trade-off**: Aggressive pruning risks losing signal the LLM would have used from a middle turn. Conservative parameters (`prune_after_round=3`, `keep_tail=6`) — cover 3 free-context rounds first, keep enough tail context to see the last 2-3 patcher exchanges once pruning kicks in.
 
 ---
 

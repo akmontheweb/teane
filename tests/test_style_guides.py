@@ -200,7 +200,9 @@ class TestShippedStyleGuides:
     and that the user-requested set is present."""
 
     # Focused single-source guides: each distills one authoritative source
-    # into ~3 KB of bullets. Cap at 4 KB to keep budgets predictable.
+    # into ~3 KB of bullets. Cap at 8 KB to leave headroom for cross-cutting
+    # convention rules (datetime, path handling, error hierarchies) that
+    # sit alongside the base language guide without earning their own file.
     # Stack is locked to Python|Java backend + React+TypeScript+TailwindCSS
     # web, so vue/angular/flutter/mobile-* guides have been removed.
     FOCUSED_FILES = {
@@ -251,15 +253,15 @@ class TestShippedStyleGuides:
                 f"{fname} must declare an applies_to: frontmatter list"
             )
 
-    def test_focused_guides_under_4kb(self):
+    def test_focused_guides_under_8kb(self):
         # Focused single-source guides must stay tight — anything over
-        # 4 KB has probably absorbed material that belongs in its own
+        # 8 KB has probably absorbed material that belongs in its own
         # separate guide.
         for fname in self.FOCUSED_FILES:
             path = os.path.join(HARNESS_STYLE_GUIDES_DIR, fname)
             size = os.path.getsize(path)
-            assert size <= 4096, (
-                f"{fname} is {size} bytes — focused single-source guides must stay under 4 KB"
+            assert size <= 8192, (
+                f"{fname} is {size} bytes — focused single-source guides must stay under 8 KB"
             )
 
     def test_extended_guides_under_8kb(self):

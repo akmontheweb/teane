@@ -42,6 +42,15 @@ Code is read far more often than it is written. Optimize for the reader. Prefer 
 - Default argument values must not be mutable (`def f(x=[])` is a bug). Use `None` and create the mutable inside.
 - Avoid more than ~5 positional args; force keyword args with `*` after that.
 
+### Datetime & timezones
+One convention end-to-end. Mixed naive/aware causes silent bugs.
+- Import: `from datetime import datetime, timezone`; use `timezone.utc`. NEVER `datetime.UTC` (3.11+ only, often absent in sandboxes).
+- Now: `datetime.now(timezone.utc)`. NEVER `datetime.utcnow()` (naive, deprecated 3.12) or `datetime.now()` (local, naive).
+- Wire/storage: ISO 8601 via `.isoformat()`, parse `datetime.fromisoformat()`.
+- DB: SQLAlchemy `DateTime(timezone=True)`, Postgres `TIMESTAMPTZ`, SQLite `TEXT` (ISO 8601). Never store naive.
+- Aware-vs-naive `TypeError`: fix at the source (parser / ORM / boundary), not each callsite.
+- Mocks: patch at the CALLING module, return aware values.
+
 ### Misc
 - Use `is` / `is not` only for singletons (`None`, `True`, `False`).
 - Use `isinstance(x, T)` not `type(x) is T`.

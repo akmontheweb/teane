@@ -40,6 +40,15 @@ applies_to: [typescript]
 - Prefer string-literal union types over `enum` for simple value sets — they tree-shake cleanly and don't introduce a runtime object.
 - Use `const enum` only inside the same compilation unit; never expose across package boundaries.
 
+### Datetime & timezones
+`Date` is genuinely broken (locale-sensitive parsing, silent NaN on invalid input, no timezone in the value itself). Pick ONE convention.
+- Wire / storage format: ISO 8601 UTC strings via `new Date().toISOString()` (always ends in `Z`). Never epoch numbers on the wire — they lose the "this is a time" typing.
+- Parsing: `new Date(isoString)` accepts ISO 8601 reliably; check `isNaN(d.getTime())` before use. Never parse locale strings — reject at the boundary or use a library.
+- Server + client agree on UTC. Convert to local ONLY at display time via `Intl.DateTimeFormat(undefined, {...})` — never with hand-rolled `getHours()` math.
+- Prefer `number` (epoch ms via `Date.now()`) for durations, deadlines, and TTLs — treat `Date` as a boundary/display type only.
+- If the app does calendar arithmetic (add days, quarters, business hours), pull in `date-fns` (tree-shakeable) rather than reinventing.
+- Test mocks: `jest.useFakeTimers({ now: new Date('2026-01-01T00:00:00Z') })` or Vitest `vi.setSystemTime(new Date(...))`. Always restore in `afterEach`.
+
 ### Formatting
 - 2-space indent; semicolons; single quotes; trailing commas on multi-line lists.
 - Place the type annotation on the same line as the identifier (`const x: T = ...`), not the next line.

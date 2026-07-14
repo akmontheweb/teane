@@ -14085,6 +14085,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # Use the autofix-augmented messages list so the LLM sees the
         # "we already fixed X" system message and doesn't re-fix.
         messages = list(autofix_messages)
+        # Prune the mid-array history once total_repairs > 3. The
+        # immutable system prompt + initial user turn stay pinned at
+        # the front (prefix-cache anchor); the last few turns carry
+        # the fresh error signal. Everything between is provably not
+        # helping — finsearch STORY-042 spent 10+ rounds arguing with
+        # its own round-4 assistant message. See
+        # harness/repair_context.py for the rationale.
+        from harness.repair_context import prune_repair_messages
+        messages = prune_repair_messages(
+            messages, total_repairs=loop_counter["total_repairs"],
+        )
         budget = state.get("budget_remaining_usd", 2.00)
 
         # --- Cross-Model Speculative Execution ---

@@ -4212,6 +4212,68 @@ def _read_spec_file(spec_path: str) -> str:
         return ""
 
 
+# Planner-only section labels the code-emission LLM does not need — see
+# _slim_spec_for_prompt below. Match anchor is the `**Label:**` bold
+# marker at line start; the strip covers the label line PLUS any
+# continuation lines up to the next `**Field:**` marker, section
+# separator, or heading. Adding new labels here should be validated
+# against a sample RSD before shipping.
+_PLANNER_ONLY_SPEC_FIELDS = (
+    "Business driver",
+    "Success metrics",
+    "Estimated size",
+    "Priority",
+    "Wave",
+    "Iteration",
+)
+
+
+def _slim_spec_for_prompt(spec_text: str) -> str:
+    """Remove planner-only sections from an agile RSD so the system prompt
+    injection carries only the fields the code-emission LLM (patching /
+    repair) actually needs.
+
+    Kept: assumptions, epic / feature / story titles, vision, scope,
+    out-of-scope, dependencies, acceptance criteria — everything that
+    grounds *what* to build.
+
+    Dropped: business drivers, success metrics, size, priority, wave —
+    everything that grounds *whether or when* to build. Those are
+    planner-only signals; carrying them into every LLM call inflates the
+    system prompt (and its cache footprint) without changing what code
+    the LLM writes.
+
+    Finsearch session 156032347 shipped a 243 KB system prompt; this
+    filter typically trims ~30% of that. Cache economics are preserved
+    because the transform runs once at load time — the resulting text is
+    still an immutable prefix across the session.
+
+    No-op on empty input and on files that don't contain any of the
+    stripped labels (waterfall SRS, plain markdown, ...); the ratio of
+    removed bytes is logged upstream so a wildly-off filter is visible.
+    """
+    if not spec_text:
+        return spec_text
+    import re
+    # One regex per field: match `**<Field>:** <anything until the next
+    # bold-field marker OR a horizontal rule OR EOF>`. Non-greedy so a
+    # long spec with many labels doesn't collapse into one match.
+    fields_alt = "|".join(re.escape(f) for f in _PLANNER_ONLY_SPEC_FIELDS)
+    pattern = re.compile(
+        # Line-starting **Field:** capture the rest of that line PLUS any
+        # continuation lines until we hit the next **Bold:** field, a
+        # horizontal rule (`---`), a Markdown heading (`# ` at line start),
+        # or the end of the string.
+        rf"^\*\*(?:{fields_alt}):\*\*[^\n]*(?:\n(?!\*\*[A-Za-z][^:]*:\*\*|---|#).*)*\n?",
+        flags=re.MULTILINE,
+    )
+    slimmed = pattern.sub("", spec_text)
+    # Collapse runs of blank lines the strip leaves behind so the
+    # rendered spec stays visually tidy for anyone dumping the prompt.
+    slimmed = re.sub(r"\n{3,}", "\n\n", slimmed)
+    return slimmed
+
+
 async def _dispatch_with_continuation(
     *,
     gateway: Any,
@@ -6565,11 +6627,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
             spec_arch_path = os.path.join(
                 workspace_path, "docs", "SPEC_ARCHITECTURE.md",
             )
-            spec_override = _read_spec_file(spec_req_path) or ""
+            _raw_spec = _read_spec_file(spec_req_path) or ""
+            spec_override = _slim_spec_for_prompt(_raw_spec)
             logger.info(
-                "[requirements] Reusing %s (%d chars) — skipping "
-                "spec synthesis + reviewer cycles.",
-                spec_req_path, len(spec_override),
+                "[requirements] Reusing %s (%d chars raw → %d slimmed, "
+                "%d%% smaller after planner-only sections stripped) — "
+                "skipping spec synthesis + reviewer cycles.",
+                spec_req_path, len(_raw_spec), len(spec_override),
+                (100 * (len(_raw_spec) - len(spec_override))
+                 // max(len(_raw_spec), 1)),
             )
             arch_content = (
                 _read_spec_file(spec_arch_path)
@@ -6707,8 +6773,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     "[requirements] max_doc_review_cycles=0 — skipping pre-flight spec review."
                 )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
-            spec_override = await interactive_review_loop(spec_path, gateway)
-            logger.info("[requirements] Specification locked. %d characters approved.", len(spec_override))
+            _raw_reviewed_spec = await interactive_review_loop(spec_path, gateway)
+            spec_override = _slim_spec_for_prompt(_raw_reviewed_spec)
+            logger.info(
+                "[requirements] Specification locked. %d characters "
+                "approved, %d after planner-only strip (%d%% smaller).",
+                len(_raw_reviewed_spec), len(spec_override),
+                (100 * (len(_raw_reviewed_spec) - len(spec_override))
+                 // max(len(_raw_reviewed_spec), 1)),
+            )
 
             # Architecture synthesis runs whenever the architecture stage is not
             # explicitly disabled. The previous flow jumped straight from

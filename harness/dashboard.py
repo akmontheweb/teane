@@ -1611,7 +1611,7 @@ def _render_index(cfg: DashboardConfig) -> str:
     if not rows:
         return (
             "<p class='muted'>No repo index built yet. Run "
-            "<code>teane index build -r WORKSPACE</code> to populate this view.</p>"
+            "<code>teane index build -w WORKSPACE</code> to populate this view.</p>"
         )
     items = []
     for r in rows:

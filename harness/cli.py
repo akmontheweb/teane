@@ -69,7 +69,7 @@ def _refuse_if_workspace_is_harness_root(workspace_path: str) -> bool:
         f"The path you provided ({workspace_path}) is the harness's own\n"
         f"installation directory. Running the harness against itself would\n"
         f"overwrite its own source as it generates patches.\n\n"
-        f"Please re-run with --repo / -r pointing at a different location\n"
+        f"Please re-run with --workspace / -w pointing at a different location\n"
         f"(your application's repository).\n"
     )
     print("=" * 72)
@@ -2660,7 +2660,7 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print("Resume later with:")
             print(f"  teane resume --session-id {session_id}")
             if workspace and workspace != os.getcwd():
-                print(f"  teane resume --session-id {session_id} -r {workspace}")
+                print(f"  teane resume --session-id {session_id} -w {workspace}")
             print("=" * 60)
             print()
             logger.info("[gatekeeper] %s suspended by developer. Session: %s", gate_label, session_id)
@@ -2945,7 +2945,7 @@ def _discovery_suspend(
     print("Resume later with:")
     print(f"  teane resume --session-id {session_id}")
     if workspace and workspace != os.getcwd():
-        print(f"  teane resume --session-id {session_id} -r {workspace}")
+        print(f"  teane resume --session-id {session_id} -w {workspace}")
     print("=" * 60)
     print()
     logger.info(
@@ -4216,7 +4216,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print("Resume later with:")
             print(f"  teane resume --session-id {session_id}")
             if workspace_path and workspace_path != os.getcwd():
-                print(f"  teane resume --session-id {session_id} -r {workspace_path}")
+                print(f"  teane resume --session-id {session_id} -w {workspace_path}")
             print("=" * 60)
             print()
             logger.info("[HITL] Session suspended by developer. Session: %s", session_id)
@@ -6459,7 +6459,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
 
     # P1.7: workspace-level advisory lock. Without this, two concurrent
-    # `teane run -r <same workspace>` invocations both read and write
+    # `teane run -w <same workspace>` invocations both read and write
     # source files in interleaved order — silently corrupting each other's
     # patches. The lock holds for the lifetime of this process; the OS
     # releases it on exit. Pass --force-lock to override (e.g. recovering
@@ -7739,7 +7739,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     Example:
         teane resume --session-id my-session-abc123
-        teane resume --session-id my-session -r /path/to/repo
+        teane resume --session-id my-session -w /path/to/repo
     """
     from harness.storage import HarnessAsyncSqliteSaver, inspect_session
 
@@ -10710,7 +10710,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 
     Examples:
         teane doctor
-        teane doctor -r /path/to/repo
+        teane doctor -w /path/to/repo
         teane doctor --json          # machine-readable
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
@@ -11202,7 +11202,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Teane — production-grade, model-agnostic LangGraph agent\n"
             "for autonomous code generation, sandboxed builds, and bulletproof persistence.\n\n"
             "Quick Start:\n"
-            "  teane run -r /path/to/repo -p \"Your engineering task description\"\n"
+            "  teane run -w /path/to/repo -p \"Your engineering task description\"\n"
             "  teane -h                       Show this help\n"
             "  teane --version                Print the installed teane version\n"
             "  teane run -h                   Show run subcommand help\n"
@@ -11211,8 +11211,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  teane run -r ./myproject -p \"Add JWT authentication\"\n"
-            "  teane run -r /path/to/repo -p \"Refactor logging\" --manifest notes.txt\n"
+            "  teane run -w ./myproject -p \"Add JWT authentication\"\n"
+            "  teane run -w /path/to/repo -p \"Refactor logging\" --manifest notes.txt\n"
             "  teane resume --session-id abc123\n"
             "  teane status --session-id abc123\n"
             "  teane purge --all\n"
@@ -11580,7 +11580,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="The session/thread ID to resume.",
     )
     resume_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path (auto-detected from checkpoint if omitted).",
     )
@@ -11633,7 +11633,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="List all checkpointed sessions.",
     )
     status_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
@@ -11644,7 +11644,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run first-run healthchecks (git, api keys, sandbox, db, config)",
     )
     doctor_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path to check (defaults to current directory).",
     )
@@ -11712,7 +11712,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     audit_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path to audit (defaults to current directory).",
     )
@@ -11730,7 +11730,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Purge checkpoints for a specific session only.",
     )
     purge_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
@@ -11778,7 +11778,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Burn-rate trailing window in minutes (default 10; clamped to [1, 1440]).",
     )
     metrics_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
@@ -11898,7 +11898,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interactive refinement REPL — reuses the gateway, tools, and memory; no auto-apply.",
     )
     chat_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -11920,7 +11920,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="(Re)build the repo index for the given workspace.",
     )
     index_build_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -11929,7 +11929,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show the prior index summary for the given workspace.",
     )
     index_status_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -11938,7 +11938,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete the prior index for the given workspace.",
     )
     index_clear_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -11957,7 +11957,7 @@ def build_parser() -> argparse.ArgumentParser:
     gh_issue_parser.add_argument("--repo", required=True, help="owner/repo")
     gh_issue_parser.add_argument("--number", type=int, required=True, help="Issue number")
     gh_issue_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -11971,7 +11971,7 @@ def build_parser() -> argparse.ArgumentParser:
     gh_pr_create_parser.add_argument("--base", default="main", help="Base branch (default: main)")
     gh_pr_create_parser.add_argument("--draft", action="store_true", help="Open as draft PR")
     gh_pr_create_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path. Defaults to current directory.",
     )
@@ -12014,7 +12014,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="List the volumes that would be removed without removing them.",
     )
     cache_clear_parser.add_argument(
-        "--workspace", "-w", "-r",
+        "--workspace", "-w",
         default=None,
         help="Workspace path (for config discovery). Defaults to current directory.",
     )

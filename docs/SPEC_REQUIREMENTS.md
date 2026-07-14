@@ -474,7 +474,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Description:** The harness MUST ship a per-workspace semantic-retrieval index buildable via `teane index build`. Two backends MUST be supported: zero-dep `tfidf` (default, deterministic, pure Python with identifier-aware tokenisation) and opt-in `openai_embeddings` (using `OPENAI_API_KEY`, falling back to TF-IDF when the key is missing). Index storage MUST be SQLite at `~/.harness/repo_index/repo_index.db`. When `repo_index.enabled=true`, `planning_node` MUST query top-K chunks for the user prompt and inject them as a system context block capped at `repo_index.inject_max_bytes`. `teane index {build, status, clear}` MUST be exposed as a CLI subcommand family.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `teane index build -r /repo`, the SQLite store at `~/.harness/repo_index/repo_index.db` contains one row per chunk with `(workspace_id, file_path, chunk_index, vector_json)`.
+  - Given `teane index build -w /repo`, the SQLite store at `~/.harness/repo_index/repo_index.db` contains one row per chunk with `(workspace_id, file_path, chunk_index, vector_json)`.
   - Given `repo_index.enabled=true`, the planner's system message includes a `### Repository context (semantic retrieval)` block when the index has been built.
   - Given `OPENAI_API_KEY` is unset with `repo_index.backend=openai_embeddings`, the backend falls back to TF-IDF with a one-time warning.
 
@@ -490,7 +490,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Description:** The harness MUST ship a `teane chat` subcommand that opens an interactive REPL reusing the Gateway, redactor, web/MCP tool loop, repo-memory injection, and (when enabled) repo-index injection. The REPL MUST NEVER auto-apply patches — the LLM may emit SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save <path>`, `/budget`, `/memory`. The conversation MUST be in-memory only in v1 (no cross-session persistence).
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a `teane chat -r /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
+  - Given a `teane chat -w /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
   - Given the assistant emits patch blocks, `/apply` invokes `process_llm_patch_output` against the workspace with a per-session HITL confirmation.
   - Given `/build`, the auto-wired build command runs in the sandbox and the first 80 lines of output surface in the REPL.
 
@@ -929,7 +929,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Build timeout in sandbox:** PGID-based `kill(-pgid, SIGKILL)` → `SIGTERM` escalation after 5s.
 - **Single corrupted session:** `teane purge --session-id <id>` removes only that thread's checkpoints AND its JSONL log + rotated backups; other sessions are unaffected.
 - **Corrupted checkpoint DB across the board:** `teane purge --all` wipes and recreates; sessions are lost but the workspace is untouched.
-- **Stale workspace lock from a crashed prior session:** `teane run -r <ws> -p '...' --force-lock` releases the stale lock and acquires a fresh one (operator confirms the prior PID is gone). See `docs/RUNBOOK.md` § 4.
+- **Stale workspace lock from a crashed prior session:** `teane run -w <ws> -p '...' --force-lock` releases the stale lock and acquires a fresh one (operator confirms the prior PID is gone). See `docs/RUNBOOK.md` § 4.
 - **Git stash conflict:** `git stash pop` may fail if stash conflicts; harness logs warning and continues (working tree is in the patch branch state).
 - **Self-serve recovery playbooks:** `docs/RUNBOOK.md` covers the top-five operator failure modes (checkpoint corrupted, budget exhausted mid-session, sandbox can't start, workspace lock refused, persistent LLM silence) with symptom / diagnostic / fix recipes.
 

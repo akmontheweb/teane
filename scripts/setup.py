@@ -491,7 +491,7 @@ def _run_harness_doctor(venv_path: Path, workspace: Path) -> tuple[int, str]:
         return 127, f"harness console script not found at {harness}"
     try:
         result = subprocess.run(
-            [str(harness), "doctor", "-r", str(workspace)],
+            [str(harness), "doctor", "-w", str(workspace)],
             capture_output=True, text=True, timeout=60,
         )
         return result.returncode, (result.stdout or "") + (result.stderr or "")
@@ -889,7 +889,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             try:
                 proc = subprocess.run(
-                    [str(harness), "doctor", "-r", str(workspace)],
+                    [str(harness), "doctor", "-w", str(workspace)],
                     capture_output=True, text=True, timeout=60,
                     env=doctor_env,
                 )
@@ -930,7 +930,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print()
     print(_bold("Next steps:"))
     print(f"  1. Activate the venv:   {_green(activation)}")
-    smoke_cmd = _green('teane run -r <workspace> -p "<task>"')
+    smoke_cmd = _green('teane run -w <workspace> -p "<task>"')
     print(f"  2. Smoke run:           {smoke_cmd}")
     print(f"  3. Re-verify:           {_green('teane doctor')}")
     print()

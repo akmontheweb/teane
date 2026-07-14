@@ -107,7 +107,7 @@ Sections of the report, in order:
 - **OPTIONAL** — `gh` CLI, language toolchains (Python / Java / Node — the locked stack) for the stacks the LLM may target.
 - **ENV** — informational; which provider API key env vars are set on this machine.
 
-Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `teane doctor -r <workspace>` for the workspace-bound checks.
+Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `teane doctor -w <workspace>` for the workspace-bound checks.
 
 ## 3. Prerequisites
 

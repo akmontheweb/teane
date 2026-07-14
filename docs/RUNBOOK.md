@@ -13,7 +13,7 @@ config file: `<teane_root>/config/config.json`. There is no
 `~/.harness/config.json` and no per-workspace overrides.
 
 ```bash
-teane doctor -r /path/to/workspace
+teane doctor -w /path/to/workspace
 ```
 
 If `doctor` is green and you're still stuck, the entries below cover the

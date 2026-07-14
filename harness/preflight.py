@@ -24,7 +24,7 @@ Outputs:
 Exit codes (set by the caller):
 
 * ``0`` — no FAIL rows. The machine is ready; next step is
-  ``teane doctor -r <workspace>``.
+  ``teane doctor -w <workspace>``.
 * ``1`` — at least one FAIL row. The operator must install the
   flagged required tools before the harness can run.
 """
@@ -1199,7 +1199,7 @@ def render_tty(results: list[CheckResult], *, no_color: bool = False,
     )
     lines.append(summary)
     if counts[STATUS_FAIL] == 0:
-        lines.append("  Ready for `teane doctor -r <workspace>`.")
+        lines.append("  Ready for `teane doctor -w <workspace>`.")
     else:
         lines.append(
             "  Install the failed REQUIRED items above, then re-run "

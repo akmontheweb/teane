@@ -650,7 +650,7 @@ class TestCmdMetrics:
         })
 
         args = build_parser().parse_args(
-            ["metrics", "--session-id", "abc", "-r", str(ws)]
+            ["metrics", "--session-id", "abc", "-w", str(ws)]
         )
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0
@@ -678,7 +678,7 @@ class TestCmdMetrics:
 
         args = build_parser().parse_args([
             "metrics", "--session-id", "promtest", "--prometheus",
-            "-r", str(ws),
+            "-w", str(ws),
         ])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0
@@ -707,7 +707,7 @@ class TestCmdMetrics:
         })
 
         args = build_parser().parse_args([
-            "metrics", "--session-id", "sess", "--json-dump", "true", "-r", str(ws),
+            "metrics", "--session-id", "sess", "--json-dump", "true", "-w", str(ws),
         ])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0
@@ -728,7 +728,7 @@ class TestCmdMetrics:
             "logging": {"log_dir": str(log_dir)},
         })
 
-        args = build_parser().parse_args(["metrics", "--all", "-r", str(ws)])
+        args = build_parser().parse_args(["metrics", "--all", "-w", str(ws)])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 1
 
@@ -751,7 +751,7 @@ class TestCmdMetrics:
 
         args = build_parser().parse_args([
             "metrics", "--session-id", "stdoutsess", "--prometheus",
-            "--output-path", "-", "-r", str(ws),
+            "--output-path", "-", "-w", str(ws),
         ])
         rc = asyncio.run(cmd_metrics(args))
         assert rc == 0

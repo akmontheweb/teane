@@ -114,6 +114,49 @@ _TRIGGER_ADVICE: dict[str, str] = {
         "story mode ran without a usable decomposition. Generate or repair "
         "the decomposition before patching"
     ),
+    # Post-finsearch-156032347 additions. See the "review teane web for
+    # updates" thread — before these entries the 5 new HITL prefixes fell
+    # through to _GENERIC_ADVICE, defeating the labeling work in
+    # _infer_hitl_trigger.
+    "replace_block_stuck": (
+        "a single file racked up three consecutive REPLACE_BLOCK misses "
+        "even after the automatic REWRITE_FILE recovery round. The LLM's "
+        "mental model of that file has drifted beyond surgical repair. "
+        "Emit a fresh READ_FILE against the file before any subsequent "
+        "edit — the drift signals the previous SEARCH windows have gone "
+        "stale"
+    ),
+    "no_progress_repairs": (
+        "the repair loop hit its per-cap non-progress budget — enough "
+        "consecutive rounds shrunk neither the fingerprint set nor the "
+        "raw diagnostic count that the harness declared the loop stalled. "
+        "Fix the dominant error class in a single early patch rather than "
+        "iterating; when a diagnostic won't shrink on plausible edits, "
+        "the LLM is patching the wrong file or the wrong layer"
+    ),
+    "hard_iteration_ceiling": (
+        "the repair loop ran to the hard total-iteration ceiling "
+        "(max_patch_repair_iterations × total_hard_cap_multiplier) while "
+        "still showing per-round progress signals. The batch is too broad "
+        "for one repair loop to finish — split the story or narrow the "
+        "batch so each verification chain has fewer failing fingerprints "
+        "to converge on"
+    ),
+    "same_missing_dep": (
+        "the same missing dependency recurred past the autofix bypass "
+        "cap. If the symbol is a bootstrap tool (pip / make / a system "
+        "package) it belongs in sandbox.docker_image; if it's a regular "
+        "pip / npm package the workspace-manifest topology is likely "
+        "mismatched — the build_command should install from the manifest "
+        "that actually contains the package"
+    ),
+    "build_command_blocked": (
+        "the sandbox CommandValidator refused the build command because "
+        "a leading token (cd / bash / etc.) is not in security."
+        "allowed_commands. Repair rounds cannot amend the global "
+        "validator config; adjust the policy or rewrite the build "
+        "command to use only whitelisted primitives"
+    ),
 }
 
 _GENERIC_ADVICE = (
@@ -204,6 +247,13 @@ def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
     detail = ""
     if ":" in (trigger or "") and prefix in (
         "env_misconfig", "llm_behavior", "build_command_cd_missing",
+        # Post-finsearch-156032347: the new label taxonomy carries
+        # actionable detail in the suffix — file path, cap ratio,
+        # missing symbol, validator rule. Dropping it here would leave
+        # the learned rule generic exactly where it should be specific.
+        "replace_block_stuck", "no_progress_repairs",
+        "hard_iteration_ceiling", "same_missing_dep",
+        "build_command_blocked",
     ):
         detail = f" ({trigger.split(':', 1)[1]})"
     errs = _top_errors(state)

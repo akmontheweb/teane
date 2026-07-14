@@ -292,3 +292,112 @@ class TestPhase7TraceabilityAndNonToolchainSymbols:
         assert "max_zero_emit_reprompts" in text
         # And the root-cause pointer to check upstream patcher output
         assert "patches=N succeed=0" in text or "patcher" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Post-finsearch-156032347 additions. Each new HITL trigger must produce a
+# SPECIFIC action bullet (not the generic catch-all). Symmetric with the
+# post_mortem.py tests: the operator UX and the learned-rule text must
+# both know about every new trigger prefix.
+# ---------------------------------------------------------------------------
+
+
+_CATCHALL_MARKER = "To redirect the LLM instead"
+
+
+class TestReplaceBlockStuck:
+    def test_names_the_stuck_file_and_offers_manual_edit(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "replace_block_stuck:server/app/tests/test_x.py",
+        )
+        text = "\n".join(actions)
+        assert "server/app/tests/test_x.py" in text
+        # Must mention the [m] pause-for-manual-edits recovery path.
+        assert "[m]" in text
+        # Must NOT fall through to the generic catch-all.
+        assert _CATCHALL_MARKER not in text
+
+    def test_multiple_stuck_files_extra_count_surfaced(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "replace_block_stuck:a.py+3",
+        )
+        text = "\n".join(actions)
+        assert "a.py" in text
+        assert "3 other" in text
+
+    def test_no_suffix_still_gives_specific_advice(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "replace_block_stuck",
+        )
+        text = "\n".join(actions)
+        assert "REPLACE_BLOCK" in text
+        assert _CATCHALL_MARKER not in text
+
+
+class TestNoProgressRepairs:
+    def test_mentions_wrong_layer_and_hint_injection(self):
+        actions = _build_outside_harness_actions(
+            _base_state(compiler_errors=[
+                {"file": "svc/foo.py", "line": 3, "error_code": "TS2769",
+                 "message": "x"},
+            ]),
+            "no_progress_repairs:3/3",
+        )
+        text = "\n".join(actions)
+        # Wrong-file / wrong-layer framing
+        assert "wrong file" in text.lower() or "wrong layer" in text.lower()
+        # Surfaces the file with the error
+        assert "svc/foo.py" in text
+        # Suggests [e] inject hint since manual fix isn't always needed
+        assert "[e]" in text
+
+
+class TestHardIterationCeiling:
+    def test_recommends_split_and_config_override(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "hard_iteration_ceiling:12/12",
+        )
+        text = "\n".join(actions)
+        # Prevention (split/narrow) first
+        assert "split" in text.lower() or "narrow" in text.lower()
+        # Config override option (with the actual key name)
+        assert "total_hard_cap_multiplier" in text
+        # Warns not to extend a lost cause blindly
+        assert "trending" in text.lower() or "lost cause" in text.lower()
+
+
+class TestSameMissingDep:
+    def test_bootstrap_tool_points_at_docker_image(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "same_missing_dep:pip",
+        )
+        text = "\n".join(actions)
+        assert "BOOTSTRAP TOOL" in text
+        assert "sandbox.docker_image" in text
+        # The current docker image is named for context.
+        assert "python:3.12-slim" in text
+
+    def test_regular_package_points_at_manifest_topology(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "same_missing_dep:requests",
+        )
+        text = "\n".join(actions)
+        # Regular package guidance — not the bootstrap branch.
+        assert "BOOTSTRAP TOOL" not in text
+        assert "requirements.txt" in text
+        assert "pyproject.toml" in text
+        # Names the package the operator needs to grep for.
+        assert "requests" in text
+
+
+class TestBuildCommandBlocked:
+    def test_points_at_global_config_and_names_the_rule(self):
+        actions = _build_outside_harness_actions(
+            _base_state(), "build_command_blocked:cd_not_allowed",
+        )
+        text = "\n".join(actions)
+        assert "cd_not_allowed" in text
+        # Points at the correct config file — the global harness config,
+        # NOT config/config.json which is workspace-scoped.
+        assert "~/.harness/config.json" in text
+        assert "security.allowed_commands" in text

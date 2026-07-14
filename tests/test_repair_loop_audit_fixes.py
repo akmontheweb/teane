@@ -96,6 +96,75 @@ class TestResumeGateKeyParity:
         assert '"cheap_shots_taken"' in src
 
 
+class TestResetHitlTripDropsRewriteRecoveryLedger:
+    """Companion invariant to the cap-to-2 behavior on
+    ``replace_block_misses_per_file``. Post-finsearch-156032347:
+    ``_reset_hitl_trip_counters`` caps per-file miss counts at 2 so
+    headless auto-resume gets ONE more repair attempt on the stuck file
+    without immediately re-tripping the >=3 stuck-file HITL guard.
+
+    The REWRITE-recovery ledger (``stuck_rewrite_recovery_attempted``)
+    would silently veto that repair attempt from becoming a REWRITE
+    recovery round — repair_node's ``_decide_stuck_rewrite_signal``
+    skips files already in the ledger. So the reset MUST drop ledger
+    entries for exactly the files whose miss counter it just capped;
+    otherwise the cap-to-2 unlocks REPLACE_BLOCK misses to run again
+    but recovery is dead, and the router HITLs again the moment the
+    counter climbs back to 3.
+    """
+
+    def test_ledger_entry_dropped_when_file_miss_capped(self):
+        from harness.cli import _reset_hitl_trip_counters
+
+        loop_counter: dict = {
+            "replace_block_misses_per_file": {
+                "test_a.py": 3,   # will be capped to 2 → drop ledger
+                "test_b.py": 2,   # already <=2 → keep ledger
+                "test_c.py": 5,   # will be capped to 2 → drop ledger
+            },
+            "stuck_rewrite_recovery_attempted": [
+                "test_a.py", "test_b.py", "test_c.py", "test_d.py",
+            ],
+        }
+        _reset_hitl_trip_counters(loop_counter)
+
+        # test_a and test_c were capped → dropped from ledger. test_b
+        # was already <=2 (not capped) → stays. test_d isn't in the
+        # miss map at all → the reset has no signal that its ledger
+        # entry needs clearing (would be handled by the miss-cleared
+        # filter in repair_node's tick block instead).
+        assert loop_counter["stuck_rewrite_recovery_attempted"] == [
+            "test_b.py", "test_d.py",
+        ]
+
+    def test_ledger_untouched_when_no_files_capped(self):
+        from harness.cli import _reset_hitl_trip_counters
+
+        loop_counter: dict = {
+            "replace_block_misses_per_file": {"a.py": 1, "b.py": 2},
+            "stuck_rewrite_recovery_attempted": ["a.py", "b.py"],
+        }
+        _reset_hitl_trip_counters(loop_counter)
+
+        # No files were >=3, so nothing was capped — ledger stays.
+        assert loop_counter["stuck_rewrite_recovery_attempted"] == [
+            "a.py", "b.py",
+        ]
+
+    def test_missing_ledger_is_tolerated(self):
+        from harness.cli import _reset_hitl_trip_counters
+
+        # A checkpoint from before this feature landed won't have the
+        # ledger key. The reset must not KeyError — the empty-map
+        # branch simply doesn't need to write anything.
+        loop_counter: dict = {
+            "replace_block_misses_per_file": {"a.py": 4},
+        }
+        _reset_hitl_trip_counters(loop_counter)
+        # No ledger key was created (nothing to write since prior=None).
+        assert "stuck_rewrite_recovery_attempted" not in loop_counter
+
+
 # ---------------------------------------------------------------------------
 # Finding #5 — Save-and-Quit rewind preserves diagnostic trackers
 # ---------------------------------------------------------------------------

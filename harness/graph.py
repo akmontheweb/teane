@@ -6718,6 +6718,146 @@ def _format_rewrite_file_noop_directive(rw_noops: dict[str, int]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_stuck_rewrite_mandate(
+    stuck_paths: list[str], workspace: str,
+) -> str:
+    """Hard mandate injected into the repair prompt when a file has hit the
+    REPLACE_BLOCK stuck-target limit and the router has decided to give
+    codegen one last shot at REWRITE_FILE before escalating to HITL.
+
+    Distinct from ``_format_replace_block_miss_directive`` (soft grant at
+    ≥ 2 misses that unlocks REWRITE_FILE as an option). This is the
+    recovery-round mandate: the file has already crossed the >= 3 miss
+    threshold, the router would have HITL'd, but ``repair_node`` stamped
+    ``node_state.stuck_rewrite_signal_paths`` first — so the router
+    routes back here for one shot instead. The prompt tells the LLM:
+    surgical patches on this file are BANNED this round, emit
+    REWRITE_FILE with the current on-disk content shown below and the
+    minimum corrections. If this recovery round fails to unstick the
+    file (miss counter grows again while the recovery flag is already
+    consumed), the router HITLs on the next pass.
+
+    Empty string when there are no signal paths — the caller can
+    unconditionally append the return value.
+    """
+    if not stuck_paths:
+        return ""
+    lines: list[str] = [
+        "\n## MANDATORY RECOVERY — REWRITE_FILE ONLY (last-chance before HITL)",
+        (
+            "Prior surgical REPLACE_BLOCK / DELETE_BLOCK attempts on the "
+            "following file(s) have missed the on-disk content THREE or more "
+            "times in a row. The harness would have escalated to human "
+            "intervention on this round; instead you get ONE recovery shot "
+            "here. Rules for THIS round:\n"
+            "  1. You MUST emit `REWRITE_FILE` for each file listed below "
+            "with the COMPLETE corrected file contents (imports, every "
+            "class, every def, every existing test — nothing omitted).\n"
+            "  2. You MUST NOT emit `REPLACE_BLOCK`, `DELETE_BLOCK`, or "
+            "`INSERT_AT_BLOCK` against any of these files this round.\n"
+            "  3. If the file is fundamentally unfixable without changing "
+            "OTHER files first, emit a `REWRITE_FILE` for THIS file "
+            "restoring it to a coherent state AND `REWRITE_FILE` / "
+            "`REPLACE_BLOCK` for the OTHER files in the SAME response.\n"
+            "  4. If you refuse this mandate the router will escalate to "
+            "HITL on the next pass — no further recovery shots.\n"
+            "Current on-disk content for each stuck file (authoritative — "
+            "your surgical searches have been diverging from this):"
+        ),
+    ]
+    for path in stuck_paths:
+        abs_path = (
+            path if os.path.isabs(path) else os.path.join(workspace, path)
+        )
+        try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError as exc:
+            lines.append(
+                f"\n### `{path}`\n"
+                f"(unable to read current content: {exc}. Emit REWRITE_FILE "
+                f"anyway with the corrected content you intended.)"
+            )
+            continue
+        # Trim excessively large files to keep the prompt bounded. The
+        # cap mirrors the READ_FILE cap the patcher uses elsewhere and
+        # is generous enough for typical source files but bounded so a
+        # 200 KB fixture doesn't blow the context window on this
+        # already-costly recovery round.
+        _CAP = 40_000
+        truncated = ""
+        _orig_len = len(body)
+        if _orig_len > _CAP:
+            body = body[:_CAP]
+            truncated = (
+                f"\n\n[... {_orig_len - _CAP} bytes truncated (original "
+                f"file is {_orig_len} bytes). Emit REWRITE_FILE with the "
+                f"FULL corrected content anyway; do not preserve the "
+                f"truncation marker.]"
+            )
+        lines.append(
+            f"\n### `{path}` (current on-disk bytes)\n"
+            f"```\n{body}{truncated}\n```"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _decide_stuck_rewrite_signal(
+    rb_misses: dict[str, int],
+    attempted_prev: "Iterable[str]",
+    stuck_limit: int,
+) -> tuple[list[str], list[str]]:
+    """Compute the next-round stuck-target REWRITE-recovery decision.
+
+    Given the current per-file REPLACE_BLOCK miss counts, the ledger of
+    files that have already used their one recovery shot, and the
+    stuck-target limit (default 3), return:
+
+      * ``newly_stuck``: files that just crossed the limit AND have not
+        already exhausted their recovery. Stamped into
+        ``node_state["stuck_rewrite_signal_paths"]`` so the router
+        routes back to repair_node for a REWRITE_FILE-only round on
+        those files instead of escalating to HITL.
+      * ``attempted_next``: the ledger to persist under
+        ``loop_counter["stuck_rewrite_recovery_attempted"]``. Files
+        whose miss counter has been CLEARED this round (i.e. no longer
+        in ``rb_misses``) drop off the ledger — a self-healing file is
+        eligible for recovery again if it gets stuck later.
+
+    Lifecycle: the ledger is per-session, not per-batch — it lives
+    alongside ``replace_block_misses_per_file`` which the batch reset
+    also preserves (per the session 2d0164f0 rationale). Two sites
+    prune it:
+
+      * ``cli._reset_hitl_trip_counters`` drops entries for files
+        whose miss counter it just capped to 2, so a headless
+        auto-resume from a stuck-file HITL actually gets its recovery
+        round instead of being vetoed by the pre-HITL ledger entry.
+      * ``graph._rewind_suspended_checkpoint`` on the auto-abandon
+        path clears the whole ledger (the operator's manual fix
+        outside the harness may have addressed every stuck file).
+
+    Pure function so the "one shot per file" semantics are testable
+    without spinning up repair_node's async / gateway machinery.
+    Called from the counter-tick block near the end of ``repair_node``.
+    """
+    attempted_prev_set: set[str] = {str(p) for p in attempted_prev}
+    # Drop files whose miss counter reset this round (real patch
+    # success elsewhere) — they earn back a recovery shot for a future
+    # stuck event in this same batch.
+    attempted_next_set: set[str] = {
+        p for p in attempted_prev_set if p in rb_misses
+    }
+    newly_stuck: list[str] = sorted(
+        f for f, n in rb_misses.items()
+        if isinstance(n, int)
+        and n >= stuck_limit
+        and f not in attempted_next_set
+    )
+    attempted_next_set.update(newly_stuck)
+    return newly_stuck, sorted(attempted_next_set)
+
+
 def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
     """When a file has ≥ 2 consecutive REPLACE_BLOCK misses, emit a
     directive telling the LLM to break the pattern by using a different
@@ -13858,6 +13998,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             workspace_path, _conftest_chains,
             record_hashes_into=files_seen_by_llm,
         )
+    # Stuck-target recovery round. When repair_node's PREVIOUS iteration
+    # detected a file crossing the REPLACE_BLOCK stuck-target limit for
+    # the first time, it stamped ``node_state.stuck_rewrite_signal_paths``
+    # so ``route_after_compiler`` routes back here (instead of HITL) for
+    # exactly one recovery round. This mandate is stronger than the ≥2-
+    # miss "REWRITE_FILE UNLOCKED" grant below — it BANS surgical ops on
+    # the listed files this round and injects each file's current bytes
+    # so the LLM can produce a clean rewrite without another READ_FILE.
+    # Consumed on entry: the returned node_state below sets the list back
+    # to [] so a subsequent round without a fresh trigger doesn't re-run
+    # the recovery prompt.
+    _rewrite_signal_raw = (state.get("node_state") or {}).get(
+        "stuck_rewrite_signal_paths"
+    )
+    _rewrite_signal_paths: list[str] = (
+        [str(p) for p in _rewrite_signal_raw]
+        if isinstance(_rewrite_signal_raw, list) else []
+    )
+    if _rewrite_signal_paths:
+        error_summary += _format_stuck_rewrite_mandate(
+            _rewrite_signal_paths, workspace_path,
+        )
     # Fix #3: if any file has accumulated ≥ 2 consecutive REPLACE_BLOCK
     # misses, force the LLM out of the pattern with an explicit "use a
     # different operation" directive before the diagnostics.
@@ -15896,6 +16058,48 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         loop_counter["replace_block_misses_per_file"] = rb_misses
         loop_counter["rewrite_file_no_ops_per_file"] = rw_noops
 
+        # Stuck-target rewrite-recovery signal. When a file's miss counter
+        # crosses the router's ``stuck_target_limit`` (default 3) for the
+        # first time in this batch, stamp
+        # ``node_state.stuck_rewrite_signal_paths`` so
+        # ``route_after_compiler`` routes back here for one REWRITE_FILE-
+        # only recovery round instead of HITL. ``stuck_rewrite_recovery
+        # _attempted`` (per-batch, cleared at batch_commit_node) is the
+        # idempotency ledger — a file gets at most one recovery round per
+        # batch; if the recovery round also fails to unstick it, the
+        # router escalates on the next pass.
+        #
+        # This block runs AFTER the miss-counter update above so
+        # ``rb_misses`` reflects the round's outcome.
+        _gw_for_stuck = get_gateway()
+        _stuck_limit_recov = (
+            int(getattr(_gw_for_stuck.config, "stuck_target_limit", 3))
+            if _gw_for_stuck is not None else 3
+        )
+        _attempted_raw = loop_counter.get(
+            "stuck_rewrite_recovery_attempted"
+        ) or []
+        _attempted_prev = (
+            _attempted_raw
+            if isinstance(_attempted_raw, (list, set, tuple)) else []
+        )
+        _newly_stuck, _attempted_next = _decide_stuck_rewrite_signal(
+            rb_misses, _attempted_prev, _stuck_limit_recov,
+        )
+        # Always write back the ledger so the "drop cleared-counter
+        # entries" filter inside the helper takes effect even on rounds
+        # with no fresh stuck event.
+        loop_counter["stuck_rewrite_recovery_attempted"] = _attempted_next
+        if _newly_stuck:
+            logger.warning(
+                "[repair_node] Stuck-target REWRITE recovery armed for "
+                "%d file(s) %s (miss counter at >=%d, first recovery this "
+                "batch). Next router pass will route back to repair_node "
+                "with a REWRITE_FILE-only mandate instead of HITL.",
+                len(_newly_stuck), _newly_stuck, _stuck_limit_recov,
+            )
+        _stuck_rewrite_signal_paths_next: list[str] = _newly_stuck
+
         # Audit §6.4: surface cross-file impact warnings after repair
         # patches too. Best-effort.
         if modified_files:
@@ -16015,6 +16219,13 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 # B5: persist what the LLM has been shown so the next
                 # repair iteration's drift detector has the full record.
                 "files_seen_by_llm": files_seen_by_llm,
+                # Stuck-target REWRITE recovery signal — consumed on entry
+                # by the block that builds ``error_summary`` (via
+                # ``_format_stuck_rewrite_mandate``). ``_newly_stuck``
+                # populates it when this round detected a fresh crossing;
+                # otherwise it clears any prior round's stamp so the
+                # mandate doesn't re-fire on unrelated subsequent rounds.
+                "stuck_rewrite_signal_paths": _stuck_rewrite_signal_paths_next,
             },
         }
     except RuntimeError as exc:
@@ -16108,6 +16319,14 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if node_state.get("env_misconfig"):
         sym = node_state.get("env_misconfig_symbol", "")
         return f"env_misconfig:{sym}" if sym else "env_misconfig"
+    # Sandbox CommandValidator refused the build command — the router
+    # escalates at route_after_compiler L~17592 with the matched rule
+    # stamped in node_state. Must precede the generic
+    # ``persistent_build_failure`` catch-all so operators see the actual
+    # policy denial, not a fake "build failed" story.
+    if node_state.get("build_command_blocked"):
+        rule = str(node_state.get("build_command_blocked_rule", "") or "")
+        return f"build_command_blocked:{rule}" if rule else "build_command_blocked"
     if node_state.get("build_command_cd_missing"):
         d = node_state.get("build_command_cd_missing_dir", "")
         return f"build_command_cd_missing:{d}" if d else "build_command_cd_missing"
@@ -16117,6 +16336,31 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
         return "no_progress_failsafe"
     if sec_attempts >= max_sec_attempts and max_sec_attempts > 0:
         return f"security_fix_limit:{sec_attempts}/{max_sec_attempts}"
+    # Same-file REPLACE_BLOCK stuck-target trip (router L~17679). Any file
+    # with >= stuck_target_limit consecutive miss rounds means the LLM's
+    # SEARCH text keeps diverging from disk on that file. Must precede
+    # the generic zero-patch / repair-limit / persistent-failure fallbacks
+    # so post-mortem learning attaches to the right hypothesis. Reads the
+    # same counter (``replace_block_misses_per_file``) and the same config
+    # key (``stuck_target_limit``, default 3) as the router.
+    _gw_for_stuck = get_gateway()
+    _stuck_limit_inf = (
+        int(getattr(_gw_for_stuck.config, "stuck_target_limit", 3))
+        if _gw_for_stuck is not None else 3
+    )
+    _rb_per_file_inf = loop_counter.get("replace_block_misses_per_file") or {}
+    if isinstance(_rb_per_file_inf, dict):
+        _stuck_files_inf = sorted(
+            f for f, n in _rb_per_file_inf.items()
+            if isinstance(n, int) and n >= _stuck_limit_inf
+        )
+        if _stuck_files_inf:
+            # Cap the label at the first file to keep it dashboard-friendly;
+            # the full list is already in the emitted log warning.
+            _head = _stuck_files_inf[0]
+            _extra = len(_stuck_files_inf) - 1
+            _suffix = f"+{_extra}" if _extra > 0 else ""
+            return f"replace_block_stuck:{_head}{_suffix}"
     consecutive_all_rejected = int(
         loop_counter.get("consecutive_all_allowlist_rejected_rounds", 0) or 0
     )
@@ -16154,7 +16398,74 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     )
     if consecutive_low_signal >= _low_signal_cap:
         return f"low_signal_verdict_loop:{consecutive_low_signal}"
-    if int(loop_counter.get("total_repairs", 0) or 0) >= max_repair:
+    # ``has_autofixable`` (mirror of the router-side computation at
+    # route_after_compiler L~17657). The router skips no_progress /
+    # hard_cap / repair-limit escalations when every current diagnostic
+    # is deterministically autofixable — the autofix bypass will land
+    # the fix without a repair round. Inference must gate the same way;
+    # otherwise a HITL reached via a DIFFERENT path (e.g. security
+    # branch) with autofixable diagnostics + counters at cap would be
+    # mislabeled as no_progress_repairs / hard_iteration_ceiling and
+    # post-mortem learning would attach to the wrong hypothesis.
+    _autofixable_codes = frozenset({"MISSING_DEP", "DEP_RESOLUTION_CONFLICT"})
+    _current_errors_raw = state.get("compiler_errors", []) or []
+    _current_errors: list[Any] = (
+        [e for e in _current_errors_raw if isinstance(e, dict)]
+        if isinstance(_current_errors_raw, list) else []
+    )
+    _has_autofixable_now = bool(_current_errors) and all(
+        str(e.get("error_code", "")).upper() in _autofixable_codes
+        for e in _current_errors
+    )
+    # Progress-based repair budget (router L~17836). Ticks in repair_node
+    # when a round shrinks neither the fingerprint set nor the raw
+    # diagnostic count. Distinct from ``total_repairs`` — a session can
+    # sit at total_repairs=11 while no_progress_repairs=3 tripped first.
+    # Ordered BEFORE same_missing_dep: matches the router's own gate
+    # sequence (route_after_compiler evaluates no_progress at 17836
+    # before same_missing_dep at 17890), and defends against a stale
+    # missing-dep counter left over from an earlier resolved cascade.
+    _no_progress = int(loop_counter.get("no_progress_repairs", 0) or 0)
+    if _no_progress >= max_repair and not _has_autofixable_now:
+        return f"no_progress_repairs:{_no_progress}/{max_repair}"
+    # Hard total-iteration ceiling (router L~17864). Sized at
+    # ``max_iterations * total_hard_cap_multiplier`` (default 4 → cap 12
+    # with default max_iterations=3). Must precede the generic
+    # ``repair_loop_limit`` fallback since both check ``total_repairs``;
+    # this is the more-specific cap that fires when per-round progress
+    # signals kept the earlier gates from tripping.
+    _hard_cap_mult = (
+        int(getattr(_gw_for_inf.config, "total_hard_cap_multiplier", 4))
+        if _gw_for_inf is not None else 4
+    )
+    _hard_cap = max_repair * _hard_cap_mult
+    _total_repairs = int(loop_counter.get("total_repairs", 0) or 0)
+    if _total_repairs >= _hard_cap and not _has_autofixable_now:
+        return f"hard_iteration_ceiling:{_total_repairs}/{_hard_cap}"
+    # Same-MISSING_DEP-symbol trip (router L~17890). The autofixable
+    # bypass has demonstrably failed to resolve the same package N times.
+    # Reads ``missing_dep_consecutive_same`` (per-symbol) and the same
+    # ``same_missing_dep_limit`` config key (default 3) as the router.
+    # Additionally gated on CURRENT diagnostics containing MISSING_DEP —
+    # the counter can persist across a resolved cascade, so without this
+    # guard a stale count from earlier in the batch would shadow the
+    # real reason we're at HITL (e.g., a stuck test file with an old
+    # missing-dep symbol still in loop_counter).
+    _same_dep_limit = (
+        int(getattr(_gw_for_inf.config, "same_missing_dep_limit", 3))
+        if _gw_for_inf is not None else 3
+    )
+    _same_dep_count = int(
+        loop_counter.get("missing_dep_consecutive_same", 0) or 0
+    )
+    _has_missing_dep_now = any(
+        str(e.get("error_code", "")).upper() == "MISSING_DEP"
+        for e in _current_errors
+    )
+    if _same_dep_count >= _same_dep_limit and _has_missing_dep_now:
+        _sym = str(loop_counter.get("missing_dep_last_symbol", "") or "?")
+        return f"same_missing_dep:{_sym}"
+    if _total_repairs >= max_repair:
         return "repair_loop_limit"
     exit_code_raw = state.get("exit_code", -1)
     exit_code = int(exit_code_raw) if exit_code_raw is not None else -1
@@ -17687,6 +17998,33 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             if isinstance(n, int) and n >= _STUCK_TARGET_LIMIT
         )
         if stuck_files:
+            # REWRITE-recovery override. ``repair_node`` stamps
+            # ``node_state.stuck_rewrite_signal_paths`` the first time a
+            # file crosses the stuck-target limit in this batch. When
+            # non-empty, that means the operator hasn't yet been asked
+            # AND recovery hasn't yet been attempted — route back to
+            # repair_node for one REWRITE_FILE-only round instead of
+            # HITL. The signal is consumed on entry to repair_node so a
+            # second stuck event with the ledger already populated
+            # (``stuck_rewrite_recovery_attempted``) will NOT re-stamp,
+            # so this branch's signal check fails and we HITL as before.
+            _signal_paths_raw = (
+                (state.get("node_state") or {}).get("stuck_rewrite_signal_paths")
+            )
+            _signal_paths: list[str] = (
+                [str(p) for p in _signal_paths_raw]
+                if isinstance(_signal_paths_raw, list) else []
+            )
+            if _signal_paths:
+                logger.warning(
+                    "[router] REPLACE_BLOCK stuck on file(s) %s (>=%d misses "
+                    "each) — REWRITE recovery armed for %s. Routing back to "
+                    "repair_node for one REWRITE_FILE-only round instead of "
+                    "HITL.",
+                    stuck_files, _STUCK_TARGET_LIMIT,
+                    _signal_paths,
+                )
+                return _transition("repair_node")
             logger.warning(
                 "[router] REPLACE_BLOCK stuck on file(s) %s (>=%d misses each). "
                 "The LLM keeps emitting search blocks the patcher rejects against "
@@ -23121,6 +23459,11 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
             new_lc["consecutive_all_allowlist_rejected_rounds"] = 0
             new_lc["no_progress_repairs"] = 0
             new_lc["file_modification_history"] = {}
+            # Sibling of ``replace_block_misses_per_file`` — the
+            # per-batch recovery ledger. If the operator manually fixed
+            # the stuck file, the ledger should not veto a future
+            # recovery for the same path.
+            new_lc["stuck_rewrite_recovery_attempted"] = []
             values["loop_counter"] = new_lc
             logger.info(
                 "[run_graph] Resume rewind: auto-abandon path cleared "

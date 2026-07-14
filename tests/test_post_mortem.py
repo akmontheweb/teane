@@ -62,6 +62,60 @@ def test_deterministic_rule_specific_per_prefix():
     assert "make build" in r                    # build command included
 
 
+# ---------------------------------------------------------------------------
+# Post-finsearch-156032347 additions. Each new HITL prefix must produce a
+# SPECIFIC rule (not the _GENERIC_ADVICE catch-all) AND the detail suffix
+# must survive into the rule text — the whole point of the label change.
+# ---------------------------------------------------------------------------
+
+
+_GENERIC_MARKER = "harness could not classify"
+
+
+class TestNewTriggerPrefixesGetSpecificAdvice:
+
+    def test_replace_block_stuck_advice_is_specific(self):
+        r = deterministic_rule(
+            "replace_block_stuck:server/app/tests/test_x.py", _state(),
+        )
+        assert _GENERIC_MARKER not in r
+        assert "REPLACE_BLOCK" in r
+        # Detail (file path) must appear in the rule text.
+        assert "server/app/tests/test_x.py" in r
+
+    def test_no_progress_repairs_advice_is_specific(self):
+        r = deterministic_rule("no_progress_repairs:3/3", _state())
+        assert _GENERIC_MARKER not in r
+        assert "non-progress budget" in r or "stalled" in r
+        assert "3/3" in r
+
+    def test_hard_iteration_ceiling_advice_is_specific(self):
+        r = deterministic_rule("hard_iteration_ceiling:12/12", _state())
+        assert _GENERIC_MARKER not in r
+        assert "hard total-iteration ceiling" in r
+        assert "12/12" in r
+
+    def test_same_missing_dep_advice_is_specific_and_names_symbol(self):
+        r = deterministic_rule("same_missing_dep:pip", _state())
+        assert _GENERIC_MARKER not in r
+        assert "bootstrap tool" in r.lower() or "sandbox" in r.lower()
+        assert "pip" in r
+
+    def test_build_command_blocked_advice_is_specific(self):
+        r = deterministic_rule("build_command_blocked:cd_not_allowed", _state())
+        assert _GENERIC_MARKER not in r
+        assert "CommandValidator" in r or "allowed_commands" in r
+        assert "cd_not_allowed" in r
+
+    def test_replace_block_stuck_without_detail_still_specific(self):
+        """Suffix is optional (a checkpoint from before the label
+        change might not have one). The trigger-prefix branch must
+        still return specific advice rather than falling back."""
+        r = deterministic_rule("replace_block_stuck", _state())
+        assert _GENERIC_MARKER not in r
+        assert "REPLACE_BLOCK" in r
+
+
 def test_deterministic_rule_parametrised_trigger_prefix_matches():
     r = deterministic_rule("env_misconfig:pytest", _state())
     assert "missing" in r and "(pytest)" in r

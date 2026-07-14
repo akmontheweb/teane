@@ -3027,11 +3027,27 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     # directive at >=2 — we want to keep that signal alive but not let
     # the >=3 stuck-file HITL guard immediately re-trip. Cap at 2.
     per_file = loop_counter.get("replace_block_misses_per_file")
+    capped_files: set[str] = set()
     if isinstance(per_file, dict):
         for f in list(per_file.keys()):
             v = per_file[f]
             if isinstance(v, int) and v > 2:
                 per_file[f] = 2
+                capped_files.add(str(f))
+    # Sibling of the cap-to-2 above: the stuck-target REWRITE recovery
+    # ledger vetoes a second recovery shot for any file already in it.
+    # If we cap the miss counter to unstick the router but leave the
+    # ledger populated, the very next stuck round (miss counter climbs
+    # back to 3) will HITL again without giving repair the recovery
+    # shot the cap was supposed to enable. Drop just the entries we
+    # capped, so the operator's headless auto-resume gets the recovery
+    # round the cap-to-2 was designed for.
+    ledger_raw = loop_counter.get("stuck_rewrite_recovery_attempted")
+    if isinstance(ledger_raw, list) and capped_files:
+        loop_counter["stuck_rewrite_recovery_attempted"] = sorted(
+            p for p in ledger_raw
+            if isinstance(p, str) and p not in capped_files
+        )
 
 
 def _reset_iteration_counters(
@@ -3414,6 +3430,186 @@ def _build_outside_harness_actions(
             "`[e]` and inject a sentence like 'the missing import is "
             "X in file Y' — the next repair turn will see it as a "
             "user hint."
+        )
+
+    # ---- replace_block_stuck:<file> ---------------------------------
+    # Router bailed after a specific file racked up ≥3 REPLACE_BLOCK
+    # misses AND the REWRITE-recovery round (repair_node's auto-promote)
+    # also failed to unstick it. The suffix carries the file path.
+    elif trigger.startswith("replace_block_stuck"):
+        stuck_head = ""
+        stuck_extra = 0
+        if ":" in trigger:
+            suffix = trigger.split(":", 1)[1].strip()
+            # Format is either "path/to/file.py" or "path/to/file.py+N"
+            # (N additional stuck files, per _infer_hitl_trigger's label
+            # compression). Recover the head so we can name it.
+            if "+" in suffix:
+                stuck_head, _, extra_str = suffix.rpartition("+")
+                try:
+                    stuck_extra = int(extra_str)
+                except ValueError:
+                    stuck_head = suffix
+            else:
+                stuck_head = suffix
+        also = (
+            f" (and {stuck_extra} other file(s) in the same state)"
+            if stuck_extra else ""
+        )
+        head_ref = f"`{stuck_head}`" if stuck_head else "the stuck file"
+        actions.append(
+            f"REPLACE_BLOCK on {head_ref}{also} has missed the on-disk "
+            "content three times in a row AND the automatic REWRITE_FILE "
+            "recovery round already spent its one shot. The LLM's mental "
+            "model of the file has drifted beyond surgical or wholesale "
+            "repair from inside the loop."
+        )
+        if stuck_head:
+            actions.append(
+                f"Open `{stuck_head}` in your IDE, apply the fix by hand, "
+                "then `[m]` Pause for manual edits → Enter. That clears "
+                "the LLM's stale mental model and re-runs the compiler."
+            )
+        actions.append(
+            "Alternative: `[e]` inject a hint that names the concrete "
+            "change the LLM keeps missing (e.g. 'the field was renamed "
+            "from `foo` to `bar` in the previous batch'). A pointed hint "
+            "often converges where mechanical retry couldn't."
+        )
+
+    # ---- no_progress_repairs:<n>/<cap> -------------------------------
+    # Enough consecutive rounds shrunk neither the fingerprint set nor
+    # the raw diagnostic count that the harness declared the loop
+    # stalled. Distinct from repair_loop_limit — usually indicates the
+    # LLM is patching the wrong file / layer.
+    elif trigger.startswith("no_progress_repairs"):
+        actions.append(
+            "The repair loop hit its non-progress cap — enough "
+            "consecutive rounds shrunk neither the fingerprint set nor "
+            "the raw diagnostic count that the harness declared the "
+            "loop stalled. Usually this means the LLM is patching the "
+            "wrong file (a test that documents a bug in the production "
+            "code, or vice-versa) or the wrong layer (patching an "
+            "adapter when the interface contract is the actual issue)."
+        )
+        if errors:
+            files_with_errors = sorted({
+                str(e.get("file", "")) for e in errors[:8] if e.get("file")
+            })[:5]
+            if files_with_errors:
+                actions.append(
+                    "Open these files and trace the failure back to its "
+                    f"root cause: {', '.join(files_with_errors)}. The "
+                    "actual bug may live upstream of the file the "
+                    "diagnostic names."
+                )
+        actions.append(
+            "If you can identify the wrong-layer patching, `[e]` inject "
+            "a hint like 'the bug is in file X, not the test that "
+            "asserts it' — the next repair round will re-target."
+        )
+
+    # ---- hard_iteration_ceiling:<n>/<cap> ----------------------------
+    # Total repairs hit the hard cap (max_iterations * multiplier, default
+    # 12) while per-round progress signals kept the smaller no_progress
+    # cap from tripping. Batch is likely too broad for one loop.
+    elif trigger.startswith("hard_iteration_ceiling"):
+        actions.append(
+            "The repair loop ran to the hard total-iteration ceiling "
+            "while STILL showing per-round progress. The batch is too "
+            "broad for a single repair loop to finish — each round fixed "
+            "one fingerprint but surfaced another of equal weight."
+        )
+        actions.append(
+            "Best mitigation is prevention: split the story or narrow "
+            "the batch so each verification chain has fewer failing "
+            "fingerprints. For this session, `[q]` Abandon + re-plan is "
+            "often cheaper than continuing."
+        )
+        actions.append(
+            "If you want to try one more push, raise `node_throttle."
+            "total_hard_cap_multiplier` in `config/config.json` (default "
+            "4 → set to 6 or 8), then `[r]` Resume. Only do this if the "
+            "diagnostic count has been trending DOWN across recent "
+            "rounds — otherwise you're extending a lost cause."
+        )
+
+    # ---- same_missing_dep:<symbol> -----------------------------------
+    # Same dep symbol recurred past the autofix bypass cap. Two very
+    # different failure modes depending on symbol class (bootstrap tool
+    # vs regular package) — mirror the router-side messaging at
+    # graph.py::route_after_compiler L~17904 / L~17915.
+    elif trigger.startswith("same_missing_dep"):
+        symbol = ""
+        if ":" in trigger:
+            symbol = trigger.split(":", 1)[1].strip()
+        symbol_ref = f"`{symbol}`" if symbol else "the missing dependency"
+        # Deferred import — graph.py imports cli.py at module-level, so a
+        # top-level `from harness.graph import ...` would risk a cycle.
+        from harness.graph import _is_bootstrap_tool
+        if symbol and _is_bootstrap_tool(symbol):
+            actions.append(
+                f"Missing dependency {symbol_ref} is a BOOTSTRAP TOOL — "
+                "it belongs in the sandbox image, not the workspace "
+                "manifest. The autofix bypass cannot install it from "
+                "inside the loop."
+            )
+            actions.append(
+                f"Edit `sandbox.docker_image` in `config/config.json` "
+                f"(currently `{docker_image or '(unset)'}`) to an image "
+                f"that includes {symbol_ref}, then `[r]` Resume."
+            )
+        else:
+            actions.append(
+                f"Missing package {symbol_ref} is a regular pip / npm "
+                "package. Recurrence past the autofix cap usually means "
+                "workspace-manifest topology mismatch: the workspace has "
+                "multiple manifests (e.g. root `pyproject.toml` + "
+                "`requirements.txt` + a subdir `requirements.txt`) but "
+                "the `build_command` only installs from a subset."
+            )
+            actions.append(
+                f"Grep the workspace at `{workspace_path}` for every "
+                "`requirements.txt`, `pyproject.toml`, `package.json`, "
+                f"`Pipfile`, `setup.py`. Confirm {symbol_ref} appears in "
+                "at least one, then confirm the build_command installs "
+                "from THAT manifest — either `uv pip install -e .` (root "
+                "pyproject) or `uv pip install -r <path>` (specific "
+                "requirements file)."
+            )
+            if build_command:
+                actions.append(
+                    f"Current build_command: `{build_command}`. Adjust "
+                    "or add the missing install step, then `[r]` Resume."
+                )
+
+    # ---- build_command_blocked:<rule> --------------------------------
+    # Sandbox CommandValidator refused the leading command primitive
+    # (cd / bash / etc.) — the global validator config is what needs
+    # to change; repair rounds cannot amend it.
+    elif trigger.startswith("build_command_blocked"):
+        rule = ""
+        if ":" in trigger:
+            rule = trigger.split(":", 1)[1].strip()
+        rule_ref = f"`{rule}`" if rule else "the build command's leading token"
+        actions.append(
+            f"The sandbox CommandValidator refused {rule_ref}. The "
+            "validator's allow-list lives in the global harness config "
+            "(`~/.harness/config.json` under `security.allowed_commands`) — "
+            "repair rounds cannot amend it because the patcher's "
+            "allowlist protects the workspace tree, not the harness "
+            "home directory."
+        )
+        actions.append(
+            "Two mitigations: (a) add the refused primitive to "
+            "`security.allowed_commands` in `~/.harness/config.json` if "
+            "it's genuinely safe (bash / cd are common), OR (b) rewrite "
+            f"the build_command (currently `{build_command or '(unset)'}`) "
+            "to use only whitelisted primitives (e.g. `sh -c '...'` → "
+            "invoke the interpreter directly)."
+        )
+        actions.append(
+            "After fixing the policy or the command, `[r]` Resume."
         )
 
     # ---- repair_loop_limit / persistent_build_failure ----------------

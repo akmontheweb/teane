@@ -258,3 +258,91 @@ class TestRouterHonoursResetFromPriorGreenBuild:
             "node_state": {},
         }
         assert route_after_compiler(state) == "human_intervention_node"
+
+
+# ---------------------------------------------------------------------------
+# Stuck-target REWRITE recovery — router override. When a file has crossed
+# the stuck-target limit (>=3 REPLACE_BLOCK misses) the router would HITL,
+# BUT if repair_node stamped ``node_state.stuck_rewrite_signal_paths`` on
+# the previous round we get one recovery shot: route back to repair_node
+# for a REWRITE_FILE-only round instead of surfacing to the operator.
+# Added post-finsearch-156032347 (5 of that session's 10 uncovered HITL
+# fires were stuck-REPLACE_BLOCK — the class this recovery targets).
+# ---------------------------------------------------------------------------
+
+
+class TestStuckTargetRewriteRecovery:
+
+    def test_stuck_file_without_signal_still_hitls(self):
+        """The default path: file at the stuck limit, no recovery signal
+        stamped — router escalates as before. This is what happens when
+        recovery has ALREADY been used for the file (ledger entry blocks
+        re-arming in repair_node's tick block)."""
+        state = {
+            "exit_code": 1,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "replace_block_misses_per_file": {"test_x.py": 3},
+                "total_repairs": 4,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_stuck_file_with_recovery_signal_routes_to_repair(self):
+        """Recovery override: repair_node stamped stuck_rewrite_signal
+        _paths after the miss counter crossed the threshold for the first
+        time this batch. Router must give the LLM one REWRITE_FILE round
+        instead of jumping to HITL."""
+        state = {
+            "exit_code": 1,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "replace_block_misses_per_file": {"test_x.py": 3},
+                "total_repairs": 4,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {
+                "stuck_rewrite_signal_paths": ["test_x.py"],
+            },
+        }
+        assert route_after_compiler(state) == "repair_node"
+
+    def test_stuck_file_with_empty_signal_list_still_hitls(self):
+        """Guard on the falsy-list case: an EMPTY list must NOT arm
+        recovery — that's the sentinel value repair_node writes back
+        after CONSUMING a signal. If the router treated it as truthy the
+        recovery would loop forever."""
+        state = {
+            "exit_code": 1,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "replace_block_misses_per_file": {"test_x.py": 3},
+                "total_repairs": 4,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {
+                "stuck_rewrite_signal_paths": [],
+            },
+        }
+        assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_stuck_file_signal_with_bogus_type_falls_through(self):
+        """Defensive: a corrupted checkpoint might have a non-list value
+        under the key. The router must treat non-list as "no signal" and
+        HITL rather than crash or (worse) route to repair with an
+        undefined mandate."""
+        state = {
+            "exit_code": 1,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "replace_block_misses_per_file": {"test_x.py": 3},
+                "total_repairs": 4,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {
+                "stuck_rewrite_signal_paths": "test_x.py",  # str, not list
+            },
+        }
+        assert route_after_compiler(state) == "human_intervention_node"

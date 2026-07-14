@@ -49,6 +49,15 @@ applies_to: [typescript]
 - If the app does calendar arithmetic (add days, quarters, business hours), pull in `date-fns` (tree-shakeable) rather than reinventing.
 - Test mocks: `jest.useFakeTimers({ now: new Date('2026-01-01T00:00:00Z') })` or Vitest `vi.setSystemTime(new Date(...))`. Always restore in `afterEach`.
 
+### Filesystem paths (server / Node) — Linux / macOS / Windows
+Client React code has no filesystem — this applies to server code only.
+- Import `path` as `import path from 'node:path'`. Use `path.join()`, `path.resolve()`, `path.dirname()`; never string concatenation with `+`.
+- `path.sep` differs (`/` vs `\`). Assume nothing — always go through `path` helpers when interoperating with OS paths.
+- URL segments are always `/`: use `path.posix.join()` for URL construction, plain `path.join()` for filesystem. Do not swap.
+- Absolute vs relative: `path.isAbsolute()` before joining user input, and `path.resolve()` when you need canonical form.
+- `import.meta.url` + `fileURLToPath()` for locating source files in ESM (Windows-safe); do NOT use `__dirname` in `.mts`/`.ts` ESM code.
+- Encoding: always specify `'utf8'` on `fs.readFile`/`fs.writeFile`. Never rely on the default.
+
 ### Formatting
 - 2-space indent; semicolons; single quotes; trailing commas on multi-line lists.
 - Place the type annotation on the same line as the identifier (`const x: T = ...`), not the next line.

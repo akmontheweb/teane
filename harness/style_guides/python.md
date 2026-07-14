@@ -51,6 +51,23 @@ One convention end-to-end. Mixed naive/aware causes silent bugs.
 - Aware-vs-naive `TypeError`: fix at the source (parser / ORM / boundary), not each callsite.
 - Mocks: patch at the CALLING module, return aware values.
 
+### Filesystem paths (Linux / macOS / Windows)
+Cross-platform means `pathlib.Path` end-to-end. String path arithmetic breaks silently on Windows (backslash vs forward slash).
+- Use `pathlib.Path` for every new path. Do NOT mix `os.path.join` and `Path`/`/` in the same module.
+- Never build paths by string concatenation (`base + "/" + name`) — always `Path(base) / name`.
+- Cast at boundaries: `Path(os.environ["FOO"])`, `Path(cfg["dir"])`. Downstream code sees `Path`, never `str`.
+- `Path.resolve()` returns absolute AND resolves symlinks. `Path.absolute()` does NOT resolve symlinks (subtle — pick deliberately).
+- Compare as `Path`, not `str`. `Path("/a/b") == "/a/b"` is False; on Windows `"C:\\a" != "c:/a"` even for the same file.
+- Tests: use pytest's `tmp_path` fixture (returns `Path`). Do NOT hardcode `/tmp/...` — Windows CI has no `/tmp`.
+- Reading files: `path.read_text(encoding="utf-8")` beats `open(path, "r").read()`. Always name the encoding explicitly.
+
+### Packages & `__init__.py`
+Every new submodule needs its package init to exist BEFORE the module lands, otherwise imports break the whole tree.
+- When creating `pkg/mod.py`, first ensure `pkg/__init__.py` exists — CREATE_FILE it (empty is fine) if not.
+- Do not `from .sibling import X` if `sibling.py` was created this same round without its own path being verified.
+- Namespace packages (no `__init__.py`) are only correct when the WHOLE project chooses them; do not mix with regular packages in one repo.
+- Do not stuff import side-effects into `__init__.py` — keep it a re-export surface.
+
 ### Misc
 - Use `is` / `is not` only for singletons (`None`, `True`, `False`).
 - Use `isinstance(x, T)` not `type(x) is T`.

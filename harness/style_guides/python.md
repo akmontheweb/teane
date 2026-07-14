@@ -61,6 +61,15 @@ Cross-platform means `pathlib.Path` end-to-end. String path arithmetic breaks si
 - Tests: use pytest's `tmp_path` fixture (returns `Path`). Do NOT hardcode `/tmp/...` — Windows CI has no `/tmp`.
 - Reading files: `path.read_text(encoding="utf-8")` beats `open(path, "r").read()`. Always name the encoding explicitly.
 
+### Concurrency & async
+Sync and async locking primitives are NOT interchangeable — pick the right one for the caller.
+- `threading.Lock` and `multiprocessing.Lock` support `with x:` (sync context manager) ONLY. Using `async with threading.Lock():` is a bug — no `__aenter__`, silent misbehaviour or runtime `AttributeError` depending on Python version. If a coroutine needs a lock, use `asyncio.Lock`.
+- `asyncio.Lock`, `asyncio.Semaphore`, `asyncio.Event` support `async with` only. Do NOT use `with asyncio.Lock():`.
+- Never call blocking primitives (`time.sleep`, `requests.get`, `queue.Queue.get`) inside a coroutine — they stall the event loop. Use `await asyncio.sleep`, `httpx.AsyncClient`, `asyncio.Queue`.
+- Module-level `asyncio.Lock()` is safe on Python 3.10+ (uses the running loop lazily), but test frameworks that spin fresh loops per test (pytest-asyncio default) will orphan any lock still held from a prior test. Provide a `reset_*()` helper that clears cached locks and call it from an `autouse` fixture.
+- CPU-bound work in async code: offload to `asyncio.to_thread(...)`; never `time.sleep` or a busy loop.
+- Mixing threads and asyncio in one process: schedule cross-boundary work via `loop.call_soon_threadsafe` or `asyncio.run_coroutine_threadsafe` — never mutate coroutine state from a thread directly.
+
 ### Packages & `__init__.py`
 Every new submodule needs its package init to exist BEFORE the module lands, otherwise imports break the whole tree.
 - When creating `pkg/mod.py`, first ensure `pkg/__init__.py` exists — CREATE_FILE it (empty is fine) if not.

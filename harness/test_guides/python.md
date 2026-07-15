@@ -34,6 +34,47 @@ Write pytest-style unit tests for the Python source files just modified. Tests e
 - Do not stub HTTP — if the code under test makes network calls, the test runner uses a local fake server (e.g., `http.server` in a thread) or marks the test `pytest.mark.network` and the harness skips it deterministically.
 - Do not import the production code under a fake name; use the actual import path.
 
+### FastAPI / SQLAlchemy API tests — the ONLY safe database pattern
+API tests that override `get_db` keep re-introducing two whole-suite
+failure classes. Both rules are non-negotiable:
+
+1. **Engine**: use a plain private in-memory database with `StaticPool` —
+   `create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)`.
+   NEVER use `sqlite:///:memory:` without StaticPool (each pooled
+   connection gets its own empty database, and `TestClient` runs the app
+   on a different thread — "no such table" forever) and NEVER use
+   `file::memory:?cache=shared` (every test module using that URL shares
+   ONE database; their fixtures create/drop each other's tables and the
+   suite fails in ways single-file runs don't reproduce).
+2. **Override lifetime**: NEVER assign `app.dependency_overrides[...]` at
+   module import time. Pytest imports every test module at collection, so
+   the last module's override silently wins for the ENTIRE suite. Install
+   and remove the override inside a fixture:
+
+```python
+from sqlalchemy.pool import StaticPool
+
+engine = create_engine(
+    "sqlite://", connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+@pytest.fixture(autouse=True)
+def db_override():
+    Base.metadata.create_all(bind=engine)
+    def _get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+    app.dependency_overrides[get_db] = _get_db
+    yield
+    app.dependency_overrides.pop(get_db, None)
+    Base.metadata.drop_all(bind=engine)
+```
+
 ### Minimal example
 ```python
 import pytest

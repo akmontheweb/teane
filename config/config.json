@@ -299,7 +299,8 @@
     },
     "_compiler_comment": "Pre-build smoke checks. run_prod_import_smoke_check=true makes compiler_node first attempt to import every production module inside the sandbox before running the actual build, so module-level errors surface as [prod-import] diagnostics ahead of any cascade-amplified test failures.",
     "compiler": {
-        "run_prod_import_smoke_check": true
+        "run_prod_import_smoke_check": true,
+        "targeted_tests_first": true
     },
     "_patcher_comment": "Patcher behaviour. enforce_read_before_edit=true makes the patcher reject REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK on any file the LLM has not been shown this turn (via pre-flight content, READ_FILE results, or a prior closest-match window). Mirrors Claude Code's Read-before-Edit invariant \u2014 flip on after verifying the LLM emits READ_FILE for unfamiliar files. Drift detection (sha256 comparison) runs unconditionally whenever the host has recorded a hash. root_files is a list of root-level filenames the patcher is allowed to modify (e.g. Dockerfile, package.json, setup.py). These are merged with dynamically scanned entries (requirements*.txt, node config variants) and the workspace layout's declared source roots to form the final allowlist. Omit or leave empty to use the built-in defaults.",
     "patcher": {

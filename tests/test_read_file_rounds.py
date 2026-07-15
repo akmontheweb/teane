@@ -145,9 +145,17 @@ class TestSourceContracts:
         assert src.count("_resolve_read_file_rounds(state)") >= 2
 
     def test_bonus_round_exists_in_both_nodes(self):
+        # The bonus round lives in the SHARED _read_file_resolution_cycle
+        # (event name assembled from event_prefix); both nodes must call
+        # the cycle with their prefix so both emit their bonus event.
         src = self._graph_src()
-        assert "repair_read_file_bonus_round" in src
-        assert "patching_read_file_bonus_round" in src
+        assert "_read_file_bonus_round" in src
+        assert src.count("_read_file_resolution_cycle(") >= 4, (
+            "expected the shared cycle definition plus call sites in "
+            "patching_node (main + mop-up) and repair_node"
+        )
+        assert 'event_prefix="repair"' in src
+        assert src.count('event_prefix="patching"') >= 2
 
     def test_reread_injection_walks_most_recent_first(self):
         src = self._graph_src()
@@ -202,3 +210,112 @@ class TestReadBlockBracketLeniency:
         stripped = strip_read_blocks(text)
         assert "READ_FILE" not in stripped
         assert "prefix" in stripped and "suffix" in stripped
+
+
+class _Resp:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _CycleDispatch:
+    """Stub dispatch: returns canned responses in order, records calls."""
+
+    def __init__(self, scripted: list[str]):
+        self.scripted = [_Resp(s) for s in scripted]
+        self.calls = 0
+
+    async def __call__(self, messages, budget):
+        self.calls += 1
+        return self.scripted.pop(0), budget - 0.01
+
+
+class TestReadFileResolutionCycle:
+    """The shared patching/repair READ_FILE component: resolve loop →
+    never-seen-file bonus round → forced-patch retry."""
+
+    @staticmethod
+    def _run(response_text, scripted, ws, files_seen=None, **kw):
+        import asyncio
+        from harness.graph import _read_file_resolution_cycle
+        dispatch = _CycleDispatch(scripted)
+        messages: list = []
+        out = asyncio.run(_read_file_resolution_cycle(
+            response=_Resp(response_text),
+            text=response_text,
+            budget=1.0,
+            messages=messages,
+            dispatch=dispatch,
+            state={},
+            workspace=ws,
+            files_seen=files_seen if files_seen is not None else {},
+            node_label="repair_node",
+            event_prefix="repair",
+            iteration_noun="repair",
+            **kw,
+        ))
+        return out, dispatch, messages
+
+    def test_no_reads_is_a_no_op(self, tmp_path):
+        (out_resp, out_text, out_budget), dispatch, messages = self._run(
+            "<<<REPLACE_BLOCK>>>\nfile: a.py\nsearch:\nx\nreplace:\ny\n<<<END_REPLACE_BLOCK>>>",
+            [], str(tmp_path),
+        )
+        assert dispatch.calls == 0
+        assert messages == []
+        assert out_budget == 1.0
+
+    def test_resolve_loop_feeds_content_and_redispatches(self, tmp_path):
+        (tmp_path / "a.py").write_text("def f(): return 1\n")
+        patch_resp = (
+            "<<<REPLACE_BLOCK>>>\nfile: a.py\nsearch:\ndef f(): return 1\n"
+            "replace:\ndef f(): return 2\n<<<END_REPLACE_BLOCK>>>"
+        )
+        (out_resp, out_text, _), dispatch, messages = self._run(
+            "<<<READ_FILE>>>\nfile: a.py\n<<<END_READ_FILE>>>",
+            [patch_resp], str(tmp_path),
+        )
+        assert dispatch.calls == 1
+        assert out_resp.content == patch_resp and out_text == patch_resp
+        # The resolution round-trip landed in the transcript.
+        assert any("READ_FILE results" in m["content"] for m in messages)
+
+    def test_bonus_round_for_unseen_file_past_cap(self, tmp_path):
+        (tmp_path / "root_cause.py").write_text("BUG = True\n")
+        read_req = "<<<READ_FILE>>>\nfile: root_cause.py\n<<<END_READ_FILE>>>"
+        patch_resp = (
+            "<<<REPLACE_BLOCK>>>\nfile: root_cause.py\nsearch:\nBUG = True\n"
+            "replace:\nBUG = False\n<<<END_REPLACE_BLOCK>>>"
+        )
+        # max_resolves=0 → straight past the cap; the unseen file earns
+        # the bonus resolve instead of the forced-patch ultimatum.
+        (out_resp, _, _), dispatch, messages = self._run(
+            read_req, [patch_resp], str(tmp_path), max_resolves=0,
+        )
+        assert dispatch.calls == 1
+        assert out_resp.content == patch_resp
+        assert any("READ_FILE results" in m["content"] for m in messages)
+
+    def test_forced_patch_for_already_seen_file_past_cap(self, tmp_path):
+        (tmp_path / "seen.py").write_text("x = 1\n")
+        read_req = "<<<READ_FILE>>>\nfile: seen.py\n<<<END_READ_FILE>>>"
+        patch_resp = (
+            "<<<REPLACE_BLOCK>>>\nfile: seen.py\nsearch:\nx = 1\n"
+            "replace:\nx = 2\n<<<END_REPLACE_BLOCK>>>"
+        )
+        (out_resp, _, _), dispatch, messages = self._run(
+            read_req, [patch_resp], str(tmp_path),
+            files_seen={"seen.py": "somehash"},  # already shown → no bonus
+            max_resolves=0,
+        )
+        assert dispatch.calls == 1
+        assert any("[Forced-patch]" in m["content"] for m in messages)
+
+    def test_stages_can_be_disabled_for_mop_up_reuse(self, tmp_path):
+        read_req = "<<<READ_FILE>>>\nfile: never/there.py\n<<<END_READ_FILE>>>"
+        (out_resp, out_text, _), dispatch, _ = self._run(
+            read_req, [], str(tmp_path),
+            max_resolves=0, bonus_round=False, forced_patch=False,
+        )
+        # Nothing fired: no bonus, no ultimatum, no dispatch.
+        assert dispatch.calls == 0
+        assert out_text == read_req

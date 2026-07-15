@@ -849,7 +849,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enforce_read_before_edit", "root_files", "use_structured_tools",
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
-    "compiler": frozenset({"run_prod_import_smoke_check", "advisory_exit_codes"}),
+    "compiler": frozenset({
+        "run_prod_import_smoke_check", "advisory_exit_codes",
+        # Fail-to-pass fast path: re-run the previous round's failing
+        # pytest selectors before the full suite (default True). See
+        # compiler_node's targeted-tests-first block.
+        "targeted_tests_first",
+    }),
     # Coverage gate for generated apps (FR-080).
     # min_pct — integer 0-100, default 70. Substituted into every Makefile
     #   / package.json coverage rule the LLM emits (skills reference it via
@@ -997,6 +1003,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     # single-key config edit or the wizard.
     "security.diff_approval_required": (bool,),
     "compiler.run_prod_import_smoke_check": (bool,),
+    "compiler.targeted_tests_first": (bool,),
     "change_requests.reverse_engineer_budget_usd": (int, float),
     "hitl.requirement": (bool,),
     "hitl.architecture": (bool,),

@@ -4356,142 +4356,35 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # without it the patcher would only ever see the first
             # truncated slice when finish_reason was "length".
 
-            # READ_FILE inline resolve: if the LLM emitted the DSL
-            # <<<READ_FILE>>> blocks (either alone or alongside patch
-            # blocks), resolve them here without consuming a patching
-            # round. Mirrors repair_node so the format contract in the
-            # system prompt ("READ_FILE does NOT consume a repair-loop
-            # slot") is honoured in patching_node too — otherwise a
-            # legitimate READ_FILE-first turn at story entry (model
-            # has never seen the scoped files) trips
+            # READ_FILE machinery — resolve loop, never-seen-file bonus
+            # round, forced-patch retry. Shared with repair_node; see
+            # _read_file_resolution_cycle for the full contract. READ_FILE
+            # does NOT consume a patching iteration — otherwise a
+            # legitimate READ_FILE-first turn at story entry trips
             # consecutive_zero_patch_rounds and escalates to HITL.
             from harness.patcher import (
                 parse_patch_blocks as _parse_patch_blocks,
                 parse_read_blocks as _parse_read_blocks,
                 strip_read_blocks as _strip_read_blocks,
             )
-            _READ_FILE_MAX_RESOLVES = _resolve_read_file_rounds(state)
-            for _resolve_round in range(_READ_FILE_MAX_RESOLVES):
-                read_reqs = _parse_read_blocks(combined_response_text)
-                if not read_reqs:
-                    break
-                messages.append(MessageDict(
-                    role="assistant", content=combined_response_text,
-                ))
-                resolution = _resolve_read_blocks(
-                    read_reqs, workspace,
-                    record_hashes_into=tool_files_seen,
+            response, combined_response_text, new_budget = (
+                await _read_file_resolution_cycle(
+                    response=response,
+                    text=combined_response_text,
+                    budget=new_budget,
+                    messages=messages,
+                    dispatch=_patching_dispatch,
+                    state=state,
+                    workspace=workspace,
+                    files_seen=tool_files_seen,
+                    node_label="patching_node",
+                    event_prefix="patching",
+                    iteration_noun="patching",
+                    event_extra={
+                        "story_id": state.get("current_story_id") or "",
+                    },
                 )
-                messages.append(MessageDict(role="user", content=resolution))
-                logger.info(
-                    "[patching_node] READ_FILE resolved for %d file(s): %s. "
-                    "Re-dispatching without consuming an iteration.",
-                    len(read_reqs), [r[0] for r in read_reqs],
-                )
-                response, new_budget = await _patching_dispatch(
-                    messages, new_budget,
-                )
-                combined_response_text = response.content or ""
-
-            # Forced-patch escape valve: if the post-cap response is
-            # STILL a READ_FILE-only emission with no parseable
-            # patches, spend one more dispatch with an explicit
-            # "no more READ_FILE, patch now" prompt so the model is
-            # forced to commit. Without this, a model that kept
-            # asking for files would burn a whole patching round on
-            # zero patches — the exact stall that trips
-            # consecutive_zero_patch_rounds.
-            # Never-seen-file bonus round — mirrors repair_node: a post-cap
-            # READ_FILE for a workspace file the LLM has not been shown is
-            # an investigation step, not spiralling. Resolve it once and
-            # re-dispatch rather than forcing a blind patch.
-            _post_cap_reads = _parse_read_blocks(combined_response_text)
-            if _post_cap_reads and not _parse_patch_blocks(
-                _strip_read_blocks(combined_response_text)
-            ):
-                _unseen_reads = [
-                    (p, rng) for p, rng in _post_cap_reads
-                    if p not in tool_files_seen
-                    and os.path.isfile(os.path.join(workspace, p))
-                ]
-                if _unseen_reads:
-                    _bonus_resolution = _resolve_read_blocks(
-                        _unseen_reads, workspace,
-                        record_hashes_into=tool_files_seen,
-                    )
-                    if _bonus_resolution:
-                        messages.append(MessageDict(
-                            role="assistant", content=combined_response_text,
-                        ))
-                        messages.append(MessageDict(
-                            role="user", content=_bonus_resolution,
-                        ))
-                        logger.info(
-                            "[patching_node] Post-cap READ_FILE names %d "
-                            "never-shown workspace file(s) (%s). Granting "
-                            "one bonus resolve round instead of forcing a "
-                            "blind patch.",
-                            len(_unseen_reads),
-                            [r[0] for r in _unseen_reads],
-                        )
-                        try:
-                            from harness.observability import emit_event
-                            emit_event(
-                                "patching_read_file_bonus_round",
-                                unseen_files=[r[0] for r in _unseen_reads],
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        response, new_budget = await _patching_dispatch(
-                            messages, new_budget,
-                        )
-                        combined_response_text = response.content or ""
-
-            _post_cap_reads = _parse_read_blocks(combined_response_text)
-            if _post_cap_reads:
-                _stripped_preview = _strip_read_blocks(combined_response_text)
-                if not _parse_patch_blocks(_stripped_preview):
-                    logger.info(
-                        "[patching_node] READ_FILE cap hit and post-cap "
-                        "response carries %d more READ_FILE block(s) with "
-                        "no patches (%s). Issuing forced-patch retry.",
-                        len(_post_cap_reads),
-                        [r[0] for r in _post_cap_reads],
-                    )
-                    messages.append(MessageDict(
-                        role="assistant", content=combined_response_text,
-                    ))
-                    messages.append(MessageDict(
-                        role="user",
-                        content=(
-                            "[Forced-patch] Your READ_FILE budget for this "
-                            "patching iteration is exhausted. The harness "
-                            "will IGNORE any further READ_FILE blocks. "
-                            "Based on the files you have already been "
-                            "shown above, emit your best-guess patches "
-                            "NOW using REPLACE_BLOCK / CREATE_FILE / "
-                            "DELETE_BLOCK / INSERT_AT_BLOCK only. If you "
-                            "are uncertain, favour the narrowest "
-                            "plausible fix — a near-miss patch is more "
-                            "useful than zero patches. No prose, no "
-                            "READ_FILE, no markdown."
-                        ),
-                    ))
-                    response, new_budget = await _patching_dispatch(
-                        messages, new_budget,
-                    )
-                    combined_response_text = response.content or ""
-                    try:
-                        from harness.observability import emit_event
-                        emit_event(
-                            "patching_forced_patch_retry",
-                            unresolved_read_files=[
-                                r[0] for r in _post_cap_reads
-                            ],
-                            story_id=state.get("current_story_id") or "",
-                        )
-                    except Exception:  # noqa: BLE001 — telemetry must not block
-                        pass
+            )
 
             # Fix 5d — proactive scope refresh. Before we let the
             # screen reject the round, dry-run it against the LLM's
@@ -4595,24 +4488,26 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # response asked for MORE files (rare — usually the LLM
             # commits after seeing injected content), resolve those
             # inline without spending another patching iteration.
-            # Keeps parity with the pre-preflight READ_FILE loop.
+            # Resolve-loop stage only — the bonus/forced-patch stages
+            # already ran in the main cycle above.
             if _preflight_ran:
-                for _mop_round in range(_READ_FILE_MAX_RESOLVES):
-                    _mop_reads = _parse_read_blocks(combined_response_text)
-                    if not _mop_reads:
-                        break
-                    messages.append(MessageDict(
-                        role="assistant", content=combined_response_text,
-                    ))
-                    _mop_res = _resolve_read_blocks(
-                        _mop_reads, workspace,
-                        record_hashes_into=tool_files_seen,
+                response, combined_response_text, new_budget = (
+                    await _read_file_resolution_cycle(
+                        response=response,
+                        text=combined_response_text,
+                        budget=new_budget,
+                        messages=messages,
+                        dispatch=_patching_dispatch,
+                        state=state,
+                        workspace=workspace,
+                        files_seen=tool_files_seen,
+                        node_label="patching_node",
+                        event_prefix="patching",
+                        iteration_noun="patching",
+                        bonus_round=False,
+                        forced_patch=False,
                     )
-                    messages.append(MessageDict(role="user", content=_mop_res))
-                    response, new_budget = await _patching_dispatch(
-                        messages, new_budget,
-                    )
-                    combined_response_text = response.content or ""
+                )
 
             # Strip any residual READ_FILE blocks so the patcher and
             # the test-block filter don't try to parse them as
@@ -8233,6 +8128,157 @@ def _resolve_read_blocks(
         + _SEARCH_BLOCK_COPY_RULES
     )
     return intro + "\n" + "\n".join(sections) + "\n"
+
+
+async def _read_file_resolution_cycle(
+    *,
+    response: Any,
+    text: str,
+    budget: float,
+    messages: list["MessageDict"],
+    dispatch: Any,
+    state: "AgentState",
+    workspace: str,
+    files_seen: dict[str, str],
+    node_label: str,
+    event_prefix: str,
+    iteration_noun: str,
+    event_extra: Optional[dict[str, Any]] = None,
+    max_resolves: Optional[int] = None,
+    bonus_round: bool = True,
+    forced_patch: bool = True,
+) -> tuple[Any, str, float]:
+    """The shared READ_FILE machinery for patching_node and repair_node:
+    resolve loop → never-seen-file bonus round → forced-patch retry.
+
+    The two nodes carried byte-similar copies of this cycle ("mirrors
+    repair_node" comments and all); every fix had to land twice and the
+    copies drifted (the bonus round and the config-driven cap were each
+    retrofitted into both). Single implementation, parameterised by the
+    node's dispatch function, seen-files map, and telemetry naming.
+
+    ``text`` is the LLM output to scan — callers that splice
+    continuation chunks WITHOUT mutating ``response.content``
+    (patching_node's ``combined_response_text``) pass the spliced form;
+    after every re-dispatch the cycle re-reads ``response.content``.
+    Returns ``(response, text, budget)`` — unchanged when the model
+    emitted no READ_FILE blocks.
+
+    Stages (each can be disabled for partial reuse, e.g. the
+    post-preflight mop-up wants the resolve loop only):
+
+    1. Resolve loop — up to ``max_resolves`` rounds
+       (``llm_dispatch.read_file_rounds``): resolve the blocks, append
+       the exchange, re-dispatch. Does NOT consume a node iteration.
+    2. Bonus round — past the cap, when the response is read-only AND
+       names workspace files the model has never been shown, resolve
+       them once more: an unseen-file request is an investigation step,
+       not spiralling (session 22471c0c: the stripped request was for
+       the file containing the root cause).
+    3. Forced-patch retry — still read-only: one final dispatch with an
+       explicit "no more READ_FILE, patch now" ultimatum so the round
+       can't land zero patches by silent strip.
+    """
+    from harness.patcher import (
+        parse_patch_blocks,
+        parse_read_blocks,
+        strip_read_blocks,
+    )
+    extra = dict(event_extra or {})
+    if max_resolves is None:
+        max_resolves = _resolve_read_file_rounds(state)
+
+    for _resolve_round in range(max_resolves):
+        read_reqs = parse_read_blocks(text)
+        if not read_reqs:
+            break
+        messages.append(MessageDict(role="assistant", content=text))
+        resolution = _resolve_read_blocks(
+            read_reqs, workspace, record_hashes_into=files_seen,
+        )
+        messages.append(MessageDict(role="user", content=resolution))
+        logger.info(
+            "[%s] READ_FILE resolved for %d file(s): %s. "
+            "Re-dispatching without consuming an iteration.",
+            node_label, len(read_reqs), [r[0] for r in read_reqs],
+        )
+        response, budget = await dispatch(messages, budget)
+        text = response.content or ""
+
+    if bonus_round:
+        post_cap_reads = parse_read_blocks(text)
+        if post_cap_reads and not parse_patch_blocks(strip_read_blocks(text)):
+            unseen_reads = [
+                (p, rng) for p, rng in post_cap_reads
+                if p not in files_seen
+                and os.path.isfile(os.path.join(workspace, p))
+            ]
+            if unseen_reads:
+                bonus_resolution = _resolve_read_blocks(
+                    unseen_reads, workspace, record_hashes_into=files_seen,
+                )
+                if bonus_resolution:
+                    messages.append(MessageDict(role="assistant", content=text))
+                    messages.append(MessageDict(
+                        role="user", content=bonus_resolution,
+                    ))
+                    logger.info(
+                        "[%s] Post-cap READ_FILE names %d never-shown "
+                        "workspace file(s) (%s). Granting one bonus "
+                        "resolve round instead of forcing a blind patch.",
+                        node_label, len(unseen_reads),
+                        [r[0] for r in unseen_reads],
+                    )
+                    try:
+                        from harness.observability import emit_event
+                        emit_event(
+                            f"{event_prefix}_read_file_bonus_round",
+                            unseen_files=[r[0] for r in unseen_reads],
+                            **extra,
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry must not block
+                        pass
+                    response, budget = await dispatch(messages, budget)
+                    text = response.content or ""
+
+    if forced_patch:
+        post_cap_reads = parse_read_blocks(text)
+        if post_cap_reads and not parse_patch_blocks(strip_read_blocks(text)):
+            logger.info(
+                "[%s] READ_FILE cap hit and post-cap response carries %d "
+                "more READ_FILE block(s) with no patches (%s). Issuing "
+                "forced-patch retry.",
+                node_label, len(post_cap_reads),
+                [r[0] for r in post_cap_reads],
+            )
+            messages.append(MessageDict(role="assistant", content=text))
+            messages.append(MessageDict(
+                role="user",
+                content=(
+                    f"[Forced-patch] Your READ_FILE budget for this "
+                    f"{iteration_noun} iteration is exhausted. The harness "
+                    "will IGNORE any further READ_FILE blocks. Based on "
+                    "the files you have already been shown above, emit "
+                    "your best-guess patches NOW using REPLACE_BLOCK / "
+                    "CREATE_FILE / DELETE_BLOCK / INSERT_AT_BLOCK only. "
+                    "If you are uncertain, favour the narrowest plausible "
+                    "fix — a near-miss patch is more useful than zero "
+                    "patches. No prose, no READ_FILE, no markdown."
+                ),
+            ))
+            response, budget = await dispatch(messages, budget)
+            text = response.content or ""
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    f"{event_prefix}_forced_patch_retry",
+                    unresolved_read_files=[r[0] for r in post_cap_reads],
+                    **extra,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+
+    return response, text, budget
 
 
 _DEFAULT_REPAIR_DIAGNOSTIC_CAP = 24
@@ -11971,6 +12017,43 @@ def _apply_toolchain_adaptation(
     )
 
 
+_TARGETED_MAX_NODEIDS = 5
+
+
+def _targeted_tests_first_selectors(
+    state: "AgentState", build_cmd: str, *, is_pre_exit_verify: bool,
+) -> list[str]:
+    """Return the prior round's failing pytest nodeids when the
+    fail-to-pass fast path applies, else ``[]``.
+
+    Eligibility: compiler.targeted_tests_first enabled (default True),
+    a pytest build command, not the final pre-exit verify, and EVERY
+    prior failure carries a nodeid (≤ :data:`_TARGETED_MAX_NODEIDS`
+    distinct). The all-nodeids gate keeps the fingerprint-based
+    progress detectors coherent — a targeted run covering only a
+    subset of the prior failure set would make the uncovered failures
+    look spuriously resolved.
+    """
+    cfg_raw = state.get("compiler_config")
+    cfg: dict[str, Any] = cfg_raw if isinstance(cfg_raw, dict) else {}
+    if not bool(cfg.get("targeted_tests_first", True)):
+        return []
+    if is_pre_exit_verify or "pytest" not in build_cmd:
+        return []
+    prior_errors = [
+        d for d in (state.get("compiler_errors") or [])
+        if isinstance(d, dict)
+    ]
+    if not prior_errors:
+        return []
+    if not all(d.get("pytest_nodeid") for d in prior_errors):
+        return []
+    nodeids = sorted({str(d["pytest_nodeid"]) for d in prior_errors})
+    if not nodeids or len(nodeids) > _TARGETED_MAX_NODEIDS:
+        return []
+    return nodeids
+
+
 async def compiler_node(state: AgentState) -> dict[str, Any]:
     """
     Node 3: The Verifier.
@@ -12400,7 +12483,66 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         allow_network=allow_network,
         sandbox_config=sandbox_cfg,
     )
-    result = await executor.run(build_cmd)
+
+    # Fail-to-pass fast path (SWE-bench methodology): when EVERY failure
+    # from the previous round carries a pytest nodeid (≤ 5 of them), run
+    # just those selectors first. Still failing → this round's
+    # diagnostics come from the cheap targeted run and the full suite is
+    # skipped: the repair clearly hasn't landed yet, so a full-suite run
+    # adds latency, not signal. All passing → fall through to the full
+    # suite (the pass-to-pass check for regressions and remaining
+    # failures). Gated on "ALL prior failures have nodeids" so the
+    # fingerprint-based progress detectors stay coherent — a targeted
+    # run that only covers a subset of the prior failure set would make
+    # the uncovered ones look spuriously resolved. Same append-selector
+    # trick the isolation rerun uses: pytest positional args are test
+    # selectors, so appending to the build chain re-scopes only the
+    # final pytest invocation. Exit 5 (no tests collected — the nodeid
+    # was renamed/removed by the repair) falls back to the full suite.
+    _prior_nodeids = _targeted_tests_first_selectors(
+        state, build_cmd, is_pre_exit_verify=is_pre_exit_verify,
+    )
+    result = None
+    if _prior_nodeids:
+        import shlex as _shlex
+        _selectors = " ".join(_shlex.quote(n) for n in _prior_nodeids)
+        targeted_cmd = f"{build_cmd} -p no:cacheprovider {_selectors}"
+        logger.info(
+            "[compiler_node:targeted] Re-running %d prior failing "
+            "selector(s) before the full suite: %s",
+            len(_prior_nodeids), ", ".join(_prior_nodeids),
+        )
+        targeted_result = await executor.run(targeted_cmd)
+        if (
+            targeted_result.exit_code not in (0, 5)
+            and targeted_result.diagnostics
+        ):
+            logger.info(
+                "[compiler_node:targeted] %d selector(s) still failing "
+                "(exit=%d) — using the targeted run as this round's "
+                "diagnostics and skipping the full suite.",
+                len(_prior_nodeids), targeted_result.exit_code,
+            )
+            result = targeted_result
+        else:
+            logger.info(
+                "[compiler_node:targeted] Prior failing selector(s) now "
+                "pass (exit=%d) — running the full suite for "
+                "regressions and remaining failures.",
+                targeted_result.exit_code,
+            )
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "targeted_tests_first",
+                nodeids=_prior_nodeids,
+                targeted_exit=targeted_result.exit_code,
+                full_suite_skipped=result is not None,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+    if result is None:
+        result = await executor.run(build_cmd)
 
     exit_code: int = result.exit_code
     compiler_errors: list[Any] = [d.to_dict() for d in result.diagnostics]
@@ -15648,138 +15790,35 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         if len(_repair_chunks) > 1:
             response.content = "\n".join(c for c in _repair_chunks if c)
 
-        # READ_FILE inline resolve (B3): if the LLM emitted READ_FILE blocks
-        # instead of (or alongside) patch blocks, resolve them here without
-        # consuming a repair iteration. The model fans out a single
-        # "show me the file → write the patch" round in one logical turn,
-        # matching how Claude Code's Read-before-Edit feels. Capped at
-        # READ_FILE_MAX_RESOLVES so the LLM can't loop forever asking for
-        # files instead of patching.
+        # READ_FILE machinery (B3) — resolve loop, never-seen-file bonus
+        # round, forced-patch retry. Shared with patching_node; see
+        # _read_file_resolution_cycle for the full contract. READ_FILE
+        # does NOT consume a repair iteration; the cap comes from
+        # llm_dispatch.read_file_rounds. The continuation splice above
+        # already folded chunked output into ``response.content``, so
+        # the cycle scans that directly.
         from harness.patcher import (
             parse_patch_blocks,
             parse_read_blocks as _parse_read_blocks,
             strip_read_blocks as _strip_read_blocks,
         )
-        READ_FILE_MAX_RESOLVES = _read_file_rounds
-        for _resolve_round in range(READ_FILE_MAX_RESOLVES):
-            read_reqs = _parse_read_blocks(response.content)
-            if not read_reqs:
-                break
-            # Persist the LLM's READ_FILE request as an assistant turn so the
-            # next dispatch sees what was asked, and inject our resolution as
-            # a follow-up user message.
-            messages.append(MessageDict(
-                role="assistant", content=response.content,
-            ))
-            resolution = _resolve_read_blocks(
-                read_reqs, workspace,
-                record_hashes_into=files_seen_by_llm,
-            )
-            messages.append(MessageDict(role="user", content=resolution))
-            logger.info(
-                "[repair_node] READ_FILE resolved for %d file(s): %s. "
-                "Re-dispatching without consuming an iteration.",
-                len(read_reqs), [r[0] for r in read_reqs],
-            )
-            response, new_budget = await _dispatch_repair(messages, new_budget)
-
-        # Forced-patch escape valve: if the post-cap response is STILL a
-        # READ_FILE-only emission with no parseable patches, the model is
-        # spiralling — it would otherwise get its READ_FILE stripped and
-        # land 0 patches, tripping consecutive_zero. Spend one more
-        # dispatch with an explicit "no more READ_FILE, patch now" prompt
-        # so the model is forced to commit. Without this, a model that
-        # correctly diagnosed the fix (recorded in reasoning_content) but
-        # kept asking for files burns a full repair iteration on nothing.
-        # Never-seen-file bonus round: when the post-cap READ_FILE names a
-        # workspace file the LLM has NOT been shown this session, the
-        # request is an investigation step, not spiralling — stripping it
-        # forces a blind patch against exactly the context gap the judge
-        # will flag as DISTRACTION next round. Session 22471c0c: the
-        # model's stripped post-cap request was server/app/database.py —
-        # the file containing the root cause. Resolve the unseen files
-        # once and re-dispatch; a request for already-shown files still
-        # falls through to the forced-patch valve below.
-        post_cap_reads = _parse_read_blocks(response.content)
-        if post_cap_reads and not parse_patch_blocks(
-            _strip_read_blocks(response.content)
-        ):
-            _unseen_reads = [
-                (p, rng) for p, rng in post_cap_reads
-                if p not in files_seen_by_llm
-                and os.path.isfile(os.path.join(workspace, p))
-            ]
-            if _unseen_reads:
-                _bonus_resolution = _resolve_read_blocks(
-                    _unseen_reads, workspace,
-                    record_hashes_into=files_seen_by_llm,
-                )
-                if _bonus_resolution:
-                    messages.append(MessageDict(
-                        role="assistant", content=response.content,
-                    ))
-                    messages.append(MessageDict(
-                        role="user", content=_bonus_resolution,
-                    ))
-                    logger.info(
-                        "[repair_node] Post-cap READ_FILE names %d "
-                        "never-shown workspace file(s) (%s). Granting one "
-                        "bonus resolve round instead of forcing a blind "
-                        "patch.",
-                        len(_unseen_reads), [r[0] for r in _unseen_reads],
-                    )
-                    try:
-                        from harness.observability import emit_event
-                        emit_event(
-                            "repair_read_file_bonus_round",
-                            unseen_files=[r[0] for r in _unseen_reads],
-                            total_repairs=loop_counter.get("total_repairs", 0),
-                        )
-                    except Exception:  # noqa: BLE001 — telemetry must not block
-                        pass
-                    response, new_budget = await _dispatch_repair(
-                        messages, new_budget,
-                    )
-
-        post_cap_reads = _parse_read_blocks(response.content)
-        if post_cap_reads:
-            stripped_preview = _strip_read_blocks(response.content)
-            if not parse_patch_blocks(stripped_preview):
-                logger.info(
-                    "[repair_node] READ_FILE cap hit and post-cap response "
-                    "carries %d more READ_FILE block(s) with no patches "
-                    "(%s). Issuing forced-patch retry.",
-                    len(post_cap_reads),
-                    [r[0] for r in post_cap_reads],
-                )
-                messages.append(MessageDict(
-                    role="assistant", content=response.content,
-                ))
-                messages.append(MessageDict(
-                    role="user",
-                    content=(
-                        "[Forced-patch] Your READ_FILE budget for this "
-                        "repair iteration is exhausted. The harness will "
-                        "IGNORE any further READ_FILE blocks. Based on "
-                        "the files you have already been shown above, "
-                        "emit your best-guess patches NOW using "
-                        "REPLACE_BLOCK / CREATE_FILE / DELETE_BLOCK / "
-                        "INSERT_AT_BLOCK only. If you are uncertain, "
-                        "favour the narrowest plausible fix — a "
-                        "near-miss patch is more useful than zero "
-                        "patches. No prose, no READ_FILE, no markdown."
-                    ),
-                ))
-                response, new_budget = await _dispatch_repair(messages, new_budget)
-                try:
-                    from harness.observability import emit_event
-                    emit_event(
-                        "repair_forced_patch_retry",
-                        unresolved_read_files=[r[0] for r in post_cap_reads],
-                        total_repairs=loop_counter.get("total_repairs", 0),
-                    )
-                except Exception:  # noqa: BLE001 — telemetry must not block
-                    pass
+        response, _final_text, new_budget = await _read_file_resolution_cycle(
+            response=response,
+            text=response.content or "",
+            budget=new_budget,
+            messages=messages,
+            dispatch=_dispatch_repair,
+            state=state,
+            workspace=workspace,
+            files_seen=files_seen_by_llm,
+            node_label="repair_node",
+            event_prefix="repair",
+            iteration_noun="repair",
+            event_extra={
+                "total_repairs": loop_counter.get("total_repairs", 0),
+            },
+            max_resolves=_read_file_rounds,
+        )
         # If the LLM is still emitting READ_FILE after the forced retry,
         # ignore them (strip below) and let the rest of the response apply.
 

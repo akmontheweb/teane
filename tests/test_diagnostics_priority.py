@@ -290,3 +290,98 @@ class TestMultiFileIsolation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
+
+
+class TestTargetedTestsFirst:
+    """Fail-to-pass fast path: re-run the previous round's failing pytest
+    selectors before paying for the full suite (SWE-bench methodology)."""
+
+    @staticmethod
+    def _state(errors, cfg=None):
+        s = {"compiler_errors": errors}
+        if cfg is not None:
+            s["compiler_config"] = cfg
+        return s
+
+    @staticmethod
+    def _fail(nodeid):
+        return {
+            "file": nodeid.split("::")[0], "line": 1, "severity": "error",
+            "error_code": "AssertionError", "message": "assert False",
+            "pytest_nodeid": nodeid,
+        }
+
+    def test_eligible_when_all_failures_have_nodeids(self):
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([
+            self._fail("tests/test_a.py::test_1"),
+            self._fail("tests/test_b.py::test_2"),
+        ])
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest -q", is_pre_exit_verify=False,
+        ) == ["tests/test_a.py::test_1", "tests/test_b.py::test_2"]
+
+    def test_ineligible_when_any_failure_lacks_nodeid(self):
+        # A non-pytest diagnostic in the prior set means a targeted run
+        # would only cover a subset and confuse progress fingerprints.
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([
+            self._fail("tests/test_a.py::test_1"),
+            {"file": "x.py", "line": 1, "severity": "error",
+             "error_code": "F821", "message": "undefined name"},
+        ])
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest -q", is_pre_exit_verify=False,
+        ) == []
+
+    def test_ineligible_over_nodeid_cap(self):
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([
+            self._fail(f"tests/test_a.py::test_{i}") for i in range(6)
+        ])
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest -q", is_pre_exit_verify=False,
+        ) == []
+
+    def test_ineligible_for_non_pytest_build(self):
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([self._fail("tests/test_a.py::test_1")])
+        assert _targeted_tests_first_selectors(
+            state, "npx jest --silent", is_pre_exit_verify=False,
+        ) == []
+
+    def test_ineligible_on_pre_exit_verify(self):
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([self._fail("tests/test_a.py::test_1")])
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest -q", is_pre_exit_verify=True,
+        ) == []
+
+    def test_config_opt_out(self):
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state(
+            [self._fail("tests/test_a.py::test_1")],
+            cfg={"targeted_tests_first": False},
+        )
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest -q", is_pre_exit_verify=False,
+        ) == []
+
+    def test_no_prior_errors_is_ineligible(self):
+        from harness.graph import _targeted_tests_first_selectors
+        assert _targeted_tests_first_selectors(
+            self._state([]), "python3 -m pytest -q",
+            is_pre_exit_verify=False,
+        ) == []
+
+    def test_config_key_wired_into_validator_and_template(self):
+        import json as _json
+        from pathlib import Path
+        from harness.cli import _KNOWN_NESTED_KEYS, _TYPE_SCHEMA
+        assert "targeted_tests_first" in _KNOWN_NESTED_KEYS["compiler"]
+        assert _TYPE_SCHEMA["compiler.targeted_tests_first"] == (bool,)
+        repo_root = Path(__file__).resolve().parents[1]
+        cfg = _json.loads(
+            (repo_root / "config" / "config.json").read_text(encoding="utf-8")
+        )
+        assert cfg["compiler"]["targeted_tests_first"] is True

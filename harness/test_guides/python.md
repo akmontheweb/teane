@@ -75,6 +75,29 @@ def db_override():
     Base.metadata.drop_all(bind=engine)
 ```
 
+### SQLAlchemy tests without FastAPI
+- Same engine rule: private `sqlite://` + `StaticPool` per module.
+- Prefer transaction-rollback isolation over create/drop per test when the
+  suite is slow: open one connection, `begin()` a transaction, bind the
+  session to the connection, and `rollback()` in teardown — every test
+  starts from the same clean state without re-creating tables.
+- Never commit seed data from a module-scoped fixture that later tests
+  mutate — a function-scoped seed keeps tests order-independent.
+
+### Async code (pytest-asyncio)
+- Decorate async tests with `@pytest.mark.asyncio`; the runner config
+  (`asyncio_mode = strict`) is already the harness default — do NOT add a
+  custom event loop fixture.
+- pytest-asyncio creates a FRESH event loop per test. Never create an
+  `httpx.AsyncClient`, aiohttp session, DB pool, or any loop-bound object
+  at module level or behind `@functools.lru_cache` — it binds to the first
+  test's loop and every later test fails with "attached to a different
+  loop". Construct loop-bound objects inside the test or a function-scoped
+  async fixture and close them there.
+- For async FastAPI endpoints, `TestClient` (sync) is fine — it manages its
+  own portal. Only reach for `httpx.AsyncClient(transport=ASGITransport(app=app))`
+  when the test itself must be async.
+
 ### Minimal example
 ```python
 import pytest

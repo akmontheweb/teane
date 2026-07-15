@@ -22,6 +22,34 @@ Same conventions as the JavaScript guide — Jest, real implementations, no mock
 - No `jest.mock`, no `jest.fn`, no `ts-mockito`, no `sinon`.
 - Do not invent `Partial<T>` shapes to stand in for real values; construct full objects (use a factory function defined in the test file if the type has many required fields).
 
+### Test-environment scaffolding — create the config WITH the tests
+A `.test.ts(x)` file whose type environment is missing produces hundreds
+of `TS2304 Cannot find name 'expect'` / `TS2307 Cannot find module
+'@testing-library/react'` diagnostics that drown every real error. When
+you generate tests, verify the environment exists and patch it in the
+SAME response if it doesn't:
+- `package.json` devDependencies must include `jest`, `ts-jest`,
+  `@types/jest` — plus `@testing-library/react`,
+  `@testing-library/jest-dom`, and `jest-environment-jsdom` when testing
+  React components.
+- `tsconfig.json` `compilerOptions.types` must list `"jest"` (and
+  `"@testing-library/jest-dom"` if used), and `include` must cover the
+  test files.
+- Component tests need `testEnvironment: "jsdom"` in the jest config and
+  a `jest.setup.ts` importing `@testing-library/jest-dom`, wired via
+  `setupFilesAfterEach`.
+- NEVER paper over missing types with `@ts-ignore`, `declare const
+  expect`, or hand-rolled ambient declarations — fix the config.
+
+### React components (@testing-library/react)
+- `render(<Panel {...props} />)` then query via `screen` by role or
+  accessible text: `screen.getByRole('button', { name: /save/i })`.
+  Do not assert on class names, DOM structure, or component internals.
+- Interactions through `@testing-library/user-event`
+  (`await userEvent.click(...)`) — not `fireEvent` — and `await
+  screen.findByText(...)` for anything that appears asynchronously.
+- One render per test; no shared component instances across tests.
+
 ### Minimal example
 ```typescript
 import { divide } from '../src/calculator';

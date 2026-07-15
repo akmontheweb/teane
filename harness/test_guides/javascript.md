@@ -25,6 +25,13 @@ Write Jest-style unit tests for the JavaScript source files just modified. Tests
 - No `nock`, no `sinon`. If the code under test makes an HTTP call, the test starts a local `http.createServer` on `port: 0`, points the code at it, asserts, then closes it in `afterEach`.
 - No "test doubles" implemented inline (e.g., `const fakeDb = { query: () => [] }`). Use an in-process real implementation instead.
 
+### Test-environment scaffolding — create the config WITH the tests
+If the workspace has no jest wiring yet, patch it in the SAME response
+as the tests: `jest` in `package.json` devDependencies (plus
+`jest-environment-jsdom` and a `testEnvironment: "jsdom"` jest config for
+DOM/component tests). A test file without its runner config just shifts
+the failure to the environment and drowns real errors in noise.
+
 ### Minimal example
 ```javascript
 const { divide } = require('../src/calculator');

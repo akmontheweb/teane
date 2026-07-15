@@ -635,13 +635,49 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
         first_byte = blob[sniff_idx] if sniff_idx < len(blob) else 0
         looks_like_json = first_byte in (0x7B, 0x5B, 0x22)  # { [ "
 
+        def _try_langgraph_serde() -> tuple[bool, Any, Optional[str]]:
+            # LangGraph's own serializer WROTE this blob (AsyncSqliteSaver
+            # → JsonPlusSerializer → ormsgpack, including ExtType entries
+            # for LC-serialized objects), so it is the authoritative
+            # decoder — and unlike the optional ``msgpack`` package it is
+            # always importable wherever teane runs, because ormsgpack is
+            # a hard dependency of langgraph-checkpoint. Session 22471c0c:
+            # resume declared a healthy 520 KB checkpoint "corrupted" and
+            # suggested purging it, purely because the standalone
+            # ``msgpack`` module wasn't installed in the venv.
+            try:
+                from langgraph.checkpoint.serde.jsonplus import (
+                    JsonPlusSerializer,
+                )
+                value = JsonPlusSerializer().loads_typed(
+                    ("msgpack", bytes(blob)),
+                )
+            except Exception as e:  # noqa: BLE001
+                return False, None, str(e)
+            # ormsgpack decodes the FIRST msgpack value and silently
+            # ignores trailing bytes, so garbage like b"\xff\xff\xff\xff"
+            # "succeeds" as the scalar -1. Checkpoint and metadata blobs
+            # are always maps — anything else is a corruption signal,
+            # not a decode.
+            if not isinstance(value, dict):
+                return False, None, (
+                    f"decoded to {type(value).__name__}, not a mapping"
+                )
+            return True, value, None
+
         def _try_msgpack() -> tuple[bool, Any, Optional[str]]:
             if msgpack is None:
                 return False, None, "msgpack module unavailable"
             try:
-                return True, msgpack.unpackb(blob, raw=False), None
+                value = msgpack.unpackb(blob, raw=False)
             except Exception as e:  # noqa: BLE001
                 return False, None, str(e)
+            # Same mapping guard as the serde path above.
+            if not isinstance(value, dict):
+                return False, None, (
+                    f"decoded to {type(value).__name__}, not a mapping"
+                )
+            return True, value, None
 
         def _try_json() -> tuple[bool, Any, Optional[str]]:
             # Audit §5.16: strict decode so a truncated UTF-8 sequence
@@ -652,7 +688,11 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 return False, None, str(e)
 
-        attempts = (_try_json, _try_msgpack) if looks_like_json else (_try_msgpack, _try_json)
+        attempts = (
+            (_try_json, _try_langgraph_serde, _try_msgpack)
+            if looks_like_json
+            else (_try_langgraph_serde, _try_msgpack, _try_json)
+        )
         first_err: Optional[str] = None
         for attempt in attempts:
             ok, value, err = attempt()
@@ -660,15 +700,16 @@ def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str
                 return value
             first_err = first_err or err
 
-        # Both decoders failed → real corruption. Now the WARNING is meaningful.
+        # Every decoder failed → real corruption. Now the WARNING is meaningful.
         logger.warning(
-            "[storage] Checkpoint blob decode failed (msgpack and JSON both "
-            "rejected it; first byte=0x%02x len=%d).",
+            "[storage] Checkpoint blob decode failed (langgraph serde, "
+            "msgpack and JSON all rejected it; first byte=0x%02x len=%d).",
             first_byte, len(blob),
         )
         if strict:
             raise CheckpointCorruptedError(
-                f"Checkpoint blob could not be decoded as msgpack or JSON: {first_err}"
+                "Checkpoint blob could not be decoded (langgraph serde, "
+                f"msgpack and JSON all rejected it): {first_err}"
             )
         return {}
 

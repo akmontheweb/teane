@@ -254,7 +254,13 @@ class TestCheckpointSchemaVersion:
             await saver.conn.close()
 
     def test_validate_accepts_current_version(self):
-        import msgpack
+        # ormsgpack, not the standalone ``msgpack`` package: ormsgpack is a
+        # hard dependency (via langgraph-checkpoint) so these tests run in
+        # every teane venv; ``msgpack`` is optional and its absence used to
+        # fail this whole class — the same missing-decoder gap that made
+        # cmd_resume misreport session 22471c0c's healthy checkpoint as
+        # corrupted.
+        import ormsgpack as msgpack
         from harness.storage import (
             CHECKPOINT_SCHEMA_VERSION,
             SCHEMA_VERSION_METADATA_KEY,
@@ -264,7 +270,13 @@ class TestCheckpointSchemaVersion:
         assert validate_checkpoint_schema(blob) == CHECKPOINT_SCHEMA_VERSION
 
     def test_validate_refuses_future_version(self):
-        import msgpack
+        # ormsgpack, not the standalone ``msgpack`` package: ormsgpack is a
+        # hard dependency (via langgraph-checkpoint) so these tests run in
+        # every teane venv; ``msgpack`` is optional and its absence used to
+        # fail this whole class — the same missing-decoder gap that made
+        # cmd_resume misreport session 22471c0c's healthy checkpoint as
+        # corrupted.
+        import ormsgpack as msgpack
         import pytest as _pytest
         from harness.storage import (
             CHECKPOINT_SCHEMA_VERSION,
@@ -278,7 +290,13 @@ class TestCheckpointSchemaVersion:
 
     def test_validate_legacy_checkpoint_warns_but_allows(self, caplog):
         import logging as _logging
-        import msgpack
+        # ormsgpack, not the standalone ``msgpack`` package: ormsgpack is a
+        # hard dependency (via langgraph-checkpoint) so these tests run in
+        # every teane venv; ``msgpack`` is optional and its absence used to
+        # fail this whole class — the same missing-decoder gap that made
+        # cmd_resume misreport session 22471c0c's healthy checkpoint as
+        # corrupted.
+        import ormsgpack as msgpack
         from harness.storage import validate_checkpoint_schema
         blob = msgpack.packb({"source": "input"})
         with caplog.at_level(_logging.WARNING, logger="harness.storage"):
@@ -287,7 +305,13 @@ class TestCheckpointSchemaVersion:
         assert any("no schema version stamp" in rec.message for rec in caplog.records)
 
     def test_validate_non_integer_version_rejected(self):
-        import msgpack
+        # ormsgpack, not the standalone ``msgpack`` package: ormsgpack is a
+        # hard dependency (via langgraph-checkpoint) so these tests run in
+        # every teane venv; ``msgpack`` is optional and its absence used to
+        # fail this whole class — the same missing-decoder gap that made
+        # cmd_resume misreport session 22471c0c's healthy checkpoint as
+        # corrupted.
+        import ormsgpack as msgpack
         import pytest as _pytest
         from harness.storage import (
             CheckpointSchemaMismatchError,
@@ -297,3 +321,58 @@ class TestCheckpointSchemaVersion:
         blob = msgpack.packb({SCHEMA_VERSION_METADATA_KEY: "v1"})
         with _pytest.raises(CheckpointSchemaMismatchError, match="not an integer"):
             validate_checkpoint_schema(blob)
+
+
+class TestCheckpointBlobDecodeWithoutMsgpack:
+    """Session 22471c0c: `teane resume` declared a healthy 520 KB
+    checkpoint corrupted — and suggested purging it — because the blob
+    decoder's only binary path was the OPTIONAL ``msgpack`` package.
+    LangGraph's own JsonPlusSerializer (backed by ormsgpack, a hard
+    dependency) wrote the blob and must sit first in the decode chain,
+    so resume works in every venv teane can be installed into."""
+
+    @staticmethod
+    def _serde_blob(payload):
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        typ, blob = JsonPlusSerializer().dumps_typed(payload)
+        assert typ == "msgpack"
+        return blob
+
+    def test_serde_blob_decodes_without_msgpack_module(self, monkeypatch):
+        import sys
+        from harness.storage import _deserialize_checkpoint_blob
+        # Simulate the standalone msgpack package being uninstalled even
+        # in environments that happen to have it.
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+        payload = {"channel_values": {"loop_counter": {"repair": 2}}, "ts": "t"}
+        result = _deserialize_checkpoint_blob(
+            self._serde_blob(payload), strict=True,
+        )
+        assert result == payload
+
+    def test_json_metadata_blob_still_decodes(self, monkeypatch):
+        import sys
+        from harness.storage import _deserialize_checkpoint_blob
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+        blob = b'{"source": "input", "step": 3}'
+        assert _deserialize_checkpoint_blob(blob, strict=True) == {
+            "source": "input", "step": 3,
+        }
+
+    def test_garbage_still_reports_corruption_in_strict_mode(self, monkeypatch):
+        import sys
+        from harness.storage import (
+            CheckpointCorruptedError,
+            _deserialize_checkpoint_blob,
+        )
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+        with pytest.raises(CheckpointCorruptedError):
+            _deserialize_checkpoint_blob(b"\xc1\xff\x00 not a checkpoint", strict=True)
+
+    def test_garbage_returns_empty_dict_in_lenient_mode(self, monkeypatch):
+        import sys
+        from harness.storage import _deserialize_checkpoint_blob
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+        assert _deserialize_checkpoint_blob(
+            b"\xc1\xff\x00 not a checkpoint", strict=False,
+        ) == {}

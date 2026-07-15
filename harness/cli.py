@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from harness import _platform
-from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS
+from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS, STALL_TRIPWIRE_KEYS
 from harness.spec_files import (
     SPEC_FILE_EXTS,
     list_spec_files,
@@ -820,6 +820,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Clamped to [1, 30] in graph._resolve_patching_read_file_cap;
         # default 10.
         "patching_read_file_cap",
+        # Cap on <<<READ_FILE>>> DSL resolve rounds per repair/patching
+        # iteration. Clamped to [1, 20] in
+        # graph._resolve_read_file_rounds; default 6. One bonus round is
+        # granted past the cap when the request names a workspace file
+        # the LLM has never been shown (session 22471c0c).
+        "read_file_rounds",
         # Prompt caching master switch. Default True. Falls back to the
         # legacy string-form Anthropic system payload when False, and
         # silences the prefix-stability drift events. Single-flag
@@ -1096,6 +1102,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.continue_on_length": (dict,),
     "llm_dispatch.max_continuation_cycles": (int,),
     "llm_dispatch.patching_read_file_cap": (int,),
+    "llm_dispatch.read_file_rounds": (int,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "web_tools.enabled": (bool,),
     "web_tools.max_bytes": (int,),
@@ -2975,22 +2982,17 @@ def _reset_hitl_trip_counters(loop_counter: dict[str, Any]) -> None:
     session 2d0164f0 / 19b28eff / 0a5c6fe8's fix (see
     ``_reset_iteration_counters``).
     """
-    for key in (
-        "consecutive_zero_patch_rounds",
-        "consecutive_all_allowlist_rejected_rounds",
-        "no_progress_repairs",
-        "consecutive_distraction_rounds",
-        "consecutive_low_signal_rounds",
-        # 2026-07-04 — reset the cheap-model shot counter on HITL
-        # auto-resume so the cheap model gets a fresh
-        # ``max_repair_attempts - 1`` shots per HITL cycle. Without
-        # this, the counter accumulates across the whole session and
-        # every post-HITL round burns the reasoning model. Ciod
-        # session 523e86a7 saw 5+ escalations per batch because the
-        # cheap-shot budget was effectively exhausted after the first
-        # HITL cycle.
-        "cheap_shots_taken",
-    ):
+    # STALL_TRIPWIRE_KEYS is the canonical registry of router stall
+    # tripwires (see harness/loop_counter_keys.py). It includes
+    # ``cheap_shots_taken`` (2026-07-04): reset on HITL auto-resume so
+    # the cheap model gets a fresh ``max_repair_attempts - 1`` shots
+    # per HITL cycle. Without this, the counter accumulates across the
+    # whole session and every post-HITL round burns the reasoning
+    # model. Ciod session 523e86a7 saw 5+ escalations per batch because
+    # the cheap-shot budget was effectively exhausted after the first
+    # HITL cycle. Present-only reset: a legacy checkpoint without a key
+    # must not gain it here.
+    for key in STALL_TRIPWIRE_KEYS:
         if key in loop_counter:
             loop_counter[key] = 0
     # PER_BATCH_CAP_COUNTERS is the canonical registry of caps that
@@ -3054,9 +3056,8 @@ def _reset_iteration_counters(
     loop_counter: Optional[dict[str, Any]], *, total_repairs: int = 0,
 ) -> dict[str, Any]:
     """Reset only the iteration counters in ``loop_counter`` while preserving
-    diagnostic trackers (``replace_block_misses_per_file``,
-    ``consecutive_zero_patch_rounds``, etc.) that the repair loop relies on
-    for prompt directives across HITL resume.
+    diagnostic trackers (``replace_block_misses_per_file``, etc.) that the
+    repair loop relies on for prompt directives across HITL resume.
 
     Wiping the whole dict here (the original behavior) was the root cause
     behind sessions like 2d0164f0 ping-ponging through HITL: the
@@ -3064,6 +3065,22 @@ def _reset_iteration_counters(
     misses per file, so resetting that counter to zero on every resume meant
     the LLM never received the "use a different operation" directive and went
     straight back to the same broken REPLACE_BLOCK pattern.
+
+    The router stall tripwires (``STALL_TRIPWIRE_KEYS`` — distraction /
+    low-signal / zero-patch streaks and friends) are stepped back by ONE
+    instead of preserved verbatim or zeroed. Preserving them verbatim made
+    ``[r]`` Resume a dead end whenever the HITL trigger WAS one of them:
+    the counter sits at its cap when HITL fires, ``route_after_compiler``
+    consults it again BEFORE repair_node can run, and the only resets
+    (PROGRESS verdict in repair_node, green-build
+    ``_reset_stall_tripwires_on_progress``) are unreachable — session
+    22471c0c re-fired ``reflection_distraction_loop:3`` twenty seconds
+    after every resume with zero repair turns in between. Decrementing by
+    one admits exactly one more repair round through the gate that fired
+    (mirroring the ``total_repairs`` seed contract: "one more attempt
+    before HITL re-fires") while keeping the streak high enough that
+    directive escalations still hold (e.g. the reflection judge keeps
+    using the reasoning model at ``consecutive_distraction_rounds >= 2``).
 
     Two counters ARE reset alongside the iteration counters because they
     track the very condition the operator just intervened to address:
@@ -3086,6 +3103,13 @@ def _reset_iteration_counters(
     # enforces the invariant.
     for key in PER_BATCH_CAP_COUNTERS:
         base[key] = 0
+    # Step each stall tripwire one below its current (= trip) value so
+    # the gate that fired HITL passes exactly once — see docstring.
+    # Present-only, like ``_reset_hitl_trip_counters``: a checkpoint
+    # without the key must not gain it here.
+    for key in STALL_TRIPWIRE_KEYS:
+        if key in base:
+            base[key] = max(0, int(base.get(key, 0) or 0) - 1)
     base["total_repairs"] = total_repairs
     base["missing_dep_consecutive_same"] = 0
     base["missing_dep_last_symbol"] = ""
@@ -4132,12 +4156,14 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             # The "2" refers to ``total_repairs`` — the seed value passed
             # to ``_reset_iteration_counters`` so the next compile has
             # one repair attempt remaining before the ``max_patch_repair_
-            # iterations`` cap re-fires HITL. Diagnostic trackers
-            # (``consecutive_zero_patch_rounds``, per-file miss counts,
-            # etc.) are deliberately preserved so the repair LLM still
-            # gets the "use a different operation" directive; those are
-            # reset to 0 by the next green compile or successful
-            # code_review re-patch (see ``compiler_node`` /
+            # iterations`` cap re-fires HITL. Per-file miss counts are
+            # deliberately preserved so the repair LLM still gets the
+            # "use a different operation" directive; router stall
+            # tripwires are stepped one below their trip value so the
+            # trigger that fired admits one repair round instead of
+            # re-firing straight off the compile (session 22471c0c).
+            # All of them reset to 0 on the next green compile or
+            # successful code_review re-patch (see ``compiler_node`` /
             # ``code_review_node``).
             from harness.graph import hitl_next_node as _hitl_next_node
             _next_node = _hitl_next_node(str(trigger or ""))

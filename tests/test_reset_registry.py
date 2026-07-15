@@ -30,7 +30,10 @@ from pathlib import Path
 import pytest
 
 from harness.cli import _reset_hitl_trip_counters, _reset_iteration_counters
-from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS
+from harness.loop_counter_keys import (
+    PER_BATCH_CAP_COUNTERS,
+    STALL_TRIPWIRE_KEYS,
+)
 
 SENTINEL = 9
 
@@ -132,3 +135,71 @@ def test_every_registered_key_survives_a_round_trip(key: str):
     live = dict(seeded)
     _reset_hitl_trip_counters(live)
     assert live[key] == 0
+
+
+# ---------------------------------------------------------------------------
+# STALL_TRIPWIRE_KEYS — the router's "N bad rounds in a row" gates
+# ---------------------------------------------------------------------------
+#
+# Session 22471c0c: HITL fired on ``reflection_distraction_loop:3``, the
+# operator pressed [r], and the SAME trigger re-fired 20 seconds later —
+# route_after_compiler consults ``consecutive_distraction_rounds`` before
+# repair_node can run, the counter was preserved at its cap across the
+# resume, and the only resets (PROGRESS verdict / green build) were
+# unreachable. The [r]/[e] resume path must step every stall tripwire
+# below its trip value so the gate that fired admits exactly one more
+# repair round; the headless auto-resume path zeros them outright.
+
+
+@pytest.mark.parametrize("key", list(STALL_TRIPWIRE_KEYS))
+def test_stall_tripwire_steps_below_trip_on_human_resume(key: str):
+    """[r]/[e] resume: a counter at its cap must come back below it —
+    but only by one, so streak-keyed directives (reasoning-judge
+    escalation at distraction >= 2, "use a different operation") stay
+    armed and the trigger re-fires after a single fruitless round."""
+    result = _reset_iteration_counters({key: 3}, total_repairs=2)
+    assert result[key] == 2, (
+        f"_reset_iteration_counters left stall tripwire {key!r} at "
+        f"{result.get(key)!r}; a value at the trip cap re-fires the "
+        f"same HITL trigger off the resume compile before repair_node "
+        f"ever runs (session 22471c0c dead end)."
+    )
+
+
+@pytest.mark.parametrize("key", list(STALL_TRIPWIRE_KEYS))
+def test_stall_tripwire_zeroed_on_auto_resume(key: str):
+    live = {key: 3}
+    _reset_hitl_trip_counters(live)
+    assert live[key] == 0
+
+
+@pytest.mark.parametrize("key", list(STALL_TRIPWIRE_KEYS))
+def test_stall_tripwire_reset_is_present_only(key: str):
+    """A legacy checkpoint without the key must not gain it (mirrors
+    the ``cheap_shots_taken`` contract in test_cheap_shots_escalation)."""
+    result = _reset_iteration_counters({}, total_repairs=0)
+    assert key not in result
+    live: dict[str, int] = {}
+    _reset_hitl_trip_counters(live)
+    assert key not in live
+
+
+def test_stall_tripwire_never_goes_negative():
+    result = _reset_iteration_counters(
+        {key: 0 for key in STALL_TRIPWIRE_KEYS}, total_repairs=0,
+    )
+    for key in STALL_TRIPWIRE_KEYS:
+        assert result[key] == 0
+
+
+def test_graph_router_uses_the_shared_registry():
+    """graph.py's ``_reset_stall_tripwires_on_progress`` must iterate
+    the same canonical tuple — a hand-rolled copy there is the exact
+    drift this module exists to prevent. Source-level check to avoid
+    importing the full graph module."""
+    src = (
+        Path(__file__).resolve().parents[1] / "harness" / "graph.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "from harness.loop_counter_keys import STALL_TRIPWIRE_KEYS" in src
+    ), "graph.py no longer imports STALL_TRIPWIRE_KEYS from the registry"

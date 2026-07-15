@@ -61,3 +61,31 @@ PER_BATCH_CAP_COUNTERS: tuple[str, ...] = (
     "test_generation",
     "test_generation_zero_emit",
 )
+
+
+STALL_TRIPWIRE_KEYS: tuple[str, ...] = (
+    # "N bad rounds in a row" tripwires that ``route_after_compiler`` /
+    # ``route_after_patching`` consult to short-circuit to HITL. Shared
+    # by three reset sites that must never drift apart:
+    #
+    #   1. ``graph._reset_stall_tripwires_on_progress`` — zeroed on any
+    #      real forward progress (green build, code_review re-patch).
+    #   2. ``cli._reset_hitl_trip_counters``  — zeroed on headless
+    #      auto-resume (nothing outside the harness changed; a counter
+    #      left at its cap re-fires the same trigger within seconds).
+    #   3. ``cli._reset_iteration_counters``  — stepped to one below
+    #      their current value on human [r]/[e] resume. Zeroing would
+    #      discard directive-shaping signal the repair prompts rely on,
+    #      but preserving them verbatim is a guaranteed dead end when
+    #      the HITL trigger IS one of these counters: the router gates
+    #      on them BEFORE repair_node can run, and the only resets
+    #      (PROGRESS verdict, green build) are unreachable. Session
+    #      22471c0c re-fired reflection_distraction_loop:3 twenty
+    #      seconds after every [r] with zero repair turns in between.
+    "consecutive_zero_patch_rounds",
+    "consecutive_all_allowlist_rejected_rounds",
+    "consecutive_distraction_rounds",
+    "consecutive_low_signal_rounds",
+    "no_progress_repairs",
+    "cheap_shots_taken",
+)

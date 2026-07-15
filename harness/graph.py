@@ -1957,9 +1957,10 @@ bytes. The harness will:
 
 You may emit READ_FILE blocks alongside patch blocks in the same
 response; the patches still apply. If you only need to read, emit ONLY
-the READ_FILE block(s) and no patches. Cap: at most two READ_FILE
-resolution rounds per iteration — after that the harness ignores
-further READ_FILE blocks and applies whatever patches you emitted.
+the READ_FILE block(s) and no patches. Cap: READ_FILE resolution rounds
+per iteration are budgeted (the exact budget is stated in the format
+instruction each turn) — past the budget the harness ignores further
+READ_FILE blocks and applies whatever patches you emitted.
 
 When to use READ_FILE:
 - Your REPLACE_BLOCK keeps missing and the diagnostic does not include a
@@ -3089,6 +3090,36 @@ def _resolve_patching_read_file_cap(state: "AgentState") -> int:
     except (TypeError, ValueError):
         return _PATCHING_READ_FILE_CAP
     return max(1, min(30, val))
+
+
+# Cap on ``<<<READ_FILE>>>`` DSL resolve rounds inside one repair /
+# patching iteration (distinct from ``patching_read_file_cap``, which
+# bounds the tool-use read_file loop). Each round re-dispatches without
+# consuming an iteration; the model can request several files per round.
+# Was hard-coded at 2, which cut investigations off one file short:
+# session 22471c0c's repair model spent its two rounds walking
+# service → api → repository and had its third request — for
+# server/app/database.py, the file with the actual root cause — stripped
+# by the forced-patch valve. Five fixture-shaped no-op repairs followed.
+# Operators can override via ``llm_dispatch.read_file_rounds`` in
+# config.json (clamped to [1, 20] at read time).
+_READ_FILE_ROUNDS_DEFAULT = 6
+
+
+def _resolve_read_file_rounds(state: "AgentState") -> int:
+    """Resolve the cap on ``<<<READ_FILE>>>`` resolve rounds per iteration.
+
+    Reads ``state.llm_dispatch_config.read_file_rounds`` and clamps to
+    ``[1, 20]``; falls back to :data:`_READ_FILE_ROUNDS_DEFAULT` when the
+    config omits it or supplies a non-int / out-of-range value.
+    """
+    cfg = state.get("llm_dispatch_config", {}) or {}
+    raw = cfg.get("read_file_rounds", _READ_FILE_ROUNDS_DEFAULT)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _READ_FILE_ROUNDS_DEFAULT
+    return max(1, min(20, val))
 
 
 async def _continue_on_length(
@@ -4339,7 +4370,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 parse_read_blocks as _parse_read_blocks,
                 strip_read_blocks as _strip_read_blocks,
             )
-            _READ_FILE_MAX_RESOLVES = 2
+            _READ_FILE_MAX_RESOLVES = _resolve_read_file_rounds(state)
             for _resolve_round in range(_READ_FILE_MAX_RESOLVES):
                 read_reqs = _parse_read_blocks(combined_response_text)
                 if not read_reqs:
@@ -4370,6 +4401,52 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # asking for files would burn a whole patching round on
             # zero patches — the exact stall that trips
             # consecutive_zero_patch_rounds.
+            # Never-seen-file bonus round — mirrors repair_node: a post-cap
+            # READ_FILE for a workspace file the LLM has not been shown is
+            # an investigation step, not spiralling. Resolve it once and
+            # re-dispatch rather than forcing a blind patch.
+            _post_cap_reads = _parse_read_blocks(combined_response_text)
+            if _post_cap_reads and not _parse_patch_blocks(
+                _strip_read_blocks(combined_response_text)
+            ):
+                _unseen_reads = [
+                    (p, rng) for p, rng in _post_cap_reads
+                    if p not in tool_files_seen
+                    and os.path.isfile(os.path.join(workspace, p))
+                ]
+                if _unseen_reads:
+                    _bonus_resolution = _resolve_read_blocks(
+                        _unseen_reads, workspace,
+                        record_hashes_into=tool_files_seen,
+                    )
+                    if _bonus_resolution:
+                        messages.append(MessageDict(
+                            role="assistant", content=combined_response_text,
+                        ))
+                        messages.append(MessageDict(
+                            role="user", content=_bonus_resolution,
+                        ))
+                        logger.info(
+                            "[patching_node] Post-cap READ_FILE names %d "
+                            "never-shown workspace file(s) (%s). Granting "
+                            "one bonus resolve round instead of forcing a "
+                            "blind patch.",
+                            len(_unseen_reads),
+                            [r[0] for r in _unseen_reads],
+                        )
+                        try:
+                            from harness.observability import emit_event
+                            emit_event(
+                                "patching_read_file_bonus_round",
+                                unseen_files=[r[0] for r in _unseen_reads],
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        response, new_budget = await _patching_dispatch(
+                            messages, new_budget,
+                        )
+                        combined_response_text = response.content or ""
+
             _post_cap_reads = _parse_read_blocks(combined_response_text)
             if _post_cap_reads:
                 _stripped_preview = _strip_read_blocks(combined_response_text)
@@ -7751,7 +7828,11 @@ _PREFLIGHT_FILE_LINE_CAP = 300
 # boundaries; per-file line/char caps
 # (:data:`_PREFLIGHT_FILE_LINE_CAP`,
 # :data:`_PREFLIGHT_FILE_CHAR_CAP`) still apply on each entry.
-_REREAD_INJECTION_CAP = 5
+# Selection is most-recent-first (see the walk in repair_node), so the
+# cap evicts the oldest reads. 8 tracks llm_dispatch.read_file_rounds=6:
+# a single investigation can now legitimately read six-plus files, and
+# a cap of 5 would evict part of the active working set between rounds.
+_REREAD_INJECTION_CAP = 8
 # Max number of files that get the workspace-context enrichment
 # (modification history + symbol registry + reverse import map) on
 # every repair round. Prior to 2026-07-04 the enrichment fired ONLY
@@ -8079,7 +8160,12 @@ def _resolve_read_blocks(
 
     When ``record_hashes_into`` is supplied, every successfully-read file's
     sha256 is recorded so the patcher's B5 drift detector knows what the
-    LLM has actually been shown.
+    LLM has actually been shown. Recording is move-to-end: a re-read pops
+    the key before re-inserting so the dict's insertion order doubles as
+    a last-read recency order — the post-cleanse re-injection uses that
+    order to keep the MOST RECENT reads in the prompt (session 22471c0c:
+    oldest-first selection re-injected five stale files from a prior
+    story while the current investigation's reads were evicted).
     """
     if not read_blocks:
         return ""
@@ -8089,6 +8175,7 @@ def _resolve_read_blocks(
         if rng is None:
             rendered, file_hash = _render_file_with_line_numbers_and_hash(abs_path)
             if record_hashes_into is not None and file_hash is not None:
+                record_hashes_into.pop(rel_path, None)
                 record_hashes_into[rel_path] = file_hash
         else:
             # Window mode: render a sub-range. Re-use the renderer's
@@ -8122,6 +8209,7 @@ def _resolve_read_blocks(
                     with open(abs_path, "rb") as bf:
                         for chunk in iter(lambda: bf.read(65536), b""):
                             h.update(chunk)
+                    record_hashes_into.pop(rel_path, None)
                     record_hashes_into[rel_path] = h.hexdigest()
                 except OSError:
                     pass
@@ -12829,14 +12917,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
 # ``cheap_shots_taken`` sits here for the same reason at a smaller
 # scale — see :func:`_reset_stall_tripwires_on_progress` docstring for
 # the cost story.
-_STALL_TRIPWIRE_KEYS: tuple[str, ...] = (
-    "consecutive_zero_patch_rounds",
-    "consecutive_all_allowlist_rejected_rounds",
-    "consecutive_distraction_rounds",
-    "consecutive_low_signal_rounds",
-    "no_progress_repairs",
-    "cheap_shots_taken",
-)
+# Canonical tuple lives in harness.loop_counter_keys — shared with the
+# two HITL-resume reset sites in cli.py so the key lists cannot drift.
+from harness.loop_counter_keys import STALL_TRIPWIRE_KEYS as _STALL_TRIPWIRE_KEYS  # noqa: E402 — re-export at former def site
 
 
 def _reset_stall_tripwires_on_progress(loop_counter: dict[str, Any]) -> None:
@@ -13920,7 +14003,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # already applies per-file line + char caps on each entry.
             _existing_preflight = set(files_for_preflight)
             _reread_candidates: list[str] = []
-            for _seen_path in files_seen_by_llm.keys():
+            # Walk MOST-RECENT-FIRST. ``files_seen_by_llm`` insertion
+            # order is last-read recency (``_resolve_read_blocks`` does
+            # move-to-end on re-read), and the cap must evict the OLDEST
+            # reads, not the newest: session 22471c0c's oldest-first walk
+            # re-injected five stale files from the previous story while
+            # the current investigation's reads (the files the judge kept
+            # naming) fell past the cap — each round re-spent its
+            # READ_FILE budget rediscovering them.
+            for _seen_path in reversed(list(files_seen_by_llm.keys())):
                 if _seen_path in _existing_preflight:
                     continue
                 _abs = os.path.join(workspace_path, _seen_path)
@@ -13932,6 +14023,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _reread_candidates.append(_seen_path)
                 if len(_reread_candidates) >= _REREAD_INJECTION_CAP:
                     break
+            # Restore chronological (oldest → newest) order for the
+            # prompt so the rendering stays stable across rounds.
+            _reread_candidates.reverse()
             if _reread_candidates:
                 files_for_preflight = (
                     list(files_for_preflight) + _reread_candidates
@@ -15334,9 +15428,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # Then append the strict format reminder (same as patching_node).
         # In change-request mode prepend the CR-N attribution rules so
         # repair patches also carry the marker comments.
+        _read_file_rounds = _resolve_read_file_rounds(state)
         _REPAIR_FORMAT_REMINDER = _build_change_request_preamble(
             state, "patching"
-        ) + """[CRITICAL FORMAT INSTRUCTION]
+        ) + f"""[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more blocks.
@@ -15363,12 +15458,12 @@ File-read block (use SPARINGLY — strictly budgeted):
 file: path/to/file.ext
 <<<END_READ_FILE>>>
 
-READ_FILE budget: at most 2 READ_FILE rounds per repair iteration. The
-harness resolves your reads and re-dispatches without consuming an
-iteration — but only twice. A third READ_FILE WILL BE STRIPPED and you
-will be forced to emit patches with whatever context you have. So read
-only files you genuinely need to see and have not been shown; everything
-else, patch directly.
+READ_FILE budget: at most {_read_file_rounds} READ_FILE rounds per repair
+iteration. The harness resolves your reads and re-dispatches without
+consuming an iteration — but only {_read_file_rounds} times. After that,
+further READ_FILE blocks WILL BE STRIPPED and you will be forced to emit
+patches with whatever context you have. So read only files you genuinely
+need to see and have not been shown; everything else, patch directly.
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your fix patches NOW. Only the blocks above. No other text."""
@@ -15449,7 +15544,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             parse_read_blocks as _parse_read_blocks,
             strip_read_blocks as _strip_read_blocks,
         )
-        READ_FILE_MAX_RESOLVES = 2
+        READ_FILE_MAX_RESOLVES = _read_file_rounds
         for _resolve_round in range(READ_FILE_MAX_RESOLVES):
             read_reqs = _parse_read_blocks(response.content)
             if not read_reqs:
@@ -15480,6 +15575,56 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # so the model is forced to commit. Without this, a model that
         # correctly diagnosed the fix (recorded in reasoning_content) but
         # kept asking for files burns a full repair iteration on nothing.
+        # Never-seen-file bonus round: when the post-cap READ_FILE names a
+        # workspace file the LLM has NOT been shown this session, the
+        # request is an investigation step, not spiralling — stripping it
+        # forces a blind patch against exactly the context gap the judge
+        # will flag as DISTRACTION next round. Session 22471c0c: the
+        # model's stripped post-cap request was server/app/database.py —
+        # the file containing the root cause. Resolve the unseen files
+        # once and re-dispatch; a request for already-shown files still
+        # falls through to the forced-patch valve below.
+        post_cap_reads = _parse_read_blocks(response.content)
+        if post_cap_reads and not parse_patch_blocks(
+            _strip_read_blocks(response.content)
+        ):
+            _unseen_reads = [
+                (p, rng) for p, rng in post_cap_reads
+                if p not in files_seen_by_llm
+                and os.path.isfile(os.path.join(workspace, p))
+            ]
+            if _unseen_reads:
+                _bonus_resolution = _resolve_read_blocks(
+                    _unseen_reads, workspace,
+                    record_hashes_into=files_seen_by_llm,
+                )
+                if _bonus_resolution:
+                    messages.append(MessageDict(
+                        role="assistant", content=response.content,
+                    ))
+                    messages.append(MessageDict(
+                        role="user", content=_bonus_resolution,
+                    ))
+                    logger.info(
+                        "[repair_node] Post-cap READ_FILE names %d "
+                        "never-shown workspace file(s) (%s). Granting one "
+                        "bonus resolve round instead of forcing a blind "
+                        "patch.",
+                        len(_unseen_reads), [r[0] for r in _unseen_reads],
+                    )
+                    try:
+                        from harness.observability import emit_event
+                        emit_event(
+                            "repair_read_file_bonus_round",
+                            unseen_files=[r[0] for r in _unseen_reads],
+                            total_repairs=loop_counter.get("total_repairs", 0),
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry must not block
+                        pass
+                    response, new_budget = await _dispatch_repair(
+                        messages, new_budget,
+                    )
+
         post_cap_reads = _parse_read_blocks(response.content)
         if post_cap_reads:
             stripped_preview = _strip_read_blocks(response.content)

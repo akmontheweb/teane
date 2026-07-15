@@ -4000,7 +4000,7 @@ class TestAgentState:
             "missing_dep_last_symbol": "pip",
             # Diagnostic trackers we DO want to preserve.
             "replace_block_misses_per_file": {"foo.py": 2},
-            "consecutive_zero_patch_rounds": 1,
+            "consecutive_zero_patch_rounds": 2,
         }
         after = _reset_iteration_counters(before, total_repairs=2)
         # Iteration counters reset.
@@ -4013,6 +4013,9 @@ class TestAgentState:
         assert after["missing_dep_last_symbol"] == ""
         # Diagnostic trackers preserved (unchanged from prior fix).
         assert after["replace_block_misses_per_file"] == {"foo.py": 2}
+        # Stall tripwires step one below their trip value (session
+        # 22471c0c: preserved-at-cap counters made [r] a dead end) —
+        # NOT zeroed, so streak-keyed directives stay armed.
         assert after["consecutive_zero_patch_rounds"] == 1
 
     def test_refresh_session_config_into_state_picks_up_image_change(

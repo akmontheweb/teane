@@ -1677,8 +1677,19 @@ class TextPatcher(BasePatcher):
                 original, search, normalize=str.strip,
             )
             if len(i_matches) == 1:
+                # Re-anchor the replacement's indentation to the file's
+                # matched region: this tier fires precisely when the
+                # LLM's block is uniformly out/indented relative to the
+                # file, and writing its replace text verbatim would land
+                # the new code at the WRONG column (fatal in Python /
+                # Makefile / YAML). Falls back to verbatim when no
+                # consistent delta exists.
                 modified = _whitespace_tolerant_replace(
-                    original, search, replace, i_matches[0],
+                    original, search,
+                    _reindent_replace_for_match(
+                        original, search, replace, i_matches[0],
+                    ),
+                    i_matches[0],
                 )
                 lines_changed = _count_diff_lines(original, modified)
                 try:
@@ -1782,6 +1793,41 @@ class TextPatcher(BasePatcher):
                                 success=False, file=filepath,
                                 operation=OperationType.REPLACE_BLOCK, error=str(exc),
                             )
+
+            # Elided-middle tier (Aider-style): the LLM wrote head/tail
+            # anchor lines with a whole-line "..." marker for the
+            # unchanged middle. Match the anchors uniquely and in order,
+            # keep the file's middle bytes verbatim, and require the
+            # replace block to carry the same marker count. This is the
+            # lazy-edit shape long-reasoning models fall into; without
+            # this tier it's an unconditional search miss.
+            elided = _elided_match_replace(original, search, replace)
+            if elided is not None:
+                lines_changed = _count_diff_lines(original, elided)
+                try:
+                    await _awrite(full_path, elided)
+                    logger.info(
+                        "[patcher:text] Replaced block in %s via "
+                        "elided-middle match (%d lines changed). The "
+                        "search block used '...' markers; the file's "
+                        "elided middle was preserved verbatim.",
+                        filepath, lines_changed,
+                    )
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.REPLACE_BLOCK,
+                        message=(
+                            f"Replaced block in {filepath} "
+                            f"(elided-middle match)"
+                        ),
+                        lines_changed=lines_changed,
+                    )
+                except OSError as exc:
+                    return PatchResult(
+                        success=False, file=filepath,
+                        operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                    )
 
             # Log the first ~600 chars of the failed search at DEBUG so
             # future debugging has the LLM's actual output to look at
@@ -3208,6 +3254,159 @@ def _whitespace_tolerant_replace(
     elif not last_has_newline and replace_has_newline:
         replace_text = replace_text.rstrip("\r\n")
     return original[:start_byte] + replace_text + original[start_byte + replaced_bytes:]
+
+
+def _reindent_replace_for_match(
+    original: str, search: str, replace: str, start_byte: int,
+) -> str:
+    """Re-anchor ``replace``'s indentation to the file's matched region.
+
+    The full-strip (indent-tolerant) tier matches when the LLM's search
+    block is uniformly outdented/indented relative to the file — e.g. a
+    Python method emitted at column 0 while the file has it at column 4.
+    Writing the LLM's ``replace`` verbatim would then land the new code
+    at the WRONG indentation and corrupt indentation-sensitive files.
+
+    Detect a CONSISTENT delta between the file's matched lines and the
+    search lines (either the file adds a common prefix to every non-blank
+    search line, or vice versa) and apply the same transformation to every
+    non-blank ``replace`` line. When the delta is inconsistent (mixed
+    tabs/spaces drift, ragged edits) return ``replace`` unchanged — the
+    caller keeps today's verbatim behavior rather than guessing.
+    """
+    orig_lines_keep = original.splitlines(keepends=True)
+    line_offsets = [0]
+    for line in orig_lines_keep:
+        line_offsets.append(line_offsets[-1] + len(line))
+    try:
+        start_line = line_offsets.index(start_byte)
+    except ValueError:
+        return replace
+    search_lines = search.splitlines()
+    file_lines = [
+        ln.rstrip("\r\n")
+        for ln in orig_lines_keep[start_line:start_line + len(search_lines)]
+    ]
+    if len(file_lines) != len(search_lines):
+        return replace
+
+    def _leading_ws(s: str) -> str:
+        return s[: len(s) - len(s.lstrip())]
+
+    # Determine the delta from the first non-blank pair, then verify it
+    # holds for every other non-blank pair.
+    file_adds: Optional[str] = None   # file = delta + search
+    search_adds: Optional[str] = None  # search = delta + file
+    verified_any = False
+    for f_ln, s_ln in zip(file_lines, search_lines):
+        if not f_ln.strip() or not s_ln.strip():
+            continue
+        f_ws, s_ws = _leading_ws(f_ln), _leading_ws(s_ln)
+        if file_adds is None and search_adds is None:
+            if f_ws == s_ws:
+                file_adds = ""  # no delta — nothing to re-anchor
+            elif f_ws.endswith(s_ws):
+                file_adds = f_ws[: len(f_ws) - len(s_ws)]
+            elif s_ws.endswith(f_ws):
+                search_adds = s_ws[: len(s_ws) - len(f_ws)]
+            else:
+                return replace
+        if file_adds is not None:
+            if f_ws != file_adds + s_ws:
+                return replace
+        elif search_adds is not None:
+            if s_ws != search_adds + f_ws:
+                return replace
+        verified_any = True
+    if not verified_any or (file_adds == "" or (file_adds is None and search_adds is None)):
+        return replace
+
+    ends_nl = replace.endswith("\n")
+    out_lines: list[str] = []
+    for r_ln in replace.splitlines():
+        if not r_ln.strip():
+            out_lines.append(r_ln)
+        elif file_adds is not None:
+            out_lines.append(file_adds + r_ln)
+        else:
+            assert search_adds is not None
+            out_lines.append(
+                r_ln[len(search_adds):]
+                if r_ln.startswith(search_adds) else r_ln
+            )
+    return "\n".join(out_lines) + ("\n" if ends_nl else "")
+
+
+# Whole-line elision markers the LLM uses to mean "the middle of this
+# region is unchanged". Aider-style: a search block segmented by these
+# markers matches head/tail anchors and preserves the file's middle
+# bytes verbatim; the replace block must carry the SAME number of
+# markers, in order.
+_ELISION_MARKERS = frozenset({"...", "# ...", "// ...", "/* ... */", "…"})
+
+
+def _split_on_elision(text: str) -> Optional[list[str]]:
+    """Split ``text`` into segments on whole-line elision markers.
+
+    Returns None when the text contains no marker. Segments keep their
+    trailing newlines; a marker at the very start/end produces an empty
+    boundary segment (rejected by the caller — anchors must be real)."""
+    lines = text.splitlines(keepends=True)
+    if not any(ln.strip() in _ELISION_MARKERS for ln in lines):
+        return None
+    segments: list[str] = []
+    current: list[str] = []
+    for ln in lines:
+        if ln.strip() in _ELISION_MARKERS:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(ln)
+    segments.append("".join(current))
+    return segments
+
+
+def _elided_match_replace(
+    original: str, search: str, replace: str,
+) -> Optional[str]:
+    """Aider-style elided-middle matching.
+
+    When the search block contains whole-line ``...`` markers, match each
+    non-elided segment as an ordered, UNIQUE anchor in ``original`` and
+    rebuild the region as: replace-segment + preserved-middle + … . The
+    replace block must contain exactly as many markers as the search.
+    Returns the modified file text, or None when the shape doesn't apply
+    or any anchor is missing/ambiguous (caller falls through to the
+    closest-match error)."""
+    search_segments = _split_on_elision(search)
+    if search_segments is None or len(search_segments) < 2:
+        return None
+    replace_segments = _split_on_elision(replace)
+    if replace_segments is None or len(replace_segments) != len(search_segments):
+        return None
+    if any(not seg.strip() for seg in search_segments):
+        return None  # markers must be BETWEEN real anchor lines
+
+    # Locate each anchor uniquely, in order.
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for seg in search_segments:
+        first = original.find(seg, cursor)
+        if first == -1:
+            return None
+        if original.find(seg, first + 1) != -1:
+            return None  # ambiguous anchor — refuse rather than guess
+        spans.append((first, first + len(seg)))
+        cursor = first + len(seg)
+
+    out: list[str] = [original[: spans[0][0]]]
+    for i, seg in enumerate(replace_segments):
+        out.append(seg)
+        if i < len(spans) - 1:
+            # Preserve the file's elided middle verbatim.
+            out.append(original[spans[i][1]: spans[i + 1][0]])
+    out.append(original[spans[-1][1]:])
+    return "".join(out)
 
 
 def _list_stem_siblings(missing_path: str, limit: int = 6) -> list[str]:

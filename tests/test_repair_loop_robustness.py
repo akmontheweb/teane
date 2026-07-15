@@ -686,3 +686,116 @@ def test_low_signal_counter_included_in_resume_gate_keys():
         "resume-reset must zero consecutive_low_signal_rounds so a "
         "resumed session gets a fresh escalation budget"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 2D — indent-tolerant tier re-anchors the REPLACEMENT indentation
+# ---------------------------------------------------------------------------
+
+
+def test_indent_tolerant_replace_reanchors_python_indentation(tmp_path):
+    """When the LLM's whole block is uniformly outdented (method emitted
+    at column 0 while the file has it at column 4), the strip tier
+    matches — but the replacement must land at the FILE's indentation,
+    not the LLM's, or the patch corrupts Python."""
+    target = tmp_path / "svc.py"
+    target.write_text(
+        "class Svc:\n"
+        "    def score(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    engine = TextPatcher(str(tmp_path))
+    result = asyncio.run(engine.replace_block(
+        "svc.py",
+        search="def score(self):\n    return 1\n",      # outdented by 4
+        replace="def score(self):\n    return 2\n",     # same drift
+    ))
+    assert result.success is True
+    body = target.read_text(encoding="utf-8")
+    assert "    def score(self):\n        return 2\n" in body, (
+        f"replacement landed at the wrong indentation:\n{body}"
+    )
+
+
+def test_indent_reanchor_helper_handles_strip_direction(tmp_path):
+    """Delta in the other direction: the LLM over-indented relative to
+    the file — the common prefix is removed from the replacement."""
+    from harness.patcher import _reindent_replace_for_match
+    original = "def f():\n    return 1\n"
+    search = "    def f():\n        return 1\n"      # over-indented by 4
+    replace = "    def f():\n        return 2\n"
+    fixed = _reindent_replace_for_match(original, search, replace, 0)
+    assert fixed == "def f():\n    return 2\n"
+
+
+def test_indent_reanchor_falls_back_verbatim_on_ragged_delta():
+    from harness.patcher import _reindent_replace_for_match
+    original = "  a\n      b\n"
+    search = "a\n  b\n"  # deltas differ per line (2 vs 4) — inconsistent
+    replace = "c\n"
+    assert _reindent_replace_for_match(original, search, replace, 0) == "c\n"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2E — elided-middle ("...") matching
+# ---------------------------------------------------------------------------
+
+
+def test_elided_middle_replaces_anchors_and_preserves_middle(tmp_path):
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def top():\n"
+        "    return 'old-top'\n"
+        "\n"
+        "def middle():\n"
+        "    return 'untouched'\n"
+        "\n"
+        "def bottom():\n"
+        "    return 'old-bottom'\n",
+        encoding="utf-8",
+    )
+    engine = TextPatcher(str(tmp_path))
+    result = asyncio.run(engine.replace_block(
+        "mod.py",
+        search=(
+            "def top():\n"
+            "    return 'old-top'\n"
+            "...\n"
+            "def bottom():\n"
+            "    return 'old-bottom'\n"
+        ),
+        replace=(
+            "def top():\n"
+            "    return 'new-top'\n"
+            "...\n"
+            "def bottom():\n"
+            "    return 'new-bottom'\n"
+        ),
+    ))
+    assert result.success is True
+    body = target.read_text(encoding="utf-8")
+    assert "new-top" in body and "new-bottom" in body
+    assert "return 'untouched'" in body, "elided middle must be preserved"
+    assert "old-top" not in body and "old-bottom" not in body
+
+
+def test_elided_middle_refuses_ambiguous_anchor():
+    from harness.patcher import _elided_match_replace
+    original = "x = 1\ny = 2\nx = 1\nz = 3\n"
+    # First anchor "x = 1" appears twice — must refuse, not guess.
+    assert _elided_match_replace(
+        original, "x = 1\n...\nz = 3\n", "x = 9\n...\nz = 9\n",
+    ) is None
+
+
+def test_elided_middle_requires_matching_marker_counts():
+    from harness.patcher import _elided_match_replace
+    original = "a\nb\nc\n"
+    # Search has one marker, replace has none — shape mismatch.
+    assert _elided_match_replace(original, "a\n...\nc\n", "a2\nc2\n") is None
+
+
+def test_elided_middle_ignored_when_no_marker():
+    from harness.patcher import _elided_match_replace
+    assert _elided_match_replace("a\nb\n", "a\nb\n", "a\nc\n") is None

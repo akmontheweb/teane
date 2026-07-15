@@ -178,6 +178,100 @@ class TestParserDispatch:
         assert all(d.file == "src/db/seed.ts" for d in diags)
         assert {d.error_code for d in diags} == {"TS1109", "TS1005"}
 
+class TestPythonParserWorkspaceFrames:
+    """The diagnostic must anchor on workspace code, not the library frame
+    where the exception happened to be raised (session 22471c0c: five
+    repair rounds re-edited test fixtures because "no such table" surfaced
+    only as site-packages/sqlalchemy/engine/default.py:952 — every
+    app-side frame had been discarded, so file auto-injection never
+    showed the repair LLM the files where the fix lived)."""
+
+    _SQLALCHEMY_STYLE_OUTPUT = (
+        "____________ TestCompanyLookup.test_unknown_cik ____________\n"
+        "\n"
+        "tests/api/test_financials.py:95: \n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "server/app/api/companies.py:41: in get_company\n"
+        "    company = repo.find_by_cik(cik)\n"
+        "server/app/repositories/company_repository.py:52: in find_by_cik\n"
+        "    return self.db.query(Company).filter(Company.cik == cik).first()\n"
+        "/tmp/teane-venv/lib/python3.11/site-packages/sqlalchemy/orm/query.py:2728: in first\n"
+        "    return self.limit(1)._iter().first()\n"
+        "/tmp/teane-venv/lib/python3.11/site-packages/sqlalchemy/engine/default.py:952: in do_execute\n"
+        "    cursor.execute(statement, parameters)\n"
+        "E   sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: companies\n"
+        "/tmp/teane-venv/lib/python3.11/site-packages/sqlalchemy/engine/default.py:952: OperationalError\n"
+    )
+
+    def test_library_terminal_reanchors_on_workspace_frame(self):
+        diags = PythonParser.parse_diagnostics(self._SQLALCHEMY_STYLE_OUTPUT)
+        hits = [d for d in diags if "no such table" in d.message]
+        assert hits, (
+            f"expected a 'no such table' diagnostic, got "
+            f"{[(d.file, d.line, d.message) for d in diags]}"
+        )
+        d = hits[0]
+        # The anchor must be the innermost WORKSPACE frame — this drives
+        # file auto-injection into the repair prompt and the judge's
+        # grounding vocabulary.
+        assert d.file == "server/app/repositories/company_repository.py", (
+            f"diagnostic anchored on {d.file!r}; a site-packages anchor "
+            f"is unpatchable and hides the app-side call chain"
+        )
+        assert d.line == 52
+
+    def test_library_location_preserved_in_context(self):
+        diags = PythonParser.parse_diagnostics(self._SQLALCHEMY_STYLE_OUTPUT)
+        d = [x for x in diags if "no such table" in x.message][0]
+        assert "raised in library frame:" in d.semantic_context
+        assert "sqlalchemy/engine/default.py:952" in d.semantic_context
+
+    def test_workspace_call_chain_rendered_in_context(self):
+        diags = PythonParser.parse_diagnostics(self._SQLALCHEMY_STYLE_OUTPUT)
+        d = [x for x in diags if "no such table" in x.message][0]
+        assert "workspace call chain" in d.semantic_context
+        assert "server/app/api/companies.py:41 in get_company" in (
+            d.semantic_context
+        )
+        assert (
+            "server/app/repositories/company_repository.py:52 in find_by_cik"
+            in d.semantic_context
+        )
+
+    def test_workspace_terminal_keeps_its_anchor(self):
+        # A plain assert failure whose terminal line already points at
+        # workspace code must be untouched by the re-anchoring.
+        output = (
+            "____________ test_revenue ____________\n"
+            "    def test_revenue():\n"
+            ">       assert data == [1000.0]\n"
+            "E       assert [] == [1000.0]\n"
+            "\n"
+            "tests/api/test_financials.py:95: AssertionError\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        precise = [d for d in diags if d.line == 95]
+        assert precise
+        d = precise[0]
+        assert d.file == "tests/api/test_financials.py"
+        assert "raised in library frame" not in (d.semantic_context or "")
+
+    def test_no_chain_section_for_single_frame(self):
+        # One workspace frame is the diagnostic's own location — a
+        # one-entry "call chain" would be noise.
+        output = (
+            "____________ test_single ____________\n"
+            "tests/test_single.py:10: in test_single\n"
+            "    do_thing()\n"
+            "E   ValueError: boom\n"
+            "tests/test_single.py:10: ValueError\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        hits = [d for d in diags if d.error_code == "ValueError"]
+        assert hits
+        assert "workspace call chain" not in (hits[0].semantic_context or "")
+
+
 class TestPythonParserAssertionBody:
     """Verify pytest plain-`assert` failures keep their message body so the
     repair LLM sees what the test actually expected (session 2d0164f0).

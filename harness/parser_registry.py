@@ -340,6 +340,21 @@ class PythonParser(BaseLanguageParser):
         # diagnostic prompt.
         pending_teane: list[str] = []
         _MAX_TEANE_LINES = 60
+        # Workspace-owned frames seen in the current stanza, outermost →
+        # innermost. When the error is raised inside a library (the
+        # sqlalchemy/starlette case), the terminal fail-line and
+        # ``last_frame`` both point at a venv path — actionless for the
+        # repair LLM and outside the patch allowlist. The frames that
+        # matter (the app-side call chain: api → repository → session
+        # wiring) were walked right past. We keep them so (1) the emitted
+        # diagnostic can be re-anchored on the innermost user frame and
+        # (2) the full chain lands in semantic_context as breadcrumbs.
+        # Session 22471c0c: five repair rounds re-edited test fixtures
+        # because "no such table: companies" surfaced ONLY as
+        # site-packages/sqlalchemy/engine/default.py:952 with starlette
+        # middleware locals — every app frame had been discarded.
+        stanza_user_frames: list[tuple[str, int, str]] = []
+        _MAX_USER_FRAMES = 10
         # The Layer 2 plugin emits ``[teane] ...`` lines (runtime object
         # detail) and the Layer 3b debug mode emits ``[teane-debug] ...``
         # lines (pre-call fixture snapshot, unhandled asyncio task
@@ -374,10 +389,23 @@ class PythonParser(BaseLanguageParser):
             src: Optional[str],
             locals_map: dict[str, str],
             teane_lines: list[str],
+            user_frames: Optional[list[tuple[str, int, str]]] = None,
         ) -> str:
             parts: list[str] = []
             if src:
                 parts.append(f"failing source: {src}")
+            if user_frames and len(user_frames) > 1:
+                # Render the workspace call chain so the repair LLM can
+                # follow the failure into the app-side files instead of
+                # fixating on the single file:line the diagnostic anchors
+                # on. Only worth showing with ≥2 frames — a single frame
+                # is already the diagnostic's own location.
+                chain = "\n  ".join(
+                    f"{f}:{ln} in {fn}" for f, ln, fn in user_frames
+                )
+                parts.append(
+                    f"workspace call chain (outermost → innermost):\n  {chain}"
+                )
             if bare_lines:
                 joined = "\n  ".join(bare_lines)
                 parts.append(f"assertion-rewrite:\n  {joined}")
@@ -419,7 +447,16 @@ class PythonParser(BaseLanguageParser):
                 m = PythonParser._E_BARE_FILE_LINE_PATTERN.match(body.strip())
                 if m and PythonParser._is_user_frame(m.group("file")):
                     recovered = (m.group("file"), int(m.group("line")))
-            return recovered if recovered is not None else frame
+            if recovered is not None:
+                return recovered
+            # Last resort before giving up: the innermost workspace frame
+            # walked earlier in this stanza. Beats anchoring the diagnostic
+            # on a site-packages path the LLM can neither read usefully nor
+            # patch.
+            if stanza_user_frames:
+                f, ln, _fn = stanza_user_frames[-1]
+                return (f, ln)
+            return frame
 
         for line in lines:
             stripped = line.rstrip()
@@ -437,6 +474,7 @@ class PythonParser(BaseLanguageParser):
                 pending_e_bare = []
                 pending_failing_src = None
                 last_frame = None
+                stanza_user_frames = []
                 conftest_path = None
                 last_emitted = None
                 continue
@@ -455,6 +493,17 @@ class PythonParser(BaseLanguageParser):
             frame = PythonParser._PYTEST_FRAME_PATTERN.match(bare)
             if frame:
                 last_frame = (frame.group("file"), int(frame.group("line")))
+                if PythonParser._is_user_frame(last_frame[0]):
+                    entry = (
+                        last_frame[0], last_frame[1],
+                        frame.group("func").strip(),
+                    )
+                    if (
+                        len(stanza_user_frames) < _MAX_USER_FRAMES
+                        and (not stanza_user_frames
+                             or stanza_user_frames[-1] != entry)
+                    ):
+                        stanza_user_frames.append(entry)
                 continue
 
             # Terminal "file:line: ErrorType" (no message, no E-line follow-up)
@@ -473,11 +522,26 @@ class PythonParser(BaseLanguageParser):
                     # judge/repair prompts don't show a bare exception type.
                     msg = f"{term_type}: {pending_e_bare[0]}"
                 ctx = _fmt_context(
-                    pending_e_bare, pending_failing_src, pending_locals, pending_teane,
+                    pending_e_bare, pending_failing_src, pending_locals,
+                    pending_teane, stanza_user_frames,
                 )
+                # Re-anchor on the innermost workspace frame when the
+                # terminal line points into a library. The venv path is
+                # where the exception was *raised*; the workspace frame is
+                # where the fix lives — and it's what drives downstream
+                # file auto-injection into the repair prompt. The original
+                # library location is preserved in semantic_context.
+                term_file, term_line = term.group("file"), int(term.group("line"))
+                if (
+                    not PythonParser._is_user_frame(term_file)
+                    and stanza_user_frames
+                ):
+                    lib_note = f"raised in library frame: {term_file}:{term_line}"
+                    ctx = f"{ctx}\n{lib_note}" if ctx else lib_note
+                    term_file, term_line, _fn = stanza_user_frames[-1]
                 diag = DiagnosticObject(
-                    file=term.group("file"),
-                    line=int(term.group("line")),
+                    file=term_file,
+                    line=term_line,
                     column=0,
                     severity="error",
                     error_code=term_type,
@@ -487,6 +551,7 @@ class PythonParser(BaseLanguageParser):
                 diags.append(diag)
                 last_emitted = diag
                 last_frame = None
+                stanza_user_frames = []
                 pending_e = None
                 pending_e_bare = []
                 pending_failing_src = None
@@ -509,8 +574,22 @@ class PythonParser(BaseLanguageParser):
                     # No frame yet — wait for the terminal fail line to pair us.
                     continue
                 ctx = _fmt_context(
-                    pending_e_bare, pending_failing_src, pending_locals, pending_teane,
+                    pending_e_bare, pending_failing_src, pending_locals,
+                    pending_teane, stanza_user_frames,
                 )
+                # Same raised-at preservation as the terminal branch: when
+                # the walked frame was a library path and we re-anchored on
+                # a workspace frame, keep the library location visible.
+                if (
+                    last_frame is not None
+                    and not PythonParser._is_user_frame(last_frame[0])
+                    and (file_path, lineno) != last_frame
+                ):
+                    lib_note = (
+                        f"raised in library frame: "
+                        f"{last_frame[0]}:{last_frame[1]}"
+                    )
+                    ctx = f"{ctx}\n{lib_note}" if ctx else lib_note
                 diag = DiagnosticObject(
                     file=file_path,
                     line=lineno,
@@ -523,6 +602,7 @@ class PythonParser(BaseLanguageParser):
                 diags.append(diag)
                 last_emitted = diag
                 last_frame = None
+                stanza_user_frames = []
                 conftest_path = None
                 pending_e = None
                 pending_e_bare = []

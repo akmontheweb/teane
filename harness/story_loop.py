@@ -1059,53 +1059,17 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         committed_sha or "—", len(batch_files),
     )
 
-    # v5 test_verifies_ac sweep (2026-07-04) — walk the workspace,
-    # parse ``@verifies:`` markers from every generated test file, and
-    # persist ``(test_path, ac_id)`` edges into ``test_verifies_ac``.
-    # ``test_generation_node`` only writes links inside its own single
-    # invocation when the sandbox run passes ON THAT CALL; in practice
-    # tests fail their initial marker gate or their initial run and
-    # repair fixes them via ``compiler_node``, which never routes back
-    # to ``test_generation_node``. Ciod session 523e86a7 sealed 5
-    # batches with passing tests but ``test_verifies_ac`` stayed empty
-    # for every AC. Sweeping at batch-seal time closes that gap —
-    # idempotent, best-effort, never fails the seal.
-    try:
-        # 2026-07-11 fix — before the sweep, retroactively prepend
-        # ``@verifies:`` markers to test files whose bodies reference a
-        # story informally (e.g. ``# STORY-002: Filing Index...``) but
-        # forgot the exact marker syntax. ``patching_node`` emits many
-        # such test files as part of story scope; they bypass
-        # ``test_generation_node``'s marker gate entirely, so without
-        # this the sweep sees no markers and every AC on those stories
-        # is reported as untested by the audit. Finsearch session
-        # 1d4e49b0: 20/26 untested ACs were on tests with story
-        # mentions in comments but no ``@verifies:`` line.
-        from harness.test_generation import (
-            autofix_markers_by_body_reference,
-            sweep_verifies_links,
-        )
-        af_scanned, af_patched = autofix_markers_by_body_reference(
-            workspace_path,
-        )
-        if af_patched:
-            logger.info(
-                "[batch_commit] @verifies marker autofix by body "
-                "reference: scanned=%d, patched=%d.",
-                af_scanned, af_patched,
-            )
-        scanned, inserted, dropped = sweep_verifies_links(workspace_path)
-        if inserted or dropped:
-            logger.info(
-                "[batch_commit] test_verifies_ac sweep: scanned=%d, "
-                "inserted=%d, dropped=%d (unknown ac_keys).",
-                scanned, inserted, dropped,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[batch_commit] test_verifies_ac sweep raised (%s) — "
-            "continuing seal without link persistence.", exc,
-        )
+    # NOTE (unit-test model): the batch seal used to run a
+    # ``test_verifies_ac`` sweep here — parsing ``@verifies:`` markers
+    # out of test files and even retroactively PREPENDING markers to
+    # tests whose bodies mentioned a story informally. Both are gone
+    # on purpose: unit tests generated during build / patch are linked
+    # to the CODE under test (the ``@tests:`` marker), never to stories
+    # or acceptance criteria. AC edges are written exclusively by the
+    # ``teane test`` functional pack (harness/playwright_gen.py), and
+    # the traceability AC gate only fires in that flow
+    # (traceability.has_ac_gap). Session 22471c0c's seal inserted 18
+    # bogus test→AC edges from unit tests this way.
     return {
         "current_batch_id": 0,
         "current_story_id": "",
@@ -1179,23 +1143,12 @@ def traceability_node(state: dict[str, Any]) -> dict[str, Any]:
         from harness.arch_summary import load_arch_summary
         arch_summary_dict = load_arch_summary(workspace_path) or {}
 
-    # NFR AC backfill (2026-07-11): before regenerating the matrix
-    # views or running the audit, sweep for NFR stories whose ACs have
-    # no ``test_verifies_ac`` link and emit ``@pytest.mark.skip`` stubs
-    # for them. The in-node ``test_generation`` NFR guard only fires
-    # when a fresh NFR batch runs; sessions whose NFR batches sealed
-    # before the guard existed (or where the batch topology skipped
-    # test_generation entirely) leave their AC edges empty and the
-    # end-of-session audit blocks. Idempotent — safe to call on every
-    # batch. See test_generation.backfill_untested_nfr_acs for the
-    # policy details.
-    try:
-        from harness.test_generation import backfill_untested_nfr_acs
-        backfill_untested_nfr_acs(workspace_path)
-    except Exception as exc:  # noqa: BLE001 — never block audit on this
-        logger.debug(
-            "[traceability] NFR backfill sweep failed (non-fatal): %s", exc,
-        )
+    # NOTE (unit-test model): the NFR AC skip-stub backfill that ran
+    # here is gone. Build / patch unit tests never carry AC linkage,
+    # and the AC-coverage gate only fires during ``teane test``
+    # (traceability.has_ac_gap), so there is no audit block to appease
+    # with placeholder stubs. NFR verification is owned by the
+    # ``teane test`` functional pack.
 
     conn = story_state.open_story_db()
     try:

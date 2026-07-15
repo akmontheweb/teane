@@ -685,6 +685,18 @@ _AC_KEY_RE = re.compile(r"^STORY-(?:NFR-)?\d+\.AC-\d+$")
 # any reasonable preamble depth (docstring + imports + a class header).
 _VERIFIES_SCAN_LINES = 50
 
+# Unit-test → code linkage marker. Build/patch test generation produces
+# PURE UNIT TESTS of the generated functions and classes — linked to the
+# source files under test, never to stories or acceptance criteria. AC
+# linkage (``@verifies``) belongs exclusively to the functional pack that
+# ``teane test`` generates (harness/playwright_gen.py); the parsers above
+# stay for that flow. Same permissive comment-lead shape as
+# ``_VERIFIES_RE``; captures the comma-separated source-path list.
+_TESTS_MARKER_RE = re.compile(
+    r"^\s*(?:#|//)\s*@tests:\s*(?P<paths>.+?)\s*$",
+    re.MULTILINE,
+)
+
 
 # Map primary stack → the language-appropriate comment lead for the
 # ``@verifies: STORY-N.AC-N`` marker. Autofix uses this when it needs to
@@ -758,6 +770,101 @@ def _prepend_verifies_marker(abs_path: str, marker_line: str) -> bool:
         )
         return False
     return True
+
+
+def _parse_tests_marker(body: str) -> list[str]:
+    """Return the source-path list from the first ``@tests:`` marker in
+    ``body``'s first :data:`_VERIFIES_SCAN_LINES` lines.
+
+    Returns ``[]`` when no marker is found in the scan window or the
+    path list is empty. Paths are stripped but otherwise taken as-is —
+    existence is the autofix/gate caller's concern, not the parser's.
+    """
+    if not body:
+        return []
+    lines = body.splitlines()
+    head = "\n".join(lines[: _VERIFIES_SCAN_LINES])
+    match = _TESTS_MARKER_RE.search(head)
+    if not match:
+        return []
+    raw = match.group("paths") or ""
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def _tests_marker_line_for(
+    primary_stack: str, source_paths: list[str],
+) -> Optional[str]:
+    """Render the ``# @tests: path/a.py, path/b.py`` line for
+    ``primary_stack``, or ``None`` when no paths are supplied."""
+    paths = [p for p in source_paths if isinstance(p, str) and p.strip()]
+    if not paths:
+        return None
+    lead = _MARKER_COMMENT_LEAD_BY_STACK.get(primary_stack, "#")
+    return f"{lead} @tests: {', '.join(paths)}"
+
+
+def _prepend_tests_marker(abs_path: str, marker_line: str) -> bool:
+    """``_prepend_verifies_marker`` for the ``@tests:`` code-linkage
+    marker. Idempotent; returns True on success or already-present."""
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as exc:
+        logger.warning(
+            "[test_generation_node] @tests autofix could not read %r: %s",
+            abs_path, exc,
+        )
+        return False
+    if _parse_tests_marker(body):
+        return True
+    lines = body.splitlines(keepends=True)
+    insert_at = 0
+    if lines:
+        first = lines[0].lstrip()
+        if first.startswith("#!"):
+            insert_at = 1
+        elif first.startswith("#") and "coding" in first:
+            insert_at = 1
+    lines.insert(insert_at, marker_line + "\n")
+    try:
+        with open(abs_path, "w", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+    except OSError as exc:
+        logger.warning(
+            "[test_generation_node] @tests autofix could not write %r: %s",
+            abs_path, exc,
+        )
+        return False
+    return True
+
+
+def _guess_sources_for_test(
+    rel_test: str, source_files: list[str], cap: int = 3,
+) -> list[str]:
+    """Best-effort mapping of a generated test file to the source files
+    it exercises, for the deterministic ``@tests`` autofix.
+
+    Prefers a basename match (``test_billing.py`` / ``billing.test.ts``
+    → ``.../billing.py`` / ``.../billing.ts``); falls back to the first
+    ``cap`` files of the generation call's source list — the test was
+    generated FROM those files, so they're the honest default.
+    """
+    stem = os.path.splitext(os.path.basename(rel_test))[0]
+    for prefix in ("test_", "tests_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    for suffix in ("_test", ".test", ".spec", "_spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    matches = [
+        s for s in source_files
+        if os.path.splitext(os.path.basename(s))[0] == stem
+    ]
+    if matches:
+        return matches[:cap]
+    return list(source_files[:cap])
 
 
 def _fetch_ac_keys_for_current_story(
@@ -1162,9 +1269,8 @@ def _parse_verifies_marker(body: str) -> list[str]:
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
-# Base rules (1-4) — always emitted. RULE 5 (the @verifies marker
-# contract) is appended only in agile mode where acceptance_criteria
-# rows exist for the LLM to cite; see _build_format_reminder below.
+# Base rules (1-4) — always emitted. RULE 5 (the @tests code-linkage
+# marker) is likewise always emitted; see _build_format_reminder below.
 _PROMPT_FORMAT_REMINDER_BASE = """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. No prose, no markdown
 code fences, no commentary. Your entire response must be parseable as patch
@@ -1226,43 +1332,38 @@ RULES — absolute:
      services.
   4. Match the stack-canonical layout and naming convention."""
 
-_VERIFIES_RULE = """  5. EVERY generated test file MUST carry a `@verifies` marker at the top
+_TESTS_MARKER_RULE = """  5. EVERY generated test file MUST carry a `@tests` marker at the top
      of the file (after the module docstring / imports, within the first
-     50 non-blank lines) naming the acceptance criteria the file's tests
-     verify. Use the language-appropriate comment style:
-       - Python:    # @verifies: STORY-003.AC-2
-       - JS / TS:   // @verifies: STORY-003.AC-2
-       - Java:      // @verifies: STORY-003.AC-2
-     Comma-separate multiple ACs (e.g. `# @verifies: STORY-003.AC-1, STORY-003.AC-2`).
-     Use the AC keys exactly as they appear in the story preamble's
-     "Acceptance criteria" block. A file with no marker — or a marker
-     that uses an AC key absent from the preamble — is rejected and
-     the test-gen pass is routed back to repair."""
+     50 non-blank lines) naming the workspace-relative source file(s)
+     whose functions / classes the file's tests exercise. Use the
+     language-appropriate comment style:
+       - Python:    # @tests: server/app/services/billing.py
+       - JS / TS:   // @tests: client/src/utils/formatters.ts
+       - Java:      // @tests: src/main/java/com/acme/Billing.java
+     Comma-separate multiple source files. Unit tests are linked to the
+     CODE under test — do NOT reference stories or acceptance criteria
+     (STORY-N / AC-N / @verifies) anywhere in a test file; requirement-
+     level functional coverage is generated separately by `teane test`."""
 
 _REMINDER_TAIL = "\n\nGenerate test patches NOW. Only the blocks above. No other text."
 
 
-def _build_format_reminder(agile: bool) -> str:
-    """Return the test-gen format reminder, conditionally including the
-    v5 ``@verifies`` marker rule (RULE 5) when ``agile=True``.
+def _build_format_reminder(agile: bool = True) -> str:
+    """Return the test-gen format reminder.
 
-    Non-agile (monolithic) runs have no ``acceptance_criteria`` rows in
-    state.db for the LLM to cite, so RULE 5 would be a contract the
-    workspace cannot satisfy — the LLM would fabricate keys to pass
-    syntactic validation and the link writer would drop every one with
-    a noisy warning. Skipping the rule in non-agile keeps the prompt
-    honest and avoids the spurious churn (Phase 6 of the schema-v5
-    plan).
+    RULE 5 is the ``@tests`` code-linkage marker and is emitted
+    unconditionally — linking a unit test to the source file it
+    exercises needs no story/AC rows, so the old agile/non-agile split
+    (which gated the retired ``@verifies`` AC contract) no longer
+    changes the output. The parameter is kept for caller compatibility.
     """
-    if agile:
-        return f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_VERIFIES_RULE}{_REMINDER_TAIL}"
-    return f"{_PROMPT_FORMAT_REMINDER_BASE}{_REMINDER_TAIL}"
+    del agile  # retained for signature compatibility; no longer used
+    return f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_TESTS_MARKER_RULE}{_REMINDER_TAIL}"
 
 
 # Backward-compat alias for any out-of-tree caller / test that imports
-# the legacy constant. Returns the agile-mode reminder (matches the
-# pre-Phase-6 string verbatim).
-_PROMPT_FORMAT_REMINDER = _build_format_reminder(agile=True)
+# the legacy constant.
+_PROMPT_FORMAT_REMINDER = _build_format_reminder()
 
 
 def _build_test_gen_prompt(
@@ -1276,8 +1377,9 @@ def _build_test_gen_prompt(
     """Build the user-prompt body listing modified source files and asking
     for tests.
 
-    ``agile`` toggles whether the @verifies marker contract (RULE 5) is
-    included — see :func:`_build_format_reminder`.
+    ``agile`` is retained for signature compatibility only — RULE 5 is
+    now the flow-independent ``@tests`` code-linkage marker; see
+    :func:`_build_format_reminder`.
     """
     lines: list[str] = [
         f"Generate unit tests for the following source files (stack: {primary_stack}).",
@@ -1343,26 +1445,23 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
 
     workspace_path: str = state.get("workspace_path", os.getcwd())
 
-    # NFR-only-batch guardrail (2026-07-10, refined 2026-07-11): when
-    # EVERY story in this batch's scope is a SAFe enabler / NFR story,
-    # emit deterministic ``@pytest.mark.skip`` stub tests carrying the
-    # ``# @verifies:`` markers for each AC. NFRs (rate limits, latency
-    # budgets, security posture, retention policies) aren't naturally
-    # unit-testable — the LLM reliably refuses to emit tests for pure
-    # NFR scope, burns its zero-emit re-prompt sub-cap, and trips a HITL
-    # the operator can't productively resolve.
+    # NFR-only-batch guardrail (2026-07-10): when EVERY story in this
+    # batch's scope is a SAFe enabler / NFR story, skip test generation
+    # cleanly. NFRs (rate limits, latency budgets, security posture,
+    # retention policies) aren't naturally unit-testable — the LLM
+    # reliably refuses to emit tests for pure NFR scope, burns its
+    # zero-emit re-prompt sub-cap, and trips a HITL the operator can't
+    # productively resolve.
     #
-    # First iteration of this guardrail (2026-07-10) SKIPPED test-gen
-    # entirely and returned early. That prevented the zero-emit HITL but
-    # the downstream traceability audit correctly flagged every NFR AC
-    # as untested and terminated the run with ``traceability_block`` on
-    # the finsearch resume at 14:09. Emitting skip-stubs closes the
-    # traceability contract while making the "human still owes an
-    # integration test" story explicit in the workspace.
+    # An intermediate iteration of this guardrail emitted @verifies
+    # skip-stubs here to appease the traceability audit's AC gate. Both
+    # halves of that are gone: build/patch unit tests link to CODE (the
+    # @tests marker), never to ACs, and the AC-coverage gate only fires
+    # during ``teane test`` (see traceability.has_ac_gap), whose
+    # functional pack owns NFR verification.
     #
     # Mixed batches (NFR alongside a regular story) still run the LLM
-    # path — the regular story anchors tests and NFR ACs ride along as
-    # ``@verifies:`` citations.
+    # path — the regular story's source files anchor the unit tests.
     from harness.req_ids import STORY_NFR_ID_RE
     _batch_story_keys: list[str] = []
     _cur_story = str(state.get("current_story_id") or "")
@@ -1375,78 +1474,19 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     if _batch_story_keys and all(
         STORY_NFR_ID_RE.fullmatch(k) for k in _batch_story_keys
     ):
-        # Detect stack for the stub template. Falls back to a
-        # log-and-skip if no supported stack is detected — same shape
-        # as the previous guardrail so mixed monorepos without a
-        # detectable primary stack don't wedge on this branch.
-        from harness.impact import _detect_workspace_stack
-        _nfr_tags = _detect_workspace_stack(workspace_path) or set()
-        _nfr_primary = _pick_primary_stack(_nfr_tags)
-        if _nfr_primary not in ("python", "typescript"):
-            logger.info(
-                "[test_generation_node] Batch scope is entirely NFR "
-                "story/stories (%s) but no supported stack detected "
-                "(primary=%r). Skipping cleanly — operator must add "
-                "integration coverage manually.",
-                ", ".join(_batch_story_keys), _nfr_primary,
-            )
-            return {
-                "node_state": {
-                    "current_node": "test_generation",
-                    "test_generation": {
-                        "status": "skipped",
-                        "reason": "nfr_only_batch_unsupported_stack",
-                        "story_keys": _batch_story_keys,
-                    },
-                },
-            }
-        stub_paths, stub_markers = _emit_nfr_stubs(
-            workspace_path, _batch_story_keys, _nfr_primary,
-        )
-        if not stub_paths:
-            # Nothing landed — fall back to the pure-skip behaviour so
-            # the batch isn't wedged. Traceability will flag the ACs;
-            # that's the correct signal since we couldn't stub them.
-            logger.info(
-                "[test_generation_node] Batch scope is entirely NFR "
-                "story/stories (%s) but no stubs could be written "
-                "(missing story rows / no ACs / IO error). Skipping — "
-                "operator must add integration coverage manually.",
-                ", ".join(_batch_story_keys),
-            )
-            return {
-                "node_state": {
-                    "current_node": "test_generation",
-                    "test_generation": {
-                        "status": "skipped",
-                        "reason": "nfr_only_batch_no_stubs",
-                        "story_keys": _batch_story_keys,
-                    },
-                },
-            }
-        links_inserted, links_dropped = _persist_verifies_links(
-            workspace_path, stub_markers,
-        )
-        total_markers = sum(len(v) for v in stub_markers.values())
         logger.info(
-            "[test_generation_node] NFR-only batch (%s): wrote %d stub "
-            "file(s) covering %d AC marker(s) — %d verifies-link(s) "
-            "inserted, %d dropped as unknown.",
-            ", ".join(_batch_story_keys), len(stub_paths),
-            total_markers, links_inserted, links_dropped,
+            "[test_generation_node] Batch scope is entirely NFR "
+            "story/stories (%s). Skipping unit-test generation — NFR "
+            "verification is owned by the `teane test` functional pack.",
+            ", ".join(_batch_story_keys),
         )
         return {
-            "modified_files": list(state.get("modified_files", [])) + stub_paths,
-            "generated_tests": list(state.get("generated_tests", [])) + stub_paths,
             "node_state": {
                 "current_node": "test_generation",
                 "test_generation": {
-                    "status": "nfr_stubbed",
-                    "primary_stack": _nfr_primary,
-                    "tests_generated": len(stub_paths),
+                    "status": "skipped",
+                    "reason": "nfr_only_batch",
                     "story_keys": _batch_story_keys,
-                    "verifies_links_inserted": links_inserted,
-                    "verifies_links_dropped": links_dropped,
                 },
             },
         }
@@ -1658,22 +1698,14 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "content": "## Test-generation guidance\n\n" + guides_body,
         })
 
-    # v5 Phase 6: agile mode gates the @verifies marker contract. When
-    # decomposition_enabled is False (monolithic build/patch), there
-    # are no acceptance_criteria rows for the LLM to cite — RULE 5
-    # would be a contract the workspace can't satisfy and the marker
-    # gate below is skipped entirely.
-    agile = bool(state.get("decomposition_enabled"))
-
     user_prompt = _build_test_gen_prompt(
-        workspace_path, source_files, primary, agile=agile,
+        workspace_path, source_files, primary,
     )
     # Change-request mode: prepend the CR-N attribution rules so generated
     # tests follow the `test_cr_N_*` naming convention and reference the
     # CR in their docstrings. No-op (empty string) outside CR mode.
     from harness.graph import (
         _build_arch_summary_preamble,
-        _build_batch_scope_preamble,
         _build_change_request_preamble,
         _build_story_preamble,
     )
@@ -1689,24 +1721,17 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     arch_preamble, _resolved_arch = _build_arch_summary_preamble(
         cast("AgentState", state), consumer="test_generator",
     )
-    # v5 Phase 6b: inject the per-story preamble so the test-gen LLM
-    # actually sees the AC keys it's expected to cite in @verifies
-    # markers. Empty string in non-agile / no-current-story — no-op
-    # there. patching_node already injects this preamble for code-
-    # gen; mirroring it here makes RULE 5's "use AC keys from the
-    # story preamble" instruction verifiable (Phase 3 oversight).
-    #
-    # Phase 7 BUG #2 fix: in the per-batch verification phase,
-    # ``current_story_id`` is empty (story_loop cleared it before
-    # routing to verification), so _build_story_preamble returns
-    # "". Fall through to _build_batch_scope_preamble which lists
-    # every story patched this batch and its AC keys — the LLM
-    # needs at least one set of valid keys to satisfy RULE 5.
+    # Story preamble as CONTEXT only — it tells the test-gen LLM what
+    # the code under test is supposed to do. The "tests" phase wording
+    # in _build_story_preamble instructs the LLM to link tests to the
+    # code under test and NOT to reference story/AC ids in test files;
+    # unit tests generated here are code-linked (RULE 5's @tests
+    # marker), never AC-linked. Empty in monolithic / no-current-story
+    # runs, which is fine — the source files in the prompt body are
+    # the primary material either way.
     story_preamble = _build_story_preamble(
         cast("AgentState", state), "tests",
     )
-    if not story_preamble and agile:
-        story_preamble = _build_batch_scope_preamble(cast("AgentState", state))
 
     # Fix 5a: preflight the current on-disk bodies of every existing test
     # file the LLM might edit. Without this, REPLACE_BLOCK anchors on
@@ -1923,96 +1948,76 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         ),
     })
 
-    # --- v5 @verifies marker gate (agile mode only) ---
-    # Every generated test file MUST carry a `# @verifies: STORY-N.AC-N`
-    # marker (Phase 3 contract). Files that don't are short-circuited
-    # into the existing repair pipeline via a TEST_FAILURE diagnostic
-    # — the LLM's next iteration sees the diagnostic and adds the
-    # marker. We parse markers here (in-memory, no DB) so the gate
-    # fires before the sandbox run; the actual ``test_verifies_ac``
-    # write happens AFTER the sandbox passes (a failing test that
-    # claims to verify an AC shouldn't carry the link).
-    #
-    # Skipped when ``agile=False`` (Phase 6): non-agile runs have no
-    # acceptance_criteria rows to cite, so the gate would only force
-    # the LLM to fabricate fake keys to satisfy syntactic validation.
-    marker_keys_by_file: dict[str, list[str]] = {}
+    # --- @tests code-linkage marker gate ---
+    # Every generated test file MUST carry a `# @tests: <source path>`
+    # marker naming the file(s) under test. Unit tests generated during
+    # build / patch link to CODE, never to stories or acceptance
+    # criteria — AC linkage (`@verifies`) belongs to the functional pack
+    # `teane test` generates. The marker is deterministic to autofix:
+    # the source files this generation call was asked to cover are on
+    # hand, so a missing marker almost never spends an LLM turn.
+    marker_sources_by_file: dict[str, list[str]] = {}
     marker_missing: list[str] = []
-    if agile:
-        for rel in generated_tests:
-            abs_path = os.path.join(workspace_path, rel)
-            try:
-                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            except OSError as exc:
-                logger.warning(
-                    "[test_generation_node] Could not re-read generated test %r "
-                    "for marker parse: %s — treating as marker-missing.",
-                    rel, exc,
-                )
-                marker_missing.append(rel)
-                continue
-            keys = _parse_verifies_marker(body)
-            if not keys:
-                marker_missing.append(rel)
-            else:
-                marker_keys_by_file[rel] = keys
+    for rel in generated_tests:
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError as exc:
+            logger.warning(
+                "[test_generation_node] Could not re-read generated test %r "
+                "for marker parse: %s — treating as marker-missing.",
+                rel, exc,
+            )
+            marker_missing.append(rel)
+            continue
+        paths = _parse_tests_marker(body)
+        if not paths:
+            marker_missing.append(rel)
+        else:
+            marker_sources_by_file[rel] = paths
 
     if marker_missing:
-        # Fix 3: autofix the marker deterministically when we can. The
-        # AC keys are already known from state.db (they're what the
-        # story_preamble renders); prepending a well-formed marker line
-        # is not something worth spending an LLM turn on. Only files
-        # we CAN'T autofix (no current story, malformed AC keys, IO
-        # error) route to LLM repair.
-        current_story_id = str(state.get("current_story_id") or "")
-        ac_keys = _fetch_ac_keys_for_current_story(
-            workspace_path, current_story_id,
-        )
-        marker_line = _marker_line_for(primary, ac_keys)
         autofixed: list[str] = []
         unfixable: list[str] = []
-        if marker_line:
-            for rel in marker_missing:
-                abs_path = os.path.join(workspace_path, rel)
-                if _prepend_verifies_marker(abs_path, marker_line):
-                    autofixed.append(rel)
-                    marker_keys_by_file[rel] = list(ac_keys)
-                else:
-                    unfixable.append(rel)
-        else:
-            unfixable = list(marker_missing)
+        for rel in marker_missing:
+            guessed = _guess_sources_for_test(rel, source_files)
+            marker_line = _tests_marker_line_for(primary, guessed)
+            abs_path = os.path.join(workspace_path, rel)
+            if marker_line and _prepend_tests_marker(abs_path, marker_line):
+                autofixed.append(rel)
+                marker_sources_by_file[rel] = guessed
+            else:
+                unfixable.append(rel)
 
         if autofixed:
             logger.info(
-                "[test_generation_node] Autofix prepended @verifies marker "
-                "on %d file(s) without spending an iteration "
-                "(story=%s, keys=%s): %s",
-                len(autofixed), current_story_id or "?",
-                ", ".join(ac_keys) if ac_keys else "?",
-                ", ".join(autofixed),
+                "[test_generation_node] Autofix prepended @tests marker "
+                "on %d file(s) without spending an iteration: %s",
+                len(autofixed), ", ".join(autofixed),
             )
         if unfixable:
             diags = [
                 _synth_diag(
                     file=rel,
                     message=(
-                        f"Generated test {rel!r} is missing a `@verifies:` marker. "
-                        "Every generated test file MUST declare which acceptance "
-                        "criteria it verifies, using a comment at the top of the "
-                        "file (within the first 50 lines): "
-                        "`# @verifies: STORY-N.AC-N` (Python) or "
-                        "`// @verifies: STORY-N.AC-N` (JS/TS/Java). Comma-separate "
-                        "multiple ACs. Use AC keys exactly as they appear in the "
-                        "story preamble's `### Acceptance criteria` block."
+                        f"Generated test {rel!r} is missing a `@tests:` marker. "
+                        "Every generated test file MUST declare which source "
+                        "file(s) it exercises, using a comment at the top of "
+                        "the file (within the first 50 lines): "
+                        "`# @tests: path/to/module.py` (Python) or "
+                        "`// @tests: path/to/module.ts` (JS/TS/Java). "
+                        "Comma-separate multiple source files. Do NOT "
+                        "reference stories or acceptance criteria in test "
+                        "files."
                     ),
-                    error_code="TEST_FAILURE:missing_verifies_marker",
+                    error_code="TEST_FAILURE:missing_tests_marker",
                 )
                 for rel in unfixable
             ]
             logger.warning(
-                "[test_generation_node] %d/%d marker(s) needed LLM repair "
-                "(no story context to autofix from, or write failed); "
+                "[test_generation_node] %d/%d @tests marker(s) needed LLM "
+                "repair (no source files to autofix from, or write failed); "
                 "routing to repair: %s",
                 len(unfixable), len(marker_missing), ", ".join(unfixable),
             )
@@ -2029,7 +2034,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                     **(state.get("node_state") or {}),
                     "current_node": "test_generation",
                     "test_generation": {
-                        "status": "missing_verifies_marker",
+                        "status": "missing_tests_marker",
                         "primary_stack": primary,
                         "tests_generated": len(generated_tests),
                         "markerless_count": len(unfixable),
@@ -2158,34 +2163,16 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "[test_generation_node] Tests passed (%d test file(s) executed).",
             len(generated_tests),
         )
-        # v5 link writer — for every test that parsed a marker AND
-        # passed the sandbox run, persist (test_path, ac_key) edges
-        # into ``test_verifies_ac`` so the audit gate can join AC
-        # coverage. Unknown ac_keys are warned-and-dropped here
-        # (Phase 3 soft mode); the audit gate in Phase 4 still
-        # surfaces them as "untested AC" if no other test claims to
-        # verify them, so the data loss is bounded. Skipped in
-        # non-agile mode (Phase 6) — no acceptance_criteria rows
-        # exist for the workspace, so the helper would just open
-        # state.db and immediately return (0, 0).
+        # Unit tests link to code, not ACs — no ``test_verifies_ac``
+        # edges are written during build / patch. AC coverage edges are
+        # owned by the ``teane test`` functional pack.
         tg_status: dict[str, Any] = {
             "status": "passed",
             "primary_stack": primary,
             "tests_generated": len(generated_tests),
             "test_command": test_cmd,
+            "tests_marker_files": len(marker_sources_by_file),
         }
-        if agile:
-            link_count, drop_count = _persist_verifies_links(
-                workspace_path, marker_keys_by_file,
-            )
-            if link_count or drop_count:
-                logger.info(
-                    "[test_generation_node] @verifies links persisted: %d "
-                    "edge(s) inserted, %d unknown ac_key(s) dropped.",
-                    link_count, drop_count,
-                )
-            tg_status["verifies_links_inserted"] = link_count
-            tg_status["verifies_links_dropped"] = drop_count
         return {
             "messages": messages,
             "modified_files": new_modified,

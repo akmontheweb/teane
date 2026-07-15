@@ -297,83 +297,54 @@ class TestSkipBehaviour:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_nfr_only_batch_emits_skip_stubs_and_persists_links(
+    async def test_nfr_only_batch_skips_without_stubs_or_links(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """2026-07-10: finsearch tripped test_generation_zero_emit on
-        NFR-only batches. First fix skipped the node, but downstream
-        traceability audit then blocked on untested NFR ACs (2026-07-11).
-        Refined fix: emit `@pytest.mark.skip` stub files carrying the
-        `# @verifies: STORY-NFR-N.AC-M` markers so the traceability
-        contract is satisfied while making the "human owes an integration
-        test" story explicit."""
+        """Unit-test model: NFR-only batches skip cleanly — no LLM
+        dispatch (NFRs aren't unit-testable and the model burns its
+        zero-emit sub-cap trying), no `@verifies` skip-stubs, and no
+        ``test_verifies_ac`` edges. NFR verification is owned by the
+        `teane test` functional pack; the AC-coverage gate only fires
+        in that flow (traceability.has_ac_gap)."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def x(): return 1\n")
         self._seed_nfr_story(
             str(tmp_path), "STORY-NFR-001",
             ["Non-December fiscal year", "Current incomplete fiscal year"],
         )
-        self._seed_nfr_story(
-            str(tmp_path), "STORY-NFR-004",
-            ["Secrets not in environment or code"],
-        )
         gw = stub_gateway("should never be dispatched")
         result = await run_test_generation({
             "workspace_path": str(tmp_path),
             "modified_files": ["foo.py"],
-            "batch_patched_story_keys": ["STORY-NFR-001", "STORY-NFR-004"],
+            "batch_patched_story_keys": ["STORY-NFR-001"],
         })
         # No LLM dispatch — the whole point.
         assert gw.dispatched == []
-        # State signals the refined outcome.
-        node_state = result["node_state"]
-        assert node_state["test_generation"]["status"] == "nfr_stubbed"
-        assert node_state["test_generation"]["primary_stack"] == "python"
-        assert node_state["test_generation"]["tests_generated"] == 2
-        assert node_state["test_generation"]["story_keys"] == [
-            "STORY-NFR-001", "STORY-NFR-004",
-        ]
-        assert node_state["test_generation"]["verifies_links_inserted"] == 3
-        # Files on disk under the workspace's canonical NFR stub path.
-        stub_001 = tmp_path / "tests" / "nfr" / "test_story_nfr_001.py"
-        stub_004 = tmp_path / "tests" / "nfr" / "test_story_nfr_004.py"
-        assert stub_001.exists()
-        assert stub_004.exists()
-        body_001 = stub_001.read_text()
-        assert "@pytest.mark.skip" in body_001
-        assert "@verifies: STORY-NFR-001.AC-1" in body_001
-        assert "@verifies: STORY-NFR-001.AC-2" in body_001
-        body_004 = stub_004.read_text()
-        assert "@verifies: STORY-NFR-004.AC-1" in body_004
-        # generated_tests / modified_files carry the new paths so
-        # downstream compiler / commit nodes see them.
-        assert "tests/nfr/test_story_nfr_001.py" in result["generated_tests"]
-        assert "tests/nfr/test_story_nfr_004.py" in result["generated_tests"]
-        assert "tests/nfr/test_story_nfr_001.py" in result["modified_files"]
-        # AC→test edges are in state.db so the traceability audit passes.
+        ns = result["node_state"]["test_generation"]
+        assert ns["status"] == "skipped"
+        assert ns["reason"] == "nfr_only_batch"
+        assert ns["story_keys"] == ["STORY-NFR-001"]
+        # No placeholder stubs on disk, no AC edges in state.db —
+        # build/patch never writes AC linkage.
+        assert not (tmp_path / "tests" / "nfr").exists()
         from harness import story_state
         app = story_state.app_name_for_workspace(str(tmp_path))
         conn = story_state.open_story_db()
         try:
             rows = conn.execute(
                 "SELECT test_path FROM test_verifies_ac "
-                "WHERE workspace = ? ORDER BY test_path", (app,),
+                "WHERE workspace = ?", (app,),
             ).fetchall()
         finally:
             conn.close()
-        assert {r[0] for r in rows} == {
-            "tests/nfr/test_story_nfr_001.py",
-            "tests/nfr/test_story_nfr_004.py",
-        }
+        assert rows == []
 
     @pytest.mark.asyncio
-    async def test_nfr_only_batch_falls_back_to_skip_when_no_story_rows(
+    async def test_nfr_only_batch_skips_even_without_story_rows(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """Guardrail must degrade to the safe old behaviour when
-        state.db has no matching story (decomposition drift, wrong
-        workspace path). Traceability will still flag the ACs as
-        untested but the run doesn't wedge."""
+        """The skip is keyed on the story-key SHAPE alone — no state.db
+        rows required (decomposition drift, wrong workspace path)."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "foo.py").write_text("def x(): return 1\n")
         # NOTE: no _seed_nfr_story call — state.db has no matching rows
@@ -386,16 +357,15 @@ class TestSkipBehaviour:
         assert gw.dispatched == []
         ns = result["node_state"]["test_generation"]
         assert ns["status"] == "skipped"
-        assert ns["reason"] == "nfr_only_batch_no_stubs"
+        assert ns["reason"] == "nfr_only_batch"
         assert ns["story_keys"] == ["STORY-NFR-999"]
 
     @pytest.mark.asyncio
-    async def test_nfr_only_batch_skips_cleanly_on_unsupported_stack(
+    async def test_nfr_only_batch_skips_on_any_stack(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """Java / other stacks have no stub template today — the guard
-        must still trip (avoiding the zero-emit HITL) but degrade to
-        the old skip behaviour."""
+        """The skip is stack-independent — no stub templates exist any
+        more, so there is no python/typescript special case."""
         (tmp_path / "Main.java").write_text("class Main {}\n")
         gw = stub_gateway("...")
         result = await run_test_generation({
@@ -406,13 +376,7 @@ class TestSkipBehaviour:
         assert gw.dispatched == []
         ns = result["node_state"]["test_generation"]
         assert ns["status"] == "skipped"
-        # Either unsupported stack (java) OR no stubs (state.db empty).
-        # Both are acceptable fallbacks — the guard's job is only to
-        # prevent the LLM dispatch and the ensuing zero-emit HITL.
-        assert ns["reason"] in (
-            "nfr_only_batch_unsupported_stack",
-            "nfr_only_batch_no_stubs",
-        )
+        assert ns["reason"] == "nfr_only_batch"
 
     @pytest.mark.asyncio
     async def test_mixed_nfr_and_regular_batch_still_dispatches(
@@ -735,28 +699,27 @@ class TestVerifiesMarkerParser:
         assert _parse_verifies_marker("") == []
 
 
-class TestVerifiesGate:
-    """Integration tests for the markerless-test gate inside
-    test_generation_node."""
+class TestTestsMarkerGate:
+    """Integration tests for the ``@tests`` code-linkage gate inside
+    test_generation_node. Unit tests link to the CODE under test —
+    a missing marker is autofixed deterministically from the source
+    files the generation call was asked to cover, so no LLM turn (and
+    no repair round-trip) is spent on it."""
 
     @pytest.mark.asyncio
-    async def test_markerless_test_routes_to_repair(
+    async def test_markerless_test_gets_tests_marker_autofixed(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """A generated test without a `@verifies:` marker is rejected
-        before the sandbox runs; the resulting compiler_errors route
-        the flow to repair_node via the existing TEST_FAILURE path."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "calculator.py").write_text("def divide(a, b): return a // b\n")
         stub_gateway(
             "<<<CREATE_FILE>>>\n"
-            "file: tests/test_calc.py\n"
+            "file: tests/test_calculator.py\n"
             "content:\n"
             "from calculator import divide\n"
             "def test_divide(): assert divide(10, 2) == 5\n"
             "<<<END_CREATE_FILE>>>\n"
         )
-        # If the sandbox ran, the test would pass — gate must intercept first.
         stub_sandbox(0, "1 passed in 0.01s")
 
         result = await run_test_generation({
@@ -765,27 +728,29 @@ class TestVerifiesGate:
             "messages": [],
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
-            # Phase 6: marker gate only fires in agile mode.
             "decomposition_enabled": True,
         })
 
-        assert result["compiler_errors"], "marker gate must populate compiler_errors"
-        codes = [d["error_code"] for d in result["compiler_errors"]]
-        assert all(c.startswith("TEST_FAILURE:missing_verifies_marker") for c in codes)
-        assert result["node_state"]["test_generation"]["status"] == "missing_verifies_marker"
-        assert route_after_test_generation(result) == "repair_node"
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        body = (tmp_path / "tests" / "test_calculator.py").read_text()
+        # Basename heuristic maps test_calculator.py → calculator.py.
+        assert "# @tests: calculator.py" in body
+        assert "@verifies" not in body
+        assert route_after_test_generation(result) == "lintgate_node"
 
     @pytest.mark.asyncio
-    async def test_malformed_marker_treated_as_missing(
+    async def test_verifies_marker_alone_does_not_satisfy_gate(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
+        """An AC marker is NOT code linkage — a test carrying only
+        ``@verifies`` still gets the ``@tests`` autofix."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "f.py").write_text("def f(): return 1\n")
         stub_gateway(
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_f.py\n"
             "content:\n"
-            "# @verifies: NOT-A-VALID-KEY\n"
+            "# @verifies: STORY-001.AC-1\n"
             "from f import f\n"
             "def test_f(): assert f() == 1\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -798,12 +763,41 @@ class TestVerifiesGate:
             "messages": [],
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
-            # Phase 6: marker gate only fires in agile mode.
             "decomposition_enabled": True,
         })
 
-        assert result["node_state"]["test_generation"]["status"] == "missing_verifies_marker"
-        assert route_after_test_generation(result) == "repair_node"
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        body = (tmp_path / "tests" / "test_f.py").read_text()
+        assert "# @tests: f.py" in body
+
+    @pytest.mark.asyncio
+    async def test_present_tests_marker_is_left_alone(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "g.py").write_text("def g(): return 2\n")
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_g.py\n"
+            "content:\n"
+            "# @tests: g.py\n"
+            "from g import g\n"
+            "def test_g(): assert g() == 2\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["g.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        body = (tmp_path / "tests" / "test_g.py").read_text()
+        assert body.count("@tests:") == 1
 
 
 class TestVerifiesLinkPersistence:
@@ -1139,20 +1133,15 @@ class TestAutofixMarkersByBodyReference:
 # v5 Phase 6 — non-agile mode skips the @verifies machinery
 # ---------------------------------------------------------------------------
 
-class TestNonAgileSkipsVerifiesGate:
-    """Phase 6 contract: the @verifies marker prompt + gate + link
-    writer are all gated on ``state["decomposition_enabled"]``.
-
-    Non-agile runs (monolithic ``teane build`` / ``teane patch``)
-    have no acceptance_criteria rows to cite, so enforcing the
-    marker would force the LLM to fabricate fake STORY-N.AC-N keys
-    to pass syntactic validation — every link insert would then be
-    silently dropped with a warning. Skipping keeps the prompt
-    honest and the log noise zero.
-    """
+class TestTestsMarkerRuleInPrompt:
+    """Unit-test contract: RULE 5 is the ``@tests`` code-linkage marker
+    and is emitted in EVERY flow — linking a unit test to the source
+    file it exercises needs no story/AC rows, so the old agile /
+    non-agile split is gone. The prompt must never instruct the LLM to
+    cite AC keys."""
 
     @pytest.mark.asyncio
-    async def test_rule5_absent_from_user_prompt_in_non_agile(
+    async def test_tests_rule_present_in_non_agile_prompt(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
@@ -1176,18 +1165,18 @@ class TestNonAgileSkipsVerifiesGate:
         })
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
-        # RULE 5 must NOT appear in non-agile prompts.
-        assert "@verifies" not in joined, (
-            "non-agile prompt must not require @verifies markers"
-        )
+        assert "@tests:" in joined
+        # The prompt must not demand AC citations anywhere.
+        assert "# @verifies: STORY" not in joined
+        assert "STORY-003.AC-2" not in joined
 
     @pytest.mark.asyncio
     async def test_markerless_test_accepted_in_non_agile(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """The marker gate is skipped entirely — a test without a
-        @verifies marker passes through to the sandbox and lands as
-        ``status=passed``, NOT ``missing_verifies_marker``."""
+        """A markerless test still lands as ``status=passed`` in
+        non-agile runs (the @tests autofix supplies the marker), and no
+        AC-link fields ever appear in node_state."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
         stub_gateway(
@@ -1214,17 +1203,18 @@ class TestNonAgileSkipsVerifiesGate:
         assert route_after_test_generation(result) == "lintgate_node"
 
     @pytest.mark.asyncio
-    async def test_rule5_present_in_user_prompt_when_agile(
+    async def test_tests_rule_present_in_agile_prompt(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):
-        """The agile path still emits RULE 5 — Phase 3 contract intact."""
+        """Agile runs get the same code-linkage rule — stories change
+        nothing about how unit tests are linked."""
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
         gw = stub_gateway(
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calc.py\n"
             "content:\n"
-            "# @verifies: STORY-001.AC-1\n"
+            "# @tests: calc.py\n"
             "from calc import add\n"
             "def test_add(): assert add(1, 2) == 3\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -1240,8 +1230,9 @@ class TestNonAgileSkipsVerifiesGate:
         })
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
-        assert "@verifies" in joined
-        assert "STORY-003.AC-2" in joined  # canonical example in RULE 5
+        assert "@tests:" in joined
+        assert "# @verifies: STORY" not in joined
+        assert "STORY-003.AC-2" not in joined
 
 
 class TestStoryPreambleInjectedIntoTestGenPrompt:
@@ -1303,15 +1294,14 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
         assert "add(1, 2) returns 3" in joined
 
     @pytest.mark.asyncio
-    async def test_batch_preamble_renders_when_current_story_cleared(
+    async def test_no_batch_scope_preamble_in_batch_verification(
         self, tmp_path, stub_sandbox, stub_gateway, monkeypatch,
     ):
-        """Phase 7 BUG #2 regression: story_loop_node clears
-        current_story_id="" before routing into batch verification.
-        Without the batch-scope fallback, test_generation would emit
-        RULE 5 but no preamble, leaving the LLM with no AC keys to
-        cite. The fallback must render ACs from every story patched
-        in the current batch."""
+        """Unit-test model: the batch-scope AC preamble is gone. In the
+        per-batch verification phase (current_story_id cleared) the
+        test-gen prompt carries the modified source files and the
+        @tests contract — no story/AC keys are injected, because unit
+        tests never cite them."""
         from harness import story_state
         ws = tmp_path / "batch-preamble-ws"
         ws.mkdir()
@@ -1342,7 +1332,7 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
             "<<<CREATE_FILE>>>\n"
             "file: tests/test_calc.py\n"
             "content:\n"
-            "# @verifies: STORY-001.AC-1, STORY-002.AC-1\n"
+            "# @tests: calc.py\n"
             "from calc import add\n"
             "def test_add(): assert add(1, 2) == 3\n"
             "<<<END_CREATE_FILE>>>\n"
@@ -1362,13 +1352,12 @@ class TestStoryPreambleInjectedIntoTestGenPrompt:
         })
         sent = gw.dispatched[0]["messages"]
         joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
-        # Batch preamble must list BOTH stories' AC keys so the LLM
-        # has real keys to cite in the @verifies marker.
-        assert "Batch Scope:" in joined
-        assert "STORY-001.AC-1" in joined
-        assert "STORY-002.AC-1" in joined
-        assert "add(1, 2) returns 3" in joined
-        assert "sub(2, 1) returns 1" in joined
+        # No AC keys injected — unit tests never cite them.
+        assert "Batch Scope:" not in joined
+        assert "STORY-001.AC-1" not in joined
+        assert "STORY-002.AC-1" not in joined
+        # The code-linkage contract is still there.
+        assert "@tests:" in joined
 
     @pytest.mark.asyncio
     async def test_preamble_empty_when_no_current_story(
@@ -1617,3 +1606,52 @@ class TestZeroEmitRetrySucceeds:
             "second dispatch must carry the stronger re-prompt system "
             "message pushed after the first zero-emit response"
         )
+
+
+class TestTestsMarkerHelpers:
+    """Direct unit coverage for the @tests code-linkage helpers."""
+
+    def test_parse_tests_marker_python_style(self):
+        from harness.test_generation import _parse_tests_marker
+        body = '"""Docstring."""\n# @tests: server/app/billing.py, server/app/tax.py\nimport x\n'
+        assert _parse_tests_marker(body) == [
+            "server/app/billing.py", "server/app/tax.py",
+        ]
+
+    def test_parse_tests_marker_js_style(self):
+        from harness.test_generation import _parse_tests_marker
+        body = "// @tests: client/src/utils/fmt.ts\nimport { fmt } from '../fmt';\n"
+        assert _parse_tests_marker(body) == ["client/src/utils/fmt.ts"]
+
+    def test_parse_tests_marker_absent(self):
+        from harness.test_generation import _parse_tests_marker
+        assert _parse_tests_marker("def test_x(): pass\n") == []
+        assert _parse_tests_marker("") == []
+
+    def test_parse_tests_marker_outside_scan_window_ignored(self):
+        from harness.test_generation import _parse_tests_marker
+        body = "\n" * 60 + "# @tests: a.py\n"
+        assert _parse_tests_marker(body) == []
+
+    def test_marker_line_uses_stack_comment_lead(self):
+        from harness.test_generation import _tests_marker_line_for
+        assert _tests_marker_line_for("python", ["a.py"]) == "# @tests: a.py"
+        assert _tests_marker_line_for("typescript", ["b.ts"]) == "// @tests: b.ts"
+        assert _tests_marker_line_for("python", []) is None
+
+    def test_guess_sources_prefers_basename_match(self):
+        from harness.test_generation import _guess_sources_for_test
+        sources = ["server/app/billing.py", "server/app/tax.py"]
+        assert _guess_sources_for_test(
+            "tests/test_billing.py", sources,
+        ) == ["server/app/billing.py"]
+        assert _guess_sources_for_test(
+            "client/src/fmt.test.ts", ["client/src/fmt.ts", "client/src/other.ts"],
+        ) == ["client/src/fmt.ts"]
+
+    def test_guess_sources_falls_back_to_generation_scope(self):
+        from harness.test_generation import _guess_sources_for_test
+        sources = ["a.py", "b.py", "c.py", "d.py"]
+        assert _guess_sources_for_test("tests/test_misc.py", sources) == [
+            "a.py", "b.py", "c.py",
+        ]

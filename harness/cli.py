@@ -3260,10 +3260,12 @@ def _build_outside_harness_actions(
                 "requirement."
             )
         actions.append(
-            "Untested acceptance criterion: write a test that carries a "
-            "`# @verifies: STORY-N.AC-N` marker for the listed AC key, "
-            "or run another `teane patch --agile true` so test-gen "
-            "covers it. Re-run `teane audit -w <workspace>` to verify."
+            "Untested acceptance criterion: run `teane test` so the "
+            "functional pack generates AC-linked coverage (it owns the "
+            "`# @verifies: STORY-N.AC-N` markers), or write such a test "
+            "by hand. Build/patch unit tests link to code via `@tests:` "
+            "and never close AC gaps. Re-run `teane audit -w "
+            "<workspace>` to verify."
         )
         actions.append(
             "Emergency bypass: set `traceability.enforce = false` in "
@@ -3291,11 +3293,11 @@ def _build_outside_harness_actions(
                 "`test_generation.max_iterations` in `config/config.json`."
             )
             actions.append(
-                "Common cause: the @verifies marker contract is "
-                "demanding AC keys the LLM doesn't see in its prompt "
-                "context. Check `docs/STORIES.md` for the active "
-                "story's AC keys and confirm they appear in the "
-                "test files under review."
+                "Common cause: the `@tests:` marker contract — every "
+                "generated test file must name the source file(s) it "
+                "exercises (`# @tests: path/to/module.py`). Check the "
+                "test files under review carry the marker and that the "
+                "named paths exist in the workspace."
             )
         elif symbol == "test_generation_zero_emit":
             actions.append(

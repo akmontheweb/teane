@@ -94,13 +94,19 @@ def test_preamble_marker_contract_for_patching(workspace: str):
     assert "test_story_1_" not in preamble
 
 
-def test_preamble_includes_test_naming_rule_in_tests_phase(workspace: str):
+def test_preamble_tests_phase_forbids_story_linkage_in_tests(workspace: str):
+    """Unit-test model: the tests-phase preamble instructs the LLM to
+    link tests to the CODE under test and explicitly forbids story/AC
+    ids in test files — the old `test_story_1_*` naming convention is
+    retired."""
     state = {
         "workspace_path": workspace,
         "current_story_id": "STORY-1",
     }
     preamble = _build_story_preamble(state, "tests")
-    assert "test_story_1_" in preamble
+    assert "test_story_1_" not in preamble
+    assert "never to stories or" in preamble
+    assert "`teane test`" in preamble
 
 
 def test_preamble_emits_dual_markers_for_cr_bridged_story(workspace: str):

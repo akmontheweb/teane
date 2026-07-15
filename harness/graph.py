@@ -19268,10 +19268,10 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
             try:
                 story = _sst.get_story(conn, app_name, story_key)
                 # v5: fetch the AC rows separately so the preamble can
-                # render each criterion with its stable ac_key. The
-                # test-gen @verifies marker contract references these
-                # keys verbatim (e.g. ``# @verifies: STORY-3.AC-2``),
-                # so the LLM must see them in the source material.
+                # render each criterion with its stable ac_key — the
+                # patcher tags production code per story, and reviewers
+                # grep for the keys. (Test files no longer cite AC
+                # keys; the ACs render here as context only.)
                 if story is not None:
                     ac_rows = _sst.list_acceptance_criteria(
                         conn, app_name, story["id"],
@@ -19318,9 +19318,14 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
 
     if phase == "tests":
         marker_lines.append(
-            f"Name new test functions `test_{story_key.lower().replace('-', '_')}"
-            "_<descriptive>` and reference the story in each test docstring "
-            f"(e.g. `\"\"\"Verifies {story_key}: …\"\"\"`)."
+            "Test files are the EXCEPTION to the story-marker rule: unit "
+            "tests link to the CODE under test, never to stories or "
+            "acceptance criteria. Name test functions after the function/"
+            "class they exercise, reference the module under test in the "
+            "docstring, and do NOT put STORY-N / AC-N ids or `@verifies` "
+            "markers anywhere in a test file. The acceptance criteria "
+            "above are context for what the code should do — requirement-"
+            "level coverage is generated separately by `teane test`."
         )
 
     rules = "\n".join(marker_lines)
@@ -19343,86 +19348,6 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
         f"{rules}\n\n"
         "---\n\n"
     )
-
-
-def _build_batch_scope_preamble(state: AgentState) -> str:
-    """Multi-story preamble for the per-batch verification phase.
-
-    ``story_loop_node`` clears ``current_story_id=""`` when a batch is
-    fully patched and hands control to the verification chain
-    (``speculative → test_generation → lintgate → compiler →
-    code_review``). At that point :func:`_build_story_preamble`
-    returns empty — but the test-generation LLM still gets RULE 5
-    requiring it to cite AC keys via ``# @verifies:`` markers. With
-    no preamble, the LLM has no AC keys to cite and fabricates them;
-    the marker gate then loops until ``max_iterations`` and
-    eventually escalates to HITL.
-
-    This helper renders a "Batch Scope" block listing every story
-    just patched in the current batch alongside its acceptance
-    criteria (with stable ``STORY-N.AC-N`` keys). The test-gen LLM
-    can then cite real keys; the marker gate validates them; the
-    link writer persists ``test_verifies_ac`` edges to real ACs.
-
-    Returns ``""`` when there's no active batch context — either
-    monolithic / non-agile mode, or a single-story phase where
-    :func:`_build_story_preamble` already rendered the per-story
-    preamble (callers should prefer the single-story form when
-    ``current_story_id`` is set; this helper is the fallback).
-    """
-    if state.get("current_story_id"):
-        # Single story is active — caller should use _build_story_preamble.
-        return ""
-    patched_keys = list(state.get("batch_patched_story_keys") or [])
-    if not patched_keys:
-        return ""
-    workspace = state.get("workspace_path") or ""
-    if not workspace:
-        return ""
-    try:
-        from harness import story_state as _sst
-        app_name = _sst.app_name_for_workspace(workspace)
-        conn = _sst.open_story_db()
-        try:
-            stories: list[dict[str, Any]] = []
-            for key in patched_keys:
-                row = _sst.get_story(conn, app_name, key)
-                if row is None:
-                    continue
-                acs = _sst.list_acceptance_criteria(conn, app_name, row["id"])
-                stories.append({"row": row, "acs": acs})
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001
-        return ""
-    if not stories:
-        return ""
-
-    lines: list[str] = [
-        f"## Batch Scope: {len(stories)} story / stories patched in this batch",
-        "",
-        "The patcher just landed the stories below as a unit. Generate "
-        "tests that verify their acceptance criteria. Cite the AC keys "
-        "EXACTLY as shown below in your ``@verifies:`` markers — every "
-        "test file MUST cite at least one of these keys.",
-        "",
-    ]
-    for s in stories:
-        row = s["row"]
-        title = row.get("title", "")
-        lines.append(f"### {row['story_key']} — {title}")
-        lines.append("")
-        if s["acs"]:
-            lines.append("**Acceptance criteria:**")
-            lines.append("")
-            for ac in s["acs"]:
-                lines.append(f"  - {ac['ac_key']}: {ac['text']}")
-        else:
-            lines.append("  _(no acceptance criteria recorded — skip this story)_")
-        lines.append("")
-    lines.append("---")
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _build_arch_summary_preamble(

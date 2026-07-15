@@ -34,6 +34,7 @@ Guardrails:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -479,6 +480,231 @@ def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
         "--import-mode=importlib so duplicate test basenames coexist."
     )
     return "pytest.ini"
+
+
+# Pinned dev-dependency versions the JS/TS test-env scaffolder adds when
+# missing. Only ADDED when absent — existing entries (any version) are
+# never touched, so a workspace's own pins always win.
+_JS_TEST_DEVDEPS_BASE: dict[str, str] = {"jest": "^29.7.0"}
+_TS_TEST_DEVDEPS: dict[str, str] = {
+    "ts-jest": "^29.1.2",
+    "@types/jest": "^29.5.12",
+}
+_COMPONENT_TEST_DEVDEPS: dict[str, str] = {
+    "@testing-library/react": "^14.2.0",
+    "@testing-library/jest-dom": "^6.4.2",
+    "jest-environment-jsdom": "^29.7.0",
+}
+
+_JS_TEST_EXTS = (".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+                 ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")
+_JEST_CONFIG_NAMES = (
+    "jest.config.js", "jest.config.cjs", "jest.config.mjs",
+    "jest.config.ts", "jest.config.json",
+)
+
+
+def _nearest_package_root(abs_test_path: str, workspace_abs: str) -> Optional[str]:
+    """Walk up from the test file to the nearest directory containing a
+    ``package.json``, stopping at the workspace root. None when no
+    package.json exists on the path — there is no npm package to
+    scaffold into."""
+    d = os.path.dirname(abs_test_path)
+    ws = os.path.abspath(workspace_abs)
+    while True:
+        if os.path.isfile(os.path.join(d, "package.json")):
+            return d
+        if os.path.abspath(d) == ws or len(d) <= len(ws):
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _ensure_js_test_env(
+    workspace_path: str,
+    generated_tests: list[str],
+) -> list[str]:
+    """Deterministically scaffold the jest/type environment for freshly
+    generated JS/TS test files. The TypeScript test guide instructs the
+    LLM to patch the config in the same response; this is the harness's
+    guarantee for when it doesn't — a ``.test.tsx`` without its
+    environment produces hundreds of TS2304/TS2307 type-noise
+    diagnostics and a jest run that can't even collect (session
+    22471c0c: 456 of them drowned the real failures).
+
+    Per affected package root (nearest ``package.json``):
+      1. devDependencies — ADD missing entries only (jest; + ts-jest /
+         @types/jest for TS tests; + @testing-library/* and
+         jest-environment-jsdom for component tests). Existing pins are
+         never modified.
+      2. jest config — written only when NO jest config of any shape
+         exists (jest.config.* or a "jest" key in package.json):
+         ts-jest transform for TS, jsdom environment + a
+         ``setupFilesAfterEnv`` hook for component tests.
+      3. ``jest.setup.<ts|js>`` importing @testing-library/jest-dom —
+         only alongside a config this function wrote.
+      4. tsconfig.json ``compilerOptions.types`` — APPEND "jest" only
+         when a ``types`` array already exists and lacks it. When the
+         key is absent every @types package is auto-included, which is
+         strictly better; adding the key would EXCLUDE the rest.
+
+    Mirrors :func:`_ensure_pytest_importlib_config`'s contract:
+    idempotent, fail-open per file, returns the workspace-relative
+    paths it created or modified.
+    """
+    ws = os.path.abspath(workspace_path)
+    js_tests = [
+        t for t in generated_tests
+        if t.replace("\\", "/").endswith(_JS_TEST_EXTS)
+    ]
+    if not js_tests:
+        return []
+
+    roots: dict[str, list[str]] = {}
+    for rel in js_tests:
+        pkg_dir = _nearest_package_root(os.path.join(ws, rel), ws)
+        if pkg_dir is None:
+            logger.info(
+                "[test_generation_node] No package.json above generated "
+                "test %s — skipping JS test-env scaffold for it.", rel,
+            )
+            continue
+        roots.setdefault(pkg_dir, []).append(rel)
+
+    changed: list[str] = []
+    for pkg_dir, tests in sorted(roots.items()):
+        is_ts = any(t.endswith((".ts", ".tsx")) for t in tests)
+        is_component = any(t.endswith((".tsx", ".jsx")) for t in tests)
+        pkg_path = os.path.join(pkg_dir, "package.json")
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as fh:
+                pkg = json.loads(fh.read())
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[test_generation_node] Could not parse %s (%s) — "
+                "skipping JS test-env scaffold for this package.",
+                pkg_path, exc,
+            )
+            continue
+        if not isinstance(pkg, dict):
+            continue
+
+        needed = dict(_JS_TEST_DEVDEPS_BASE)
+        if is_ts:
+            needed.update(_TS_TEST_DEVDEPS)
+        if is_component:
+            needed.update(_COMPONENT_TEST_DEVDEPS)
+        present = set()
+        for section in ("dependencies", "devDependencies"):
+            sec = pkg.get(section)
+            if isinstance(sec, dict):
+                present.update(sec.keys())
+        to_add = {k: v for k, v in needed.items() if k not in present}
+        if to_add:
+            dev = pkg.get("devDependencies")
+            if not isinstance(dev, dict):
+                dev = {}
+            dev.update(to_add)
+            pkg["devDependencies"] = dict(sorted(dev.items()))
+            try:
+                with open(pkg_path, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(pkg, indent=2) + "\n")
+                changed.append(os.path.relpath(pkg_path, ws).replace(os.sep, "/"))
+                logger.info(
+                    "[test_generation_node] Added %d test devDependencies "
+                    "to %s: %s",
+                    len(to_add),
+                    os.path.relpath(pkg_path, ws),
+                    ", ".join(sorted(to_add)),
+                )
+            except OSError as exc:
+                logger.warning(
+                    "[test_generation_node] Could not write %s: %s",
+                    pkg_path, exc,
+                )
+
+        has_jest_config = "jest" in pkg or any(
+            os.path.isfile(os.path.join(pkg_dir, name))
+            for name in _JEST_CONFIG_NAMES
+        )
+        if not has_jest_config:
+            setup_ext = "ts" if is_ts else "js"
+            cfg_lines = ["module.exports = {"]
+            if is_ts:
+                cfg_lines += [
+                    "  preset: 'ts-jest',",
+                    "  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx'],",
+                    "  testMatch: ['**/*.test.ts', '**/*.test.tsx', "
+                    "'**/*.spec.ts', '**/*.spec.tsx'],",
+                ]
+            cfg_lines.append(
+                f"  testEnvironment: '{'jsdom' if is_component else 'node'}',"
+            )
+            if is_component:
+                cfg_lines.append(
+                    f"  setupFilesAfterEnv: ['<rootDir>/jest.setup.{setup_ext}'],"
+                )
+            cfg_lines.append("};")
+            cfg_path = os.path.join(pkg_dir, "jest.config.cjs")
+            try:
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(cfg_lines) + "\n")
+                changed.append(os.path.relpath(cfg_path, ws).replace(os.sep, "/"))
+                if is_component:
+                    setup_path = os.path.join(
+                        pkg_dir, f"jest.setup.{setup_ext}",
+                    )
+                    if not os.path.isfile(setup_path):
+                        with open(setup_path, "w", encoding="utf-8") as fh:
+                            fh.write("import '@testing-library/jest-dom';\n")
+                        changed.append(
+                            os.path.relpath(setup_path, ws).replace(os.sep, "/")
+                        )
+                logger.info(
+                    "[test_generation_node] Wrote %s (%s environment%s).",
+                    os.path.relpath(cfg_path, ws),
+                    "jsdom" if is_component else "node",
+                    " + jest.setup" if is_component else "",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "[test_generation_node] Could not write jest config "
+                    "in %s: %s", pkg_dir, exc,
+                )
+
+        if is_ts:
+            ts_path = os.path.join(pkg_dir, "tsconfig.json")
+            if os.path.isfile(ts_path):
+                try:
+                    with open(ts_path, "r", encoding="utf-8") as fh:
+                        tscfg = json.loads(fh.read())
+                except (OSError, ValueError):
+                    tscfg = None  # JSONC or unreadable — leave alone
+                if isinstance(tscfg, dict):
+                    opts = tscfg.get("compilerOptions")
+                    if isinstance(opts, dict):
+                        types = opts.get("types")
+                        if isinstance(types, list) and "jest" not in types:
+                            opts["types"] = list(types) + ["jest"]
+                            try:
+                                with open(ts_path, "w", encoding="utf-8") as fh:
+                                    fh.write(json.dumps(tscfg, indent=2) + "\n")
+                                changed.append(
+                                    os.path.relpath(ts_path, ws).replace(os.sep, "/")
+                                )
+                                logger.info(
+                                    "[test_generation_node] Appended 'jest' "
+                                    "to %s compilerOptions.types.",
+                                    os.path.relpath(ts_path, ws),
+                                )
+                            except OSError as exc:
+                                logger.warning(
+                                    "[test_generation_node] Could not write "
+                                    "%s: %s", ts_path, exc,
+                                )
+    return changed
 
 
 def _is_test_file(rel_path: str) -> bool:
@@ -2107,6 +2333,27 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         ensured = _ensure_pytest_importlib_config(workspace_path)
         if ensured:
             new_modified.append(ensured)
+
+    # JS/TS counterpart: freshly generated .test.ts(x)/.test.js(x) files
+    # need their jest/type environment (devDependencies, jest config with
+    # the right testEnvironment, setup wiring, tsconfig types) or they
+    # produce hundreds of TS2304/TS2307 type-noise diagnostics and a run
+    # that can't collect. The TypeScript guide instructs the LLM to patch
+    # the config in the same response; this is the deterministic
+    # guarantee for when it doesn't. Idempotent, add-only.
+    scaffolded = _ensure_js_test_env(workspace_path, generated_tests)
+    if scaffolded:
+        new_modified.extend(
+            p for p in scaffolded if p not in new_modified
+        )
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "js_test_env_scaffolded",
+                files=scaffolded,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
 
     from harness.sandbox import SandboxExecutor
     sandbox_cfg = dict(state.get("sandbox_config", {}) or {})

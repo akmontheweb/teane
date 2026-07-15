@@ -236,20 +236,29 @@ _DEFAULT_FORMATTERS: dict[str, FormatterSpec] = {
         linter_args=["--fix", "--quiet"],
         install_hint="npm install -g prettier eslint",
     ),
+    # eslint --fix on the whole JS family, not just .ts — the fixer is
+    # a zero-LLM-cost pre-pass and component files (.tsx/.jsx) are where
+    # generated code needs it most.
     ".tsx": FormatterSpec(
         command="prettier",
         args=["--write"],
-        install_hint="npm install -g prettier",
+        linter_command="eslint",
+        linter_args=["--fix", "--quiet"],
+        install_hint="npm install -g prettier eslint",
     ),
     ".js": FormatterSpec(
         command="prettier",
         args=["--write"],
-        install_hint="npm install -g prettier",
+        linter_command="eslint",
+        linter_args=["--fix", "--quiet"],
+        install_hint="npm install -g prettier eslint",
     ),
     ".jsx": FormatterSpec(
         command="prettier",
         args=["--write"],
-        install_hint="npm install -g prettier",
+        linter_command="eslint",
+        linter_args=["--fix", "--quiet"],
+        install_hint="npm install -g prettier eslint",
     ),
     ".css": FormatterSpec(
         command="prettier",

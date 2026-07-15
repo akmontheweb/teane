@@ -233,11 +233,20 @@ class PatchResult:
 #   range: 1-200       # optional; default is whole file capped at the
 #                      # patcher's line/char limits.
 #   <<<END_READ_FILE>>>
+# Bracket count is lenient (1-3) on purpose: models under long reasoning
+# traces slip to ``<READ_FILE>`` / ``<<READ_FILE>>``, and a strict match
+# silently drops the request — the round then lands zero patches AND zero
+# reads, with no corrective feedback. Session 22471c0c's post-resume run
+# stalled to HITL exactly this way: a well-formed investigation request
+# for server/app/models/*.py written with single angle brackets was
+# ignored, and two such rounds tripped the zero-patch gate. The interior
+# shape (READ_FILE marker + ``file:`` line + END marker) is distinctive
+# enough that bracket leniency cannot misfire on real code content.
 _READ_FILE_PATTERN = re.compile(
-    r'<<<READ_FILE>>>\s*\n'
+    r'<{1,3}READ_FILE>{1,3}\s*\n'
     r'file:\s*(?P<file>.+?)\s*\n'
     r'(?:range:\s*(?P<range>\d+\s*-\s*\d+|\d+)\s*\n)?'
-    r'<<<END_READ_FILE>>>',
+    r'<{1,3}END_READ_FILE>{1,3}',
     re.DOTALL,
 )
 

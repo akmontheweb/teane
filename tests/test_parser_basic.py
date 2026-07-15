@@ -238,6 +238,99 @@ class TestPythonParserWorkspaceFrames:
             in d.semantic_context
         )
 
+    # Condensed from the REAL --tb=long output captured from finsearch
+    # (scratchpad/full_pytest_output.txt): frames render as BARE
+    # "path:line: " boundary lines — no "in <func>" suffix — and the
+    # chained cause (sqlite3.OperationalError) renders its own
+    # library-frames-only traceback ending in its own terminal line
+    # BEFORE the outer chain that contains the workspace frames.
+    _LONG_TB_CHAINED_OUTPUT = (
+        "____________________ test_search_by_ticker ____________________\n"
+        "\n"
+        "self = <SQLiteDialect_pysqlite object at 0x1>\n"
+        "\n"
+        "    def do_execute(self, cursor, statement, parameters, context=None):\n"
+        ">       cursor.execute(statement, parameters)\n"
+        "E       sqlite3.OperationalError: no such table: companies\n"
+        "\n"
+        "/tmp/venv/lib/python3.11/site-packages/sqlalchemy/engine/default.py:952: OperationalError\n"
+        "\n"
+        "The above exception was the direct cause of the following exception:\n"
+        "\n"
+        "client = <starlette.testclient.TestClient object at 0x2>\n"
+        "\n"
+        "    def test_search_by_ticker(client):\n"
+        '        """Search by exact ticker returns that company."""\n'
+        ">       response = client.get(\"/api/companies/search?q=AAPL\")\n"
+        "\n"
+        "server/tests/test_api.py:62: \n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "\n"
+        "    def get(self, url, **kwargs):\n"
+        "        return super().request(...)\n"
+        "\n"
+        "/tmp/venv/lib/python3.11/site-packages/starlette/testclient.py:482: \n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "\n"
+        "    async def search_companies(q: str, db: Session = Depends(get_db)):\n"
+        "        return service.search_companies(q)\n"
+        "\n"
+        "server/app/api/companies.py:28: \n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "\n"
+        "    def search_by_ticker(self, ticker):\n"
+        "        return self.db.query(Company).filter(...).first()\n"
+        "\n"
+        "server/app/repositories/company_repository.py:22: \n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "\n"
+        "    def do_execute(self, cursor, statement, parameters, context=None):\n"
+        ">       cursor.execute(statement, parameters)\n"
+        "E       sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: companies\n"
+        "\n"
+        "/tmp/venv/lib/python3.11/site-packages/sqlalchemy/engine/default.py:952: OperationalError\n"
+    )
+
+    def test_long_tb_bare_frame_boundaries_are_captured(self):
+        diags = PythonParser.parse_diagnostics(self._LONG_TB_CHAINED_OUTPUT)
+        hits = [
+            d for d in diags
+            if d.error_code == "OperationalError"
+            and "no such table" in d.message
+        ]
+        assert hits, (
+            f"expected an OperationalError diagnostic, got "
+            f"{[(d.file, d.line, d.message) for d in diags]}"
+        )
+        d = hits[0]
+        assert d.file == "server/app/repositories/company_repository.py"
+        assert d.line == 22
+        assert "server/tests/test_api.py:62 in test_search_by_ticker" in (
+            d.semantic_context
+        )
+        assert "server/app/api/companies.py:28 in search_companies" in (
+            d.semantic_context
+        )
+        assert "raised in library frame:" in d.semantic_context
+
+    def test_chained_cause_duplicate_is_collapsed(self):
+        # The cause chain's own terminal (library-frames-only) must NOT
+        # survive as a second venv-anchored OperationalError — it would
+        # win downstream dedupe and hide the workspace anchor again.
+        diags = PythonParser.parse_diagnostics(self._LONG_TB_CHAINED_OUTPUT)
+        op_errors = [
+            d for d in diags
+            if d.error_code == "OperationalError"
+            and "no such table" in d.message
+        ]
+        assert len(op_errors) == 1, (
+            f"chained duplicate not collapsed: "
+            f"{[(d.file, d.line) for d in op_errors]}"
+        )
+        assert op_errors[0].file == (
+            "server/app/repositories/company_repository.py"
+        )
+
     def test_workspace_terminal_keeps_its_anchor(self):
         # A plain assert failure whose terminal line already points at
         # workspace code must be untouched by the re-anchoring.

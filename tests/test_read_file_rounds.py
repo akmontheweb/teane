@@ -156,3 +156,49 @@ class TestSourceContracts:
             "the cap will evict the active working set again "
             "(session 22471c0c)"
         )
+
+
+class TestReadBlockBracketLeniency:
+    """Session 22471c0c post-resume: the repair model emitted
+    ``<READ_FILE>`` (single angle brackets) for the two files containing
+    the root cause; the strict triple-bracket pattern dropped the request
+    silently and the round counted as zero patches — two of those tripped
+    the zero-patch HITL. Bracket count is now lenient (1-3) on both parse
+    and strip."""
+
+    def test_triple_brackets_still_parse(self):
+        from harness.patcher import parse_read_blocks
+        out = parse_read_blocks(
+            "<<<READ_FILE>>>\nfile: a.py\n<<<END_READ_FILE>>>"
+        )
+        assert out == [("a.py", None)]
+
+    def test_single_brackets_parse(self):
+        from harness.patcher import parse_read_blocks
+        # Verbatim shape from debug dump 22471c0c_0012.
+        out = parse_read_blocks(
+            "<READ_FILE>\nfile: server/app/models/financial.py\n<END_READ_FILE>\n"
+            "<READ_FILE>\nfile: server/app/models/company.py\n<END_READ_FILE>\n"
+        )
+        assert out == [
+            ("server/app/models/financial.py", None),
+            ("server/app/models/company.py", None),
+        ]
+
+    def test_double_brackets_parse_with_range(self):
+        from harness.patcher import parse_read_blocks
+        out = parse_read_blocks(
+            "<<READ_FILE>>\nfile: b.py\nrange: 10-20\n<<END_READ_FILE>>"
+        )
+        assert out == [("b.py", (10, 20))]
+
+    def test_strip_removes_lenient_variants(self):
+        from harness.patcher import strip_read_blocks
+        text = (
+            "prefix\n"
+            "<READ_FILE>\nfile: a.py\n<END_READ_FILE>\n"
+            "suffix"
+        )
+        stripped = strip_read_blocks(text)
+        assert "READ_FILE" not in stripped
+        assert "prefix" in stripped and "suffix" in stripped

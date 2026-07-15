@@ -167,6 +167,22 @@ class PythonParser(BaseLanguageParser):
         r'^(?P<file>[^\s:][^:]*?\.py):(?P<line>\d+):\s+'
         r'(?P<type>\w+(?:Error|Warning|Exception))\s*$'
     )
+    # Long-traceback frame boundary: ``--tb=long`` (teane's build flag)
+    # ends each frame's section with a BARE "path.py:NN: " line — no
+    # ``in <func>`` suffix (that's the short-tb style matched above) and
+    # no error type (that's the terminal fail line). Session 22471c0c:
+    # every workspace frame in the real traceback rendered this way, so
+    # the short-tb pattern captured nothing and the "no such table"
+    # diagnostic stayed anchored on sqlalchemy venv internals.
+    _PYTEST_LONG_FRAME_PATTERN = re.compile(
+        r'^(?P<file>[^\s:][^:]*?\.py):(?P<line>\d+):\s*$'
+    )
+    # Source ``def`` line inside a long-tb frame section — pytest renders
+    # the frame's source snippet above the boundary line, so the last
+    # ``def`` seen names the function the frame executes in.
+    _PYTEST_DEF_LINE_PATTERN = re.compile(
+        r'^(?:async\s+)?def\s+(?P<name>\w+)\s*\('
+    )
     # Pytest "E   " line — error name and message at the deepest level.
     _PYTEST_E_PATTERN = re.compile(
         r'^E\s+(?P<type>\w+(?:Error|Warning|Exception)):\s*(?P<msg>.+)$'
@@ -355,6 +371,24 @@ class PythonParser(BaseLanguageParser):
         # middleware locals — every app frame had been discarded.
         stanza_user_frames: list[tuple[str, int, str]] = []
         _MAX_USER_FRAMES = 10
+        # Function name for the NEXT long-tb frame boundary — tracked from
+        # the ``def`` line in the frame's source snippet.
+        last_def_name: Optional[str] = None
+        # Index into ``diags`` where the current failure block began.
+        # Chained exceptions (``raise X from Y``) render the cause's
+        # traceback first — often library-frames-only — then the outer
+        # chain with the workspace frames, and BOTH end in a terminal
+        # fail line carrying near-identical messages. The collapse logic
+        # at emission compares only against diags from the same block.
+        block_start_idx = 0
+
+        def _chain_dup_key(code: str, msg: str) -> tuple[str, str]:
+            # Chained duplicates differ only in exception-wrapper noise
+            # ("sqlite3.OperationalError: X" vs
+            # "sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
+            # X"), so key on the punctuation-stripped tail of the message.
+            normalized = re.sub(r"[^a-z0-9]", "", (msg or "").lower())
+            return (code, normalized[-48:])
         # The Layer 2 plugin emits ``[teane] ...`` lines (runtime object
         # detail) and the Layer 3b debug mode emits ``[teane-debug] ...``
         # lines (pre-call fixture snapshot, unhandled asyncio task
@@ -401,7 +435,8 @@ class PythonParser(BaseLanguageParser):
                 # on. Only worth showing with ≥2 frames — a single frame
                 # is already the diagnostic's own location.
                 chain = "\n  ".join(
-                    f"{f}:{ln} in {fn}" for f, ln, fn in user_frames
+                    f"{f}:{ln} in {fn}" if fn else f"{f}:{ln}"
+                    for f, ln, fn in user_frames
                 )
                 parts.append(
                     f"workspace call chain (outermost → innermost):\n  {chain}"
@@ -475,6 +510,8 @@ class PythonParser(BaseLanguageParser):
                 pending_failing_src = None
                 last_frame = None
                 stanza_user_frames = []
+                last_def_name = None
+                block_start_idx = len(diags)
                 conftest_path = None
                 last_emitted = None
                 continue
@@ -504,6 +541,33 @@ class PythonParser(BaseLanguageParser):
                              or stanza_user_frames[-1] != entry)
                     ):
                         stanza_user_frames.append(entry)
+                continue
+
+            # ``--tb=long`` frame boundary: bare "path.py:NN:" with nothing
+            # after the colon. No clash with the terminal fail line below —
+            # that one carries an error-type suffix this pattern rejects.
+            long_frame = PythonParser._PYTEST_LONG_FRAME_PATTERN.match(bare)
+            if long_frame:
+                last_frame = (
+                    long_frame.group("file"), int(long_frame.group("line")),
+                )
+                if PythonParser._is_user_frame(last_frame[0]):
+                    entry = (last_frame[0], last_frame[1], last_def_name or "")
+                    if (
+                        len(stanza_user_frames) < _MAX_USER_FRAMES
+                        and (not stanza_user_frames
+                             or stanza_user_frames[-1] != entry)
+                    ):
+                        stanza_user_frames.append(entry)
+                last_def_name = None
+                continue
+
+            # ``def`` line from a long-tb source snippet — names the
+            # function for the NEXT frame boundary.
+            def_line = PythonParser._PYTEST_DEF_LINE_PATTERN.match(bare)
+            if def_line:
+                last_def_name = def_line.group("name")
+                # Fall through: a def line carries no other signal.
                 continue
 
             # Terminal "file:line: ErrorType" (no message, no E-line follow-up)
@@ -548,10 +612,35 @@ class PythonParser(BaseLanguageParser):
                     message=msg,
                     semantic_context=ctx,
                 )
-                diags.append(diag)
-                last_emitted = diag
+                # Chained-exception collapse: ``raise X from Y`` renders
+                # the cause's traceback first (library frames only, ending
+                # in its own terminal line), then the outer chain with the
+                # workspace frames. Both terminals carry the same
+                # underlying error. Keep ONE diagnostic per block,
+                # preferring the workspace-anchored emission — otherwise
+                # the cause's venv-anchored duplicate can win downstream
+                # dedupe and hide the app-side call chain again.
+                _dup_idx: Optional[int] = None
+                _new_key = _chain_dup_key(term_type, msg)
+                for _i in range(block_start_idx, len(diags)):
+                    if _chain_dup_key(
+                        diags[_i].error_code, diags[_i].message,
+                    ) == _new_key:
+                        _dup_idx = _i
+                        break
+                if _dup_idx is not None:
+                    _old_user = PythonParser._is_user_frame(diags[_dup_idx].file)
+                    _new_user = PythonParser._is_user_frame(term_file)
+                    if _new_user and not _old_user:
+                        diags[_dup_idx] = diag
+                        last_emitted = diag
+                    # else: keep the earlier emission, drop the duplicate.
+                else:
+                    diags.append(diag)
+                    last_emitted = diag
                 last_frame = None
                 stanza_user_frames = []
+                last_def_name = None
                 pending_e = None
                 pending_e_bare = []
                 pending_failing_src = None
@@ -603,6 +692,7 @@ class PythonParser(BaseLanguageParser):
                 last_emitted = diag
                 last_frame = None
                 stanza_user_frames = []
+                last_def_name = None
                 conftest_path = None
                 pending_e = None
                 pending_e_bare = []

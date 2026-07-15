@@ -9186,10 +9186,12 @@ async def _maybe_pytest_isolation_rerun(
 
     Contract:
 
-    * NOOP unless exactly one diagnostic in ``diagnostics`` carries a
-      ``pytest_nodeid``. Broad regressions (multiple failures) may share
-      a root cause that isolation doesn't reveal, and running N extra
-      pytest invocations per compile is not free.
+    * Single failure: isolate that one nodeid (path below). Multiple
+      failures: delegate to :func:`_maybe_pytest_isolation_rerun_multi`,
+      which isolates per test FILE when the failures cluster into at
+      most 3 files — session 22471c0c had 14 failures across 4 test
+      modules whose import-time ``app.dependency_overrides`` clobbered
+      each other; every file passed alone, and no signal said so.
     * The isolation command is the ORIGINAL ``build_cmd`` with the pytest
       nodeid appended as a positional arg. pytest's positional args are
       test selectors, so the appended nodeid supersedes any collection
@@ -9207,7 +9209,12 @@ async def _maybe_pytest_isolation_rerun(
         d for d in diagnostics
         if isinstance(d, dict) and d.get("pytest_nodeid")
     ]
+    if not pytest_failures:
+        return
     if len(pytest_failures) != 1:
+        await _maybe_pytest_isolation_rerun_multi(
+            executor, pytest_failures, loop_counter, build_cmd,
+        )
         return
     failure = pytest_failures[0]
     nodeid = str(failure.get("pytest_nodeid") or "")
@@ -9248,7 +9255,12 @@ async def _maybe_pytest_isolation_rerun(
                 nodeid, exc,
             )
             return
-        passed_alone = int(getattr(iso_result, "exit_code", 1) or 1) == 0
+        # NOTE: not ``int(... or 1)`` — exit code 0 is falsy, so the
+        # ``or 1`` coerced every PASS into a fail and this signal could
+        # never fire (latent since it shipped; caught by the multi-file
+        # variant's tests).
+        _iso_exit = getattr(iso_result, "exit_code", None)
+        passed_alone = isinstance(_iso_exit, int) and _iso_exit == 0
         cache[nodeid] = passed_alone
         logger.info(
             "[compiler_node:isolation] Re-ran %s alone: %s. "
@@ -9280,12 +9292,116 @@ async def _maybe_pytest_isolation_rerun(
         "use and don't reset (``ClassVar`` counters, in-memory caches).\n"
         "  • FastAPI lifespan / conftest teardown that CLOSES a shared "
         "resource which the next test then tries to reuse.\n"
+        "  • MODULE-LEVEL ``app.dependency_overrides[...] = ...`` in any "
+        "test module — pytest imports every module at collection, so the "
+        "last module's import-time override wins for the WHOLE suite.\n"
+        "  • Multiple test modules sharing one "
+        "``sqlite:///file::memory:?cache=shared`` database — their "
+        "fixtures create/drop each other's tables. Give each module a "
+        "private ``sqlite://`` engine with ``poolclass=StaticPool``.\n"
         "Fix the shared state (usually pytest.ini or conftest.py or the "
         "module that owns the singleton) — do NOT edit the endpoint or "
         "the test itself unless you can prove the shared-state theory is "
         "wrong."
     )
     failure["semantic_context"] = (str(failure.get("semantic_context") or "") + hint)
+
+
+async def _maybe_pytest_isolation_rerun_multi(
+    executor: Any,
+    pytest_failures: list[dict[str, Any]],
+    loop_counter: dict[str, Any],
+    build_cmd: str,
+) -> None:
+    """Per-FILE isolation reruns for multi-failure compiles.
+
+    When 2+ pytest failures cluster into at most
+    ``_ISOLATION_MULTI_MAX_FILES`` test files, re-run each failing FILE
+    alone. A file whose tests all pass in isolation is not broken — the
+    suite is: some other module's import-time or shared-state side
+    effect breaks it. Session 22471c0c: five API test modules each did
+    ``app.dependency_overrides[get_db] = ...`` at module level against
+    the same app (last import wins for the whole suite) and several
+    shared one ``cache=shared`` in-memory database; 9/14 failures were
+    in files that passed alone, and nothing in the prompt could reveal
+    it — the root cause lives in OTHER files than the ones the
+    diagnostics name.
+
+    Cost bound: at most ``_ISOLATION_MULTI_MAX_FILES`` extra pytest
+    invocations per compile, each cached in the same
+    ``_isolation_rerun_cache`` (keyed ``file::<path>``) so repeat rounds
+    re-attach the hint for free. Above the bound, broad regressions
+    almost always share one in-code root cause that isolation would not
+    disambiguate — skip.
+    """
+    _ISOLATION_MULTI_MAX_FILES = 3
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for failure in pytest_failures:
+        nodeid = str(failure.get("pytest_nodeid") or "")
+        if not nodeid:
+            continue
+        by_file.setdefault(nodeid.split("::", 1)[0], []).append(failure)
+    if not by_file or len(by_file) > _ISOLATION_MULTI_MAX_FILES:
+        return
+
+    cache_raw = loop_counter.get("_isolation_rerun_cache")
+    cache: dict[str, bool] = (
+        cache_raw if isinstance(cache_raw, dict) else {}
+    )
+    loop_counter["_isolation_rerun_cache"] = cache
+
+    for rel_file, failures in sorted(by_file.items()):
+        cache_key = f"file::{rel_file}"
+        if cache_key in cache:
+            passed_alone = cache[cache_key]
+        else:
+            iso_cmd = f"{build_cmd} -p no:cacheprovider {rel_file}"
+            try:
+                iso_result = await executor.run(iso_cmd)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[compiler_node:isolation] executor.run raised for "
+                    "%s: %s", rel_file, exc,
+                )
+                continue
+            _iso_exit = getattr(iso_result, "exit_code", None)
+            passed_alone = isinstance(_iso_exit, int) and _iso_exit == 0
+            cache[cache_key] = passed_alone
+            logger.info(
+                "[compiler_node:isolation] Re-ran failing file %s alone "
+                "(%d failure(s) in suite): %s.",
+                rel_file, len(failures),
+                "ALL PASSED (suite-order pollution signal)"
+                if passed_alone else "still failing (real bug in file)",
+            )
+        if not passed_alone:
+            continue
+        hint = (
+            "\n\n[HARNESS ISOLATION SIGNAL — HIGHEST PRIORITY]\n"
+            f"EVERY test in `{rel_file}` PASSES when the file runs alone "
+            "(verified this round in the same sandbox) but fails in the "
+            "full suite. The code and tests this diagnostic points at "
+            "are NOT the bug — another test module's import-time or "
+            "shared state breaks them. Check, ACROSS ALL TEST MODULES:\n"
+            "  • Module-level ``app.dependency_overrides[...] = ...`` "
+            "assignments — pytest imports every test module at "
+            "collection, so the LAST module's import-time override wins "
+            "for the whole suite. Install/remove overrides inside a "
+            "fixture instead.\n"
+            "  • Several modules sharing one "
+            "``sqlite:///file::memory:?cache=shared`` database — their "
+            "fixtures create/drop each other's tables. Each module "
+            "needs its own private ``sqlite://`` engine with "
+            "``poolclass=StaticPool``.\n"
+            "  • Module-level singletons / ``@functools.lru_cache`` "
+            "holding connections or event-loop-bound clients.\n"
+            "Fix the offending module(s) — do NOT edit the code or the "
+            "tests this diagnostic names."
+        )
+        for failure in failures:
+            failure["semantic_context"] = (
+                str(failure.get("semantic_context") or "") + hint
+            )
 
 
 def _promote_module_not_found_diagnostics(
@@ -17745,6 +17861,62 @@ def _format_diagnostics_for_repair(
         code = str(g.get("code", "")).upper()
         return 0 if any(code.startswith(p) for p in _UPSTREAM_PREFIXES) else 1
 
+    # Test-environment noise demotion (session 22471c0c): 456 tsc
+    # diagnostics of the "Cannot find module '@testing-library/react'" /
+    # "Cannot find name 'expect'" family monopolised the top-N context
+    # slots — their counts are huge and TS2304/TS2307 sit in
+    # _UPSTREAM_PREFIXES, so the cascade prior loved them — while 14
+    # REAL runtime test failures sat in the deferred list. The repair
+    # LLM spent its round on tsconfig.json and got a judge-ignored
+    # strike. These codes are test-runner/type CONFIG gaps, not code
+    # defects; they must never outrank a failing assertion. Ranked
+    # ahead of the survival tier deliberately: env noise persisting
+    # across rounds is expected (nobody is fixing type stubs mid-build)
+    # and must not re-earn priority through persistence.
+    _TEST_ENV_NOISE_CODES = (
+        "TS2304", "TS2307", "TS2503", "TS2582", "TS2591", "TS2593",
+        "TS2875", "TS2882", "TS7016", "TS7026",
+    )
+    _TEST_ENV_NOISE_TOKENS = (
+        "jest", "expect", "describe", "vitest", "mocha", "jasmine",
+        "@testing-library", "@types/", "jsx", "react/jsx-runtime",
+        "type declarations", "type definitions for a test runner",
+        "type definitions for node",
+    )
+
+    def _env_noise_rank(g: dict[str, Any]) -> int:
+        code = str(g.get("code", "")).upper()
+        if code not in _TEST_ENV_NOISE_CODES:
+            return 0
+        msg = str(g.get("message", "")).lower()
+        if any(tok in msg for tok in _TEST_ENV_NOISE_TOKENS):
+            return 1
+        locs = g.get("locations", [])
+        if locs and all(
+            any(str(loc).startswith(p) for p in _TEST_DIR_PREFIXES)
+            for loc in locs
+        ):
+            return 1
+        return 0
+
+    # Runtime failures (pytest assertions / exceptions, TEST_FAILURE
+    # synthetics) outrank everything else within the same
+    # survival/severity tier — a failing test is direct evidence about
+    # behaviour; a checker finding is a prediction. POSITIVE match on
+    # the pytest-parser code shapes (exception class names and the
+    # harness's TEST_FAILURE synthetics); unknown codes are NOT assumed
+    # runtime, so custom/upstream static codes keep their kind_rank
+    # ordering.
+    _RUNTIME_CODE_RE = re.compile(
+        r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)$"
+    )
+
+    def _runtime_rank(g: dict[str, Any]) -> int:
+        code = str(g.get("code", ""))
+        if code.upper().startswith("TEST_FAILURE"):
+            return 0
+        return 0 if _RUNTIME_CODE_RE.fullmatch(code) else 1
+
     # Fix #4: cascade detection. When a group has ≥ 3 occurrences and
     # every location lives under tests/ (or test/ / __tests__/), the
     # group is almost certainly a single production-code bug rippling
@@ -17805,12 +17977,38 @@ def _format_diagnostics_for_repair(
         enumerate(group_list),
         key=lambda pair: (
             _llm_promoted_rank(pair[1]),
+            _env_noise_rank(pair[1]),
             _survival_rank(pair[1]),
             _severity_rank(pair[1]),
+            _runtime_rank(pair[1]),
             _kind_rank(pair[1]),
             pair[0],
         ),
     )
+    # Noise-class compression: env-noise groups don't get a context slot
+    # OR a per-group deferred line — they collapse into ONE classified
+    # summary section below, and their diagnostics are excluded from the
+    # structured payload. Session 22471c0c: 456 missing-test-runner-type
+    # diagnostics burned ~15 deferred lines plus the entire structured
+    # JSON block every round, and the LLM kept getting pulled toward
+    # tsconfig instead of the failing tests. An LLM-promoted group
+    # escapes compression — the model explicitly asked to see it.
+    noise_groups = [
+        g for _, g in ranked
+        if _env_noise_rank(g) == 1 and not g.get("llm_promoted")
+    ]
+    _noise_keys = {(g["code"], g["message"]) for g in noise_groups}
+    _real_ranked = [
+        (i, g) for i, g in ranked
+        if (g["code"], g["message"]) not in _noise_keys
+    ]
+    if _real_ranked:
+        ranked = _real_ranked
+    else:
+        # Everything is env noise — then it IS the diagnosis this round;
+        # compressing would leave the repair prompt with zero errors.
+        noise_groups = []
+        _noise_keys = set()
     # Layer 2 — small-N short-circuit. Deferring a group strips its full
     # source context from the prompt; that's only a worthwhile token saving
     # when there are enough groups that the context bloat would matter. At
@@ -17820,7 +18018,7 @@ def _format_diagnostics_for_repair(
     # without the deferral mechanism stealing context from any of them.
     TOP_N = 3
     _SMALL_N_THRESHOLD = 5
-    if len(group_list) <= _SMALL_N_THRESHOLD:
+    if len(ranked) <= _SMALL_N_THRESHOLD:
         shown = [g for _, g in ranked]
         hidden: list[dict[str, Any]] = []
     else:
@@ -17944,13 +18142,57 @@ def _format_diagnostics_for_repair(
             "the next round.",
         ])
         lines.extend(tail_lines)
+    if noise_groups:
+        noise_total = sum(len(g["locations"]) for g in noise_groups)
+        lines.extend([
+            "",
+            f"### Suppressed: test-environment type-config noise "
+            f"({noise_total} diagnostic(s), {len(noise_groups)} shape(s))",
+            "These are ONE class of problem, not code defects: the "
+            "type-checker cannot resolve test-runner / UI type "
+            "declarations (missing devDependencies such as @types/jest "
+            "or @testing-library/*, or a tsconfig `types`/`include` "
+            "gap). They do not affect runtime behaviour and do not fail "
+            "the build. Do NOT patch the source files they point at, "
+            "and do not let their counts outweigh the real errors "
+            "above. If you choose to address the class, the fix is "
+            "config-level only (package.json devDependencies + "
+            "tsconfig). Shapes suppressed: "
+            + ", ".join(
+                f"`{g['code']}`×{len(g['locations'])}"
+                for g in noise_groups
+            )
+            + ". To see any of these in full next round, name the code "
+            "in a PROMOTE_DEFERRED block.",
+        ])
+        try:
+            from harness.observability import emit_event as _emit_noise
+            _emit_noise(
+                "suppressed_env_noise_diagnostics",
+                suppressed_count=noise_total,
+                shape_count=len(noise_groups),
+                codes=[g["code"] for g in noise_groups],
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
     rendered = "\n".join(lines)
     # Phase 4 — append a structured JSON block of every diagnostic so
     # the LLM can sort/filter/group on its own if it disagrees with the
     # harness's cascade ranking. Capped + opt-out via config so the
-    # token cost is bounded.
+    # token cost is bounded. Env-noise diagnostics are excluded — with
+    # hundreds of "cannot find name 'expect'" rows the payload becomes
+    # the single biggest token sink in the prompt while carrying zero
+    # actionable signal (session 22471c0c: 456 of them).
     if emit_structured_payload:
-        rendered += _format_structured_diagnostic_payload(errors)
+        payload_errors = [
+            e for e in errors
+            if (
+                str(e.get("error_code", "UNKNOWN")),
+                str(e.get("message", "No message")),
+            ) not in _noise_keys
+        ]
+        if payload_errors:
+            rendered += _format_structured_diagnostic_payload(payload_errors)
     return rendered
 
 

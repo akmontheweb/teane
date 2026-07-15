@@ -255,6 +255,16 @@ async def run_checker(
         return [], False
     # Errors only: warnings don't justify a repair round.
     diags = [d for d in diags if str(d.severity).lower() == "error"]
+    # Relativize at the gate boundary. pyright/tsc print ABSOLUTE paths;
+    # left unnormalised they leak into diagnostic locations, the repair
+    # prompt's "Current Content of Files You Need to Edit" headers, and
+    # the reflection judge's file grounding — and the patcher REJECTS
+    # any patch target starting with '/', so the prompt ends up teaching
+    # the LLM paths it cannot use (session 22471c0c: the judge cited
+    # /Users/.../financial_repository.py verbatim). Everything
+    # downstream keys on workspace-relative forward-slash paths.
+    for d in diags:
+        d.file = _norm_rel(d.file, workspace_path)
     if spec.filter_output:
         scoped = set(spec.scoped_files)
         diags = [d for d in diags if _norm_rel(d.file, workspace_path) in scoped]

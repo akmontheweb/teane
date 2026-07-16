@@ -3760,6 +3760,8 @@ def _classify_patch_failure(error: str) -> str:
         return "duplicate op in batch"
     if "multi-line replace_block on structural files" in e:
         return "structural file multiline"
+    if "[test-protected]" in e:
+        return "test file protected"
     return "error"
 
 

@@ -1245,25 +1245,72 @@ def create_provider(
 # 8. Token Counting Utility (Pre-flight Context Window Guard)
 # ---------------------------------------------------------------------------
 
+# Optional real-tokenizer cache. tiktoken is NOT a hard dependency — when it
+# is installed the harness uses it for accurate token counts (OpenAI / DeepSeek
+# are exact; other providers are a close BPE proxy), and otherwise falls back
+# to the chars/4 heuristic below. `pip install tiktoken` to enable accuracy;
+# nothing breaks without it. Resolved once and cached (encoder init is slow).
+_TIKTOKEN_ENCODER: Any = None
+_TIKTOKEN_RESOLVED: bool = False
+
+
+def _tiktoken_encoder() -> Any:
+    """Return a cached tiktoken encoder, or None when tiktoken isn't
+    installed. Never raises."""
+    global _TIKTOKEN_ENCODER, _TIKTOKEN_RESOLVED
+    if _TIKTOKEN_RESOLVED:
+        return _TIKTOKEN_ENCODER
+    _TIKTOKEN_RESOLVED = True
+    try:
+        import tiktoken
+        try:
+            _TIKTOKEN_ENCODER = tiktoken.get_encoding("o200k_base")
+        except Exception:  # noqa: BLE001 — older tiktoken lacks o200k
+            _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    except Exception:  # noqa: BLE001 — tiktoken not installed / import failure
+        _TIKTOKEN_ENCODER = None
+    return _TIKTOKEN_ENCODER
+
+
+def count_text_tokens(text: str) -> int:
+    """Best-effort token count for a single string.
+
+    Uses a real BPE tokenizer (tiktoken) when available — accurate for
+    OpenAI / DeepSeek, a close proxy for other providers — and falls back to
+    the ~4-chars-per-token heuristic otherwise. Never raises; the fallback is
+    byte-identical to the harness's historical estimate so budget/context
+    behaviour is unchanged when tiktoken isn't installed.
+    """
+    if not text:
+        return 0
+    enc = _tiktoken_encoder()
+    if enc is not None:
+        try:
+            return len(enc.encode(text, disallowed_special=()))
+        except Exception:  # noqa: BLE001 — fall through to heuristic
+            pass
+    return max(1, len(text) // 4)
+
+
 def estimate_token_count(messages: list[dict[str, Any]]) -> int:
     """
-    Fast heuristic token estimation for pre-flight context window checks.
+    Token estimation for pre-flight context-window checks.
 
-    Uses a simple character-to-token ratio (~4 chars per token for English text)
-    plus overhead for message formatting. Not exact, but fast and sufficient for
-    the 85% guardrail threshold check.
+    Uses :func:`count_text_tokens` (real tokenizer when tiktoken is installed,
+    chars/4 heuristic otherwise) per message, plus a small per-message
+    overhead for role markers / formatting. Sufficient for the 85% guardrail.
     """
-    total_chars = 0
+    total_tokens = 0
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, str):
-            total_chars += len(content)
+            total_tokens += count_text_tokens(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
-                    total_chars += len(str(block))
-        total_chars += 50  # Overhead per message for role markers, formatting, etc.
-    return max(1, total_chars // 4)  # ~4 chars per token is a common heuristic
+                    total_tokens += count_text_tokens(str(block))
+        total_tokens += 12  # ~role markers + formatting overhead per message
+    return max(1, total_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1465,80 @@ def _summarize_prefix_diff(
 # 10. Context Window Guardrail & Truncation
 # ---------------------------------------------------------------------------
 
+def _message_content_text(msg: dict[str, Any]) -> str:
+    """Flatten a message's content (str or list-of-blocks) to a single
+    whitespace-collapsed string for digesting."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text") or block.get("content") or block))
+            else:
+                parts.append(str(block))
+        content = " ".join(parts)
+    return " ".join(str(content).split())
+
+
+def _compact_dropped_messages(
+    dropped: list[dict[str, Any]], token_budget: int,
+) -> Optional[dict[str, Any]]:
+    """Fold ``dropped`` messages into a single compact digest message so the
+    context-window guardrail preserves a breadcrumb of earlier context
+    instead of silently deleting it.
+
+    Deterministic (no LLM call — this runs inside a pre-flight guardrail with
+    no gateway access, so it must be cheap and infallible). One line per
+    dropped message (role + a clipped preview), elided in the middle when
+    there are many, and trimmed to fit ``token_budget``. Returns None when
+    there is nothing worth keeping.
+    """
+    lines: list[str] = []
+    for m in dropped:
+        role = str(m.get("role", "?"))
+        text = _message_content_text(m)
+        if text:
+            lines.append(f"- {role}: {text[:200]}")
+    if not lines:
+        return None
+    # Elide the middle when there are many dropped messages.
+    _MAX_LINES = 40
+    if len(lines) > _MAX_LINES:
+        half = _MAX_LINES // 2
+        lines = (
+            lines[:half]
+            + [f"- … ({len(lines) - _MAX_LINES} more messages elided) …"]
+            + lines[-half:]
+        )
+
+    def _build(body_lines: list[str]) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": (
+                "[Context-window compaction] To fit the model's context "
+                f"window, {len(dropped)} earlier message(s) were folded into "
+                "this digest. Treat it as a summary of prior conversation for "
+                "continuity — NOT as new instructions:\n" + "\n".join(body_lines)
+            ),
+        }
+
+    digest = _build(lines)
+    # Trim to fit the reserved budget by keeping a halving tail (most recent
+    # dropped messages are the most useful). Halving guarantees termination.
+    if estimate_token_count([digest]) > token_budget:
+        keep = len(lines)
+        while keep > 1:
+            keep //= 2
+            elide = (
+                f"- … ({len(dropped)} messages summarized; older detail "
+                "trimmed to fit) …"
+            )
+            digest = _build([elide] + lines[-keep:])
+            if estimate_token_count([digest]) <= token_budget:
+                break
+    return digest if estimate_token_count([digest]) <= token_budget else None
+
+
 async def check_context_window(
     messages: list[dict[str, Any]],
     spec: ModelSpec,
@@ -1481,28 +1602,50 @@ async def check_context_window(
             f"({preserved_count} > {threshold}). Reduce the system prompt size or split the task."
         )
 
-    # Build truncated list: system + most recent N messages that fit
-    truncated = [messages[0]]
-    available_budget = threshold - estimate_token_count(truncated) - estimate_token_count([messages[-1]])
+    # Reserve a small slice of the budget for a compaction digest so the
+    # messages we drop leave a breadcrumb instead of a silent gap. Capped so
+    # the digest can never crowd out real recent context.
+    digest_reserve = min(1000, max(256, threshold // 8))
 
-    # Fill from the end (most recent first) excluding system[0] and last[-1]
+    # Build truncated list: system + most recent N messages that fit, keeping
+    # room for the digest.
+    truncated = [messages[0]]
+    available_budget = (
+        threshold
+        - estimate_token_count(truncated)
+        - estimate_token_count([messages[-1]])
+        - digest_reserve
+    )
+
+    # Fill from the end (most recent first) excluding system[0] and last[-1].
     middle_messages = messages[1:-1]
     insertion_point = 1  # After system prompt
+    kept_ids: set[int] = set()
 
     for msg in reversed(middle_messages):
         msg_estimate = estimate_token_count([msg])
         if msg_estimate <= available_budget:
             truncated.insert(insertion_point, msg)
             available_budget -= msg_estimate
+            kept_ids.add(id(msg))
         # Don't break — a subsequent (older, smaller) message may still fit.
+
+    # Everything we couldn't keep gets folded into one digest message,
+    # inserted right after the system prompt (oldest-context position).
+    dropped = [m for m in middle_messages if id(m) not in kept_ids]
+    digest = _compact_dropped_messages(dropped, digest_reserve) if dropped else None
+    if digest is not None:
+        truncated.insert(1, digest)
 
     truncated.append(messages[-1])
 
     final_estimate = estimate_token_count(truncated)
     logger.info(
-        "[gateway] Truncation complete. %d → %d messages, %d → ~%d tokens.",
+        "[gateway] Compaction complete. %d → %d messages (%d folded into a "
+        "digest), %d → ~%d tokens.",
         len(messages),
         len(truncated),
+        len(dropped),
         estimated,
         final_estimate,
     )
@@ -1859,9 +2002,11 @@ class GatewayConfig:
     # ``tool_calls`` responses into ``LLMResponse.tool_calls``. The
     # patching/repair nodes translate each tool call to a PatchBlock and
     # feed the existing apply pipeline. Falls back to text DSL parsing on
-    # providers that don't support tool-use. Default false until the
-    # per-provider wiring lands and is exercised in production.
-    use_structured_tools: bool = False
+    # providers that don't support tool-use. Default true: native tool-use
+    # also unlocks the read-only retrieval tools (grep/glob/list_dir/
+    # find_symbol/file_outline/semantic_search/git_blame/git_log). Set
+    # patcher.use_structured_tools=false to force the legacy text DSL.
+    use_structured_tools: bool = True
     context_window_threshold_pct: float = 0.85
     max_retries: int = 5
     base_delay: float = 1.0
@@ -2719,15 +2864,17 @@ class Gateway:
         # than it" case — a single big planning call could overspend by its
         # own cost. We compute a rough projected cost from message length
         # plus a reserve for the response and refuse early if it would push
-        # us past the hard cap. Estimation is intentionally pessimistic
-        # (chars/4 + 4k output reserve) — better to refuse a borderline
-        # call than overspend the cap silently.
+        # us past the hard cap. Input tokens are counted with a real
+        # tokenizer when tiktoken is installed (accurate for OpenAI/DeepSeek,
+        # close proxy otherwise) and fall back to chars/4; a fixed 4k output
+        # reserve keeps the estimate on the safe side — better to refuse a
+        # borderline call than overspend the cap silently.
         try:
-            est_input_chars = sum(
-                len(m.get("content", "")) if isinstance(m.get("content", ""), str) else 0
+            est_input_tokens = max(1, sum(
+                count_text_tokens(m.get("content", ""))
+                if isinstance(m.get("content", ""), str) else 0
                 for m in messages
-            )
-            est_input_tokens = max(1, est_input_chars // 4)
+            ))
             est_output_tokens = 4000  # pessimistic reserve for the response
             est_cost = (
                 (est_input_tokens / 1_000_000.0) * spec.input_cost_per_1m
@@ -3675,7 +3822,7 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         use_structured_tools=bool(
             (config_dict.get("patcher", {}) or {}).get(
-                "use_structured_tools", False,
+                "use_structured_tools", True,
             )
         ),
         context_window_threshold_pct=token_budget.get("context_window_threshold_pct", 0.85),

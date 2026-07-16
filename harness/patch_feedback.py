@@ -105,6 +105,14 @@ _DIRECTIVE_BY_TAG: dict[str, str] = {
         "single-value (1-3 line) REPLACE_BLOCK on structural files is "
         "accepted."
     ),
+    "test file protected": (
+        "this is a test file, and the repair loop may not edit, delete, or "
+        "weaken tests to make a red build pass — that is reward-hacking, not "
+        "a fix. Fix the PRODUCTION code under test so the existing test "
+        "passes honestly. If the test itself encodes a genuinely incorrect "
+        "expectation, leave it unchanged and explain the discrepancy rather "
+        "than modifying it."
+    ),
 }
 _DEFAULT_DIRECTIVE = (
     "read the error text above and adjust the block accordingly."

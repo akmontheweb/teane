@@ -756,6 +756,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "level", "log_dir", "json_stderr", "langsmith",
         # P2.3: rotation knobs for the per-session JSONL file handler.
         "max_bytes", "backup_count",
+        # Console (stderr) verbosity, independent of the file handler.
+        # "WARNING" keeps the terminal quiet while the file captures the
+        # full stream; "OFF"/"NONE" silences the console entirely; null
+        # mirrors `level`. See observability.configure_logging.
+        "console_level",
     }),
     "test_generation": frozenset({
         "enabled", "max_iterations",
@@ -6447,6 +6452,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if _refuse_if_workspace_is_harness_root(workspace_path):
         return 1
 
+    # Fail fast on a broken environment (a missing/incompatible runtime
+    # dependency) with a clean message + fix, rather than a raw ImportError
+    # partway through startup once the graph/gateway build reaches it.
+    _dep_exit = _preflight_dependency_guard()
+    if _dep_exit is not None:
+        return _dep_exit
+
     # Record git mode for every downstream code path that touches git
     # (GitGuardian init, _attempt_git_rollback, _perform_new_build_reset).
     # --git is now a bool (default False); the legacy str form
@@ -6586,6 +6598,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         json_stderr=bool(log_cfg.get("json_stderr", False)),
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
+        console_level=log_cfg.get("console_level"),
     )
 
     # Extract budget and sandbox settings
@@ -7776,6 +7789,13 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         teane resume --session-id my-session-abc123
         teane resume --session-id my-session -w /path/to/repo
     """
+    # Fail fast on a missing runtime dependency BEFORE the first heavy import
+    # below (harness.storage pulls langgraph-checkpoint-sqlite) so the operator
+    # gets a clean message + fix instead of a raw ImportError.
+    _dep_exit = _preflight_dependency_guard()
+    if _dep_exit is not None:
+        return _dep_exit
+
     from harness.storage import HarnessAsyncSqliteSaver, inspect_session
 
     # Workspace auto-detect: --help promises "auto-detected from checkpoint if
@@ -7844,6 +7864,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         json_stderr=bool(log_cfg.get("json_stderr", False)),
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
+        console_level=log_cfg.get("console_level"),
     )
 
     persistence_cfg = config.get("persistence", {})
@@ -9452,14 +9473,14 @@ def _doctor_check_patcher_mode(config: dict[str, Any]) -> tuple[str, str]:
     rejected. Default on.
 
     B6 (``patcher.use_structured_tools``) — when on, providers that
-    support native tool-use receive PATCH_TOOLS as ``tools=...`` instead
-    of relying on the text DSL. Default off pending integration work;
-    this row exists so operators stop expecting native tool-use to "just
-    work" when they haven't enabled the dispatch wiring.
+    support native tool-use receive PATCH_TOOLS (plus the read-only
+    retrieval tools) as ``tools=...`` instead of relying on the text DSL.
+    Default ON; set patcher.use_structured_tools=false to force the legacy
+    text DSL for providers/models where native tool-use misbehaves.
     """
     patcher = (config.get("patcher") or {})
     b5 = bool(patcher.get("enforce_read_before_edit", True))
-    b6 = bool(patcher.get("use_structured_tools", False))
+    b6 = bool(patcher.get("use_structured_tools", True))
     b5_label = "read-before-edit ON" if b5 else "read-before-edit OFF"
     b6_label = (
         "native tool-use ON (experimental)" if b6
@@ -9553,6 +9574,82 @@ def _doctor_check_product_spec(
         f"`{spec_dirname.strip()}/` at workspace root contains "
         f"{len(spec_files)} spec file(s)",
     )
+
+
+# Runtime dependencies declared in pyproject.toml [project.dependencies],
+# as (import_name, pip_name) pairs. KEEP IN SYNC with pyproject — the test
+# tests/test_doctor_dependencies.py::test_table_matches_pyproject asserts the
+# two agree so drift fails CI. import_name is what Python imports (e.g.
+# `yaml`); pip_name is what an operator installs (e.g. `pyyaml`).
+_RUNTIME_DEPENDENCIES: tuple[tuple[str, str], ...] = (
+    ("langgraph", "langgraph"),
+    ("langgraph.checkpoint.sqlite", "langgraph-checkpoint-sqlite"),
+    ("aiofiles", "aiofiles"),
+    ("tree_sitter", "tree-sitter"),
+    ("tree_sitter_language_pack", "tree-sitter-language-pack"),
+    ("httpx", "httpx"),
+    ("uuid7", "uuid7"),
+    ("typing_extensions", "typing-extensions"),
+    ("yaml", "pyyaml"),
+    ("pypdf", "pypdf"),
+)
+
+
+def _missing_runtime_dependencies() -> list[str]:
+    """Return the pip names of every runtime dependency that fails to import
+    (missing, or present-but-broken on this Python ABI), sorted and
+    de-duplicated. Cheap: import-only, no side effects."""
+    import importlib
+    missing: list[str] = []
+    for import_name, pip_name in _RUNTIME_DEPENDENCIES:
+        try:
+            importlib.import_module(import_name)
+        except Exception:  # noqa: BLE001 — ImportError or a broken transitive import
+            missing.append(pip_name)
+    return sorted(set(missing))
+
+
+def _doctor_check_dependencies() -> tuple[str, str]:
+    """Every runtime dependency declared in pyproject.toml is importable.
+
+    Without this, a missing or ABI-incompatible dependency surfaces as a raw
+    ImportError traceback the first time a run reaches the code that imports
+    it — mid-startup, after config / git / API-key work — the single most
+    basic environment failure, reported the least clearly. This turns it into
+    an upfront FAIL naming the package(s) and the fix. (Tree-sitter also gets
+    a deeper grammar-load check, `tree-sitter`; this one is import-only across
+    the whole dependency set and runs even when the config check fails.)
+    """
+    missing = _missing_runtime_dependencies()
+    if missing:
+        return "fail", (
+            f"unimportable: {', '.join(missing)}. Install the harness and its "
+            f"dependencies from the repo root — `pip install -e .` — or "
+            f"`pip install {' '.join(missing)}`."
+        )
+    return "pass", (
+        f"all {len(_RUNTIME_DEPENDENCIES)} runtime dependencies importable"
+    )
+
+
+def _preflight_dependency_guard() -> "int | None":
+    """Fail fast at the top of cmd_run / cmd_resume when a runtime dependency
+    is missing, instead of letting a raw ImportError escape mid-startup.
+    Returns an exit code to propagate, or None when the environment is
+    complete."""
+    missing = _missing_runtime_dependencies()
+    if not missing:
+        return None
+    print(
+        "[teane] Cannot start — missing runtime dependencies: "
+        + ", ".join(missing) + ".\n"
+        "        Install the harness and its dependencies from the repo "
+        "root:\n"
+        "            pip install -e .\n"
+        "        Then re-run. `teane doctor` gives a full environment report.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _doctor_check_tree_sitter() -> tuple[str, str]:
@@ -10625,6 +10722,10 @@ async def collect_doctor_results(
     checks: list[tuple[str, tuple[str, str]]] = [
         ("config", (config_status, config_detail)),
         ("git repo", _doctor_check_git(workspace_path)),
+        # Runtime-dependency import check runs regardless of config validity —
+        # a missing dep is more fundamental than a config typo, and this is
+        # the check that turns a raw mid-startup ImportError into a clean FAIL.
+        ("dependencies", _doctor_check_dependencies()),
     ]
 
     if config_status == "pass":

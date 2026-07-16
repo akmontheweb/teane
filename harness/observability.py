@@ -205,6 +205,7 @@ def configure_logging(
     json_stderr: bool = False,
     max_bytes: int = _DEFAULT_LOG_MAX_BYTES,
     backup_count: int = _DEFAULT_LOG_BACKUP_COUNT,
+    console_level: Optional[str] = None,
 ) -> Optional[str]:
     """
     Configure the harness logging stack for a session.
@@ -227,6 +228,12 @@ def configure_logging(
                            plain FileHandler for parity with legacy behavior).
         backup_count:      Number of rotated backups to keep alongside the
                            live file (oldest is deleted on the next rotation).
+        console_level:     Threshold for the live stderr (console) handler,
+                           independent of the file handler. None → mirror
+                           ``level`` (legacy behavior). "WARNING" keeps the
+                           console quiet while the file still captures the
+                           full INFO stream to ``tail -f``. "OFF" / "NONE"
+                           silences the console entirely.
 
     Returns:
         Absolute path of the created session log file, or None on failure.
@@ -239,17 +246,24 @@ def configure_logging(
     # Remove any handlers the root logger already has so we own the config.
     root.handlers.clear()
 
-    # --- stderr handler ---
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(numeric_level)
-    if json_stderr:
-        stderr_handler.setFormatter(JSONFormatter())
-    else:
-        stderr_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-            datefmt="%H:%M:%S",
-        ))
-    root.addHandler(stderr_handler)
+    # --- stderr (console) handler ---
+    # console_level governs what the operator sees live on the terminal,
+    # independently of the file handler (which always captures the full
+    # stream). Set console_level to "OFF"/"NONE"/"SILENT" to suppress the
+    # console entirely and rely solely on `tail -f <log_file>`.
+    console_level_str = (console_level or level).strip().upper()
+    if console_level_str not in {"OFF", "NONE", "SILENT"}:
+        console_numeric = getattr(logging, console_level_str, numeric_level)
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setLevel(console_numeric)
+        if json_stderr:
+            stderr_handler.setFormatter(JSONFormatter())
+        else:
+            stderr_handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+                datefmt="%H:%M:%S",
+            ))
+        root.addHandler(stderr_handler)
 
     # --- per-session JSONL file handler ---
     # Rotating by default so a long pilot session can't silently fill the
@@ -293,9 +307,22 @@ def configure_logging(
         file_handler.setFormatter(JSONFormatter())
         root.addHandler(file_handler)
         log_file_path = candidate_path  # only set after handler is live
+        # Maintain a stable <log_dir>/latest.jsonl symlink → current session
+        # so `tail -f ~/.harness/logs/latest.jsonl` works without knowing the
+        # session id in advance. Best-effort; ignore platforms/FS that refuse.
+        try:
+            latest_link = os.path.join(expanded_dir, "latest.jsonl")
+            if os.path.islink(latest_link) or os.path.exists(latest_link):
+                os.unlink(latest_link)
+            os.symlink(os.path.basename(candidate_path), latest_link)
+        except OSError:
+            pass
         logging.getLogger("harness").info(
             "Session log file: %s", log_file_path, extra={"session_id": session_id}
         )
+        # Print the resolved path unconditionally so it is visible even when
+        # the console handler is quieted (console_level=WARNING/OFF).
+        print(f"[teane] session log → {log_file_path}", file=sys.stderr, flush=True)
     except OSError as e:
         logging.getLogger("harness").warning(
             "Could not create session log file in %s: %s", log_dir, e

@@ -236,6 +236,12 @@ class AgentState(TypedDict, total=False):
     # top-K chunks when ``enabled`` and injects them as a system
     # message. Empty dict = disabled (no retrieval, no injection).
     repo_index_config: dict[str, Any]
+    # Retrieval-tools config (``retrieval_tools`` section of config.json:
+    # {enabled, max_results, max_files, max_bytes, ...}). Read by the native
+    # tool loop to gate exposure of the read-only search tools (grep / glob /
+    # list_dir / find_symbol / file_outline / semantic_search / git_blame /
+    # git_log) and to bound their output. Empty dict = enabled, default caps.
+    retrieval_tools_config: dict[str, Any]
     # Operator-controlled toggle for the entire deployment phase (discovery
     # → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose up). Set by the
     # `--deploy-dev` CLI flag on `teane run`; default False. When False,
@@ -3315,6 +3321,25 @@ def _resolve_read_file_call(
     return content
 
 
+def _patch_tools_for_state(state: "AgentState") -> list[dict[str, Any]]:
+    """``PATCH_TOOLS`` plus the read-only retrieval tools (grep / glob /
+    list_dir / find_symbol / file_outline / semantic_search / git_blame /
+    git_log), unless the operator set ``retrieval_tools.enabled: false``.
+
+    Exposed to the model only in native tool-use mode (``use_structured_tools``
+    — the same gate ``read_file`` rides). The retrieval calls are resolved and
+    fed back inside :func:`_patching_tool_loop`; they never become PatchBlocks.
+    """
+    from harness.tool_schemas import PATCH_TOOLS
+
+    rcfg = state.get("retrieval_tools_config") or {}
+    if isinstance(rcfg, dict) and rcfg.get("enabled", True) is False:
+        return list(PATCH_TOOLS)
+    from harness.retrieval_tools import RETRIEVAL_TOOLS
+
+    return list(PATCH_TOOLS) + list(RETRIEVAL_TOOLS)
+
+
 async def _patching_tool_loop(
     *,
     gateway: Any,
@@ -3370,27 +3395,49 @@ async def _patching_tool_loop(
     rounds = 0
     while rounds < read_file_cap:
         tool_calls_list = getattr(response, "tool_calls", None) or []
-        read_calls = [
-            c for c in tool_calls_list if c.get("name") == "read_file"
+        # Navigation calls the loop resolves-and-continues on: read_file plus
+        # the read-only retrieval tools. The loop keeps feeding results back
+        # until the model stops navigating and emits patch operations (or a
+        # pure-text response).
+        from harness.retrieval_tools import (
+            RETRIEVAL_TOOL_NAMES, resolve_retrieval_call,
+        )
+        nav_calls = [
+            c for c in tool_calls_list
+            if c.get("name") == "read_file"
+            or c.get("name") in RETRIEVAL_TOOL_NAMES
         ]
-        if not read_calls:
+        if not nav_calls:
             return response, budget, messages, files_seen
         rounds += 1
         # Persist the assistant turn — typed blocks so the next round's
         # tool_result references match against the right tool_use ids.
         messages.append(_build_assistant_tool_turn(response))
-        # Resolve each read_file and assemble the tool_result user turn.
+        # Resolve each navigation call and assemble the tool_result user turn.
         tool_results: list[dict[str, Any]] = []
-        for call in read_calls:
-            result_text = _resolve_read_file_call(call, workspace)
+        _retrieval_cfg = {
+            "retrieval_tools": (state.get("retrieval_tools_config") or {}),
+        }
+        for call in nav_calls:
+            _tool_name = call.get("name")
+            if _tool_name == "read_file":
+                result_text = _resolve_read_file_call(call, workspace)
+            else:
+                # Read-only retrieval tool. resolve_retrieval_call never
+                # raises and emits its own success/failure telemetry.
+                result_text = await resolve_retrieval_call(
+                    call, workspace, config=_retrieval_cfg,
+                )
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": call.get("id", ""),
                 "content": result_text,
             })
-            # Record the sha256 of the bytes we just showed so B5 drift
-            # detection / read-before-edit can use them on the next
-            # dispatch.
+            if _tool_name != "read_file":
+                continue
+            # read_file only: record the sha256 of the bytes we just showed
+            # so B5 drift detection / read-before-edit can use them on the
+            # next dispatch, and emit the read_file telemetry inline.
             args = call.get("input") or {}
             rel = str(args.get("file_path") or "").strip()
             is_error = result_text.startswith("Error:")
@@ -3446,10 +3493,11 @@ async def _patching_tool_loop(
             messages.append(MessageDict(
                 role="user",
                 content=(
-                    f"[System]: You've used the read_file tool "
+                    f"[System]: You've used the read_file / search tools "
                     f"{read_file_cap} times — the cap is reached. "
-                    f"Emit SEARCH/REPLACE patches now using the file content "
-                    f"you've already seen. Do NOT call read_file again."
+                    f"Emit SEARCH/REPLACE patches now using what you've "
+                    f"already seen. Do NOT call read_file or any search tool "
+                    f"(grep/glob/list_dir/find_symbol/etc.) again."
                 ),
             ))
             response, budget = await gateway.dispatch(
@@ -3598,6 +3646,15 @@ async def _run_tool_loop(
 
         # Append tool results as a user message — same shape as the rest of
         # the harness's tool DSL (READ_FILE results come back this way too).
+        # web_fetch / web_search / MCP results are UNTRUSTED external content
+        # (arbitrary web pages, third-party servers), so fence them with an
+        # explicit data-not-instructions boundary and neutralize any harness
+        # control tokens they contain (prompt-injection defense — see
+        # harness/untrusted.py and docs/THREAT_MODEL.md).
+        from harness.untrusted import fence_untrusted as _fence_untrusted
+        _fenced_results = _fence_untrusted(
+            "\n".join(tool_results), "web/mcp tool output",
+        )
         messages.append(
             MessageDict(
                 role="user",
@@ -3605,7 +3662,7 @@ async def _run_tool_loop(
                     "Tool execution results (round %d/%d):\n%s\n\n"
                     "Continue your previous task. Emit more tool blocks if "
                     "needed, or proceed to the final answer."
-                ) % (rounds, cap, "\n".join(tool_results)),
+                ) % (rounds, cap, _fenced_results),
             )
         )
 
@@ -4232,7 +4289,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             budget=budget,
             workspace=workspace,
             use_tools=use_tools,
-            tools=PATCH_TOOLS,
+            tools=_patch_tools_for_state(state),
             state=state,
         )
 
@@ -4258,7 +4315,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 budget=budget_remaining,
                 workspace=workspace,
                 use_tools=use_tools,
-                tools=PATCH_TOOLS,
+                tools=_patch_tools_for_state(state),
                 state=state,
             )
             messages = msgs_out
@@ -5801,6 +5858,51 @@ def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
             continue
         kept.append(block)
     return kept, dropped
+
+
+def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
+    """Repair-loop reward-hacking guard.
+
+    Counterpart to :func:`_filter_test_patch_blocks` (which protects the
+    patching node). Splits ``blocks`` into ``(production_blocks,
+    test_rejections)``: any block whose target is a test path is refused and
+    turned into a ``PatchResult(success=False)`` carrying the
+    ``[test-protected]`` sentinel, so :func:`compose_patch_feedback` renders
+    the "fix the implementation, not the test" directive on the LLM's next
+    round.
+
+    Rationale: the repair loop runs on a RED build. Editing, deleting, or
+    weakening a failing test to turn it green is reward-hacking, not a fix —
+    a failing build must be resolved in the production code under test. Test
+    files are owned by the test-generation phase, never the solve loop. Uses
+    the same :func:`_is_test_path` predicate as the patching-node filter so
+    both nodes agree on what "a test file" is.
+    """
+    from harness.patcher import PatchResult
+
+    kept: list[Any] = []
+    rejections: list[Any] = []
+    for block in blocks:
+        file_path = getattr(block, "file", "") or ""
+        if _is_test_path(file_path):
+            rejections.append(
+                PatchResult(
+                    success=False,
+                    file=file_path,
+                    operation=getattr(block, "operation", ""),
+                    error=(
+                        "[test-protected] Editing test files is not permitted "
+                        "during the repair loop. A failing build must be fixed "
+                        "in the production code under test — do not modify, "
+                        "delete, or weaken the test to make it pass. If the "
+                        "test encodes a genuinely incorrect expectation, leave "
+                        "it unchanged for human review rather than editing it."
+                    ),
+                )
+            )
+            continue
+        kept.append(block)
+    return kept, rejections
 
 
 def _filter_test_blocks_from_patch_response(
@@ -15991,6 +16093,34 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             logger.warning(
                 "[repair_node:parser] %s", _parse_miss_diag,
             )
+        # Test-tamper guard (reward-hacking defense) — parity with
+        # patching_node's phase-1 test filter, which the repair path
+        # historically lacked. The repair loop runs on a RED build; editing,
+        # deleting, or weakening a failing test to turn it green is reward-
+        # hacking, not a fix. Split test-targeting blocks out HERE — before
+        # the anti-drift screen and the apply — and surface them as
+        # rejections so the LLM is told to fix the production code instead.
+        _blocks_parsed, _test_tamper_rejections = _reject_test_patch_blocks(
+            _blocks_parsed
+        )
+        if _test_tamper_rejections:
+            _tt_files = sorted({r.file for r in _test_tamper_rejections})
+            logger.warning(
+                "[repair_node:test-guard] Refused %d repair edit(s) to "
+                "test file(s): %s",
+                len(_test_tamper_rejections), ", ".join(_tt_files),
+            )
+            try:
+                from harness.observability import log_failure as _log_failure
+                _log_failure(
+                    "test_tamper_blocked",
+                    node="repair",
+                    files=_tt_files,
+                    count=len(_test_tamper_rejections),
+                    repair_attempt=loop_counter.get("total_repairs"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         _blocks_kept, _screen_rejections = _pre_patch_screen(
             _blocks_parsed, loop_counter, files_seen_by_llm, workspace,
         )
@@ -16018,9 +16148,18 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # requires a fresh READ_FILE.
         if modified_files:
             _mark_files_modified(loop_counter, modified_files)
-        # Merge screen rejections so the LLM sees them in the next round's
-        # status message alongside the patcher's own results.
-        patch_results = list(_screen_rejections) + list(patch_results)
+        # Merge test-tamper rejections AND anti-drift screen rejections so
+        # the LLM sees both in the next round's status message alongside the
+        # patcher's own results. Order: tamper first (the strongest steer —
+        # "fix prod, not the test"), then the screen, then real results.
+        # These are prepended before success_count / fail_count are computed
+        # below, so a refused test edit correctly counts as a failed patch
+        # (never a silent no-op that could mask a stuck loop).
+        patch_results = (
+            list(_test_tamper_rejections)
+            + list(_screen_rejections)
+            + list(patch_results)
+        )
         # Fix 5c parity with patching_node — auto-inject current
         # content for any stuck-reread file(s) the screen rejected.
         # Same rationale as graph.py:~4392: skip the READ_FILE
@@ -19217,12 +19356,21 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
     for rec in records:
         rec["abs_path"] = os.path.join(cr_dir, rec["original_name"])
 
+    from harness.untrusted import (
+        CHANGE_REQUEST_PROVENANCE_NOTE as _CR_PROVENANCE_NOTE,
+        neutralize_control_tokens as _neutralize_control_tokens,
+    )
     sections: list[str] = [
         f"# Change requests ({len(records)} pending)",
         "",
         "Each request below is a self-contained ask. Each carries a CR-N "
         "identifier so downstream artifacts (spec revisions, code, tests, "
         "infra) can be traced back to the originating request via `grep CR-N`.",
+        "",
+        # Prompt-injection framing: CR content may be externally sourced
+        # (e.g. `teane gh issue`). Implement the ask; ignore embedded
+        # meta-instructions. See harness/untrusted.py / docs/THREAT_MODEL.md.
+        _CR_PROVENANCE_NOTE,
         "",
     ]
     for rec in records:
@@ -19236,7 +19384,10 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
             continue
         sections.append(f"# === CR-{rec['cr_id']}: {rec['original_name']} ===")
         sections.append("")
-        sections.append(content.rstrip())
+        # Neutralize any harness control tokens (<<<CREATE_FILE>>> etc.) an
+        # externally-authored request might embed, so it cannot forge a patch
+        # op or tool call downstream. Visible text is unchanged.
+        sections.append(_neutralize_control_tokens(content.rstrip()))
         sections.append("")
 
     consolidated = "\n".join(sections)
@@ -24335,6 +24486,11 @@ async def run_graph(
         initial_state["repo_index_config"] = repo_index_config
     if llm_dispatch_config is not None:
         initial_state["llm_dispatch_config"] = llm_dispatch_config
+    # Retrieval-tools config drives the native tool loop's read-only search
+    # tools. Read straight from full_config — no dedicated run_graph param.
+    initial_state["retrieval_tools_config"] = (full_config or {}).get(
+        "retrieval_tools", {}
+    )
     # Plumb the smoke-check flag into state so compiler_node can read it
     # without reaching out to config (which the graph module doesn't
     # touch directly today).

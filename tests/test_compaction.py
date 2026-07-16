@@ -128,6 +128,41 @@ class TestOrphanToolBlocks:
         assert _orphaned_tool_results(out) == []
         assert out[0] is msgs[0] and out[-1] is msgs[-1]
 
+    def test_current_turn_tool_result_keeps_its_partner(self):
+        # The standard mid-tool-loop shape: assistant tool_use, then the
+        # CURRENT turn is its tool_result. Scanning only the body used to
+        # strip the tool_use and manufacture an orphan in the preserved
+        # final message.
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "A", "name": "grep"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "A", "content": "ok"}]},
+        ]
+        out = gw._strip_orphan_tool_blocks(msgs)
+        uses = [b["id"] for m in out if isinstance(m.get("content"), list)
+                for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+        assert uses == ["A"]
+        assert _orphaned_tool_results(out) == []
+
+    def test_final_orphan_tool_result_converted_to_text(self):
+        # The final message can't be dropped; when its tool_use partner was
+        # trimmed, the tool_result block must become a text block (content
+        # preserved) rather than ship as a guaranteed provider rejection.
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "DROPPED", "content": "the output"},
+                {"type": "text", "text": "now fix it"},
+            ]},
+        ]
+        out = gw._strip_orphan_tool_blocks(msgs)
+        assert _orphaned_tool_results(out) == []
+        blocks = out[-1]["content"]
+        assert all(b.get("type") != "tool_result" for b in blocks)
+        assert any("the output" in b.get("text", "") for b in blocks)
+        assert any(b.get("text") == "now fix it" for b in blocks)
+
     def test_compaction_leaves_no_orphans(self):
         spec = _spec(1200)
         msgs = [{"role": "system", "content": "SYS"}]

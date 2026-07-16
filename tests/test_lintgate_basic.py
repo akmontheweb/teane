@@ -218,7 +218,10 @@ class TestResolvePath:
             with open(test_file, "w") as f:
                 f.write("")  # Create the file
             result = _resolve_path(test_file, tmpdir)
-            assert result == test_file
+            # _resolve_path canonicalizes for boundary enforcement, so
+            # compare realpaths — on macOS the tempdir itself sits behind
+            # the /var -> /private/var symlink.
+            assert result == os.path.realpath(test_file)
 
     def test_resolve_nonexistent_returns_none(self):
         """Nonexistent path should return None."""

@@ -1549,7 +1549,13 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
     OpenAI-normalized path) reject the request with an unmatched-tool error.
     This pass drops a ``tool_result`` whose ``tool_use`` was dropped and vice
     versa. ``messages[0]`` (system anchor) and ``messages[-1]`` (current turn)
-    are always preserved intact.
+    are never dropped; the id scans still INCLUDE them — the current turn is
+    routinely the ``tool_result`` for a ``tool_use`` sitting in the body, and
+    scanning the body alone would strip that partner and manufacture the very
+    orphan this function exists to prevent. If the final message itself holds
+    a ``tool_result`` whose partner the trim already dropped, the block is
+    converted to a plain text block (content preserved) — the one repair the
+    preserve-the-current-turn rule allows.
     """
     if len(messages) <= 2:
         return messages
@@ -1557,7 +1563,7 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
 
     use_ids = {
         b.get("id")
-        for m in body if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+        for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), list)
         for b in m["content"]
         if isinstance(b, dict) and b.get("type") == "tool_use"
     }
@@ -1576,7 +1582,8 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
 
     result_ids = {
         b.get("tool_use_id")
-        for m in stage1 if m.get("role") == "user" and isinstance(m.get("content"), list)
+        for m in (stage1 + [messages[-1]])
+        if m.get("role") == "user" and isinstance(m.get("content"), list)
         for b in m["content"]
         if isinstance(b, dict) and b.get("type") == "tool_result"
     }
@@ -1593,7 +1600,42 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
                 m = {**m, "content": nb}
         stage2.append(m)
 
-    return [messages[0]] + stage2 + [messages[-1]]
+    # Final message: a tool_result whose tool_use the trim dropped can't be
+    # deleted (it's the current turn) — convert it to a text block so the
+    # provider doesn't reject the request outright.
+    final = messages[-1]
+    kept_use_ids = {
+        b.get("id")
+        for m in ([messages[0]] + stage2)
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    }
+    fc = final.get("content")
+    if final.get("role") == "user" and isinstance(fc, list):
+        nb = []
+        for b in fc:
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") not in kept_use_ids):
+                inner = b.get("content")
+                if isinstance(inner, list):
+                    inner = "\n".join(
+                        str(x.get("text", "")) for x in inner
+                        if isinstance(x, dict)
+                    )
+                nb.append({
+                    "type": "text",
+                    "text": (
+                        "[tool result — its originating tool call was "
+                        "trimmed for context]\n" + str(inner or "")
+                    ),
+                })
+            else:
+                nb.append(b)
+        if nb != fc:
+            final = {**final, "content": nb}
+
+    return [messages[0]] + stage2 + [final]
 
 
 async def check_context_window(

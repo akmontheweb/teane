@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import socketserver
+import tempfile
 import threading
 import urllib.parse
 
@@ -332,6 +333,14 @@ def _browse_response(query_path: str) -> tuple[int, str, str]:
     except OSError:
         pass
     roots.append(os.path.realpath(_platform.harness_temp_dir("")))
+    # harness_temp_dir is pinned to /tmp on POSIX for legacy-path
+    # stability, but on macOS the REAL system temp dir is the per-user
+    # /var/folders/<hash>/T — include it so "system temp" means what the
+    # docstring says on every platform.
+    try:
+        roots.append(os.path.realpath(tempfile.gettempdir()))
+    except OSError:
+        pass
     try:
         target_real = os.path.realpath(abs_path)
     except OSError:

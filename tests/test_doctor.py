@@ -21,10 +21,20 @@ from harness.cli import (
 
 
 class TestDoctorPatcherMode:
-    def test_default_mode_reports_b5_on_b6_off(self):
+    def test_default_mode_reports_b5_on_b6_on(self):
+        # Both flags default ON since native tool-use became the default
+        # dispatch path (patcher.use_structured_tools=false opts back
+        # into the legacy text DSL).
         status, detail = _doctor_check_patcher_mode({})
         assert status == "pass"
         assert "read-before-edit ON" in detail
+        assert "native tool-use ON" in detail
+
+    def test_b6_opt_out_reports_text_dsl(self):
+        status, detail = _doctor_check_patcher_mode({
+            "patcher": {"use_structured_tools": False},
+        })
+        assert status == "pass"
         assert "native tool-use OFF" in detail
         assert "text DSL active" in detail
 

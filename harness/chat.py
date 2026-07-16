@@ -128,6 +128,8 @@ async def run_chat(
     """
     if not session_id:
         import uuid
+        # uuid4, not uuid7: a truncated uuid7 is mostly timestamp bits, so
+        # short ids minted close together would collide.
         session_id = f"chat-{uuid.uuid4().hex[:8]}"
     if reader is None:
         reader = input

@@ -65,15 +65,32 @@ class TestPreflightGuard:
         assert _preflight_dependency_guard() is None
 
     def test_returns_exit_and_prints(self, monkeypatch, capsys):
-        # Fail the IMPORT name (uuid_extensions); the message must name the
-        # PIP package (uuid7) — that's what the operator has to install.
+        # Fail the IMPORT name (yaml); the message must name the PIP
+        # package (pyyaml) — that's what the operator has to install.
         monkeypatch.setattr(
-            importlib, "import_module", _fake_import(fail={"uuid_extensions"}),
+            importlib, "import_module", _fake_import(fail={"yaml"}),
         )
         rc = _preflight_dependency_guard()
         assert rc == 1
         err = capsys.readouterr().err
-        assert "uuid7" in err and "pip install -e ." in err
+        assert "pyyaml" in err and "pip install -e ." in err
+
+    def test_interpreter_below_floor_rejected(self, monkeypatch, capsys):
+        # Editable installs upgraded via `git pull` never re-check
+        # requires-python; the guard must catch a 3.11-3.13 interpreter
+        # before anything reaches uuid.uuid7().
+        import collections
+        import harness.cli as cli_mod
+        _vi = collections.namedtuple(
+            "version_info", "major minor micro releaselevel serial",
+        )
+        monkeypatch.setattr(
+            cli_mod.sys, "version_info", _vi(3, 11, 9, "final", 0),
+        )
+        rc = _preflight_dependency_guard()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "3.14" in err and "uuid.uuid7" in err
 
 
 class TestNoDrift:

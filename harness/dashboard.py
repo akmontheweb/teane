@@ -4763,7 +4763,7 @@ def make_request_handler(
             request_id = (
                 str(prompt.get("request_id"))
                 if prompt.get("request_id")
-                else _uuid.uuid4().hex
+                else _uuid.uuid7().hex
             )
             entry = get_hitl_queue().register_pending(
                 request_id=request_id, session_id=session_id, prompt=prompt,

@@ -6465,7 +6465,7 @@ async def _run_best_of_n_flow(
         run_best_of_n_build,
     )
 
-    session = uuid.uuid4().hex
+    session = uuid.uuid7().hex
     base_argv = reconstruct_child_argv(list(sys.argv))
     runner = make_subprocess_variant_runner(base_argv)
     logger.info(
@@ -9690,11 +9690,6 @@ _RUNTIME_DEPENDENCIES: tuple[tuple[str, str], ...] = (
     ("tree_sitter", "tree-sitter"),
     ("tree_sitter_language_pack", "tree-sitter-language-pack"),
     ("httpx", "httpx"),
-    # The `uuid7` pip package installs a module named `uuid_extensions`
-    # (there is no importable `uuid7` module). Probing "uuid7" made the
-    # guard fail on every environment — even a correct `pip install -e .`
-    # — bricking cmd_run/cmd_resume at startup.
-    ("uuid_extensions", "uuid7"),
     ("typing_extensions", "typing-extensions"),
     ("yaml", "pyyaml"),
     ("pypdf", "pypdf"),
@@ -9743,6 +9738,20 @@ def _preflight_dependency_guard() -> "int | None":
     is missing, instead of letting a raw ImportError escape mid-startup.
     Returns an exit code to propagate, or None when the environment is
     complete."""
+    # Interpreter floor first. pip enforces requires-python at install
+    # time, but an editable install upgraded via `git pull` never
+    # re-checks — a 3.11-3.13 venv would crash later at uuid.uuid7().
+    if sys.version_info < (3, 14):
+        print(
+            "[teane] Cannot start — Python "
+            f"{sys.version_info.major}.{sys.version_info.minor} is below "
+            "the required 3.14 (session ids use the stdlib uuid.uuid7, "
+            "added in 3.14).\n"
+            "        Recreate the venv with Python 3.14+ and reinstall:\n"
+            "            pip install -e .",
+            file=sys.stderr,
+        )
+        return 1
     missing = _missing_runtime_dependencies()
     if not missing:
         return None

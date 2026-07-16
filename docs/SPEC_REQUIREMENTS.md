@@ -273,7 +273,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
   - Given a clean config, no `Unknown config key` warnings are emitted.
 
 ### FR-031: Continuous Integration Gate
-- **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.11 / 3.12 / 3.13 on `ubuntu-latest` (blocking) plus `macos-latest` and `windows-latest` on Python 3.12 (advisory via `continue-on-error: true`). A separate `quality` job MUST run `ruff check` (blocking gate) plus `ruff format --check` and `mypy harness/` (advisory until typing/format backlog clears). The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing blocking job MUST block merge; advisory failures MUST NOT.
+- **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.14 on `ubuntu-latest` (blocking) plus `macos-latest` and `windows-latest` on Python 3.14 (advisory via `continue-on-error: true`). A separate `quality` job MUST run `ruff check` (blocking gate) plus `ruff format --check` and `mypy harness/` (advisory until typing/format backlog clears). The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing blocking job MUST block merge; advisory failures MUST NOT.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
   - Given a PR that breaks any test, the `pytest (py3.11, ubuntu-latest)` / `(py3.12, ubuntu-latest)` / `(py3.13, ubuntu-latest)` job(s) fail and block merge.
@@ -738,7 +738,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - Discovery JSON trust guards: 1 MB byte-size cap + depth-10 recursion guard in `trust.validate_discovery_json`
 - Sandbox network auto-enable gated by `sandbox.auto_enable_network_for_install` opt-in (default false)
 - Hard cap on the discovery interview loop via `node_throttle.max_discovery_iterations` (default 10)
-- GitHub Actions CI: pytest pack on Linux (Python 3.11 / 3.12 / 3.13, blocking) plus macOS + Windows (Python 3.12, advisory `continue-on-error`); separate `quality` job with `ruff check` blocking
+- GitHub Actions CI: pytest pack on Linux (Python 3.14, blocking) plus macOS + Windows (Python 3.14, advisory `continue-on-error`); separate `quality` job with `ruff check` blocking
 - MIT `LICENSE` at repo root; `requirements-prod.txt` with exact transitive pins for reproducible pilot installs
 
 ### Out-of-Scope

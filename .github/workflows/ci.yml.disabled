@@ -23,12 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.14"]
         include:
           - os: macos-latest
-            python-version: "3.12"
+            python-version: "3.14"
           - os: windows-latest
-            python-version: "3.12"
+            python-version: "3.14"
     env:
       # Non-TTY auto-approval path inside cmd_run; ensures HITL gates
       # never block CI by waiting on stdin.

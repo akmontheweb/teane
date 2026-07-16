@@ -571,8 +571,10 @@ def generate_session_id(user_provided: Optional[str] = None) -> str:
         logger.info("[storage] Using user-provided session ID: %s", session_id)
         return session_id
 
-    session_id = str(uuid.uuid4())
-    logger.info("[storage] Auto-generated session ID (UUIDv4): %s", session_id)
+    # UUIDv7: the leading bits are a ms timestamp, so session ids (and the
+    # log/debug filenames derived from them) sort chronologically.
+    session_id = str(uuid.uuid7())
+    logger.info("[storage] Auto-generated session ID (UUIDv7): %s", session_id)
     return session_id
 
 

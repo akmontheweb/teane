@@ -99,6 +99,8 @@ def spawn_harness_subcommand(
         if resolved and os.path.isabs(resolved):
             harness_binary = resolved
 
+    # uuid4, not uuid7: a truncated uuid7 is mostly timestamp bits, so
+    # short ids minted close together would collide.
     session_id = f"web-{_uuid.uuid4().hex[:12]}"
     log_dir = os.path.expanduser(cfg.log_dir)
     os.makedirs(log_dir, exist_ok=True)

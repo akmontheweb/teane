@@ -24591,7 +24591,7 @@ async def run_graph(
 
     # Generate session identifiers
     if not session_id:
-        session_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid7())
     if thread_id is None:
         thread_id = session_id  # Use session_id as thread_id for simplicity
 

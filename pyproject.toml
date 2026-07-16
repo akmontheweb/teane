@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "teane"
 version = "1.0.0"
 description = "Production-grade, model-agnostic AI agent harness with LangGraph orchestration, sandboxed builds, and bulletproof persistence."
-requires-python = ">=3.11"
+# 3.14 floor: session/thread ids use stdlib uuid.uuid7() (time-ordered,
+# added in 3.14) instead of the abandoned third-party `uuid7` package.
+requires-python = ">=3.14"
 license = { file = "LICENSE" }
 authors = [
     { name = "Teane Team" }
@@ -23,7 +25,6 @@ dependencies = [
     # Dart coverage (which doesn't have a standalone PyPI distribution).
     "tree-sitter-language-pack>=1.8.0",
     "httpx>=0.28.0",
-    "uuid7>=0.1.0",
     "typing-extensions>=4.12.0",
     # Loader for harness/security_fix_rules.yaml — the Layer-2 rule
     # table that catches absence-based scanner findings (e.g.
@@ -134,7 +135,7 @@ exclude_lines = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 strict = true
 warn_return_any = false
 warn_unused_configs = true

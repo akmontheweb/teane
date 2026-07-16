@@ -574,14 +574,14 @@ AgentState fields and which nodes write to them:
 | Layer | Technology | Justification |
 |-------|-----------|---------------|
 | **Orchestration** | LangGraph ≥ 0.4.0 | Stateful graph execution with checkpointing; typed state schema |
-| **Language** | Python 3.11+ (CI: 3.11 / 3.12 / 3.13) | TypedDict, asyncio improvements, `None`-aware operators |
+| **Language** | Python 3.14+ (CI: 3.14) | TypedDict, asyncio improvements, `None`-aware operators |
 | **Persistence** | aiosqlite + WAL mode | Crash-safe, zero-config, survives reboots; WAL for concurrent reads |
 | **File I/O** | aiofiles ≥ 24.0 | Non-blocking disk ops with sync fallback for missing dep |
 | **AST Parsing** | tree-sitter + tree-sitter-language-pack ≥ 1.8 | Single wheel covering the locked stack (Python / Java / JS / TS / TSX) plus surrounding grammars used by the patcher; replaces individual grammar packages with one dependency line. |
 | **HTTP Client** | httpx ≥ 0.28 | Async HTTP/2 with connection pooling and timeout management |
 | **Config** | JSON (discovered hierarchically) | Workspace `.harness_config.json` → `~/.harness/config.json` → `cli.json` |
 | **Testing** | pytest + pytest-asyncio | Async test support, fixture injection, coverage |
-| **CI** | GitHub Actions matrix | `pytest tests/ -q --tb=short` across Python 3.11 / 3.12 / 3.13 on `ubuntu-latest` (blocking) + Python 3.12 on `macos-latest` and `windows-latest` (advisory `continue-on-error`); separate `quality` job runs `ruff check` (blocking) plus `ruff format` and `mypy` (advisory). |
+| **CI** | GitHub Actions matrix | `pytest tests/ -q --tb=short` across Python 3.14 on `ubuntu-latest` (blocking) + Python 3.14 on `macos-latest` and `windows-latest` (advisory `continue-on-error`); separate `quality` job runs `ruff check` (blocking) plus `ruff format` and `mypy` (advisory). |
 | **Pre-commit** | pre-commit + local pytest hook + ruff | Same suite + lint gate runs locally as in CI; bypassable with `--no-verify` for emergencies only |
 | **Linting** | ruff ≥ 0.8 | Fast Python linter + formatter; `ruff check harness/ tests/` is the blocking CI gate |
 | **Type Checking** | mypy ≥ 1.13 (strict mode) | TypedDict validation; advisory in CI pending typing backlog |
@@ -1392,7 +1392,7 @@ schedule.db
 ## 8. Deployment & Environment
 
 ### 8.1 Runtime Requirements
-- Python 3.11+ (3.11 / 3.12 / 3.13 covered by CI; macOS + Windows on 3.12 as advisory `continue-on-error` matrix entries)
+- Python 3.14+ (3.14 covered by CI; macOS + Windows on 3.14 as advisory `continue-on-error` matrix entries)
 - Linux is the blocking CI target. macOS and Windows + WSL2 are best-effort via the Docker backend; the `unshare` backend and fcntl workspace lock are Linux-only.
 - Git 2.x+ (for branch lifecycle management)
 - Sandbox: Docker daemon (preferred), OR Linux user-namespace support

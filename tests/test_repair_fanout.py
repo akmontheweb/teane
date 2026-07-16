@@ -124,6 +124,40 @@ def _run(coro):
 
 
 class TestFanout:
+    def test_config_off_is_inert_even_at_threshold(self, git_workspace):
+        # repair_fanout=false (the shipped default) must be a hard no-op:
+        # no variant dispatches, no worktrees — repair_node falls through
+        # to its normal single sequential dispatch, exactly as before the
+        # feature existed.
+        calls = []
+
+        async def dispatch(msgs, budget):  # pragma: no cover — must not run
+            calls.append(msgs)
+            return _response("x"), budget
+
+        state = _state(git_workspace)
+        state["speculative_config"] = {"repair_fanout": False}
+        out = _run(maybe_run_repair_fanout(
+            state=state, messages=[], dispatch=dispatch,
+            workspace_path=str(git_workspace), budget=1.0,
+            loop_counter={"no_progress_repairs": 2},  # trigger WOULD be met
+        ))
+        assert out is None
+        assert calls == []
+
+    def test_absent_speculative_section_is_inert(self, git_workspace):
+        # A config with no speculative section at all (older configs) must
+        # also mean fanout-off.
+        async def dispatch(msgs, budget):  # pragma: no cover — must not run
+            raise AssertionError("dispatch must not be called")
+
+        out = _run(maybe_run_repair_fanout(
+            state={"workspace_path": str(git_workspace)}, messages=[],
+            dispatch=dispatch, workspace_path=str(git_workspace), budget=1.0,
+            loop_counter={"no_progress_repairs": 2},
+        ))
+        assert out is None
+
     def test_trigger_not_met_returns_none_without_dispatch(self, git_workspace):
         calls = []
 

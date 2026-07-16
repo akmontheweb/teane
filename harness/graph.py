@@ -12172,6 +12172,132 @@ def _targeted_tests_first_selectors(
     return nodeids
 
 
+_FAILURE_SURFACE_MAX_LINES = 60
+_FAILURE_SURFACE_MAX_BYTES = 6000
+
+# Test-runner report sections. Start regexes are tried in order — the
+# first one with a match anchors the section (pytest: the detailed
+# FAILURES/ERRORS block beats the terse summary when both exist); the
+# LAST occurrence wins so re-runs anchor the final report. The end
+# regex is the runner's closing summary line, so trailing noise from a
+# LATER pipeline step never leaks into the extraction.
+_TEST_REPORT_SECTIONS: tuple[
+    tuple[str, tuple[re.Pattern[str], ...], re.Pattern[str]], ...
+] = (
+    (
+        "pytest",
+        (
+            re.compile(r"^=+ (FAILURES|ERRORS) =+$"),
+            re.compile(r"^=+ short test summary info =+$"),
+        ),
+        re.compile(r"^=+ .*(failed|error|passed|no tests ran).* =+$"),
+    ),
+    (
+        "jest",
+        (
+            re.compile(r"^Summary of all failing tests"),
+            re.compile(r"^\s*● "),
+        ),
+        re.compile(r"^(Tests:|Test Suites:).*"),
+    ),
+)
+
+
+def _extract_failure_surface(raw_log: str) -> tuple[str, str]:
+    """Pull the actual failure text out of ``raw_log`` for the
+    RAW_BUILD_STDERR synthetic diagnostic.
+
+    The sandbox streamers return stdout and stderr CONCATENATED (all
+    stdout, then all stderr — see ``MemoryLogStreamer.read_all``), so
+    "the last 40 lines" is really the tail of stderr. Package
+    installers (uv / pip / npm) write their progress to stderr, which
+    means any build command that installs deps late buries the test
+    runner's stdout report under installer noise — finsearch session
+    b674f3ca burned 12 blind repair rounds on exactly that shape.
+    Scan the WHOLE log for known failure surfaces instead of trusting
+    position:
+
+      1. test-runner report sections (pytest FAILURES/ERRORS/summary,
+         jest failures) — last section start through its summary line;
+      2. the last Python traceback block;
+      3. a window around the last generic error-ish line;
+      4. the existing last-N-non-blank-lines tail.
+
+    Returns ``(strategy, text)`` — strategy is logged so blind-repair
+    incidents can be triaged from the session log alone.
+    """
+    lines = [ln for ln in (raw_log or "").splitlines() if ln.strip()]
+    if not lines:
+        return "empty", "(raw build output was empty)"
+
+    def _clip(selected: list[str]) -> str:
+        if len(selected) > _FAILURE_SURFACE_MAX_LINES:
+            half = _FAILURE_SURFACE_MAX_LINES // 2
+            selected = (
+                selected[:half]
+                + [f"... ({len(selected) - 2 * half} line(s) elided) ..."]
+                + selected[-half:]
+            )
+        text = "\n".join(selected)
+        if len(text) > _FAILURE_SURFACE_MAX_BYTES:
+            # Keep the END — summaries and assertion messages sit there.
+            text = "(clipped)...\n" + text[-_FAILURE_SURFACE_MAX_BYTES:]
+        return text
+
+    # 1. Test-runner report sections.
+    for name, start_res, end_re in _TEST_REPORT_SECTIONS:
+        start = next(
+            (
+                i
+                for start_re in start_res
+                for i in range(len(lines) - 1, -1, -1)
+                if start_re.search(lines[i])
+            ),
+            None,
+        )
+        if start is None:
+            continue
+        end = next(
+            (j for j in range(start + 1, len(lines)) if end_re.search(lines[j])),
+            None,
+        )
+        # pytest prints FAILURES, then short-summary, then the final
+        # "= N failed ... =" line — one contiguous span, so anchoring
+        # on FAILURES naturally carries the summary along.
+        section = lines[start:(end + 1) if end is not None else len(lines)]
+        return f"{name}_report", _clip(section)
+
+    # 2. Last Python traceback block (through its trailing exception line).
+    tb_start = next(
+        (i for i in range(len(lines) - 1, -1, -1)
+         if lines[i].lstrip().startswith("Traceback (most recent call last)")),
+        None,
+    )
+    if tb_start is not None:
+        tb_end = tb_start
+        for j in range(tb_start + 1, len(lines)):
+            stripped = lines[j][:1]
+            tb_end = j
+            # First non-indented line after the frames is the exception.
+            if stripped not in (" ", "\t"):
+                break
+        return "traceback", _clip(lines[tb_start:tb_end + 1])
+
+    # 3. Window around the last generic error-ish line.
+    err_re = re.compile(r"(?i)\b(error|failed|failure|exception|fatal|panic)\b")
+    last_err = next(
+        (i for i in range(len(lines) - 1, -1, -1) if err_re.search(lines[i])),
+        None,
+    )
+    if last_err is not None:
+        return "error_window", _clip(
+            lines[max(0, last_err - 20):last_err + 10]
+        )
+
+    # 4. Legacy fallback: tail of the (stdout+stderr concatenated) log.
+    return "tail", _clip(lines[-40:])
+
+
 async def compiler_node(state: AgentState) -> dict[str, Any]:
     """
     Node 3: The Verifier.
@@ -13166,11 +13292,12 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         and not node_state.get("build_command_cd_missing")
         and not node_state.get("no_tests_collected")
     ):
-        # Tail-only: pytest / uv / npm etc. can emit thousands of lines and
-        # the LLM's repair context is expensive. The last ~40 non-blank
-        # lines almost always contain the actual failure surface.
-        raw_lines = [ln for ln in (raw_log or "").splitlines() if ln.strip()]
-        tail = "\n".join(raw_lines[-40:]) or "(raw build output was empty)"
+        # Scan the WHOLE log for the failure surface rather than taking
+        # the last ~40 lines: the streamers concatenate stdout THEN
+        # stderr, so a positional tail is really the stderr tail —
+        # installer noise (uv/pip/npm progress) masks the test runner's
+        # stdout report. See _extract_failure_surface.
+        strategy, surface = _extract_failure_surface(raw_log)
         compiler_errors = [{
             "file": "<build-command>",
             "line": 0,
@@ -13180,9 +13307,10 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             "message": (
                 f"Build command exited with code {exit_code} but no parser "
                 f"(stderr, pyright, tsc, prod-smoke, pip-resolution, "
-                f"env-misconfig) extracted a structured diagnostic. Raw "
-                f"tail below — infer the failure from the shell output:\n"
-                f"---\n{tail}\n---"
+                f"env-misconfig) extracted a structured diagnostic. "
+                f"Highest-signal excerpt of the shell output "
+                f"(strategy={strategy}) — infer the failure from it:\n"
+                f"---\n{surface}\n---"
             ),
             "semantic_context": f"Build command: {build_cmd}. Exit code: {exit_code}.",
             "missing_symbol": "",
@@ -13191,8 +13319,8 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         logger.warning(
             "[compiler_node] Synthesized RAW_BUILD_STDERR diagnostic "
             "(exit=%d, no parsed errors, no HITL short-circuit matched). "
-            "Tail bytes=%d, kept lines=%d.",
-            exit_code, len(tail), len(raw_lines[-40:]),
+            "Extraction strategy=%s, bytes=%d.",
+            exit_code, strategy, len(surface),
         )
 
     # Rotate the survival-tracking fingerprints: yesterday's "current"

@@ -65,7 +65,11 @@ class TestPreflightGuard:
         assert _preflight_dependency_guard() is None
 
     def test_returns_exit_and_prints(self, monkeypatch, capsys):
-        monkeypatch.setattr(importlib, "import_module", _fake_import(fail={"uuid7"}))
+        # Fail the IMPORT name (uuid_extensions); the message must name the
+        # PIP package (uuid7) — that's what the operator has to install.
+        monkeypatch.setattr(
+            importlib, "import_module", _fake_import(fail={"uuid_extensions"}),
+        )
         rc = _preflight_dependency_guard()
         assert rc == 1
         err = capsys.readouterr().err

@@ -91,6 +91,28 @@ class TestValidateConfigStrict:
         assert "Unknown nested key 'token_budget.hrad_cap_usd'" in msg
         assert "hard_cap_usd" in msg  # difflib suggestion
 
+    def test_llm_judgment_section_accepted(self, openai_key):
+        # The documented kill-switch section for the cheap judgment
+        # touchpoints must validate — it was previously unregistered,
+        # so setting any switch (e.g. repair_history_condense: false)
+        # crashed startup instead of disabling the touchpoint.
+        cfg = _min_valid_config()
+        cfg["llm_judgment"] = {
+            "repair_reflection": False,
+            "repair_history_condense": False,
+        }
+        cfg["repair"] = {"structured_diagnostic_payload": False}
+        validate_config_strict(cfg, source="test")
+
+    def test_llm_judgment_typo_rejected(self, openai_key):
+        cfg = _min_valid_config()
+        cfg["llm_judgment"] = {"repair_history_condence": False}  # typo
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        msg = str(exc.value)
+        assert "Unknown nested key 'llm_judgment.repair_history_condence'" in msg
+        assert "repair_history_condense" in msg  # difflib suggestion
+
     def test_deployment_defaults_valid_passes(self, openai_key):
         # A populated deployment_defaults section with the four known
         # sub-sections (network, storage, secrets, infra_sync) is

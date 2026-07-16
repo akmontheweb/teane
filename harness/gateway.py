@@ -2134,6 +2134,14 @@ class GatewayConfig:
     # current round's repair LLM. ~$0.001 per round. Off by setting
     # llm_judgment.repair_reflection=false.
     llm_judgment_repair_reflection: bool = True
+    # Repair-history condenser. Once the repair loop passes the prune
+    # threshold, the dropped mid-history is folded into a one-message
+    # LLM-written digest instead of being silently deleted, so later
+    # rounds keep "what was tried / what's a dead end" without replaying
+    # 15-20k-char emissions. Incremental (only newly-dropped turns are
+    # summarized each round, ~$0.001) and fail-open to the plain prune.
+    # Off by setting llm_judgment.repair_history_condense=false.
+    llm_judgment_repair_history_condense: bool = True
     # Phase 4 — emit a structured JSON block of every diagnostic in the
     # repair prompt alongside the markdown summary, so the LLM has the
     # raw data and can override the harness's cascade ranking if it
@@ -3916,6 +3924,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         llm_judgment_repair_reflection=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(
                 "repair_reflection", True,
+            )
+        ),
+        llm_judgment_repair_history_condense=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "repair_history_condense", True,
             )
         ),
         repair_structured_diagnostic_payload=bool(

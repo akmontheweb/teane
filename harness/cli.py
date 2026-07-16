@@ -657,6 +657,16 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # worktrees and apply the winner. Off by default. See
     # harness/best_of_n_runner.py.
     "best_of_n",
+    # Kill switches for the cheap LLM-judgment touchpoints (HITL escalation
+    # summary, patcher-rejection diagnosis, repair reflection, repair-history
+    # condenser, ...). All default True; see GatewayConfig.llm_judgment_*.
+    # Previously documented but rejected by this validator — the switches
+    # were unusable.
+    "llm_judgment",
+    # Repair-node tuning (structured_diagnostic_payload). Read by the
+    # gateway config factory; same previously-unregistered situation as
+    # llm_judgment.
+    "repair",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -1007,6 +1017,20 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # web_language MUST equal {"React", "TypeScript", "TailwindCSS"}.
     "core_languages": frozenset({
         "backend_language", "web_language",
+    }),
+    # Per-touchpoint kill switches for the cheap LLM-judgment calls.
+    # Names match the config-side keys read by the gateway factory
+    # (create_gateway_from_config), NOT the GatewayConfig attribute
+    # names. All default True when the section is absent.
+    "llm_judgment": frozenset({
+        "hitl_escalation_summary", "patcher_rejection_diagnosis",
+        "preflight_autofix_judgment", "discovery_saturation_check",
+        "repair_reflection", "discovery_followup_focus",
+        "app_usage_guide", "repair_history_condense",
+    }),
+    # Repair-node tuning read by the gateway factory.
+    "repair": frozenset({
+        "structured_diagnostic_payload",
     }),
 }
 
@@ -9666,7 +9690,11 @@ _RUNTIME_DEPENDENCIES: tuple[tuple[str, str], ...] = (
     ("tree_sitter", "tree-sitter"),
     ("tree_sitter_language_pack", "tree-sitter-language-pack"),
     ("httpx", "httpx"),
-    ("uuid7", "uuid7"),
+    # The `uuid7` pip package installs a module named `uuid_extensions`
+    # (there is no importable `uuid7` module). Probing "uuid7" made the
+    # guard fail on every environment — even a correct `pip install -e .`
+    # — bricking cmd_run/cmd_resume at startup.
+    ("uuid_extensions", "uuid7"),
     ("typing_extensions", "typing-extensions"),
     ("yaml", "pyyaml"),
     ("pypdf", "pypdf"),

@@ -14922,18 +14922,41 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # Use the autofix-augmented messages list so the LLM sees the
         # "we already fixed X" system message and doesn't re-fix.
         messages = list(autofix_messages)
-        # Prune the mid-array history once total_repairs > 3. The
+        # Condense the mid-array history once total_repairs > 3. The
         # immutable system prompt + initial user turn stay pinned at
         # the front (prefix-cache anchor); the last few turns carry
-        # the fresh error signal. Everything between is provably not
-        # helping — finsearch STORY-042 spent 10+ rounds arguing with
-        # its own round-4 assistant message. See
+        # the fresh error signal; the dropped middle is folded into a
+        # one-message digest by a cheap judgment call (fail-open to
+        # the plain prune) so later rounds keep "what was tried /
+        # what's a dead end" — finsearch STORY-042 spent 10+ rounds
+        # arguing with its own round-4 assistant message. See
         # harness/repair_context.py for the rationale.
-        from harness.repair_context import prune_repair_messages
-        messages = prune_repair_messages(
-            messages, total_repairs=loop_counter["total_repairs"],
-        )
+        from harness.repair_context import condense_repair_messages
         budget = state.get("budget_remaining_usd", 2.00)
+        _condense_budget = {"value": budget}
+
+        async def _condense_call(prompt: str) -> Optional[str]:
+            text, _condense_budget["value"] = await _maybe_judgment_llm(
+                prompt=prompt,
+                budget_remaining_usd=_condense_budget["value"],
+                purpose="repair_history_condense",
+                enabled=bool(getattr(
+                    gateway.config,
+                    "llm_judgment_repair_history_condense",
+                    True,
+                )),
+            )
+            return text
+
+        messages = await condense_repair_messages(
+            messages,
+            total_repairs=loop_counter["total_repairs"],
+            judgment_call=_condense_call,
+        )
+        if _condense_budget["value"] != budget:
+            budget = _condense_budget["value"]
+            state = cast(AgentState, dict(state))
+            state["budget_remaining_usd"] = budget
 
         # --- Cross-Model Speculative Execution ---
         # Use the cheap model (repair_primary) for the first N-1 attempts;

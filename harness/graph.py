@@ -16028,7 +16028,49 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             )
 
         workspace = state.get("workspace_path", os.getcwd())
-        response, new_budget = await _dispatch_repair(messages, budget)
+
+        # Repair-level fanout (speculative.repair_fanout, off by default).
+        # When the no-progress streak hits the configured round count,
+        # sample N repair variants, test-compile each in a worktree seeded
+        # with the current dirty workspace, and substitute the best
+        # response for this round's single dispatch. Everything below —
+        # READ_FILE cycle, patcher, bookkeeping — runs unchanged on the
+        # substituted response; the workspace is only mutated by the
+        # normal apply path. Fail-open: None → plain sequential dispatch.
+        _fanout_outcome = None
+        try:
+            from harness.speculative import maybe_run_repair_fanout
+            _fanout_outcome = await maybe_run_repair_fanout(
+                state=state,
+                messages=messages,
+                dispatch=_dispatch_repair,
+                workspace_path=workspace,
+                budget=budget,
+                loop_counter=loop_counter,
+            )
+        except Exception:  # noqa: BLE001 — fanout must never break repair
+            logger.warning(
+                "[repair_node] repair fanout errored; using sequential "
+                "dispatch.", exc_info=True,
+            )
+        if _fanout_outcome is not None:
+            response, new_budget = _fanout_outcome.response, _fanout_outcome.budget
+            # Aggregate the non-chosen variants' token usage too, so the
+            # tracker reflects the full fanout spend (the chosen response's
+            # usage is aggregated on the main path below).
+            _tt = state.get("token_tracker", {})
+            for _usage in _fanout_outcome.extra_usages:
+                _tt = gateway.aggregate_tokens(_tt, _usage, role=NodeRole.REPAIR)
+            state = cast(AgentState, dict(state))
+            state["token_tracker"] = _tt
+            logger.info(
+                "[repair_node] repair fanout %s — continuing with the "
+                "selected variant's response.",
+                "produced a compiling winner" if _fanout_outcome.won
+                else "found no clean winner (best-applying variant kept)",
+            )
+        else:
+            response, new_budget = await _dispatch_repair(messages, budget)
 
         # Continuation on finish_reason=="length" — opt-in via
         # llm_dispatch.continue_on_length.repair. Cost-aware: repair

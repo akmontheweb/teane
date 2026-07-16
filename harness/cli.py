@@ -890,6 +890,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "diversity_mode", "cost_strategy", "salvage_strategy",
         "max_concurrency", "variant_models", "variant_prompt_styles",
         "expensive_model", "cheap_model", "voting",
+        # Repair-level fanout: after repair_fanout_after_rounds consecutive
+        # no-progress repair rounds, sample repair_fanout_variants repair
+        # responses, test-compile each in a seeded worktree, keep the best.
+        # See harness/speculative.py:maybe_run_repair_fanout.
+        "repair_fanout", "repair_fanout_variants",
+        "repair_fanout_after_rounds",
     }),
     # LLM dispatch parameters consumed by harness/gateway.py.
     # max_tokens_per_role is a free-form dict (role -> int) — the

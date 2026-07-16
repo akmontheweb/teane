@@ -300,6 +300,10 @@
         "variant_prompt_styles": [],
         "expensive_model": "",
         "cheap_model": "",
+        "_repair_fanout_comment": "Repair-level best-of-N. When the sequential repair loop accrues repair_fanout_after_rounds consecutive no-progress rounds, sample repair_fanout_variants repair responses (distinct strategy framings), test-compile each in a git worktree seeded with the current dirty workspace, and hand the best response to the normal repair apply path. Costs N extra dispatches + N sandbox compiles per engagement; off by default. Engages at streak == repair_fanout_after_rounds exactly, so it fires once per climb toward the HITL cap and re-arms after any progress.",
+        "repair_fanout": false,
+        "repair_fanout_variants": 3,
+        "repair_fanout_after_rounds": 2,
         "voting": {
             "n_judges": 3,
             "judge_role": "code_reviewer"

@@ -182,6 +182,16 @@ class SpeculativeConfig:
     num_variants: int = 3
     max_concurrency: int = 3
     temperature: float = 0.3
+    # Repair-level fanout: when the sequential repair loop has burned
+    # ``repair_fanout_after_rounds`` consecutive no-progress rounds,
+    # sample ``repair_fanout_variants`` repair responses (one dispatch
+    # each, distinct strategy framings), test-compile each in a worktree
+    # seeded with the CURRENT dirty workspace, and hand the best response
+    # back to repair_node's normal apply path. Off by default — N extra
+    # dispatches + N sandbox compiles per engagement.
+    repair_fanout: bool = False
+    repair_fanout_variants: int = 3
+    repair_fanout_after_rounds: int = 2
     # Diversity vectors — used when the mode references them.
     variant_models: list[str] = field(default_factory=list)
     variant_prompt_styles: list[str] = field(default_factory=list)
@@ -266,6 +276,13 @@ class SpeculativeConfig:
             cheap_model=str(raw.get("cheap_model") or ""),
             voting=voting,
             worktree_base_dir=str(raw.get("worktree_base_dir") or "/tmp/.harness/speculative"),
+            repair_fanout=bool(raw.get("repair_fanout", False)),
+            repair_fanout_variants=_clamp_int(
+                raw.get("repair_fanout_variants"), 3, 2, 5,
+            ),
+            repair_fanout_after_rounds=_clamp_int(
+                raw.get("repair_fanout_after_rounds"), 2, 1, 10,
+            ),
         )
 
 
@@ -1644,3 +1661,292 @@ def _fallback_result() -> dict[str, Any]:
             },
         },
     }
+
+# ---------------------------------------------------------------------------
+# 6. Repair-level fanout
+# ---------------------------------------------------------------------------
+# The graph-level speculative_node fans out at PATCH generation (per story /
+# batch entry); the inner compiler<->repair cycle stays sequential and can
+# burn its whole round cap on one stuck trajectory. Repair fanout is the
+# missing variant primitive for that loop: when K consecutive no-progress
+# rounds have accrued, sample N repair responses (distinct strategy
+# framings), test-compile each in a worktree seeded with the CURRENT dirty
+# workspace, and return the best response. The caller (repair_node)
+# substitutes it for the single dispatch it was about to make and runs its
+# ENTIRE normal path unchanged — READ_FILE cycle, patcher, bookkeeping —
+# so the workspace is only ever mutated by the standard apply machinery.
+
+_REPAIR_FANOUT_STRATEGIES: tuple[str, ...] = (
+    "STRATEGY DIRECTIVE: Make the minimal, surgical fix for the single "
+    "highest-priority diagnostic. Touch as few lines as possible; do not "
+    "refactor.",
+    "STRATEGY DIRECTIVE: Re-derive the root cause from scratch. Previous "
+    "rounds may have misdiagnosed the failure — consider that the real "
+    "defect is upstream of the reported symptom (wrong file, wrong layer, "
+    "wrong assumption in a caller or fixture).",
+    "STRATEGY DIRECTIVE: Abandon the approach taken in previous rounds. "
+    "Rewrite the affected block(s) cleanly rather than patching the prior "
+    "attempt; prefer replacing a whole function body over another "
+    "incremental edit.",
+    "STRATEGY DIRECTIVE: Suspect the tests and environment as much as the "
+    "code: check for stale imports, fixture drift, and assertions that "
+    "no longer match intended behaviour, and fix whichever side is wrong.",
+    "STRATEGY DIRECTIVE: Fix the top diagnostic AND audit the same pattern "
+    "elsewhere in the touched files — apply the corrected pattern "
+    "consistently in one pass.",
+)
+
+
+@dataclass
+class RepairFanoutOutcome:
+    """What ``maybe_run_repair_fanout`` hands back to repair_node."""
+    response: Any                    # winning (or best-effort) LLMResponse
+    budget: float                    # budget after all variant dispatches
+    won: bool                        # True when a variant compiled clean
+    extra_usages: list[Any] = field(default_factory=list)
+    """Usage payloads from the non-returned variant dispatches, so the
+    caller can aggregate the FULL token spend, not just the winner's."""
+
+
+def repair_fanout_should_engage(
+    cfg: "SpeculativeConfig", loop_counter: dict[str, Any],
+) -> bool:
+    """Engage exactly when the no-progress streak reaches the configured
+    round count. The == (not >=) comparison makes engagement self-limiting:
+    one fanout per climb toward the HITL cap — if the fanout round fails,
+    the streak keeps climbing past the threshold without re-engaging; if
+    it succeeds, the streak resets and the trigger re-arms for the next
+    stall.
+    """
+    if not cfg.repair_fanout:
+        return False
+    streak = int(loop_counter.get("no_progress_repairs", 0) or 0)
+    return streak == cfg.repair_fanout_after_rounds
+
+
+def _seed_worktree_from_workspace(workspace_path: str, worktree_path: str) -> int:
+    """Overlay the workspace's uncommitted state onto a fresh HEAD worktree.
+
+    ``git worktree add --detach HEAD`` reproduces the last commit, but the
+    repair loop runs mid-batch with many uncommitted modifications — a
+    variant compiled against bare HEAD would be judged against stale code.
+    Copy every path ``git status`` reports (modified, added, untracked;
+    gitignore respected) and mirror deletions. Returns the number of paths
+    synced. NUL-separated output (-z) so quoting/renames can't corrupt
+    paths.
+    """
+    result = subprocess.run(
+        ["git", "-C", workspace_path, "status", "--porcelain=v1", "-z", "-uall"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git status failed: {result.stderr.strip()[:200]}")
+    synced = 0
+    entries = [e for e in result.stdout.split("\0") if e]
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        status, path = entry[:2], entry[3:]
+        if status.startswith(("R", "C")):
+            # Rename/copy entries carry the ORIGIN path as the next
+            # NUL-separated record; the destination is in this one.
+            i += 1
+        src = os.path.join(workspace_path, path)
+        dst = os.path.join(worktree_path, path)
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst) or worktree_path, exist_ok=True)
+            shutil.copy2(src, dst)
+            synced += 1
+        elif not os.path.exists(src) and os.path.isfile(dst):
+            os.remove(dst)
+            synced += 1
+    return synced
+
+
+async def maybe_run_repair_fanout(
+    *,
+    state: dict[str, Any],
+    messages: list[dict[str, Any]],
+    dispatch: Any,
+    workspace_path: str,
+    budget: float,
+    loop_counter: dict[str, Any],
+    compile_variant: Any = None,
+) -> Optional[RepairFanoutOutcome]:
+    """Run the repair fanout when the trigger is met; None means "caller
+    proceeds with its normal single dispatch" (disabled, trigger not met,
+    unborn HEAD, or every variant dispatch failed). Never raises.
+
+    ``dispatch`` is repair_node's own ``_dispatch_repair`` (escalation
+    model + cache family included) called as ``await dispatch(msgs,
+    budget) -> (response, new_budget)``. Variant diversity comes from
+    per-variant strategy directives appended as the final user message.
+    ``compile_variant`` is a test seam: ``await compile_variant(vr) -> vr``
+    with ``vr.exit_code`` set; the default runs the state's build command
+    in a sandbox against the variant's worktree.
+    """
+    try:
+        cfg = SpeculativeConfig.from_state(state)
+        if not repair_fanout_should_engage(cfg, loop_counter):
+            return None
+        if not _repo_has_resolvable_head(workspace_path):
+            logger.info(
+                "[repair_fanout] Skipping: workspace has no commits "
+                "(unborn HEAD) — worktrees need a HEAD to branch from.",
+            )
+            return None
+
+        n = cfg.repair_fanout_variants
+        logger.info(
+            "[repair_fanout] Engaging: %d consecutive no-progress repair "
+            "round(s) reached the configured threshold — sampling %d "
+            "repair variant(s).",
+            loop_counter.get("no_progress_repairs", 0), n,
+        )
+
+        # --- Dispatch N variants (sequential: budget threads through) ---
+        responses: list[Any] = []
+        for i in range(n):
+            strategy = _REPAIR_FANOUT_STRATEGIES[i % len(_REPAIR_FANOUT_STRATEGIES)]
+            variant_messages = list(messages) + [
+                {"role": "user", "content": strategy},
+            ]
+            try:
+                response, budget = await dispatch(variant_messages, budget)
+                responses.append(response)
+            except Exception as exc:  # noqa: BLE001 — one bad variant is fine
+                logger.warning(
+                    "[repair_fanout] Variant %d dispatch failed: %s", i, exc,
+                )
+                responses.append(None)
+        live = [r for r in responses if r is not None
+                and (getattr(r, "content", "") or "").strip()]
+        if not live:
+            logger.warning("[repair_fanout] Every variant dispatch failed.")
+            return None
+
+        # --- Apply each variant in a seeded worktree and compile ---
+        build_command = str(state.get("build_command") or "")
+        worktree_base = os.path.join(cfg.worktree_base_dir, "repair")
+        variant_results: list[VariantResult] = []
+
+        async def _default_compile(vr: "VariantResult") -> "VariantResult":
+            from harness.sandbox import SandboxExecutor
+            sandbox_config = dict(state.get("sandbox_config") or {})
+            variant_env = _build_variant_cache_env(
+                vr.worktree_path,
+                use_shared_package_cache=bool(sandbox_config.get("cache_volumes")),
+            )
+            executor = SandboxExecutor(
+                workspace_path=vr.worktree_path,
+                extra_env=variant_env,
+                sandbox_config=sandbox_config,
+                allow_network=bool(state.get("allow_network", False)),
+                session_id=state.get("session_id"),
+            )
+            result = await executor.run(build_command)
+            vr.exit_code = result.exit_code
+            vr.timed_out = result.timed_out
+            return vr
+
+        compile_fn = compile_variant or _default_compile
+
+        for i, response in enumerate(responses):
+            if response is None or not (getattr(response, "content", "") or "").strip():
+                continue
+            variant_id = str(uuid.uuid4())[:8]
+            worktree_path = os.path.join(worktree_base, f"repair-{i}-{variant_id}")
+            vr = VariantResult(index=i, variant_id=variant_id, worktree_path=worktree_path)
+            vr.llm_response = response
+            if not _create_worktree(workspace_path, worktree_path):
+                vr.error = "worktree creation failed"
+                vr.worktree_path = ""
+                variant_results.append(vr)
+                continue
+            try:
+                synced = _seed_worktree_from_workspace(workspace_path, worktree_path)
+                logger.info(
+                    "[repair_fanout] Variant %d worktree seeded with %d "
+                    "dirty path(s) from the workspace.", i, synced,
+                )
+                patch_results, modified = await process_llm_patch_output(
+                    response.content, worktree_path, existing_modified_files=[],
+                )
+                vr.patch_results = patch_results
+                vr.modified_files = modified
+                if not any(r.success for r in patch_results):
+                    vr.error = f"no patches applied ({len(patch_results)} attempted)"
+                    variant_results.append(vr)
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                vr.error = f"apply failed: {exc}"
+                variant_results.append(vr)
+                continue
+            variant_results.append(vr)
+
+        compile_sem = asyncio.Semaphore(max(1, cfg.max_concurrency))
+
+        async def _compile_gated(vr: "VariantResult") -> "VariantResult":
+            if vr.error or not vr.worktree_path or not build_command:
+                return vr
+            async with compile_sem:
+                try:
+                    return await compile_fn(vr)
+                except Exception as exc:  # noqa: BLE001
+                    vr.error = f"compile failed: {exc}"
+                    return vr
+
+        variant_results = list(await asyncio.gather(
+            *[_compile_gated(vr) for vr in variant_results]
+        ))
+
+        # --- Select: first clean compile wins; else best-effort ---
+        winner = next(
+            (vr for vr in variant_results
+             if not vr.error and vr.exit_code == 0 and not vr.timed_out),
+            None,
+        )
+        for vr in variant_results:
+            logger.info(
+                "[repair_fanout] Variant %d: exit=%s patches=%d error=%s%s",
+                vr.index, vr.exit_code, len(vr.patch_results),
+                vr.error or "-",
+                " <- WINNER" if winner is vr else "",
+            )
+        _cleanup_worktrees(workspace_path, worktree_base, variant_results)
+
+        if winner is not None:
+            chosen = winner.llm_response
+            won = True
+        else:
+            # No variant compiled clean: hand back the response whose
+            # patches at least APPLIED (most patcher successes), so the
+            # round costs no additional dispatch and the loop's normal
+            # feedback machinery sees a concrete attempt.
+            applied = [vr for vr in variant_results if not vr.error]
+            best = max(
+                applied,
+                key=lambda vr: sum(1 for r in vr.patch_results if r.success),
+                default=None,
+            )
+            chosen = best.llm_response if best is not None else live[0]
+            won = False
+            logger.info(
+                "[repair_fanout] No variant compiled clean — continuing "
+                "the sequential round with the best-applying variant.",
+            )
+        extra = [
+            getattr(r, "usage", None) for r in live
+            if r is not chosen and getattr(r, "usage", None)
+        ]
+        return RepairFanoutOutcome(
+            response=chosen, budget=budget, won=won, extra_usages=extra,
+        )
+    except Exception:  # noqa: BLE001 — fanout must never break the repair loop
+        logger.warning(
+            "[repair_fanout] Fanout failed; falling back to the normal "
+            "sequential dispatch.", exc_info=True,
+        )
+        return None

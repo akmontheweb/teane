@@ -3461,6 +3461,30 @@ async def _patching_tool_loop(
                     emit_event("tool_call_succeeded", tool_name="read_file")
             except Exception:  # noqa: BLE001 — telemetry must never block
                 pass
+        # Answer EVERY tool_call id from the assistant turn, not just the
+        # navigation subset. _build_assistant_tool_turn persists all the
+        # tool_use blocks, and OpenAI-compatible providers reject the
+        # follow-up with 400 when any id lacks a tool response (observed
+        # live: deepseek, eval fix_off_by_one — the model mixed read_file
+        # with patch-operation calls in one response, and the next
+        # dispatch 400'd). Non-nav operations are deferred, not executed:
+        # this loop's contract is navigation-only, and the model re-emits
+        # its operations once it has seen the file contents.
+        _answered_ids = {r.get("tool_use_id") for r in tool_results}
+        for call in tool_calls_list:
+            _cid = call.get("id") or ""
+            if _cid in _answered_ids:
+                continue
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": _cid,
+                "content": (
+                    "Deferred — the file contents you requested are in "
+                    "this turn. Re-emit this operation in your next "
+                    "response, updated for what the files actually "
+                    "contain."
+                ),
+            })
         messages.append(MessageDict(role="user", content=tool_results))
         # Re-dispatch.
         try:

@@ -1,7 +1,7 @@
 # Teane Eval Harness
 
 A thin scaffolding for measuring harness changes before / after. Walks every
-task in `golden_set.yaml`, drives `teane run` against an isolated temp
+task in `golden_set.yaml`, drives `teane build` / `teane patch` against an isolated temp
 workspace per task, and emits `results.json` with cost, tokens, cache hit
 rate, and per-tool error rates.
 

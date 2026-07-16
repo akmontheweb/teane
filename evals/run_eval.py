@@ -6,8 +6,8 @@ each in an isolated temp workspace, and writes a per-task results record
 to ``evals/results.json``. Pair with ``compare.py`` to print a delta vs.
 ``baseline.json``.
 
-This is intentionally minimal: a subprocess shells out to ``teane run``
-per task, the runner reconstructs metrics from the on-disk JSONL logs via
+This is intentionally minimal: a subprocess shells out to ``teane build``
+(greenfield) or ``teane patch`` (brownfield fixtures) per task, the runner reconstructs metrics from the on-disk JSONL logs via
 ``harness.metrics.aggregate_session``, and a success_check shell command
 decides pass/fail per task.
 
@@ -43,6 +43,11 @@ except ImportError:  # pragma: no cover — surfaced at CLI time
 
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent
+
+# Test seam: the watchdog tests swap this for a fake child (e.g.
+# ``[sys.executable, "-c", "import time; time.sleep(60)"]``) so timeout
+# and process-group-kill behaviour is testable without LLM spend.
+_HARNESS_CMD_PREFIX: list[str] = [sys.executable, "-m", "harness.cli"]
 DEFAULT_GOLDEN_SET = EVAL_DIR / "golden_set.yaml"
 DEFAULT_OUTPUT = EVAL_DIR / "results.json"
 DEFAULT_LOG_DIR = Path(os.path.expanduser("~/.harness/logs"))
@@ -58,6 +63,10 @@ class TaskRecord:
     session_id: str
     workspace: str
     error: Optional[str] = None
+    # Last ~600 chars of the harness subprocess's stderr on non-zero exit —
+    # without this, an instant contract failure (wrong flags, missing
+    # product_spec/) reads as a bare exit code and needs manual repro.
+    stderr_tail: str = ""
     total_cost_usd: float = 0.0
     llm_call_count: int = 0
     tokens_in: int = 0
@@ -81,20 +90,33 @@ def _load_tasks(path: Path) -> list[dict[str, Any]]:
     return tasks
 
 
-def _materialise_workspace(task: dict[str, Any], dest: Path) -> None:
+def _materialise_workspace(
+    task: dict[str, Any], dest: Path, *, new_build: bool, description: str,
+) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     fixture_dir = task.get("fixture_dir")
-    if not fixture_dir:
-        return
-    src = (EVAL_DIR / fixture_dir).resolve()
-    if not src.is_dir():
-        raise FileNotFoundError(f"fixture_dir {src} does not exist for task {task.get('name')}")
-    for entry in src.iterdir():
-        target = dest / entry.name
-        if entry.is_dir():
-            shutil.copytree(entry, target, dirs_exist_ok=True)
-        else:
-            shutil.copy2(entry, target)
+    if fixture_dir:
+        src = (EVAL_DIR / fixture_dir).resolve()
+        if not src.is_dir():
+            raise FileNotFoundError(f"fixture_dir {src} does not exist for task {task.get('name')}")
+        for entry in src.iterdir():
+            target = dest / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, target)
+    # The spec files are the authoritative task source since `teane run`
+    # split into build/patch: build refuses to start without product_spec/,
+    # patch without change_requests/*.txt. Write the task description into
+    # the mode's authoritative location (the -p prompt is secondary).
+    if new_build:
+        spec_dir = dest / "product_spec"
+        spec_dir.mkdir(exist_ok=True)
+        (spec_dir / "task.md").write_text(description + "\n", encoding="utf-8")
+    else:
+        cr_dir = dest / "change_requests"
+        cr_dir.mkdir(exist_ok=True)
+        (cr_dir / "eval_task.txt").write_text(description + "\n", encoding="utf-8")
 
 
 def _run_harness(
@@ -105,31 +127,113 @@ def _run_harness(
     new_build: bool,
     timeout_s: int,
 ) -> tuple[int, Optional[str]]:
-    """Invoke ``teane run`` in a subprocess. Returns (exit_code, error_str)."""
+    """Invoke the harness in a subprocess. Returns (exit_code, error_str).
+
+    ``teane run`` was split into the four-target CLI: greenfield tasks
+    (``new_build: true``) drive ``teane build`` (workspace reset implied,
+    ``--yes`` confirms it); brownfield fixture tasks drive ``teane patch``
+    (which has no ``--yes``/reset semantics).
+    """
     cmd = [
-        sys.executable, "-m", "harness.cli", "run",
+        *_HARNESS_CMD_PREFIX,
+        "build" if new_build else "patch",
         "--workspace", str(workspace),
         "--prompt", prompt,
         "--session-id", session_id,
-        "--new-build", "true" if new_build else "false",
-        "--yes",
+        # Eval profile: skip the interactive discovery interview rounds —
+        # the task description in the spec file IS the whole requirement,
+        # and discovery is the dominant wall-clock cost of the modern
+        # pipeline (a greenfield hello-world spent 70+ min in synthesis
+        # with discovery on).
+        "--spec-discovery", "false",
+        "--cd-discovery", "false",
     ]
+    if new_build:
+        cmd.append("--yes")
     env = os.environ.copy()
     env.setdefault("TEANE_EVAL", "1")
+
+    # Manual watchdog instead of subprocess.run(timeout=...): a 600s cap
+    # was observed NOT firing while the harness child ran 68+ minutes
+    # (runner parked in poll()), and run()'s kill-on-timeout only signals
+    # the direct child — MCP-server / sandbox grandchildren leak (an
+    # orphaned `harness.cli` was found reparented to init). Popen with
+    # start_new_session=True + killpg bounds the WHOLE tree, and the
+    # drain threads + poll loop cannot miss the deadline.
+    import signal
+    import threading
+
+    bufs: dict[str, list[str]] = {"out": [], "err": []}
+
+    def _drain(stream: Any, key: str) -> None:
+        try:
+            for line in stream:
+                bufs[key].append(line)
+        except Exception:  # noqa: BLE001 — stream closed on kill
+            pass
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(REPO_ROOT),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_s,
+            start_new_session=True,
         )
-        return proc.returncode, None
-    except subprocess.TimeoutExpired:
-        return 124, f"timeout after {timeout_s}s"
     except Exception as exc:  # noqa: BLE001 — surface every reason
-        return 1, f"{type(exc).__name__}: {exc}"
+        return 1, f"{type(exc).__name__}: {exc}", ""
+
+    threads = [
+        threading.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    # Belt and suspenders on the deadline: monotonic AND wall clock (a
+    # 600s subprocess.run timeout was once observed not firing while the
+    # child ran 68+ minutes), plus a per-minute heartbeat so a stalled
+    # watchdog is visible in the output stream instead of silent.
+    deadline = time.monotonic() + timeout_s
+    wall_deadline = time.time() + timeout_s
+    next_beat = time.monotonic() + 60.0
+    while proc.poll() is None:
+        now = time.monotonic()
+        if now >= deadline or time.time() >= wall_deadline:
+            break
+        if now >= next_beat:
+            print(
+                f"[eval] watchdog: {int(max(deadline - now, 0))}s remaining",
+                flush=True,
+            )
+            next_beat = now + 60.0
+        time.sleep(1.0)
+
+    timed_out = proc.poll() is None
+    if timed_out:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    for t in threads:
+        t.join(timeout=5)
+
+    stderr_text = "".join(bufs["err"])
+    stdout_text = "".join(bufs["out"])
+    if timed_out:
+        return 124, f"timeout after {timeout_s}s (process group killed)", (
+            (stderr_text + stdout_text)[-600:]
+        )
+    tail = ""
+    if proc.returncode != 0:
+        tail = (stderr_text + stdout_text)[-600:]
+    return proc.returncode, None, tail
 
 
 def _run_success_check(workspace: Path, command: str) -> int:
@@ -168,7 +272,9 @@ def run_task(task: dict[str, Any], *, log_dir: Path) -> TaskRecord:
     with tempfile.TemporaryDirectory(prefix=f"teane-eval-{name}-") as tmp:
         workspace = Path(tmp)
         try:
-            _materialise_workspace(task, workspace)
+            _materialise_workspace(
+                task, workspace, new_build=new_build, description=description,
+            )
         except Exception as exc:  # noqa: BLE001
             return TaskRecord(
                 name=name, success=False, harness_exit_code=-1, check_exit_code=None,
@@ -177,7 +283,7 @@ def run_task(task: dict[str, Any], *, log_dir: Path) -> TaskRecord:
             )
 
         t0 = time.monotonic()
-        exit_code, error = _run_harness(
+        exit_code, error, stderr_tail = _run_harness(
             workspace=workspace, session_id=session_id, prompt=description,
             new_build=new_build, timeout_s=timeout_s,
         )
@@ -207,6 +313,7 @@ def run_task(task: dict[str, Any], *, log_dir: Path) -> TaskRecord:
             session_id=session_id,
             workspace=str(workspace),
             error=error,
+            stderr_tail=stderr_tail,
             total_cost_usd=float(agg.get("total_cost_usd") or 0.0),
             llm_call_count=int(agg.get("llm_call_count") or 0),
             tokens_in=int(agg.get("tokens_in") or 0),
@@ -280,7 +387,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(output, fh, indent=2, sort_keys=True)
-    print(f"[eval] wrote {out_path}")
+    print(f"[eval] wrote {out_path}", flush=True)
     return 0 if all(r.success for r in results) else 1
 
 

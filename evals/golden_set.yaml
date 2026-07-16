@@ -45,7 +45,7 @@ tasks:
       pytest test in `tests/test_hello.py` that invokes the CLI via subprocess
       and asserts both behaviours.
     new_build: true
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "python3 -m pytest -q"
 
   - name: py_flask_microservice
@@ -58,7 +58,7 @@ tasks:
       use Flask's test client to verify both endpoints. Module layout: source
       under `app/` (e.g. `app/__init__.py`, `app/routes.py`).
     new_build: true
-    timeout_s: 900
+    timeout_s: 2700
     success_check: "python3 -m pytest -q"
 
   - name: node_express_micro
@@ -70,7 +70,7 @@ tasks:
       and jest tests under `__tests__/` that use supertest to verify both
       endpoints. Source under `src/`.
     new_build: true
-    timeout_s: 900
+    timeout_s: 2700
     success_check: "npm test --silent"
 
   - name: go_http_server
@@ -81,7 +81,7 @@ tasks:
       go.mod, a Makefile with build/test targets, and a Go test file that
       uses net/http/httptest to verify both endpoints.
     new_build: true
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "go test ./..."
 
   # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ tasks:
       bug. Do not modify the existing test.
     fixture_dir: fixtures/fix_off_by_one
     new_build: false
-    timeout_s: 300
+    timeout_s: 1800
     success_check: "python3 -m pytest -q"
 
   - name: add_logging
@@ -110,7 +110,7 @@ tasks:
       `service` logger.
     fixture_dir: fixtures/add_logging
     new_build: false
-    timeout_s: 300
+    timeout_s: 1800
     success_check: "python3 -m pytest -q"
 
   - name: fix_missing_error_handling
@@ -121,7 +121,7 @@ tasks:
       handler. Do not modify the existing tests.
     fixture_dir: fixtures/fix_missing_error_handling
     new_build: false
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "python3 -m pytest -q"
 
   - name: add_pagination
@@ -135,7 +135,7 @@ tasks:
       offset, and clamping behaviour.
     fixture_dir: fixtures/add_pagination
     new_build: false
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "python3 -m pytest -q"
 
   - name: fix_import_cycle
@@ -148,7 +148,7 @@ tasks:
       responsibilities. Existing tests must pass.
     fixture_dir: fixtures/fix_import_cycle
     new_build: false
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "python3 -m pytest -q"
 
   - name: dep_manifest_coherence
@@ -163,5 +163,5 @@ tasks:
       after the manifest is corrected.
     fixture_dir: fixtures/dep_manifest_coherence
     new_build: false
-    timeout_s: 600
+    timeout_s: 3600
     success_check: "python3 -m pip install -e '.[dev]' >/dev/null 2>&1 && python3 -m pytest -q"

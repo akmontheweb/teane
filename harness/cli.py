@@ -12483,7 +12483,58 @@ def _install_aiosqlite_shutdown_filter() -> None:
     threading.excepthook = _filter
 
 
+def _arm_exit_watchdog(code: int, grace_seconds: float = 60.0) -> None:
+    """Guarantee the process actually exits with ``code``.
+
+    CPython joins NON-daemon threads (``threading._shutdown``) BEFORE
+    running atexit hooks, so a wedged worker thread — e.g. an asyncio
+    default-executor thread blocked on a still-running MCP-server
+    subprocess — parks the interpreter in ``wait_for_thread_shutdown``
+    forever, and the atexit hook that would have killed those servers
+    never gets a chance. Observed live (eval fix_off_by_one): a fatal
+    dispatch error returned from cmd_patch, then the process sat in
+    shutdown for 30+ minutes until killed externally.
+
+    The watchdog is a daemon thread (never blocks shutdown itself): if
+    the process is still alive ``grace_seconds`` after main returned,
+    force the already-decided exit code out with ``os._exit``. Orphaned
+    stdio MCP servers self-terminate on stdin EOF once we're gone.
+    """
+    # Never arm inside a test runner (a lingering armed watchdog would
+    # os._exit the pytest process itself) and honor an operator escape
+    # hatch for debugging shutdown behaviour.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    if os.environ.get("HARNESS_NO_EXIT_WATCHDOG", "").lower() in ("1", "true"):
+        return
+    import threading as _threading
+
+    def _reap() -> None:
+        import time as _time
+        _time.sleep(grace_seconds)
+        print(
+            f"[harness] shutdown did not complete within {grace_seconds:.0f}s "
+            f"(a non-daemon worker thread is wedged) — forcing exit({code}).",
+            file=sys.stderr, flush=True,
+        )
+        os._exit(code)
+
+    _threading.Thread(target=_reap, name="exit-watchdog", daemon=True).start()
+
+
 def main() -> int:
+    """Console-script entry point: dispatch, then arm the exit watchdog
+    so a wedged worker thread can never hold the process open past the
+    decided exit code. See :func:`_arm_exit_watchdog`."""
+    code = 1
+    try:
+        code = _dispatch_command()
+    finally:
+        _arm_exit_watchdog(code)
+    return code
+
+
+def _dispatch_command() -> int:
     """
     Primary CLI entry point. Dispatches to the correct subcommand handler.
 

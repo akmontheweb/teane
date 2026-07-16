@@ -129,3 +129,50 @@ class TestDoctorEnvPlaceholders:
         assert "/srv/work" in rows["env override: TEANE_MCP_FS_ROOT"][1]
         assert rows["env override: TEANE_VOLUME_ROOT"][0] == "pass"
         assert "default used" in rows["env override: TEANE_VOLUME_ROOT"][1]
+
+
+class TestPreflightEnvReport:
+    def test_logs_resolutions_and_warns_on_missing_fs_root(self, caplog):
+        from harness.cli import _preflight_config_env_report
+        config = {
+            "mcp": {
+                "enabled": True,
+                "servers": [{
+                    "name": "fs",
+                    "command": [
+                        "npx", "-y",
+                        "@modelcontextprotocol/server-filesystem",
+                        "/nonexistent/root/for/test",
+                    ],
+                }],
+            },
+        }
+        with caplog.at_level("INFO", logger="harness.cli"):
+            _preflight_config_env_report(config)
+        text = caplog.text
+        assert "env override: TEANE_MCP_FS_ROOT" in text  # resolution lines
+        assert "does not exist on this host" in text      # missing-root warning
+        assert "TEANE_MCP_FS_ROOT" in text
+
+    def test_existing_root_produces_no_warning(self, caplog, tmp_path):
+        from harness.cli import _preflight_config_env_report
+        config = {
+            "mcp": {
+                "enabled": True,
+                "servers": [{
+                    "name": "fs",
+                    "command": [
+                        "npx", "-y",
+                        "@modelcontextprotocol/server-filesystem",
+                        str(tmp_path),
+                    ],
+                }],
+            },
+        }
+        with caplog.at_level("WARNING", logger="harness.cli"):
+            _preflight_config_env_report(config)
+        assert "does not exist" not in caplog.text
+
+    def test_never_raises(self):
+        from harness.cli import _preflight_config_env_report
+        _preflight_config_env_report({"mcp": {"enabled": True, "servers": [None, 42]}})

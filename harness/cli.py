@@ -6640,6 +6640,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # vars for routed models. By running this before _acquire_workspace_lock
     # we avoid leaving a stale lock file when the operator's config is bad.
     config = discover_config(workspace_path)
+    _preflight_config_env_report(config)
 
     # Opt-in trajectory-level best-of-N. Default off; a child variant sets
     # TEANE_BEST_OF_N_CHILD so it never re-enters (no fork bomb), and the
@@ -8008,6 +8009,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     _set_git_enabled(bool(getattr(args, "git", True)))
 
     config = discover_config(workspace_path)
+    _preflight_config_env_report(config)
 
     # Bind the active session_id immediately so any pre-graph dispatches
     # (e.g. checkpoint health-check helpers, future hooks) and the in-graph
@@ -8783,6 +8785,45 @@ def _doctor_check_env_placeholders() -> list[tuple[str, tuple[str, str]]]:
                 ("fail", f"unset and no ':-default' in config — export {var}"),
             ))
     return rows
+
+
+def _preflight_config_env_report(config: dict[str, Any]) -> None:
+    """One startup log line per ``${TEANE_*}``/``${HARNESS_*}`` placeholder
+    (env override vs default), plus a WARNING when the resolved MCP
+    filesystem root doesn't exist on this host.
+
+    Hard failures (unset var without default, malformed placeholder) are
+    already raised by ``load_raw_config`` before this runs — this is the
+    visibility half: env-resolved config is invisible state, and the
+    session log should answer "which value fed that path?" without a
+    trip to ``teane doctor``. Never raises; a nonexistent MCP root is a
+    degradation (the server start fails and is skipped), not an abort.
+    """
+    try:
+        for name, (status, detail) in _doctor_check_env_placeholders():
+            logger.info("[preflight] %s: %s", name, detail)
+
+        mcp_cfg = config.get("mcp") or {}
+        if not mcp_cfg.get("enabled", False):
+            return
+        for server in (mcp_cfg.get("servers") or []):
+            if not isinstance(server, dict):
+                continue
+            command = server.get("command") or []
+            if not (isinstance(command, list) and len(command) > 1
+                    and any("server-filesystem" in str(c) for c in command)):
+                continue
+            root = str(command[-1])
+            if root and not os.path.isdir(root):
+                logger.warning(
+                    "[preflight] MCP filesystem root `%s` (server `%s`) "
+                    "does not exist on this host — the fs server will "
+                    "fail to start and its tools will be missing. Export "
+                    "TEANE_MCP_FS_ROOT or fix mcp.servers in config.json.",
+                    root, server.get("name") or "fs",
+                )
+    except Exception:  # noqa: BLE001 — reporting must never block startup
+        logger.debug("[preflight] config env report failed", exc_info=True)
 
 
 # Search backends the harness ships built-in, which never need an

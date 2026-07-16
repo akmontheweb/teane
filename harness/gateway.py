@@ -1539,6 +1539,63 @@ def _compact_dropped_messages(
     return digest if estimate_token_count([digest]) <= token_budget else None
 
 
+def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove ``tool_use`` / ``tool_result`` blocks left orphaned by
+    truncation.
+
+    Native tool-use turns come in pairs: an assistant ``tool_use`` block and
+    the following user ``tool_result`` that references its id. If the
+    context-window trim keeps one side but drops the other, Anthropic (and the
+    OpenAI-normalized path) reject the request with an unmatched-tool error.
+    This pass drops a ``tool_result`` whose ``tool_use`` was dropped and vice
+    versa. ``messages[0]`` (system anchor) and ``messages[-1]`` (current turn)
+    are always preserved intact.
+    """
+    if len(messages) <= 2:
+        return messages
+    body = messages[1:-1]
+
+    use_ids = {
+        b.get("id")
+        for m in body if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    }
+    # Drop tool_result blocks whose tool_use is gone (and messages emptied by it).
+    stage1: list[dict[str, Any]] = []
+    for m in body:
+        c = m.get("content")
+        if m.get("role") == "user" and isinstance(c, list):
+            nb = [b for b in c if not (isinstance(b, dict)
+                  and b.get("type") == "tool_result" and b.get("tool_use_id") not in use_ids)]
+            if not nb:
+                continue
+            if len(nb) != len(c):
+                m = {**m, "content": nb}
+        stage1.append(m)
+
+    result_ids = {
+        b.get("tool_use_id")
+        for m in stage1 if m.get("role") == "user" and isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    }
+    # Drop tool_use blocks whose tool_result is gone (and messages emptied by it).
+    stage2: list[dict[str, Any]] = []
+    for m in stage1:
+        c = m.get("content")
+        if m.get("role") == "assistant" and isinstance(c, list):
+            nb = [b for b in c if not (isinstance(b, dict)
+                  and b.get("type") == "tool_use" and b.get("id") not in result_ids)]
+            if not nb:
+                continue
+            if len(nb) != len(c):
+                m = {**m, "content": nb}
+        stage2.append(m)
+
+    return [messages[0]] + stage2 + [messages[-1]]
+
+
 async def check_context_window(
     messages: list[dict[str, Any]],
     spec: ModelSpec,
@@ -1638,6 +1695,10 @@ async def check_context_window(
         truncated.insert(1, digest)
 
     truncated.append(messages[-1])
+
+    # Drop any tool_use/tool_result blocks orphaned by the trim so the
+    # provider doesn't reject an unmatched pair (native tool-use turns).
+    truncated = _strip_orphan_tool_blocks(truncated)
 
     final_estimate = estimate_token_count(truncated)
     logger.info(

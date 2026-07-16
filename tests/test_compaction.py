@@ -99,3 +99,45 @@ class TestCompaction:
         out = _run(msgs, window=2000)
         assert gw.estimate_token_count(out) <= int(2000 * 0.85)
         assert len(_digest_of(out)) == 1
+
+
+def _orphaned_tool_results(msgs):
+    use_ids = {
+        b.get("id")
+        for m in msgs if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+        for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use"
+    }
+    return [
+        b for m in msgs if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+        and b.get("tool_use_id") not in use_ids
+    ]
+
+
+class TestOrphanToolBlocks:
+    def test_strip_drops_orphan_tool_result(self):
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "GONE", "content": "x"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "A", "name": "grep"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "A", "content": "ok"}]},
+            {"role": "user", "content": "final"},
+        ]
+        out = gw._strip_orphan_tool_blocks(msgs)
+        assert _orphaned_tool_results(out) == []
+        assert out[0] is msgs[0] and out[-1] is msgs[-1]
+
+    def test_compaction_leaves_no_orphans(self):
+        spec = _spec(1200)
+        msgs = [{"role": "system", "content": "SYS"}]
+        for i in range(8):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": f"T{i}", "name": "grep"},
+                {"type": "text", "text": "x" * 400}]})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"T{i}", "content": "y" * 400}]})
+        msgs.append({"role": "user", "content": "now"})
+        out = asyncio.run(gw.check_context_window(msgs, spec, 0.85))
+        assert _orphaned_tool_results(out) == []
+        assert gw.estimate_token_count(out) <= int(1200 * 0.85)

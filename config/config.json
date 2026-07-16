@@ -67,6 +67,7 @@
         "google:gemini-3.5-flash": {
             "provider": "google",
             "model_id": "gemini-3.5-flash",
+            "supports_tools": true,
             "context_window": 128000,
             "input_cost_per_1m": 1.5,
             "output_cost_per_1m": 9.0,
@@ -79,6 +80,7 @@
         "google:gemini-3.1-pro-preview": {
             "provider": "google",
             "model_id": "gemini-3.1-pro-preview",
+            "supports_tools": true,
             "context_window": 128000,
             "input_cost_per_1m": 2.0,
             "output_cost_per_1m": 12.0,
@@ -91,6 +93,7 @@
         "openai:gpt-4o-mini": {
             "provider": "openai",
             "model_id": "gpt-4o-mini",
+            "supports_tools": true,
             "context_window": 128000,
             "input_cost_per_1m": 0.15,
             "output_cost_per_1m": 0.6,
@@ -103,6 +106,7 @@
         "anthropic:claude-sonnet-4": {
             "provider": "anthropic",
             "model_id": "claude-sonnet-4-20250514",
+            "supports_tools": true,
             "context_window": 200000,
             "input_cost_per_1m": 3.0,
             "output_cost_per_1m": 15.0,
@@ -115,6 +119,7 @@
         "deepseek:deepseek-v4-pro": {
             "provider": "deepseek",
             "model_id": "deepseek-v4-pro",
+            "supports_tools": true,
             "context_window": 1000000,
             "input_cost_per_1m": 0.435,
             "output_cost_per_1m": 0.87,
@@ -127,6 +132,7 @@
         "deepseek:deepseek-v4-flash": {
             "provider": "deepseek",
             "model_id": "deepseek-v4-flash",
+            "supports_tools": true,
             "context_window": 1000000,
             "input_cost_per_1m": 0.14,
             "output_cost_per_1m": 0.28,
@@ -139,6 +145,7 @@
         "ollama:qwen2.5-coder:14b": {
             "provider": "ollama",
             "model_id": "qwen2.5-coder:14b",
+            "supports_tools": true,
             "context_window": 32768,
             "input_cost_per_1m": 0.0,
             "output_cost_per_1m": 0.0,

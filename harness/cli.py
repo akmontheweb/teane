@@ -648,6 +648,15 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # system-prompt-build time via {{coverage.min_pct}} substitution
     # (see graph._load_skills_markdown).
     "coverage",
+    # Read-only agentic retrieval tools (grep / glob / list_dir / find_symbol
+    # / file_outline / semantic_search / git_blame / git_log) exposed in the
+    # native tool loop. Master switch + output caps. See
+    # harness/retrieval_tools.py.
+    "retrieval_tools",
+    # Opt-in trajectory-level best-of-N: run N teane subprocesses in isolated
+    # worktrees and apply the winner. Off by default. See
+    # harness/best_of_n_runner.py.
+    "best_of_n",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -871,6 +880,20 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     #   more tests. When false coverage is still measured but the threshold
     #   flag is omitted — the build passes regardless of coverage%.
     "coverage": frozenset({"min_pct", "enforce"}),
+    # Read-only agentic retrieval tools exposed in the native tool loop.
+    # enabled=false removes them from the tool list (patch tools still ship).
+    # The rest bound output/latency. See harness/retrieval_tools.py.
+    "retrieval_tools": frozenset({
+        "enabled", "max_results", "max_files", "max_bytes",
+        "grep_timeout_s", "git_timeout_s", "list_dir_depth",
+        "semantic_top_k", "git_log_max",
+    }),
+    # Opt-in trajectory-level best-of-N. enabled + n>1 activates it; strategy
+    # ∈ {first_success, fewest_changes, voted}. See harness/best_of_n_runner.py.
+    "best_of_n": frozenset({
+        "enabled", "n", "strategy", "max_concurrency",
+        "diversity_mode", "per_variant_budget_usd",
+    }),
     # Web research tools. enabled toggles registration of web_fetch +
     # web_search in the SkillRegistry. max_bytes / max_results cap result
     # size. search_backend selects the search provider (only
@@ -6399,6 +6422,49 @@ async def _maybe_start_lsp_pool(
 # 3. Subcommand Handlers
 # ---------------------------------------------------------------------------
 
+async def _run_best_of_n_flow(
+    args: argparse.Namespace, workspace_path: str, bon: Any,
+) -> int:
+    """Fan out ``bon.n`` teane subprocess trajectories in isolated worktrees
+    and apply the winner. Returns 0 when a winner's diff landed, else 1.
+
+    NOTE: this path drives full LLM solves across N subprocesses; its
+    orchestration, worktree lifecycle, and winner-diff application are unit-
+    tested (tests/test_best_of_n_runner.py), but the end-to-end multi-solve is
+    only exercised against a live provider.
+    """
+    import sys
+    import uuid
+    from harness.best_of_n_runner import (
+        make_subprocess_variant_runner,
+        reconstruct_child_argv,
+        run_best_of_n_build,
+    )
+
+    session = uuid.uuid4().hex
+    base_argv = reconstruct_child_argv(list(sys.argv))
+    runner = make_subprocess_variant_runner(base_argv)
+    logger.info(
+        "[best_of_n] fanning out %d trajectories (strategy=%s, concurrency=%d)...",
+        bon.n, bon.strategy, bon.max_concurrency,
+    )
+    winner, results = await run_best_of_n_build(
+        workspace_path, session, bon, variant_runner=runner,
+    )
+    n_ok = sum(1 for r in results if r.compiled_ok)
+    if winner is None:
+        logger.error(
+            "[best_of_n] no trajectory produced an applicable green build "
+            "(%d/%d reached green).", n_ok, len(results),
+        )
+        return 1
+    logger.info(
+        "[best_of_n] winner v%d applied (%d/%d green, %d files changed).",
+        winner.variant_id, n_ok, len(results), winner.changed_files,
+    )
+    return 0
+
+
 async def cmd_run(args: argparse.Namespace) -> int:
     """
     Execute the `teane run` subcommand.
@@ -6483,6 +6549,18 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # vars for routed models. By running this before _acquire_workspace_lock
     # we avoid leaving a stale lock file when the operator's config is bad.
     config = discover_config(workspace_path)
+
+    # Opt-in trajectory-level best-of-N. Default off; a child variant sets
+    # TEANE_BEST_OF_N_CHILD so it never re-enters (no fork bomb), and the
+    # --best-of flag is stripped from the child argv as a second guard. When
+    # active, fan out N teane subprocesses in worktrees and apply the winner.
+    from harness.best_of_n_runner import BestOfNConfig, is_best_of_n_child
+    _bon = BestOfNConfig.from_config(config)
+    _best_of_flag = getattr(args, "best_of", None)
+    if isinstance(_best_of_flag, int) and _best_of_flag > 1:
+        _bon.enabled, _bon.n = True, _best_of_flag
+    if _bon.is_active() and not is_best_of_n_child():
+        return await _run_best_of_n_flow(args, workspace_path, _bon)
 
     # Pin the operator's --hitl-* choices for this run so the
     # human_gatekeeper_node / interactive_review_loop / repair-menu
@@ -11529,6 +11607,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Falls back to config.json's top-level `agile` key, then to false. "
             "Per-knob tuning (batch_size, commit_on_story, repair_cap) lives "
             "in config.json's agile_defaults block."
+        ),
+    )
+    build_parser.add_argument(
+        "--best-of",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="best_of",
+        help=(
+            "Run N independent solve trajectories in isolated git worktrees "
+            "and apply the winner (trajectory-level best-of-N). Overrides "
+            "best_of_n.enabled/n in config.json. Cost scales ~linearly with N."
         ),
     )
     build_parser.add_argument(

@@ -227,6 +227,27 @@
         "json_stderr": false,
         "langsmith": false
     },
+    "_retrieval_tools_comment": "Read-only agentic retrieval tools the model drives inside the native tool loop (requires patcher.use_structured_tools=true and a tool-capable model). enabled=false removes grep/glob/list_dir/find_symbol/file_outline/semantic_search/git_blame/git_log from the tool list (the patch tools still ship, and the model falls back to read_file only). The rest are best-effort output/latency caps: max_results caps grep/find_symbol matches; max_files caps glob/list_dir entries; max_bytes hard-caps any single tool result string; grep_timeout_s/git_timeout_s bound the shell-outs; list_dir_depth is the default tree depth; semantic_top_k is the default chunk count for semantic_search; git_log_max caps git_log commits. find_symbol/file_outline need a running LSP pool (brownfield flows); semantic_search needs a prebuilt index (teane index build) — each degrades to an actionable message otherwise.",
+    "retrieval_tools": {
+        "enabled": true,
+        "max_results": 80,
+        "max_files": 200,
+        "max_bytes": 12000,
+        "grep_timeout_s": 15,
+        "git_timeout_s": 15,
+        "list_dir_depth": 2,
+        "semantic_top_k": 8,
+        "git_log_max": 15
+    },
+    "_best_of_n_comment": "Opt-in trajectory-level best-of-N for `teane build`/`patch`. When enabled with n>1, the harness runs n independent teane subprocesses each in its own git worktree (branched from HEAD), then applies the winner's diff back to the workspace. enabled=false (default) runs a single trajectory exactly as before. n = number of trajectories. strategy selects the winner: first_success (lowest-id green build), fewest_changes (smallest diff among green builds), or voted (a judge over green builds; falls back to fewest_changes). max_concurrency caps how many run at once. diversity_mode is a forward-looking knob (temperature/model/none); meaningful diversity currently relies on sampling nondeterminism. per_variant_budget_usd optionally caps spend per variant. NOTE: this fans out full LLM solves — cost scales ~linearly with n.",
+    "best_of_n": {
+        "enabled": false,
+        "n": 3,
+        "strategy": "first_success",
+        "max_concurrency": 3,
+        "diversity_mode": "temperature",
+        "per_variant_budget_usd": null
+    },
     "_lintgate_comment": "Lintgate behaviour after patches land. format_modified_files=false (default) skips the auto-formatter on pre-existing files so the harness doesn't clobber user style. Linters still run on every modified file. strict_missing_formatter=false (default) silently warns when a configured formatter (ruff, prettier, gofmt, etc.) isn't on PATH; set true to surface as a build-blocking diagnostic so the format lock the spec promises is actually enforced.",
     "lintgate": {
         "format_modified_files": false,

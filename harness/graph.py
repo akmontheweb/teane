@@ -5838,6 +5838,21 @@ def _is_test_path(path: str) -> bool:
     return p in _TEST_INFRA_ROOT_FILES
 
 
+def _is_test_artifact(path: str) -> bool:
+    """Union of the two test predicates, used by the patching test-filters
+    and the repair-loop tamper guard.
+
+    :func:`_is_test_path` is directory-based (anything under ``tests/`` /
+    ``test/`` / ``__tests__/`` or ``conftest.py`` / ``pytest.ini``). It misses
+    *co-located* tests — ``Button.test.tsx``, ``foo_test.py`` sitting next to
+    the source — which are the norm in React/TS. :func:`_is_test_file` catches
+    those by basename across all supported languages. Taking the union means
+    both patching AND repair protect co-located tests, not just files under a
+    ``tests/`` directory.
+    """
+    return _is_test_path(path) or _is_test_file(path)
+
+
 def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
     """Sister of :func:`_filter_test_blocks_from_patch_response` that
     operates on pre-parsed :class:`PatchBlock` instances.
@@ -5851,7 +5866,7 @@ def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
     dropped: list[str] = []
     for block in blocks:
         file_path = getattr(block, "file", "") or ""
-        if _is_test_path(file_path):
+        if _is_test_artifact(file_path):
             op = getattr(block, "operation", "")
             op_name = getattr(op, "value", str(op))
             dropped.append(f"{op_name.lower()}:{file_path}")
@@ -5875,8 +5890,9 @@ def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
     weakening a failing test to turn it green is reward-hacking, not a fix —
     a failing build must be resolved in the production code under test. Test
     files are owned by the test-generation phase, never the solve loop. Uses
-    the same :func:`_is_test_path` predicate as the patching-node filter so
-    both nodes agree on what "a test file" is.
+    the same :func:`_is_test_artifact` predicate as the patching-node filter
+    (dir-based + co-located basenames) so both nodes agree on what "a test
+    file" is.
     """
     from harness.patcher import PatchResult
 
@@ -5884,7 +5900,7 @@ def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
     rejections: list[Any] = []
     for block in blocks:
         file_path = getattr(block, "file", "") or ""
-        if _is_test_path(file_path):
+        if _is_test_artifact(file_path):
             rejections.append(
                 PatchResult(
                     success=False,
@@ -5932,7 +5948,7 @@ def _filter_test_blocks_from_patch_response(
 
     def _maybe_drop(match: "_re.Match[str]") -> str:
         path = match.group(2).strip()
-        if _is_test_path(path):
+        if _is_test_artifact(path):
             dropped.append(f"{match.group(1).lower()}:{path}")
             return ""
         return match.group(0)

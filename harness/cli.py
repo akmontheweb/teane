@@ -455,7 +455,7 @@ def load_raw_config() -> dict[str, Any]:
             f"{path} must contain a JSON object at the top level, got {type(raw).__name__}."
         )
 
-    return _strip_comments(raw)
+    return _expand_env_placeholders(_strip_comments(raw))
 
 
 def load_deployment_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -525,6 +525,73 @@ def _strip_comments(cfg: dict[str, Any]) -> dict[str, Any]:
         else:
             out[key] = value
     return out
+
+
+# Machine-local values in the committed config resolve from the
+# environment, the same way API keys do: the repo commits the shape
+# (`${TEANE_MCP_FS_ROOT:-~/projects/teane}`), each machine supplies its
+# values via exported env vars, and the default after `:-` covers the
+# common case so most machines need no setup at all. ONLY the
+# TEANE_/HARNESS_ namespaces expand — `${POSTGRES_PASSWORD}`-style
+# strings destined for docker-compose or shell templates pass through
+# untouched.
+_ENV_PLACEHOLDER_RE = re.compile(
+    r"\$\{((?:TEANE|HARNESS)_[A-Z0-9_]+)(?::-([^}]*))?\}"
+)
+
+
+def _expand_env_placeholders(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve ``${TEANE_*}`` / ``${HARNESS_*}`` placeholders (with
+    optional ``:-default``) in every string value, then expand a leading
+    ``~``. Raises :class:`ConfigError` naming the variable and the config
+    location when a placeholder has no default and the variable is unset,
+    or when a namespace placeholder is malformed (e.g. unclosed brace).
+    """
+    def _expand_str(value: str, where: str) -> str:
+        def _sub(match: "re.Match[str]") -> str:
+            var, default = match.group(1), match.group(2)
+            resolved = os.environ.get(var)
+            if resolved is None:
+                if default is None:
+                    raise ConfigError(
+                        f"Config value at '{where}' references ${{{var}}} "
+                        f"but the environment variable is not set and no "
+                        f"':-default' was given. Export {var} (like the "
+                        f"API-key env vars) or add a default: "
+                        f"${{{var}:-<value>}}."
+                    )
+                resolved = default
+            return resolved
+
+        expanded = _ENV_PLACEHOLDER_RE.sub(_sub, value)
+        if "${TEANE_" in expanded or "${HARNESS_" in expanded:
+            raise ConfigError(
+                f"Config value at '{where}' contains a malformed "
+                f"TEANE_/HARNESS_ env placeholder: {expanded!r}. Use the "
+                f"form ${{TEANE_NAME}} or ${{TEANE_NAME:-default}}."
+            )
+        if expanded == "~" or expanded.startswith("~/"):
+            expanded = os.path.expanduser(expanded)
+        return expanded
+
+    def _walk(node: Any, where: str) -> Any:
+        if isinstance(node, str):
+            return _expand_str(node, where)
+        if isinstance(node, dict):
+            # ``_``-prefixed keys are inline documentation. _strip_comments
+            # removes them from dicts it reaches, but it doesn't recurse
+            # into lists (e.g. mcp.servers[]) — leave any survivors
+            # verbatim rather than expanding prose.
+            return {
+                k: v if (isinstance(k, str) and k.startswith("_"))
+                else _walk(v, f"{where}.{k}" if where else str(k))
+                for k, v in node.items()
+            }
+        if isinstance(node, list):
+            return [_walk(v, f"{where}[{i}]") for i, v in enumerate(node)]
+        return node
+
+    return _walk(cfg, "")
 
 
 def _warn_if_legacy_workspace_config(workspace_path: str) -> None:
@@ -8679,6 +8746,45 @@ def _doctor_check_config_paths(config: dict[str, Any]) -> list[tuple[str, tuple[
     return rows
 
 
+def _doctor_check_env_placeholders() -> list[tuple[str, tuple[str, str]]]:
+    """Report every ``${TEANE_*}`` / ``${HARNESS_*}`` placeholder in the
+    RAW config file and where its value came from (env override vs the
+    ``:-default``). Env-resolved config is invisible state — this is the
+    line that answers "why is it using that path?" without grepping
+    shell profiles.
+    """
+    rows: list[tuple[str, tuple[str, str]]] = []
+    path = _get_global_config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+    except OSError:
+        return rows  # the config check itself reports unreadable files
+    seen: set[str] = set()
+    for match in _ENV_PLACEHOLDER_RE.finditer(raw_text):
+        var, default = match.group(1), match.group(2)
+        if var in seen:
+            continue
+        seen.add(var)
+        value = os.environ.get(var)
+        if value is not None:
+            rows.append((
+                f"env override: {var}",
+                ("pass", f"set in environment → `{value}`"),
+            ))
+        elif default is not None:
+            rows.append((
+                f"env override: {var}",
+                ("pass", f"unset — default used → `{default}`"),
+            ))
+        else:
+            rows.append((
+                f"env override: {var}",
+                ("fail", f"unset and no ':-default' in config — export {var}"),
+            ))
+    return rows
+
+
 # Search backends the harness ships built-in, which never need an
 # API key even when named as the ``web_tools.search_backend`` primary.
 # Any name outside this set is user-supplied and expected to declare a
@@ -10860,6 +10966,7 @@ async def collect_doctor_results(
         checks.extend(_doctor_check_lsp(config))
         checks.extend(_doctor_check_mcp_commands(config))
         checks.extend(_doctor_check_config_paths(config))
+        checks.extend(_doctor_check_env_placeholders())
         checks.extend(_doctor_check_env_vars_from_config(config))
         checks.extend(await _doctor_check_mcp(config))
     else:

@@ -10342,6 +10342,40 @@ def _reflection_verdict_is_low_signal(verdict: dict[str, str]) -> bool:
     return blocker.startswith("insufficient data")
 
 
+def _judge_calibration_cell(
+    verdict: dict[str, str], actual_progress: bool,
+) -> str:
+    """Classify one (judge verdict, deterministic outcome) pair into a
+    confusion-matrix cell for the reflection-judge calibration metric.
+
+    The reflection judge and the fingerprint-survival check evaluate the
+    SAME previous repair round in the same repair_node invocation — the
+    judge semantically ("did it address the top error?"), the fingerprint
+    diff factually ("did a prior diagnostic disappear / the count
+    shrink?"). Pairing them auto-labels every verdict from data the
+    harness already tracks, so every long run doubles as a calibration
+    dataset with zero extra cost.
+
+    Cells (positive class = "judge said PROGRESS"):
+      tp — PROGRESS and the round factually advanced.
+      fp — PROGRESS but nothing advanced: the expensive error, it delays
+           escalation and burns budget on a stuck loop.
+      tn — DISTRACTION/REGRESSION and nothing advanced.
+      fn — DISTRACTION/REGRESSION but the round DID advance: premature-
+           escalation pressure.
+      low_signal — the "insufficient data" sentinel; excluded from the
+           matrix (the judge abstained) but tracked as a rate, since a
+           high abstention rate is its own defect (judge can't see the
+           diagnostics — see the finsearch b674f3ca incident).
+    """
+    if _reflection_verdict_is_low_signal(verdict):
+        return "low_signal"
+    says_progress = str(verdict.get("verdict") or "").strip().upper() == "PROGRESS"
+    if says_progress:
+        return "tp" if actual_progress else "fp"
+    return "fn" if actual_progress else "tn"
+
+
 def _reflection_grounds_in_diagnostics(
     verdict: dict[str, str],
     compiler_errors: list[dict[str, Any]],
@@ -14189,6 +14223,31 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         ),
                     )
                 except Exception:  # noqa: BLE001
+                    pass
+                # Judge calibration: pair this verdict with the
+                # deterministic fingerprint-survival outcome computed at
+                # the top of this invocation — both evaluate the SAME
+                # previous round. Only emitted when the deterministic
+                # label was informative (not the neutral first-iteration
+                # / no-meaningful-prior credit). Aggregated by
+                # ``teane metrics`` into precision/recall for the judge.
+                try:
+                    if has_meaningful_prior and not is_first_iteration:
+                        from harness.observability import emit_event as _emit_cal
+                        _emit_cal(
+                            "judge_calibration",
+                            cell=_judge_calibration_cell(
+                                reflection_verdict,
+                                bool(prior_round_made_progress),
+                            ),
+                            verdict=str(reflection_verdict.get("verdict") or ""),
+                            actual_progress=bool(prior_round_made_progress),
+                            fps_advanced=bool(fps_advanced),
+                            count_shrank=bool(count_shrank),
+                            iteration=loop_counter["total_repairs"],
+                            session_id=str(state.get("session_id") or ""),
+                        )
+                except Exception:  # noqa: BLE001 — telemetry never breaks repair
                     pass
                 # Stash a compact copy of the FINAL verdict so the next
                 # round's reflection prompt can feed it back for anti-

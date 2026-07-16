@@ -66,6 +66,13 @@ _SYSTEM_PROMPT_BUILT_EVENT = "system_prompt_built"
 # integer counters (how close each tripwire got to firing).
 _LOOP_COUNTER_SNAPSHOT_EVENT = "loop_counter_snapshot"
 
+# Reflection-judge calibration records emitted by repair_node: each pairs
+# the judge's verdict about a repair round with the deterministic
+# fingerprint-survival outcome for the SAME round (see
+# graph._judge_calibration_cell). Cells: tp/fp/tn/fn/low_signal.
+_JUDGE_CALIBRATION_EVENT = "judge_calibration"
+_JUDGE_CELLS = ("tp", "fp", "tn", "fn", "low_signal")
+
 # Default sliding window used by the recent-burn-rate calculation. Ten
 # minutes is short enough to see a runaway session in near-real-time but
 # long enough to smooth across the spiky per-call cost pattern.
@@ -106,6 +113,11 @@ class SessionMetrics:
     # Answers "how close did we get to the HITL threshold this session?"
     # for the stall-tracking counters that reset on progress.
     loop_counter_peak: dict[str, int] = field(default_factory=dict)
+    # Reflection-judge calibration confusion matrix (tp/fp/tn/fn) plus the
+    # low_signal abstention count, accumulated from judge_calibration
+    # events. Positive class = "judge said PROGRESS"; ground truth = the
+    # deterministic fingerprint-survival outcome for the same round.
+    judge_confusion: dict[str, int] = field(default_factory=dict)
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
     recent_burn_rate_usd_per_min: float = 0.0
@@ -138,6 +150,42 @@ class SessionMetrics:
         """Per-tool failure rate for every tool seen this session."""
         return {name: self.tool_error_rate(name) for name in self.tool_call_count}
 
+    def judge_precision(self) -> Optional[float]:
+        """Of the rounds the judge called PROGRESS, how many factually
+        advanced: ``tp / (tp + fp)``. The number to watch — a low value
+        means the judge keeps blessing stuck rounds, delaying escalation
+        and burning budget. None when the judge never said PROGRESS on a
+        labeled round."""
+        tp = self.judge_confusion.get("tp", 0)
+        fp = self.judge_confusion.get("fp", 0)
+        return tp / (tp + fp) if (tp + fp) > 0 else None
+
+    def judge_recall(self) -> Optional[float]:
+        """Of the rounds that factually advanced, how many the judge
+        credited: ``tp / (tp + fn)``. Low recall = premature-escalation
+        pressure. None with no factually-advancing labeled rounds."""
+        tp = self.judge_confusion.get("tp", 0)
+        fn = self.judge_confusion.get("fn", 0)
+        return tp / (tp + fn) if (tp + fn) > 0 else None
+
+    def judge_accuracy(self) -> Optional[float]:
+        """(tp + tn) / all non-abstained labeled verdicts."""
+        m = self.judge_confusion
+        total = sum(m.get(c, 0) for c in ("tp", "fp", "tn", "fn"))
+        if total <= 0:
+            return None
+        return (m.get("tp", 0) + m.get("tn", 0)) / total
+
+    def judge_low_signal_rate(self) -> Optional[float]:
+        """Abstentions ("insufficient data" sentinel) over ALL labeled
+        verdicts. High values mean the judge can't see the diagnostics —
+        an upstream signal-quality defect, not a judgment defect."""
+        m = self.judge_confusion
+        total = sum(m.get(c, 0) for c in _JUDGE_CELLS)
+        if total <= 0:
+            return None
+        return m.get("low_signal", 0) / total
+
     def to_jsonable(self) -> dict[str, Any]:
         """Render the dataclass to a JSON-serialisable dict."""
         return {
@@ -156,6 +204,11 @@ class SessionMetrics:
             "system_prompt_lines": self.system_prompt_lines,
             "loop_counter_final": dict(self.loop_counter_final),
             "loop_counter_peak": dict(self.loop_counter_peak),
+            "judge_confusion": dict(self.judge_confusion),
+            "judge_precision": self.judge_precision(),
+            "judge_recall": self.judge_recall(),
+            "judge_accuracy": self.judge_accuracy(),
+            "judge_low_signal_rate": self.judge_low_signal_rate(),
             "first_ts": self.first_ts.isoformat() if self.first_ts else None,
             "last_ts": self.last_ts.isoformat() if self.last_ts else None,
             "recent_burn_rate_usd_per_min": round(self.recent_burn_rate_usd_per_min, 6),
@@ -367,6 +420,15 @@ def aggregate_session(
                 ts = _parse_ts(rec.get("ts"))
                 if ts is not None:
                     _update_ts_range(metrics, ts)
+            elif event == _JUDGE_CALIBRATION_EVENT:
+                cell = str(rec.get("cell") or "")
+                if cell in _JUDGE_CELLS:
+                    metrics.judge_confusion[cell] = (
+                        metrics.judge_confusion.get(cell, 0) + 1
+                    )
+                ts = _parse_ts(rec.get("ts"))
+                if ts is not None:
+                    _update_ts_range(metrics, ts)
             elif event == _LOOP_COUNTER_SNAPSHOT_EVENT:
                 snapshot = rec.get("loop_counter")
                 if isinstance(snapshot, dict):
@@ -529,6 +591,24 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
             loop_bits.append(f"peak_low_signal={peak['consecutive_low_signal_rounds']}")
         if loop_bits:
             lines.append(f"  Loop health:         {', '.join(loop_bits)}")
+    # Reflection-judge calibration: how trustworthy the verdicts that gate
+    # HITL escalation (and repair-fanout winner selection) actually were.
+    if metrics.judge_confusion:
+        m = metrics.judge_confusion
+
+        def _pct(v: Optional[float]) -> str:
+            return f"{v * 100:.0f}%" if v is not None else "n/a"
+
+        lines.append(
+            "  Judge calibration:   "
+            f"precision={_pct(metrics.judge_precision())}, "
+            f"recall={_pct(metrics.judge_recall())}, "
+            f"accuracy={_pct(metrics.judge_accuracy())}, "
+            f"low_signal={_pct(metrics.judge_low_signal_rate())} "
+            f"(tp={m.get('tp', 0)} fp={m.get('fp', 0)} "
+            f"tn={m.get('tn', 0)} fn={m.get('fn', 0)} "
+            f"abstain={m.get('low_signal', 0)})"
+        )
     lines.append("=" * 60)
     return "\n".join(lines)
 

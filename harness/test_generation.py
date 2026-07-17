@@ -2272,7 +2272,16 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         unfixable: list[str] = []
         for rel in marker_missing:
             guessed = _guess_sources_for_test(rel, source_files)
-            marker_line = _tests_marker_line_for(primary, guessed)
+            # Comment style comes from the FILE being stamped, never the
+            # workspace's primary stack: a mixed py+react workspace
+            # resolved primary to a JS flavour and this autofix wrote
+            # `// @tests:` into tests/__init__.py — a SyntaxError that
+            # took out collection for the whole tests package (lumina
+            # session 019f7054). Same rule the @verifies autofix already
+            # follows via _stack_from_test_path.
+            marker_line = _tests_marker_line_for(
+                _stack_from_test_path(rel), guessed,
+            )
             abs_path = os.path.join(workspace_path, rel)
             if marker_line and _prepend_tests_marker(abs_path, marker_line):
                 autofixed.append(rel)

@@ -5899,7 +5899,62 @@ def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
     return kept, dropped
 
 
-def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
+# Parse-level error codes for the test-guard carve-out below. A file
+# that cannot PARSE cannot have its assertions weakened by making it
+# parse again — and pytest collection dying on one broken test-infra
+# file takes the WHOLE suite down.
+_PARSE_ERROR_CODES = frozenset({"SyntaxError", "IndentationError", "TabError"})
+
+
+def _syntax_broken_test_files(
+    compiler_errors: list[dict[str, Any]], workspace_path: str,
+) -> frozenset[str]:
+    """Test-artifact paths whose current diagnostic is a PARSE error.
+
+    Feeds :func:`_reject_test_patch_blocks`'s carve-out. Lumina session
+    019f7054: the harness's own @tests-marker autofix stamped a
+    JS-style ``//`` comment into ``tests/__init__.py``; the repair LLM
+    emitted the correct one-line fix twice and the test guard rejected
+    it both times — a guaranteed zero-patch HITL for a one-character
+    repair the harness itself had caused. Paths are returned in
+    normalized workspace-relative form (see :func:`_normalize_ws_path`).
+    """
+    out: set[str] = set()
+    for d in compiler_errors or []:
+        if not isinstance(d, dict):
+            continue
+        code = str(d.get("error_code") or d.get("code") or "")
+        if code not in _PARSE_ERROR_CODES:
+            continue
+        raw = str(d.get("file") or "")
+        if not raw:
+            continue
+        norm = _normalize_ws_path(raw, workspace_path)
+        if _is_test_artifact(norm):
+            out.add(norm)
+    return frozenset(out)
+
+
+def _normalize_ws_path(path: str, workspace_path: str) -> str:
+    """Workspace-relative, ``os.path.normpath``-normalized form of
+    ``path``. Absolute paths inside the workspace are relativized
+    (diagnostics anchored via pytest's assertion-rewrite carry absolute
+    paths — lumina 019f7054); everything else passes through
+    normalized."""
+    p = os.path.normpath(str(path or ""))
+    if os.path.isabs(p) and workspace_path:
+        ws = os.path.normpath(os.path.abspath(workspace_path))
+        if p == ws or p.startswith(ws + os.sep):
+            p = os.path.relpath(p, ws)
+    return p
+
+
+def _reject_test_patch_blocks(
+    blocks: list[Any],
+    *,
+    allow_parse_broken: frozenset[str] = frozenset(),
+    workspace_path: str = "",
+) -> tuple[list[Any], list[Any]]:
     """Repair-loop reward-hacking guard.
 
     Counterpart to :func:`_filter_test_patch_blocks` (which protects the
@@ -5917,6 +5972,13 @@ def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
     the same :func:`_is_test_artifact` predicate as the patching-node filter
     (dir-based + co-located basenames) so both nodes agree on what "a test
     file" is.
+
+    Carve-out: ``allow_parse_broken`` (from
+    :func:`_syntax_broken_test_files`) lists test files whose CURRENT
+    diagnostic is a parse error. A file that cannot parse cannot run any
+    assertion, so there is nothing to weaken — and pytest collection
+    failure on one test-infra file blocks the entire suite, turning a
+    one-line repair into a guaranteed HITL when rejected here.
     """
     from harness.patcher import PatchResult
 
@@ -5924,6 +5986,13 @@ def _reject_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[Any]]:
     rejections: list[Any] = []
     for block in blocks:
         file_path = getattr(block, "file", "") or ""
+        if (
+            allow_parse_broken
+            and _normalize_ws_path(file_path, workspace_path)
+            in allow_parse_broken
+        ):
+            kept.append(block)
+            continue
         if _is_test_artifact(file_path):
             rejections.append(
                 PatchResult(
@@ -16542,8 +16611,23 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # hacking, not a fix. Split test-targeting blocks out HERE — before
         # the anti-drift screen and the apply — and surface them as
         # rejections so the LLM is told to fix the production code instead.
+        # Carve-out: a test file whose current diagnostic is a PARSE
+        # error may be repaired — nothing can be weakened in a file that
+        # doesn't parse, and rejecting the fix turns a one-line repair
+        # into a guaranteed zero-patch HITL (lumina 019f7054, where the
+        # harness's own @tests autofix caused the SyntaxError).
+        _parse_broken_tests = _syntax_broken_test_files(
+            raw_errors, workspace,
+        )
+        if _parse_broken_tests:
+            logger.info(
+                "[repair_node:test-guard] Parse-error carve-out active "
+                "for: %s", ", ".join(sorted(_parse_broken_tests)),
+            )
         _blocks_parsed, _test_tamper_rejections = _reject_test_patch_blocks(
-            _blocks_parsed
+            _blocks_parsed,
+            allow_parse_broken=_parse_broken_tests,
+            workspace_path=workspace,
         )
         if _test_tamper_rejections:
             _tt_files = sorted({r.file for r in _test_tamper_rejections})

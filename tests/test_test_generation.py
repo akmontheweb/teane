@@ -739,6 +739,53 @@ class TestTestsMarkerGate:
         assert route_after_test_generation(result) == "lintgate_node"
 
     @pytest.mark.asyncio
+    async def test_marker_comment_style_follows_file_not_primary_stack(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Regression (lumina 019f7054): in a mixed py+ts workspace,
+        _PRIMARY_STACK_PRIORITY resolves primary to "typescript", and the
+        @tests autofix used the PRIMARY stack's comment lead — stamping a
+        JS-style ``// @tests:`` onto a PYTHON file. That's a SyntaxError
+        on line 1 of the test file, which killed pytest collection for
+        the whole package and dead-ended in a zero-patch HITL (the
+        repair loop's test-guard refused to touch the file). The lead
+        must come from the file being stamped, exactly as the @verifies
+        autofix already does."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        # Root package.json + tsconfig → typescript tag, which OUTRANKS
+        # python in _PRIMARY_STACK_PRIORITY.
+        (tmp_path / "package.json").write_text('{"name": "client"}\n')
+        (tmp_path / "tsconfig.json").write_text("{}\n")
+        (tmp_path / "calculator.py").write_text(
+            "def divide(a, b): return a // b\n"
+        )
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calculator.py\n"
+            "content:\n"
+            "from calculator import divide\n"
+            "def test_divide(): assert divide(10, 2) == 5\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed in 0.01s")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calculator.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+        })
+
+        body = (tmp_path / "tests" / "test_calculator.py").read_text()
+        assert "# @tests: calculator.py" in body
+        assert "// @tests" not in body
+        # The autofixed file must still be valid Python.
+        import ast as _ast
+        _ast.parse(body)
+
+    @pytest.mark.asyncio
     async def test_verifies_marker_alone_does_not_satisfy_gate(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):

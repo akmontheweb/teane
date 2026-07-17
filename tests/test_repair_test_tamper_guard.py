@@ -82,6 +82,93 @@ class TestRejectTestPatchBlocks:
 
 
 # -----------------------------------------------------------------------
+# Parse-error carve-out (lumina 019f7054)
+# -----------------------------------------------------------------------
+
+class TestParseErrorCarveOut:
+    """A test file whose CURRENT diagnostic is a parse error may be
+    repaired: a file that doesn't parse can't run any assertion, so
+    there's nothing to weaken — and pytest collection failure on one
+    test-infra file blocks the whole suite. Lumina 019f7054: the
+    harness's own @tests autofix wrote a `//` comment into
+    tests/__init__.py; the repair LLM emitted the correct one-line fix
+    twice and this guard rejected it both times → zero-patch HITL."""
+
+    def test_syntax_broken_test_file_is_editable(self) -> None:
+        from harness.graph import _syntax_broken_test_files
+        diags = [{
+            "file": "tests/__init__.py", "line": 1, "severity": "error",
+            "error_code": "SyntaxError",
+            "message": "SyntaxError: invalid syntax",
+        }]
+        allow = _syntax_broken_test_files(diags, "/ws")
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block("tests/__init__.py", OperationType.REPLACE_BLOCK)],
+            allow_parse_broken=allow, workspace_path="/ws",
+        )
+        assert [b.file for b in kept] == ["tests/__init__.py"]
+        assert rejections == []
+
+    def test_absolute_diag_path_matches_relative_block(self) -> None:
+        # The lumina diagnostic carried an ABSOLUTE path (anchored via
+        # pytest's assertion-rewrite File line); patch blocks may use
+        # either form. Both must normalize to the same key.
+        from harness.graph import _syntax_broken_test_files
+        diags = [{
+            "file": "/ws/tests/__init__.py", "line": 1,
+            "severity": "error", "error_code": "SyntaxError",
+            "message": "SyntaxError: invalid syntax",
+        }]
+        allow = _syntax_broken_test_files(diags, "/ws")
+        for block_path in ("tests/__init__.py", "/ws/tests/__init__.py"):
+            kept, rejections = _reject_test_patch_blocks(
+                [_Block(block_path, OperationType.REPLACE_BLOCK)],
+                allow_parse_broken=allow, workspace_path="/ws",
+            )
+            assert kept and not rejections, block_path
+
+    def test_carve_out_is_per_file_not_blanket(self) -> None:
+        # Only the parse-broken file is editable — sibling test files
+        # stay protected in the same round.
+        from harness.graph import _syntax_broken_test_files
+        diags = [{
+            "file": "tests/__init__.py", "line": 1, "severity": "error",
+            "error_code": "SyntaxError",
+            "message": "SyntaxError: invalid syntax",
+        }]
+        allow = _syntax_broken_test_files(diags, "/ws")
+        kept, rejections = _reject_test_patch_blocks(
+            [
+                _Block("tests/__init__.py", OperationType.REPLACE_BLOCK),
+                _Block("tests/test_api.py", OperationType.REPLACE_BLOCK),
+            ],
+            allow_parse_broken=allow, workspace_path="/ws",
+        )
+        assert [b.file for b in kept] == ["tests/__init__.py"]
+        assert {r.file for r in rejections} == {"tests/test_api.py"}
+
+    def test_assertion_failures_do_not_open_the_carve_out(self) -> None:
+        # A plain failing assertion in a test file is exactly the
+        # reward-hacking case — no carve-out.
+        from harness.graph import _syntax_broken_test_files
+        diags = [{
+            "file": "tests/test_api.py", "line": 40, "severity": "error",
+            "error_code": "AssertionError",
+            "message": "AssertionError: assert 404 == 200",
+        }]
+        assert _syntax_broken_test_files(diags, "/ws") == frozenset()
+
+    def test_parse_error_in_production_file_opens_nothing(self) -> None:
+        from harness.graph import _syntax_broken_test_files
+        diags = [{
+            "file": "server/app/main.py", "line": 3, "severity": "error",
+            "error_code": "SyntaxError",
+            "message": "SyntaxError: invalid syntax",
+        }]
+        assert _syntax_broken_test_files(diags, "/ws") == frozenset()
+
+
+# -----------------------------------------------------------------------
 # Classifier + directive wiring
 # -----------------------------------------------------------------------
 

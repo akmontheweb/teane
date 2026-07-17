@@ -8645,8 +8645,8 @@ def _doctor_check_mcp_commands(config: dict[str, Any]) -> list[tuple[str, tuple[
 _MCP_COMMAND_INSTALL_HINTS: dict[str, str] = {
     "uvx": "pip install uv",
     "npx": "install Node.js (bundles npx)",
-    "python3": "install Python 3.11+",
-    "python": "install Python 3.11+",
+    "python3": "install Python 3.14+",
+    "python": "install Python 3.14+",
     "docker": "install Docker Engine",
 }
 

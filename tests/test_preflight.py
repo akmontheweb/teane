@@ -30,17 +30,18 @@ from harness.preflight import (
 # ---------------------------------------------------------------------------
 
 class TestProbePython:
-    def test_pass_on_3_11(self, monkeypatch):
-        monkeypatch.setattr(sys, "version_info", (3, 11, 0, "final", 0))
+    def test_pass_on_3_14(self, monkeypatch):
+        monkeypatch.setattr(sys, "version_info", (3, 14, 0, "final", 0))
         result = preflight.probe_python()
         assert result.status == STATUS_PASS
-        assert "3.11.0" in result.detail
+        assert "3.14.0" in result.detail
 
-    def test_fail_on_3_10(self, monkeypatch):
-        monkeypatch.setattr(sys, "version_info", (3, 10, 5, "final", 0))
+    def test_fail_on_3_13(self, monkeypatch):
+        # Boundary: the minor just below the floor must fail.
+        monkeypatch.setattr(sys, "version_info", (3, 13, 5, "final", 0))
         result = preflight.probe_python()
         assert result.status == STATUS_FAIL
-        assert "3.10.5" in result.detail
+        assert "3.13.5" in result.detail
         assert result.install_cmd  # has install hint
 
 

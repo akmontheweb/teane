@@ -190,16 +190,16 @@ class TestIdempotentAppend:
 class TestInstallCommandFor:
 
     def test_python_linux(self, setup_module_obj):
-        cmd = setup_module_obj._install_command_for("python3.11", "linux")
+        cmd = setup_module_obj._install_command_for("python3.14", "linux")
         assert "apt install" in cmd
-        assert "python3.11" in cmd
+        assert "python3.14" in cmd
 
     def test_python_macos(self, setup_module_obj):
-        cmd = setup_module_obj._install_command_for("python3.11", "darwin")
-        assert "brew install python@3.11" in cmd
+        cmd = setup_module_obj._install_command_for("python3.14", "darwin")
+        assert "brew install python@3.14" in cmd
 
     def test_python_windows_points_at_python_org(self, setup_module_obj):
-        cmd = setup_module_obj._install_command_for("python3.11", "windows")
+        cmd = setup_module_obj._install_command_for("python3.14", "windows")
         assert "python.org" in cmd
 
     def test_docker_linux_includes_group_step(self, setup_module_obj):

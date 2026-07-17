@@ -13,7 +13,7 @@ git clone <repo-url> teane && cd teane
 python3 scripts/setup.py          # or `make setup`
 ```
 
-It walks 11 phases interactively: platform / Python 3.11+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `teane doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
+It walks 11 phases interactively: platform / Python 3.14+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `teane doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
 
 Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/teane`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
 
@@ -101,7 +101,7 @@ This auto-detects your OS (Windows / macOS / Linux) and prints a coloured checkl
 
 Sections of the report, in order:
 
-- **REQUIRED** — Python 3.11+, git, home / temp writable, disk space, outbound HTTPS, plus per-OS items (Windows long-paths registry; macOS Xcode CLI tools).
+- **REQUIRED** — Python 3.14+, git, home / temp writable, disk space, outbound HTTPS, plus per-OS items (Windows long-paths registry; macOS Xcode CLI tools).
 - **SANDBOX** — Docker Desktop (or `unshare` on Linux; `taskkill` on Windows for the cross-platform tree-kill).
 - **RECOMMENDED** — POSIX `sh` on Windows (Git Bash for schedule hooks), security scanners (gitleaks / bandit / semgrep / trivy), formatters (ruff / prettier / google-java-format / shellcheck).
 - **OPTIONAL** — `gh` CLI, language toolchains (Python / Java / Node — the locked stack) for the stacks the LLM may target.
@@ -117,20 +117,20 @@ Once `pre-flight` reports green REQUIRED, follow §5 to install the harness pack
 
 ```bash
 sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev \
+sudo apt install -y python3.14 python3.14-venv python3.14-dev \
                     git sqlite3 build-essential
 ```
 
-Other distros: install the equivalent packages. Fedora/RHEL: `python3.11`, `python3.11-devel`, `git`, `sqlite`, `gcc`, `make`.
+Other distros: install the equivalent packages. Fedora/RHEL: `python3.14`, `python3.14-devel`, `git`, `sqlite`, `gcc`, `make`.
 
 ### macOS
 
 ```bash
-brew install python@3.11 git sqlite
+brew install python@3.14 git sqlite
 xcode-select --install   # one-time, for compiler fallbacks
 ```
 
-The stock `/usr/bin/python3` is 3.9 on most macOS versions — always invoke `python3.11` explicitly.
+The stock `/usr/bin/python3` is 3.9 on most macOS versions — always invoke `python3.14` explicitly.
 
 ### Windows + WSL2 (recommended Windows path)
 
@@ -142,7 +142,7 @@ Reboot if prompted, set up the Ubuntu user, then **inside the WSL distro** follo
 
 ### Windows native (best-effort)
 
-1. **Python 3.11** — install from [python.org](https://www.python.org/downloads/windows/). On the first installer screen, tick **Add python.exe to PATH** and **Install launcher for all users**. Verify in a new shell: `py -3.11 --version`.
+1. **Python 3.14** — install from [python.org](https://www.python.org/downloads/windows/). On the first installer screen, tick **Add python.exe to PATH** and **Install launcher for all users**. Verify in a new shell: `py -3.14 --version`.
 2. **Git for Windows** — install from [git-scm.com](https://git-scm.com/download/win). Bundles `git`, `git bash`, and an OpenSSH client.
 3. **`sqlite3`** — ships inside Python's stdlib; no separate install.
 4. **Build toolchain** — install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and pick the **Desktop development with C++** workload. Needed only as a fallback if a `tree-sitter` wheel doesn't exist for your Python version.
@@ -210,7 +210,7 @@ The package is currently distributed from source. A future `pip install teane` w
 ```bash
 git clone <repo-url> teane
 cd teane
-python3.11 -m venv ~/.venvs/teane
+python3.14 -m venv ~/.venvs/teane
 source ~/.venvs/teane/bin/activate
 pip install .
 teane --version
@@ -232,7 +232,7 @@ Regenerate after a deliberate dependency bump with
 ```powershell
 git clone <repo-url> teane
 cd teane
-py -3.11 -m venv $HOME\.venvs\teane
+py -3.14 -m venv $HOME\.venvs\teane
 & $HOME\.venvs\teane\Scripts\Activate.ps1
 pip install .
 teane --version
@@ -245,7 +245,7 @@ If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser RemoteSign
 ```cmd
 git clone <repo-url> teane
 cd teane
-py -3.11 -m venv %USERPROFILE%\.venvs\teane
+py -3.14 -m venv %USERPROFILE%\.venvs\teane
 %USERPROFILE%\.venvs\teane\Scripts\activate.bat
 pip install .
 teane --version
@@ -752,7 +752,7 @@ The canonical mid-session failure recipes (checkpoint corrupted, budget exhauste
 
 | Symptom | Fix |
 |---------|-----|
-| `python3.11: command not found` | Re-do §3 for your platform; on Windows, use `py -3.11` |
+| `python3.14: command not found` | Re-do §3 for your platform; on Windows, use `py -3.14` |
 | `error: Microsoft Visual C++ 14.0 or greater is required` (Windows native, pip install) | Install MSVC Build Tools (§3) |
 | `error: failed building wheel for tree-sitter-…` | Install the build toolchain (`build-essential` / Xcode CLT / MSVC), then `pip install --no-binary :all: tree-sitter` to force a source build |
 | pip stalls behind a corporate proxy | `export HTTPS_PROXY=http://proxy:port` and `export NO_PROXY=localhost,127.0.0.1` before pip / harness commands |

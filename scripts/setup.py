@@ -4,7 +4,7 @@
 Runs through eleven phases that mirror docs/installation.md, but with
 prompts and probes wired up so the operator types a few answers and
 ends with a green `teane doctor`. Stdlib only — runs anywhere a
-Python 3.9+ interpreter is on PATH (we then locate Python 3.11+
+Python 3.9+ interpreter is on PATH (we then locate Python 3.14+
 ourselves before creating the venv).
 
 Examples
@@ -128,11 +128,11 @@ def _detect_platform() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Python 3.11+ probe
+# Phase 2 — Python 3.14+ probe
 # ---------------------------------------------------------------------------
 
 def _verify_python(path: str) -> Optional[tuple[int, int]]:
-    """Return ``(major, minor)`` when ``path`` is an executable Python ≥ 3.11.
+    """Return ``(major, minor)`` when ``path`` is an executable Python ≥ 3.14.
 
     Validates with ``--version`` rather than trusting ``shutil.which``,
     because pyenv shims can land on PATH for versions pyenv hasn't
@@ -153,30 +153,30 @@ def _verify_python(path: str) -> Optional[tuple[int, int]]:
     if not match:
         return None
     major, minor = int(match.group(1)), int(match.group(2))
-    if (major, minor) < (3, 11):
+    if (major, minor) < (3, 14):
         return None
     return (major, minor)
 
 
-def _find_python311() -> Optional[str]:
-    """Return a working Python 3.11+ interpreter, or None.
+def _find_python314() -> Optional[str]:
+    """Return a working Python 3.14+ interpreter, or None.
 
     Each candidate is validated with a ``--version`` exec — a pyenv shim
     that lives on PATH but exec-fails is treated as not-found, so the
     search moves on to the next interpreter.
     """
     # Try explicit version names first
-    for candidate in ("python3.11", "python3.12", "python3.13", "python3.14"):
+    for candidate in ("python3.14", "python3.15", "python3.16"):
         path = shutil.which(candidate)
         if path and _verify_python(path) is not None:
             return path
-    # Windows: `py -3.11`
+    # Windows: `py -3.14`
     py = shutil.which("py")
     if py:
-        full = f"{py} -3.11"
+        full = f"{py} -3.14"
         if _verify_python(full) is not None:
             return full
-    # Parse `python3 --version` as a last resort (must be ≥ 3.11)
+    # Parse `python3 --version` as a last resort (must be ≥ 3.14)
     for candidate in ("python3", "python"):
         path = shutil.which(candidate)
         if path and _verify_python(path) is not None:
@@ -251,10 +251,10 @@ def _probe_build_toolchain(platform_id: str) -> bool:
 
 _INSTALL_COMMANDS: dict[tuple[str, str], str] = {
     # (tool, platform) → install command
-    ("python3.11", "linux"):   "sudo apt install -y python3.11 python3.11-venv python3.11-dev",
-    ("python3.11", "wsl2"):    "sudo apt install -y python3.11 python3.11-venv python3.11-dev",
-    ("python3.11", "darwin"):  "brew install python@3.11",
-    ("python3.11", "windows"): "Install Python 3.11 from https://www.python.org/downloads/windows/ (tick 'Add to PATH')",
+    ("python3.14", "linux"):   "sudo apt install -y python3.14 python3.14-venv python3.14-dev",
+    ("python3.14", "wsl2"):    "sudo apt install -y python3.14 python3.14-venv python3.14-dev",
+    ("python3.14", "darwin"):  "brew install python@3.14",
+    ("python3.14", "windows"): "Install Python 3.14 from https://www.python.org/downloads/windows/ (tick 'Add to PATH')",
     ("git", "linux"):    "sudo apt install -y git",
     ("git", "wsl2"):     "sudo apt install -y git",
     ("git", "darwin"):   "brew install git",
@@ -626,13 +626,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     _ok(f"Platform: {platform_id}")
 
     # ---- Phase 2: Python --------------------------------------------------
-    _banner(2, "Probing Python 3.11+")
-    python311 = _find_python311()
-    if not python311:
-        _fail("Python 3.11+ not found on PATH.")
-        _info(f"Install: {_install_command_for('python3.11', platform_id)}")
+    _banner(2, "Probing Python 3.14+")
+    python314 = _find_python314()
+    if not python314:
+        _fail("Python 3.14+ not found on PATH.")
+        _info(f"Install: {_install_command_for('python3.14', platform_id)}")
         return 2
-    _ok(f"Python 3.11+ found: {python311}")
+    _ok(f"Python 3.14+ found: {python314}")
 
     # ---- Phase 3: git + sqlite -------------------------------------------
     _banner(3, "Probing git and sqlite3")
@@ -669,7 +669,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         _ok("Build toolchain found (tree-sitter source-build fallback ready)")
     else:
         _warn(f"No build toolchain detected. tree-sitter usually has prebuilt "
-              f"wheels for Python 3.11+ — if `pip install` fails on a wheel "
+              f"wheels for Python 3.14+ — if `pip install` fails on a wheel "
               f"build, run: {_install_command_for('build-toolchain', platform_id)}")
 
     # ---- Phase 6: Venv ----------------------------------------------------
@@ -683,7 +683,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         _ok(f"Reusing existing venv: {venv_path}")
     else:
         venv_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd: list[str] = python311.split() + ["-m", "venv", str(venv_path)]
+        cmd: list[str] = python314.split() + ["-m", "venv", str(venv_path)]
         print(f"    Running: {' '.join(cmd)}")
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)

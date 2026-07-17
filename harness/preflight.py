@@ -175,20 +175,20 @@ def _detected_platform_name() -> str:
 # ---------------------------------------------------------------------------
 
 def probe_python() -> CheckResult:
-    """Python 3.11+ — the harness package requires it."""
+    """Python 3.14+ — the harness package requires it (uuid.uuid7 session ids)."""
     major, minor, micro = sys.version_info[:3]
     version = f"{major}.{minor}.{micro}"
-    if (major, minor) >= (3, 11):
+    if (major, minor) >= (3, 14):
         return CheckResult(
-            name="Python 3.11+",
+            name="Python 3.14+",
             status=STATUS_PASS,
             detail=f"python {version}",
             section="REQUIRED",
         )
     return CheckResult(
-        name="Python 3.11+",
+        name="Python 3.14+",
         status=STATUS_FAIL,
-        detail=f"python {version} — need 3.11 or newer",
+        detail=f"python {version} — need 3.14 or newer",
         install_cmd="see https://www.python.org/downloads/",
         section="REQUIRED",
     )

@@ -116,7 +116,7 @@ def _apply_teane_diagnostics_env(
 
 
 # The harness's kitchen-sink builder image. One image with every toolchain
-# the supported stacks need (Python 3.11 + pip + venv + uv + pytest +
+# the supported stacks need (Python 3.12 uv-managed + pip + venv + uv + pytest +
 # pytest-cov + pytest-xdist, Java JDK 21 + Maven + Gradle, Node 20 LTS +
 # npm + yarn + pnpm + tsc + jest + ts-jest, SQLite, Playwright +
 # Chromium, plus make/gcc/git/curl). Built from
@@ -1998,7 +1998,7 @@ def create_backend(backend_name: str, **kwargs: Any) -> SandboxBackend:
 
     Args:
         backend_name: One of 'unshare', 'docker', 'bare', or 'auto'.
-        **kwargs: Backend-specific configuration (e.g., image='python:3.11' for docker).
+        **kwargs: Backend-specific configuration (e.g., image='python:3.12' for docker).
 
     Returns:
         A SandboxBackend instance.

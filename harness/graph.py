@@ -12081,7 +12081,7 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
         f"operator config (`~/.harness/config.json` or `~/.harness/"
         f"config.yaml`, NOT any file in the workspace) to an image "
         f"that ships `{symbol}` pre-installed (e.g. `node:20-slim` for "
-        f"node/npm, `python:3.11-slim` for python)."
+        f"node/npm, `python:3.12-slim` for python)."
     )
 
 

@@ -5,9 +5,18 @@
 # container at runtime (the latter is impossible under --user $UID:$GID
 # mode, which is the default).
 #
-# Covers: Python 3.11 + pip + venv + uv, Java JDK 21 + Maven + Gradle,
-# Node 20 LTS + npm + yarn + pnpm + tsc, SQLite, Playwright + Chromium.
-# Plus make, gcc, git, curl as the universal glue.
+# Covers: Python 3.12 (uv-managed CPython) + pip + venv + uv, Java JDK 21
+# + Maven + Gradle, Node 20 LTS + npm + yarn + pnpm + tsc, SQLite,
+# Playwright + Chromium. Plus make, gcc, git, curl as the universal glue.
+#
+# Python comes from `uv python install`, NOT Ubuntu's apt: jammy's
+# python3.11 package is frozen at 3.11.0rc1 — an unreleased RELEASE
+# CANDIDATE — so every generated app was being built and tested against
+# a 2022 pre-final interpreter while the harness host runs 3.14. The
+# uv-managed build lands at ${UV_PYTHON_INSTALL_DIR} (world-readable for
+# --user mode) and /usr/local/bin/python3 points at it, which outranks
+# any /usr/bin/python3 an apt dependency may drag in. Bumping Python is
+# now a one-line version change below.
 #
 # Test toolchain is pre-baked, NOT generated-app runtime deps:
 #   - Python: pytest, pytest-cov, pytest-xdist installed system-wide so
@@ -49,6 +58,15 @@
 
 FROM eclipse-temurin:21-jdk-jammy
 
+# uv as a static binary (no Python needed to bootstrap it).
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Managed-CPython home. Set as ENV (not a build ARG) so runtime uv
+# invocations — including under --user $UID:$GID — discover the
+# interpreter without a writable home directory.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+ARG PYTHON_VERSION=3.12
+
 # NodeSource for Node 20 LTS — Ubuntu Jammy's apt ships Node 12, too old
 # for current web frameworks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -59,23 +77,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list \
  && apt-get update && apt-get install -y --no-install-recommends \
-      python3.11 python3-pip python3-venv \
       maven gradle \
       nodejs \
       sqlite3 libsqlite3-dev \
       make gcc git \
  && npm install -g yarn pnpm typescript playwright jest ts-jest @types/jest \
- && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
- && python3 -m pip install --no-cache-dir --upgrade \
+ && uv python install "${PYTHON_VERSION}" \
+ && PY="$(uv python find "${PYTHON_VERSION}")" \
+ && ln -sf "$PY" /usr/local/bin/python3 \
+ && ln -sf "$PY" /usr/local/bin/python \
+ # pip directly into the managed interpreter (python-build-standalone
+ # ships pip bundled — no ensurepip, which PEP668 also blocks). The
+ # interpreter is PEP668-marked ("managed by uv"), and `uv pip install
+ # --python` refuses non-venv targets while `--system` overrides
+ # `--python`'s interpreter choice — pip with --break-system-packages
+ # is the sanctioned override for an immutable baked image.
+ && "$PY" -m pip install --no-cache-dir --break-system-packages --upgrade \
       pip setuptools wheel \
- && python3 -m pip install --no-cache-dir \
-      uv pytest pytest-cov pytest-xdist pytest-timeout \
+ && "$PY" -m pip install --no-cache-dir --break-system-packages \
+      pytest pytest-cov pytest-xdist pytest-timeout \
+ && chmod -R a+rX /opt/uv-python \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
       npx --yes playwright install --with-deps chromium \
  && chmod -R a+rX /opt/playwright-browsers \
  && mkdir -p /cache/pip /cache/uv /cache/npm \
  && chmod -R a+rwX /cache \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 --version && python3 -m pip --version && python3 -m pytest --version
 
 ENV PIP_ROOT_USER_ACTION=ignore \
     JAVA_HOME=/opt/java/openjdk \

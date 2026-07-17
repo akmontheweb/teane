@@ -3922,6 +3922,48 @@ async def process_llm_patch_output(
     )
 
 
+def _relativize_workspace_absolute(
+    path: str, workspace_root: str,
+) -> Optional[str]:
+    """Workspace-relative form of an ABSOLUTE ``path`` that resolves
+    inside ``workspace_root``; None when it isn't absolute or resolves
+    outside.
+
+    Lumina session 019f71a0: with structured tool-use the patch tools
+    take a ``file_path`` parameter — the same name Claude-Code-style
+    tooling uses with an ABSOLUTE-path convention — and deepseek-flash
+    intermittently emits absolute paths despite the schema saying
+    "workspace-relative" (0/3 rejected → 7/7 relative applied → 0/6
+    absolute rejected, all inside ``server/``). ``safe_resolve``
+    hard-rejects every absolute path before the allowlist is consulted,
+    so patches to files the allowlist explicitly permits bounced with a
+    misleading "not in skill allowlist" message until the
+    ``all_allowlist_rejected:2`` HITL fired. Meeting the model halfway
+    here is safe: the relative form still passes through
+    ``safe_resolve``'s full traversal/symlink validation at apply time
+    — this only canonicalises the SPELLING of paths that were already
+    inside the workspace.
+
+    Containment is judged on ``os.path.realpath`` so a symlinked
+    workspace root (macOS ``/tmp`` → ``/private/tmp``) matches, and the
+    returned relative path is derived from the resolved form.
+    """
+    if not path or not os.path.isabs(path):
+        return None
+    workspace_real = os.path.realpath(workspace_root)
+    candidate = os.path.realpath(path)
+    try:
+        common = os.path.commonpath([candidate, workspace_real])
+    except ValueError:
+        return None  # mixed drives / unresolvable — leave untouched
+    if common != workspace_real:
+        return None
+    rel = os.path.relpath(candidate, workspace_real)
+    if rel == "." or rel.startswith(".."):
+        return None
+    return rel
+
+
 async def apply_patch_blocks(
     blocks: list[PatchBlock],
     workspace_root: str,
@@ -3945,6 +3987,21 @@ async def apply_patch_blocks(
     if not blocks:
         logger.warning("[patcher] No patch blocks to apply.")
         return [], existing_modified_files or []
+
+    # Absolute-path normalization (lumina 019f71a0) — see
+    # :func:`_relativize_workspace_absolute`. Runs FIRST so the
+    # harness-internal check, dedup keys, allowlist, read-before-edit
+    # hashes (keyed by relative path), and apply all see the canonical
+    # relative spelling. In-place: downstream bookkeeping in the caller
+    # (search history, sticky rejections) then agrees with the results.
+    for block in blocks:
+        _rel = _relativize_workspace_absolute(block.file, workspace_root)
+        if _rel is not None:
+            logger.info(
+                "[patcher] Normalized absolute path %s -> %s",
+                block.file, _rel,
+            )
+            block.file = _rel
 
     # If an allowlist is configured, partition blocks into allowed/rejected
     # *before* applying. Rejected blocks become failure PatchResults so the
@@ -4038,6 +4095,31 @@ async def apply_patch_blocks(
         for block in other_blocks:
             if is_path_allowed(block.file, workspace_root, allowed_list):
                 blocks_to_apply.append(block)
+            elif os.path.isabs(block.file):
+                # Still absolute after the normalization above → it
+                # resolves OUTSIDE the workspace. Name the actual rule
+                # instead of dumping the allowlist — the generic message
+                # taught the model nothing about the real problem
+                # (lumina 019f71a0 oscillated absolute/relative for
+                # rounds because the feedback never said which rule it
+                # broke).
+                results.append(PatchResult(
+                    success=False,
+                    file=block.file,
+                    operation=block.operation,
+                    error=(
+                        f"absolute path rejected: {block.file!r} does "
+                        f"not resolve inside the workspace. Patch paths "
+                        f"must be WORKSPACE-RELATIVE (e.g. "
+                        f"'server/app/main.py', not '/abs/prefix/"
+                        f"server/app/main.py'). Re-emit this patch with "
+                        f"the path relative to the workspace root."
+                    ),
+                ))
+                logger.warning(
+                    "[patcher] Rejected absolute path outside workspace: %s",
+                    block.file,
+                )
             else:
                 # Two things the LLM commonly misreads about this message:
                 # (a) the list is an ALLOWLIST (paths the patcher will

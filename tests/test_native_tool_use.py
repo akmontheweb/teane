@@ -804,3 +804,110 @@ def test_to_anthropic_tools_keeps_raw_shape():
     out = to_anthropic_tools(PATCH_TOOLS)
     assert {t["name"] for t in out} == {t["name"] for t in PATCH_TOOLS}
     assert "input_schema" in out[0]
+
+
+# ---------------------------------------------------------------------------
+# 7. Absolute-path normalization at the apply seam (lumina 019f71a0)
+# ---------------------------------------------------------------------------
+#
+# With structured tool-use the patch tools take ``file_path`` — the same
+# parameter name Claude-Code-style tooling uses with an ABSOLUTE-path
+# convention — and flash-tier models intermittently emit absolute paths
+# despite the schema saying "workspace-relative". safe_resolve rejects
+# every absolute path before the allowlist is consulted, so patches to
+# files the allowlist explicitly permitted bounced with a misleading
+# "not in skill allowlist" message until all_allowlist_rejected:2 HITL'd.
+
+@pytest.mark.asyncio
+async def test_absolute_path_inside_workspace_is_normalized_and_applied(tmp_path):
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": str(tmp_path / "server" / "app" / "main.py"),
+            "content": "app = 1\n",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=["server/"],
+    )
+    assert len(results) == 1
+    assert results[0].success, results[0].error
+    # Bookkeeping sees the canonical relative spelling, not the absolute.
+    assert "server/app/main.py" in modified
+    assert (tmp_path / "server" / "app" / "main.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_absolute_path_to_allowlisted_root_file_applies(tmp_path):
+    # The exact lumina 019f71a0 shape: /abs/workspace/requirements.txt
+    # with requirements.txt in the allowlist's root-file entries.
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": str(tmp_path / "requirements.txt"),
+            "content": "fastapi==0.111.0\n",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [],
+        allowed_paths=["server/", "requirements.txt"],
+    )
+    assert results[0].success, results[0].error
+    assert "requirements.txt" in modified
+
+
+@pytest.mark.asyncio
+async def test_absolute_path_outside_workspace_rejected_with_precise_rule(tmp_path):
+    from harness.patcher import apply_patch_blocks
+    outside = tmp_path / "elsewhere"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": str(outside / "evil.py"),
+            "content": "x = 1\n",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(ws), [], allowed_paths=["server/"],
+    )
+    assert not results[0].success
+    # The feedback names the actual rule, not a generic allowlist dump.
+    assert "absolute path rejected" in results[0].error
+    assert "WORKSPACE-RELATIVE" in results[0].error
+    assert not (outside / "evil.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_absolute_inside_workspace_but_not_allowlisted_shows_relative(tmp_path):
+    # Normalization happens first, so a genuine allowlist miss reports
+    # the relative path — feedback the model can actually act on.
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": str(tmp_path / "docs" / "notes.md"),
+            "content": "notes\n",
+        },
+    }])
+    results, _modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=["server/"],
+    )
+    assert not results[0].success
+    assert "not in skill allowlist" in results[0].error
+    assert results[0].file == "docs/notes.md"
+
+
+@pytest.mark.asyncio
+async def test_relative_paths_pass_through_unchanged(tmp_path):
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": "server/app/db.py",
+            "content": "conn = None\n",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=["server/"],
+    )
+    assert results[0].success, results[0].error
+    assert "server/app/db.py" in modified

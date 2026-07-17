@@ -46,10 +46,14 @@ class _StubResponse:
 
 
 class _StubGateway:
-    """Records every dispatch + returns canned patch content."""
+    """Records every dispatch + returns canned patch content.
 
-    def __init__(self, content: str):
-        self._content = content
+    ``content`` may be a single string (returned for every dispatch) or a
+    list of strings consumed one per dispatch, the last repeating — for
+    tests that script a multi-turn exchange (e.g. zero-emit retry)."""
+
+    def __init__(self, content):
+        self._contents = list(content) if isinstance(content, list) else [content]
         self.dispatched = []
 
     class config:
@@ -58,7 +62,8 @@ class _StubGateway:
 
     async def dispatch(self, *, messages, role, budget_remaining_usd, **kwargs):
         self.dispatched.append({"messages": list(messages), "role": role})
-        return _StubResponse(self._content), budget_remaining_usd - 0.001
+        idx = min(len(self.dispatched) - 1, len(self._contents) - 1)
+        return _StubResponse(self._contents[idx]), budget_remaining_usd - 0.001
 
     def aggregate_tokens(self, tracker, usage, role=None):
         out = dict(tracker or {})
@@ -784,6 +789,94 @@ class TestTestsMarkerGate:
         # The autofixed file must still be valid Python.
         import ast as _ast
         _ast.parse(body)
+
+    @pytest.mark.asyncio
+    async def test_stack_framing_follows_sources_not_workspace_primary(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Regression (lumina 019f7109): in a mixed py+ts workspace the
+        test-gen prompt framed PYTHON sources as "(stack: typescript)" —
+        the workspace-priority pick ranks typescript above python — and
+        the model floundered into the zero-emit HITL. Homogeneous
+        sources must drive the stack for the generation call."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "package.json").write_text('{"name": "client"}\n')
+        (tmp_path / "tsconfig.json").write_text("{}\n")
+        (tmp_path / "calculator.py").write_text(
+            "def divide(a, b): return a // b\n"
+        )
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calculator.py\n"
+            "content:\n"
+            "from calculator import divide\n"
+            "def test_divide(): assert divide(10, 2) == 5\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed in 0.01s")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calculator.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+        })
+
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        joined = "\n".join(
+            str(m.get("content", ""))
+            for d in gw.dispatched for m in d["messages"]
+        )
+        assert "(stack: python)" in joined
+        assert "(stack: typescript)" not in joined
+
+    @pytest.mark.asyncio
+    async def test_zero_emit_mimicry_gets_targeted_feedback(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """Regression (lumina 019f7109): the model adopted the flattened
+        tool-history notation as a tool syntax and zero-emitted three
+        responses in it. The retry system message must name that exact
+        mistake, not just repeat the generic emit-patch-blocks nudge."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "f.py").write_text("def f(): return 1\n")
+        responses = [
+            # First response: bracket-mimicry, zero parseable blocks.
+            '[called tool create_file with arguments: {"file_path": '
+            '"tests/test_f.py", "content": "def test_f(): pass"}]',
+            # After the targeted retry: a real patch block.
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_f.py\n"
+            "content:\n"
+            "from f import f\n"
+            "def test_f(): assert f() == 1\n"
+            "<<<END_CREATE_FILE>>>\n",
+        ]
+        stub_gateway(responses)
+        stub_sandbox(0, "1 passed")
+
+        state = {
+            "workspace_path": str(tmp_path),
+            "modified_files": ["f.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+        }
+        result = await run_test_generation(state)
+
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        retry_msgs = [
+            m for m in result["messages"]
+            if m.get("role") == "system"
+            and "zero PATCH blocks" in str(m.get("content", ""))
+        ]
+        assert retry_msgs, "expected a zero-emit retry system message"
+        assert any(
+            "NOT a tool interface" in str(m["content"]) for m in retry_msgs
+        )
 
     @pytest.mark.asyncio
     async def test_verifies_marker_alone_does_not_satisfy_gate(

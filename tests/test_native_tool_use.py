@@ -384,6 +384,87 @@ def test_flatten_handles_nested_tool_result_content():
     assert "part1" in out[0]["content"] and "part2" in out[0]["content"]
 
 
+def test_flatten_carries_anti_mimicry_note_exactly_once():
+    # Regression (lumina 019f7109): the first flatten rendering used an
+    # imperative "[called tool X with arguments: ...]" shape; the next
+    # tool-less dispatcher (test_generation) adopted it as a tool syntax
+    # and zero-emitted three responses in it — one containing a complete
+    # valid test file the parser ignored. The rendering must be
+    # narrative AND the first flattened message must carry an explicit
+    # this-is-not-a-tool-interface note — once, not per message.
+    from harness.gateway import _flatten_tool_turns_for_plain_dispatch
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "read_file",
+             "input": {"file_path": "x.py"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "b", "name": "glob",
+             "input": {"pattern": "**/*.py"}},
+        ]},
+    ]
+    out = _flatten_tool_turns_for_plain_dispatch(msgs)
+    joined = "\n".join(m["content"] for m in out if isinstance(m.get("content"), str))
+    assert joined.count("NOT a tool interface") == 1
+    # The note leads the FIRST flattened message.
+    assert out[1]["content"].startswith("[NOTE:")
+    # No imperative bracket form anywhere — nothing inviting imitation.
+    assert "[called tool" not in joined
+    assert "(history: invoked read_file" in joined
+
+
+# ---------------------------------------------------------------------------
+# 2c. read_file resolver path tolerance (lumina 019f7109)
+# ---------------------------------------------------------------------------
+
+class TestReadFilePathTolerance:
+    def _call(self, path, ws):
+        import asyncio
+        from harness.graph import _resolve_read_file_call
+        result = _resolve_read_file_call(
+            {"input": {"file_path": path}}, str(ws),
+        )
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
+        return result
+
+    def test_absolute_path_inside_workspace_is_served(self, tmp_path):
+        # Absolute anchors leak into prompts (pytest assertion-rewrite
+        # File lines); the model echoes them and the old guard refused
+        # perfectly legitimate in-workspace reads — three wasted tool
+        # rounds per turn in lumina 019f7109.
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "SPEC.md").write_text("spec body\n")
+        out = self._call(str(tmp_path / "docs" / "SPEC.md"), tmp_path)
+        assert "spec body" in out
+        assert not out.startswith("Error:")
+
+    def test_absolute_path_outside_workspace_refused(self, tmp_path):
+        out = self._call("/etc/passwd", tmp_path)
+        assert out.startswith("Error: refused absolute / traversal path")
+
+    def test_traversal_refused(self, tmp_path):
+        out = self._call("../secrets.txt", tmp_path)
+        assert out.startswith("Error: refused absolute / traversal path")
+
+    def test_prefix_sibling_dir_refused(self, tmp_path):
+        # /ws-sibling must not pass a startswith("/ws") check.
+        sibling = tmp_path.parent / (tmp_path.name + "-sibling")
+        sibling.mkdir(exist_ok=True)
+        (sibling / "f.txt").write_text("outside\n")
+        out = self._call(str(sibling / "f.txt"), tmp_path)
+        assert out.startswith("Error: refused absolute / traversal path")
+
+    def test_relative_path_still_works(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        out = self._call("a.py", tmp_path)
+        assert "x = 1" in out
+
+
 # ---------------------------------------------------------------------------
 # 3. Capability detection in Gateway.dispatch
 # ---------------------------------------------------------------------------

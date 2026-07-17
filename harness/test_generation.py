@@ -1856,6 +1856,29 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                 tags.add(ext_stack)
                 break
     primary = _pick_primary_stack(tags)
+    # Homogeneous-source override: when every file under test maps to ONE
+    # stack by extension, that stack drives this generation call — the
+    # prompt framing, the test-guide, and the runner all follow it. The
+    # workspace-priority pick ranks typescript above python, so a mixed
+    # py+react workspace framed PYTHON sources as "(stack: typescript)"
+    # and the model floundered into the zero-emit HITL (lumina 019f7109 —
+    # its reasoning literally says "But stack is typescript? It says
+    # typescript but all files are Python"). The priority pick remains
+    # the tie-breaker for genuinely mixed source sets.
+    _src_stacks = {
+        _SOURCE_EXTENSIONS.get(os.path.splitext(rel)[1].lower())
+        for rel in source_files
+    }
+    _src_stacks.discard(None)
+    if len(_src_stacks) == 1:
+        _src_stack = next(iter(_src_stacks))
+        if _src_stack != primary:
+            logger.info(
+                "[test_generation_node] Source files are homogeneously "
+                "%s — overriding workspace-priority stack %s for this "
+                "generation call.", _src_stack, primary,
+            )
+            primary = _src_stack
     if primary is None:
         logger.info(
             "[test_generation_node] No supported stack detected (tags=%s). Skipping.",
@@ -2181,19 +2204,39 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                     "llm_behavior_symbol": "test_generation_zero_emit",
                 },
             }
-        messages.append({
-            "role": "system",
-            "content": (
-                "Your last response contained zero PATCH blocks. You MUST "
-                "emit at least one CREATE_FILE / REWRITE_FILE / "
-                "REPLACE_BLOCK / INSERT_AT_BLOCK targeting a file under "
-                "the language-appropriate test root (tests/ for Python, "
-                "colocated *.test.tsx for TS, src/test/java for Java). "
-                "If you do not know what to test, pick the simplest public "
-                "function in the newest source file shown above and write "
-                "ONE assertion for its happy path."
-            ),
-        })
+        # Format-mimicry callout: when the zero-emit response is written
+        # in the flattened tool-history notation, the model has adopted
+        # the read-only record as a tool syntax (lumina 019f7109 — three
+        # consecutive responses in it, one containing a complete valid
+        # test file the parser ignored). Generic "emit patch blocks"
+        # nudges don't break that lock; naming the exact mistake does.
+        _resp_text = response.content or ""
+        _mimicry = (
+            "[called tool" in _resp_text
+            or "(history: invoked" in _resp_text
+        )
+        _retry = (
+            "Your last response contained zero PATCH blocks. You MUST "
+            "emit at least one CREATE_FILE / REWRITE_FILE / "
+            "REPLACE_BLOCK / INSERT_AT_BLOCK targeting a file under "
+            "the language-appropriate test root (tests/ for Python, "
+            "colocated *.test.tsx for TS, src/test/java for Java). "
+            "If you do not know what to test, pick the simplest public "
+            "function in the newest source file shown above and write "
+            "ONE assertion for its happy path."
+        )
+        if _mimicry:
+            _retry = (
+                "STOP: your last response used the bracketed tool-history "
+                "notation (\"[called tool ...]\" / \"(history: ...)\"). "
+                "That notation is a read-only RECORD of an earlier phase's "
+                "tool activity — it is NOT a tool interface, and everything "
+                "you wrote in it was ignored. There are no callable tools "
+                "in this phase. Re-emit your work as literal patch blocks "
+                "(<<<CREATE_FILE>>> ... <<<END_CREATE_FILE>>>) with the "
+                "full file content inline. " + _retry
+            )
+        messages.append({"role": "system", "content": _retry})
 
     # Record any consumed zero-emit budget alongside the successful attempt
     # so the persistent counter reflects reality across HITL round-trips.

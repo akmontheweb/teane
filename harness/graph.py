@@ -3270,18 +3270,28 @@ def _resolve_read_file_call(
     rel_path = str(args.get("file_path") or "").strip()
     if not rel_path:
         return "Error: read_file requires file_path."
-    # Refuse absolute / traversal paths up front. The patcher would
-    # reject them on the apply side anyway; doing it here means the
-    # model gets a clear error in the same turn.
+    # Absolute paths that resolve INSIDE the workspace are relativized
+    # and served: absolute anchors leak into prompts (pytest's
+    # assertion-rewrite File lines, diagnostics), the model echoes them
+    # back, and refusing them burned three read rounds per turn on
+    # perfectly legitimate reads (lumina 019f7109 —
+    # docs/SPEC_REQUIREMENTS.md et al. refused by their own absolute
+    # paths). Only genuinely-outside and traversal paths are refused.
+    if rel_path.startswith("/") or os.path.isabs(rel_path):
+        _norm = os.path.normpath(rel_path)
+        _ws = os.path.normpath(os.path.abspath(workspace_root))
+        if _norm == _ws or _norm.startswith(_ws + os.sep):
+            rel_path = os.path.relpath(_norm, _ws) if _norm != _ws else "."
+        else:
+            return f"Error: refused absolute / traversal path {rel_path!r}."
+    # Refuse traversal up front. The patcher would reject it on the
+    # apply side anyway; doing it here means the model gets a clear
+    # error in the same turn.
     # On Windows, ``split_path_components`` normalises backslashes so
     # paths like ``..\\foo`` or ``C:\\Windows`` are caught by the same
     # POSIX-shaped traversal/absolute check. POSIX behaviour is
     # byte-identical because backslash is a legal filename character there.
-    if (
-        rel_path.startswith("/")
-        or os.path.isabs(rel_path)
-        or ".." in _platform.split_path_components(rel_path)
-    ):
+    if ".." in _platform.split_path_components(rel_path):
         return f"Error: refused absolute / traversal path {rel_path!r}."
     abs_path = os.path.join(workspace_root, rel_path)
     if not os.path.isfile(abs_path):

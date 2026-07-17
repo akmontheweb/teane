@@ -628,8 +628,21 @@ def _flatten_tool_turns_for_plain_dispatch(
     rendered as TEXT — it is inert context there, not an active
     exchange. Roles are preserved; messages without typed blocks pass
     through untouched.
+
+    Anti-mimicry: the rendering is deliberately narrative ("(history:
+    …)") and the FIRST flattened message carries an explicit note that
+    the notation is a read-only record, not a tool interface. The first
+    rendering used an imperative "[called tool X with arguments: …]"
+    shape — and the very next tool-less dispatcher (test_generation,
+    lumina session 019f7109) saw it in the inherited history, adopted it
+    as a tool syntax, and wrote three consecutive responses in it — one
+    containing a complete, valid test file the parser silently ignored —
+    straight into the zero-emit HITL. Models imitate whatever format
+    appears in context; the note is the defense, the narrative shape
+    just lowers the temptation.
     """
     out: list[dict[str, Any]] = []
+    note_pending = True
     for msg in messages:
         content = msg.get("content", "")
         if not isinstance(content, list):
@@ -650,8 +663,8 @@ def _flatten_tool_turns_for_plain_dispatch(
                 except (TypeError, ValueError):
                     args = "{}"
                 parts.append(
-                    f"[called tool {block.get('name', '?')} with "
-                    f"arguments: {args[:2000]}]"
+                    f"(history: invoked {block.get('name', '?')} with "
+                    f"{args[:2000]} — already executed)"
                 )
             elif btype == "tool_result":
                 saw_tool_block = True
@@ -661,12 +674,26 @@ def _flatten_tool_turns_for_plain_dispatch(
                         str(b.get("text", "")) for b in tr_content
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
-                parts.append(f"[tool result]\n{tr_content}")
+                parts.append(f"(history: that call returned)\n{tr_content}")
         if saw_tool_block:
+            if note_pending:
+                parts.insert(0, _FLATTEN_HISTORY_NOTE)
+                note_pending = False
             out.append({**msg, "content": "\n".join(parts)})
         else:
             out.append(msg)
     return out
+
+
+# Prepended once, to the first flattened message of a tool-less dispatch.
+# See _flatten_tool_turns_for_plain_dispatch's anti-mimicry rationale.
+_FLATTEN_HISTORY_NOTE = (
+    "[NOTE: \"(history: ...)\" lines in this conversation are a read-only "
+    "record of tool activity from an earlier phase — already executed. "
+    "That notation is NOT a tool interface: responses written in it (or "
+    "in any bracketed tool-call form) are ignored entirely. Respond only "
+    "in the output format your instructions specify.]"
+)
 
 
 def _extract_openai_compat_reasoning(message: dict[str, Any]) -> str:

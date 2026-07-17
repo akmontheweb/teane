@@ -494,3 +494,25 @@ def test_replace_block_stuck_beats_all_allowlist_rejected():
         max_repair=3,
     )
     assert out == "replace_block_stuck:x.py"
+
+
+def test_unsatisfiable_test_label_carries_path():
+    out = _infer_hitl_trigger(
+        _state(node_state={"unsatisfiable_test": "tests/test_db.py"}),
+        max_repair=3,
+    )
+    assert out == "unsatisfiable_test:tests/test_db.py"
+
+
+def test_unsatisfiable_test_wins_over_zero_patch_loop():
+    # The declaration is the precise story; the zero-patch counter is the
+    # generic one. Precise must win (lumina 019f7109 fired zero_patch_loop:2
+    # for what was really an unsatisfiable generated test).
+    out = _infer_hitl_trigger(
+        _state(
+            node_state={"unsatisfiable_test": "tests/test_db.py"},
+            loop_counter={"consecutive_zero_patch_rounds": 2},
+        ),
+        max_repair=3,
+    )
+    assert out == "unsatisfiable_test:tests/test_db.py"

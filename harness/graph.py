@@ -6024,6 +6024,39 @@ def _reject_test_patch_blocks(
     return kept, rejections
 
 
+# Declared-dead-end marker for the repair loop (lumina 019f7109). Offered
+# by the defective-test banner directive ONLY when every judge-named
+# location is a tamper-guarded test file; honoured ONLY on rounds where
+# that offer was made and no real patch landed. Path first, then a free-
+# text reason after an em/en dash, hyphen, or colon separator.
+_UNSAT_TEST_DECL_RE = re.compile(
+    r"^[ \t]*UNSATISFIABLE_TEST:[ \t]*(?P<path>[^\s—–:-]\S*)"
+    r"(?:[ \t]*(?:—|–|-{1,2}|:)[ \t]*(?P<reason>\S.*?))?[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _parse_unsatisfiable_test_declaration(
+    text: str,
+) -> Optional[tuple[str, str]]:
+    """First ``UNSATISFIABLE_TEST: <path> — <reason>`` line in ``text``,
+    as ``(path, reason)``; None when absent. Reason may be empty — the
+    path is the load-bearing part (it is validated against the banner's
+    offer set by the caller, so a hallucinated or production path can
+    never escalate).
+    """
+    if not text or "UNSATISFIABLE_TEST" not in text:
+        return None
+    m = _UNSAT_TEST_DECL_RE.search(text)
+    if not m:
+        return None
+    path = (m.group("path") or "").strip().strip("`'\"")
+    reason = (m.group("reason") or "").strip()
+    if not path:
+        return None
+    return path, reason
+
+
 def _filter_test_blocks_from_patch_response(
     response_content: str,
 ) -> tuple[str, list[str]]:
@@ -10741,17 +10774,79 @@ def _verdict_named_files(
     return matched
 
 
+def _resolve_impl_file_in_workspace(
+    impl_file: str, workspace_path: str,
+) -> Optional[str]:
+    """Resolve the judge's ``impl_file`` guess to a real workspace path by
+    unique suffix/basename match, or None.
+
+    Lumina session 019f7109: the reflection judge (which sees only the
+    diagnostics' file:line anchors — no build-output imports, no workspace
+    file list) answered ``impl_file: "db.py"`` for an assertion failure in
+    ``tests/test_db.py``. The real module is ``server/app/db.py``, so Fix
+    G's verbatim ``os.path.isfile`` check dropped the field silently and
+    the MUST-MODIFY banner fell back to mandating the test file — which
+    the tamper guard then vetoed, a guaranteed zero-patch HITL. A
+    basename-right guess is the judge's common case (it is TOLD to infer
+    from the test's name when imports aren't visible), so meet it halfway:
+    accept the guess iff it matches exactly ONE on-disk file. Ambiguity
+    (two ``db.py``) returns None — promotion must never be a coin flip.
+
+    Test-shaped matches are excluded by pruning test dirs from the walk
+    and re-checking the basename pattern, mirroring the caller's own
+    refuse-to-promote-a-test guard.
+    """
+    if not impl_file or not workspace_path or not os.path.isdir(workspace_path):
+        return None
+    needle = impl_file.replace("\\", "/").lstrip("./")
+    if not needle or needle.endswith("/"):
+        return None
+    matches: list[str] = []
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [
+            d for d in dirs
+            if d not in _SMOKE_CHECK_SKIP_DIRS
+            and not d.startswith(".")
+            and not d.endswith(".egg-info")
+        ]
+        for fname in files:
+            rel = os.path.relpath(os.path.join(root, fname), workspace_path)
+            rel_slash = rel.replace(os.sep, "/")
+            if rel_slash == needle or rel_slash.endswith("/" + needle):
+                if _is_test_artifact(rel_slash):
+                    continue
+                matches.append(rel_slash)
+                if len(matches) > 1:
+                    return None  # ambiguous — refuse early
+    return matches[0] if matches else None
+
+
 def _effective_judge_named_files(
     verdict: dict[str, str],
     compiler_errors: list[dict[str, Any]],
     top_persisted_diagnostics: list[dict[str, Any]],
     workspace_path: str,
-) -> tuple[list[str], Optional[str]]:
-    """Return ``(files, impl_file_promoted)`` — the effective "MUST MODIFY"
-    list to use in the JUDGE'S VERDICT banner AND in the judge-ignored gate.
+) -> tuple[list[str], Optional[str], list[str]]:
+    """Return ``(files, impl_file_promoted, guarded_tests_dropped)`` — the
+    effective "MUST MODIFY" list to use in the JUDGE'S VERDICT banner AND
+    in the judge-ignored gate.
 
     On non-test-assertion rounds returns the standard
     ``_verdict_named_files`` output unchanged and ``impl_file_promoted=None``.
+
+    ``guarded_tests_dropped`` (lumina 019f7109): any file the judge named
+    that is a test artifact the repair tamper guard would refuse to let
+    the LLM patch (i.e. not covered by the parse-error carve-out) is
+    REMOVED from ``files`` and reported here instead. Mandating such a
+    file constructs an order the guard is guaranteed to veto — round 12/13
+    of that session told the model "MUST MODIFY tests/test_db.py:46" while
+    the guard rejected both of its (correct) attempts to do so, and the
+    judge-ignored gate then penalised it for complying with the guard.
+    Both banner and gate route through this helper, so dropping the file
+    here keeps the directive, the guard, and the gate telling the model
+    the same story. Callers use ``guarded_tests_dropped`` to emit the
+    defective-test directive (the UNSATISFIABLE_TEST escape) in place of
+    the impossible mandate.
 
     Fix G — when the top persistent diagnostic is a pytest assertion failure
     inside a test file AND the verdict carries an ``impl_file`` field that
@@ -10813,28 +10908,58 @@ def _effective_judge_named_files(
                 continue
             base_files = base_files + [rel]
 
+    def _drop_guarded_tests(files: list[str]) -> tuple[list[str], list[str]]:
+        """Split ``files`` into (mandatable, guarded-test) using the SAME
+        predicate + carve-out as the repair tamper guard, so the banner
+        never mandates what the guard will veto."""
+        if not files:
+            return files, []
+        allow = _syntax_broken_test_files(compiler_errors, workspace_path)
+        kept: list[str] = []
+        guarded: list[str] = []
+        for f in files:
+            if (
+                _is_test_artifact(f)
+                and _normalize_ws_path(f, workspace_path) not in allow
+            ):
+                guarded.append(f)
+            else:
+                kept.append(f)
+        return kept, guarded
+
     if not _top_error_is_test_assertion(top_persisted_diagnostics):
-        return base_files, None
+        kept, guarded = _drop_guarded_tests(base_files)
+        return kept, None, guarded
     impl_file = str(verdict.get("impl_file", "") or "").strip()
-    if not impl_file:
-        return base_files, None
-    if not workspace_path:
-        return base_files, None
+    if not impl_file or not workspace_path:
+        kept, guarded = _drop_guarded_tests(base_files)
+        return kept, None, guarded
     # Normalise + workspace-relative check. Reject absolute paths,
     # traversal, and non-existent files — the LLM occasionally
     # hallucinates plausible-looking paths.
     if os.path.isabs(impl_file) or ".." in impl_file.split("/"):
-        return base_files, None
+        kept, guarded = _drop_guarded_tests(base_files)
+        return kept, None, guarded
     abs_path = os.path.join(workspace_path, impl_file)
     if not os.path.isfile(abs_path):
-        return base_files, None
+        # The judge's guess doesn't exist verbatim — try a unique
+        # suffix/basename resolution before giving up. The reflection
+        # judge sees neither the build-output imports nor a workspace
+        # file list, so "db.py" for "server/app/db.py" is its best
+        # possible answer (lumina 019f7109 rounds 12-13).
+        resolved = _resolve_impl_file_in_workspace(impl_file, workspace_path)
+        if resolved is None:
+            kept, guarded = _drop_guarded_tests(base_files)
+            return kept, None, guarded
+        impl_file = resolved
     # Guard: refuse to promote a test path as the impl target (the judge
     # would only do this by mistake, but we should never end up back
     # where we started).
     if _is_test_path(impl_file) or _TEST_FILENAME_RE.search(
         impl_file.replace(os.sep, "/")
     ):
-        return base_files, None
+        kept, guarded = _drop_guarded_tests(base_files)
+        return kept, None, guarded
     # When ``impl_file`` is a valid, on-disk, non-test path, replace
     # ``base_files`` wholesale — the judge has explicitly named where
     # the fix belongs, and the LLM should focus on it rather than
@@ -10843,7 +10968,7 @@ def _effective_judge_named_files(
     # signal than a text-scanned reference, and mixing them re-invites
     # the "LLM rewrites the test to make the assertion pass" bug that
     # ``impl_file`` was introduced to fix (session 52c16e16-*).
-    return [impl_file], impl_file
+    return [impl_file], impl_file, []
 
 
 def _verdict_named_file_lines(
@@ -15702,6 +15827,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # framer — that framer's system prompt does NOT match the main
         # repair bucket's prefix, so it belongs in its own drift bucket.
         _repair_cache_family = "repair:main"
+        # Defective-test escape offer (lumina 019f7109). Set by the banner
+        # below when every judge-named location lives in a tamper-guarded
+        # test file; consumed after the patch apply to honour an
+        # UNSATISFIABLE_TEST declaration. Reset every round so a stale
+        # offer can never validate a later round's declaration.
+        _offered_unsat_marker = False
+        _unsat_offer_files: set[str] = set()
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
@@ -15735,11 +15867,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             )
         ):
             _compiler_errors_for_seed = state.get("compiler_errors", []) or []
-            judge_named_files, _impl_promoted = _effective_judge_named_files(
-                reflection_verdict,
-                _compiler_errors_for_seed,
-                _compiler_errors_for_seed[:3],
-                _workspace_for_persist_check,
+            judge_named_files, _impl_promoted, _guarded_tests_dropped = (
+                _effective_judge_named_files(
+                    reflection_verdict,
+                    _compiler_errors_for_seed,
+                    _compiler_errors_for_seed[:3],
+                    _workspace_for_persist_check,
+                )
             )
             if _impl_promoted:
                 logger.info(
@@ -15812,10 +15946,38 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # 8+ rounds on `test_edgar.py:126` with 0-1 patches per round,
             # each leaving line 126 untouched. Promote that fact to a
             # non-negotiable directive: patch MUST alter the exact line.
-            _current_named_lines = _verdict_named_file_lines(
+            #
+            # Guard-parity filter (lumina 019f7109): entries pointing at
+            # test files the tamper guard protects (not parse-broken) are
+            # split out BEFORE the persistence machinery. A MANDATORY
+            # "touch tests/test_db.py:46" directive is an order the guard
+            # is guaranteed to veto — the defective-test directive below
+            # replaces it for those locations.
+            _guard_carveout_for_banner = _syntax_broken_test_files(
+                state.get("compiler_errors", []) or [],
+                str(state.get("workspace_path", "") or ""),
+            )
+
+            def _is_guarded_test_for_banner(path: str) -> bool:
+                return (
+                    _is_test_artifact(path)
+                    and _normalize_ws_path(
+                        path, str(state.get("workspace_path", "") or ""),
+                    ) not in _guard_carveout_for_banner
+                )
+
+            _all_named_lines = _verdict_named_file_lines(
                 reflection_verdict,
                 state.get("compiler_errors", []) or [],
             )
+            _guarded_test_lines = [
+                (f, ln) for (f, ln) in _all_named_lines
+                if _is_guarded_test_for_banner(f)
+            ]
+            _current_named_lines = [
+                (f, ln) for (f, ln) in _all_named_lines
+                if not _is_guarded_test_for_banner(f)
+            ]
             _prev_named_lines_raw = list(
                 loop_counter.get("judge_named_file_lines_last_round") or []
             )
@@ -15848,11 +16010,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # is elsewhere) still enters the persistence check. Grounded
             # via workspace-existence, same as the save site.
             _workspace_for_banner = str(state.get("workspace_path", "") or "")
-            _current_named_files_only: set[str] = set(
-                _verdict_referenced_files(
+            _current_named_files_only: set[str] = {
+                f for f in _verdict_referenced_files(
                     reflection_verdict, _workspace_for_banner,
                 )
-            )
+                if not _is_guarded_test_for_banner(f)
+            }
             _prev_named_files_only = set(
                 str(p) for p in (
                     loop_counter.get("judge_persistent_files_last_round") or []
@@ -16016,6 +16179,67 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # so a NEW blocker on a stale-streak file doesn't inherit
                 # a bogus count.
                 loop_counter.pop("persistent_blocker_streak_per_file", None)
+            # Defective-test directive (lumina 019f7109). The judge's named
+            # locations that live inside tamper-guarded test files were
+            # withheld from MUST-MODIFY / PERSISTENT BLOCKER above — a
+            # mandate on them is an order the guard is guaranteed to veto
+            # (rounds 12-13 of that session: the model twice emitted the
+            # correct test fix, the guard rejected both, zero-patch HITL).
+            # Surface the protected location honestly, and when NOTHING
+            # mandatable remains, offer the declared dead-end so the
+            # harness can escalate in one round instead of two.
+            _guarded_display_parts = [
+                f"{f}:{ln}" for f, ln in _guarded_test_lines[:5]
+            ]
+            _guarded_line_files = {f for f, _ in _guarded_test_lines}
+            _guarded_display_parts += [
+                f for f in _guarded_tests_dropped[:5]
+                if f not in _guarded_line_files
+            ]
+            if _guarded_display_parts:
+                _guarded_display = ", ".join(_guarded_display_parts)
+                _has_mandatable_target = bool(
+                    judge_named_files or _persistent_lines
+                    or _persistent_files_only
+                )
+                if _has_mandatable_target:
+                    reflection_banner_lines.append(
+                        "PROTECTED TEST LOCATION — the failing assertion "
+                        f"lives at {_guarded_display}, which is a test "
+                        "file the repair loop may NOT modify (patches to "
+                        "it are auto-rejected). Fix the production "
+                        "code named above so the assertion passes as "
+                        "written; do not emit any patch targeting the "
+                        "test file."
+                    )
+                else:
+                    _offered_unsat_marker = True
+                    _unsat_offer_files = {
+                        _normalize_ws_path(f, _workspace_for_banner)
+                        for f in (
+                            _guarded_line_files | set(_guarded_tests_dropped)
+                        )
+                    }
+                    reflection_banner_lines.append(
+                        "PROTECTED TEST LOCATION — the failing assertion "
+                        f"lives at {_guarded_display}, inside a test file "
+                        "the repair loop may NOT modify. Patches targeting "
+                        "it WILL be auto-rejected; do not emit any. First "
+                        "re-examine whether ANY production-code change can "
+                        "make the assertion pass as written, and if so, "
+                        "patch the production code. If — and only if — no "
+                        "production-code change can EVER satisfy the "
+                        "assertion (it encodes an impossible expectation, "
+                        "e.g. asserting SQLite WAL journal mode on an "
+                        "in-memory connection), emit ZERO patch blocks and "
+                        "exactly one line of the form:\n"
+                        "UNSATISFIABLE_TEST: <workspace-relative test "
+                        "path> — <one sentence: why no production change "
+                        "can satisfy it>\n"
+                        "The harness will stop the repair loop and hand "
+                        "the defective test to a human instead of burning "
+                        "further rounds."
+                    )
             # Verdict word last: this is the noisiest single field across
             # rounds and belongs after everything the cache can plausibly
             # match.
@@ -16675,6 +16899,55 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             files_seen_by_llm=files_seen_by_llm,
             enforce_read_before_edit=enforce_read,
         )
+        # UNSATISFIABLE_TEST declaration (lumina 019f7109). Honoured only
+        # when (a) this round's banner explicitly offered the escape (the
+        # judge named nothing but tamper-guarded test files), (b) the
+        # declared path is one of the offered files, and (c) no real patch
+        # landed this round — a model that both patches and declares is
+        # hedging, and the patches win. When honoured, the flag routes
+        # ``route_after_compiler`` straight to HITL with a precise trigger
+        # instead of burning two zero-patch rounds to reach the same place.
+        _unsat_declared: Optional[tuple[str, str]] = None
+        if _offered_unsat_marker:
+            _unsat_decl_raw = _parse_unsatisfiable_test_declaration(
+                patch_payload,
+            )
+            if _unsat_decl_raw is not None:
+                _unsat_path_norm = _normalize_ws_path(
+                    _unsat_decl_raw[0], workspace,
+                )
+                _any_real_patch = any(
+                    getattr(r, "success", False)
+                    and not getattr(r, "no_op", False)
+                    for r in patch_results
+                )
+                if _unsat_path_norm in _unsat_offer_files and not _any_real_patch:
+                    _unsat_declared = (_unsat_path_norm, _unsat_decl_raw[1])
+                    logger.warning(
+                        "[repair_node] LLM declared unsatisfiable test "
+                        "%s (%s). Escalating to HITL via "
+                        "route_after_compiler.",
+                        _unsat_path_norm,
+                        _unsat_decl_raw[1] or "no reason given",
+                    )
+                else:
+                    logger.info(
+                        "[repair_node] UNSATISFIABLE_TEST line ignored "
+                        "(path %r not in this round's offer set, or real "
+                        "patches landed alongside it).",
+                        _unsat_decl_raw[0],
+                    )
+                try:
+                    from harness.observability import emit_event as _emit_ud
+                    _emit_ud(
+                        "unsatisfiable_test_declared",
+                        file=_unsat_decl_raw[0],
+                        reason=_unsat_decl_raw[1],
+                        honoured=_unsat_declared is not None,
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
         # Post-patch bookkeeping for the repeat-search detector.
         _update_search_history_post_patch(
             _blocks_kept, patch_results, loop_counter,
@@ -16931,7 +17204,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             and not _reflection_verdict_is_low_signal(reflection_verdict)
         ):
             _compiler_errors_for_gate = state.get("compiler_errors", []) or []
-            _judge_named_now, _ = _effective_judge_named_files(
+            _judge_named_now, _, _ = _effective_judge_named_files(
                 reflection_verdict,
                 _compiler_errors_for_gate,
                 _compiler_errors_for_gate[:3],
@@ -17286,6 +17559,17 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 # otherwise it clears any prior round's stamp so the
                 # mandate doesn't re-fire on unrelated subsequent rounds.
                 "stuck_rewrite_signal_paths": _stuck_rewrite_signal_paths_next,
+                # Declared-dead-end signal (lumina 019f7109), set-or-clear
+                # every round like stuck_rewrite_signal_paths so a stale
+                # declaration can never outlive the round that made it.
+                # route_after_compiler additionally re-validates the path
+                # against the CURRENT failing set before escalating.
+                "unsatisfiable_test": (
+                    _unsat_declared[0] if _unsat_declared else ""
+                ),
+                "unsatisfiable_test_reason": (
+                    _unsat_declared[1] if _unsat_declared else ""
+                ),
             },
         }
     except RuntimeError as exc:
@@ -17390,6 +17674,13 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if node_state.get("build_command_cd_missing"):
         d = node_state.get("build_command_cd_missing_dir", "")
         return f"build_command_cd_missing:{d}" if d else "build_command_cd_missing"
+    # Declared unsatisfiable test (lumina 019f7109) — must precede the
+    # zero-patch / repair-limit fallbacks: the whole point of the
+    # declaration is a precise label ("this specific generated test can
+    # never pass") instead of the generic "no patches landed" story.
+    if node_state.get("unsatisfiable_test"):
+        _unsat_f = str(node_state.get("unsatisfiable_test") or "")
+        return f"unsatisfiable_test:{_unsat_f}"
     if budget_remaining <= 0.0:
         return "budget_exhausted"
     if _np_tripped_inf(loop_counter):
@@ -19158,6 +19449,47 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     if state.get("node_state", {}).get("llm_silent"):
         logger.warning("[router] LLM returned empty content. Routing to HITL immediately.")
         return _transition("human_intervention_node")
+
+    # Declared unsatisfiable test (lumina 019f7109). The repair LLM — on
+    # the banner's explicit invitation, validated against the offer set —
+    # declared that no production change can satisfy a tamper-guarded
+    # test. Repair cannot edit the test, so every further round is a
+    # guaranteed zero-patch round; escalate now. Re-validate against the
+    # CURRENT failing set first: if the operator (or a landed patch)
+    # already resolved the declared file's failure, the declaration is
+    # stale and the loop should keep going on whatever remains.
+    _unsat_declared_file = str(
+        state.get("node_state", {}).get("unsatisfiable_test", "") or ""
+    )
+    if _unsat_declared_file:
+        _ws_for_unsat = str(state.get("workspace_path", "") or "")
+        _unsat_norm = _normalize_ws_path(_unsat_declared_file, _ws_for_unsat)
+        _still_failing = False
+        for _d in state.get("compiler_errors", []) or []:
+            if not isinstance(_d, dict):
+                continue
+            _df = _normalize_ws_path(
+                str(_d.get("file", "") or ""), _ws_for_unsat,
+            )
+            if _df and (
+                _df == _unsat_norm
+                or _df.endswith(os.sep + _unsat_norm)
+                or _unsat_norm.endswith(os.sep + _df)
+            ):
+                _still_failing = True
+                break
+        if _still_failing:
+            logger.warning(
+                "[router] Repair LLM declared test %s unsatisfiable and it "
+                "is still failing. Repair cannot edit tests — routing to "
+                "HITL.", _unsat_declared_file,
+            )
+            return _transition("human_intervention_node")
+        logger.info(
+            "[router] Stale unsatisfiable-test declaration for %s (no "
+            "longer in the failing set) — continuing the loop.",
+            _unsat_declared_file,
+        )
 
     # Pytest exit=5 (no tests collected) is not a build failure.
     #   * Source files exist → route to test_generation_node, which will

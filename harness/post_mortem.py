@@ -86,6 +86,13 @@ _TRIGGER_ADVICE: dict[str, str] = {
         "something concrete to test, or narrow the batch so the eligible "
         "source set is unambiguous"
     ),
+    "unsatisfiable_test": (
+        "a generated unit test encoded an expectation no production code "
+        "can ever satisfy, and the repair loop is barred from editing "
+        "tests. Generate assertions against observable behaviour that the "
+        "implementation can actually exhibit in the test context (e.g. "
+        "never assert SQLite WAL journal mode on an in-memory connection)"
+    ),
     "build_command_cd_missing": (
         "the build command referenced a directory that does not exist. "
         "Align the build command with the actual workspace layout"
@@ -253,7 +260,7 @@ def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
         # the learned rule generic exactly where it should be specific.
         "replace_block_stuck", "no_progress_repairs",
         "hard_iteration_ceiling", "same_missing_dep",
-        "build_command_blocked",
+        "build_command_blocked", "unsatisfiable_test",
     ):
         detail = f" ({trigger.split(':', 1)[1]})"
     errs = _top_errors(state)

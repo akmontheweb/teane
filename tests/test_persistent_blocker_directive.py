@@ -322,11 +322,12 @@ class TestFixGTestAssertionMode:
             "error_code": "AssertionError",
             "message": "assert len(result) >= 1",
         }]
-        files, promoted = _effective_judge_named_files(
+        files, promoted, guarded = _effective_judge_named_files(
             verdict, errs, errs, str(tmp_path),
         )
         assert files == ["backend/services/edgar.py"]
         assert promoted == "backend/services/edgar.py"
+        assert guarded == []
 
     def test_seeder_falls_back_when_impl_missing_on_disk(self, tmp_path):
         from harness.graph import _effective_judge_named_files
@@ -341,12 +342,16 @@ class TestFixGTestAssertionMode:
             "error_code": "AssertionError",
             "message": "assert len(result) >= 1",
         }]
-        files, promoted = _effective_judge_named_files(
+        files, promoted, guarded = _effective_judge_named_files(
             verdict, errs, errs, str(tmp_path),
         )
-        # No swap → the standard grounding still matches the test file.
-        assert files == ["tests/unit/backend/test_edgar.py"]
+        # No swap, and the test file is tamper-guarded (an assertion
+        # failure, not a parse error) — it must move to ``guarded``
+        # rather than become a MUST-MODIFY mandate the repair guard
+        # would veto (lumina 019f7109).
+        assert files == []
         assert promoted is None
+        assert guarded == ["tests/unit/backend/test_edgar.py"]
 
     def test_seeder_refuses_to_promote_test_path_as_impl(self, tmp_path):
         from harness.graph import _effective_judge_named_files
@@ -364,11 +369,12 @@ class TestFixGTestAssertionMode:
             "error_code": "AssertionError",
             "message": "assert len(result) >= 1",
         }]
-        files, promoted = _effective_judge_named_files(
+        files, promoted, guarded = _effective_judge_named_files(
             verdict, errs, errs, str(tmp_path),
         )
         assert promoted is None
-        assert files == ["tests/unit/backend/test_edgar.py"]
+        assert files == []
+        assert guarded == ["tests/unit/backend/test_edgar.py"]
 
     def test_seeder_unchanged_for_compile_errors(self, tmp_path):
         """Non-test-assertion rounds must be byte-identical to the old
@@ -388,11 +394,12 @@ class TestFixGTestAssertionMode:
             "error_code": "ImportError",
             "message": "cannot import name X",
         }]
-        files, promoted = _effective_judge_named_files(
+        files, promoted, guarded = _effective_judge_named_files(
             verdict, errs, errs, str(tmp_path),
         )
         assert promoted is None
         assert files == ["backend/services/parser.py"]
+        assert guarded == []
 
     def test_seeder_rejects_absolute_and_traversal_paths(self, tmp_path):
         from harness.graph import _effective_judge_named_files
@@ -406,7 +413,7 @@ class TestFixGTestAssertionMode:
                 "recommendation": "Fix.",
                 "impl_file": bad,
             }
-            files, promoted = _effective_judge_named_files(
+            files, promoted, _guarded = _effective_judge_named_files(
                 verdict, errs, errs, str(tmp_path),
             )
             assert promoted is None, f"Should reject {bad}"
@@ -448,3 +455,199 @@ class TestFixGTestAssertionMode:
         )
         assert "TEST-ASSERTION HINT" not in prompt
         assert "impl_file" not in prompt
+
+
+class TestImplFileResolution:
+    """_resolve_impl_file_in_workspace — lumina 019f7109: the reflection
+    judge guesses basenames ("db.py") because it sees neither the build
+    imports nor a workspace file list; Fix G must meet the guess halfway
+    instead of silently dropping it."""
+
+    def test_unique_basename_match_resolves(self, tmp_path):
+        from harness.graph import _resolve_impl_file_in_workspace
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "db.py").write_text("# impl\n")
+        out = _resolve_impl_file_in_workspace("db.py", str(tmp_path))
+        assert out == "server/app/db.py"
+
+    def test_unique_suffix_match_resolves(self, tmp_path):
+        from harness.graph import _resolve_impl_file_in_workspace
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "db.py").write_text("# impl\n")
+        out = _resolve_impl_file_in_workspace("app/db.py", str(tmp_path))
+        assert out == "server/app/db.py"
+
+    def test_ambiguous_basename_refuses(self, tmp_path):
+        from harness.graph import _resolve_impl_file_in_workspace
+        (tmp_path / "server").mkdir()
+        (tmp_path / "client").mkdir()
+        (tmp_path / "server" / "db.py").write_text("# a\n")
+        (tmp_path / "client" / "db.py").write_text("# b\n")
+        assert _resolve_impl_file_in_workspace("db.py", str(tmp_path)) is None
+
+    def test_no_match_returns_none(self, tmp_path):
+        from harness.graph import _resolve_impl_file_in_workspace
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "other.py").write_text("# x\n")
+        assert _resolve_impl_file_in_workspace("db.py", str(tmp_path)) is None
+
+    def test_test_dirs_pruned_from_walk(self, tmp_path):
+        # A basename that only exists under tests/ must NOT resolve —
+        # promoting a test path would recreate the deadlock the
+        # resolution exists to prevent.
+        from harness.graph import _resolve_impl_file_in_workspace
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "db.py").write_text("# test helper\n")
+        assert _resolve_impl_file_in_workspace("db.py", str(tmp_path)) is None
+
+    def test_seeder_promotes_via_basename_resolution(self, tmp_path):
+        # End-to-end through _effective_judge_named_files: the exact
+        # lumina 019f7109 shape — judge answers impl_file "db.py", real
+        # module is server/app/db.py, failing anchor is the test file.
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "db.py").write_text("# impl\n")
+        verdict = {
+            "real_blocker": (
+                "Assertion at tests/test_db.py:46 expects WAL journal "
+                "mode but gets 'memory'."
+            ),
+            "recommendation": "Set journal_mode=WAL in db.py.",
+            "impl_file": "db.py",
+        }
+        errs = [{
+            "file": "tests/test_db.py",
+            "line": 46,
+            "error_code": "AssertionError",
+            "message": "assert 'memory' == 'wal'",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["server/app/db.py"]
+        assert promoted == "server/app/db.py"
+        assert guarded == []
+
+
+class TestGuardAwareSeeder:
+    """Guard-parity filtering in _effective_judge_named_files — the
+    MUST-MODIFY list must never mandate a file the repair tamper guard
+    will refuse to let the LLM patch (lumina 019f7109 rounds 12-13)."""
+
+    def test_parse_broken_test_stays_mandatable(self, tmp_path):
+        # The carve-out case (lumina 019f7054): a test file whose current
+        # diagnostic is a SyntaxError MAY be repaired, so it must stay in
+        # the mandate list.
+        from harness.graph import _effective_judge_named_files
+        verdict = {
+            "real_blocker": "SyntaxError at tests/test_db.py:3",
+            "recommendation": "Fix the comment syntax.",
+        }
+        errs = [{
+            "file": "tests/test_db.py",
+            "line": 3,
+            "error_code": "SyntaxError",
+            "message": "invalid syntax",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["tests/test_db.py"]
+        assert promoted is None
+        assert guarded == []
+
+    def test_non_assertion_round_also_filters_guarded_tests(self, tmp_path):
+        # An ImportError anchored in a healthy test file: the guard would
+        # veto repair edits to it in ANY round type, so the filter must
+        # apply outside test-assertion mode too.
+        from harness.graph import _effective_judge_named_files
+        verdict = {
+            "real_blocker": "ImportError at tests/test_api.py:2",
+            "recommendation": "Export the symbol from the api module.",
+        }
+        errs = [{
+            "file": "tests/test_api.py",
+            "line": 2,
+            "error_code": "ImportError",
+            "message": "cannot import name 'create_app'",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == []
+        assert promoted is None
+        assert guarded == ["tests/test_api.py"]
+
+    def test_mixed_files_keep_production_drop_guarded_test(self, tmp_path):
+        # Judge names a production file in the recommendation AND the
+        # test anchor: production stays mandatable, test moves to guarded.
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "main.py").write_text("# app\n")
+        verdict = {
+            "real_blocker": "AssertionError at tests/test_main.py:9",
+            "recommendation": (
+                "Edit server/main.py to include the search router."
+            ),
+        }
+        errs = [{
+            "file": "tests/test_main.py",
+            "line": 9,
+            "error_code": "AssertionError",
+            "message": "assert 404 == 200",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["server/main.py"]
+        assert guarded == ["tests/test_main.py"]
+
+
+class TestUnsatisfiableTestDeclaration:
+    """_parse_unsatisfiable_test_declaration — the declared-dead-end
+    marker offered by the defective-test banner directive."""
+
+    def test_em_dash_form(self):
+        from harness.graph import _parse_unsatisfiable_test_declaration
+        out = _parse_unsatisfiable_test_declaration(
+            "UNSATISFIABLE_TEST: tests/test_db.py — SQLite cannot use WAL "
+            "on an in-memory connection"
+        )
+        assert out == (
+            "tests/test_db.py",
+            "SQLite cannot use WAL on an in-memory connection",
+        )
+
+    def test_hyphen_and_colon_forms(self):
+        from harness.graph import _parse_unsatisfiable_test_declaration
+        assert _parse_unsatisfiable_test_declaration(
+            "UNSATISFIABLE_TEST: tests/a.py - impossible expectation"
+        ) == ("tests/a.py", "impossible expectation")
+        assert _parse_unsatisfiable_test_declaration(
+            "UNSATISFIABLE_TEST: tests/a.py: impossible expectation"
+        ) == ("tests/a.py", "impossible expectation")
+
+    def test_reason_optional(self):
+        from harness.graph import _parse_unsatisfiable_test_declaration
+        assert _parse_unsatisfiable_test_declaration(
+            "UNSATISFIABLE_TEST: tests/a.py"
+        ) == ("tests/a.py", "")
+
+    def test_embedded_in_prose_and_first_wins(self):
+        from harness.graph import _parse_unsatisfiable_test_declaration
+        text = (
+            "Some analysis first.\n"
+            "UNSATISFIABLE_TEST: tests/first.py — reason one\n"
+            "UNSATISFIABLE_TEST: tests/second.py — reason two\n"
+        )
+        assert _parse_unsatisfiable_test_declaration(text) == (
+            "tests/first.py", "reason one",
+        )
+
+    def test_absent_returns_none(self):
+        from harness.graph import _parse_unsatisfiable_test_declaration
+        assert _parse_unsatisfiable_test_declaration("") is None
+        assert _parse_unsatisfiable_test_declaration("no marker here") is None
+        assert _parse_unsatisfiable_test_declaration(
+            "UNSATISFIABLE_TEST:"
+        ) is None

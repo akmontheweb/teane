@@ -3491,6 +3491,48 @@ def _build_outside_harness_actions(
                 "produce, or `[m]` pause for manual edits."
             )
 
+    # ---- unsatisfiable_test:<path> -----------------------------------
+    # The repair LLM — on the harness's explicit invitation, after the
+    # judge named ONLY tamper-guarded test files — declared that no
+    # production-code change can ever satisfy a generated test's
+    # assertion (e.g. asserting SQLite WAL journal mode on an in-memory
+    # connection). Repair is forbidden from editing tests, so the loop
+    # cannot make progress until a human resolves the test itself.
+    elif trigger.startswith("unsatisfiable_test"):
+        _unsat_path = ""
+        if ":" in trigger:
+            _unsat_path = trigger.split(":", 1)[1].strip()
+        _unsat_path = _unsat_path or str(
+            node_state.get("unsatisfiable_test", "")
+        )
+        _unsat_reason = str(
+            node_state.get("unsatisfiable_test_reason", "") or ""
+        ).strip()
+        _reason_suffix = f" Reason given: {_unsat_reason}" if _unsat_reason else ""
+        actions.append(
+            f"The repair LLM declared the generated test "
+            f"`{_unsat_path or '<unknown>'}` unsatisfiable — its "
+            f"assertion cannot pass under ANY production-code change, "
+            f"and the repair loop is (correctly) not allowed to edit "
+            f"test files.{_reason_suffix}"
+        )
+        actions.append(
+            "Fix the test by hand: `[m]` pause, edit the assertion so it "
+            "tests the intended behaviour in a satisfiable way (the "
+            "declared reason usually points at the exact defect), then "
+            "`[r]` Resume."
+        )
+        actions.append(
+            "Or delete the defective test function/file if the coverage "
+            "is redundant, then `[r]` Resume. Do NOT weaken unrelated "
+            "assertions — only the declared expectation is at issue."
+        )
+        actions.append(
+            "If the declaration looks WRONG (a production fix does "
+            "exist), `[e]` inject a hint naming the production file and "
+            "change to make — the next repair round will see it."
+        )
+
     # ---- env_misconfig:<symbol> --------------------------------------
     # Highest-precision trigger — we know exactly what's missing.
     elif trigger.startswith("env_misconfig"):
@@ -4302,6 +4344,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         "build_command_blocked",
                         "build_command_blocked_rule",
                         "llm_silent",
+                        "unsatisfiable_test",
+                        "unsatisfiable_test_reason",
                     ):
                         _ns.pop(_k, None)
                     state["node_state"] = _ns
@@ -7697,6 +7741,10 @@ def _resolve_cli_exit_code(
         "build_command_blocked",
         "build_command_cd_missing",
         "llm_silent",
+        # A declared-unsatisfiable generated test left unresolved shares
+        # the same semantics: a human must fix the test before another
+        # run can go clean.
+        "unsatisfiable_test",
     )
     if any(node_state.get(f) for f in infra_flags):
         return EXIT_INFRASTRUCTURE_FAILURE

@@ -541,3 +541,81 @@ class TestRouterEnvMisconfig:
             "node_state": {},
         }
         assert route_after_compiler(state) == "security_scan_node"
+
+
+# ---------------------------------------------------------------------------
+# route_after_compiler — declared unsatisfiable test skips further repair
+# ---------------------------------------------------------------------------
+
+class TestRouterUnsatisfiableTest:
+    """lumina 019f7109: the repair LLM (on the banner's invitation)
+    declared a tamper-guarded test unsatisfiable. Repair cannot edit
+    tests, so every further round is a guaranteed zero-patch round —
+    the router must escalate immediately, but only while the declared
+    file is still in the failing set."""
+
+    def test_routes_to_hitl_when_declared_file_still_failing(self):
+        state = {
+            "exit_code": 1,
+            "budget_remaining_usd": 1.99,
+            "loop_counter": {"total_repairs": 1},
+            "workspace_path": "",
+            "compiler_errors": [{
+                "file": "tests/test_db.py",
+                "line": 46,
+                "error_code": "AssertionError",
+                "message": "assert 'memory' == 'wal'",
+            }],
+            "node_state": {"unsatisfiable_test": "tests/test_db.py"},
+        }
+        assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_stale_declaration_falls_through_to_repair(self):
+        # The operator fixed (or a landed patch resolved) the declared
+        # test; the remaining failure is elsewhere. The stale flag must
+        # NOT hijack the loop.
+        state = {
+            "exit_code": 1,
+            "budget_remaining_usd": 1.99,
+            "loop_counter": {"total_repairs": 1},
+            "workspace_path": "",
+            "compiler_errors": [{
+                "file": "server/app/api/routes.py",
+                "line": 10,
+                "error_code": "SyntaxError",
+                "message": "invalid syntax",
+            }],
+            "node_state": {"unsatisfiable_test": "tests/test_db.py"},
+        }
+        assert route_after_compiler(state) == "repair_node"
+
+    def test_absolute_diagnostic_path_still_matches(self, tmp_path):
+        # pytest assertion-rewrite diagnostics can carry absolute paths;
+        # the still-failing check must match them against the
+        # workspace-relative declared path.
+        ws = str(tmp_path)
+        state = {
+            "exit_code": 1,
+            "budget_remaining_usd": 1.99,
+            "loop_counter": {"total_repairs": 1},
+            "workspace_path": ws,
+            "compiler_errors": [{
+                "file": f"{ws}/tests/test_db.py",
+                "line": 46,
+                "error_code": "AssertionError",
+                "message": "assert 'memory' == 'wal'",
+            }],
+            "node_state": {"unsatisfiable_test": "tests/test_db.py"},
+        }
+        assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_green_build_ignores_stale_flag(self):
+        state = {
+            "exit_code": 0,
+            "budget_remaining_usd": 1.99,
+            "loop_counter": {"total_repairs": 1},
+            "workspace_path": "",
+            "compiler_errors": [],
+            "node_state": {"unsatisfiable_test": "tests/test_db.py"},
+        }
+        assert route_after_compiler(state) == "security_scan_node"

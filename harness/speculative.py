@@ -1578,9 +1578,11 @@ def _repo_has_resolvable_head(repo_path: str) -> bool:
 
 def _create_worktree(repo_path: str, worktree_path: str) -> bool:
     """Create a git worktree at the given path."""
-    os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
-
     try:
+        # Inside the try: a disk-full/permission OSError here otherwise
+        # escapes as an exception AFTER the caller already paid for its
+        # LLM dispatches (repair-fanout fail-open incident class).
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
         # Remove if exists from a previous run
         if os.path.exists(worktree_path):
             _remove_worktree(repo_path, worktree_path)
@@ -1752,7 +1754,19 @@ def _seed_worktree_from_workspace(workspace_path: str, worktree_path: str) -> in
         if status.startswith(("R", "C")):
             # Rename/copy entries carry the ORIGIN path as the next
             # NUL-separated record; the destination is in this one.
+            origin = entries[i] if i < len(entries) else ""
             i += 1
+            # A staged RENAME deletes the origin in the workspace, but the
+            # fresh HEAD worktree still has it — leaving it produces a tree
+            # with BOTH old and new files (duplicate pytest collection,
+            # shadowed imports) that can flip a variant's compile verdict.
+            # Copies keep their origin, so only renames mirror the delete.
+            if status.startswith("R") and origin:
+                origin_src = os.path.join(workspace_path, origin)
+                origin_dst = os.path.join(worktree_path, origin)
+                if not os.path.exists(origin_src) and os.path.isfile(origin_dst):
+                    os.remove(origin_dst)
+                    synced += 1
         src = os.path.join(workspace_path, path)
         dst = os.path.join(worktree_path, path)
         if os.path.isfile(src):
@@ -1787,6 +1801,11 @@ async def maybe_run_repair_fanout(
     with ``vr.exit_code`` set; the default runs the state's build command
     in a sandbox against the variant's worktree.
     """
+    # Pre-bound so the fail-open handler below can clean up worktrees and
+    # salvage already-paid dispatches no matter where the body failed.
+    live: list[Any] = []
+    variant_results: list[VariantResult] = []
+    worktree_base = ""
     try:
         cfg = SpeculativeConfig.from_state(state)
         if not repair_fanout_should_engage(cfg, loop_counter):
@@ -1830,7 +1849,23 @@ async def maybe_run_repair_fanout(
         # --- Apply each variant in a seeded worktree and compile ---
         build_command = str(state.get("build_command") or "")
         worktree_base = os.path.join(cfg.worktree_base_dir, "repair")
-        variant_results: list[VariantResult] = []
+
+        # Score variants under the SAME rules the winner will face on the
+        # real apply (graph.py repair_node): source-root allowlist, and
+        # READ_FILE / PROMOTE_DEFERRED blocks stripped before parsing.
+        # Without this, a variant whose patches write outside the allowlist
+        # compiles clean in the worktree and wins, then gets rejected on
+        # the real apply — the selection signal is invalid exactly when the
+        # allowlist matters. Late imports: graph.py imports this module.
+        from harness.graph import _build_patcher_allowlist
+        from harness.patcher import (
+            strip_promote_deferred_blocks,
+            strip_read_blocks,
+        )
+        fanout_allowed_paths = _build_patcher_allowlist(workspace_path)
+
+        def _apply_payload(content: str) -> str:
+            return strip_promote_deferred_blocks(strip_read_blocks(content))
 
         async def _default_compile(vr: "VariantResult") -> "VariantResult":
             from harness.sandbox import SandboxExecutor
@@ -1872,7 +1907,9 @@ async def maybe_run_repair_fanout(
                     "dirty path(s) from the workspace.", i, synced,
                 )
                 patch_results, modified = await process_llm_patch_output(
-                    response.content, worktree_path, existing_modified_files=[],
+                    _apply_payload(response.content), worktree_path,
+                    existing_modified_files=[],
+                    allowed_paths=fanout_allowed_paths,
                 )
                 vr.patch_results = patch_results
                 vr.modified_files = modified
@@ -1949,4 +1986,27 @@ async def maybe_run_repair_fanout(
             "[repair_fanout] Fanout failed; falling back to the normal "
             "sequential dispatch.", exc_info=True,
         )
+        # Never leak worktrees: the happy path's cleanup may not have run.
+        # _cleanup_worktrees is idempotent, so a double call is safe.
+        try:
+            if worktree_base and variant_results:
+                _cleanup_worktrees(workspace_path, worktree_base, variant_results)
+        except Exception:  # noqa: BLE001 — cleanup is best-effort here
+            logger.debug("[repair_fanout] cleanup after failure also failed",
+                         exc_info=True)
+        if live:
+            # The variant dispatches were already PAID FOR. Returning None
+            # here made repair_node re-dispatch against the PRE-fanout
+            # budget — the N paid calls vanished from budget_remaining_usd
+            # and the token tracker. Hand back the first live variant as
+            # the round's response instead: the accounting stays truthful
+            # and the round costs no additional dispatch.
+            extra = [
+                getattr(r, "usage", None) for r in live[1:]
+                if getattr(r, "usage", None)
+            ]
+            return RepairFanoutOutcome(
+                response=live[0], budget=budget, won=False,
+                extra_usages=extra,
+            )
         return None

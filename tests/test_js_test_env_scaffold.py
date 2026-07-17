@@ -146,6 +146,66 @@ class TestNonComponentAndEdgeCases:
         assert "testEnvironment: 'node'" in cfg
         assert "setupFilesAfterEnv" not in cfg
 
+    def test_jsx_component_scaffold_is_runnable(self, tmp_path):
+        # Regression: the non-TS component path wrote an ESM `import` in
+        # jest.setup.js under a CJS jest config with no babel wiring —
+        # babel-jest without a preset can parse neither the setup file
+        # nor the .jsx tests, so the scaffolded env was dead on arrival.
+        _write(tmp_path, "client/package.json", json.dumps({
+            "name": "client", "dependencies": {"react": "^18.2.0"},
+        }))
+        _write(
+            tmp_path, "client/src/__tests__/Panel.test.jsx",
+            "import { render } from '@testing-library/react';\n",
+        )
+        changed = _ensure_js_test_env(
+            str(tmp_path), ["client/src/__tests__/Panel.test.jsx"],
+        )
+        assert "client/babel.config.cjs" in changed
+        # CJS require, not ESM import — the setup file runs under
+        # babel-jest in a CJS package.
+        assert (tmp_path / "client/jest.setup.js").read_text() == (
+            "require('@testing-library/jest-dom');\n"
+        )
+        babel = (tmp_path / "client/babel.config.cjs").read_text()
+        assert "@babel/preset-env" in babel
+        assert "@babel/preset-react" in babel
+        dev = json.loads((tmp_path / "client/package.json").read_text())[
+            "devDependencies"
+        ]
+        for dep in ("@babel/core", "@babel/preset-env",
+                    "@babel/preset-react"):
+            assert dep in dev, f"missing devDependency {dep}"
+        # The TS toolchain is NOT dragged into a plain-JS package.
+        assert "ts-jest" not in dev
+
+    def test_plain_js_gets_babel_env_but_not_react_preset(self, tmp_path):
+        _write(tmp_path, "package.json", json.dumps({"name": "app"}))
+        _write(tmp_path, "src/util.test.js", "test('u', () => {});\n")
+        _ensure_js_test_env(str(tmp_path), ["src/util.test.js"])
+        babel = (tmp_path / "babel.config.cjs").read_text()
+        assert "@babel/preset-env" in babel
+        assert "@babel/preset-react" not in babel
+
+    def test_existing_babel_config_never_touched(self, tmp_path):
+        _write(tmp_path, "package.json", json.dumps({"name": "app"}))
+        _write(tmp_path, ".babelrc", '{"presets": ["my-own"]}')
+        _write(tmp_path, "src/util.test.js", "test('u', () => {});\n")
+        changed = _ensure_js_test_env(str(tmp_path), ["src/util.test.js"])
+        assert "babel.config.cjs" not in changed
+        assert not (tmp_path / "babel.config.cjs").exists()
+        assert (tmp_path / ".babelrc").read_text() == '{"presets": ["my-own"]}'
+
+    def test_ts_path_gets_no_babel_scaffold(self, tmp_path):
+        _write(tmp_path, "package.json", json.dumps({"name": "app"}))
+        _write(tmp_path, "src/x.test.ts", "test('x', () => {});\n")
+        changed = _ensure_js_test_env(str(tmp_path), ["src/x.test.ts"])
+        assert "babel.config.cjs" not in changed
+        dev = json.loads((tmp_path / "package.json").read_text())[
+            "devDependencies"
+        ]
+        assert "@babel/core" not in dev
+
     def test_no_package_json_is_a_no_op(self, tmp_path):
         _write(tmp_path, "src/x.test.ts", "test('x', () => {});\n")
         assert _ensure_js_test_env(str(tmp_path), ["src/x.test.ts"]) == []

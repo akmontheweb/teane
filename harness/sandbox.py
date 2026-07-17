@@ -226,6 +226,15 @@ class BuildResult:
     # if it occurred after the cap was hit. Surfaced so downstream nodes
     # can warn the user instead of treating the truncated tail as ground truth.
     log_truncated: bool = False
+    # The COMPLETE captured log (all stdout, then all stderr — streamer
+    # concatenation order), untouched by filter_critical_errors. On failure
+    # ``raw_output`` is the filtered view, and the filter's no-critical-match
+    # fallback ("last 50 lines") can reduce the log to installer chatter when
+    # the runner's report matches no critical pattern (finsearch b674f3ca:
+    # pytest fixture errors — "ERROR at setup of", "E fixture 'x' not
+    # found" — match nothing in _CRITICAL_ERROR_PATTERNS). Failure-surface
+    # extraction in compiler_node must scan THIS field, never raw_output.
+    full_output: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1839,6 +1848,23 @@ _CRITICAL_ERROR_PATTERNS: list[re.Pattern[str]] = [
     # iterations on blind guesses.
     re.compile(r"^FAIL:\s"),
     re.compile(r"PROD_IMPORT_SMOKE_(?:FAILURES|OK)"),
+    # Pytest ERROR-section shapes (finsearch b674f3ca). Setup/teardown/
+    # collection errors print "ERROR at setup of X" block headers,
+    # "ERROR path.py::node" summary rows (no colon after ERROR, so the
+    # ``\bERROR:\s`` pattern above misses every one of them), and a
+    # fixture-lookup cause line ("fixture 'client' not found") that names
+    # no exception class. A report whose only failures are these shapes
+    # matches NOTHING else in this list, and the no-match fallback in
+    # filter_critical_errors then reduces the whole log to its last 50
+    # lines — the stderr installer tail. Case-sensitive on ERROR
+    # deliberately: pytest always prints it uppercase, and lowercase
+    # "error at setup" prose from app logging must not drag five lines
+    # of context each into the filtered view.
+    re.compile(r"\bERROR at (setup|teardown|collection) of\b"),
+    re.compile(r"\bERROR collecting\b"),
+    re.compile(r"^=+ ERRORS =+$"),
+    re.compile(r"^ERROR\s+\S+\.py(?:::|\s|$)"),
+    re.compile(r"\bfixture '[^']+' not found\b"),
     # "No tests collected" markers across stacks. These look benign but
     # graph.py's `_is_no_tests_collected` uses them to fold the runner's
     # non-zero exit to success (the batch just has no tests yet).
@@ -2189,6 +2215,7 @@ class SandboxExecutor:
                     raw_output=str(exc),
                     diagnostics=[],
                     timed_out=False,
+                    full_output=str(exc),
                 )
 
         start_time = time.monotonic()
@@ -2255,9 +2282,11 @@ class SandboxExecutor:
         # the original raw_output (filter_critical_errors may have dropped
         # the signature line under aggressive filtering).
         result_output = filtered if exit_code != 0 else raw_output
+        full_output = raw_output
         hint = _cache_corruption_hint(raw_output)
         if hint:
             result_output = (result_output or "") + hint
+            full_output = (full_output or "") + hint
 
         return BuildResult(
             exit_code=exit_code,
@@ -2266,6 +2295,7 @@ class SandboxExecutor:
             elapsed_seconds=elapsed,
             timed_out=timed_out,
             log_truncated=log_truncated,
+            full_output=full_output,
         )
 
 

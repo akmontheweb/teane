@@ -550,12 +550,33 @@ def _expand_env_placeholders(cfg: dict[str, Any]) -> dict[str, Any]:
     def _expand_str(value: str, where: str) -> str:
         def _sub(match: "re.Match[str]") -> str:
             var, default = match.group(1), match.group(2)
+            if default is not None and "${" in default:
+                # The regex's default group stops at the FIRST '}', so a
+                # nested placeholder like ${TEANE_A:-${TEANE_B}} would
+                # otherwise substitute with a truncated default and leave
+                # a stray '}' in the value — silent corruption when the
+                # outer var is set. Reject loudly instead of supporting
+                # one level badly.
+                raise ConfigError(
+                    f"Config value at '{where}' nests a placeholder inside "
+                    f"the default of ${{{var}:-…}}. Nested placeholders "
+                    f"are not supported — give the inner variable its own "
+                    f"config key or a literal default."
+                )
             resolved = os.environ.get(var)
-            if resolved is None:
+            # Shell ':-' semantics: the default applies when the variable
+            # is unset OR EMPTY. An empty export (`export TEANE_X=` in a
+            # profile) previously resolved to "" — the fs MCP server then
+            # got an empty root argument AND the empty value dodged the
+            # preflight degradation warning, because that check is guarded
+            # on truthiness. Empty is treated as unset throughout: with a
+            # default it falls back, without one it fails loudly.
+            if not resolved:
                 if default is None:
                     raise ConfigError(
                         f"Config value at '{where}' references ${{{var}}} "
-                        f"but the environment variable is not set and no "
+                        f"but the environment variable is "
+                        f"{'empty' if resolved == '' else 'not set'} and no "
                         f"':-default' was given. Export {var} (like the "
                         f"API-key env vars) or add a default: "
                         f"${{{var}:-<value>}}."
@@ -1229,6 +1250,13 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.expensive_model": (str,),
     "speculative.cheap_model": (str,),
     "speculative.voting": (dict,),
+    # Repair-level fanout. Typed like every other speculative.* key — a
+    # string "false" would otherwise pass validation and then evaluate
+    # truthy in RepairFanoutConfig, silently ENABLING the feature from a
+    # config that reads as off.
+    "speculative.repair_fanout": (bool,),
+    "speculative.repair_fanout_variants": (int,),
+    "speculative.repair_fanout_after_rounds": (int,),
     "llm_dispatch.max_tokens_default": (int, str, type(None)),
     "llm_dispatch.max_tokens_per_role": (dict,),
     "llm_dispatch.continue_on_length": (dict,),
@@ -8775,20 +8803,29 @@ def _doctor_check_env_placeholders() -> list[tuple[str, tuple[str, str]]]:
             continue
         seen.add(var)
         value = os.environ.get(var)
-        if value is not None:
+        # NEVER echo the resolved env value: the expansion mechanism accepts
+        # any ${TEANE_*}/${HARNESS_*} anywhere in config, so the value can be
+        # a credentialed URL or token, and this detail string lands in doctor
+        # output AND every session log at INFO. Name the source only — the
+        # sibling _doctor_check_env_vars_from_config prints "set" without
+        # values for exactly this reason. Empty counts as unset, mirroring
+        # the expander's shell-style ':-' semantics.
+        if value:
             rows.append((
                 f"env override: {var}",
-                ("pass", f"set in environment → `{value}`"),
+                ("pass", "set in environment (value not shown)"),
             ))
         elif default is not None:
             rows.append((
                 f"env override: {var}",
-                ("pass", f"unset — default used → `{default}`"),
+                ("pass", f"{'empty' if value == '' else 'unset'} — "
+                         f"default used → `{default}`"),
             ))
         else:
             rows.append((
                 f"env override: {var}",
-                ("fail", f"unset and no ':-default' in config — export {var}"),
+                ("fail", f"{'empty' if value == '' else 'unset'} and no "
+                         f"':-default' in config — export {var}"),
             ))
     return rows
 
@@ -8820,12 +8857,16 @@ def _preflight_config_env_report(config: dict[str, Any]) -> None:
                     and any("server-filesystem" in str(c) for c in command)):
                 continue
             root = str(command[-1])
-            if root and not os.path.isdir(root):
+            # An empty root (only reachable via an explicitly empty
+            # ':-default') is just as broken as a missing directory —
+            # don't let falsiness skip the warning.
+            if not root or not os.path.isdir(root):
                 logger.warning(
                     "[preflight] MCP filesystem root `%s` (server `%s`) "
-                    "does not exist on this host — the fs server will "
-                    "fail to start and its tools will be missing. Export "
-                    "TEANE_MCP_FS_ROOT or fix mcp.servers in config.json.",
+                    "is empty or does not exist on this host — the fs "
+                    "server will fail to start and its tools will be "
+                    "missing. Export TEANE_MCP_FS_ROOT or fix mcp.servers "
+                    "in config.json.",
                     root, server.get("name") or "fs",
                 )
     except Exception:  # noqa: BLE001 — reporting must never block startup
@@ -11884,6 +11925,18 @@ def build_parser() -> argparse.ArgumentParser:
             "→ agile). true = force agile (decomposes into first story set "
             "on a flat workspace). false = force flat (logs a gap-marker "
             "row in state.db on agile workspaces)."
+        ),
+    )
+    patch_parser.add_argument(
+        "--best-of",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="best_of",
+        help=(
+            "Run N independent patch trajectories in isolated git worktrees "
+            "and apply the winner (trajectory-level best-of-N). Overrides "
+            "best_of_n.enabled/n in config.json. Cost scales ~linearly with N."
         ),
     )
     patch_parser.add_argument(

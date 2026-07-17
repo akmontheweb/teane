@@ -163,6 +163,35 @@ class TestOrphanToolBlocks:
         assert any("the output" in b.get("text", "") for b in blocks)
         assert any(b.get("text") == "now fix it" for b in blocks)
 
+    def test_converted_orphan_lands_after_surviving_tool_results(self):
+        # Regression: when the final user turn carried 2+ tool_results and
+        # only ONE partner was trimmed, the in-place conversion produced
+        # [text, tool_result] — Anthropic requires a user message's
+        # tool_result blocks FIRST, so the repair itself shipped a
+        # guaranteed rejection.
+        msgs = [
+            {"role": "system", "content": "s"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "KEPT", "name": "grep"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "DROPPED", "content": "lost partner"},
+                {"type": "tool_result", "tool_use_id": "KEPT", "content": "ok"},
+            ]},
+        ]
+        out = gw._strip_orphan_tool_blocks(msgs)
+        blocks = out[-1]["content"]
+        kinds = [b.get("type") for b in blocks]
+        # Every tool_result precedes every text block.
+        assert "tool_result" in kinds and "text" in kinds
+        assert max(i for i, k in enumerate(kinds) if k == "tool_result") < \
+            min(i for i, k in enumerate(kinds) if k == "text")
+        # The surviving pair is intact and the orphan's content preserved.
+        assert any(b.get("tool_use_id") == "KEPT" for b in blocks
+                   if b.get("type") == "tool_result")
+        assert any("lost partner" in b.get("text", "") for b in blocks
+                   if b.get("type") == "text")
+
     def test_compaction_leaves_no_orphans(self):
         spec = _spec(1200)
         msgs = [{"role": "system", "content": "SYS"}]

@@ -28,24 +28,41 @@ the model a clear, consistent signal about provenance.
 
 from __future__ import annotations
 
+import re
+
 # Zero-width space used to break apart control markers without changing how
 # the text reads to the model.
 _ZWSP = "​"
+
+# The fence banners below key on this phrase. An untrusted document that
+# contains the literal ``===== END UNTRUSTED EXTERNAL DATA … =====`` line
+# would otherwise close the fence early — everything after it reads as
+# trusted framing. Case-insensitive: the model plausibly honours a
+# lower-case forgery too.
+_FENCE_BANNER_RE = re.compile(
+    r"(?i)(BEGIN|END)(\s+)(U)(NTRUSTED\s+EXTERNAL\s+DATA)"
+)
 
 
 def neutralize_control_tokens(text: str) -> str:
     """Defang harness control markers embedded in untrusted text.
 
-    The harness's DSL parsers and fence markers all key on the literal
-    ``<<<`` / ``>>>`` bracket sequences. Splitting those with a zero-width
-    space means no parser matches them and untrusted content cannot forge a
-    ``<<<CREATE_FILE>>>`` / ``<<<MCP_CALL>>>`` or a fence-close, while the
-    text remains human/model readable. Idempotent enough for practical use
-    (already-broken sequences simply gain another break).
+    The harness's DSL parsers key on the literal ``<<<`` / ``>>>`` bracket
+    sequences, and the fence boundary keys on the ``BEGIN/END UNTRUSTED
+    EXTERNAL DATA`` banner phrase. Splitting both with a zero-width space
+    means no parser matches them and untrusted content cannot forge a
+    ``<<<CREATE_FILE>>>`` / ``<<<MCP_CALL>>>`` — or a fence-close banner
+    that would let everything after it masquerade as trusted framing —
+    while the text remains human/model readable. Idempotent enough for
+    practical use (already-broken sequences simply gain another break).
     """
     if not text:
         return text
-    return text.replace("<<<", f"<{_ZWSP}<{_ZWSP}<").replace(">>>", f">{_ZWSP}>{_ZWSP}>")
+    out = text.replace("<<<", f"<{_ZWSP}<{_ZWSP}<").replace(">>>", f">{_ZWSP}>{_ZWSP}>")
+    return _FENCE_BANNER_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_ZWSP}{m.group(4)}",
+        out,
+    )
 
 
 def _clean_source(source: str) -> str:

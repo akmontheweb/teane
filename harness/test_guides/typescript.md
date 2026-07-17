@@ -37,7 +37,9 @@ SAME response if it doesn't:
   test files.
 - Component tests need `testEnvironment: "jsdom"` in the jest config and
   a `jest.setup.ts` importing `@testing-library/jest-dom`, wired via
-  `setupFilesAfterEach`.
+  `setupFilesAfterEnv` (NOT `setupFilesAfterEach` — that key does not
+  exist and jest silently ignores it, so the jest-dom matchers go
+  missing with no error).
 - NEVER paper over missing types with `@ts-ignore`, `declare const
   expect`, or hand-rolled ambient declarations — fix the config.
 

@@ -495,12 +495,28 @@ _COMPONENT_TEST_DEVDEPS: dict[str, str] = {
     "@testing-library/jest-dom": "^6.4.2",
     "jest-environment-jsdom": "^29.7.0",
 }
+# Plain-JS packages get no ts-jest preset, so jest falls back to
+# babel-jest — which without a preset can parse neither modern syntax in
+# .js tests nor JSX in .jsx tests. Scaffold the babel side too, or the
+# "runnable env" this function promises isn't (the TS path never needs
+# these: ts-jest is its own transform).
+_JS_BABEL_DEVDEPS: dict[str, str] = {
+    "@babel/core": "^7.24.0",
+    "@babel/preset-env": "^7.24.0",
+}
+_JS_BABEL_REACT_DEVDEPS: dict[str, str] = {
+    "@babel/preset-react": "^7.24.0",
+}
 
 _JS_TEST_EXTS = (".test.ts", ".test.tsx", ".test.js", ".test.jsx",
                  ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")
 _JEST_CONFIG_NAMES = (
     "jest.config.js", "jest.config.cjs", "jest.config.mjs",
     "jest.config.ts", "jest.config.json",
+)
+_BABEL_CONFIG_NAMES = (
+    ".babelrc", ".babelrc.json", "babel.config.js", "babel.config.cjs",
+    "babel.config.json", "babel.config.mjs",
 )
 
 
@@ -543,8 +559,13 @@ def _ensure_js_test_env(
          exists (jest.config.* or a "jest" key in package.json):
          ts-jest transform for TS, jsdom environment + a
          ``setupFilesAfterEnv`` hook for component tests.
-      3. ``jest.setup.<ts|js>`` importing @testing-library/jest-dom —
-         only alongside a config this function wrote.
+      3. ``jest.setup.<ts|js>`` loading @testing-library/jest-dom (ESM
+         import under ts-jest, CJS require under babel-jest) — only
+         alongside a config this function wrote. Plain-JS packages also
+         get ``babel.config.cjs`` (+ @babel/preset-env, and
+         @babel/preset-react for components) when no babel config
+         exists, since babel-jest without a preset can parse neither
+         modern syntax nor JSX.
       4. tsconfig.json ``compilerOptions.types`` — APPEND "jest" only
          when a ``types`` array already exists and lacks it. When the
          key is absent every @types package is auto-included, which is
@@ -594,6 +615,10 @@ def _ensure_js_test_env(
         needed = dict(_JS_TEST_DEVDEPS_BASE)
         if is_ts:
             needed.update(_TS_TEST_DEVDEPS)
+        else:
+            needed.update(_JS_BABEL_DEVDEPS)
+            if is_component:
+                needed.update(_JS_BABEL_REACT_DEVDEPS)
         if is_component:
             needed.update(_COMPONENT_TEST_DEVDEPS)
         present = set()
@@ -657,10 +682,49 @@ def _ensure_js_test_env(
                         pkg_dir, f"jest.setup.{setup_ext}",
                     )
                     if not os.path.isfile(setup_path):
+                        # CJS require for the plain-JS path: the setup
+                        # file runs under jest's default babel-jest
+                        # transform, and an ESM `import` in a CJS package
+                        # fails to parse before any test runs. ts-jest
+                        # handles the import form fine for .ts.
+                        setup_line = (
+                            "import '@testing-library/jest-dom';\n"
+                            if is_ts else
+                            "require('@testing-library/jest-dom');\n"
+                        )
                         with open(setup_path, "w", encoding="utf-8") as fh:
-                            fh.write("import '@testing-library/jest-dom';\n")
+                            fh.write(setup_line)
                         changed.append(
                             os.path.relpath(setup_path, ws).replace(os.sep, "/")
+                        )
+                # Plain-JS packages need babel presets for babel-jest to
+                # parse modern syntax / JSX. Only written alongside a
+                # jest config this function owns, and only when the
+                # package has no babel config of any shape — an
+                # operator-owned babel setup is never touched.
+                if not is_ts:
+                    has_babel_config = "babel" in pkg or any(
+                        os.path.isfile(os.path.join(pkg_dir, name))
+                        for name in _BABEL_CONFIG_NAMES
+                    )
+                    if not has_babel_config:
+                        babel_lines = [
+                            "module.exports = {",
+                            "  presets: [",
+                            "    ['@babel/preset-env', "
+                            "{ targets: { node: 'current' } }],",
+                        ]
+                        if is_component:
+                            babel_lines.append(
+                                "    ['@babel/preset-react', "
+                                "{ runtime: 'automatic' }],"
+                            )
+                        babel_lines += ["  ],", "};"]
+                        babel_path = os.path.join(pkg_dir, "babel.config.cjs")
+                        with open(babel_path, "w", encoding="utf-8") as fh:
+                            fh.write("\n".join(babel_lines) + "\n")
+                        changed.append(
+                            os.path.relpath(babel_path, ws).replace(os.sep, "/")
                         )
                 logger.info(
                     "[test_generation_node] Wrote %s (%s environment%s).",

@@ -230,6 +230,22 @@ class TestCondense:
         result = self._run(_history(18), judge, total_repairs=5)
         assert "good-summary" in result[2]["content"]
 
+    def test_stale_summary_survives_llm_raise(self) -> None:
+        # Regression: the except path set summary = "" — a RAISING
+        # provider (vs one returning None) discarded the cached digest,
+        # contradicting the docstring's "stale beats absent" contract.
+        healthy = True
+
+        async def judge(prompt: str):
+            if healthy:
+                return "good-summary"
+            raise RuntimeError("provider down")
+
+        self._run(_history(15), judge)
+        healthy = False
+        result = self._run(_history(18), judge, total_repairs=5)
+        assert "good-summary" in result[2]["content"]
+
     def test_distinct_sessions_do_not_share_summaries(self) -> None:
         async def judge_a(prompt: str):
             return "summary-for-a"

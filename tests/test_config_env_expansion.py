@@ -67,6 +67,35 @@ class TestExpansion:
             _expand_env_placeholders({"a": "${TEANE_OOPS"})
         assert "malformed" in str(exc.value)
 
+    def test_empty_env_var_falls_back_to_default(self, monkeypatch):
+        # Shell ':-' semantics: falls back on unset OR EMPTY. An empty
+        # `export TEANE_X=` profile line previously resolved to "" and the
+        # fs MCP server got an empty root while the preflight warning
+        # (guarded on truthiness) stayed silent.
+        monkeypatch.setenv("TEANE_MCP_FS_ROOT", "")
+        out = _expand_env_placeholders({"a": "${TEANE_MCP_FS_ROOT:-/d/efault}"})
+        assert out["a"] == "/d/efault"
+
+    def test_empty_env_var_without_default_raises(self, monkeypatch):
+        monkeypatch.setenv("TEANE_EMPTYX", "")
+        with pytest.raises(ConfigError) as exc:
+            _expand_env_placeholders({"a": "${TEANE_EMPTYX}"})
+        msg = str(exc.value)
+        assert "TEANE_EMPTYX" in msg
+        assert "empty" in msg
+
+    def test_nested_placeholder_rejected_loudly(self, monkeypatch):
+        # The default group stops at the first '}' — supporting nesting
+        # would silently truncate. Must raise whether or not the outer
+        # var is set (the set case previously produced `/x}`).
+        monkeypatch.setenv("TEANE_A", "/x")
+        with pytest.raises(ConfigError) as exc:
+            _expand_env_placeholders({"a": "${TEANE_A:-${TEANE_B}}"})
+        assert "nest" in str(exc.value).lower()
+        monkeypatch.delenv("TEANE_A", raising=False)
+        with pytest.raises(ConfigError):
+            _expand_env_placeholders({"a": "${TEANE_A:-${TEANE_B}}"})
+
     def test_nested_structures_and_non_strings(self, monkeypatch):
         monkeypatch.setenv("HARNESS_X", "resolved")
         out = _expand_env_placeholders({
@@ -126,9 +155,30 @@ class TestDoctorEnvPlaceholders:
         monkeypatch.delenv("TEANE_VOLUME_ROOT", raising=False)
         rows = dict(_doctor_check_env_placeholders())
         assert rows["env override: TEANE_MCP_FS_ROOT"][0] == "pass"
-        assert "/srv/work" in rows["env override: TEANE_MCP_FS_ROOT"][1]
         assert rows["env override: TEANE_VOLUME_ROOT"][0] == "pass"
         assert "default used" in rows["env override: TEANE_VOLUME_ROOT"][1]
+
+    def test_resolved_env_value_never_echoed(self, monkeypatch):
+        # The placeholder mechanism accepts any ${TEANE_*} anywhere in
+        # config, so the resolved value can be a credentialed URL — and the
+        # detail string lands in doctor output and every session log at
+        # INFO. Names only, like _doctor_check_env_vars_from_config.
+        secret = "https://user:hunter2@backups.internal/container/"
+        monkeypatch.setenv("TEANE_MCP_FS_ROOT", secret)
+        rows = dict(_doctor_check_env_placeholders())
+        detail = rows["env override: TEANE_MCP_FS_ROOT"][1]
+        assert secret not in detail
+        assert "hunter2" not in detail
+
+    def test_empty_env_var_reported_as_unset(self, monkeypatch):
+        # Mirrors the expander's shell ':-' semantics: empty counts as
+        # unset, so the default-used row must fire, not "set in
+        # environment".
+        monkeypatch.setenv("TEANE_MCP_FS_ROOT", "")
+        rows = dict(_doctor_check_env_placeholders())
+        detail = rows["env override: TEANE_MCP_FS_ROOT"][1]
+        assert "default used" in detail
+        assert "empty" in detail
 
 
 class TestPreflightEnvReport:

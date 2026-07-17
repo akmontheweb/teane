@@ -41,6 +41,14 @@ class TestCellClassification:
     def test_verdict_case_insensitive(self):
         assert _judge_calibration_cell(_verdict("progress"), True) == "tp"
 
+    def test_working_hypothesis_abstains_regardless_of_outcome(self):
+        # Regression: WH was bucketed with DISTRACTION/REGRESSION, so a
+        # judge that correctly deferred on a factually-advancing round
+        # recorded an fn — corrupting the recall the metric isolates.
+        v = _verdict("WORKING_HYPOTHESIS")
+        assert _judge_calibration_cell(v, True) == "working_hypothesis"
+        assert _judge_calibration_cell(v, False) == "working_hypothesis"
+
 
 class TestMetricsMath:
     def _m(self, **cells):
@@ -66,6 +74,15 @@ class TestMetricsMath:
         m = self._m(low_signal=5)
         assert m.judge_precision() is None
         assert m.judge_low_signal_rate() == 1.0
+
+    def test_working_hypothesis_excluded_from_matrix_math(self):
+        m = self._m(tp=6, fp=2, tn=3, fn=1, working_hypothesis=4)
+        # Precision/recall/accuracy unchanged by deferrals...
+        assert m.judge_precision() == 6 / 8
+        assert m.judge_recall() == 6 / 7
+        assert m.judge_accuracy() == 9 / 12
+        # ...but the deferral rate is tracked over all labeled verdicts.
+        assert m.judge_working_hypothesis_rate() == 4 / 16
 
     def test_jsonable_includes_calibration(self):
         d = self._m(tp=1, fp=1).to_jsonable()

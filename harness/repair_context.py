@@ -261,7 +261,17 @@ async def condense_repair_messages(
             "[repair_context] condense failed; falling back to plain prune",
             exc_info=True,
         )
-        summary = ""
+        # Stale beats absent (the docstring's contract): a failed refresh
+        # falls back to the last good cached digest, not to dropping the
+        # digest entirely — the summary variable may hold a partially
+        # updated value or be unbound depending on where the raise hit.
+        try:
+            summary = str(
+                (_CONDENSE_CACHE.get(_cache_key(messages)) or {})
+                .get("summary", "") or ""
+            )
+        except Exception:  # noqa: BLE001 — cache key itself failed
+            summary = ""
 
     if not summary:
         logger.info(

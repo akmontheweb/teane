@@ -126,8 +126,12 @@ def _run_harness(
     prompt: str,
     new_build: bool,
     timeout_s: int,
-) -> tuple[int, Optional[str]]:
-    """Invoke the harness in a subprocess. Returns (exit_code, error_str).
+) -> tuple[int, Optional[str], str]:
+    """Invoke the harness in a subprocess.
+
+    Returns ``(exit_code, error_str, stderr_tail)`` — the tail is the last
+    ~600 chars of the child's output on non-zero exit ("" otherwise), so an
+    instant contract failure doesn't read as a bare exit code.
 
     ``teane run`` was split into the four-target CLI: greenfield tasks
     (``new_build: true``) drive ``teane build`` (workspace reset implied,

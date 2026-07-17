@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import signal
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -112,23 +114,73 @@ def make_worktree(workspace: str, session: str, variant_id: int) -> str:
     wt = _worktree_path(workspace, session, variant_id)
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     branch = f"agent/bon-{session[:8]}-v{variant_id}"
-    r = _git(["worktree", "add", "-f", "-b", branch, wt, "HEAD"], workspace)
+    # -B (not -b): reset the branch if it already exists. A branch leaked
+    # by an earlier crashed run — or a reused session id — otherwise makes
+    # ``worktree add -b`` fail outright.
+    r = _git(["worktree", "add", "-f", "-B", branch, wt, "HEAD"], workspace)
     if r.returncode != 0:
         raise RuntimeError(f"worktree add failed for v{variant_id}: {r.stderr.strip()[:200]}")
     return wt
 
 
+_BON_DIR_RE = re.compile(r"^\.teane_bon_([A-Za-z0-9_-]{1,8})$")
+_BON_VARIANT_RE = re.compile(r"^v\d+$")
+
+
 def remove_worktree(workspace: str, wt: str) -> None:
-    """Best-effort worktree teardown (never raises)."""
+    """Best-effort worktree teardown (never raises).
+
+    ``git worktree remove`` does NOT delete the branch the worktree was
+    created with, and the ``.teane_bon_<sess>`` parent dir would otherwise
+    accumulate — so both are swept here (branch name re-derived from the
+    path shape ``.teane_bon_<sess8>/v<N>`` that :func:`_worktree_path`
+    produces; unknown shapes just skip the sweep)."""
     try:
         _git(["worktree", "remove", "--force", wt], workspace)
+        parent = os.path.dirname(wt)
+        dir_m = _BON_DIR_RE.match(os.path.basename(parent))
+        vid = os.path.basename(wt)
+        if dir_m and _BON_VARIANT_RE.match(vid):
+            _git(["branch", "-D", f"agent/bon-{dir_m.group(1)}-{vid}"],
+                 workspace)
+        try:
+            os.rmdir(parent)  # only succeeds once the last variant is gone
+        except OSError:
+            pass
     except Exception as exc:  # noqa: BLE001
         logger.debug("[best_of_n] worktree remove failed for %s: %s", wt, exc)
 
 
-def _diff_stat(wt: str) -> tuple[int, int]:
-    """(changed_files, lines_changed) for a worktree vs HEAD. (0,0) on error."""
-    r = _git(["diff", "--numstat", "HEAD"], wt)
+def _base_commit(workspace: str) -> Optional[str]:
+    """The MAIN workspace's HEAD sha — the commit every variant worktree was
+    branched from. Diffs must run against THIS, never against the worktree's
+    own ``HEAD``: with ``agile_defaults.commit_on_story=true`` the child
+    ``teane`` process commits inside the worktree after every green story,
+    advancing the worktree branch — a winner whose work is fully committed
+    then diffs EMPTY against its own HEAD and the run reports success while
+    landing nothing. The main workspace's HEAD does not move during a
+    best-of-N run (only the children commit, each in its own worktree), so it
+    is the stable branch point. None on git failure — callers fail CLOSED.
+    """
+    try:
+        r = _git(["rev-parse", "HEAD"], workspace)
+    except Exception as exc:  # noqa: BLE001 — treated as resolution failure
+        logger.warning("[best_of_n] rev-parse HEAD failed in %s: %s", workspace, exc)
+        return None
+    if r.returncode != 0:
+        logger.warning("[best_of_n] rev-parse HEAD failed in %s: %s",
+                       workspace, (r.stderr or "").strip()[:200])
+        return None
+    sha = (r.stdout or "").strip()
+    return sha or None
+
+
+def _diff_stat(wt: str, base: Optional[str]) -> tuple[int, int]:
+    """(changed_files, lines_changed) for a worktree vs the branch-point
+    commit ``base`` (see :func:`_base_commit`). (0,0) on error."""
+    if not base:
+        return (0, 0)
+    r = _git(["diff", "--numstat", base], wt)
     if r.returncode != 0:
         return (0, 0)
     files = lines = 0
@@ -143,9 +195,17 @@ def _diff_stat(wt: str) -> tuple[int, int]:
 
 
 def apply_winner_diff(winner_wt: str, main_workspace: str) -> bool:
-    """Apply the winning worktree's uncommitted+committed diff (vs HEAD) onto
-    the main workspace. Returns True on clean apply."""
-    d = _git(["diff", "HEAD"], winner_wt)
+    """Apply the winning worktree's full delta — committed AND uncommitted —
+    onto the main workspace. Returns True on clean apply.
+
+    The delta is computed against the main workspace's HEAD (the commit the
+    worktree was branched from), not the worktree's own HEAD, which
+    ``commit_on_story`` advances. Base-resolution failure returns False
+    (fail closed) rather than risking a silent no-op "success"."""
+    base = _base_commit(main_workspace)
+    if base is None:
+        return False
+    d = _git(["diff", base], winner_wt)
     if d.returncode != 0:
         return False
     patch = d.stdout
@@ -160,6 +220,30 @@ def apply_winner_diff(winner_wt: str, main_workspace: str) -> bool:
     return True
 
 
+def _save_winner_patch(winner_wt: str, main_workspace: str,
+                       session: str) -> Optional[str]:
+    """Write the winning worktree's full delta to a rescue file under
+    ``~/.harness/best_of_n/`` and return its path (None on any failure —
+    best-effort, never raises). Called only when the apply onto the main
+    workspace failed and the worktrees are about to be force-removed."""
+    try:
+        base = _base_commit(main_workspace)
+        if base is None:
+            return None
+        d = _git(["diff", base], winner_wt)
+        if d.returncode != 0 or not (d.stdout or "").strip():
+            return None
+        rescue_dir = os.path.expanduser("~/.harness/best_of_n")
+        os.makedirs(rescue_dir, exist_ok=True)
+        path = os.path.join(rescue_dir, f"{session[:8]}-winner.patch")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(d.stdout)
+        return path
+    except Exception as exc:  # noqa: BLE001 — rescue is best-effort
+        logger.debug("[best_of_n] winner-patch rescue failed: %s", exc)
+        return None
+
+
 def make_subprocess_variant_runner(
     base_argv: list[str],
     *,
@@ -172,21 +256,43 @@ def make_subprocess_variant_runner(
     ``base_argv`` is the base command minus the workspace (e.g.
     ``["teane", "build"]``); the runner points ``-w`` at the worktree.
     ``TEANE_BEST_OF_N_CHILD=1`` is exported so the child never re-enters
-    best-of-N (no fork bomb). Cost is aggregated from the child's own metrics
-    log elsewhere; this returns 0 for cost and lets the git diffstat supply
-    the change counts. Meaningful diversity across variants relies on
-    sampling nondeterminism today; per-variant model/temperature routing is a
-    forward-looking ``diversity_mode`` seam.
+    best-of-N (no fork bomb). ``per_variant_budget_usd`` (when set) is
+    passed to each child as ``--budget`` so the cap is enforced by the
+    child's own budget gateway — a true per-variant ceiling. The runner
+    itself returns 0 for cost (per-variant spend lives in each child's own
+    session metrics) and lets the git diffstat supply the change counts.
+    Meaningful diversity across variants relies on sampling nondeterminism
+    today; per-variant model/temperature routing is a forward-looking
+    ``diversity_mode`` seam.
     """
 
     async def runner(variant_id: int, wt: str, cfg: "BestOfNConfig") -> tuple[int, int, int, float]:
         cmd = [*base_argv, "-w", wt]
+        if cfg.per_variant_budget_usd:
+            cmd.extend(["--budget", str(cfg.per_variant_budget_usd)])
         child_env = dict(env if env is not None else os.environ)
         child_env["TEANE_BEST_OF_N_CHILD"] = "1"
+        # Force every HITL gate to auto-approve in the child. The gates'
+        # tty fallback checks sys.stdin.isatty(): children spawned from an
+        # interactive terminal INHERIT that tty, so with default gate
+        # config all N variants would block on input() reading the shared
+        # terminal (menus written to the unread stdout pipe) and die at
+        # the timeout — an hour of silence, then "no trajectory produced
+        # an applicable green build". stdin=DEVNULL breaks the tty
+        # inheritance; the env var pins auto-approve even if a future
+        # gate forgets the isatty check.
+        child_env["HARNESS_AUTO_APPROVE"] = "true"
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=wt, env=child_env,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                # Own process group, so the timeout path can reap the WHOLE
+                # tree — the child teane spawns sandbox/MCP grandchildren
+                # that a bare proc.kill() leaves running to race the
+                # worktree force-remove below. POSIX-only kwarg; a no-op
+                # on Windows (where the killpg path falls back anyway).
+                start_new_session=True,
             )
         except Exception as exc:  # noqa: BLE001 — spawn failure → failed variant
             logger.warning("[best_of_n] variant %d spawn failed: %s", variant_id, exc)
@@ -195,8 +301,20 @@ def make_subprocess_variant_runner(
             await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             try:
-                proc.kill()
-            except ProcessLookupError:
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:  # Windows: no process groups — direct kill only
+                    proc.kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            # Reap so the kill is complete before the caller tears down
+            # the worktree the (former) grandchildren were writing to.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
                 pass
             logger.warning("[best_of_n] variant %d timed out after %ds", variant_id, timeout_s)
             return (124, 0, 0, 0.0)
@@ -259,6 +377,10 @@ async def run_best_of_n_build(
     green build or the winner's diff failed to apply.
     """
     worktrees: dict[int, str] = {}
+    # Branch point every variant is created from — captured ONCE, up front,
+    # so diffstats and the winner apply measure against the same commit even
+    # if a child's commit_on_story advances its worktree branch.
+    base = _base_commit(workspace)
 
     async def solve(variant_id: int) -> TrajectoryResult:
         wt = make_worktree(workspace, session, variant_id)
@@ -266,7 +388,7 @@ async def run_best_of_n_build(
         exit_code, changed, lines, cost = await variant_runner(variant_id, wt, cfg)
         # Prefer the runner's counts; fall back to a git diffstat of the worktree.
         if changed <= 0:
-            changed, lines = _diff_stat(wt)
+            changed, lines = _diff_stat(wt, base)
         return TrajectoryResult(
             variant_id=variant_id, label=f"v{variant_id}",
             compiled_ok=(exit_code == 0), changed_files=changed,
@@ -282,8 +404,19 @@ async def run_best_of_n_build(
         )
         if winner is not None and isinstance(winner.payload, str):
             if not diff_applier(winner.payload, workspace):
-                logger.warning("[best_of_n] winner v%d diff failed to apply — "
-                               "no changes landed.", winner.variant_id)
+                # The ``finally`` below force-removes every worktree —
+                # including the green one — and with commit_on_story=false
+                # the winning diff exists NOWHERE else. Save it to a rescue
+                # file before teardown so a failed apply (typical cause: a
+                # dirty operator workspace) degrades to "apply this patch
+                # by hand", not to an unrecoverable loss of the run's work.
+                rescue = _save_winner_patch(winner.payload, workspace, session)
+                logger.warning(
+                    "[best_of_n] winner v%d diff failed to apply — no "
+                    "changes landed.%s", winner.variant_id,
+                    f" Winner's diff saved to {rescue} — inspect and "
+                    f"`git apply` it manually." if rescue else "",
+                )
                 winner = None
         return winner, results
     finally:

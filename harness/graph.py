@@ -9350,6 +9350,65 @@ async def _maybe_pytest_debug_rerun(
     failure["semantic_context"] = (str(failure.get("semantic_context") or "") + hint)
 
 
+# pytest flags that consume the NEXT token as their value. Used by the
+# positional-arg sniffer below; the list only needs to cover flags that
+# plausibly appear in teane-composed or operator build commands — an
+# unknown value flag makes the sniffer see its value as positional, which
+# only DISABLES an optimization (the safe direction).
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-p", "-k", "-m", "-o", "-W", "-c", "-n",
+    "--timeout", "--timeout-method", "--rootdir", "--maxfail",
+    "--durations", "--junitxml", "--cov", "--dist", "--ignore",
+})
+
+
+def _pytest_cmd_has_positional_args(build_cmd: str) -> bool:
+    """True when the pytest segment of ``build_cmd`` already carries
+    positional (path/selector) arguments — e.g. ``pytest tests/ -q``.
+
+    Appending a nodeid to such a command does NOT supersede the existing
+    collection args: pytest treats positional args as a UNION, so
+    ``pytest tests/ x.py::test_y`` runs everything in ``tests/`` PLUS the
+    selector. Both the targeted-tests fast path and the isolation re-runs
+    are built on the supersede assumption and silently break on
+    path-carrying commands — the "targeted" run becomes the full suite
+    (doubling wall-clock when priors pass) and ``passed alone`` can never
+    be true while the suite has any failure. Callers skip their fast
+    paths when this returns True. Fail-safe by construction: parse
+    trouble reports True, which only disables an optimization.
+    """
+    import shlex
+    for segment in re.split(r"&&|\|\||;", build_cmd or ""):
+        if "pytest" not in segment:
+            continue
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            return True
+        start = None
+        for j, tok in enumerate(tokens):
+            base = tok.rsplit("/", 1)[-1]
+            if base in ("pytest", "py.test"):
+                start = j + 1
+                break
+            if tok == "-m" and j + 1 < len(tokens) and tokens[j + 1] == "pytest":
+                start = j + 2
+                break
+        if start is None:
+            continue
+        expect_value = False
+        for tok in tokens[start:]:
+            if expect_value:
+                expect_value = False
+                continue
+            if tok.startswith("-"):
+                if tok in _PYTEST_VALUE_FLAGS:
+                    expect_value = True
+                continue
+            return True
+    return False
+
+
 async def _maybe_pytest_isolation_rerun(
     executor: Any,
     diagnostics: list[dict[str, Any]],
@@ -9381,9 +9440,11 @@ async def _maybe_pytest_isolation_rerun(
       modules whose import-time ``app.dependency_overrides`` clobbered
       each other; every file passed alone, and no signal said so.
     * The isolation command is the ORIGINAL ``build_cmd`` with the pytest
-      nodeid appended as a positional arg. pytest's positional args are
-      test selectors, so the appended nodeid supersedes any collection
-      done by the earlier args and only that one test executes.
+      nodeid appended as a positional arg. This only isolates when the
+      original command has NO positional args of its own — pytest UNIONS
+      positional selectors, so a path-carrying command would run the full
+      suite plus the nodeid and ``passed alone`` could never be observed.
+      :func:`_pytest_cmd_has_positional_args` gates both variants.
     * ``-p no:cacheprovider`` is appended too so the re-run doesn't
       pollute ``.pytest_cache``. Order matters: the nodeid must come
       LAST so it's still treated as a positional selector.
@@ -9398,6 +9459,14 @@ async def _maybe_pytest_isolation_rerun(
         if isinstance(d, dict) and d.get("pytest_nodeid")
     ]
     if not pytest_failures:
+        return
+    if _pytest_cmd_has_positional_args(build_cmd):
+        logger.info(
+            "[compiler_node:isolation] Skipping isolation re-run: the "
+            "build command already carries positional pytest args, and an "
+            "appended selector UNIONS with them (full suite + selector) — "
+            "'passed alone' could never be observed.",
+        )
         return
     if len(pytest_failures) != 1:
         await _maybe_pytest_isolation_rerun_multi(
@@ -9431,9 +9500,11 @@ async def _maybe_pytest_isolation_rerun(
     if nodeid in cache:
         passed_alone = cache[nodeid]
     else:
-        # Append the nodeid as a positional selector. Positional args in
-        # ``python -m pytest`` are test selectors — appending overrides
-        # the implicit collection root without touching the flag list.
+        # Append the nodeid as a positional selector. The gate above
+        # guarantees the command has no positional args of its own, so
+        # the nodeid is the ONLY selector and just that one test runs
+        # (pytest UNIONS positional selectors — see
+        # _pytest_cmd_has_positional_args).
         iso_cmd = f"{build_cmd} -p no:cacheprovider {nodeid}"
         try:
             iso_result = await executor.run(iso_cmd)
@@ -10391,11 +10462,20 @@ def _judge_calibration_cell(
            matrix (the judge abstained) but tracked as a rate, since a
            high abstention rate is its own defect (judge can't see the
            diagnostics — see the finsearch b674f3ca incident).
+      working_hypothesis — the judge explicitly DEFERRED judgement to let
+           the LLM test an upstream theory. Neither a positive nor a
+           negative: counting it as fn/tn (the original behavior) made a
+           correctly-deferring judge read as one that damns progressing
+           rounds, corrupting the exact recall signal this metric exists
+           to isolate. Excluded from the matrix like low_signal, tracked
+           as its own rate.
     """
     if _reflection_verdict_is_low_signal(verdict):
         return "low_signal"
-    says_progress = str(verdict.get("verdict") or "").strip().upper() == "PROGRESS"
-    if says_progress:
+    v = str(verdict.get("verdict") or "").strip().upper()
+    if v == "WORKING_HYPOTHESIS":
+        return "working_hypothesis"
+    if v == "PROGRESS":
         return "tp" if actual_progress else "fp"
     return "fn" if actual_progress else "tn"
 
@@ -12216,6 +12296,18 @@ def _targeted_tests_first_selectors(
         return []
     if is_pre_exit_verify or "pytest" not in build_cmd:
         return []
+    if _pytest_cmd_has_positional_args(build_cmd):
+        # Appended selectors UNION with existing positional path args —
+        # the "targeted" run would be the full suite plus selectors, and
+        # when priors pass the full suite then runs a SECOND time: the
+        # fast path inverts into a 2x slowdown. Skip it for
+        # path-carrying build commands.
+        logger.info(
+            "[compiler_node:targeted] Skipping targeted-tests-first: the "
+            "build command carries positional pytest args, so appended "
+            "selectors cannot narrow the run.",
+        )
+        return []
     prior_errors = [
         d for d in (state.get("compiler_errors") or [])
         if isinstance(d, dict)
@@ -12288,18 +12380,28 @@ def _extract_failure_surface(raw_log: str) -> tuple[str, str]:
     if not lines:
         return "empty", "(raw build output was empty)"
 
-    def _clip(selected: list[str]) -> str:
+    def _clip(selected: list[str], keep: str = "both") -> str:
         if len(selected) > _FAILURE_SURFACE_MAX_LINES:
-            half = _FAILURE_SURFACE_MAX_LINES // 2
-            selected = (
-                selected[:half]
-                + [f"... ({len(selected) - 2 * half} line(s) elided) ..."]
-                + selected[-half:]
-            )
+            if keep == "front":
+                dropped = len(selected) - _FAILURE_SURFACE_MAX_LINES
+                selected = (
+                    selected[:_FAILURE_SURFACE_MAX_LINES]
+                    + [f"... ({dropped} line(s) elided) ..."]
+                )
+            else:
+                half = _FAILURE_SURFACE_MAX_LINES // 2
+                selected = (
+                    selected[:half]
+                    + [f"... ({len(selected) - 2 * half} line(s) elided) ..."]
+                    + selected[-half:]
+                )
         text = "\n".join(selected)
         if len(text) > _FAILURE_SURFACE_MAX_BYTES:
-            # Keep the END — summaries and assertion messages sit there.
-            text = "(clipped)...\n" + text[-_FAILURE_SURFACE_MAX_BYTES:]
+            if keep == "front":
+                text = text[:_FAILURE_SURFACE_MAX_BYTES] + "\n...(clipped)"
+            else:
+                # Keep the END — summaries and assertion messages sit there.
+                text = "(clipped)...\n" + text[-_FAILURE_SURFACE_MAX_BYTES:]
         return text
 
     # 1. Test-runner report sections.
@@ -12315,15 +12417,26 @@ def _extract_failure_surface(raw_log: str) -> tuple[str, str]:
         )
         if start is None:
             continue
+        # LAST end match, not the first: a failing test whose CAPTURED
+        # OUTPUT embeds a pytest-style summary line (a test that shells
+        # out to pytest) would otherwise close the section early and
+        # drop the real short summary.
         end = next(
-            (j for j in range(start + 1, len(lines)) if end_re.search(lines[j])),
+            (j for j in range(len(lines) - 1, start, -1)
+             if end_re.search(lines[j])),
             None,
         )
         # pytest prints FAILURES, then short-summary, then the final
         # "= N failed ... =" line — one contiguous span, so anchoring
         # on FAILURES naturally carries the summary along.
-        section = lines[start:(end + 1) if end is not None else len(lines)]
-        return f"{name}_report", _clip(section)
+        if end is not None:
+            return f"{name}_report", _clip(lines[start:end + 1])
+        # No closing summary line at all (run killed mid-report): the
+        # log's tail is likely the OTHER stream (installer stderr), so
+        # keep the FRONT of the section — a tail-biased clip would
+        # reintroduce the installer-noise excerpt this function exists
+        # to avoid.
+        return f"{name}_report", _clip(lines[start:], keep="front")
 
     # 2. Last Python traceback block (through its trailing exception line).
     tb_start = next(
@@ -12799,8 +12912,11 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # the uncovered ones look spuriously resolved. Same append-selector
     # trick the isolation rerun uses: pytest positional args are test
     # selectors, so appending to the build chain re-scopes only the
-    # final pytest invocation. Exit 5 (no tests collected — the nodeid
-    # was renamed/removed by the repair) falls back to the full suite.
+    # final pytest invocation (guarded: never on path-carrying commands,
+    # where positional selectors would UNION). Stale selectors fall back
+    # to the full suite: a renamed/removed nodeid makes pytest exit 4
+    # (usage error: "file or package not found"), an empty collection
+    # exits 5 — both mean "the targeted run couldn't answer".
     _prior_nodeids = _targeted_tests_first_selectors(
         state, build_cmd, is_pre_exit_verify=is_pre_exit_verify,
     )
@@ -12815,8 +12931,13 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             len(_prior_nodeids), ", ".join(_prior_nodeids),
         )
         targeted_result = await executor.run(targeted_cmd)
+        # Exit 4 = pytest usage error (stale/renamed nodeid: "file or
+        # package not found"); exit 5 = no tests collected. Neither is a
+        # test verdict — run the full suite. The old code keyed the
+        # stale-nodeid case to exit 5 and only fell through by accident
+        # (the usage-error output happens to parse to zero diagnostics).
         if (
-            targeted_result.exit_code not in (0, 5)
+            targeted_result.exit_code not in (0, 4, 5)
             and targeted_result.diagnostics
         ):
             logger.info(
@@ -12849,6 +12970,14 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     exit_code: int = result.exit_code
     compiler_errors: list[Any] = [d.to_dict() for d in result.diagnostics]
     raw_log: str = result.raw_output
+    # The unfiltered capture. On failure ``raw_output`` has been through
+    # filter_critical_errors, whose no-critical-match fallback ("last 50
+    # lines") strips a pytest report whose lines match no critical pattern
+    # (fixture errors: "ERROR at setup of" has no colon, so even
+    # ``\bERROR:\s`` misses it — finsearch b674f3ca). The failure-surface
+    # scan below must see the whole log or it degrades to the stderr tail.
+    # getattr guard: test doubles may construct minimal BuildResult stubs.
+    full_log: str = getattr(result, "full_output", "") or raw_log
 
     # Audit §6.8: allow operators to declare non-zero exit codes as
     # ``advisory`` for this build_command — useful for tools like
@@ -13354,8 +13483,12 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         # the last ~40 lines: the streamers concatenate stdout THEN
         # stderr, so a positional tail is really the stderr tail —
         # installer noise (uv/pip/npm progress) masks the test runner's
-        # stdout report. See _extract_failure_surface.
-        strategy, surface = _extract_failure_surface(raw_log)
+        # stdout report. Scan full_log, NOT raw_log: on failure raw_log
+        # is filter_critical_errors' view, and its no-match fallback has
+        # already reduced the log to the last 50 lines — scanning that
+        # re-creates the exact blindness this extraction exists to fix.
+        # See _extract_failure_surface.
+        strategy, surface = _extract_failure_surface(full_log)
         compiler_errors = [{
             "file": "<build-command>",
             "line": 0,
@@ -14018,6 +14151,11 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # the counter against ``max_consecutive_distraction_rounds``
                 # and escalates to HITL when it saturates.
                 _v = reflection_verdict["verdict"]
+                # Frozen BEFORE the WH streak-cap promotion below mutates
+                # reflection_verdict in place — the calibration emit must
+                # record what the judge actually issued, not what the
+                # harness promoted it to.
+                _judge_issued_verdict = str(reflection_verdict.get("verdict") or "")
                 _low_signal = _reflection_verdict_is_low_signal(reflection_verdict)
                 # Fix B — WORKING_HYPOTHESIS: judge is deferring on a
                 # plausible upstream fix. Does NOT tick the distraction
@@ -14258,13 +14396,25 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 try:
                     if has_meaningful_prior and not is_first_iteration:
                         from harness.observability import emit_event as _emit_cal
+                        # Classify against the verdict the judge ISSUED —
+                        # the WH streak cap may have promoted
+                        # reflection_verdict to DISTRACTION in place, and
+                        # calibrating the judge on a verdict the harness
+                        # wrote would poison the dataset.
+                        _issued = dict(reflection_verdict)
+                        _issued["verdict"] = _judge_issued_verdict
                         _emit_cal(
                             "judge_calibration",
                             cell=_judge_calibration_cell(
-                                reflection_verdict,
+                                _issued,
                                 bool(prior_round_made_progress),
                             ),
-                            verdict=str(reflection_verdict.get("verdict") or ""),
+                            verdict=_judge_issued_verdict,
+                            promoted_to=(
+                                str(reflection_verdict.get("verdict") or "")
+                                if str(reflection_verdict.get("verdict") or "")
+                                != _judge_issued_verdict else ""
+                            ),
                             actual_progress=bool(prior_round_made_progress),
                             fps_advanced=bool(fps_advanced),
                             count_shrank=bool(count_shrank),
@@ -18347,20 +18497,59 @@ def _format_diagnostics_for_repair(
         "TS2304", "TS2307", "TS2503", "TS2582", "TS2591", "TS2593",
         "TS2875", "TS2882", "TS7016", "TS7026",
     )
-    _TEST_ENV_NOISE_TOKENS = (
-        "jest", "expect", "describe", "vitest", "mocha", "jasmine",
-        "@testing-library", "@types/", "jsx", "react/jsx-runtime",
-        "type declarations", "type definitions for a test runner",
-        "type definitions for node",
+    # Noise classification keys on the QUOTED SUBJECT of the tsc message
+    # (the name/module inside '...'), never on bare substrings. The
+    # substring version misfired both ways: "expect" matched a typo'd
+    # `Cannot find name 'expectedTotal'` the patch itself introduced,
+    # "jsx" matched a genuinely missing `./Button.jsx`, and the phrase
+    # "type declarations" appears in EVERY TS2307 message ("... or its
+    # corresponding type declarations."), demoting all module-not-found
+    # errors — the demotion then told the LLM NOT to fix real defects.
+    _TEST_ENV_NOISE_IDENTIFIERS = frozenset({
+        # Test-runner globals injected by jest/vitest/mocha/jasmine type
+        # packages — a missing NAME from this set is a type-config gap.
+        "jest", "vi", "vitest", "expect", "describe", "it", "test",
+        "beforeeach", "aftereach", "beforeall", "afterall", "xdescribe",
+        "xit", "fit", "fdescribe", "jsx", "jsx.intrinsicelements",
+    })
+    _TEST_ENV_NOISE_MODULES = frozenset({
+        "jest", "vitest", "mocha", "jasmine", "react/jsx-runtime",
+        "react/jsx-dev-runtime", "jest-environment-jsdom", "supertest",
+    })
+    _TEST_ENV_NOISE_MODULE_PREFIXES = (
+        "@types/", "@testing-library/", "@jest/", "@vitest/",
     )
+    # Phrases specific to tsc's install-the-test-types hints (TS2582/
+    # TS2593/TS2688 family) — these name the fix ("install type
+    # definitions"), so they are unambiguous.
+    _TEST_ENV_NOISE_PHRASES = (
+        "type definitions for a test runner",
+        "type definitions for node",
+        "'--jsx' flag",
+    )
+    _QUOTED_SUBJECT_RE = re.compile(r"'([^']+)'")
 
     def _env_noise_rank(g: dict[str, Any]) -> int:
         code = str(g.get("code", "")).upper()
         if code not in _TEST_ENV_NOISE_CODES:
             return 0
         msg = str(g.get("message", "")).lower()
-        if any(tok in msg for tok in _TEST_ENV_NOISE_TOKENS):
+        if any(p in msg for p in _TEST_ENV_NOISE_PHRASES):
             return 1
+        # A message can quote several subjects (TS7026 quotes 'any' AND
+        # 'JSX.IntrinsicElements') — scan them all. A relative module
+        # anywhere wins first: that's a file the LLM can (and often
+        # should) create — a real defect, never env noise.
+        subjects = _QUOTED_SUBJECT_RE.findall(msg)
+        if any(s.startswith(("./", "../")) for s in subjects):
+            return 0
+        for subject in subjects:
+            if subject in _TEST_ENV_NOISE_IDENTIFIERS:
+                return 1
+            if subject in _TEST_ENV_NOISE_MODULES:
+                return 1
+            if subject.startswith(_TEST_ENV_NOISE_MODULE_PREFIXES):
+                return 1
         locs = g.get("locations", [])
         if locs and all(
             any(str(loc).startswith(p) for p in _TEST_DIR_PREFIXES)

@@ -276,7 +276,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.14 on `ubuntu-latest` (blocking) plus `macos-latest` and `windows-latest` on Python 3.14 (advisory via `continue-on-error: true`). A separate `quality` job MUST run `ruff check` (blocking gate) plus `ruff format --check` and `mypy harness/` (advisory until typing/format backlog clears). The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing blocking job MUST block merge; advisory failures MUST NOT.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given a PR that breaks any test, the `pytest (py3.11, ubuntu-latest)` / `(py3.12, ubuntu-latest)` / `(py3.13, ubuntu-latest)` job(s) fail and block merge.
+  - Given a PR that breaks any test, the `pytest (py3.14, ubuntu-latest)` job fails and blocks merge.
   - Given a ruff-check violation in `harness/` or `tests/`, the `quality` job fails and blocks merge.
   - Given a Linux-only regression that breaks the macOS or Windows run, the `pytest` job for that OS reports failure but merge is NOT blocked (advisory).
   - Given a green pytest + ruff-check run on all blocking targets, the workflow reports `success`.
@@ -758,7 +758,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 ## 4. Technical Constraints
 
 ### Language and Runtime
-- **Language:** Python 3.11+ (CI matrix: 3.11 / 3.12 / 3.13)
+- **Language:** Python 3.14+ (CI matrix: 3.14; floor raised for stdlib UUIDv7 — see pyproject.toml)
 - **Async Model:** asyncio with `async/await` throughout
 - **Type System:** TypedDict for LangGraph compatibility; no Pydantic dependency (removed — see `SPEC_ARCHITECTURE.md` §5.8).
 - **Package Manager:** pip + pyproject.toml
@@ -786,7 +786,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 | msgpack | 1.0.0 | Required by the storage GC regression test (not a runtime dep — runtime code falls back to JSON if absent). |
 
 ### Platform Requirements
-- **OS:** Linux is the blocking CI target (Python 3.11 / 3.12 / 3.13). macOS and Windows (both Python 3.12) are covered as advisory `continue-on-error` jobs in the matrix — regressions surface but do not block merge. The `unshare` backend and fcntl-based workspace lock are Linux-only.
+- **OS:** Linux is the blocking CI target (Python 3.14). macOS and Windows (both Python 3.14) are covered as advisory `continue-on-error` jobs in the matrix — regressions surface but do not block merge. The `unshare` backend and fcntl-based workspace lock are Linux-only.
 - **Sandbox backend:** Docker daemon, or Linux user-namespace support (`unshare --user`), or `HARNESS_ALLOW_UNSAFE_SANDBOX=true` opt-in for the bare backend.
 - **Disk:** ~10MB for checkpoint database per 30-day window; up to ~50MB per session for rotated JSONL logs (10 MB live × 5 backups, default).
 - **Network:** Outbound HTTPS required for LLM API calls (unless `force_local_only` + Ollama).

@@ -232,14 +232,39 @@ class PythonParser(BaseLanguageParser):
     # Pytest "short test summary info" lines at run end:
     #   FAILED tests/foo.py::test_x - AssertionError: assert ...
     #   ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'x'
-    # ERROR rows omit the "::test" suffix (collection-time failures).
+    #   ERROR tests/foo.py::TestX::test_y
+    # Collection-time ERROR rows omit the "::test" suffix; setup/teardown
+    # ERROR rows (fixture-lookup failures — finsearch b674f3ca) omit the
+    # entire " - reason" tail, so the tail is OPTIONAL — requiring it made
+    # this pattern miss every one of the 49 errored tests in that session.
     # ``nodeid_tail`` captures the ``::TestClass::test_method`` suffix so
     # ``_parse_pytest_summary`` can preserve the full pytest node id for
     # downstream isolation re-runs (compiler_node uses it to detect
     # test-ordering pollution).
     _PYTEST_SUMMARY_PATTERN = re.compile(
-        r'^(?P<kind>FAILED|ERROR)\s+(?P<file>[^\s:]+\.py)(?P<nodeid_tail>::\S+)?\s+-\s+'
-        r'(?P<rest>.+)$'
+        r'^(?P<kind>FAILED|ERROR)\s+(?P<file>[^\s:]+\.py)(?P<nodeid_tail>::\S+)?'
+        r'(?:\s+-\s+(?P<rest>.+))?$'
+    )
+    # Fixture-lookup error anchor — the first line of pytest's
+    # FixtureLookupError block ("ERROR at setup of X" sections):
+    #   file /ws/tests/test_companies_api.py, line 11
+    # Lowercase "file", unquoted path, comma before "line" — none of the
+    # traceback/frame patterns above match it.
+    _PYTEST_FIXTURE_FILE_PATTERN = re.compile(
+        r'^file\s+(?P<file>\S+\.py),\s+line\s+(?P<line>\d+)\s*$'
+    )
+    # Fixture-lookup error terminal — the block's LAST line is a bare
+    # "path.py:NN" with NO trailing colon (the long-tb frame boundary
+    # above requires the colon) and NO error type (the terminal fail line
+    # requires one). Emission is gated on a buffered E-line so ordinary
+    # prose containing a path:line token can't fabricate a diagnostic.
+    _PYTEST_BARE_LOC_PATTERN = re.compile(
+        r'^(?P<file>[^\s:][^:]*?\.py):(?P<line>\d+)$'
+    )
+    # The fixture-lookup cause line pytest emits with no exception class:
+    #   E       fixture 'client' not found
+    _FIXTURE_NOT_FOUND_PATTERN = re.compile(
+        r"^fixture '(?P<name>[^']+)' not found\b"
     )
     # Conftest header pytest prints before the short frame:
     #   "ImportError while loading conftest '/.../tests/conftest.py'."
@@ -326,6 +351,19 @@ class PythonParser(BaseLanguageParser):
         """
         diags: list[DiagnosticObject] = []
         last_frame: Optional[tuple[str, int]] = None
+        # True when ``last_frame`` came from a ``--tb=long`` frame BOUNDARY
+        # (bare "path.py:NN:"). Long-tb renders each frame's location line
+        # at the END of its section, so the boundary seen most recently
+        # belongs to the PREVIOUS (outer) frame — a typed E-line that
+        # follows must NOT emit against it (that anchors the diagnostic on
+        # the caller, usually the test file, and steals the summary row's
+        # nodeid) but wait for its own terminal ``file:line: ErrorType``
+        # line. Short-tb frames ("path.py:NN: in func") and the fixture
+        # anchor ("file path, line N") genuinely precede their E-lines and
+        # stay emit-eligible. The boundary is still recorded in last_frame /
+        # stanza_user_frames — the terminal branch needs those to re-anchor
+        # library-raised errors onto workspace frames (session 22471c0c).
+        last_frame_is_long_boundary = False
         conftest_path: Optional[str] = None
         # Buffer the most recent E-line message and the failing ``>`` source
         # line so a terminal fail-line that lacks its own message body can
@@ -509,6 +547,7 @@ class PythonParser(BaseLanguageParser):
                 pending_e_bare = []
                 pending_failing_src = None
                 last_frame = None
+                last_frame_is_long_boundary = False
                 stanza_user_frames = []
                 last_def_name = None
                 block_start_idx = len(diags)
@@ -530,6 +569,7 @@ class PythonParser(BaseLanguageParser):
             frame = PythonParser._PYTEST_FRAME_PATTERN.match(bare)
             if frame:
                 last_frame = (frame.group("file"), int(frame.group("line")))
+                last_frame_is_long_boundary = False
                 if PythonParser._is_user_frame(last_frame[0]):
                     entry = (
                         last_frame[0], last_frame[1],
@@ -551,6 +591,10 @@ class PythonParser(BaseLanguageParser):
                 last_frame = (
                     long_frame.group("file"), int(long_frame.group("line")),
                 )
+                # A boundary line closes the PREVIOUS frame's section — see
+                # the flag's declaration comment. Recorded for terminal
+                # re-anchoring, but not a valid anchor for a typed E-line.
+                last_frame_is_long_boundary = True
                 if PythonParser._is_user_frame(last_frame[0]):
                     entry = (last_frame[0], last_frame[1], last_def_name or "")
                     if (
@@ -560,6 +604,27 @@ class PythonParser(BaseLanguageParser):
                     ):
                         stanza_user_frames.append(entry)
                 last_def_name = None
+                continue
+
+            # Fixture-lookup anchor: "file <path>, line <N>" — the first
+            # line of a FixtureLookupError block ("ERROR at setup of X").
+            # Records the frame the bare-location terminal below anchors on.
+            fixture_file = PythonParser._PYTEST_FIXTURE_FILE_PATTERN.match(bare)
+            if fixture_file:
+                last_frame = (
+                    fixture_file.group("file"), int(fixture_file.group("line")),
+                )
+                # Unlike a long-tb boundary, this anchor HEADS its block —
+                # the E-lines that follow genuinely belong to it.
+                last_frame_is_long_boundary = False
+                if PythonParser._is_user_frame(last_frame[0]):
+                    entry = (last_frame[0], last_frame[1], "")
+                    if (
+                        len(stanza_user_frames) < _MAX_USER_FRAMES
+                        and (not stanza_user_frames
+                             or stanza_user_frames[-1] != entry)
+                    ):
+                        stanza_user_frames.append(entry)
                 continue
 
             # ``def`` line from a long-tb source snippet — names the
@@ -639,6 +704,64 @@ class PythonParser(BaseLanguageParser):
                     diags.append(diag)
                     last_emitted = diag
                 last_frame = None
+                last_frame_is_long_boundary = False
+                stanza_user_frames = []
+                last_def_name = None
+                pending_e = None
+                pending_e_bare = []
+                pending_failing_src = None
+                pending_locals = {}
+                pending_teane = []
+                continue
+
+            # Fixture-lookup terminal: a bare "path.py:NN" line (no
+            # trailing colon — that's the long-tb frame boundary; no error
+            # type — that's the terminal fail line) closes pytest's
+            # FixtureLookupError block ("ERROR at setup of X"). The cause
+            # line ("E   fixture 'client' not found") names no exception
+            # class, so it sits in ``pending_e_bare`` and neither the
+            # typed-E branch nor the terminal fail-line branch ever fires —
+            # before this branch existed the whole block parsed to NOTHING
+            # (finsearch b674f3ca: 49 such errors, zero diagnostics).
+            # Gated on a buffered BARE E-line so prose containing a
+            # path:line token can't fabricate a diagnostic — and on NO
+            # typed E-line pending: a typed error means we're mid-way
+            # through an ordinary failure block whose real terminal
+            # (``file:line: ErrorType``) is still coming, and emitting at
+            # a stray bare location would steal that block's context.
+            bare_loc = PythonParser._PYTEST_BARE_LOC_PATTERN.match(bare)
+            if bare_loc and pending_e_bare and pending_e is None:
+                cause = pending_e_bare[0]
+                is_fixture = bool(
+                    PythonParser._FIXTURE_NOT_FOUND_PATTERN.match(cause)
+                )
+                err_code = "FixtureLookupError" if is_fixture else "Error"
+                ctx = _fmt_context(
+                    pending_e_bare, pending_failing_src, pending_locals,
+                    pending_teane, stanza_user_frames,
+                )
+                loc_file = bare_loc.group("file")
+                loc_line = int(bare_loc.group("line"))
+                if (
+                    not PythonParser._is_user_frame(loc_file)
+                    and stanza_user_frames
+                ):
+                    lib_note = f"raised in library frame: {loc_file}:{loc_line}"
+                    ctx = f"{ctx}\n{lib_note}" if ctx else lib_note
+                    loc_file, loc_line, _fn = stanza_user_frames[-1]
+                diag = DiagnosticObject(
+                    file=loc_file,
+                    line=loc_line,
+                    column=0,
+                    severity="error",
+                    error_code=err_code,
+                    message=f"{err_code}: {cause}",
+                    semantic_context=ctx,
+                )
+                diags.append(diag)
+                last_emitted = diag
+                last_frame = None
+                last_frame_is_long_boundary = False
                 stanza_user_frames = []
                 last_def_name = None
                 pending_e = None
@@ -652,6 +775,16 @@ class PythonParser(BaseLanguageParser):
             if e_line:
                 # Always remember it for the terminal-line fallback above.
                 pending_e = (e_line.group("type"), e_line.group("msg"))
+                if last_frame_is_long_boundary:
+                    # ``--tb=long``: the most recent boundary belongs to the
+                    # PREVIOUS (outer) frame — this E-line's true location
+                    # is its own terminal "file:line: ErrorType" line, still
+                    # to come. Emitting here anchored diagnostics on the
+                    # caller (usually the TEST file), stole the summary
+                    # row's nodeid in _dedup, and left a context-less
+                    # duplicate from the terminal branch (817babc
+                    # regression). Buffer and wait for the terminal.
+                    continue
                 recovered = _recover_user_frame_from_e_bare(
                     last_frame, pending_e_bare,
                 )
@@ -691,6 +824,7 @@ class PythonParser(BaseLanguageParser):
                 diags.append(diag)
                 last_emitted = diag
                 last_frame = None
+                last_frame_is_long_boundary = False
                 stanza_user_frames = []
                 last_def_name = None
                 conftest_path = None
@@ -761,15 +895,22 @@ class PythonParser(BaseLanguageParser):
             m = PythonParser._PYTEST_SUMMARY_PATTERN.match(line.strip())
             if not m:
                 continue
-            rest = m.group("rest").strip()
-            err_match = PythonParser._ERROR_PATTERN.match(rest)
+            rest = (m.group("rest") or "").strip()
+            err_match = PythonParser._ERROR_PATTERN.match(rest) if rest else None
             if err_match:
                 error_type = err_match.group(1)
                 message = err_match.group(2)
-            else:
+            elif rest:
                 # Bare-assert form ("assert 1 == 2") with no ErrorType prefix.
                 error_type = "AssertionError" if m.group("kind") == "FAILED" else "Error"
                 message = rest
+            else:
+                # Reasonless row — setup/teardown errors print only
+                # "ERROR path.py::node" (finsearch b674f3ca). The row still
+                # carries the one thing nothing else in the report has: the
+                # re-runnable node id. The block parser supplies the cause.
+                error_type = "AssertionError" if m.group("kind") == "FAILED" else "Error"
+                message = line.strip()
             # Preserve the full pytest node id when present. Collection-time
             # errors ("ERROR tests/conftest.py - ...") lack the ``::test``
             # tail — those aren't re-runnable in isolation and stay blank.

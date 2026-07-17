@@ -44,6 +44,52 @@ class TestConfig:
         assert cfg.repair_fanout_after_rounds == 1  # lo clamp
 
 
+class TestStrictValidatorTypes:
+    def test_string_false_is_rejected_not_silently_enabled(self):
+        # Regression: the three repair_fanout keys were registered in
+        # _KNOWN_NESTED_KEYS but not _TYPE_SCHEMA, so `"repair_fanout":
+        # "false"` passed validation and bool("false") then ENABLED the
+        # feature from a config that reads as off.
+        import harness.cli as cli_mod
+        bad_config = {
+            "models": {"any": {"provider": "deepseek", "model_id": "x",
+                               "api_key": ""}},
+            "model_routing": {
+                "planning_primary": "any",
+                "patching_primary": "any",
+                "repair_primary": "any",
+            },
+            "persistence": {"db_path": "~/.harness/x.db"},
+            "token_budget": {"hard_cap_usd": 1.0},
+            "sandbox": {"backend": "bare"},
+            "product_spec_dir": "product_spec",
+            "speculative": {"repair_fanout": "false"},
+        }
+        with pytest.raises(cli_mod.ConfigError) as ex:
+            cli_mod.validate_config_strict(bad_config, source="<test>")
+        assert "repair_fanout" in str(ex.value)
+
+    def test_int_keys_reject_strings(self):
+        import harness.cli as cli_mod
+        for key in ("repair_fanout_variants", "repair_fanout_after_rounds"):
+            bad_config = {
+                "models": {"any": {"provider": "deepseek", "model_id": "x",
+                                   "api_key": ""}},
+                "model_routing": {
+                    "planning_primary": "any",
+                    "patching_primary": "any",
+                    "repair_primary": "any",
+                },
+                "persistence": {"db_path": "~/.harness/x.db"},
+                "token_budget": {"hard_cap_usd": 1.0},
+                "sandbox": {"backend": "bare"},
+                "product_spec_dir": "product_spec",
+                "speculative": {key: "3"},
+            }
+            with pytest.raises(cli_mod.ConfigError):
+                cli_mod.validate_config_strict(bad_config, source="<test>")
+
+
 class TestEngage:
     def test_disabled_never_engages(self):
         assert not repair_fanout_should_engage(
@@ -96,6 +142,22 @@ class TestWorktreeSeeding:
         assert (ws / "committed.py").read_text() == "modified\n"
         spec._remove_worktree(str(ws), wt)
 
+    def test_staged_rename_removes_origin_in_worktree(self, git_workspace, tmp_path):
+        # Regression: `git status --porcelain=v1 -z` emits `R  new\0old` for
+        # a STAGED rename; the seeder copied the destination but never
+        # removed the origin — the worktree then held BOTH files (duplicate
+        # pytest collection, shadowed imports), corrupting the variant's
+        # compile verdict.
+        ws = git_workspace
+        subprocess.run(["git", "-C", str(ws), "mv", "committed.py", "renamed.py"],
+                       check=True, capture_output=True)
+        wt = str(tmp_path / "wt")
+        assert spec._create_worktree(str(ws), wt)
+        _seed_worktree_from_workspace(str(ws), wt)
+        assert os.path.exists(os.path.join(wt, "renamed.py"))
+        assert not os.path.exists(os.path.join(wt, "committed.py"))
+        spec._remove_worktree(str(ws), wt)
+
 
 def _response(tag: str):
     return SimpleNamespace(
@@ -112,8 +174,11 @@ def _state(ws, **over):
     }
 
 
-def _fake_apply(success=True):
-    async def _apply(content, worktree, existing_modified_files):
+def _fake_apply(success=True, seen=None):
+    async def _apply(content, worktree, existing_modified_files,
+                     allowed_paths=None):
+        if seen is not None:
+            seen.append({"content": content, "allowed_paths": allowed_paths})
         return ([SimpleNamespace(success=success, no_op=False)],
                 ["some_file.py"] if success else [])
     return _apply
@@ -202,6 +267,75 @@ class TestFanout:
         assert len(directives) == 3
         # Workspace files untouched (fanout never writes to the workspace).
         assert (git_workspace / "committed.py").read_text() == "original\n"
+
+    def test_apply_uses_allowlist_and_stripped_payload(self, git_workspace, monkeypatch):
+        # Scoring parity with the real apply path (graph.py repair_node):
+        # variants must be applied under the same source-root allowlist and
+        # with READ_FILE blocks stripped — otherwise a variant that writes
+        # outside the allowlist (or leads with READ_FILE) is scored under
+        # laxer rules than the winner will face on the real apply.
+        seen: list = []
+        monkeypatch.setattr(spec, "process_llm_patch_output",
+                            _fake_apply(seen=seen))
+
+        async def dispatch(msgs, budget):
+            resp = _response("v")
+            resp.content = (
+                "<<<READ_FILE>>>\nfile: app.py\n<<<END_READ_FILE>>>\n"
+                "PATCH BODY"
+            )
+            return resp, budget
+
+        async def compile_variant(vr):
+            vr.exit_code = 0
+            return vr
+
+        out = _run(maybe_run_repair_fanout(
+            state=_state(git_workspace), messages=[], dispatch=dispatch,
+            workspace_path=str(git_workspace), budget=1.0,
+            loop_counter={"no_progress_repairs": 2},
+            compile_variant=compile_variant,
+        ))
+        assert out is not None
+        assert seen, "apply seam never called"
+        for call in seen:
+            assert "READ_FILE" not in call["content"]
+            assert "PATCH BODY" in call["content"]
+            # graph._build_patcher_allowlist returns a non-None allowlist
+            # for a real workspace — the fanout must thread it through.
+            assert call["allowed_paths"] is not None
+
+    def test_post_dispatch_failure_still_returns_paid_dispatches(
+        self, git_workspace, monkeypatch,
+    ):
+        # Regression: an exception AFTER the variant dispatches (worktree
+        # plumbing, selection, cleanup) fell into the outer fail-open and
+        # returned None — repair_node then re-dispatched against the
+        # PRE-fanout budget, so the N paid dispatches vanished from
+        # budget/token accounting.
+        monkeypatch.setattr(spec, "process_llm_patch_output", _fake_apply())
+
+        def _boom(*a, **k):
+            raise RuntimeError("post-dispatch plumbing failure")
+        monkeypatch.setattr(spec, "_cleanup_worktrees", _boom)
+
+        async def dispatch(msgs, budget):
+            return _response(f"v{len(msgs)}"), budget - 0.01
+
+        async def compile_variant(vr):
+            vr.exit_code = 1
+            return vr
+
+        out = _run(maybe_run_repair_fanout(
+            state=_state(git_workspace), messages=[], dispatch=dispatch,
+            workspace_path=str(git_workspace), budget=1.0,
+            loop_counter={"no_progress_repairs": 2},
+            compile_variant=compile_variant,
+        ))
+        assert out is not None, "paid dispatches were dropped"
+        assert out.won is False
+        assert out.budget == pytest.approx(1.0 - 0.03)
+        assert len(out.extra_usages) == 2
 
     def test_no_winner_falls_back_to_best_applying(self, git_workspace, monkeypatch):
         monkeypatch.setattr(spec, "process_llm_patch_output", _fake_apply())

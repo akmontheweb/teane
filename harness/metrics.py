@@ -69,9 +69,12 @@ _LOOP_COUNTER_SNAPSHOT_EVENT = "loop_counter_snapshot"
 # Reflection-judge calibration records emitted by repair_node: each pairs
 # the judge's verdict about a repair round with the deterministic
 # fingerprint-survival outcome for the SAME round (see
-# graph._judge_calibration_cell). Cells: tp/fp/tn/fn/low_signal.
+# graph._judge_calibration_cell). Cells: tp/fp/tn/fn plus two abstention
+# buckets — low_signal ("insufficient data" sentinel) and
+# working_hypothesis (the judge explicitly deferred; counting it as a
+# negative corrupted recall).
 _JUDGE_CALIBRATION_EVENT = "judge_calibration"
-_JUDGE_CELLS = ("tp", "fp", "tn", "fn", "low_signal")
+_JUDGE_CELLS = ("tp", "fp", "tn", "fn", "low_signal", "working_hypothesis")
 
 # Default sliding window used by the recent-burn-rate calculation. Ten
 # minutes is short enough to see a runaway session in near-real-time but
@@ -186,6 +189,16 @@ class SessionMetrics:
             return None
         return m.get("low_signal", 0) / total
 
+    def judge_working_hypothesis_rate(self) -> Optional[float]:
+        """Explicit deferrals (WORKING_HYPOTHESIS) over ALL labeled
+        verdicts. A judge that defers constantly never commits to a
+        verdict — its own defect class, kept out of precision/recall."""
+        m = self.judge_confusion
+        total = sum(m.get(c, 0) for c in _JUDGE_CELLS)
+        if total <= 0:
+            return None
+        return m.get("working_hypothesis", 0) / total
+
     def to_jsonable(self) -> dict[str, Any]:
         """Render the dataclass to a JSON-serialisable dict."""
         return {
@@ -209,6 +222,7 @@ class SessionMetrics:
             "judge_recall": self.judge_recall(),
             "judge_accuracy": self.judge_accuracy(),
             "judge_low_signal_rate": self.judge_low_signal_rate(),
+            "judge_working_hypothesis_rate": self.judge_working_hypothesis_rate(),
             "first_ts": self.first_ts.isoformat() if self.first_ts else None,
             "last_ts": self.last_ts.isoformat() if self.last_ts else None,
             "recent_burn_rate_usd_per_min": round(self.recent_burn_rate_usd_per_min, 6),
@@ -604,10 +618,12 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
             f"precision={_pct(metrics.judge_precision())}, "
             f"recall={_pct(metrics.judge_recall())}, "
             f"accuracy={_pct(metrics.judge_accuracy())}, "
-            f"low_signal={_pct(metrics.judge_low_signal_rate())} "
+            f"low_signal={_pct(metrics.judge_low_signal_rate())}, "
+            f"deferred={_pct(metrics.judge_working_hypothesis_rate())} "
             f"(tp={m.get('tp', 0)} fp={m.get('fp', 0)} "
             f"tn={m.get('tn', 0)} fn={m.get('fn', 0)} "
-            f"abstain={m.get('low_signal', 0)})"
+            f"abstain={m.get('low_signal', 0)} "
+            f"wh={m.get('working_hypothesis', 0)})"
         )
     lines.append("=" * 60)
     return "\n".join(lines)

@@ -1613,7 +1613,8 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
     }
     fc = final.get("content")
     if final.get("role") == "user" and isinstance(fc, list):
-        nb = []
+        kept: list[Any] = []
+        converted: list[dict[str, Any]] = []
         for b in fc:
             if (isinstance(b, dict) and b.get("type") == "tool_result"
                     and b.get("tool_use_id") not in kept_use_ids):
@@ -1623,7 +1624,7 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
                         str(x.get("text", "")) for x in inner
                         if isinstance(x, dict)
                     )
-                nb.append({
+                converted.append({
                     "type": "text",
                     "text": (
                         "[tool result — its originating tool call was "
@@ -1631,9 +1632,15 @@ def _strip_orphan_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
                     ),
                 })
             else:
-                nb.append(b)
-        if nb != fc:
-            final = {**final, "content": nb}
+                kept.append(b)
+        if converted:
+            # Converted blocks go AFTER every surviving block, never in
+            # the orphan's original slot: Anthropic requires the
+            # tool_result blocks of a user message to come first, so an
+            # in-place conversion sitting before a surviving tool_result
+            # ([text, tool_result]) recreates the guaranteed-rejection
+            # class this whole function exists to prevent.
+            final = {**final, "content": kept + converted}
 
     return [messages[0]] + stage2 + [final]
 

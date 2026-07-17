@@ -313,6 +313,61 @@ class TestPythonParserWorkspaceFrames:
         )
         assert "raised in library frame:" in d.semantic_context
 
+    # Regression (2026-07-16 review): the long-tb boundary line for frame k
+    # prints BEFORE frame k+1's source and E-lines, so when the boundary
+    # capture landed (817babc) the typed-E branch started emitting against
+    # the OUTER frame — anchoring on the calling test file, stealing the
+    # summary row's nodeid in _dedup, and leaving a context-less duplicate
+    # from the terminal branch. 817babc's own tests only used dotted
+    # exception names (which the \w+ E-pattern can't match), so the
+    # early-emit path was never exercised.
+    _LONG_TB_NESTED_UNDOTTED = (
+        "=================================== FAILURES "
+        "===================================\n"
+        "_______________________________ test_total "
+        "_____________________________________\n"
+        "\n"
+        "    def test_total(self):\n"
+        ">       assert compute_total([1, 2]) == 3\n"
+        "tests/test_c.py:4:\n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n"
+        "\n"
+        "    def compute_total(items):\n"
+        ">       raise ValueError(\"boom\")\n"
+        "E       ValueError: boom\n"
+        "app/util.py:2: ValueError\n"
+        "=========================== short test summary info "
+        "============================\n"
+        "FAILED tests/test_c.py::test_total - ValueError: boom\n"
+    )
+
+    def test_long_tb_typed_e_anchors_on_raising_frame_not_caller(self):
+        diags = PythonParser.parse_diagnostics(self._LONG_TB_NESTED_UNDOTTED)
+        block = [d for d in diags if d.line > 0]
+        assert len(block) == 1, (
+            f"expected exactly one anchored diagnostic, got "
+            f"{[(d.file, d.line, d.message) for d in block]}"
+        )
+        d = block[0]
+        # The RAISING frame (app code), not the calling test frame.
+        assert d.file == "app/util.py"
+        assert d.line == 2
+        # Full message from the E-line, not a bare type.
+        assert d.message == "ValueError: boom"
+
+    def test_long_tb_typed_e_no_junk_duplicate_and_nodeid_survives(self):
+        diags = PythonParser.parse_diagnostics(self._LONG_TB_NESTED_UNDOTTED)
+        # No block-level diagnostic may sit on the test file — that anchor
+        # sends file auto-injection at the test instead of the app code.
+        assert not [
+            d for d in diags if d.file == "tests/test_c.py" and d.line > 0
+        ]
+        # The summary row keeps its re-runnable nodeid.
+        assert [
+            d for d in diags
+            if d.pytest_nodeid == "tests/test_c.py::test_total"
+        ]
+
     def test_chained_cause_duplicate_is_collapsed(self):
         # The cause chain's own terminal (library-frames-only) must NOT
         # survive as a second venv-anchored OperationalError — it would

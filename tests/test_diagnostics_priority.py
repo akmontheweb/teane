@@ -127,6 +127,31 @@ class TestEnvNoiseDemotion:
         rendered = _format_diagnostics_for_repair(self._errors())
         assert rendered.find("compute_score") < rendered.find("### Suppressed")
 
+    def test_real_errors_with_noise_like_substrings_not_demoted(self):
+        # Regression: substring tokens demoted REAL errors — "expect"
+        # matched a typo'd identifier the patch itself introduced, "jsx"
+        # matched a genuinely missing relative module, and the phrase
+        # "type declarations" appears in EVERY TS2307 message. The
+        # demotion then told the LLM "Do NOT patch" its own new bugs.
+        errors = self._errors() + _diag(
+            "TS2304", "Cannot find name 'expectedTotal'.",
+            ["client/src/components/Summary.tsx"],
+        ) + _diag(
+            "TS2307",
+            "Cannot find module './Button.jsx' or its corresponding "
+            "type declarations.",
+            ["client/src/App.tsx"],
+        )
+        rendered = _format_diagnostics_for_repair(errors)
+        shown, _, rest = rendered.partition("### Suppressed")
+        # The suppressed-noise section ends where the structured payload
+        # begins (real errors legitimately reappear in the payload).
+        suppressed = rest.partition("### Structured payload")[0]
+        assert "expectedTotal" in shown
+        assert "./Button.jsx" in shown
+        assert "expectedTotal" not in suppressed
+        assert "Button.jsx" not in suppressed
+
     def test_env_codes_on_production_files_with_env_message_compressed(self):
         # TS7026 hits production .tsx files, but the message is the
         # missing-JSX-types signature — env noise regardless of path.
@@ -343,6 +368,19 @@ class TestTargetedTestsFirst:
             state, "python3 -m pytest -q", is_pre_exit_verify=False,
         ) == []
 
+    def test_ineligible_when_build_cmd_has_positional_paths(self):
+        # Regression: pytest UNIONS positional selectors — with a
+        # `pytest tests/ -q` build command the "targeted" run was the
+        # full suite plus selectors, and when priors passed the full
+        # suite ran a SECOND time: the fast path inverted into a 2x
+        # slowdown.
+        from harness.graph import _targeted_tests_first_selectors
+        state = self._state([self._fail("tests/test_a.py::test_1")])
+        assert _targeted_tests_first_selectors(
+            state, "python3 -m pytest tests/ -q", is_pre_exit_verify=False,
+        ) == []
+
+
     def test_ineligible_for_non_pytest_build(self):
         from harness.graph import _targeted_tests_first_selectors
         state = self._state([self._fail("tests/test_a.py::test_1")])
@@ -385,3 +423,41 @@ class TestTargetedTestsFirst:
             (repo_root / "config" / "config.json").read_text(encoding="utf-8")
         )
         assert cfg["compiler"]["targeted_tests_first"] is True
+
+
+class TestPytestPositionalSniffer:
+    def _has(self, cmd):
+        from harness.graph import _pytest_cmd_has_positional_args
+        return _pytest_cmd_has_positional_args(cmd)
+
+    def test_flag_only_commands_have_none(self):
+        assert not self._has("python3 -m pytest -vv --tb=long --showlocals")
+        assert not self._has(
+            "pytest -q --timeout 30 --timeout-method thread -p no:cacheprovider"
+        )
+
+    def test_path_args_detected(self):
+        assert self._has("pytest tests/ -q")
+        assert self._has("python3 -m pytest tests/unit tests/api")
+        assert self._has("pytest x.py::TestA::test_b")
+
+    def test_value_flag_values_are_not_positional(self):
+        assert not self._has("pytest -k 'not slow' -m unit")
+        assert not self._has("pytest -p no:cacheprovider -o addopts=")
+
+    def test_install_chain_prefix_ignored(self):
+        # teane-composed commands chain installs before pytest; tokens in
+        # non-pytest segments (paths, requirements.txt) must not count.
+        assert not self._has(
+            "test -d /tmp/venv || uv venv /tmp/venv && "
+            ". /tmp/venv/bin/activate && uv pip install -r requirements.txt "
+            "&& python3 -m pytest -vv --tb=long"
+        )
+        assert self._has(
+            "uv pip install -r requirements.txt && python3 -m pytest server/tests"
+        )
+
+    def test_unparseable_command_fails_safe(self):
+        # Unbalanced quote → shlex raises → treat as positional (the safe
+        # direction: only disables an optimization).
+        assert self._has("pytest 'unclosed")

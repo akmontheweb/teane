@@ -2149,3 +2149,55 @@ class TestPatchingNodeContinuation:
         # All six chunks reached the patcher via the concatenated text.
         assert "chunk1" in captured["content"]
         assert "chunk6" in captured["content"]
+
+
+class TestImportConventionsSection:
+    """Import-conventions block for the code-review re-patch prompt
+    (lumina 019f7109: the reviewer authored test files importing
+    `from app.` while every existing test used `from server.app.` —
+    four flat repair rounds and a no-progress HITL, because the tamper
+    guard rightly keeps repair out of test files)."""
+
+    def _ws(self, tmp_path):
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_date_utils.py").write_text(
+            "# @tests: server/app/date_utils.py\n"
+            "import pytest\n"
+            "from server.app.date_utils import compute_birthday_info\n"
+            "def test_x(): pass\n"
+        )
+        return str(tmp_path)
+
+    def test_samples_real_import_lines(self, tmp_path):
+        from harness.graph import _import_conventions_section
+        section = _import_conventions_section(self._ws(tmp_path))
+        assert "MIRROR THESE" in section
+        assert "from server.app.date_utils import compute_birthday_info" in section
+        assert "tests/test_date_utils.py" in section
+
+    def test_empty_workspace_yields_empty_section(self, tmp_path):
+        from harness.graph import _import_conventions_section
+        assert _import_conventions_section(str(tmp_path)) == ""
+
+    def test_line_cap_respected(self, tmp_path):
+        from harness.graph import (
+            _IMPORT_CONVENTIONS_MAX_LINES,
+            _import_conventions_section,
+        )
+        (tmp_path / "tests").mkdir()
+        body = "\n".join(f"import mod{i}" for i in range(40)) + "\ndef test_a(): pass\n"
+        for name in ("test_a.py", "test_b.py"):
+            (tmp_path / "tests" / name).write_text(body)
+        section = _import_conventions_section(str(tmp_path))
+        sampled = [ln for ln in section.splitlines() if ": import mod" in ln]
+        assert 0 < len(sampled) <= _IMPORT_CONVENTIONS_MAX_LINES
+
+    def test_js_test_imports_sampled_too(self, tmp_path):
+        from harness.graph import _import_conventions_section
+        (tmp_path / "client" / "src").mkdir(parents=True)
+        (tmp_path / "client" / "src" / "Panel.test.tsx").write_text(
+            "import { render } from '@testing-library/react';\n"
+            "import Panel from './Panel';\n"
+        )
+        section = _import_conventions_section(str(tmp_path))
+        assert "@testing-library/react" in section

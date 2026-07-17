@@ -22057,6 +22057,81 @@ Return STRICT JSON with this exact shape and NOTHING else (no prose, no markdown
 Each finding must name a file and (where applicable) a line number."""
 
 
+# Caps for _import_conventions_section. A handful of real import lines is
+# plenty of signal; more is prompt bloat.
+_IMPORT_CONVENTIONS_MAX_FILES = 4
+_IMPORT_CONVENTIONS_MAX_LINES = 12
+_IMPORT_CONVENTIONS_HEAD_LINES = 40
+
+
+def _import_conventions_section(workspace_path: str) -> str:
+    """Render an import-conventions block for the code-review re-patch
+    prompt, sampled from the workspace's EXISTING test files.
+
+    The re-patch dispatch may author or edit test files, but its prompt
+    historically carried only the findings JSON + modified-file snapshot —
+    no import-convention context — so the model invented module paths:
+    lumina session 019f7109's reviewer wrote four test files importing
+    ``from app.`` while every existing test used ``from server.app.``,
+    which cost four flat repair rounds and a no-progress HITL (the
+    tamper guard rightly blocks repair from touching test files, so the
+    mistake was unfixable downstream). Real import lines from real test
+    files are self-maintaining ground truth — no hardcoded prefix to
+    drift out of date. Returns "" when the workspace has no test imports
+    to sample (nothing to mislead the model with either way).
+    """
+    import glob
+    samples: list[str] = []
+    try:
+        test_files: list[str] = []
+        for pattern in ("tests/**/*.py", "test/**/*.py",
+                        "**/*.test.ts", "**/*.test.tsx",
+                        "**/*.test.js", "**/*.test.jsx"):
+            test_files.extend(sorted(
+                glob.glob(os.path.join(workspace_path, pattern),
+                          recursive=True)
+            ))
+            if len(test_files) >= _IMPORT_CONVENTIONS_MAX_FILES * 3:
+                break
+        seen_files = 0
+        for abs_path in test_files:
+            if seen_files >= _IMPORT_CONVENTIONS_MAX_FILES:
+                break
+            if len(samples) >= _IMPORT_CONVENTIONS_MAX_LINES:
+                break
+            try:
+                with open(abs_path, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    head = fh.read(8000).splitlines()
+            except OSError:
+                continue
+            rel = os.path.relpath(abs_path, workspace_path).replace(os.sep, "/")
+            took_any = False
+            for line in head[:_IMPORT_CONVENTIONS_HEAD_LINES]:
+                stripped = line.strip()
+                if stripped.startswith(("from ", "import ")):
+                    samples.append(f"{rel}: {stripped}")
+                    took_any = True
+                    if len(samples) >= _IMPORT_CONVENTIONS_MAX_LINES:
+                        break
+            if took_any:
+                seen_files += 1
+    except Exception:  # noqa: BLE001 — advisory context must never block review
+        return ""
+    if not samples:
+        return ""
+    joined = "\n".join(samples)
+    return (
+        "\n\n## Import conventions (MIRROR THESE — do not invent module paths)\n"
+        "Import lines sampled from this workspace's existing test files:\n"
+        f"```\n{joined}\n```\n"
+        "Any test file you create or edit MUST import production code "
+        "using the same package prefixes shown above. Do not shorten or "
+        "restructure them — an import the runner cannot resolve fails "
+        "collection for the whole suite."
+    )
+
+
 async def code_review_node(state: AgentState) -> dict[str, Any]:
     """
     Independent LLM critiques freshly compiled code, then the patcher model
@@ -22342,6 +22417,7 @@ Generate the patches that address every finding below. Output only the blocks �
     repatch_user_prompt = (
         f"## Reviewer Findings (JSON)\n```json\n{json.dumps(critique, indent=2, sort_keys=True)}\n```\n\n"
         f"## Modified Files Snapshot\n" + "\n".join(snapshot_chunks) +
+        _import_conventions_section(workspace) +
         f"\n\n{_CODE_REVIEW_FORMAT_REMINDER}"
     )
     repatch_messages: list[MessageDict] = [

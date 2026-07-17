@@ -604,6 +604,71 @@ def _normalize_messages_for_openai_tools(
     return out
 
 
+def _flatten_tool_turns_for_plain_dispatch(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Render typed tool blocks as plain text for dispatches that declare
+    NO tools.
+
+    The native tool loop persists its turns into state in the canonical
+    Anthropic block shape (assistant ``tool_use`` blocks, user
+    ``tool_result`` blocks). Nodes that dispatch WITHOUT tools —
+    test_generation, doc/code review, discovery — inherit that history
+    verbatim, and the providers' block translation only runs on the
+    ``tools`` path, so the raw blocks used to ship to the wire.
+    DeepSeek's strict deserializer then 400s the whole request
+    (``unknown variant `tool_use`, expected `text```) and the gateway's
+    4xx handling aborts the run — lumina session 019f6e13: 18 clean
+    tool-loop dispatches, then test_generation_node inherited the
+    history and died on its first call.
+
+    Emitting OpenAI ``tool_calls`` / ``role: "tool"`` messages without a
+    ``tools`` field is not safe either (strict backends reject the
+    orphan shape), so for a tool-less dispatch the tool exchange is
+    rendered as TEXT — it is inert context there, not an active
+    exchange. Roles are preserved; messages without typed blocks pass
+    through untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        parts: list[str] = []
+        saw_tool_block = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(str(block.get("text", "")))
+            elif btype == "tool_use":
+                saw_tool_block = True
+                try:
+                    args = json.dumps(block.get("input") or {})
+                except (TypeError, ValueError):
+                    args = "{}"
+                parts.append(
+                    f"[called tool {block.get('name', '?')} with "
+                    f"arguments: {args[:2000]}]"
+                )
+            elif btype == "tool_result":
+                saw_tool_block = True
+                tr_content = block.get("content", "")
+                if isinstance(tr_content, list):
+                    tr_content = "\n".join(
+                        str(b.get("text", "")) for b in tr_content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                parts.append(f"[tool result]\n{tr_content}")
+        if saw_tool_block:
+            out.append({**msg, "content": "\n".join(parts)})
+        else:
+            out.append(msg)
+    return out
+
+
 def _extract_openai_compat_reasoning(message: dict[str, Any]) -> str:
     """Pull a reasoning-model's hidden chain-of-thought out of an
     OpenAI-compat chat-completions response message.
@@ -707,6 +772,11 @@ class DeepSeekProvider(BaseLLM):
         client = await self._get_client()
         if tools:
             messages = _normalize_messages_for_openai_tools(messages)
+        else:
+            # Inherited tool-loop history must not ship raw typed blocks
+            # on a tool-less dispatch — DeepSeek 400s the whole request
+            # (lumina 019f6e13). See _flatten_tool_turns_for_plain_dispatch.
+            messages = _flatten_tool_turns_for_plain_dispatch(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,
@@ -801,6 +871,14 @@ class AnthropicProvider(BaseLLM):
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
+
+        # Tool-less dispatch with inherited tool-loop history: Anthropic
+        # rejects tool_use/tool_result blocks when no ``tools`` param is
+        # declared, same failure class as the OpenAI-shape providers —
+        # flatten the typed blocks to text (see
+        # _flatten_tool_turns_for_plain_dispatch).
+        if not tools:
+            messages = _flatten_tool_turns_for_plain_dispatch(messages)
 
         # Anthropic requires a system prompt separated from the messages array.
         # Extract system message(s) and pass them as the top-level 'system' field.
@@ -1027,6 +1105,10 @@ class OpenAIProvider(BaseLLM):
         client = await self._get_client()
         if tools:
             messages = _normalize_messages_for_openai_tools(messages)
+        else:
+            # See _flatten_tool_turns_for_plain_dispatch — raw typed
+            # blocks 400 on strict OpenAI-compat deserializers.
+            messages = _flatten_tool_turns_for_plain_dispatch(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,
@@ -1140,6 +1222,10 @@ class OllamaProvider(BaseLLM):
         client = await self._get_client()
         if tools:
             messages = _normalize_messages_for_openai_tools(messages)
+        else:
+            # See _flatten_tool_turns_for_plain_dispatch — raw typed
+            # blocks 400 on strict OpenAI-compat deserializers.
+            messages = _flatten_tool_turns_for_plain_dispatch(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,

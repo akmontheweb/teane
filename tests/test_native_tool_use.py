@@ -321,6 +321,70 @@ def test_normalize_messages_handles_assistant_with_only_tool_use():
 
 
 # ---------------------------------------------------------------------------
+# 2b. Tool-less dispatch flatten (lumina 019f6e13 regression)
+# ---------------------------------------------------------------------------
+
+def test_flatten_renders_tool_blocks_as_text():
+    # Regression: nodes that dispatch WITHOUT tools (test_generation,
+    # reviewers, discovery) inherit the tool loop's typed-block history;
+    # the raw blocks shipped to the wire and DeepSeek 400'd the request
+    # ("unknown variant `tool_use`, expected `text`"), which the
+    # gateway's 4xx handling escalated to a run-aborting
+    # HarnessConfigError.
+    from harness.gateway import _flatten_tool_turns_for_plain_dispatch
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Let me look."},
+            {"type": "tool_use", "id": "tu_1", "name": "read_file",
+             "input": {"file_path": "a.py"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1",
+             "content": "print('hi')"},
+        ]},
+        {"role": "user", "content": "now write tests"},
+    ]
+    out = _flatten_tool_turns_for_plain_dispatch(msgs)
+    # Roles preserved, count preserved, plain messages untouched.
+    assert [m["role"] for m in out] == ["system", "assistant", "user", "user"]
+    assert out[0] == msgs[0]
+    assert out[3] == msgs[3]
+    # Every content is now a plain string — nothing typed remains.
+    assert all(isinstance(m["content"], str) for m in out)
+    assert "read_file" in out[1]["content"]
+    assert "Let me look." in out[1]["content"]
+    assert "print('hi')" in out[2]["content"]
+    flat = json.dumps(out)
+    assert "tool_use" not in flat
+    assert "tool_result" not in flat
+
+
+def test_flatten_passes_plain_history_through_identically():
+    from harness.gateway import _flatten_tool_turns_for_plain_dispatch
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello back"},
+        # Anthropic text-block list without tool blocks stays as-is
+        # (the cache-control path depends on the block shape).
+        {"role": "user", "content": [{"type": "text", "text": "block"}]},
+    ]
+    assert _flatten_tool_turns_for_plain_dispatch(msgs) == msgs
+
+
+def test_flatten_handles_nested_tool_result_content():
+    from harness.gateway import _flatten_tool_turns_for_plain_dispatch
+    msgs = [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "tu_9",
+         "content": [{"type": "text", "text": "part1"},
+                     {"type": "text", "text": "part2"}]},
+    ]}]
+    out = _flatten_tool_turns_for_plain_dispatch(msgs)
+    assert "part1" in out[0]["content"] and "part2" in out[0]["content"]
+
+
+# ---------------------------------------------------------------------------
 # 3. Capability detection in Gateway.dispatch
 # ---------------------------------------------------------------------------
 

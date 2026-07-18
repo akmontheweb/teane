@@ -26,3 +26,25 @@ def isolated_state_db(tmp_path, monkeypatch):
     monkeypatch.setenv("TEANE_STATE_DB", str(db))
     yield db
     # tmp_path cleanup handles the file removal.
+
+
+@pytest.fixture(autouse=True)
+def _stub_moonshot_api_key(monkeypatch):
+    """Provide a stub ``MOONSHOT_API_KEY`` for the whole suite.
+
+    The shipped ``config/config.json`` routes ``patching_fallback`` /
+    ``repair_fallback`` to ``moonshot:kimi-3``, so strict validation
+    (and everything that runs it — doctor, presets, the web wizard's
+    "config ok?" gate, the dashboard home render) now requires the key.
+    Many of those tests validate the canonical config while stubbing
+    only the older provider keys they knew about; stubbing Moonshot here
+    keeps them from failing merely because the runner's shell lacks a
+    key the shipped routing depends on.
+
+    Safe by construction: the only tests that assert Moonshot-key
+    *absence* (``test_moonshot_provider.py``) set or clear the var with
+    their own ``monkeypatch`` calls, which run after this fixture and
+    win. If a future default routes to a new remote provider, add its
+    key here (or generalize this to read the config's routing).
+    """
+    monkeypatch.setenv("MOONSHOT_API_KEY", "stub-test-key")

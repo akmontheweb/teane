@@ -172,6 +172,9 @@ class AgentState(TypedDict, total=False):
     # round-tripping through cli.py's config loader. Loaded from the
     # "test_generation" section of config/config.json.
     test_generation_config: dict[str, Any]
+    # ADR-0001 test-author regeneration parameters. Loaded from the
+    # "test_regeneration" section of config/config.json.
+    test_regeneration_config: dict[str, Any]
     # Speculative-execution branching parameters. Loaded from the
     # "speculative" section of config/config.json. Keys: num_variants
     # (default 3), temperature (default 0.3), selection_strategy
@@ -19648,7 +19651,81 @@ def route_after_diagnostics(state: AgentState) -> Literal["repair_node", "compil
     return _transition("repair_node")
 
 
-def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node"]:
+def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
+    """ADR-0001 autonomy ladder for a declared-unsatisfiable test.
+
+    Decides whether a repair-declared ``UNSATISFIABLE_TEST`` should be
+    autonomously regenerated (``test_regeneration_node``) or escalated to a
+    human (``human_intervention_node``). This is a *pure read* — the caller
+    owns the ``_transition`` telemetry; the attempt counter is incremented by
+    the regeneration node, never here.
+
+    Rungs, top (most autonomous) to bottom (last resort):
+      1. Code rung — the defect is machine-PROVABLE (contradictory pair /
+         unparseable, via ``harness.test_contradiction``). Regenerate.
+      2. Tier B — the model *declared* it unsatisfiable but we can't prove it.
+         Regenerate only when ``tier_b_auto`` is set; otherwise HITL.
+    Guards below either rung: regeneration disabled, or the per-test attempt
+    cap is exhausted → HITL (the human now gets a run that already tried).
+    """
+    cfg = state.get("test_regeneration_config", {}) or {}
+    if not cfg.get("enabled", False):
+        return "human_intervention_node"
+
+    workspace = str(state.get("workspace_path", "") or "")
+    attempts = (
+        (state.get("loop_counter", {}) or {})
+        .get("test_regen_attempts", {})
+        .get(declared_file, 0)
+    )
+    cap = int(cfg.get("max_attempts_per_test", 1))
+    if attempts >= cap:
+        logger.warning(
+            "[router] Test %s already regenerated %d/%d time(s) and is still "
+            "unsatisfiable — routing to HITL.", declared_file, attempts, cap,
+        )
+        return "human_intervention_node"
+
+    # Read the declared test file to classify the defect deterministically.
+    abs_path = declared_file
+    if not os.path.isabs(abs_path) and workspace:
+        abs_path = os.path.join(workspace, declared_file)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except OSError as exc:
+        logger.warning(
+            "[router] Could not read declared-unsatisfiable test %s (%s) — "
+            "routing to HITL.", abs_path, exc,
+        )
+        return "human_intervention_node"
+
+    from harness.test_contradiction import machine_unsatisfiable_reason
+    provable = machine_unsatisfiable_reason(source, filename=declared_file)
+    if provable is not None:
+        logger.warning(
+            "[router] Test %s is PROVABLY unsatisfiable (%s) — routing to "
+            "test-author regeneration (attempt %d/%d).",
+            declared_file, provable, attempts + 1, cap,
+        )
+        return "test_regeneration_node"
+
+    if cfg.get("tier_b_auto", False):
+        logger.warning(
+            "[router] Test %s declared unsatisfiable (not machine-provable); "
+            "tier_b_auto enabled — routing to regeneration (attempt %d/%d).",
+            declared_file, attempts + 1, cap,
+        )
+        return "test_regeneration_node"
+
+    logger.warning(
+        "[router] Test %s declared unsatisfiable but not machine-provable and "
+        "tier_b_auto is off — routing to HITL.", declared_file,
+    )
+    return "human_intervention_node"
+
+
+def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node", "test_regeneration_node"]:
     """
     Conditional edge router executed after compiler_node completes.
 
@@ -19695,7 +19772,7 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         if gw is not None else 3
     )
 
-    _Dest = Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node"]
+    _Dest = Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node", "test_regeneration_node"]
 
     def _transition(dest: _Dest) -> _Dest:
         try:
@@ -19809,12 +19886,11 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
                 _still_failing = True
                 break
         if _still_failing:
-            logger.warning(
-                "[router] Repair LLM declared test %s unsatisfiable and it "
-                "is still failing. Repair cannot edit tests — routing to "
-                "HITL.", _unsat_declared_file,
-            )
-            return _transition("human_intervention_node")
+            # ADR-0001: climb the autonomy ladder before halting for a human.
+            # Repair still cannot edit the test — but the test-AUTHOR phase
+            # can regenerate it from spec when the defect is provable.
+            _unsat_dest = route_after_unsatisfiable(state, _unsat_declared_file)
+            return _transition(_unsat_dest)  # type: ignore[arg-type]
         logger.info(
             "[router] Stale unsatisfiable-test declaration for %s (no "
             "longer in the failing set) — continuing the loop.",
@@ -24484,6 +24560,14 @@ def build_graph() -> Any:
     )
     graph.add_node("test_generation_node", _test_generation_node)  # type: ignore[type-var]
 
+    # ADR-0001: test-author regeneration for declared-unsatisfiable tests.
+    # Sits off route_after_compiler's unsatisfiable branch; re-verifies via
+    # compiler_node.
+    from harness.test_regeneration import (
+        test_regeneration_node as _test_regeneration_node,
+    )
+    graph.add_node("test_regeneration_node", _test_regeneration_node)  # type: ignore[type-var]
+
     # Register change-request ingest entry point and the one-shot
     # reverse-engineer architecture synthesis node that runs once on
     # first contact with a repo that lacks SPEC_ARCHITECTURE.md.
@@ -24966,6 +25050,8 @@ def build_graph() -> Any:
             # pytest exit=5 with source present → generate tests instead of
             # burning a repair iteration on a non-error.
             "test_generation_node": "test_generation_node",
+            # ADR-0001: provably-unsatisfiable test → regenerate from spec.
+            "test_regeneration_node": "test_regeneration_node",
         },
     )
 
@@ -25020,6 +25106,13 @@ def build_graph() -> Any:
     # minutes-scale compile; when clean (or capped) the gate falls through
     # to compiler_node unconditionally.
     graph.add_edge("repair_node", "diagnostics_node")
+
+    # ADR-0001: after regenerating a defective test, re-verify via the
+    # compiler. If the rewrite made the build clean → success; if it exposed a
+    # real production bug (a now-correct assertion fails) → route_after_compiler
+    # sends it to repair_node; if it's still unsatisfiable → the per-test
+    # attempt cap converges to HITL.
+    graph.add_edge("test_regeneration_node", "compiler_node")
 
     # =====================================================================
     # Deployment discovery pipeline (after security scan clean):
@@ -25694,6 +25787,7 @@ async def run_graph(
     deployment_defaults: Optional[dict[str, Any]] = None,
     sandbox_config: Optional[dict[str, Any]] = None,
     test_generation_config: Optional[dict[str, Any]] = None,
+    test_regeneration_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
     compiler_config: Optional[dict[str, Any]] = None,
     change_request_mode: bool = False,
@@ -25789,6 +25883,8 @@ async def run_graph(
         initial_state["deployment_defaults"] = deployment_defaults
     if test_generation_config is not None:
         initial_state["test_generation_config"] = test_generation_config
+    if test_regeneration_config is not None:
+        initial_state["test_regeneration_config"] = test_regeneration_config
     if speculative_config is not None:
         initial_state["speculative_config"] = speculative_config
     if change_requests_config is not None:

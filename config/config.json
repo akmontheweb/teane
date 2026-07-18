@@ -343,6 +343,14 @@
         "enabled": true,
         "max_iterations": 5
     },
+    "_test_regeneration_comment": "ADR-0001 autonomy ladder. When the repair loop declares a test UNSATISFIABLE_TEST, regenerate the defective test from the spec (via the test-author phase) instead of dead-ending at HITL. enabled=false keeps the legacy straight-to-HITL behaviour. max_attempts_per_test caps regeneration attempts per test path before falling through to HITL. tier_b_auto=false means only machine-PROVABLE defects (contradictory-pair / unparseable — Tier A) auto-regenerate; model-declared-only cases still route to HITL. require_spec_reference rejects a regeneration that doesn't cite the governing AC/story. coverage_nonregression rejects a regeneration that weakens assertion coverage (the anti-reward-hack gate).",
+    "test_regeneration": {
+        "enabled": true,
+        "max_attempts_per_test": 1,
+        "tier_b_auto": false,
+        "require_spec_reference": true,
+        "coverage_nonregression": true
+    },
     "_fanout_comment": "Parallel task fan-out across independent workers (used by code-review, doc-review, test variants, discovery follow-ups). max_concurrency caps how many workers run at once; raise on larger machines / hosted-model paths to speed up wide fan-outs, lower to reduce peak RAM or provider rate-limit risk. timeout_seconds is the per-task wall-clock ceiling before an individual worker is cancelled — raise for slow reasoning models, lower to fail-fast on hung workers.",
     "fanout": {
         "max_concurrency": 8,

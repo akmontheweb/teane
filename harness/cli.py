@@ -638,7 +638,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "node_throttle", "models", "model_routing", "persistence",
     "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
-    "test_generation", "metrics", "llm_dispatch",
+    "test_generation", "test_regeneration", "metrics", "llm_dispatch",
     # 2026-07-06 — parallel-agent fan-out defaults promoted from
     # harness/fanout.py constants. See GatewayConfig.fanout_max_concurrency
     # / fanout_timeout_seconds for semantics.
@@ -871,6 +871,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "test_generation": frozenset({
         "enabled", "max_iterations",
+    }),
+    "test_regeneration": frozenset({
+        "enabled", "max_attempts_per_test", "tier_b_auto",
+        "require_spec_reference", "coverage_nonregression",
     }),
     "fanout": frozenset({
         "max_concurrency",
@@ -1237,6 +1241,12 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.backup_count": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
+    # ADR-0001 test-author regeneration for unsatisfiable tests.
+    "test_regeneration.enabled": (bool,),
+    "test_regeneration.max_attempts_per_test": (int,),
+    "test_regeneration.tier_b_auto": (bool,),
+    "test_regeneration.require_spec_reference": (bool,),
+    "test_regeneration.coverage_nonregression": (bool,),
     # Coverage gate for generated apps (FR-080). See _KNOWN_NESTED_KEYS.
     "coverage.min_pct": (int,),
     "coverage.enforce": (bool,),
@@ -7507,6 +7517,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
+            test_regeneration_config=config.get("test_regeneration", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
             change_request_mode=change_request_mode,
@@ -8359,6 +8370,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
+            test_regeneration_config=config.get("test_regeneration", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
             llm_dispatch_config=config.get("llm_dispatch", {}),

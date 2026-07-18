@@ -142,32 +142,32 @@
             "api_key": "",
             "supports_cache": true
         },
-        "_moonshot_kimi_comment": "Moonshot AI (Kimi), OpenAI-compatible via the 'moonshot' provider. CONFIRM BEFORE RELYING ON IT: (1) model_id — 'kimi-latest' is Moonshot's always-newest alias (resolves to Kimi 3.0 when that is current); pin an explicit dated string (e.g. the exact Kimi 3.0 model name from your Moonshot console) if you want reproducible routing. (2) Region — api_base_url defaults to the international host https://api.moonshot.ai/v1; switch to https://api.moonshot.cn/v1 for the mainland platform (accounts/keys are NOT shared across the two). (3) Pricing — the cost_per_1m fields below are placeholders for budget tracking and must be set to the published Kimi 3.0 rates for accurate spend accounting. (4) context_window — set to the model's real limit. Key: export MOONSHOT_API_KEY. supports_thinking is false because OpenAIProvider (which the moonshot provider extends) does not emit a thinking parameter; a reasoning field in the response is still surfaced automatically. supports_cache is false pending confirmation that Moonshot returns prompt_tokens_details.cached_tokens for implicit caching.",
+        "_moonshot_kimi_comment": "Moonshot AI (Kimi), OpenAI-compatible via the 'moonshot' provider. Values below are confirmed against Moonshot's platform docs (platform.kimi.ai, July 2026): kimi-k3 is the current flagship — model_id 'kimi-k3', 1M-token context, USD $3.00/1M input (cache-miss), $0.30/1M cached input, $15.00/1M output. 'kimi-latest' is Moonshot's always-newest alias (resolves to kimi-k3 today); its specs here mirror kimi-k3 and should be re-checked if a newer Kimi ships. Region: api_base_url defaults to the international host https://api.moonshot.ai/v1; switch to https://api.moonshot.cn/v1 for the mainland platform (accounts/keys are NOT shared across the two). Key: export MOONSHOT_API_KEY. supports_thinking is false because the moonshot provider extends OpenAIProvider, which does not emit a thinking/reasoning_effort parameter — K3 always runs with thinking enabled server-side (reasoning_effort='max') regardless, and its reasoning output is surfaced automatically. supports_cache is true: Moonshot bills cache-hit vs cache-miss input and returns prompt_tokens_details.cached_tokens.",
         "moonshot:kimi-latest": {
             "provider": "moonshot",
             "model_id": "kimi-latest",
             "supports_tools": true,
-            "context_window": 256000,
+            "context_window": 1000000,
             "input_cost_per_1m": 3.00,
             "output_cost_per_1m": 15.00,
-            "cached_input_cost_per_1m": 0.15,
+            "cached_input_cost_per_1m": 0.30,
             "api_base_url": "https://api.moonshot.ai/v1",
             "supports_thinking": false,
             "api_key": "",
-            "supports_cache": false
+            "supports_cache": true
         },
-        "moonshot:kimi-3": {
+        "moonshot:kimi-k3": {
             "provider": "moonshot",
-            "model_id": "kimi-3",
+            "model_id": "kimi-k3",
             "supports_tools": true,
-            "context_window": 256000,
-            "input_cost_per_1m": 0.60,
-            "output_cost_per_1m": 2.50,
-            "cached_input_cost_per_1m": 0.15,
+            "context_window": 1000000,
+            "input_cost_per_1m": 3.00,
+            "output_cost_per_1m": 15.00,
+            "cached_input_cost_per_1m": 0.30,
             "api_base_url": "https://api.moonshot.ai/v1",
             "supports_thinking": false,
             "api_key": "",
-            "supports_cache": false
+            "supports_cache": true
         },
         "ollama:qwen2.5-coder:14b": {
             "provider": "ollama",
@@ -201,11 +201,11 @@
         "planning_fallback_mode": "thinking",
         "patching_primary": "deepseek:deepseek-v4-pro",
         "patching_mode": "non_thinking",
-        "patching_fallback": "moonshot:kimi-3",
+        "patching_fallback": "moonshot:kimi-k3",
         "patching_fallback_mode": "thinking",
         "repair_primary": "deepseek:deepseek-v4-pro",
         "repair_mode": "non_thinking",
-        "repair_fallback": "moonshot:kimi-3",
+        "repair_fallback": "moonshot:kimi-k3",
         "repair_fallback_mode": "thinking",
         "doc_reviewer_primary": "deepseek:deepseek-v4-pro",
         "doc_reviewer_mode": "non_thinking",

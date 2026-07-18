@@ -408,21 +408,21 @@ class TestDoctorLivePingOpenAICompat:
 
         _install_fake_async_client(monkeypatch, handler)
         config = {
-            "model_routing": {"planning_primary": "moonshot:kimi-3"},
+            "model_routing": {"planning_primary": "moonshot:kimi-k3"},
             "models": {
-                "moonshot:kimi-3": {
+                "moonshot:kimi-k3": {
                     "provider": "moonshot",
-                    "model_id": "kimi-3",
+                    "model_id": "kimi-k3",
                     "api_base_url": "https://api.moonshot.ai/v1",
                 },
             },
         }
         status, detail = _run_api_keys_check(config)
         assert status == "pass"
-        assert "moonshot:kimi-3" in detail and "live" in detail
+        assert "moonshot:kimi-k3" in detail and "live" in detail
         assert captured["url"] == "https://api.moonshot.ai/v1/chat/completions"
         assert captured["headers"]["Authorization"] == "Bearer sk-kimi"
-        assert captured["body"]["model"] == "kimi-3"
+        assert captured["body"]["model"] == "kimi-k3"
         assert captured["body"]["max_tokens"] == 1
 
     def test_moonshot_cn_region_base_is_honoured(self, monkeypatch):
@@ -436,9 +436,9 @@ class TestDoctorLivePingOpenAICompat:
 
         _install_fake_async_client(monkeypatch, handler)
         config = {
-            "model_routing": {"planning_primary": "moonshot:kimi-3"},
+            "model_routing": {"planning_primary": "moonshot:kimi-k3"},
             "models": {
-                "moonshot:kimi-3": {
+                "moonshot:kimi-k3": {
                     "api_base_url": "https://api.moonshot.cn/v1",
                 },
             },
@@ -493,8 +493,8 @@ class TestDoctorLivePingOpenAICompat:
 
         _install_fake_async_client(monkeypatch, handler)
         config = {
-            "model_routing": {"planning_primary": "moonshot:kimi-3"},
-            "models": {"moonshot:kimi-3": {"provider": "moonshot"}},
+            "model_routing": {"planning_primary": "moonshot:kimi-k3"},
+            "models": {"moonshot:kimi-k3": {"provider": "moonshot"}},
         }
         status, detail = _run_api_keys_check(config)
         assert status == "fail"

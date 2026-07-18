@@ -33,7 +33,7 @@ def _stub_moonshot_api_key(monkeypatch):
     """Provide a stub ``MOONSHOT_API_KEY`` for the whole suite.
 
     The shipped ``config/config.json`` routes ``patching_fallback`` /
-    ``repair_fallback`` to ``moonshot:kimi-3``, so strict validation
+    ``repair_fallback`` to ``moonshot:kimi-k3``, so strict validation
     (and everything that runs it — doctor, presets, the web wizard's
     "config ok?" gate, the dashboard home render) now requires the key.
     Many of those tests validate the canonical config while stubbing

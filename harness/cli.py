@@ -9276,10 +9276,16 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     Two-phase check:
       1. Key resolution — same as before: env var OR per-model
          ``api_key`` config field, matching ``BaseProviderClient.__init__``.
-      2. Live ping — for each provider that resolved a key, make the
-         smallest possible chat call. Pings run in parallel via
-         ``asyncio.gather`` so the doctor stays fast even with 3-4
-         providers configured.
+      2. Live ping — for each DISTINCT routed model, make the smallest
+         possible chat call. Pings run in parallel via ``asyncio.gather``
+         so the doctor stays fast even with several models configured.
+
+    Every distinct model is checked (not one-per-provider) so the live
+    ping validates each model_id — the failure that ships a typo'd id
+    (e.g. ``kimi-3`` for ``kimi-k3``) which dispatches to a 404. The
+    scanned fields come from the canonical routing-field lists so this
+    check can't drift from :func:`find_missing_api_keys` (a prior copy
+    hardcoded its own tuple and silently omitted ``patching_fallback``).
 
     Set ``HARNESS_DOCTOR_SKIP_LIVE=true`` to skip the live ping (key
     presence only). Useful in headless CI where outbound network may be
@@ -9288,14 +9294,12 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     """
     routing = config.get("model_routing", {}) or {}
     models_cfg = config.get("models", {}) or {}
-    routing_keys = (
-        "planning_primary", "planning_fallback",
-        "patching_primary",
-        "repair_primary", "repair_fallback",
-        "doc_reviewer_primary", "doc_reviewer_fallback",
-        "code_reviewer_primary", "code_reviewer_fallback",
-    )
-    needed_providers: dict[str, str] = {}  # provider -> first model that wants it
+    # Canonical field set — same source find_missing_api_keys scans, so
+    # the doctor and the validator never disagree on which routing slots
+    # require a key. ollama_local_* are included but harmlessly filtered
+    # by the ollama provider skip below.
+    routing_keys = (*_REQUIRED_ROUTING_FIELDS, *_OPTIONAL_ROUTING_FIELDS)
+    needed_models: dict[str, str] = {}  # model_key -> provider (distinct models)
     for routing_key in routing_keys:
         model_key = routing.get(routing_key, "") or ""
         if not model_key or ":" not in model_key:
@@ -9303,16 +9307,16 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
         provider = model_key.split(":", 1)[0]
         if provider == "ollama":
             continue
-        needed_providers.setdefault(provider, model_key)
+        needed_models.setdefault(model_key, provider)
 
-    if not needed_providers:
+    if not needed_models:
         return "warn", "no non-ollama models configured in model_routing"
 
     # Phase 1: resolve keys.
     # (provider, model_key, source, key, api_base_url)
     resolved: list[tuple[str, str, str, str, str]] = []
     missing: list[str] = []
-    for provider, model_key in needed_providers.items():
+    for model_key, provider in needed_models.items():
         env_var = f"{provider.upper()}_API_KEY"
         env_value = (os.environ.get(env_var, "") or "").strip()
         cfg_entry = models_cfg.get(model_key, {}) or {}

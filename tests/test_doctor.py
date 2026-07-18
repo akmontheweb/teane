@@ -123,6 +123,41 @@ class TestDoctorApiKeysCheck:
         assert status == "fail"
         assert "OPENAI_API_KEY" in detail
 
+    def test_covers_patching_fallback_slot(self, monkeypatch):
+        # Regression: the doctor's routing-field scan hardcoded its own
+        # tuple and omitted patching_fallback, so a provider routed ONLY
+        # there was silently skipped. The scan now derives from the
+        # canonical routing-field lists.
+        monkeypatch.setenv("OPENAI_API_KEY", "stub")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "stub")
+        config = {
+            "model_routing": {
+                "planning_primary": "openai:gpt-4o",
+                "patching_fallback": "deepseek:deepseek-v4-pro",
+            },
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "deepseek:deepseek-v4-pro" in detail
+
+    def test_checks_every_distinct_routed_model_not_one_per_provider(
+        self, monkeypatch,
+    ):
+        # Two distinct models of the SAME provider must both be reported
+        # so the live ping validates each model_id (the kimi-3 vs kimi-k3
+        # typo class). The old per-provider dedup surfaced only one.
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "stub")
+        config = {
+            "model_routing": {
+                "planning_primary": "deepseek:deepseek-v4-pro",
+                "patching_primary": "deepseek:deepseek-v4-flash",
+            },
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "deepseek:deepseek-v4-pro" in detail
+        assert "deepseek:deepseek-v4-flash" in detail
+
     def test_passes_when_all_keys_present(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")

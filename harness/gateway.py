@@ -528,6 +528,46 @@ def _check_provider_embedded_error(data: Any) -> None:
     raise ProviderEmbeddedError(msg, payload=err)
 
 
+# Placeholder substituted for an otherwise-empty message body. Strict
+# OpenAI-compat backends (Moonshot: "the message at position N with role
+# 'user' must not be empty") 400 on empty content that DeepSeek/OpenAI
+# silently accept; a single space keeps the turn well-formed without
+# injecting misleading text. The real defence is not emitting empty turns
+# (see create_initial_state), but this guard stops a stray one aborting a run.
+_EMPTY_CONTENT_PLACEHOLDER = " "
+
+
+def _ensure_nonempty_message_content(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace empty message content with a placeholder for strict
+    OpenAI-compat backends.
+
+    Only messages that carry no ``tool_calls`` and are not ``role=tool``
+    are eligible — an assistant turn with ``tool_calls`` legitimately
+    carries ``content=None`` (see _normalize_messages_for_openai_tools),
+    and a ``role=tool`` result always has content. "Empty" means None, a
+    blank/whitespace string, or an empty list; non-empty content of any
+    shape passes through untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("tool_calls") or msg.get("role") == "tool":
+            out.append(msg)
+            continue
+        content = msg.get("content")
+        empty = (
+            content is None
+            or (isinstance(content, str) and not content.strip())
+            or (isinstance(content, list) and len(content) == 0)
+        )
+        if empty:
+            out.append({**msg, "content": _EMPTY_CONTENT_PLACEHOLDER})
+        else:
+            out.append(msg)
+    return out
+
+
 def _normalize_messages_for_openai_tools(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1153,6 +1193,10 @@ class OpenAIProvider(BaseLLM):
             # See _flatten_tool_turns_for_plain_dispatch — raw typed
             # blocks 400 on strict OpenAI-compat deserializers.
             messages = _flatten_tool_turns_for_plain_dispatch(messages)
+        # Strict backends (Moonshot) 400 on empty-content turns that
+        # DeepSeek/OpenAI tolerate; substitute a placeholder so a stray
+        # empty message can't abort the run. See _ensure_nonempty_message_content.
+        messages = _ensure_nonempty_message_content(messages)
         # Some models (e.g. Moonshot Kimi K3 / kimi-latest) 400 on any
         # temperature but one fixed value; honor the spec override when set.
         if self.spec.fixed_temperature is not None and temperature != self.spec.fixed_temperature:
@@ -3281,6 +3325,17 @@ class Gateway:
                     body = exc.response.text[:800]
                 except Exception:  # noqa: BLE001
                     body = "<unreadable>"
+                # Log the body BEFORE raising: the HarnessConfigError text
+                # goes to stderr, but the structured JSONL log (which the
+                # operator greps post-mortem) otherwise only captures
+                # httpx's bare "HTTP 400" request line. Origin: 2026-07-18
+                # lumina resume — an empty-user-turn 400 needed a debug-dump
+                # dig because the response body was never logged.
+                logger.error(
+                    "[gateway] Provider %r returned HTTP %s for model %r. "
+                    "Response body: %s",
+                    provider.spec.provider, status, model_key, body,
+                )
                 raise HarnessConfigError(
                     f"Provider {provider.spec.provider!r} returned HTTP {status} "
                     f"for model {model_key!r}. This is a configuration error "

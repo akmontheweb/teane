@@ -430,6 +430,17 @@ class AgentState(TypedDict, total=False):
 # 2. Default State Factory
 # ---------------------------------------------------------------------------
 
+# Fallback for the initial user turn when no ``--prompt``/``-p`` is given.
+# For spec-driven builds the goal lives in the system prompt (product_spec/),
+# so ``-p`` is documented as redundant and is usually omitted — which used to
+# leave messages[1] a 0-char user turn. DeepSeek/OpenAI tolerate that; strict
+# OpenAI-compat backends (Moonshot) 400 with "the message at position 1 with
+# role 'user' must not be empty". Seeding a real instruction keeps the
+# conversation well-formed for every provider and reads better than a blank
+# turn. See gateway._ensure_nonempty_message_content for the wire-level guard.
+_DEFAULT_INITIAL_PROMPT = "Build the software described in the product spec."
+
+
 def create_initial_state(
     *,
     workspace_path: str,
@@ -472,6 +483,11 @@ def create_initial_state(
     matching" returned zero matches — the section was never reaching the
     LLM in any product_spec/-driven run.
     """
+    # An empty ``--prompt`` (the norm for spec-driven builds — the goal is
+    # the product_spec/ system prompt) would seed a 0-char user turn that
+    # strict OpenAI-compat backends reject. Substitute a real instruction.
+    if not (initial_prompt or "").strip():
+        initial_prompt = _DEFAULT_INITIAL_PROMPT
     if spec_override:
         # Spec first (project context), then the patcher's operating
         # contract (DSL + Edit Invariants + workspace conventions). The

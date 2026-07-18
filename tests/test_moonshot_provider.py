@@ -215,6 +215,54 @@ class TestFixedTemperature:
         assert get_model_spec("moonshot:kimi-latest").fixed_temperature == 1.0
 
 
+class TestEmptyContentGuard:
+    """Moonshot 400s on an empty-content turn ("the message at position N
+    with role 'user' must not be empty") that DeepSeek/OpenAI tolerate. The
+    lumina spec-driven build seeds a 0-char user turn at messages[1] (goal
+    lives in the system prompt), so the wire payload must carry a placeholder
+    instead of empty content — without clobbering the intentional
+    content=None on assistant tool-call turns.
+    """
+
+    @staticmethod
+    def _client():
+        return _RecordingClient({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    @pytest.mark.asyncio
+    async def test_empty_user_turn_sent_as_placeholder(self, monkeypatch):
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-x")
+        prov = MoonshotProvider(_spec())
+        prov._client = self._client()
+        await prov.chat_completion([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": ""},  # the lumina messages[1]
+        ])
+        sent = prov._client.last_payload["messages"]
+        assert sent[1]["content"].strip() != "" or sent[1]["content"] == " "
+        assert sent[1]["content"] != ""
+
+    @pytest.mark.asyncio
+    async def test_assistant_tool_call_content_none_preserved(self, monkeypatch):
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-x")
+        prov = MoonshotProvider(_spec())
+        prov._client = self._client()
+        # Anthropic-shape assistant tool_use turn → normalized to
+        # content=None + tool_calls; the guard must not overwrite that None.
+        await prov.chat_completion([
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "run", "input": {}},
+            ]},
+        ], tools=[{"name": "run", "description": "x", "input_schema": {"type": "object"}}])
+        sent = prov._client.last_payload["messages"]
+        asst = [m for m in sent if m.get("role") == "assistant"][0]
+        assert asst.get("tool_calls")
+        assert asst["content"] is None
+
+
 class TestConfigIntegration:
     def test_find_missing_api_keys_gates_on_moonshot_key(self, monkeypatch):
         from harness.cli import find_missing_api_keys

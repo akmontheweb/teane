@@ -3743,6 +3743,25 @@ class TestAgentState:
             assert state["exit_code"] == -1
             assert state["budget_remaining_usd"] == 2.00
 
+    def test_empty_prompt_seeds_default_instruction(self):
+        # Spec-driven builds omit --prompt (the goal is the product_spec/
+        # system prompt), which used to leave messages[1] a 0-char user
+        # turn that strict OpenAI-compat backends (Moonshot) 400 on.
+        # An empty/whitespace prompt must become the default instruction.
+        from harness.graph import _DEFAULT_INITIAL_PROMPT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for empty in ("", "   ", "\n\t"):
+                state = _make_state(tmpdir, initial_prompt=empty)
+                assert state["messages"][1]["content"] == _DEFAULT_INITIAL_PROMPT
+                assert state["messages"][1]["content"].strip() != ""
+
+    def test_explicit_prompt_is_preserved(self):
+        # A real --prompt must survive untouched — the default only fills
+        # the empty case.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir, initial_prompt="Fix the login bug")
+            assert state["messages"][1]["content"] == "Fix the login bug"
+
     def test_create_initial_state_with_spec(self):
         # When spec_override is provided, the project spec is anchored at
         # messages[0] AHEAD of (not instead of) the built-in patcher

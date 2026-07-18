@@ -381,6 +381,145 @@ class TestDoctorApiKeysLivePing:
         assert any("anthropic.com" in u for u in urls_hit)
 
 
+class TestDoctorLivePingOpenAICompat:
+    """Live-ping probe coverage for the OpenAI-compatible provider family.
+
+    Regression for the sibling-drift that shipped Moonshot support: the
+    gateway's provider registry gained `moonshot` (and already had
+    `google`) while `_ping_provider_live` still hardcoded only
+    openai/deepseek, so `teane doctor` reported `unknown provider
+    'moonshot'` for a model that dispatched fine. The probe now builds
+    the URL from the model's configured `api_base_url` so every
+    OpenAI-shape provider is reachable and region hosts are honoured.
+    """
+
+    def test_moonshot_probes_configured_base_with_bearer_auth(
+        self, monkeypatch,
+    ):
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-kimi")
+        captured: dict = {}
+
+        def handler(url, headers, body):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = body
+            return _FakeResponse(200, "{}")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {
+            "model_routing": {"planning_primary": "moonshot:kimi-3"},
+            "models": {
+                "moonshot:kimi-3": {
+                    "provider": "moonshot",
+                    "model_id": "kimi-3",
+                    "api_base_url": "https://api.moonshot.ai/v1",
+                },
+            },
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert "moonshot:kimi-3" in detail and "live" in detail
+        assert captured["url"] == "https://api.moonshot.ai/v1/chat/completions"
+        assert captured["headers"]["Authorization"] == "Bearer sk-kimi"
+        assert captured["body"]["model"] == "kimi-3"
+        assert captured["body"]["max_tokens"] == 1
+
+    def test_moonshot_cn_region_base_is_honoured(self, monkeypatch):
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-kimi")
+        captured: dict = {}
+
+        def handler(url, _headers, _body):
+            captured["url"] = url
+            return _FakeResponse(200, "{}")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {
+            "model_routing": {"planning_primary": "moonshot:kimi-3"},
+            "models": {
+                "moonshot:kimi-3": {
+                    "api_base_url": "https://api.moonshot.cn/v1",
+                },
+            },
+        }
+        status, _detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert captured["url"] == "https://api.moonshot.cn/v1/chat/completions"
+
+    def test_google_openai_compat_base_is_probed(self, monkeypatch):
+        # The pre-existing latent gap the same fix closes: google was also
+        # in the gateway registry but not the probe list.
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("GOOGLE_API_KEY", "sk-gg")
+        captured: dict = {}
+
+        def handler(url, headers, _body):
+            captured["url"] = url
+            captured["headers"] = headers
+            return _FakeResponse(200, "{}")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {
+            "model_routing": {"planning_primary": "google:gemini-3.5-flash"},
+            "models": {
+                "google:gemini-3.5-flash": {
+                    "api_base_url": (
+                        "https://generativelanguage.googleapis.com/"
+                        "v1beta/openai/"
+                    ),
+                },
+            },
+        }
+        status, _detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert captured["url"] == (
+            "https://generativelanguage.googleapis.com/v1beta/openai/"
+            "chat/completions"
+        )
+        assert captured["headers"]["Authorization"] == "Bearer sk-gg"
+
+    def test_moonshot_without_base_url_fails_with_actionable_message(
+        self, monkeypatch,
+    ):
+        # No hardcoded default host for moonshot (region-specific), so an
+        # entry that omits api_base_url must fail loudly rather than
+        # probe the wrong host.
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-kimi")
+
+        def handler(_url, _headers, _body):  # pragma: no cover - must not fire
+            raise AssertionError("no probe should fire without a base url")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {
+            "model_routing": {"planning_primary": "moonshot:kimi-3"},
+            "models": {"moonshot:kimi-3": {"provider": "moonshot"}},
+        }
+        status, detail = _run_api_keys_check(config)
+        assert status == "fail"
+        assert "api_base_url" in detail
+
+    def test_openai_still_pings_default_host_without_models_entry(
+        self, monkeypatch,
+    ):
+        # Back-compat: openai/deepseek keep their well-known default host
+        # when the config omits an explicit api_base_url.
+        monkeypatch.delenv("HARNESS_DOCTOR_SKIP_LIVE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-o")
+        captured: dict = {}
+
+        def handler(url, _headers, _body):
+            captured["url"] = url
+            return _FakeResponse(200, "{}")
+
+        _install_fake_async_client(monkeypatch, handler)
+        config = {"model_routing": {"planning_primary": "openai:gpt-4o-mini"}}
+        status, _detail = _run_api_keys_check(config)
+        assert status == "pass"
+        assert captured["url"] == "https://api.openai.com/v1/chat/completions"
+
+
 class TestDoctorSandboxCheck:
     def test_bare_backend_warns(self):
         status, detail = _doctor_check_sandbox({"sandbox": {"backend": "bare"}})

@@ -9153,9 +9153,32 @@ def _doctor_check_ollama_daemon(config: dict[str, Any]) -> tuple[str, str]:
 _LIVE_PING_TIMEOUT_SECONDS = 8.0
 
 
+# Providers that speak the OpenAI /chat/completions wire shape (Bearer
+# auth, {model, max_tokens, messages} body). The live-ping probe treats
+# them uniformly and builds the URL from the model's configured
+# ``api_base_url`` so it stays in lockstep with the gateway's
+# ``_provider_classes`` registry — every OpenAI-compatible provider the
+# gateway can dispatch to is probeable here without a per-provider
+# branch. Mirrors the OpenAI-shape client family in gateway.py
+# (OpenAIProvider + its GoogleProvider / MoonshotProvider subclasses).
+_OPENAI_COMPAT_PING_PROVIDERS: frozenset[str] = frozenset({
+    "openai", "deepseek", "google", "moonshot",
+})
+
+# Fallback hosts for the two providers with a single well-known endpoint,
+# used only when the model config omits ``api_base_url``. Region-specific
+# providers (google's /v1beta/openai/, moonshot's .ai vs .cn) have no safe
+# default and MUST carry ``api_base_url`` in their model entry.
+_OPENAI_COMPAT_DEFAULT_BASE: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+}
+
+
 async def _ping_provider_live(
     provider: str, model_id: str, api_key: str,
     *,
+    api_base_url: str = "",
     timeout: float = _LIVE_PING_TIMEOUT_SECONDS,
 ) -> tuple[bool, str]:
     """Make the smallest possible chat call to confirm the key authenticates.
@@ -9166,6 +9189,11 @@ async def _ping_provider_live(
     403 distinguishes "key valid but no access to model", 429 calls out
     that the key works but quota is exhausted, network errors point at
     reachability.
+
+    ``api_base_url`` is the model's configured endpoint; OpenAI-shape
+    providers probe ``{api_base_url}/chat/completions`` so region-specific
+    hosts (google's ``/v1beta/openai/``, moonshot's ``.ai`` vs ``.cn``)
+    are honoured instead of hardcoded.
     """
     import httpx
     if not api_key:
@@ -9184,12 +9212,17 @@ async def _ping_provider_live(
                 "max_tokens": 1,
                 "messages": [{"role": "user", "content": "ping"}],
             }
-        elif provider in {"openai", "deepseek"}:
-            base = (
-                "https://api.deepseek.com" if provider == "deepseek"
-                else "https://api.openai.com"
-            )
-            url = f"{base}/v1/chat/completions"
+        elif provider in _OPENAI_COMPAT_PING_PROVIDERS:
+            base = (api_base_url or "").strip().rstrip("/")
+            if not base:
+                base = _OPENAI_COMPAT_DEFAULT_BASE.get(provider, "").rstrip("/")
+            if not base:
+                return False, (
+                    f"no api_base_url configured for '{provider}' model "
+                    f"'{model_id}' — set models.\"{provider}:{model_id}\"."
+                    f"api_base_url so doctor knows which host to probe"
+                )
+            url = f"{base}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -9276,17 +9309,22 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
         return "warn", "no non-ollama models configured in model_routing"
 
     # Phase 1: resolve keys.
-    resolved: list[tuple[str, str, str, str]] = []  # (provider, model_key, source, key)
+    # (provider, model_key, source, key, api_base_url)
+    resolved: list[tuple[str, str, str, str, str]] = []
     missing: list[str] = []
     for provider, model_key in needed_providers.items():
         env_var = f"{provider.upper()}_API_KEY"
         env_value = (os.environ.get(env_var, "") or "").strip()
         cfg_entry = models_cfg.get(model_key, {}) or {}
         cfg_value = (cfg_entry.get("api_key", "") or "").strip() if isinstance(cfg_entry, dict) else ""
+        base_url = (
+            str(cfg_entry.get("api_base_url", "") or "").strip()
+            if isinstance(cfg_entry, dict) else ""
+        )
         if env_value:
-            resolved.append((provider, model_key, "env", env_value))
+            resolved.append((provider, model_key, "env", env_value, base_url))
         elif cfg_value:
-            resolved.append((provider, model_key, "config", cfg_value))
+            resolved.append((provider, model_key, "config", cfg_value, base_url))
         else:
             missing.append(
                 f"{model_key} (set {env_var} env var, or "
@@ -9302,7 +9340,7 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     if skip_live:
         return (
             "pass",
-            "present: " + ", ".join(f"{m} ({s})" for _p, m, s, _k in resolved)
+            "present: " + ", ".join(f"{m} ({s})" for _p, m, s, _k, _b in resolved)
             + " (live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)",
         )
 
@@ -9310,15 +9348,18 @@ async def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
     import asyncio as _asyncio
     ping_results = await _asyncio.gather(
         *[
-            _ping_provider_live(provider, model_key.split(":", 1)[1], key)
-            for provider, model_key, _src, key in resolved
+            _ping_provider_live(
+                provider, model_key.split(":", 1)[1], key,
+                api_base_url=base_url,
+            )
+            for provider, model_key, _src, key, base_url in resolved
         ],
         return_exceptions=True,
     )
 
     live_failures: list[str] = []
     live_present: list[str] = []
-    for (provider, model_key, source, _key), result in zip(resolved, ping_results):
+    for (provider, model_key, source, _key, _base), result in zip(resolved, ping_results):
         if isinstance(result, BaseException):
             live_failures.append(f"{model_key} ({source}): unexpected {type(result).__name__}: {result}")
             continue

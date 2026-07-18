@@ -15,7 +15,9 @@ from harness.test_regeneration import (
     coverage_nonregression_ok,
     count_assertion_sites,
     count_test_functions,
-    has_spec_citation,
+    has_code_linkage,
+    public_symbols,
+    symbol_coverage,
     patch_target_paths,
     build_regeneration_messages,
 )
@@ -102,15 +104,41 @@ class TestCoverageGate:
         assert not ok
 
 
-class TestSpecCitation:
-    def test_story_id_cited(self):
-        assert has_spec_citation("# spec: STORY-002 governs this")
-        assert has_spec_citation("per FR-014 the value must be positive")
-        assert has_spec_citation("matches the acceptance criteria")
+class TestCodeLinkage:
+    def test_tests_marker_present(self):
+        assert has_code_linkage("# @tests: server/app/models/contact.py\ndef test_x(): pass")
 
-    def test_no_citation(self):
-        assert not has_spec_citation("just make it pass")
-        assert not has_spec_citation("")
+    def test_no_marker(self):
+        assert not has_code_linkage("def test_x():\n    assert True")
+        assert not has_code_linkage("")
+
+    def test_verifies_marker_is_not_code_linkage(self):
+        # AC linkage must NOT count — unit tests link to code, not stories.
+        assert not has_code_linkage("# @verifies: STORY-002.AC-1\ndef test_x(): pass")
+
+
+class TestPublicSymbols:
+    def test_extracts_public_functions_and_classes(self):
+        src = (
+            "class Foo:\n    pass\n"
+            "def bar():\n    pass\n"
+            "def _private():\n    pass\n"
+            "class _Hidden:\n    pass\n"
+        )
+        assert set(public_symbols(src)) == {"Foo", "bar"}
+
+    def test_empty_on_syntax_error(self):
+        assert public_symbols("def f(:") == []
+
+
+class TestSymbolCoverage:
+    def test_covered_and_uncovered(self):
+        test_src = "obj = ContactUpdate()\nassert ContactCreate\n"
+        covered, uncovered = symbol_coverage(
+            test_src, ["ContactCreate", "ContactUpdate", "ContactOut"],
+        )
+        assert set(covered) == {"ContactCreate", "ContactUpdate"}
+        assert uncovered == ["ContactOut"]
 
 
 class TestPatchTargets:
@@ -129,19 +157,35 @@ class TestPatchTargets:
 
 
 class TestMessageAssembly:
-    def test_includes_spec_and_test(self):
+    def test_leads_with_code_contract(self):
         msgs = build_regeneration_messages(
-            system_spec="SRS: at least one field required",
             test_rel_path="tests/t.py",
-            test_source="def test_x(): pass",
+            test_source="# @tests: app/m.py\ndef test_x(): pass",
+            code_module_path="app/m.py",
+            code_module_source="class Widget:\n    def go(self): ...",
+            module_symbols=["Widget"],
             unsat_reason="contradiction",
             failing_output="AssertionError",
+            spec_tiebreaker="SRS: at least one field required",
         )
         joined = " ".join(m["content"] for m in msgs)
-        assert "SRS: at least one field required" in joined
-        assert "tests/t.py" in joined
-        assert "contradiction" in joined
+        # code module + symbols present; test author framing; spec labelled tiebreaker
+        assert "app/m.py" in joined
+        assert "class Widget" in joined
+        assert "Widget" in joined
         assert "TEST AUTHOR" in joined
+        assert "TIEBREAKER ONLY" in joined  # the spec section header
+        assert "contradiction" in joined
+
+    def test_spec_section_omitted_when_absent(self):
+        msgs = build_regeneration_messages(
+            test_rel_path="tests/t.py", test_source="x",
+            code_module_path="app/m.py", code_module_source="def f(): ...",
+            module_symbols=["f"], unsat_reason="r", failing_output="o",
+        )
+        joined = " ".join(m["content"] for m in msgs)
+        # the spec section is only injected when a tiebreaker is supplied
+        assert "TIEBREAKER ONLY — do not cite" not in joined
 
 
 # --- node-level: gate deferrals route back to the ladder (no crash) ---
@@ -168,7 +212,7 @@ def _state(ws, rel, content_reason="contradictory pair"):
                        "unsatisfiable_test_reason": content_reason},
         "loop_counter": {},
         "test_regeneration_config": {"enabled": True, "max_attempts_per_test": 1,
-                                     "require_spec_reference": True,
+                                     "require_code_linkage": True,
                                      "coverage_nonregression": True},
         "messages": [{"role": "system", "content": "SRS spec"}],
         "budget_remaining_usd": 5.0,
@@ -193,17 +237,62 @@ async def test_node_rejects_stray_file(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_node_rejects_missing_citation(monkeypatch):
+async def test_node_rejects_missing_code_linkage(monkeypatch):
     with tempfile.TemporaryDirectory() as ws:
         rel = "tests/t.py"
         os.makedirs(os.path.join(ws, "tests"))
-        open(os.path.join(ws, rel), "w").write(ORIGINAL)
+        open(os.path.join(ws, rel), "w").write("# @tests: app/m.py\n" + ORIGINAL)
         import harness.graph as g
-        # targets the right file but cites no requirement
+        # targets the right file but drops the @tests marker
         patch = f"<<<REWRITE_FILE>>>\nfile: {rel}\ncontent:\ndef test_a():\n    assert True\n<<<END_REWRITE_FILE>>>"
         monkeypatch.setattr(g, "get_gateway", lambda: _FakeGateway(patch))
         out = await regeneration_node(_state(ws, rel))
-        assert out["node_state"]["test_regeneration"]["status"] == "no_spec_citation"
+        assert out["node_state"]["test_regeneration"]["status"] == "no_code_linkage"
+        # rolled back to original (marker restored)
+        assert "@tests: app/m.py" in open(os.path.join(ws, rel)).read()
+
+
+@pytest.mark.asyncio
+async def test_node_rejects_gutted_coverage(monkeypatch):
+    with tempfile.TemporaryDirectory() as ws:
+        rel = "tests/t.py"
+        os.makedirs(os.path.join(ws, "tests"))
+        open(os.path.join(ws, rel), "w").write("# @tests: app/m.py\n" + ORIGINAL)
+        import harness.graph as g
+        # keeps the marker but guts every assertion → coverage gate rejects
+        gutted = "# @tests: app/m.py\nclass T:\n    def test_a(self):\n        pass\n"
+        patch = f"<<<REWRITE_FILE>>>\nfile: {rel}\ncontent:\n{gutted}<<<END_REWRITE_FILE>>>"
+        monkeypatch.setattr(g, "get_gateway", lambda: _FakeGateway(patch))
+        out = await regeneration_node(_state(ws, rel))
+        assert out["node_state"]["test_regeneration"]["status"] == "coverage_regression"
+        assert ORIGINAL.strip() in open(os.path.join(ws, rel)).read()
+
+
+@pytest.mark.asyncio
+async def test_node_happy_path_regenerates(monkeypatch):
+    with tempfile.TemporaryDirectory() as ws:
+        rel = "tests/t.py"
+        os.makedirs(os.path.join(ws, "tests"))
+        os.makedirs(os.path.join(ws, "app"))
+        open(os.path.join(ws, "app/m.py"), "w").write("class Widget:\n    def go(self):\n        return 1\n")
+        open(os.path.join(ws, rel), "w").write("# @tests: app/m.py\n" + ORIGINAL)
+        import harness.graph as g
+        good = (
+            "# @tests: app/m.py\n"
+            "class TestWidget:\n"
+            "    def test_go(self):\n"
+            "        assert Widget().go() == 1\n"
+            "    def test_type(self):\n"
+            "        assert isinstance(Widget(), Widget)\n"
+        )
+        patch = f"<<<REWRITE_FILE>>>\nfile: {rel}\ncontent:\n{good}<<<END_REWRITE_FILE>>>"
+        monkeypatch.setattr(g, "get_gateway", lambda: _FakeGateway(patch))
+        out = await regeneration_node(_state(ws, rel))
+        assert out["node_state"]["test_regeneration"]["status"] == "regenerated"
+        assert out["node_state"]["test_regeneration"]["code_module"] == "app/m.py"
+        # unsatisfiable flag cleared (not re-emitted)
+        assert "unsatisfiable_test" not in out["node_state"]
+        assert out["loop_counter"]["test_regen_attempts"][rel] == 1
 
 
 @pytest.mark.asyncio

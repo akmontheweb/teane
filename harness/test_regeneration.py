@@ -2,20 +2,28 @@
 
 When the repair loop declares a test ``UNSATISFIABLE_TEST`` and the autonomy
 ladder (``route_after_unsatisfiable``) elects regeneration over HITL, this
-node rewrites the *one* defective test file **from the spec** — the
+node rewrites the *one* defective test file as a comprehensive unit suite for
+the code module it maps to (1:1), **anchored on that module's contract** — the
 test-author phase, not the code-fixer — then hands control back to
 ``compiler_node`` to re-verify.
 
+Source of truth (teane's model: unit tests link to CODE, never to stories/ACs):
+  1. the code module under test (found via the ``# @tests: <source>`` marker) —
+     its signatures / docstrings / validators define intended behaviour;
+  2. the sibling passing tests in the file;
+  3. the SRS as a *tiebreaker only* for genuinely ambiguous intent — never
+     cited in the test.
+
 Safety (why this is not a reward-hack backdoor):
-  * Authority is the SPEC, never "make the build green". The prompt asks for
-    a faithful encoding of the acceptance criteria; the regenerated test is
-    then run. If it now fails because the *production* code is wrong, that
+  * Authority is the code CONTRACT, never "make the build green". If the
+    corrected assertion then fails because the *production* code is wrong, that
     failure flows back to the repair loop (a real fix), not another rewrite.
   * The regeneration may only touch the declared test path — blocks targeting
-    any other file are rejected before applying.
-  * A mechanical **coverage-non-regression** gate rejects a rewrite that
-    guts assertions to pass, and a **spec-citation** gate rejects one that
-    doesn't name the requirement it aligned to.
+    any other file are rejected.
+  * A mechanical **coverage-non-regression** gate rejects a rewrite that guts
+    assertions to pass, and a **code-linkage** gate rejects one that drops its
+    ``# @tests:`` marker. A public-symbol coverage advisory drives toward an
+    exhaustive per-module suite.
 
 The node clears ``node_state["unsatisfiable_test"]`` by simply not re-emitting
 it (LangGraph replaces ``node_state`` wholesale), and records the attempt in
@@ -39,18 +47,13 @@ __all__ = [
     "count_test_functions",
     "count_assertion_sites",
     "coverage_nonregression_ok",
-    "has_spec_citation",
+    "has_code_linkage",
+    "public_symbols",
+    "symbol_coverage",
     "patch_target_paths",
 ]
 
 _REGEN_ATTEMPTS_KEY = "test_regen_attempts"
-
-# A spec/requirement reference the regeneration must cite — story/feature/AC
-# ids from the RSD model, or an explicit acceptance-criteria mention.
-_SPEC_ID_RE = re.compile(
-    r"\b(?:EPIC|FEAT|STORY|FR|NFR|AC)[-_ ]?\d+|acceptance\s+criteri|requirement|\bspec\b",
-    re.IGNORECASE,
-)
 
 # `file:` line inside a patch DSL block (CREATE_FILE / REWRITE_FILE /
 # REPLACE_BLOCK). Used to confirm the regeneration only touches the declared
@@ -132,10 +135,44 @@ def coverage_nonregression_ok(
     return True, f"functions {of}->{nf}, assertions {oa}->{na}"
 
 
-def has_spec_citation(text: str) -> bool:
-    """True if ``text`` references a requirement/story/AC — the regeneration
-    must justify its interpretation against the spec, not the build result."""
-    return bool(_SPEC_ID_RE.search(text or ""))
+def has_code_linkage(test_source: str) -> bool:
+    """True if the regenerated test carries a ``# @tests: <source>`` marker.
+
+    Build/patch unit tests link to the CODE under test, never to stories/ACs
+    (teane's traceability model). The regeneration must preserve that 1:1
+    code linkage — it is the anchor, not an SRS citation.
+    """
+    from harness.test_generation import _parse_tests_marker
+    return bool(_parse_tests_marker(test_source))
+
+
+def public_symbols(source: str) -> list[str]:
+    """Public top-level functions/classes defined in a code module — the
+    surface a comprehensive unit suite should exercise (empty on parse error)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    out: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and not node.name.startswith("_"):
+            out.append(node.name)
+    return out
+
+
+def symbol_coverage(
+    test_source: str, symbols: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split ``symbols`` into (referenced, unreferenced) by the test source —
+    a coarse completeness signal toward exhaustive per-module coverage."""
+    covered, uncovered = [], []
+    for sym in symbols:
+        if re.search(rf"\b{re.escape(sym)}\b", test_source or ""):
+            covered.append(sym)
+        else:
+            uncovered.append(sym)
+    return covered, uncovered
 
 
 def patch_target_paths(patch_text: str) -> set[str]:
@@ -153,52 +190,75 @@ def _norm(path: str, workspace: str) -> str:
 # ---------------------------------------------------------------------------
 
 _REGEN_SYSTEM = (
-    "You are the TEST AUTHOR repairing ONE defective generated test file. The "
-    "repair loop proved this test is unsatisfiable — no production change can "
-    "make it pass as written. Your job is NOT to make a build green; it is to "
-    "rewrite the test so it faithfully encodes the SPECIFICATION's intended "
-    "behaviour.\n\n"
+    "You are the TEST AUTHOR rewriting ONE defective unit-test file. The repair "
+    "loop proved it unsatisfiable — no production change can make it pass as "
+    "written. Your job is NOT to make a build green; it is to regenerate a "
+    "correct, COMPREHENSIVE unit-test suite for the ONE code module this file "
+    "maps to (1:1), anchored on that module's CONTRACT.\n\n"
+    "SOURCE OF TRUTH (in order):\n"
+    "  1. The CODE UNDER TEST below — its signatures, docstrings, validators "
+    "and type hints define the intended behaviour. This is a UNIT test: anchor "
+    "on the code, NOT on requirements documents.\n"
+    "  2. The sibling passing tests in the file — they show the established "
+    "contract to preserve.\n"
+    "  3. The specification is a TIEBREAKER only, used to reason about intent "
+    "when the code contract is genuinely ambiguous. Never CITE a story/FR/AC "
+    "id in the test — unit tests link to code, not to acceptance criteria.\n\n"
     "RULES:\n"
     "1. Emit exactly one <<<REWRITE_FILE>>> block for the named test file and "
     "nothing else. Touch no other file.\n"
-    "2. Anchor every assertion to the spec. Cite the governing requirement / "
-    "story / acceptance-criterion id (e.g. STORY-002, FR-014) in a comment.\n"
-    "3. Do NOT weaken coverage to pass: keep the test functions and their "
-    "assertions; only correct the ones that contradict the spec. Removing all "
-    "assertions or deleting tests is forbidden.\n"
-    "4. Resolve contradictions by the spec: if two tests demand opposite "
-    "outcomes for the same input, keep the spec-consistent one and correct the "
-    "other to match the spec.\n"
-    "5. Write the test against intended behaviour. If the current production "
-    "code then fails the corrected assertion, that is expected — the repair "
-    "loop will fix the production code."
+    "2. Keep the `# @tests: <source path>` marker at the top — it records the "
+    "1:1 code linkage. Do NOT add @verifies / STORY / AC references.\n"
+    "3. Cover the module comprehensively: exercise every public function and "
+    "class listed below across the meaningful permutations of their inputs "
+    "(valid, boundary, and error cases). Aim for an exhaustive suite, not a "
+    "token test.\n"
+    "4. Do NOT weaken coverage to pass. Removing assertions or deleting tests "
+    "to go green is forbidden.\n"
+    "5. Resolve contradictions by the code contract: if two tests demand "
+    "opposite outcomes for the identical call, keep the one consistent with the "
+    "code's contract and correct the other to match it.\n"
+    "6. If the corrected assertion then fails against the current production "
+    "code, that is EXPECTED — the repair loop will fix the production code."
 )
 
 
 def build_regeneration_messages(
     *,
-    system_spec: str,
     test_rel_path: str,
     test_source: str,
+    code_module_path: str,
+    code_module_source: str,
+    module_symbols: list[str],
     unsat_reason: str,
     failing_output: str,
+    spec_tiebreaker: str = "",
 ) -> list[dict[str, str]]:
-    """Assemble the regeneration prompt. Kept pure for testability."""
-    user = (
-        f"## Defective test file: {test_rel_path}\n\n"
-        f"### Why the repair loop declared it unsatisfiable\n{unsat_reason}\n\n"
-        f"### Failing test output\n{failing_output[:4000]}\n\n"
-        f"### Current test file content\n```\n{test_source}\n```\n\n"
-        "Rewrite this ONE file so it encodes the specification's intended "
-        "behaviour, citing the governing requirement id(s). Emit only the "
-        "<<<REWRITE_FILE>>> block."
+    """Assemble the regeneration prompt, code-contract first. Pure/testable."""
+    symbols = ", ".join(module_symbols) if module_symbols else "(none detected)"
+    parts = [
+        f"## Regenerate the unit tests for module: {code_module_path}\n",
+        f"### Code under test ({code_module_path})\n```\n{code_module_source[:12000]}\n```\n",
+        f"### Public symbols to cover comprehensively\n{symbols}\n",
+        f"### Defective test file: {test_rel_path}\n"
+        f"(keep its `# @tests:` marker; rewrite its body)\n"
+        f"```\n{test_source[:8000]}\n```\n",
+        f"### Why the repair loop declared it unsatisfiable\n{unsat_reason}\n",
+        f"### Failing test output\n{failing_output[:3000]}\n",
+    ]
+    if spec_tiebreaker.strip():
+        parts.append(
+            "### Specification (TIEBREAKER ONLY — do not cite in the test)\n"
+            f"{spec_tiebreaker[:4000]}\n"
+        )
+    parts.append(
+        "Rewrite the ONE test file as a comprehensive unit suite for the module "
+        "above, anchored on its contract. Emit only the <<<REWRITE_FILE>>> block."
     )
-    messages: list[dict[str, str]] = []
-    if system_spec.strip():
-        messages.append({"role": "system", "content": system_spec})
-    messages.append({"role": "system", "content": _REGEN_SYSTEM})
-    messages.append({"role": "user", "content": user})
-    return messages
+    return [
+        {"role": "system", "content": _REGEN_SYSTEM},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +286,9 @@ def _failing_output(state: dict[str, Any], rel: str, workspace: str) -> str:
 
 
 async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
-    """LangGraph node: regenerate one declared-unsatisfiable test from spec,
-    apply gates, write it, and route back to ``compiler_node`` to re-verify."""
+    """LangGraph node: regenerate one declared-unsatisfiable unit-test file as
+    a comprehensive suite for its 1:1-mapped code module, apply gates, write
+    it, and route back to ``compiler_node`` to re-verify."""
     node_state = state.get("node_state", {}) or {}
     rel = str(node_state.get("unsatisfiable_test", "") or "")
     reason = str(node_state.get("unsatisfiable_test_reason", "") or "")
@@ -271,22 +332,45 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         return _give_up("no_gateway", "no LLM gateway configured")
 
     from harness.gateway import NodeRole
+    from harness.test_generation import _parse_tests_marker
 
-    # Anchor the regeneration in the spec: the anchored system prompt
-    # (messages[0]) carries the SRS for spec-driven builds.
-    system_spec = ""
+    # Source of truth is the CODE this test maps to (1:1), located via the
+    # `# @tests: <source>` marker — unit tests anchor on code, not the SRS.
+    code_module_path = ""
+    code_module_source = ""
+    marker_paths = _parse_tests_marker(old_source)
+    if marker_paths:
+        code_module_path = marker_paths[0]
+        code_abs = code_module_path if os.path.isabs(code_module_path) \
+            else os.path.join(workspace, code_module_path)
+        try:
+            with open(code_abs, "r", encoding="utf-8") as fh:
+                code_module_source = fh.read()
+        except OSError as exc:
+            logger.warning(
+                "[test_regeneration_node] @tests source %s unreadable (%s); "
+                "regenerating from the test + failing output only.",
+                code_abs, exc,
+            )
+    module_symbols = public_symbols(code_module_source)
+
+    # SRS is a TIEBREAKER only (anchored system prompt for spec-driven builds).
+    spec_tiebreaker = ""
     for m in state.get("messages", []) or []:
         if isinstance(m, dict) and m.get("role") == "system" and \
                 isinstance(m.get("content"), str):
-            system_spec = m["content"]
+            spec_tiebreaker = m["content"]
             break
 
     messages = build_regeneration_messages(
-        system_spec=system_spec,
         test_rel_path=rel,
         test_source=old_source,
+        code_module_path=code_module_path or "(unknown — no @tests marker)",
+        code_module_source=code_module_source,
+        module_symbols=module_symbols,
         unsat_reason=reason,
         failing_output=_failing_output(state, rel, workspace),
+        spec_tiebreaker=spec_tiebreaker,
     )
 
     budget = float(state.get("budget_remaining_usd", 2.00))
@@ -301,7 +385,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
     content = response.content or ""
 
-    # --- Gate 1: only the declared test path may be touched ---
+    # --- Pre-apply gate: only the declared test path may be touched ---
     targets = {_norm(t, workspace) for t in patch_target_paths(content)}
     stray = {t for t in targets if t != _norm(rel, workspace)}
     if stray:
@@ -310,42 +394,61 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     if not targets:
         return _give_up("no_patch", "regeneration emitted no REWRITE_FILE block")
 
-    # --- Gate 2: spec citation ---
-    if cfg.get("require_spec_reference", True) and not has_spec_citation(content):
-        return _give_up("no_spec_citation",
-                        "regeneration did not cite a requirement/story/AC")
-
-    # --- Gate 3: coverage non-regression (parse the proposed new content) ---
+    # Apply the rewrite (test-author phase — writing tests is permitted). The
+    # allowlist still constrains where writes may land as defence in depth.
     from harness.patcher import process_llm_patch_output
     from harness.graph import _build_patcher_allowlist
-    # Restrict the allowlist to the single declared test file — defence in
-    # depth against a REWRITE that slipped a second block past Gate 1.
     allowed_paths = _build_patcher_allowlist(workspace)
     existing_modified = list(state.get("modified_files", []) or [])
     patch_results, new_modified = await process_llm_patch_output(
         content, workspace, existing_modified, allowed_paths=allowed_paths,
     )
-    if cfg.get("coverage_nonregression", True):
+
+    # Re-read the written file and run the post-apply gates on it. Any gate
+    # failure rolls the file back to the original — a rejected regeneration
+    # must not leave a half-baked test on disk.
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            written = fh.read()
+    except OSError as exc:
+        return _give_up("reread_failed", str(exc))
+
+    def _rollback() -> None:
         try:
-            with open(abs_path, "r", encoding="utf-8") as fh:
-                written = fh.read()
-        except OSError as exc:
-            return _give_up("reread_failed", str(exc))
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(old_source)
+        except OSError:
+            logger.error("[test_regeneration_node] rollback write failed for %s", abs_path)
+
+    # --- Gate: code linkage (@tests marker) — unit tests link to code ---
+    if cfg.get("require_code_linkage", True) and not has_code_linkage(written):
+        _rollback()
+        return _give_up("no_code_linkage",
+                        "regenerated test dropped its `# @tests:` marker")
+
+    # --- Gate: coverage non-regression (anti-reward-hack floor) ---
+    if cfg.get("coverage_nonregression", True):
         ok, detail = coverage_nonregression_ok(old_source, written)
         if not ok:
-            # Roll back to the original — the gate rejected this rewrite.
-            try:
-                with open(abs_path, "w", encoding="utf-8") as fh:
-                    fh.write(old_source)
-            except OSError:
-                logger.error("[test_regeneration_node] rollback write failed for %s", abs_path)
+            _rollback()
             return _give_up("coverage_regression", detail)
+
+    # --- Advisory: comprehensiveness against the module's public surface ---
+    covered, uncovered = symbol_coverage(written, module_symbols)
+    if uncovered:
+        logger.warning(
+            "[test_regeneration_node] Regenerated %s covers %d/%d public "
+            "symbol(s); not exercised: %s.",
+            rel, len(covered), len(module_symbols), ", ".join(uncovered),
+        )
 
     applied = sum(1 for r in patch_results if getattr(r, "success", False))
     logger.warning(
         "[test_regeneration_node] Regenerated %s (attempt %d): %d block(s) "
-        "applied. Routing to compiler to re-verify.",
+        "applied, %d/%d public symbol(s) covered. Routing to compiler to "
+        "re-verify.",
         rel, loop_counter[_REGEN_ATTEMPTS_KEY][rel], applied,
+        len(covered), len(module_symbols),
     )
 
     messages_out = list(state.get("messages", []) or [])
@@ -362,7 +465,10 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             "current_node": "test_regeneration",
             "test_regeneration": {
                 "status": "regenerated", "file": rel,
+                "code_module": code_module_path,
                 "attempt": loop_counter[_REGEN_ATTEMPTS_KEY][rel],
+                "symbols_covered": len(covered),
+                "symbols_total": len(module_symbols),
             },
         },
     }

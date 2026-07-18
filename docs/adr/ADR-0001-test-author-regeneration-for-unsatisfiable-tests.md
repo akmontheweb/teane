@@ -47,8 +47,9 @@ before escalation, and the run ultimately dead-ended at HITL.
 Introduce a **test-author regeneration path** for declared-unsatisfiable tests,
 governed by an explicit **autonomy ladder**: every candidate HITL exit must
 climb the ladder and be shown to have *no autonomous rung left* before it is
-allowed to halt for a human. Regeneration is spec-anchored, runs as the
-test-author phase (not the code-fixer), and is gated by a mechanical
+allowed to halt for a human. Regeneration is code-contract-anchored (unit
+tests link to code, not the SRS), runs as the test-author phase (not the
+code-fixer), and is gated by a mechanical
 anti-weakening check.
 
 ### The autonomy ladder (applied at every `→ human_intervention_node` arrow)
@@ -60,12 +61,16 @@ no higher rung applies.
    model judgment at all? The machine-checkable classes qualify: two tests with
    identical input and opposite expected outcomes; a test that fails to parse; a
    structurally impossible assertion. Resolve deterministically.
-2. **Spec-inference rung.** Consult the *whole* spec corpus — the governing AC,
-   sibling ACs, `SPEC_ARCHITECTURE.md`, the production contract, and other
-   passing tests on the same symbol — to determine intended behavior. (Lumina:
-   the SRS states *"at least one field must be provided → 422"*, so the intended
-   behavior is unambiguous — `ContactUpdate(first_name=None)` must raise. No
-   real ambiguity exists.)
+2. **Contract-inference rung.** For a *unit* test the source of truth is the
+   CODE it maps to (1:1), never the SRS — teane's traceability model links unit
+   tests to code (`@tests`), not to stories/ACs. Consult, in order: the mapped
+   code module's contract (signatures, docstrings, validators, type hints), the
+   sibling passing tests in the file, and only *then* the SRS as a **tiebreaker**
+   for genuinely ambiguous intent. (Lumina: the `contact.py` model already
+   carries a validator that raises *"at least one field must be provided"*, so
+   the code contract alone resolves it — `ContactUpdate(first_name=None)` must
+   raise, making `test_none_fields_allowed` the defective half. The SRS agrees
+   but isn't needed.)
 3. **Spec-consistent-default rung (async provenance, not a blocking prompt).**
    If inference underdetermines intent, pick the most spec-consistent
    interpretation, apply it, and record it as a **reviewable decision**
@@ -88,19 +93,22 @@ can be driven toward zero over time.
 ### Component: `test_regeneration_node`
 
 Distinct from `test_generation_node` (which writes *new* tests for
-just-patched source). This node *repairs one declared-defective test, anchored
-to spec*.
+just-patched source). This node *regenerates one declared-defective UNIT test
+as a comprehensive suite for its 1:1-mapped code module, anchored on the code
+contract*.
 
-- **Inputs:** the defective test file (full content) + failing nodeids/pytest
-  output; the repair LLM's `UNSATISFIABLE_TEST` reason; the governing spec slice
-  (STORY/AC — the disambiguation source); the production code under test
-  (read-only context for *what exists*).
-- **Authority:** the SRS/AC — **never** "make the build green." The regenerated
-  test is written from spec, then run; if it now fails because the *production*
-  code is wrong, that failure correctly flows back to the repair loop
-  (production fix), not to another test rewrite.
-- **Output:** a full `REWRITE_FILE` of that one test file, or an explicit
-  "cannot regenerate — spec insufficient" signal (which advances the ladder).
+- **Inputs (code-first):** the mapped code module — located via the defective
+  test's `# @tests: <source>` marker — as the primary contract (signatures,
+  docstrings, validators, public symbols); the defective test file + its sibling
+  tests; the failing pytest output and the repair LLM's `UNSATISFIABLE_TEST`
+  reason; the SRS **only as a tiebreaker**, never cited in the test.
+- **Authority:** the CODE contract — **never** "make the build green." If the
+  corrected assertion then fails because the *production* code is wrong, that
+  failure correctly flows back to the repair loop (production fix), not to
+  another test rewrite.
+- **Output:** a full `REWRITE_FILE` of that one test file — a comprehensive unit
+  suite over the module's public surface — or a give-up signal that advances the
+  ladder.
 
 ### Anti-reward-hack gate (mechanical, not trust-based)
 
@@ -110,10 +118,13 @@ Before accepting a regenerated test:
    the same behavior. A regen that deletes the contradictory assertions and
    asserts nothing is rejected. *This is the gate that stops "regeneration" from
    becoming "gut the test."*
-2. **Spec citation required** — the regen must name the AC/story slice it aligned
-   to; no citation → advance the ladder (do not accept).
+2. **Code linkage required** — the regen must keep its `# @tests: <source>`
+   marker (unit tests link to code, never to stories/ACs — teane's traceability
+   model); no marker → roll back and advance the ladder. A public-symbol
+   coverage advisory drives toward an exhaustive per-module suite.
 3. **Principled contradiction resolution** — for the machine-checkable pair,
-   keep the spec-consistent test, fix/remove the other, log the driving AC.
+   keep the test consistent with the code contract, fix/remove the other, log
+   the driving symbol.
 
 ### Routing
 
@@ -173,7 +184,7 @@ make-it-pass loop will weaken tests. Rejected outright.
 |-----------|------------|
 | Complexity | Medium (new node, routing helper, gates, config) |
 | Autonomy | High — HITL narrows to irreducible spec conflicts |
-| Safety | High — spec-anchored authority + mechanical anti-weakening gate; different phase from the code-fixer |
+| Safety | High — code-contract-anchored authority + mechanical anti-weakening gate; different phase from the code-fixer |
 | Team familiarity | Medium (reuses test_generation machinery) |
 
 **Pros:** Preserves the safety invariant (regen authority is the spec, not the
@@ -225,24 +236,24 @@ false) so the conservative rollout automates only the provable Tier A cases.
 
 ## Action Items
 
-1. [ ] Add machine-checkable defect **pre-filter** (Tier A): contradictory-pair
-       detector (same input, opposite expectation), unparseable-test detector,
-       impossible-assertion detector.
-2. [ ] Implement `route_after_unsatisfiable` encoding the autonomy ladder;
-       replace the direct `→ human_intervention_node` at
-       `harness/graph.py:19811`.
-3. [ ] Implement `test_regeneration_node` (spec-anchored inputs, `REWRITE_FILE`
-       output, "cannot regenerate" signal) + graph edges to `compiler_node` /
-       `repair_node`.
-4. [ ] Implement the **coverage-non-regression** gate and **spec-citation**
-       requirement.
+1. [x] Machine-checkable defect **pre-filter** (Tier A) — `harness/test_contradiction.py`:
+       contradictory-pair detector (same input, opposite expectation) +
+       unparseable-test detector. (Impossible-assertion detector deferred.)
+2. [x] `route_after_unsatisfiable` encoding the autonomy ladder; replaces the
+       direct `→ human_intervention_node` at the unsatisfiable branch.
+3. [x] `test_regeneration_node` — **code-first** inputs (mapped module via the
+       `@tests` marker + public symbols + sibling tests; SRS tiebreaker only),
+       `REWRITE_FILE` output, give-up signals; graph edges to `compiler_node`
+       (re-verify) / `repair_node` (production fix).
+4. [x] Gates: **coverage-non-regression** + **code-linkage** (`@tests` marker),
+       only-declared-path, and a public-symbol coverage advisory.
 5. [ ] Add rung-3 async-provenance path (annotation + staged rule + dashboard
        flag) so a spec-consistent default never blocks processing.
 6. [ ] Wire rung-4 escalation back to the requirements/spec-discovery phase.
 7. [ ] Make `human_intervention_node` record *which rungs were attempted* and
        *why autonomy was exhausted*; surface a HITL-per-run metric.
-8. [ ] Config block `test_regeneration` (`enabled`, `max_attempts_per_test`,
-       `tier_b_auto=false`, `require_spec_reference=true`,
-       `coverage_nonregression=true`).
-9. [ ] Ship **Tier A only** first (provably safe, covers the lumina case); gate
-       Tier B behind `tier_b_auto` pending telemetry.
+8. [x] Config block `test_regeneration` (`enabled`, `max_attempts_per_test`,
+       `tier_b_auto=false`, `require_code_linkage=true`,
+       `coverage_nonregression=true`) + strict-validation keys.
+9. [x] Shipped **Tier A only** first (provably safe, covers the lumina case);
+       Tier B gated behind `tier_b_auto` pending telemetry.

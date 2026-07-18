@@ -874,7 +874,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
-        "require_spec_reference", "coverage_nonregression",
+        "require_code_linkage", "coverage_nonregression",
     }),
     "fanout": frozenset({
         "max_concurrency",
@@ -1245,7 +1245,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "test_regeneration.enabled": (bool,),
     "test_regeneration.max_attempts_per_test": (int,),
     "test_regeneration.tier_b_auto": (bool,),
-    "test_regeneration.require_spec_reference": (bool,),
+    "test_regeneration.require_code_linkage": (bool,),
     "test_regeneration.coverage_nonregression": (bool,),
     # Coverage gate for generated apps (FR-080). See _KNOWN_NESTED_KEYS.
     "coverage.min_pct": (int,),

@@ -171,6 +171,50 @@ class TestWireShape:
         assert client.last_payload["stream"] is False
 
 
+class TestFixedTemperature:
+    """Kimi K3 / kimi-latest 400 on any temperature but 1; the spec's
+    ``fixed_temperature`` override must win over whatever the caller (e.g.
+    the repair-node escalation, which dispatches at temperature=0.0) asks
+    for. Without this the model returns a non-retryable HTTP 400 and aborts
+    the build.
+    """
+
+    @staticmethod
+    def _client():
+        return _RecordingClient({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    @pytest.mark.asyncio
+    async def test_override_replaces_caller_temperature(self, monkeypatch):
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-x")
+        spec = _spec()
+        object.__setattr__(spec, "fixed_temperature", 1.0)
+        prov = MoonshotProvider(spec)
+        prov._client = self._client()
+        # Repair escalation dispatches with the default temperature=0.0.
+        await prov.chat_completion(
+            [{"role": "user", "content": "hi"}], temperature=0.0,
+        )
+        assert prov._client.last_payload["temperature"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_none_leaves_caller_temperature_untouched(self, monkeypatch):
+        monkeypatch.setenv("MOONSHOT_API_KEY", "sk-x")
+        prov = MoonshotProvider(_spec())  # fixed_temperature defaults to None
+        prov._client = self._client()
+        await prov.chat_completion(
+            [{"role": "user", "content": "hi"}], temperature=0.3,
+        )
+        assert prov._client.last_payload["temperature"] == 0.3
+
+    def test_shipped_catalogue_pins_kimi_to_one(self):
+        # The price catalogue is the source of truth for the constraint.
+        assert get_model_spec("moonshot:kimi-k3").fixed_temperature == 1.0
+        assert get_model_spec("moonshot:kimi-latest").fixed_temperature == 1.0
+
+
 class TestConfigIntegration:
     def test_find_missing_api_keys_gates_on_moonshot_key(self, monkeypatch):
         from harness.cli import find_missing_api_keys

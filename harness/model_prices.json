@@ -207,7 +207,8 @@
     "api_base_url": "https://api.moonshot.ai/v1",
     "supports_thinking": false,
     "supports_cache": true,
-    "supports_tools": true
+    "supports_tools": true,
+    "fixed_temperature": 1.0
   },
   "moonshot:kimi-latest": {
     "provider": "moonshot",
@@ -219,7 +220,8 @@
     "api_base_url": "https://api.moonshot.ai/v1",
     "supports_thinking": false,
     "supports_cache": true,
-    "supports_tools": true
+    "supports_tools": true,
+    "fixed_temperature": 1.0
   },
   "ollama:llama3.2": {
     "provider": "ollama",

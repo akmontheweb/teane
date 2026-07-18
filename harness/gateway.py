@@ -159,6 +159,12 @@ class ModelSpec:
     # Default thinking budget in tokens when the role asks for thinking and
     # the model supports it. Anthropic requires this to be < max_tokens.
     thinking_budget_tokens: int = 8000
+    # Some models reject any sampling temperature but one fixed value and
+    # 400 on everything else (e.g. Moonshot's Kimi K3 / kimi-latest only
+    # accept temperature=1). When set, the OpenAI-compat payload builder
+    # overrides the caller's temperature with this value instead of passing
+    # it through. None (default) means honor the caller's temperature.
+    fixed_temperature: Optional[float] = None
 
 
 # Model registry — populated from model_prices.json at import time, then
@@ -227,6 +233,11 @@ def load_model_prices(prices_path: Optional[str] = None, override: bool = False)
                 supports_tools=bool(spec_dict.get("supports_tools", False)),
                 anthropic_version=spec_dict.get("anthropic_version", "2023-06-01"),
                 thinking_budget_tokens=int(spec_dict.get("thinking_budget_tokens", 8000)),
+                fixed_temperature=(
+                    float(spec_dict["fixed_temperature"])
+                    if spec_dict.get("fixed_temperature") is not None
+                    else None
+                ),
             )
             _MODEL_REGISTRY[model_key] = spec
             count += 1
@@ -322,6 +333,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                     "supports_tools": baseline.supports_tools,
                     "anthropic_version": baseline.anthropic_version,
                     "thinking_budget_tokens": baseline.thinking_budget_tokens,
+                    "fixed_temperature": baseline.fixed_temperature,
                 })
             merged.update(spec_dict)  # user config wins over catalogue baseline
 
@@ -340,6 +352,11 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 supports_tools=bool(merged.get("supports_tools", False)),
                 anthropic_version=merged.get("anthropic_version", "2023-06-01"),
                 thinking_budget_tokens=int(merged.get("thinking_budget_tokens", 8000)),
+                fixed_temperature=(
+                    float(merged["fixed_temperature"])
+                    if merged.get("fixed_temperature") is not None
+                    else None
+                ),
             )
             register_model(model_key, spec)
             count += 1
@@ -1136,6 +1153,14 @@ class OpenAIProvider(BaseLLM):
             # See _flatten_tool_turns_for_plain_dispatch — raw typed
             # blocks 400 on strict OpenAI-compat deserializers.
             messages = _flatten_tool_turns_for_plain_dispatch(messages)
+        # Some models (e.g. Moonshot Kimi K3 / kimi-latest) 400 on any
+        # temperature but one fixed value; honor the spec override when set.
+        if self.spec.fixed_temperature is not None and temperature != self.spec.fixed_temperature:
+            logger.debug(
+                "[openai] Overriding temperature %s -> %s for model=%s (fixed_temperature)",
+                temperature, self.spec.fixed_temperature, self.spec.model_id,
+            )
+            temperature = self.spec.fixed_temperature
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,

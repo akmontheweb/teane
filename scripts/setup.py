@@ -52,6 +52,7 @@ DEFAULT_MODELS_BY_PROVIDER: dict[str, str] = {
     "anthropic": "anthropic:claude-sonnet-4-6",
     "openai": "openai:gpt-4o-mini",
     "deepseek": "deepseek:deepseek-v4-flash",
+    "moonshot": "moonshot:kimi-latest",
     "ollama": "ollama:llama3.2",
 }
 
@@ -59,6 +60,7 @@ PROVIDER_ENV_VAR: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
     "ollama": "",   # local — no key needed
 }
 
@@ -711,7 +713,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         _info(f"Using preset provider: {provider}")
     else:
         provider = _prompt(
-            "Provider [anthropic|openai|deepseek|ollama]",
+            "Provider [anthropic|openai|deepseek|moonshot|ollama]",
             default="anthropic",
             interactive=interactive,
         ).lower()

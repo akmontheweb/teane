@@ -197,6 +197,18 @@
     "supports_thinking": true,
     "supports_tools": true
   },
+  "moonshot:kimi-latest": {
+    "provider": "moonshot",
+    "model_id": "kimi-latest",
+    "context_window": 256000,
+    "input_cost_per_1m": 0.60,
+    "output_cost_per_1m": 2.50,
+    "cached_input_cost_per_1m": 0.15,
+    "api_base_url": "https://api.moonshot.ai/v1",
+    "supports_thinking": false,
+    "supports_cache": false,
+    "supports_tools": true
+  },
   "ollama:llama3.2": {
     "provider": "ollama",
     "model_id": "llama3.2",

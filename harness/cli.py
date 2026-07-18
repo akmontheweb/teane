@@ -938,6 +938,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Clamped to [1, 30] in graph._resolve_patching_read_file_cap;
         # default 10.
         "patching_read_file_cap",
+        # Cap on patch-emission rounds (apply → tool_result →
+        # re-dispatch) inside one tool-use patching turn. Clamped to
+        # [1, 30] in graph._resolve_patching_emission_rounds; default
+        # 10. Added after lumina 019f71b0 — see the emission loop in
+        # graph.patching_node's tool-use branch.
+        "patching_emission_rounds",
         # Cap on <<<READ_FILE>>> DSL resolve rounds per repair/patching
         # iteration. Clamped to [1, 20] in
         # graph._resolve_read_file_rounds; default 6. One bonus round is
@@ -1262,6 +1268,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.continue_on_length": (dict,),
     "llm_dispatch.max_continuation_cycles": (int,),
     "llm_dispatch.patching_read_file_cap": (int,),
+    "llm_dispatch.patching_emission_rounds": (int,),
     "llm_dispatch.read_file_rounds": (int,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "web_tools.enabled": (bool,),
@@ -1863,7 +1870,8 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
         if not isinstance(provider, str) or not provider.strip():
             errors.append(
                 f"'models.{model_key}.provider' is missing or empty. Set "
-                f"it to one of: openai, anthropic, deepseek, ollama, …"
+                f"it to one of: openai, anthropic, deepseek, google, "
+                f"moonshot, ollama, …"
             )
 
     missing_env = find_missing_api_keys(config)

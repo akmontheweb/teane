@@ -15,7 +15,7 @@ python3 scripts/setup.py          # or `make setup`
 
 It walks 11 phases interactively: platform / Python 3.14+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `teane doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
 
-Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/teane`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
+Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/teane`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|moonshot|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
 
 Sections §1–§14 below remain the canonical manual reference and the source of truth for what the script does behind the scenes. Read them when you need to debug a failing phase or tune something the wizard skips (multi-provider routing, sandbox image overrides, headless deployment).
 
@@ -282,6 +282,7 @@ Set at least one of these, depending on which providers appear in your `model_ro
 | Anthropic | `ANTHROPIC_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
+| Moonshot (Kimi) | `MOONSHOT_API_KEY` |
 | Ollama (local) | none — no key needed |
 
 Optional: `LANGCHAIN_API_KEY` + `LANGCHAIN_TRACING_V2=true` enable LangSmith tracing.

@@ -3098,6 +3098,38 @@ def _resolve_patching_read_file_cap(state: "AgentState") -> int:
     return max(1, min(30, val))
 
 
+# Cap on patch-emission rounds inside one tool-use patching turn. The
+# read-file cap above bounds *navigation*; this bounds *emission* — the
+# apply → tool_result → re-dispatch continuation added after lumina
+# 019f71b0, where models emitted a handful of patch calls per response
+# (the prompt's own ≤3-files-per-response quality rule mandates that
+# shape) and the single-round node accepted the first slice as the
+# whole story. With ≤3 files per response, 10 rounds comfortably
+# covers a 30-file story; the two-round futility brake in
+# ``patching_node`` stops a model that keeps emitting unlandable
+# patches long before the cap. Operators can override via
+# ``llm_dispatch.patching_emission_rounds`` in config.json (clamped to
+# [1, 30] at read time — see :func:`_resolve_patching_emission_rounds`).
+_PATCHING_EMISSION_ROUNDS_CAP = 10
+
+
+def _resolve_patching_emission_rounds(state: "AgentState") -> int:
+    """Resolve the cap on patch-emission rounds per tool-use patching turn.
+
+    Reads ``state.llm_dispatch_config.patching_emission_rounds`` and
+    clamps to ``[1, 30]``; falls back to
+    :data:`_PATCHING_EMISSION_ROUNDS_CAP` when the config omits it or
+    supplies a non-int / out-of-range value.
+    """
+    cfg = state.get("llm_dispatch_config", {}) or {}
+    raw = cfg.get("patching_emission_rounds", _PATCHING_EMISSION_ROUNDS_CAP)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _PATCHING_EMISSION_ROUNDS_CAP
+    return max(1, min(30, val))
+
+
 # Cap on ``<<<READ_FILE>>>`` DSL resolve rounds inside one repair /
 # patching iteration (distinct from ``patching_read_file_cap``, which
 # bounds the tool-use read_file loop). Each round re-dispatches without
@@ -3253,6 +3285,77 @@ def _build_assistant_tool_turn(response: Any) -> "MessageDict":
             "input": call.get("input") or {},
         })
     return MessageDict(role="assistant", content=blocks)
+
+
+def _build_patch_tool_results(
+    calls: list[dict[str, Any]],
+    call_blocks: list[Any],
+    kept_block_ids: frozenset[int],
+    round_results: list[Any],
+    harness_note: str = "",
+) -> list[dict[str, Any]]:
+    """Per-call ``tool_result`` blocks for one patch-emission round.
+
+    ``call_blocks`` is parallel to ``calls`` (``None`` for calls that
+    did not convert to a :class:`PatchBlock`); ``kept_block_ids`` holds
+    ``id()`` of blocks that survived the phase-1 test filter. Results
+    are matched back to calls by ``(file, operation)`` in emission
+    order — ``apply_patch_blocks`` reorders its result list (rejections
+    first) but normalizes ``block.file`` in place, so the shared block
+    objects agree with the result rows. Every tool_use id gets exactly
+    one tool_result; OpenAI-compatible providers 400 on any gap.
+
+    ``harness_note`` (continuation guidance) is appended to the last
+    result's content rather than emitted as a sibling text block — the
+    gateway normalizers only guarantee pure tool_result user turns.
+    """
+    from collections import deque
+
+    queues: dict[tuple[str, Any], deque] = {}
+    for r in round_results or []:
+        queues.setdefault((r.file, r.operation), deque()).append(r)
+    out: list[dict[str, Any]] = []
+    for call, block in zip(calls, call_blocks):
+        if block is None:
+            content = (
+                "Ignored — not a patch operation. Emit patch tool calls "
+                "(create_file / edit_file / …) or, if the story's "
+                "production code is complete, reply with no tool calls."
+            )
+        elif id(block) not in kept_block_ids:
+            content = (
+                "REJECTED — test-artifact path. Test files are written "
+                "by the dedicated test-generation phase; emit production "
+                "code only this turn."
+            )
+        else:
+            queue = queues.get((block.file, block.operation))
+            result = queue.popleft() if queue else None
+            op_name = getattr(
+                getattr(block, "operation", None), "value", "patch",
+            )
+            if result is None:
+                content = (
+                    "Result unavailable — see the [System] status "
+                    "message this turn."
+                )
+            elif result.success and getattr(result, "no_op", False):
+                content = f"No-op — `{result.file}` already at target state."
+            elif result.success:
+                content = (
+                    f"Applied — {op_name} `{result.file}` "
+                    f"({result.lines_changed} line(s) changed)."
+                )
+            else:
+                content = f"REJECTED — {result.error or 'patch failed.'}"
+        out.append({
+            "type": "tool_result",
+            "tool_use_id": call.get("id") or "",
+            "content": content,
+        })
+    if out and harness_note:
+        out[-1]["content"] += "\n\n" + harness_note
+    return out
 
 
 def _resolve_read_file_call(
@@ -4315,8 +4418,6 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "content": _TOOL_USE_REMINDER if use_tools else _FORMAT_REMINDER,
         })
 
-        from harness.tool_schemas import PATCH_TOOLS, tool_calls_to_patch_blocks
-
         response, new_budget, messages, tool_files_seen = await _patching_tool_loop(
             gateway=gateway,
             messages=messages,
@@ -4410,35 +4511,150 @@ Generate your patches NOW. Only the blocks above. No other text."""
             # The read_file calls have already been resolved inside
             # _patching_tool_loop — any tool_calls returned here are
             # patch operations only.
-            blocks, _reads = tool_calls_to_patch_blocks(_resp_tool_calls)
-            # Phase 1 filter: drop any blocks targeting test paths even
-            # in tool-use mode. The LLM gets the same "production only"
-            # instruction; this is a belt-and-suspenders guard against
-            # an over-eager call.
-            kept_blocks, dropped_test_files = (
-                _filter_test_patch_blocks(blocks)
+            #
+            # Emission continuation (lumina 019f71b0): one apply round
+            # is NOT the whole story. Models emit a few patch calls per
+            # response and stop with finish_reason="tool_calls",
+            # expecting to be re-invoked with the results — the
+            # prompt's ≤3-files-per-response quality rule mandates that
+            # shape for any story bigger than three files. The
+            # single-round code accepted the first response's calls as
+            # the complete story: three lumina stories "succeeded" on
+            # peripheral scaffolding (__init__.py chains,
+            # requirements.txt) while their actual scope files never
+            # reached disk. Now each round's calls are applied, every
+            # tool_use id is answered with its per-patch outcome, and
+            # the model is re-dispatched until it stops emitting patch
+            # calls — bounded by llm_dispatch.patching_emission_rounds
+            # and a two-round futility brake (no real successes) so a
+            # stuck model cannot burn budget re-emitting rejects.
+            from harness.patcher import sha256_file_bytes as _sha256_file
+            from harness.tool_schemas import (
+                tool_call_to_patch_block as _to_patch_block,
             )
-            if dropped_test_files:
-                logger.info(
-                    "[patching_node:phase1] Dropped %d test-targeting "
-                    "tool_call(s): %s",
-                    len(dropped_test_files),
-                    ", ".join(dropped_test_files[:10]),
+            _emission_cap = _resolve_patching_emission_rounds(state)
+            _enforce_rbe = bool(
+                getattr(gateway.config, "enforce_read_before_edit", True),
+            )
+            patch_results = []
+            dropped_test_blocks = []
+            modified_files = list(existing_modified)
+            # Write-credit map: hashes of files the model itself wrote
+            # this turn. _patching_dispatch re-seeds tool_files_seen
+            # from the loop_counter stash on every dispatch, which
+            # would drop these — they are re-merged after each
+            # re-dispatch so a round-2 edit_file against a round-1
+            # create_file passes B5 instead of bouncing on "you have
+            # not been shown the current bytes".
+            _write_credits: dict[str, str] = {}
+            _emission_round = 0
+            _futile_rounds = 0
+            while _resp_tool_calls:
+                _emission_round += 1
+                _call_blocks = [
+                    None if c.get("name") == "read_file"
+                    else _to_patch_block(c)
+                    for c in _resp_tool_calls
+                ]
+                blocks = [b for b in _call_blocks if b is not None]
+                # Phase 1 filter: drop any blocks targeting test paths
+                # even in tool-use mode. The LLM gets the same
+                # "production only" instruction; this is a
+                # belt-and-suspenders guard against an over-eager call.
+                kept_blocks, dropped_test_files = (
+                    _filter_test_patch_blocks(blocks)
                 )
-            patch_results, modified_files = await apply_patch_blocks(
-                kept_blocks,
-                workspace,
-                existing_modified,
-                allowed_paths=allowed_paths,
-                files_seen_by_llm=tool_files_seen,
-                enforce_read_before_edit=bool(
-                    getattr(
-                        gateway.config, "enforce_read_before_edit", True,
+                if dropped_test_files:
+                    logger.info(
+                        "[patching_node:phase1] Dropped %d test-targeting "
+                        "tool_call(s): %s",
+                        len(dropped_test_files),
+                        ", ".join(dropped_test_files[:10]),
                     )
-                ),
-            )
+                    dropped_test_blocks.extend(dropped_test_files)
+                round_results, modified_files = await apply_patch_blocks(
+                    kept_blocks,
+                    workspace,
+                    modified_files,
+                    allowed_paths=allowed_paths,
+                    files_seen_by_llm=tool_files_seen,
+                    enforce_read_before_edit=_enforce_rbe,
+                )
+                patch_results.extend(round_results)
+                for _r in round_results:
+                    if not _r.success:
+                        continue
+                    _h = _sha256_file(os.path.join(workspace, _r.file))
+                    if _h:
+                        _write_credits[_r.file] = _h
+                        tool_files_seen[_r.file] = _h
+                _round_real = sum(
+                    1 for r in round_results
+                    if r.success and not getattr(r, "no_op", False)
+                )
+                _futile_rounds = 0 if _round_real else _futile_rounds + 1
+                if _emission_round >= _emission_cap:
+                    logger.info(
+                        "[patching_node] Emission cap of %d round(s) hit; "
+                        "proceeding with the %d patch result(s) landed so "
+                        "far.",
+                        _emission_cap, len(patch_results),
+                    )
+                    break
+                if _futile_rounds >= 2:
+                    logger.info(
+                        "[patching_node] Two consecutive emission rounds "
+                        "with no real patch successes; stopping "
+                        "continuation and proceeding with %d result(s).",
+                        len(patch_results),
+                    )
+                    break
+                messages.append(_build_assistant_tool_turn(response))
+                messages.append(MessageDict(
+                    role="user",
+                    content=_build_patch_tool_results(
+                        _resp_tool_calls,
+                        _call_blocks,
+                        frozenset(id(b) for b in kept_blocks),
+                        round_results,
+                        harness_note=(
+                            f"[Harness]: emission round {_emission_round}"
+                            f"/{_emission_cap} applied. If this story's "
+                            "production code is not yet complete (scope "
+                            "files missing, modules unimplemented), "
+                            "continue NOW with further patch tool calls. "
+                            "When it is complete, reply with a one-line "
+                            "summary and NO tool calls."
+                        ),
+                    ),
+                ))
+                try:
+                    response, new_budget = await _patching_dispatch(
+                        messages, new_budget,
+                    )
+                except Exception as exc:  # noqa: BLE001 — keep what landed
+                    logger.warning(
+                        "[patching_node] Emission re-dispatch failed at "
+                        "round %d: %s. Proceeding with the %d patch "
+                        "result(s) landed so far.",
+                        _emission_round, exc, len(patch_results),
+                    )
+                    break
+                # _patching_dispatch replaced tool_files_seen with a
+                # fresh seed from state; restore this turn's
+                # write-credits (same bytes the model just wrote, so a
+                # concurrent nav read of the same file yields the same
+                # hash — the merge can never mask real drift).
+                tool_files_seen.update(_write_credits)
+                _resp_tool_calls = getattr(response, "tool_calls", None) or []
+            if _emission_round > 1:
+                logger.info(
+                    "[patching_node] Emission continuation ran %d "
+                    "round(s): %d patch result(s), %d file(s) touched.",
+                    _emission_round, len(patch_results),
+                    max(0, len(modified_files) - len(existing_modified)),
+                )
             filtered_response = response.content or ""
-            dropped_test_blocks = dropped_test_files
         else:
             # Text-DSL path (legacy / fallback when provider didn't
             # support native tools or returned a pure-text response).
@@ -4807,6 +5023,62 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
                 pass
+        # Scope-coverage guard (lumina 019f71b0): three stories in a row
+        # "succeeded" while landing only peripheral scaffolding
+        # (__init__.py chains, requirements.txt, db.py) — not one of
+        # their scope_files ever reached disk, so batch 25 hit
+        # verification with no feature code and the zero-patch
+        # tripwires never fired (every round had ≥1 success). When a
+        # story-mode round lands real patches but NONE of the story's
+        # scope files are covered (on disk, or stem-matched among this
+        # session's modified files), demote the round to zero-patch so
+        # story_loop re-picks the story, and leave a directive naming
+        # the missing files so the next turn implements them first.
+        # Escalation stays bounded by the standard zero-patch rails
+        # (STORY_ZERO_PATCH_CAP auto-advance, global ≥2 HITL).
+        if real_success_count > 0:
+            _scope_missing = _story_scope_files_uncovered(
+                state, workspace, modified_files,
+            )
+            if _scope_missing:
+                logger.warning(
+                    "[patching_node] Scope-coverage guard: %d real "
+                    "success(es) but none of the story's %d scope "
+                    "file(s) are on disk or stem-matched among modified "
+                    "files (%s). Demoting to zero-patch so story_loop "
+                    "re-picks the story with a directive.",
+                    real_success_count, len(_scope_missing),
+                    ", ".join(_scope_missing[:8]),
+                )
+                messages.append(MessageDict(
+                    role="user",
+                    content=(
+                        "[Scope-coverage guard]\n"
+                        "Your patches this round applied, but NONE of "
+                        "this story's scope files landed on disk:\n"
+                        + "\n".join(f"- {p}" for p in _scope_missing)
+                        + "\nThe story cannot be complete while its "
+                        "scope files are missing. On your next turn, "
+                        "implement the missing scope files FIRST — "
+                        "create_file with full production "
+                        "implementations — before any further "
+                        "peripheral files. If a scope path's name is "
+                        "wrong for the locked stack (e.g. `.jsx` when "
+                        "the stack mandates `.tsx`), create the "
+                        "correctly-named equivalent."
+                    ),
+                ))
+                real_success_count = 0
+                success_count = 0
+                try:
+                    from harness.observability import emit_event
+                    emit_event(
+                        "patching_scope_coverage_demoted",
+                        story_id=state.get("current_story_id") or "",
+                        missing_scope_files=list(_scope_missing[:20]),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
         # Compose the LLM feedback and the two state buckets in one place
         # so patching_node and repair_node share the same per-file
         # classification + directive path. Prior to the extraction the two
@@ -7347,6 +7619,48 @@ def _partial_progress_demote(
         return False
     denom = real_success_count + stuck_reread_reject_count
     return (real_success_count / denom) < min_ratio
+
+
+def _story_scope_files_uncovered(
+    state: "AgentState", workspace: str, modified_files: list[str],
+) -> list[str]:
+    """Scope files of the active story with zero coverage this session.
+
+    Coverage for a scope entry means: the exact path exists on disk, OR
+    a file with the same stem (basename minus extension, case-folded)
+    appears in ``modified_files`` — the stem match absorbs legitimate
+    renames like the decomposer hinting ``AddEditForm.jsx`` while the
+    locked stack mandates ``.tsx``.
+
+    Returns the full scope list ONLY when not a single entry is
+    covered; any partial coverage returns ``[]`` (the guard stays
+    silent — remaining gaps are the verification chain's job). The
+    all-absent signature is the lumina 019f71b0 low-emit chain:
+    stories landing peripheral scaffolding round after round while
+    their actual scope never reached disk, each round's ≥1 success
+    keeping the zero-patch tripwires asleep.
+    """
+    if not (state.get("current_story_id") or ""):
+        return []
+    scope_raw = state.get("story_scope_files") or []
+    if not isinstance(scope_raw, list):
+        return []
+    scope = [p for p in scope_raw if isinstance(p, str) and p.strip()]
+    if not scope:
+        return []
+
+    def _stem(path: str) -> str:
+        return os.path.splitext(os.path.basename(path))[0].casefold()
+
+    modified_stems = {
+        _stem(p) for p in modified_files or [] if isinstance(p, str)
+    }
+    for p in scope:
+        if os.path.isfile(os.path.join(workspace, p)):
+            return []
+        if _stem(p) in modified_stems:
+            return []
+    return scope
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional, Union
 
@@ -134,7 +134,7 @@ class LLMResponse:
 @dataclass
 class ModelSpec:
     """Specification for a model including cost rates and context window limits."""
-    provider: str  # "deepseek", "anthropic", "openai", "google", "ollama"
+    provider: str  # "deepseek", "anthropic", "openai", "google", "moonshot", "ollama"
     model_id: str
     context_window: int  # maximum tokens the model accepts
     input_cost_per_1m: float  # cost per 1M input tokens in USD
@@ -1229,6 +1229,46 @@ class GoogleProvider(OpenAIProvider):
         super().__init__(spec, api_key=resolved, ssl_verify=ssl_verify)
 
 
+class MoonshotProvider(OpenAIProvider):
+    """Moonshot AI (Kimi) via its OpenAI-compatible endpoint.
+
+    Piggybacks on :class:`OpenAIProvider` — Moonshot exposes
+    ``/v1/chat/completions`` with the same Bearer-auth wire shape, the
+    same ``usage`` block (``prompt_tokens`` / ``completion_tokens`` /
+    ``prompt_tokens_details.cached_tokens``), OpenAI-shape ``tools`` /
+    ``tool_calls`` for native function calling, and a ``reasoning``
+    field on thinking variants that ``_extract_openai_compat_reasoning``
+    already reads. So chat_completion / extract_usage / compute_cost all
+    inherit unchanged; the only Moonshot-specific piece is the default
+    endpoint.
+
+    Key resolution is BaseLLM's default ``MOONSHOT_API_KEY`` rule
+    (``spec.provider.upper()`` + ``_API_KEY``) — no alias, so the config
+    validator's :func:`~harness.cli.find_missing_api_keys` (which gates
+    on that same computed name) and this client always agree on which
+    env var is required.
+
+    Region: the default host is the international endpoint
+    ``https://api.moonshot.ai/v1``. Point ``api_base_url`` at
+    ``https://api.moonshot.cn/v1`` in the model's config entry for the
+    mainland-China platform. The default here is a fallback for a config
+    entry that omits ``api_base_url``; a bare
+    :class:`OpenAIProvider` mapping would 400 with an empty base URL.
+    """
+
+    _DEFAULT_BASE_URL = "https://api.moonshot.ai/v1"
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        api_key: Optional[str] = None,
+        ssl_verify: Union[bool, str] = True,
+    ):
+        if not (spec.api_base_url or "").strip():
+            spec = replace(spec, api_base_url=self._DEFAULT_BASE_URL)
+        super().__init__(spec, api_key=api_key, ssl_verify=ssl_verify)
+
+
 class OllamaProvider(BaseLLM):
     """Ollama local inference server using OpenAI-compatible /v1/chat/completions endpoint."""
 
@@ -1313,6 +1353,7 @@ _provider_classes: dict[str, type[BaseLLM]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "google": GoogleProvider,
+    "moonshot": MoonshotProvider,
     "ollama": OllamaProvider,
 }
 

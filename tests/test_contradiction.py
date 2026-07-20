@@ -9,9 +9,44 @@ these tests pin the conservative boundaries as hard as the positive cases.
 from harness.test_contradiction import (
     Contradiction,
     find_contradictions,
+    find_contradictions_across,
     machine_unsatisfiable_reason,
     unparseable_reason,
 )
+
+
+# The lumina 019f803f deadlock: a same-input / opposite-expectation pair
+# split across two files, so NEITHER file is self-contradictory.
+_SCHEMAS_FILE = '''
+import pytest
+from pydantic import ValidationError
+from server.app.schemas.contact import ContactUpdate
+
+
+class TestContactUpdate:
+    def test_empty_first_name_explicitly_sent_is_rejected(self):
+        with pytest.raises(ValidationError, match="First name is required"):
+            ContactUpdate(first_name="   ")
+
+    def test_partial_update_valid(self):
+        data = ContactUpdate(first_name=" New ")
+        assert data.first_name == "New"
+'''
+
+_SERVICE_FILE = '''
+import pytest
+from fastapi import HTTPException
+from server.app.schemas.contact import ContactUpdate
+from server.app.services.contact_service import update_contact
+
+
+class TestUpdateContact:
+    def test_update_with_empty_first_name_raises_422(self, db_session):
+        update_payload = ContactUpdate(first_name="   ")
+        with pytest.raises(HTTPException) as exc_info:
+            update_contact(db_session, 1, update_payload)
+        assert exc_info.value.status_code == 422
+'''
 
 
 LUMINA_PATTERN = '''
@@ -173,3 +208,102 @@ class TestClassifierGate:
             "    pytest.raises(E, Foo(1))\n"
         )
         assert isinstance(find_contradictions(src2), list)
+
+
+class TestCrossFileDetection:
+    """find_contradictions_across — the lumina 019f803f generalisation:
+    a contradiction split across two test files that the single-file
+    detector cannot see."""
+
+    def test_lumina_cross_file_pair_flagged(self):
+        # Each file alone is clean...
+        assert find_contradictions(_SCHEMAS_FILE) == []
+        assert find_contradictions(_SERVICE_FILE) == []
+        # ...but together they are unsatisfiable.
+        out = find_contradictions_across({
+            "server/tests/test_contact_schemas.py": _SCHEMAS_FILE,
+            "server/tests/test_contact_service.py": _SERVICE_FILE,
+        })
+        assert len(out) == 1
+        c = out[0]
+        assert c.call == "ContactUpdate(first_name='   ')"
+        assert c.expect_raise_file.endswith("test_contact_schemas.py")
+        assert c.expect_success_file.endswith("test_contact_service.py")
+        # describe() surfaces both files so the re-prompt can name them.
+        d = c.describe()
+        assert "test_contact_schemas.py" in d and "test_contact_service.py" in d
+
+    def test_no_contradiction_across_consistent_files(self):
+        # Both files agree the value is rejected at construction.
+        other = (
+            "import pytest\n"
+            "from server.app.schemas.contact import ContactUpdate\n"
+            "def test_also_rejects():\n"
+            "    with pytest.raises(Exception):\n"
+            "        ContactUpdate(first_name='   ')\n"
+        )
+        assert find_contradictions_across({
+            "a.py": _SCHEMAS_FILE, "b.py": other,
+        }) == []
+
+    def test_different_inputs_not_flagged(self):
+        # X('a') raising and X('b') succeeding is legitimate — different
+        # inputs, a production change could distinguish them.
+        raise_f = (
+            "import pytest\n"
+            "def test_bad():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        Widget('a')\n"
+        )
+        ok_f = (
+            "def test_good():\n"
+            "    w = Widget('b')\n"
+        )
+        assert find_contradictions_across({"r.py": raise_f, "o.py": ok_f}) == []
+
+    def test_prefers_cross_file_pair_in_report(self):
+        # When a signature is contradicted both within one file and across
+        # files, the reported pair is the cross-file one (the added signal).
+        raise_only = (
+            "import pytest\n"
+            "def test_r():\n"
+            "    with pytest.raises(E):\n"
+            "        Foo(1)\n"
+        )
+        success_only = (
+            "def test_s():\n"
+            "    x = Foo(1)\n"
+        )
+        out = find_contradictions_across({
+            "raise.py": raise_only, "ok.py": success_only,
+        })
+        assert len(out) == 1
+        assert out[0].expect_raise_file == "raise.py"
+        assert out[0].expect_success_file == "ok.py"
+
+    def test_unparseable_file_skipped_not_raised(self):
+        # A syntactically broken file in the batch is skipped, not fatal;
+        # the other file's clean state stands.
+        broken = "def test_x(:\n  pass\n"
+        assert find_contradictions_across({
+            "broken.py": broken, "ok.py": _SCHEMAS_FILE,
+        }) == []
+
+    def test_intra_file_still_covered(self):
+        # A single-file contradiction passed through the batch API is still
+        # reported (superset of the single-file detector).
+        out = find_contradictions_across({"m.py": LUMINA_PATTERN})
+        assert len(out) == 1
+        assert out[0].call == "ContactUpdate(first_name=None)"
+
+    def test_same_test_fn_not_flagged(self):
+        # raise+success of the same call inside ONE test fn is not a spec
+        # contradiction (mirrors the single-file cross-fn requirement).
+        one = (
+            "import pytest\n"
+            "def test_both(self):\n"
+            "    x = Foo(1)\n"
+            "    with pytest.raises(E):\n"
+            "        Foo(1)\n"
+        )
+        assert find_contradictions_across({"one.py": one}) == []

@@ -40,10 +40,23 @@ import os
 import re
 from typing import Any, Optional, cast, TYPE_CHECKING
 
+from harness.test_contradiction import find_contradictions_across
+
 if TYPE_CHECKING:
     from harness.graph import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+def _read_text(abs_path: str) -> Optional[str]:
+    """Read a file as UTF-8 (errors replaced), or None if unreadable.
+    Used by the cross-file contradiction gate to re-read just-generated
+    test files off disk."""
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1648,24 @@ _TESTS_MARKER_RULE = """  5. EVERY generated test file MUST carry a `@tests` mar
      (STORY-N / AC-N / @verifies) anywhere in a test file; requirement-
      level functional coverage is generated separately by `teane test`."""
 
+_CONTRADICTION_RULES = """  6. ONE enforcement layer per validation rule. When an input is
+     rejected at CONSTRUCTION (a Pydantic/schema/model validator raises on
+     a bad value), assert that rejection AT THE SCHEMA — e.g.
+     `with pytest.raises(ValidationError): ContactUpdate(first_name="   ")`.
+     Do NOT also write a separate test that CONSTRUCTS the same bad value
+     to feed a downstream layer (service/handler): that object can never be
+     built, so the downstream test is unsatisfiable. If production enforces
+     the same rule redundantly downstream (defence-in-depth), that check is
+     unreachable for invalid input — do not unit-test it by constructing
+     invalid input. Pick the layer that OWNS the rejection and test it once.
+  7. CONSTRUCTIBILITY before use. Before writing `X(value)` and passing the
+     result to another call, check X's definition in the source files
+     above. If X's validators reject `value` at construction, any assertion
+     AFTER `X(value)` is impossible — assert the rejection ON `X(value)`
+     itself instead. Across the whole batch you are emitting, never let one
+     test require `X(v)` to RAISE while another requires the same `X(v)` to
+     SUCCEED — that pair is self-contradictory and no code can satisfy both."""
+
 _REMINDER_TAIL = "\n\nGenerate test patches NOW. Only the blocks above. No other text."
 
 
@@ -1648,7 +1679,10 @@ def _build_format_reminder(agile: bool = True) -> str:
     changes the output. The parameter is kept for caller compatibility.
     """
     del agile  # retained for signature compatibility; no longer used
-    return f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_TESTS_MARKER_RULE}{_REMINDER_TAIL}"
+    return (
+        f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_TESTS_MARKER_RULE}\n"
+        f"{_CONTRADICTION_RULES}{_REMINDER_TAIL}"
+    )
 
 
 # Backward-compat alias for any out-of-tree caller / test that imports
@@ -2386,6 +2420,108 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             }
         # All markers autofixed — fall through to the deterministic
         # test run without spending an iteration.
+
+    # --- Cross-file contradiction gate (generation-side prevention) ---
+    # Lumina 019f803f: the test-author emitted a same-input / opposite-
+    # expectation pair split across two files — ContactUpdate(first_name="  ")
+    # required to RAISE in test_contact_schemas.py and to SUCCEED in
+    # test_contact_service.py. No production change satisfies both; the
+    # repair loop is forbidden from editing tests, so it oscillated ~2.5h
+    # and dead-ended. Catch it deterministically HERE, before the build,
+    # and bounce it back to the AUTHOR (a re-prompt naming the exact pair) —
+    # NOT to repair. Prevention upstream of ADR-0001's repair-side
+    # regeneration. Bounded by ``max_contradiction_reprompts`` so a model
+    # that can't reconcile still exits to the normal build path.
+    contra_cap = int(cfg.get("max_contradiction_reprompts", 2))
+    contra_reprompts = 0
+    while contra_cap > 0 and generated_tests:
+        _py_tests = {
+            rel: _read_text(os.path.join(workspace_path, rel))
+            for rel in generated_tests
+            if rel.endswith(".py")
+        }
+        _py_tests = {k: v for k, v in _py_tests.items() if v is not None}
+        contradictions = find_contradictions_across(_py_tests)
+        if not contradictions:
+            break
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "test_generation_contradiction_detected",
+                count=len(contradictions),
+                reprompt=contra_reprompts + 1,
+                files=sorted({
+                    f for c in contradictions
+                    for f in (c.expect_raise_file, c.expect_success_file) if f
+                }),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        if contra_reprompts >= contra_cap:
+            logger.warning(
+                "[test_generation_node] Cross-file contradiction persists "
+                "after %d re-prompt(s); proceeding to the build (repair / "
+                "ADR-0001 regeneration will handle the residue). Pairs: %s",
+                contra_cap,
+                "; ".join(c.describe() for c in contradictions[:3]),
+            )
+            break
+        contra_reprompts += 1
+        _pairs = "\n".join(f"- {c.describe()}" for c in contradictions)
+        logger.warning(
+            "[test_generation_node] Detected %d cross-file test "
+            "contradiction(s); bouncing back to the author (re-prompt "
+            "%d/%d).\n%s",
+            len(contradictions), contra_reprompts, contra_cap, _pairs,
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "STOP — the tests you just generated are mutually "
+                "UNSATISFIABLE. The following call(s) are required to both "
+                "raise and succeed on identical input, across different "
+                "test files:\n" + _pairs + "\n\n"
+                "No production code can satisfy both, and the repair loop "
+                "may NOT edit test files to break the tie. Reconcile by "
+                "deciding which single layer OWNS the rejection (see RULE 6 "
+                "/ RULE 7): if the value is rejected at CONSTRUCTION, keep "
+                "the schema-level `pytest.raises(...)` assertion and REMOVE "
+                "the downstream test that constructs the same invalid value; "
+                "if the value is meant to construct and be rejected "
+                "downstream, loosen the schema test instead. Re-emit ONLY "
+                "the corrected test file(s) as REWRITE_FILE blocks, keeping "
+                "each file's `@tests` marker. Only patch blocks, no prose."
+            ),
+        })
+        try:
+            response, new_budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=budget,
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                "[test_generation_node] Gateway refused during "
+                "contradiction re-prompt: %s — proceeding to build.", exc,
+            )
+            break
+        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        budget = new_budget
+        messages.append({"role": "assistant", "content": response.content})
+        _re_results, new_modified = await process_llm_patch_output(
+            response.content,
+            workspace_path,
+            existing_modified,
+            allowed_paths=allowed_paths,
+        )
+        # Recompute the generated-test set from the accumulated modified
+        # list (a REWRITE_FILE of an existing generated test keeps it in
+        # the set; a brand-new corrected file joins it).
+        generated_tests = [
+            rel for rel in new_modified
+            if rel not in existing_modified
+            and _inside_workspace(rel, workspace_path)
+        ]
 
     # --- Skip deterministic run when no tests landed ---
     if not generated_tests:

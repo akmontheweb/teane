@@ -32,12 +32,14 @@ unit-testable in isolation.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
 __all__ = [
     "Contradiction",
     "find_contradictions",
+    "find_contradictions_across",
     "unparseable_reason",
     "machine_unsatisfiable_reason",
 ]
@@ -94,20 +96,38 @@ def _normalize_call(node: ast.Call) -> Optional[str]:
 
 @dataclass(frozen=True)
 class Contradiction:
-    """One proven same-input / opposite-expectation contradiction."""
+    """One proven same-input / opposite-expectation contradiction.
+
+    ``expect_raise_file`` / ``expect_success_file`` are populated by the
+    cross-file detector (:func:`find_contradictions_across`) and name the
+    file each side lives in; the single-file :func:`find_contradictions`
+    leaves them blank (both sides share ``filename``).
+    """
     call: str                 # normalized call expression, e.g. "ContactUpdate(first_name=None)"
     expect_raise_test: str    # test function asserting it raises
     expect_success_test: str  # test function asserting it succeeds
     filename: str = ""
+    expect_raise_file: str = ""
+    expect_success_file: str = ""
 
     def describe(self) -> str:
         loc = f"{self.filename}: " if self.filename else ""
-        return (
+        base = (
             f"{loc}`{self.call}` is required to RAISE by "
             f"`{self.expect_raise_test}` and to SUCCEED by "
             f"`{self.expect_success_test}` — identical input, opposite "
             f"expected outcomes, so no production change can satisfy both."
         )
+        if (
+            self.expect_raise_file
+            and self.expect_success_file
+            and self.expect_raise_file != self.expect_success_file
+        ):
+            base += (
+                f" (RAISE asserted in {self.expect_raise_file}, "
+                f"SUCCEED in {self.expect_success_file}.)"
+            )
+        return base
 
 
 class _TestFnScanner(ast.NodeVisitor):
@@ -207,16 +227,17 @@ class _TestFnScanner(ast.NodeVisitor):
         return _is_raises_call(node) and len(node.args) >= 2
 
 
-def find_contradictions(
-    source: str, *, filename: str = "",
-) -> list[Contradiction]:
-    """Return proven same-input / opposite-expectation contradictions in
-    ``source``. Empty on parse failure (see :func:`unparseable_reason`)."""
+def _scan_by_fn(
+    source: str,
+) -> Optional[dict[str, dict[str, set[str]]]]:
+    """Parse ``source`` and return the per-test-function raise/success
+    signature sets (``_TestFnScanner.by_fn``), or None if it doesn't parse.
+    Shared by the single-file and cross-file detectors so both classify
+    identically."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return []
-
+        return None
     scanner = _TestFnScanner()
     for node in tree.body:
         scanner.visit(node)
@@ -225,11 +246,22 @@ def find_contradictions(
         if isinstance(node, ast.ClassDef):
             for child in node.body:
                 scanner.visit(child)
+    return scanner.by_fn
+
+
+def find_contradictions(
+    source: str, *, filename: str = "",
+) -> list[Contradiction]:
+    """Return proven same-input / opposite-expectation contradictions in
+    ``source``. Empty on parse failure (see :func:`unparseable_reason`)."""
+    by_fn = _scan_by_fn(source)
+    if by_fn is None:
+        return []
 
     # Aggregate per-signature the set of tests that expect raise vs success.
     raise_tests: dict[str, list[str]] = {}
     success_tests: dict[str, list[str]] = {}
-    for fn, kinds in scanner.by_fn.items():
+    for fn, kinds in by_fn.items():
         for sig in kinds["raise"]:
             raise_tests.setdefault(sig, []).append(fn)
         for sig in kinds["success"]:
@@ -250,6 +282,66 @@ def find_contradictions(
         out.append(Contradiction(
             call=sig, expect_raise_test=r, expect_success_test=s,
             filename=filename,
+        ))
+    return out
+
+
+def find_contradictions_across(
+    files: Mapping[str, str],
+) -> list[Contradiction]:
+    """Proven same-input / opposite-expectation contradictions across a
+    *batch* of test files. ``files`` maps a display path to its source.
+
+    This is the generalisation of :func:`find_contradictions` to the
+    multi-file test batch a single ``test_generation_node`` call emits.
+    The lumina ``019f803f`` deadlock is exactly this shape and invisible to
+    the single-file detector: ``ContactUpdate(first_name='   ')`` is required
+    to RAISE by a test in ``test_contact_schemas.py`` (schema-layer
+    rejection) and to SUCCEED by a test in ``test_contact_service.py``
+    (which constructs the object to hand to the service) — a real
+    contradiction split across two files, so neither file is self-
+    contradictory.
+
+    A signature required to RAISE in one ``(file, test)`` and to SUCCEED in
+    a *different* ``(file, test)`` is reported. Same conservative bias as the
+    single-file detector: identical normalised call only, distinct locations
+    only. Unparseable files are skipped here (that class is reported
+    separately via :func:`unparseable_reason`)."""
+    # sig -> list of (file, test_fn) locations
+    raise_loc: dict[str, list[tuple[str, str]]] = {}
+    success_loc: dict[str, list[tuple[str, str]]] = {}
+    for fname in sorted(files):
+        by_fn = _scan_by_fn(files[fname])
+        if by_fn is None:
+            continue
+        for fn, kinds in by_fn.items():
+            for sig in kinds["raise"]:
+                raise_loc.setdefault(sig, []).append((fname, fn))
+            for sig in kinds["success"]:
+                success_loc.setdefault(sig, []).append((fname, fn))
+
+    out: list[Contradiction] = []
+    for sig in sorted(set(raise_loc) & set(success_loc)):
+        rl = sorted(raise_loc[sig])
+        sl = sorted(success_loc[sig])
+        # Distinct (file, fn) locations only — the same call both raising and
+        # succeeding inside ONE test fn is an intra-assertion artefact, not a
+        # spec contradiction (mirrors find_contradictions' cross-fn rule).
+        distinct = [(r, s) for r in rl for s in sl if r != s]
+        if not distinct:
+            continue
+        # Prefer a cross-FILE pair for the report — that's the signal this
+        # detector adds over the single-file one; fall back to any distinct
+        # pair (an intra-file contradiction it also legitimately covers).
+        cross = [(r, s) for r, s in distinct if r[0] != s[0]]
+        (rf, rfn), (sf, sfn) = (cross or distinct)[0]
+        out.append(Contradiction(
+            call=sig,
+            expect_raise_test=rfn,
+            expect_success_test=sfn,
+            filename=rf if rf == sf else "",
+            expect_raise_file=rf,
+            expect_success_file=sf,
         ))
     return out
 

@@ -870,7 +870,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "console_level",
     }),
     "test_generation": frozenset({
-        "enabled", "max_iterations",
+        "enabled", "max_iterations", "max_contradiction_reprompts",
     }),
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
@@ -1241,6 +1241,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.backup_count": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
+    "test_generation.max_contradiction_reprompts": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.
     "test_regeneration.enabled": (bool,),
     "test_regeneration.max_attempts_per_test": (int,),

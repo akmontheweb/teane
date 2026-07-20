@@ -11,6 +11,7 @@ import pytest
 from harness.test_generation import (
     _PRIMARY_STACK_PRIORITY,
     _STACK_TEST_COMMANDS,
+    _build_format_reminder,
     _is_test_file,
     _parse_verifies_marker,
     _persist_verifies_links,
@@ -132,6 +133,16 @@ def stub_gateway(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestHelpers:
+
+    def test_format_reminder_carries_contradiction_rules(self):
+        # Rules 6-7 (generation-side contradiction prevention) must be in
+        # the author's prompt so the model reconciles layers up front.
+        reminder = _build_format_reminder()
+        assert "ONE enforcement layer per validation" in reminder
+        assert "CONSTRUCTIBILITY before use" in reminder
+        # And the pre-existing rules are still present (not clobbered).
+        assert "Do NOT generate mocks" in reminder
+        assert "@tests" in reminder
 
     def test_is_test_file_python(self):
         assert _is_test_file("tests/test_foo.py") is True
@@ -516,6 +527,139 @@ class TestHappyPath:
             result["loop_counter"]["test_generation"] == 0
         # Router sends this to human_intervention on llm_behavior.
         assert route_after_test_generation(result) == "human_intervention_node"
+
+
+# ---------------------------------------------------------------------------
+# Cross-file contradiction gate (generation-side prevention, lumina 019f803f)
+# ---------------------------------------------------------------------------
+
+class TestContradictionGate:
+
+    _SRC_SCHEMA = (
+        "from pydantic import BaseModel\n"
+        "class ContactUpdate(BaseModel):\n"
+        "    first_name: str | None = None\n"
+    )
+    _SRC_SERVICE = (
+        "def update_contact(db, cid, payload):\n"
+        "    return payload\n"
+    )
+
+    # Round 1: the author emits a same-input / opposite-expectation pair
+    # split across two files — the schema test requires the ctor to RAISE,
+    # the service test constructs the same value expecting it to SUCCEED.
+    _CONTRADICTING = (
+        "<<<CREATE_FILE>>>\n"
+        "file: server/tests/test_contact_schemas.py\n"
+        "content:\n"
+        "# @tests: server/app/schemas/contact.py\n"
+        "import pytest\n"
+        "from pydantic import ValidationError\n"
+        "from server.app.schemas.contact import ContactUpdate\n"
+        "def test_empty_first_name_rejected():\n"
+        "    with pytest.raises(ValidationError):\n"
+        "        ContactUpdate(first_name='   ')\n"
+        "<<<END_CREATE_FILE>>>\n"
+        "<<<CREATE_FILE>>>\n"
+        "file: server/tests/test_contact_service.py\n"
+        "content:\n"
+        "# @tests: server/app/services/contact_service.py\n"
+        "from server.app.schemas.contact import ContactUpdate\n"
+        "def test_service_path():\n"
+        "    payload = ContactUpdate(first_name='   ')\n"
+        "    assert payload is not None\n"
+        "<<<END_CREATE_FILE>>>\n"
+    )
+
+    # Round 2: the corrected service test no longer constructs the invalid
+    # value, so the batch is consistent.
+    _FIXED = (
+        "<<<REWRITE_FILE>>>\n"
+        "file: server/tests/test_contact_service.py\n"
+        "content:\n"
+        "# @tests: server/app/services/contact_service.py\n"
+        "from server.app.schemas.contact import ContactUpdate\n"
+        "def test_service_path():\n"
+        "    payload = ContactUpdate(first_name='Alice')\n"
+        "    assert payload.first_name == 'Alice'\n"
+        "<<<END_REWRITE_FILE>>>\n"
+    )
+
+    def _workspace(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        for rel, body in (
+            ("server/app/schemas/contact.py", self._SRC_SCHEMA),
+            ("server/app/services/contact_service.py", self._SRC_SERVICE),
+        ):
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+
+    @pytest.mark.asyncio
+    async def test_contradiction_bounces_back_to_author_and_resolves(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        self._workspace(tmp_path)
+        gw = stub_gateway([self._CONTRADICTING, self._FIXED])
+        stub_sandbox(0, "2 passed in 0.01s\n")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": [
+                "server/app/schemas/contact.py",
+                "server/app/services/contact_service.py",
+            ],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+
+        # The author was re-prompted: 1 initial + 1 contradiction bounce.
+        assert len(gw.dispatched) == 2
+        # The re-prompt named the exact unsatisfiable call.
+        bounce = gw.dispatched[1]["messages"]
+        joined = "\n".join(m.get("content", "") for m in bounce)
+        assert "UNSATISFIABLE" in joined
+        assert "ContactUpdate(first_name='   ')" in joined
+        # The corrected batch reached the sandbox and passed.
+        assert "pytest" in _StubSandboxExecutor.last_command
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        # The on-disk service test is the fixed version (no invalid ctor).
+        svc = (tmp_path / "server/tests/test_contact_service.py").read_text()
+        assert "first_name='Alice'" in svc
+        assert "first_name='   '" not in svc
+
+    @pytest.mark.asyncio
+    async def test_no_contradiction_does_not_reprompt(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        # A clean batch dispatches exactly once — the gate is a no-op.
+        self._workspace(tmp_path)
+        clean = (
+            "<<<CREATE_FILE>>>\n"
+            "file: server/tests/test_contact_schemas.py\n"
+            "content:\n"
+            "# @tests: server/app/schemas/contact.py\n"
+            "import pytest\n"
+            "from pydantic import ValidationError\n"
+            "from server.app.schemas.contact import ContactUpdate\n"
+            "def test_empty_first_name_rejected():\n"
+            "    with pytest.raises(ValidationError):\n"
+            "        ContactUpdate(first_name='   ')\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        gw = stub_gateway([clean, "SHOULD NOT BE DISPATCHED"])
+        stub_sandbox(0, "1 passed in 0.01s\n")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["server/app/schemas/contact.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+        assert len(gw.dispatched) == 1
+        assert result["node_state"]["test_generation"]["status"] == "passed"
 
 
 # ---------------------------------------------------------------------------

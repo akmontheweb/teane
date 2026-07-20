@@ -411,6 +411,9 @@ async def test_hitl_node_emits_event_and_stages_note(monkeypatch):
     events = []
     monkeypatch.setattr(
         obs, "emit_event", lambda name, **fields: events.append((name, fields)))
+    incidents = []
+    monkeypatch.setattr(
+        obs, "emit_incident", lambda **fields: incidents.append(fields))
     # Menu loop: pretend the operator (or headless auto-resume cap) abandoned.
     monkeypatch.setattr(cli_mod, "hitl_menu_loop", lambda state: state)
 
@@ -431,6 +434,15 @@ async def test_hitl_node_emits_event_and_stages_note(monkeypatch):
     assert len(fired) == 1
     assert fired[0]["trigger"] == "repair_loop_limit"
     assert fired[0]["total_repairs"] == 7
+
+    # The structured incident record fires alongside, carrying the
+    # normalized cause + cost + test-file signal the analysis groups by.
+    assert len(incidents) == 1
+    inc = incidents[0]
+    assert inc["trigger"] == "repair_loop_limit"
+    assert inc["session_id"] == "sess-42"
+    assert inc["on_test_file"] is False  # only a.py modified, not a test
+    assert inc["modified_files"] == 1
 
     staged = out.get("post_mortem_note", "")
     assert staged.startswith("[learned-rule:repair_loop_limit]")

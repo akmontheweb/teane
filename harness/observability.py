@@ -158,6 +158,197 @@ def emit_event(name: str, **fields: Any) -> None:
     _event_logger.info("", extra={"event": name, **fields})
 
 
+# Process-start reference for incident wall-clock. Captured at import so a
+# build run measures its own elapsed time; a resumed run (fresh process)
+# measures time-since-resume rather than spanning the human pause, which is
+# the number an incident-cost analysis actually wants.
+_PROCESS_START_MONOTONIC = time.monotonic()
+
+
+def process_uptime_s() -> float:
+    """Seconds since this harness process started (monotonic, resume-safe)."""
+    return max(0.0, time.monotonic() - _PROCESS_START_MONOTONIC)
+
+
+# Normalized incident-cause vocabulary. Maps the proximate HITL trigger
+# string (produced by graph._infer_hitl_trigger) to a stable category so a
+# post-hoc "where does the pain go" analysis groups by cause without parsing
+# free-form trigger text — the exact archaeology this telemetry replaces.
+# Ordered most-specific first; the first predicate that matches wins.
+def classify_incident_cause(trigger: str) -> str:
+    """Bucket a HITL/long-loop trigger into a stable cause category.
+
+    Categories (grep targets): ``test_unsatisfiable``, ``test_generation``,
+    ``test_traceability``, ``patching_zero_patch``, ``patching_stuck_target``,
+    ``patching_allowlist``, ``repair_distraction``, ``no_progress``,
+    ``budget_exhausted``, ``spec_decomposition``, ``security``,
+    ``env_infra``, ``build_failure``, ``llm_behavior``, ``other``.
+
+    Note the proximate trigger is not always the root cause — a
+    ``patching_zero_patch`` loop is frequently a *test* problem underneath
+    (repair stuck on a test it may not edit). The incident event carries a
+    separate ``on_test_file`` flag to disambiguate those; this function only
+    classifies the trigger surface.
+    """
+    tl = (trigger or "").strip().lower()
+    if not tl:
+        return "other"
+    if tl.startswith("unsatisfiable_test"):
+        return "test_unsatisfiable"
+    if tl.startswith("llm_behavior:test_generation") or "test_generation" in tl:
+        return "test_generation"
+    if tl.startswith("traceability"):
+        return "test_traceability"
+    if tl.startswith("zero_patch_loop"):
+        return "patching_zero_patch"
+    if tl.startswith("replace_block_stuck"):
+        return "patching_stuck_target"
+    if tl.startswith("all_allowlist_rejected"):
+        return "patching_allowlist"
+    if "distraction" in tl:
+        return "repair_distraction"
+    if tl.startswith("repair_loop") or tl.startswith("repair_limit"):
+        return "repair_limit"
+    if tl.startswith("no_progress"):
+        return "no_progress"
+    if tl.startswith("budget"):
+        return "budget_exhausted"
+    if tl.startswith("decomposition"):
+        return "spec_decomposition"
+    if tl.startswith("security"):
+        return "security"
+    if tl.startswith("env_misconfig") or tl.startswith("build_command"):
+        return "env_infra"
+    if tl.startswith("persistent_build_failure") or tl.startswith("build_failure"):
+        return "build_failure"
+    if tl.startswith("llm_behavior"):
+        return "llm_behavior"
+    return "other"
+
+
+def emit_incident(
+    *,
+    trigger: str,
+    session_id: str = "",
+    usd_spent: Optional[float] = None,
+    wall_clock_s: Optional[float] = None,
+    on_test_file: Optional[bool] = None,
+    rounds: Optional[int] = None,
+    node: str = "",
+    story_id: str = "",
+    modified_files: int = 0,
+    cause: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    """Emit a structured ``incident`` event for a HITL or long-loop stall.
+
+    One record per expensive juncture, carrying the three things the
+    monthly "do we need the LLM for tests" decision needs and that the
+    pre-existing ``hitl_fired`` event lacked: a normalized **cause**, the
+    **$ spent** this run, and the **wall-clock** consumed — plus
+    ``on_test_file`` to separate test-caused stalls from prod-code ones.
+
+    Query::
+
+        jq 'select(.event=="incident")' ~/.harness/logs/<session>.jsonl
+
+    ``usd_spent``/``wall_clock_s`` default to None → the caller didn't
+    supply them; ``wall_clock_s`` falls back to process uptime. Emitted at
+    WARNING so incidents surface above the INFO event stream.
+    """
+    payload: dict[str, Any] = {
+        "cause": cause or classify_incident_cause(trigger),
+        "trigger": trigger,
+        "session_id": session_id,
+        "usd_spent": (
+            round(float(usd_spent), 6) if usd_spent is not None else None
+        ),
+        "wall_clock_s": round(
+            wall_clock_s if wall_clock_s is not None else process_uptime_s(), 1
+        ),
+        "on_test_file": on_test_file,
+        "rounds": rounds,
+        "node": node,
+        "story_id": story_id,
+        "modified_files": modified_files,
+    }
+    payload.update(extra)
+    # Drop None values so the JSON stays lean and queries don't trip on nulls.
+    clean = {k: v for k, v in payload.items() if v is not None}
+    _event_logger.warning("", extra={"event": "incident", **clean})
+
+
+def summarize_incidents(paths: "list[str]") -> dict[str, Any]:
+    """Aggregate ``incident`` events across session logs into the
+    cause × cost distribution the "where does the pain go" decision needs.
+
+    Reads each JSONL path, keeps ``event == "incident"`` records, and
+    buckets by ``cause`` with count, summed ``usd_spent``, summed
+    ``wall_clock_s``, and how many were flagged ``on_test_file``. Also rolls
+    up a ``test_share`` (fraction of incidents whose cause is a test bucket
+    OR which were flagged on a test file) — the single number that answers
+    "are tests the problem". Malformed lines and unreadable files are
+    skipped, not fatal. Pure over its inputs; no globbing or clock reads.
+    """
+    _TEST_CAUSES = {
+        "test_unsatisfiable", "test_generation", "test_traceability",
+    }
+    by_cause: dict[str, dict[str, float]] = {}
+    total = 0
+    test_related = 0
+    total_usd = 0.0
+    total_wall = 0.0
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for ln in lines:
+            if '"incident"' not in ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if rec.get("event") != "incident":
+                continue
+            cause = str(rec.get("cause") or "other")
+            usd = float(rec.get("usd_spent") or 0.0)
+            wall = float(rec.get("wall_clock_s") or 0.0)
+            on_test = bool(rec.get("on_test_file"))
+            b = by_cause.setdefault(
+                cause, {"count": 0, "usd": 0.0, "wall_s": 0.0, "on_test": 0},
+            )
+            b["count"] += 1
+            b["usd"] += usd
+            b["wall_s"] += wall
+            b["on_test"] += int(on_test)
+            total += 1
+            total_usd += usd
+            total_wall += wall
+            if cause in _TEST_CAUSES or on_test:
+                test_related += 1
+    return {
+        "total_incidents": total,
+        "total_usd": round(total_usd, 4),
+        "total_wall_s": round(total_wall, 1),
+        "test_related": test_related,
+        "test_share": round(test_related / total, 3) if total else 0.0,
+        "by_cause": {
+            c: {
+                "count": int(v["count"]),
+                "usd": round(v["usd"], 4),
+                "wall_s": round(v["wall_s"], 1),
+                "on_test": int(v["on_test"]),
+            }
+            for c, v in sorted(
+                by_cause.items(), key=lambda kv: -kv[1]["count"],
+            )
+        },
+    }
+
+
 def log_failure(name: str, **fields: Any) -> None:
     """
     Emit a structured failure event (ERROR level).

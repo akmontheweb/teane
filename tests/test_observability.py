@@ -248,3 +248,147 @@ class TestEmitEvent:
                 handler.flush()
             # Event should be logged regardless of LangSmith availability
             assert path is not None
+
+
+class TestClassifyIncidentCause:
+    """The normalized cause vocabulary the incident analysis groups by.
+    Pins the trigger→cause mapping so a category rename is a deliberate,
+    test-visible change."""
+
+    def test_test_triggers_bucket_as_test(self):
+        from harness.observability import classify_incident_cause as clf
+        assert clf("unsatisfiable_test:server/tests/test_x.py") == "test_unsatisfiable"
+        assert clf("llm_behavior:test_generation_zero_emit") == "test_generation"
+        assert clf("traceability_block") == "test_traceability"
+
+    def test_patching_and_repair_triggers(self):
+        from harness.observability import classify_incident_cause as clf
+        assert clf("zero_patch_loop:2") == "patching_zero_patch"
+        assert clf("replace_block_stuck:app/main.py+1") == "patching_stuck_target"
+        assert clf("all_allowlist_rejected:3") == "patching_allowlist"
+        assert clf("consecutive_distraction:3") == "repair_distraction"
+        assert clf("repair_loop_limit") == "repair_limit"
+
+    def test_infra_and_spec_and_budget(self):
+        from harness.observability import classify_incident_cause as clf
+        assert clf("budget_exhausted") == "budget_exhausted"
+        assert clf("no_progress_failsafe") == "no_progress"
+        assert clf("decomposition_validation_failed") == "spec_decomposition"
+        assert clf("env_misconfig:docker") == "env_infra"
+        assert clf("build_command_blocked:rm") == "env_infra"
+        assert clf("security_fix_limit:2/2") == "security"
+
+    def test_unknown_and_empty_fall_through(self):
+        from harness.observability import classify_incident_cause as clf
+        assert clf("persistent_build_failure") == "build_failure"
+        assert clf("unknown") == "other"
+        assert clf("") == "other"
+
+
+class TestEmitIncident:
+    def _read_incidents(self, path):
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        with open(path) as f:
+            return [
+                json.loads(ln) for ln in f
+                if ln.strip() and '"incident"' in ln
+            ]
+
+    def test_incident_carries_cause_cost_and_test_flag(self):
+        from harness.observability import configure_logging, emit_incident
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(
+                session_id="inc-1", log_dir=log_dir, level="DEBUG",
+            )
+            emit_incident(
+                trigger="zero_patch_loop:2",
+                session_id="inc-1",
+                usd_spent=1.7558,
+                on_test_file=True,
+                rounds=2,
+                story_id="STORY-NFR-005",
+                modified_files=7,
+            )
+            events = self._read_incidents(path)
+        assert len(events) == 1
+        e = events[0]
+        assert e["event"] == "incident"
+        assert e["cause"] == "patching_zero_patch"
+        assert e["trigger"] == "zero_patch_loop:2"
+        assert e["usd_spent"] == 1.7558
+        assert e["on_test_file"] is True
+        assert e["rounds"] == 2
+        assert e["story_id"] == "STORY-NFR-005"
+        # wall_clock_s defaults to process uptime (a non-negative float).
+        assert isinstance(e["wall_clock_s"], (int, float))
+        assert e["wall_clock_s"] >= 0
+
+    def test_none_fields_are_omitted(self):
+        from harness.observability import configure_logging, emit_incident
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(
+                session_id="inc-2", log_dir=log_dir, level="DEBUG",
+            )
+            # No usd/test-flag/rounds supplied.
+            emit_incident(trigger="budget_exhausted", session_id="inc-2")
+            events = self._read_incidents(path)
+        assert len(events) == 1
+        e = events[0]
+        assert e["cause"] == "budget_exhausted"
+        assert "usd_spent" not in e       # None → omitted
+        assert "on_test_file" not in e
+        assert "rounds" not in e
+        # wall_clock_s is always present (falls back to process uptime).
+        assert "wall_clock_s" in e
+
+
+class TestSummarizeIncidents:
+    def _write_log(self, log_dir, sid, incidents):
+        from harness.observability import configure_logging, emit_incident
+        path = configure_logging(session_id=sid, log_dir=log_dir, level="DEBUG")
+        for kw in incidents:
+            emit_incident(**kw)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        return path
+
+    def test_buckets_by_cause_with_cost_and_test_share(self):
+        from harness.observability import summarize_incidents
+        with tempfile.TemporaryDirectory() as d:
+            p1 = self._write_log(d, "s1", [
+                dict(trigger="unsatisfiable_test:t.py", usd_spent=1.5,
+                     wall_clock_s=9000, on_test_file=True),
+                dict(trigger="zero_patch_loop:2", usd_spent=0.5,
+                     wall_clock_s=120, on_test_file=True),   # test-caused repair
+                dict(trigger="budget_exhausted", usd_spent=2.0,
+                     wall_clock_s=300, on_test_file=False),
+            ])
+            summary = summarize_incidents([p1])
+        assert summary["total_incidents"] == 3
+        # 2 of 3 are test-related: the test_unsatisfiable one + the
+        # zero_patch loop flagged on_test_file.
+        assert summary["test_related"] == 2
+        assert summary["test_share"] == round(2 / 3, 3)
+        assert summary["by_cause"]["test_unsatisfiable"]["count"] == 1
+        assert summary["by_cause"]["test_unsatisfiable"]["usd"] == 1.5
+        assert summary["by_cause"]["patching_zero_patch"]["on_test"] == 1
+        assert summary["total_usd"] == 4.0
+
+    def test_skips_malformed_and_missing_files(self):
+        from harness.observability import summarize_incidents
+        with tempfile.TemporaryDirectory() as d:
+            good = self._write_log(d, "ok", [
+                dict(trigger="budget_exhausted", usd_spent=1.0),
+            ])
+            bad = os.path.join(d, "broken.jsonl")
+            with open(bad, "w") as f:
+                f.write('{not json\n"incident" but broken}\n')
+            summary = summarize_incidents(
+                [good, bad, os.path.join(d, "nope.jsonl")],
+            )
+        assert summary["total_incidents"] == 1
+
+    def test_empty_inputs_return_zero_share(self):
+        from harness.observability import summarize_incidents
+        assert summarize_incidents([])["test_share"] == 0.0

@@ -18234,6 +18234,49 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 — telemetry must never break HITL
         pass
 
+    # Structured incident record — the cause/cost/wall-clock triple that
+    # ``hitl_fired`` above lacks, so the "where does the pain go" analysis
+    # runs on measured distribution instead of log archaeology. Adds
+    # ``on_test_file`` to separate test-caused stalls (a repair loop stuck
+    # on a test it may not edit) from prod-code ones — the exact ambiguity
+    # that muddied the manual bucketing.
+    try:
+        from harness.observability import emit_incident as _emit_incident
+        _tt = state.get("token_tracker") or {}
+        _usd = _tt.get("total_cost_usd") if isinstance(_tt, dict) else None
+        # Best-effort test-file signal: the file named in the trigger
+        # (unsatisfiable_test:<f> / replace_block_stuck:<f>), else any
+        # recently-modified file that looks like a test.
+        _on_test: Optional[bool] = None
+        try:
+            from harness.test_generation import _is_test_file as _ist
+            _cands: list[str] = []
+            if ":" in trigger_reason:
+                _tail = trigger_reason.split(":", 1)[1].split("+", 1)[0]
+                if "/" in _tail or _tail.endswith(".py"):
+                    _cands.append(_tail)
+            _cands += list(state.get("modified_files") or [])[-8:]
+            if _cands:
+                _on_test = any(_ist(c) for c in _cands if isinstance(c, str))
+        except Exception:  # noqa: BLE001 — signal is best-effort
+            _on_test = None
+        # Parse a trailing ":N" round count when the trigger carries one.
+        _rounds: Optional[int] = None
+        _m = re.search(r":(\d+)(?:/\d+)?$", trigger_reason)
+        if _m:
+            _rounds = int(_m.group(1))
+        _emit_incident(
+            trigger=trigger_reason,
+            session_id=str(state.get("session_id") or ""),
+            usd_spent=float(_usd) if _usd is not None else None,
+            on_test_file=_on_test,
+            rounds=_rounds,
+            story_id=str(state.get("current_story_id") or ""),
+            modified_files=len(state.get("modified_files") or []),
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break HITL
+        pass
+
     # LLM-judgment kill-switched escalation summary (#1). For loop-stuck
     # triggers — repair limit, persistent failure, or no-progress
     # tripwires — generate a one-paragraph operator briefing that

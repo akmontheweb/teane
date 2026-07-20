@@ -154,8 +154,10 @@ def _route_after_patching_under_test():
       first so it shorts the other branches when budget has been
       bleeding without producing patches).
     - Layer 1 — ``loop_counter['consecutive_zero_patch_rounds'] >= 2``
-      → ``human_intervention_node`` (the monolithic-mode tripwire;
-      story mode never increments this field).
+      → ``human_intervention_node``, but ONLY outside story mode.
+      patching_node bumps this field in story mode too, so without the
+      story-mode suppression Layer 1 (≥2) would preempt Layer 2's cap
+      (3) and make auto-complete unreachable — lumina 019f803f.
     - else, ``current_batch_id`` AND ``current_story_id`` set →
       ``story_loop_node`` (advance to next story or auto-complete via
       Layer 2's per-story counter).
@@ -170,7 +172,10 @@ def _route_after_patching_under_test():
         consecutive_zero = int(
             loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
         )
-        if consecutive_zero >= 2:
+        story_mode = bool(int(state.get("current_batch_id") or 0)) and bool(
+            state.get("current_story_id") or ""
+        )
+        if consecutive_zero >= 2 and not story_mode:
             return "human_intervention_node"
         if int(state.get("current_batch_id") or 0) and (
             state.get("current_story_id") or ""
@@ -252,6 +257,75 @@ def test_patching_does_not_escalate_in_story_mode_via_global_counter():
         "loop_counter": {"consecutive_zero_patch_rounds": 0},
     }
     assert route(state) == "story_loop_node"
+
+
+def test_story_mode_defers_to_per_story_cap_at_global_threshold():
+    """Lumina 019f803f: STORY-NFR-005 was already implemented by an
+    earlier story's round, so the patcher correctly emitted nothing
+    twice — and Layer 1's ≥2 escalated to a human before Layer 2's cap
+    of 3 could auto-complete it. In story mode the per-story cap owns
+    the decision, so ≥2 must route back to story_loop, not HITL."""
+    route = _route_after_patching_under_test()
+    state = {
+        "current_batch_id": 31,
+        "current_story_id": "STORY-NFR-005",
+        "loop_counter": {
+            "consecutive_zero_patch_rounds": 2,
+            "story_zero_patch_rounds": {"STORY-NFR-005": 2},
+        },
+    }
+    assert route(state) == "story_loop_node"
+
+
+def test_story_mode_still_defers_at_and_above_the_per_story_cap():
+    """At the cap, story_loop is what auto-completes the story and
+    advances — so routing must still hand off to it rather than
+    escalating. Guards against 'suppress below the cap only', which
+    would just move the deadlock to round 3."""
+    route = _route_after_patching_under_test()
+    state = {
+        "current_batch_id": 31,
+        "current_story_id": "STORY-NFR-005",
+        "loop_counter": {
+            "consecutive_zero_patch_rounds": 3,
+            "story_zero_patch_rounds": {"STORY-NFR-005": 3},
+        },
+    }
+    assert route(state) == "story_loop_node"
+
+
+def test_monolithic_mode_still_escalates_at_global_threshold():
+    """The story-mode suppression must not disarm Layer 1 where it is
+    the only rail. A batch with no live story cursor counts as
+    monolithic for this purpose."""
+    route = _route_after_patching_under_test()
+    assert route({
+        "loop_counter": {"consecutive_zero_patch_rounds": 2},
+    }) == "human_intervention_node"
+    assert route({
+        "current_batch_id": 31,
+        "current_story_id": "",
+        "loop_counter": {"consecutive_zero_patch_rounds": 2},
+    }) == "human_intervention_node"
+
+
+def test_failsafe_still_wins_over_story_mode_suppression():
+    """Layer 3 runs ahead of both and stays the absolute backstop — a
+    story-mode run that is bleeding budget without progress must still
+    escalate, otherwise suppression could spin indefinitely."""
+    route = _route_after_patching_under_test()
+    state = {
+        "current_batch_id": 31,
+        "current_story_id": "STORY-NFR-005",
+        "loop_counter": {
+            "consecutive_zero_patch_rounds": 2,
+            "progress_tracker": {
+                "budget_at_last_progress": 10.0,
+                "tripped": True,
+            },
+        },
+    }
+    assert route(state) == "human_intervention_node"
 
 
 def test_graph_has_conditional_edge_out_of_patching_node():

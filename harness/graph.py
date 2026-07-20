@@ -5194,12 +5194,19 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # - Story mode (``current_story_id`` set): bump the per-story
         #   counter in ``story_zero_patch_rounds[story_key]`` AND the
         #   global ``consecutive_zero_patch_rounds``. Layer 2 (story
-        #   auto-advance at ≥STORY_ZERO_PATCH_CAP=3) usually catches
-        #   the stall first; Layer 1 is the system-wide safety net for
-        #   the case where the same story keeps getting re-picked (or
-        #   adjacent stories all stall identically) — without it, story
-        #   mode could spin indefinitely between the patcher and
-        #   story_loop_node when every story is vacuous.
+        #   auto-advance at ≥STORY_ZERO_PATCH_CAP=3) owns the decision
+        #   here; ``route_after_patching`` suppresses the Layer 1
+        #   escalation while story mode is active. Both counters still
+        #   bump — the global one stays live for observability, the
+        #   post-mortem summary, and monolithic mode.
+        #
+        #   Layer 1 used to escalate at ≥2 in story mode too, which
+        #   preempted Layer 2's cap of 3 and made it unreachable on the
+        #   common path (lumina 019f803f: an already-satisfied story
+        #   HITL'd instead of auto-completing). Keep the thresholds
+        #   ordered — if Layer 1's ≥2 is ever raised or Layer 2's cap
+        #   lowered, re-check that the suppression still lets the cap
+        #   fire first.
         # - Monolithic mode: only the global counter exists.
         #
         # Both counters reset on a REAL successful patch round (no-ops
@@ -24960,6 +24967,11 @@ def build_graph() -> Any:
         threshold as ``route_after_compiler`` for the repair loop, so
         the two zero-patch tripwires behave symmetrically.
 
+        That guard applies to monolithic mode only. In story mode the
+        per-story cap (``STORY_ZERO_PATCH_CAP``) owns the decision and
+        auto-completes a vacuous story instead of escalating — see the
+        comment on the suppression branch below.
+
         In monolithic mode (no batch active) or when a story-mode batch
         has no live story cursor (e.g. a batch-level repair re-enters
         patching), this falls straight through to ``speculative_node``
@@ -24980,7 +24992,44 @@ def build_graph() -> Any:
         consecutive_zero = int(
             loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
         )
-        if consecutive_zero >= 2:
+        # Lumina session 019f803f: STORY-NFR-005 "Generic Error Responses"
+        # was already implemented by STORY-NFR-004's round (both scope
+        # server/app/main.py). The patcher correctly emitted nothing —
+        # "no production changes required" — twice, and this tripwire
+        # read "nothing to do" as "stuck" and escalated to a human.
+        #
+        # The per-story cap (Layer 2, STORY_ZERO_PATCH_CAP=3) exists for
+        # exactly that case: it marks the story done — its log line names
+        # "already covered by an earlier story" — and advances. But at
+        # ≥2 this rail always fires first, so Layer 2 could never be
+        # reached on the common path of a single story being re-picked.
+        #
+        # In story mode Layer 2 owns the zero-patch decision, so suppress
+        # this one: below the cap story_loop re-picks, at the cap it
+        # auto-completes, and either way the batch keeps moving without a
+        # human. Layer 1 still guards monolithic mode, where it is the
+        # only rail. Layer 3 (the budget-based no-progress failsafe) runs
+        # ahead of both and remains the absolute backstop, so suppressing
+        # this cannot spin forever.
+        _story_mode = bool(int(state.get("current_batch_id") or 0)) and bool(
+            state.get("current_story_id") or ""
+        )
+        if consecutive_zero >= 2 and _story_mode:
+            from harness.story_loop import STORY_ZERO_PATCH_CAP
+            _cur = state.get("current_story_id") or ""
+            _sz = loop_counter.get("story_zero_patch_rounds", {}) or {}
+            _cap = int(
+                state.get("story_zero_patch_cap") or STORY_ZERO_PATCH_CAP
+            )
+            logger.info(
+                "[route_after_patching] consecutive_zero_patch_rounds=%d ≥ 2 "
+                "but story mode is active — deferring to the per-story cap "
+                "(%s at %s/%d). story_loop will re-pick, or auto-complete "
+                "the story at the cap.",
+                consecutive_zero, _cur,
+                _sz.get(_cur, 0) if isinstance(_sz, dict) else "?", _cap,
+            )
+        elif consecutive_zero >= 2:
             logger.warning(
                 "[route_after_patching] consecutive_zero_patch_rounds=%d ≥ 2; "
                 "escalating to human_intervention_node — patching is stuck "

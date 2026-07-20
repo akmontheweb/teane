@@ -342,6 +342,60 @@ def _drop_cross_test_root_scope_files_in_decomposition(
             )
 
 
+# Lumina session 019f7caa: STORY-NFR-001 was planned with
+# ``scope_files=['tests/performance/test_contacts_perf.py']`` — a single
+# test path and nothing else. That deadlocks the patcher: phase 1 is
+# production-only (``_PHASE1_PRODUCTION_ONLY_NOTE`` in graph.py drops any
+# CREATE_FILE under a tests root), but graph.py's scope-coverage guard
+# demotes every round to zero-patch until at least one scope file lands
+# on disk. The only file that would satisfy the guard is the one phase 1
+# refuses to write, so the story burns two rounds and trips the
+# ``zero_patch_loop:2`` HITL having produced correct prod code that got
+# thrown away. A test-only scope hint carries no production signal
+# anyway — the test-generation node writes those files against the
+# finalised prod API — so the right value is the documented default of
+# ``[]``. Mixed prod+test scope is left alone: the prod entry satisfies
+# the guard and the hint is genuinely useful.
+def _is_test_scope_path(rel_path: str) -> bool:
+    """True when ``rel_path`` is a test file the production phase won't
+    write — under a tests root, a ``test_x.py`` / ``x.spec.ts`` style
+    basename, or a pytest config file the phase-1 note also forbids."""
+    basename = os.path.basename(rel_path)
+    if basename in ("conftest.py", "pytest.ini"):
+        return True
+    if _is_test_scope_basename(basename):
+        return True
+    return _extract_test_scope_suffix(rel_path) is not None
+
+
+def _drop_test_only_scope_files_in_decomposition(
+    stories: list[dict[str, Any]],
+) -> None:
+    """In-place: blank ``scope_files`` for any story whose scope is
+    *entirely* test paths, so the production phase isn't handed a scope
+    it is forbidden from satisfying.
+
+    Runs after the cross-domain and cross-test-root drops — those can
+    strip a story's only production entry and leave a test-only scope
+    behind, so this has to see the final list.
+    """
+    for idx, story in enumerate(stories):
+        scope = story.get("scope_files") or []
+        if not scope:
+            continue
+        if not all(_is_test_scope_path(p) for p in scope):
+            continue
+        story["scope_files"] = []
+        logger.warning(
+            "[decomposition] test-only scope drop: %s scope_files "
+            "%s are all test paths — the production phase cannot "
+            "create them and the scope-coverage guard would stall the "
+            "story. Clearing to [] (the default); the test-generation "
+            "node writes these against the finalised prod API.",
+            str(story.get("story_key") or f"idx{idx}"), scope,
+        )
+
+
 def _drop_cross_domain_scope_files(
     story_key: str,
     scope: list[str],
@@ -638,6 +692,18 @@ A good story:
   traceability, or its feature). Entries that share no domain word
   are silently dropped by the deterministic guard downstream; save
   yourself the round-trip and leave those out.
+- **Never scope a story to test files alone.** ``scope_files`` names
+  the *production* code a story implements. A scope made up only of
+  test paths (``tests/…``, ``test_x.py``, ``x.spec.ts``,
+  ``conftest.py``) is dropped to ``[]`` by the guard downstream,
+  because the production phase is forbidden from creating test files —
+  a dedicated test-generation node writes them afterwards against the
+  finished production API. This bites hardest on performance and other
+  NFR stories, where the obvious hint is the benchmark file: scope
+  those to the production module whose behaviour the NFR constrains
+  (the slow query, the endpoint, the renderer), not to the test that
+  measures it. Mixing a test path in alongside real production entries
+  is fine.
 - Declares hard dependencies on prior stories in ``depends_on``.
   Independent stories run in parallel, so omit deps where genuinely
   optional. Use the ``story_key`` strings you assign (STORY-001,
@@ -891,7 +957,11 @@ determine. Every entry MUST share a domain word with the story title,
 the feature name, or an acceptance criterion — cross-domain entries
 (e.g. a story titled "Source Traceability" pointing at
 ``server/services/forecast.py``) are silently dropped by the guard
-downstream.
+downstream. A scope made up *only* of test paths (``tests/…``,
+``test_x.py``, ``x.spec.ts``, ``conftest.py``) is likewise dropped to
+``[]`` — the production phase cannot create test files, so scope NFR
+and performance stories to the production module the requirement
+constrains, not to the benchmark that measures it.
 
 Stack invariants: frontend source (paths under `client/`, `frontend/`,
 `web/`, `ui/`, `webapp/`, `app/src/`, or containing `/src/components/`,
@@ -1228,6 +1298,7 @@ def _validate_augment_payload(
             "external_ref": s.get("external_ref") or None,
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
+    _drop_test_only_scope_files_in_decomposition(cleaned)
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,
@@ -1320,6 +1391,7 @@ def _validate_stories_payload(
             "external_ref": s.get("external_ref") or None,
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
+    _drop_test_only_scope_files_in_decomposition(cleaned)
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,

@@ -490,13 +490,18 @@ class TestCrossTestRootScopeGuard:
 
     def test_does_not_touch_stories_with_different_test_suffixes(self):
         # Two stories, both with test files, but DIFFERENT basenames.
-        # Neither collides — both scope_files entries survive.
+        # Neither collides — both scope_files entries survive. Each
+        # story also carries its production module so the scope isn't
+        # test-only (which _drop_test_only_scope_files_in_decomposition
+        # would clear for unrelated reasons); this test is about the
+        # cross-root guard staying silent, nothing else.
         payload = _payload_with_one_feature([
             {
                 "story_key": "STORY-001",
                 "title": "Filing service tests",
                 "acceptance_criteria": ["Filings parsed"],
                 "scope_files": [
+                    "server/app/services/filing_service.py",
                     "server/app/tests/test_filing_service.py",
                 ],
             },
@@ -505,15 +510,18 @@ class TestCrossTestRootScopeGuard:
                 "title": "Company service tests",
                 "acceptance_criteria": ["Companies searched"],
                 "scope_files": [
+                    "server/app/services/company_service.py",
                     "server/app/tests/test_company_service.py",
                 ],
             },
         ])
         _, stories = decomposition._validate_stories_payload(payload)
         assert stories[0]["scope_files"] == [
+            "server/app/services/filing_service.py",
             "server/app/tests/test_filing_service.py",
         ]
         assert stories[1]["scope_files"] == [
+            "server/app/services/company_service.py",
             "server/app/tests/test_company_service.py",
         ]
 
@@ -607,6 +615,107 @@ class TestCrossTestRootScopeGuard:
         _, stories = decomposition._validate_stories_payload(payload)
         # Fall-through — nothing to compare against, keep everything.
         assert stories[0]["scope_files"] == ["src/anything/at_all.py"]
+
+
+class TestTestOnlyScopeGuard:
+    """Lumina session 019f7caa: STORY-NFR-001 "Performance: Fast
+    Dashboard Rendering" was planned with a single scope file —
+    ``tests/performance/test_contacts_perf.py``. Phase 1 is
+    production-only and drops CREATE_FILE under a tests root, while
+    graph.py's scope-coverage guard demotes every round to zero-patch
+    until a scope file lands. Unsatisfiable either way: the story burned
+    two rounds (throwing away correct production code) and tripped the
+    ``zero_patch_loop:2`` HITL. Clearing a test-only scope to ``[]`` at
+    decomposition time keeps the deadlock from being constructed."""
+
+    def test_clears_scope_that_is_only_test_paths(self, caplog):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-NFR-001",
+            "title": "Performance: fast contacts rendering",
+            "acceptance_criteria": [
+                "Contacts dashboard renders 500 contacts under 200ms",
+            ],
+            "scope_files": ["tests/performance/test_contacts_perf.py"],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == []
+        assert any(
+            "test-only scope drop" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_keeps_scope_mixing_production_and_test_paths(self):
+        # One production entry is enough to satisfy the downstream
+        # scope-coverage guard, so the hint stays useful — leave it be.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Contacts list endpoint",
+            "acceptance_criteria": ["GET /contacts returns the list"],
+            "scope_files": [
+                "server/app/services/contacts_service.py",
+                "tests/test_contacts_service.py",
+            ],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "server/app/services/contacts_service.py",
+            "tests/test_contacts_service.py",
+        ]
+
+    def test_clears_spec_and_conftest_only_scopes(self):
+        # Non-pytest naming and the pytest config files the phase-1
+        # note also forbids — same deadlock, same treatment.
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Dashboard renders alerts",
+                "acceptance_criteria": ["Dashboard shows alert banner"],
+                "scope_files": [
+                    "client/src/components/Dashboard.spec.tsx",
+                ],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Contacts fixtures available",
+                "acceptance_criteria": ["Contacts fixtures load"],
+                "scope_files": ["conftest.py"],
+            },
+        ])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == []
+        assert stories[1]["scope_files"] == []
+
+    def test_leaves_production_only_scope_untouched(self):
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Contacts repository query",
+            "acceptance_criteria": ["Contacts query filters by owner"],
+            "scope_files": [
+                "server/app/repositories/contacts_repository.py",
+            ],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "server/app/repositories/contacts_repository.py",
+        ]
+
+    def test_clears_scope_left_test_only_by_an_earlier_guard(self):
+        # The cross-domain guard strips the one production entry
+        # (forecast shares no domain word with a traceability story),
+        # leaving a test-only scope behind. This pass runs last
+        # precisely so it sees that post-drop state.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Source traceability",
+            "acceptance_criteria": ["Sources link back to filings"],
+            "scope_files": [
+                "server/services/forecast.py",
+                "tests/test_traceability.py",
+            ],
+        }])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == []
 
 
 class TestScopePathTokens:

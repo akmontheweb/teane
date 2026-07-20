@@ -2045,9 +2045,53 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "content": "## Test-generation guidance\n\n" + guides_body,
         })
 
+    # ADR-0003 Tier 1: deterministic schema-contract tests. Emitted from the
+    # just-patched Pydantic models BEFORE the LLM turn so (a) the model can be
+    # told which surfaces are already covered and must not re-test — the
+    # single-source-of-truth that makes the ADR-0002 cross-file contradiction
+    # structurally impossible for these models — and (b) the correct-by-
+    # construction declarative tests land regardless of what the LLM emits.
+    # Conservative: validator-bearing models are skipped (left to the LLM).
+    from harness.contract_tests import emit_contract_tests
+    contract_files: list[str] = []
+    contract_markers: dict[str, list[str]] = {}
+    _contract_covered: list[str] = []
+    try:
+        contract_files, contract_markers = emit_contract_tests(
+            workspace_path, source_files, primary,
+        )
+        _contract_covered = sorted({
+            src for srcs in contract_markers.values() for src in srcs
+        })
+        if contract_files:
+            logger.info(
+                "[test_generation_node] Emitted %d deterministic contract-test "
+                "file(s) (ADR-0003 Tier 1) covering %s: %s",
+                len(contract_files), ", ".join(_contract_covered),
+                ", ".join(contract_files),
+            )
+    except Exception as _ct_exc:  # noqa: BLE001 — deterministic tier is best-effort
+        logger.warning(
+            "[test_generation_node] Contract-test emission failed "
+            "(continuing with LLM-only): %s", _ct_exc,
+        )
+
     user_prompt = _build_test_gen_prompt(
         workspace_path, source_files, primary,
     )
+    if _contract_covered:
+        user_prompt += (
+            "\n\n[ALREADY COVERED — DO NOT DUPLICATE]\n"
+            "Deterministic schema-contract tests (field constraints, "
+            "required-field, type validation) have ALREADY been generated for "
+            "these source file(s):\n"
+            + "\n".join(f"- {s}" for s in _contract_covered)
+            + "\nDo NOT emit schema-construction or field-validation tests for "
+            "their models — those are owned by the deterministic suite. Write "
+            "ONLY business-logic / behavioural assertions (computed values, "
+            "custom-validator semantics, cross-field rules, endpoint "
+            "behaviour) that the declarative contract cannot express.\n"
+        )
     # Change-request mode: prepend the CR-N attribution rules so generated
     # tests follow the `test_cr_N_*` naming convention and reference the
     # CR in their docstrings. No-op (empty string) outside CR mode.
@@ -2293,6 +2337,14 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             )
             continue
         generated_tests.append(rel)
+
+    # Fold in the deterministic contract-test files (ADR-0003 Tier 1) so they
+    # flow through the same marker-persistence, reporting, and deterministic
+    # run as the LLM's output. They already carry `# @tests:` markers, so the
+    # marker gate passes them through untouched.
+    for _cf in contract_files:
+        if _cf not in generated_tests and _inside_workspace(_cf, workspace_path):
+            generated_tests.append(_cf)
 
     success_count = sum(1 for r in patch_results if r.success)
     fail_count = len(patch_results) - success_count

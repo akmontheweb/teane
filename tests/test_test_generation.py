@@ -662,6 +662,101 @@ class TestContradictionGate:
         assert result["node_state"]["test_generation"]["status"] == "passed"
 
 
+class TestContractTestTier:
+    """ADR-0003 Tier 1 — deterministic contract tests are emitted before the
+    LLM turn, land on disk, narrow the LLM prompt, and flow into
+    generated_tests."""
+
+    _MODEL = (
+        "from pydantic import BaseModel, Field\n"
+        "from typing import Optional\n"
+        "class Widget(BaseModel):\n"
+        "    name: str = Field(max_length=10)\n"
+        "    note: Optional[str] = None\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_contract_tests_emitted_and_llm_narrowed(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "models.py").write_text(self._MODEL)
+
+        # LLM emits a business-logic test (its narrowed job).
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_widget_behaviour.py\n"
+            "content:\n"
+            "# @tests: app/models.py\n"
+            "from app.models import Widget\n"
+            "def test_note_defaults_none():\n"
+            "    assert Widget(name='x').note is None\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "3 passed in 0.01s\n")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["app/models.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+
+        # 1. The deterministic contract-test file landed on disk.
+        ct = tmp_path / "tests/contract/test_models_contract.py"
+        assert ct.is_file()
+        body = ct.read_text()
+        assert "# @tests: app/models.py" in body
+        assert "def test_widget_valid_construction" in body
+        assert "def test_widget_name_max_length" in body
+
+        # 2. The LLM prompt carried the narrowing note (don't duplicate).
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent)
+        assert "ALREADY COVERED" in joined
+        assert "app/models.py" in joined
+
+        # 3. Both the deterministic and the LLM test are in generated_tests.
+        gts = result["generated_tests"]
+        assert "tests/contract/test_models_contract.py" in gts
+        assert "tests/test_widget_behaviour.py" in gts
+
+    @pytest.mark.asyncio
+    async def test_no_pydantic_models_no_contract_file(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        # A plain (non-pydantic) source file → no contract tests, no narrowing.
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "# @tests: calc.py\n"
+            "from calc import add\n"
+            "def test_add():\n"
+            "    assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed in 0.01s\n")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+        assert not (tmp_path / "tests/contract").exists()
+        joined = "\n".join(
+            m.get("content", "") for m in gw.dispatched[0]["messages"]
+        )
+        assert "ALREADY COVERED" not in joined
+        assert result["generated_tests"] == ["tests/test_calc.py"]
+
+
 # ---------------------------------------------------------------------------
 # Failure path: sandbox exits non-zero → repair_node
 # ---------------------------------------------------------------------------

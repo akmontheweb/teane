@@ -1,0 +1,338 @@
+# Teane configuration reference
+
+Teane — canonical configuration. This is the SOLE config source. The harness reads this file (and ONLY this file) at startup; there are no fallbacks, no per-workspace overrides, no auto-generated files. Validation is strict: unknown keys, typos, wrong types, missing required fields, or missing API key env vars all cause the harness to exit with code 2 BEFORE any LLM call. Comment fields (keys starting with '_') are stripped at load time and exist for operator documentation only.
+
+> These notes were extracted from the inline `_comment` keys that previously
+> lived in `config.json`, then corrected against the code during an audit
+> (2026-07). Edit settings in `config.json`; this file explains what each
+> does. Keys beginning with `_` are stripped on load, so nothing here
+> affects harness behavior.
+
+---
+
+## `core_languages`
+
+Locked core technology selection. The harness ONLY supports Python or Java (with Spring Boot) for backend, and the React + TypeScript + TailwindCSS trio (plus a small allowlist of optional React-ecosystem extras) for web. This restriction is enforced at config-load time — any other value causes the harness to exit with code 2 BEFORE any LLM call, with a polite message telling the operator which values are allowed. Blank values are auto-filled with the defaults below (backend_language="Python", web_language=["React","TypeScript","TailwindCSS"]). Allowed values: backend_language ∈ {"Python", "Java"}. web_language MUST include every entry of the trio ["React", "TypeScript", "TailwindCSS"] (order-insensitive, no omissions); operators MAY additionally add any subset of the optional allowlist {"radix-ui"}. Anything outside that union is rejected. Rationale: a small, fixed surface lets the harness ship deep skill files, build recipes, and prompt scaffolds for every supported combination instead of spreading thin across every framework.
+
+## `allow_network`
+
+Default for whether the build sandbox is allowed network access. compiler_node auto-flips this to true ONLY for adapter-synthesised install steps or `make` targets (or when sandbox.auto_enable_network_for_install=true). An operator-typed 'pip install'/'npm install' does NOT auto-flip — the run warns and stays offline. Override per-run via --allow-network.
+
+## `product_spec_dir`
+
+MANDATORY. NAME of the folder at the workspace root that holds the product specification files (.txt, .md, .pdf). Must be a bare folder name — no path separators, no absolute paths, no `..`. The folder MUST live at the workspace root (`<workspace>/<product_spec_dir>/`). The harness reads every supported spec file in this folder (alphabetical order; .pdf bodies are extracted via pypdf) and consolidates them into one specification before LLM synthesis. Both `teane run` and `teane doctor` REFUSE to start when this key is missing, malformed, or when the named folder is missing / empty at the workspace root.
+
+## `sandbox`
+
+Build-sandbox isolation. 'backend' is the isolation strategy: 'auto' picks docker if installed else unshare(8); the bare-subprocess fallback requires the explicit HARNESS_ALLOW_UNSAFE_SANDBOX=true opt-in (otherwise auto-detect errors rather than running on the host). 'docker_image' is the base container image (the single kitchen-sink `harness-builder` image already bakes every supported toolchain (Python/Java/Node/Playwright) and is NEVER swapped per build command). Memory / CPU / PID limits cap container resource use. readonly_cache_mounts are host directories bind-mounted read-only into the container so package managers find their warm caches. timeout_seconds is the hard cap on a single build run. pgid_kill_on_timeout=true sends SIGKILL to the process group on timeout. restore_workspace_ownership=true causes the harness to either pass --user $UID:$GID to docker (Linux non-root host) or run a chown trailer so the bind-mounted workspace doesn't end up root-owned. cache_volumes=true mounts writable Docker named volumes on the builder image's fixed /cache/{pip,uv,npm} paths (independent of readonly_cache_mounts, which still mount separately); volumes are shared across sessions by default (cache_volumes_scope="session" for per-session isolation) — pip/uv/npm can then persist downloads across containers and the next compile in the session reuses them. The speculative path runs a single sequential warm-up install before variants fan out to keep the cache race-free. Use `teane cache clear` to remove the volumes. Default off for one release while we observe.
+
+**`docker_memory_limit`** (default `512m`), **`docker_cpu_limit`** (`1.0`), **`docker_pids_limit`** (`100`) — per-container resource caps for the docker backend. **`cache_volumes_prefix`** — name prefix for the cache named-volumes. **`cache_volumes_scope`** — `global` (default, shared across sessions) or `session` (per-session isolation).
+
+## `token_budget`
+
+Spend caps. hard_cap_usd is the per-session dollar ceiling — the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window. stages (optional) is a soft per-stage budget split — maps NodeRole name to a fraction of hard_cap_usd, e.g. {"planning":0.2,"patching":0.2,"repair":0.5,"doc_reviewer":0.05,"code_reviewer":0.05}. Today this only emits a warning when a stage exceeds its share; hard enforcement is a follow-up.
+
+## `node_throttle`
+
+Per-loop iteration ceilings — prevent runaway loops. max_patch_repair_iterations caps how many times the repair loop can retry a failing build (defaults to 5, clamped to [1,10] → routes to HITL after the fifth miss). max_consecutive_distraction_rounds caps consecutive repair rounds where the reflection LLM verdicts DISTRACTION or REGRESSION (defaults to 3 → routes to HITL); the existing fingerprint-shrinkage gate resets on any churn, so an LLM that oscillates 6→4→6 fingerprints never trips it — this counter listens to the reflection verdict instead and catches the case where repair is making cosmetic changes but never touching the real blocker. max_consecutive_low_signal_rounds caps consecutive repair rounds where the reflection LLM falls back to the 'insufficient data — no diagnostic locations available' sentinel (defaults to 5 → routes to HITL); catches the pattern where every verdict says PROGRESS but the judge cannot ground on any diagnostic, so the repair LLM is patching blind and burning budget without converging. total_hard_cap_multiplier is a runaway-loop tripwire multiplier: total hard ceiling for repair rounds per compile phase is max_patch_repair_iterations × total_hard_cap_multiplier (defaults to 5 × 4 = 20 rounds). Raise for prod-smoke cascades that legitimately need many rounds; lower to fail-fast on flaky test suites. max_doc_review_cycles / max_code_review_cycles cap the adversarial doc-reviewer / code-reviewer revision rounds. max_discovery_iterations caps the requirements/architecture interview loop. max_end_of_session_regression_cycles caps the final regression repair loop after security_scan passes but before deployment (Phase G). end_of_session_repair_diagnostic_cap / end_of_session_repair_inventory_cap raise the per-file context limits in repair prompts at the end-of-session regression to give the LLM enough surface to spot shared-utility cascade fixes (Phase J); end_of_session_force_reasoning_model jumps straight to the reasoning model on the first EoS repair attempt instead of burning cheap-model rounds. stuck_target_limit is the router tripwire on same-file REPLACE_BLOCK misses (default 3 → routes to HITL once any file has failed to accept a patch this many times). generic_no_progress_limit is the ceiling on consecutive zero-patch repair rounds even when autofix is enabled (default 5 → routes to HITL). same_missing_dep_limit is the ceiling on consecutive identical MISSING_DEP symbols in a row (default 3 → escalates to HITL with a 'fix the image, not the manifest' message; catches the case where the missing tool is something the manifest cannot install, e.g. `pip` itself against buildpack-deps).
+
+**`max_requirement_gap_fill_cycles`** — P2 requirement gap-fill cap: max draft→append→reconcile cycles before the fail-fast END (default 2, clamped [1,5]).
+
+## `hitl`
+
+Human-in-the-loop gate switches. Each flag controls whether the corresponding gate prompts the operator (true) or auto-approves (false). Resolution precedence at run start: (1) the matching --hitl-* CLI flag when explicitly passed; (2) the value in this block; (3) the harness's last-resort default of true. The third tier means: if neither the CLI nor this file says otherwise, every gate prompts. Auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE=true, no TTY) still apply on top — those force auto-approve regardless of how this resolves. requirement = requirements gatekeeper + the pre-graph interactive spec review. architecture = architecture gatekeeper. repair = the repair-loop HITL menu when iteration ceilings trip. deployment = deployment gatekeeper before --deploy-dev fires. layout_divergence = the spec_layout_divergence menu fires when on-disk source drifts from SPEC_ARCHITECTURE.md's workspace_layout block.
+
+## `models`
+
+Model registry. Every LLM the harness can dispatch to must be declared here. The key (e.g. 'openai:gpt-4o-mini') is the routing handle used in model_routing below. Only `provider` (openai/anthropic/deepseek/google/moonshot/ollama) is VALIDATED. `model_id` (vendor's name) and `context_window` (max tokens) are strongly recommended but default silently to the model key and 131072 respectively if omitted (not rejected). Cost fields drive the budget tracker. supports_thinking=true allows the gateway to enable extended-thinking mode when the role's *_mode is 'thinking' or 'thinking_max'. supports_cache=true enables prefix-caching for that provider. api_key is ALWAYS empty here — set keys as env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY or GOOGLE_API_KEY, MOONSHOT_API_KEY). The gateway reads env vars at dispatch time and ignores the api_key field. Ollama models run locally so no env var is required. Google/Gemini models use Google's OpenAI-compatible endpoint (api_base_url ends in /v1beta/openai/) and are dispatched through a thin GoogleProvider wrapper around OpenAIProvider.
+
+### `models.moonshot_kimi`
+
+Moonshot AI (Kimi), OpenAI-compatible via the 'moonshot' provider. Values below are confirmed against Moonshot's platform docs (platform.kimi.ai, July 2026): kimi-k3 is the current flagship — model_id 'kimi-k3', 1M-token context, USD $3.00/1M input (cache-miss), $0.30/1M cached input, $15.00/1M output. 'kimi-latest' is Moonshot's always-newest alias (resolves to kimi-k3 today); its specs here mirror kimi-k3 and should be re-checked if a newer Kimi ships. Region: api_base_url defaults to the international host https://api.moonshot.ai/v1; switch to https://api.moonshot.cn/v1 for the mainland platform (accounts/keys are NOT shared across the two). Key: export MOONSHOT_API_KEY. supports_thinking is false because the moonshot provider extends OpenAIProvider, which does not emit a thinking/reasoning_effort parameter — K3 always runs with thinking enabled server-side (reasoning_effort='max') regardless, and its reasoning output is surfaced automatically. supports_cache is true: Moonshot bills cache-hit vs cache-miss input and returns prompt_tokens_details.cached_tokens.
+
+## `model_routing`
+
+Maps the harness's internal roles to model keys from the registry above. Only models referenced here are 'active' — declared-but-unrouted models don't require an env-var API key. *_primary fields are REQUIRED (planning, patching, repair) — the harness exits with code 2 at startup if any is empty or references a missing model. *_fallback fields fire when the primary returns empty / errors. *_mode controls extended-thinking: 'thinking_max' enables the largest budget the model supports; 'thinking' enables it conservatively; 'non_thinking' disables. doc_reviewer_* and code_reviewer_* are optional — leave primary empty to skip that adversarial review pass. ollama_local_model + force_local_only let operators route everything to a local Ollama model for offline / cost-control use.
+
+**`decomposition_*` / `decomposition_reviewer_*`** — P2 gap-fill roles, same `<role>_primary/_mode/_fallback/_fallback_mode` shape as the others. `decomposition_primary` falls back to `planning_primary` when empty; `decomposition_reviewer_primary` empty == the review pass is skipped.
+
+## `llm_dispatch`
+
+Per-call LLM dispatch parameters. max_tokens_default is the fallback ceiling on a model's response (visible content + thinking trace combined for reasoning-mode models like deepseek-v4-pro). max_tokens_per_role gives every role an explicit, tunable ceiling — operators can raise repair (thinking trace + patch blocks need headroom), lower doc_reviewer (short critiques), or tweak any other role without code changes. Any role absent from the map falls back to max_tokens_default. Blank inputs (null / empty string / 0 / missing key) mean "no limit" — the gateway omits max_tokens from the provider call and the provider's own per-request output cap applies; a blank per-role entry overrides the default with "no limit" rather than inheriting it. Provided ints are clamped to [256, 32768] at load time — below 256 produces useless truncated replies; above 32768 blows past every supported model's per-request output cap. Recommended baselines: planning 4096, patching 4096, repair 8192 (thinking mode + tracebacks eat budget before the patch block lands), doc_reviewer 2048, code_reviewer 4096. prompt_cache_enabled=true (default) makes the gateway emit Anthropic cache_control markers on the system block (+ first user message when ≥4 KB) and run prefix-stability drift detection for every cache-capable provider (OpenAI / DeepSeek auto-cache only fires when the prefix is byte-identical across calls — the gateway emits a cache_prefix_drift observability event when it isn't). Flip to false to fall back to the legacy string-form Anthropic system payload. continue_on_length is a per-role boolean map that controls whether a node re-prompts the model when the previous dispatch returned finish_reason=='length'. When enabled, the node appends the truncated assistant turn plus a role-specific 'continue' user prompt and re-dispatches, up to 3 cycles per call; text chunks are concatenated before downstream parsing. Cap is `max_continuation_cycles` (default 5, clamped to [1,10]; config.json sets 5) — NOT hard-coded. Cost: each cycle is a full re-dispatch billed against token_budget — enabling on a node can up to 6× (1 + max_continuation_cycles) that node's per-call spend. Per-role guidance and RISKS: (1) planning=false default — enabling re-stitches the plan from concatenated chunks; the architecture inventory cross-check still runs, but continuation can introduce duplicated headings or a second summary paragraph. Enable only when you see finish_reason=length events on the planning role in logs. (2) patching=true default (RECOMMENDED on) — full-stack blueprints regularly exceed the 32768-token patching cap; without continuation the harness ships backend-only and silently drops the frontend tree. Documented failure mode at >3 cycles: harness moves to repair with whatever landed. (3) repair=false default — repair already dispatches once per repair iteration (up to node_throttle.max_patch_repair_iterations), and the READ_FILE inline-resolution loop adds another inner round; enabling continuation here multiplies dispatches per repair iteration by up to 5× (worst case ≈5 × 2 dispatches/iteration). Watch the budget. (4) doc_reviewer=false default — RISKY. The critique dispatch emits JSON; concatenating continuation chunks frequently produces malformed JSON and the existing parse-error fallback then treats the critique as empty and skips revision. The markdown revise dispatch continues cleanly. Enable only if you've observed the revise dispatch truncate. (5) code_reviewer=false default — RISKY for the same reason: the critique dispatch is JSON and continuation across cycles often breaks the schema, producing a schema_drift warning and a no-findings fall-through. The conditional re-patch dispatch (patch DSL) continues cleanly. Omit the map entirely or omit individual roles to inherit these defaults. read_file_rounds caps the <<<READ_FILE>>> DSL resolve rounds per repair/patching iteration (default 6, clamped to [1, 20]); each round re-dispatches without consuming an iteration, so raising it trades latency and tokens for investigation depth. Past the cap, one bonus round is granted automatically when the stripped request names a workspace file the LLM has never been shown this session — a request for an unseen file is an investigation step, not spiraling. patching_emission_rounds caps the apply→tool_result→re-dispatch emission rounds per tool-use patching turn (default 10, clamped to [1, 30]): models emit a few patch calls per response (the patch-quality rule mandates ≤3 files per response) and are re-invoked with per-patch tool results until they stop emitting patch calls, hit this cap, or land nothing real for two consecutive rounds. Each round is a full dispatch billed against token_budget; lowering the cap below ~ceil(largest story file count / 3) reintroduces the lumina 019f71b0 failure mode where a story is accepted with only its first response's files on disk.
+
+**`max_continuation_cycles`** — cap on `finish_reason=length` re-prompt cycles per call (default 5, clamped [1,10]). **`patching_read_file_cap`** — max `READ_FILE` resolutions per patching turn. **`max_tokens_per_role.decomposition` / `.decomposition_reviewer`** — output-token caps for the P2 gap-fill generation + review roles.
+
+## `persistence`
+
+Where LangGraph stores session checkpoints. db_path is the SQLite file path (default: per-user). ttl_days expires checkpoints older than this on every teane run — set to 0 to disable GC.
+
+## `logging`
+
+Structured logging configuration. level is the global root logger level (DEBUG/INFO/WARNING/ERROR) — it governs what reaches the per-session JSONL file. log_dir is where per-session JSONL log files land; a stable latest.jsonl symlink there always points at the current session, so `tail -f ~/.harness/logs/latest.jsonl` follows any run. console_level governs ONLY what prints live to the terminal, independently of the file: 'WARNING' keeps the console quiet (warnings/errors only) while the file still captures the full INFO stream to tail; 'OFF'/'NONE' silences the console entirely; null/omit mirrors level (legacy behavior). The resolved log-file path is always printed once to stderr at startup even when the console is quieted. json_stderr=true emits each log record as a single JSON line to stderr (useful for piping into a log aggregator). langsmith=true enables LangSmith tracing if LANGCHAIN_API_KEY is set in the environment.
+
+## `retrieval_tools`
+
+Read-only agentic retrieval tools the model drives inside the native tool loop (requires patcher.use_structured_tools=true and a tool-capable model). enabled=false removes grep/glob/list_dir/find_symbol/file_outline/semantic_search/git_blame/git_log from the tool list (the patch tools still ship, and the model falls back to read_file only). The rest are best-effort output/latency caps: max_results caps grep/find_symbol matches; max_files caps glob/list_dir entries; max_bytes hard-caps any single tool result string; grep_timeout_s/git_timeout_s bound the shell-outs; list_dir_depth is the default tree depth; semantic_top_k is the default chunk count for semantic_search; git_log_max caps git_log commits. find_symbol/file_outline need a running LSP pool (brownfield flows); semantic_search needs a prebuilt index (teane index build) — each degrades to an actionable message otherwise.
+
+## `best_of_n`
+
+Opt-in trajectory-level best-of-N for `teane build`/`patch`. When enabled with n>1, the harness runs n independent teane subprocesses each in its own git worktree (branched from HEAD), then applies the winner's diff back to the workspace. enabled=false (default) runs a single trajectory exactly as before. n = number of trajectories. strategy selects the winner: first_success (lowest-id green build), fewest_changes (smallest diff among green builds), or voted (a judge over green builds; falls back to fewest_changes). max_concurrency caps how many run at once. diversity_mode is a forward-looking knob (temperature/model/none); meaningful diversity currently relies on sampling nondeterminism. per_variant_budget_usd optionally caps spend per variant — passed to each child subprocess as --budget, so the child's own budget gateway enforces it; per-variant spend is visible in each child session's metrics, not aggregated into the parent's. Children run with stdin closed and HARNESS_AUTO_APPROVE=true, so every HITL gate auto-approves inside variants. If the winner's diff fails to apply onto the workspace (e.g. dirty operator tree), the diff is saved to ~/.harness/best_of_n/<session>-winner.patch before the worktrees are removed. NOTE: this fans out full LLM solves — cost scales ~linearly with n.
+
+## `lintgate`
+
+Lintgate behaviour after patches land. format_modified_files (code default false, but THIS CONFIG SETS true — the auto-formatter runs on modified files). When false it skips the auto-formatter on pre-existing files so the harness doesn't clobber user style. Linters still run on every modified file. strict_missing_formatter (code default false, but THIS CONFIG SETS true — a configured formatter missing from PATH becomes a build-blocking diagnostic). When false it silently warns when a configured formatter (ruff, prettier, gofmt, etc.) isn't on PATH; set true to surface as a build-blocking diagnostic so the format lock the spec promises is actually enforced.
+
+## `post_mortem`
+
+Automated failure post-mortems (harness/post_mortem.py — the HITL learning loop). On a HITL breakpoint or a failed exit, the harness distills a one-line [learned-rule:<trigger>] hypothesis into the per-repo memory file, which is auto-injected into the next run's planner prompt. max_cost_usd is a small reserved allowance so the note still gets distilled by the cheap JUDGMENT model when the main session budget is exhausted (budget_exhausted is itself a key trigger); with no LLM available a deterministic template rule is recorded instead. retire_on_clean_run=true retires all active rules once a run on this repo exits clean — a green run proves the failure class no longer bites, and stale rules would poison future prompts. Duplicate failure classes are fingerprint-deduped.
+
+## `diagnostics`
+
+Read-only type-checker gate between lintgate_node and compiler_node (harness/diagnostics_gate.py). Runs pyright (mypy fallback) on Python and `tsc --noEmit` on TS/TSX over the batch's files plus their reverse-dependency closure (scope=impacted; set scope=modified to skip the closure). Pre-existing diagnostics are baseline-suppressed via a detached HEAD-worktree fingerprint diff, so only NEW type errors route to repair_node before the expensive compile. Java is deliberately not covered: javac needs the full build classpath, so compiler_node IS the Java type check. Fail-open: a missing/timed-out/crashed checker contributes nothing and the run proceeds. max_rounds bounds consecutive diagnostics→repair bounces per compile cycle (on top of the shared total_repairs cap).
+
+## `security`
+
+Security-scan gate policy (loaded by SecurityScanPolicy.from_config in harness/security.py). block_on / warn_on / ignore_below partition findings by severity; the harness routes block_on findings to repair_node and only logs warn_on. scanners selects which of {gitleaks, bandit, semgrep, trivy} actually run. allowlist_rules silently drops findings whose rule_id matches — use this to suppress noisy or false-positive rules that the LLM cannot meaningfully fix (e.g. a ws:// example inside a markdown spec that the patcher's allowlist forbids editing anyway, creating an infinite repair loop). max_findings_to_route_to_repair caps the number of findings handed to the repair LLM in one round so a 200-finding semgrep run doesn't drown the dispatch. hard_ceiling_multiplier is the runaway-loop tripwire on security-fix attempts: the router lets security repair run up to `max_sec_attempts × hard_ceiling_multiplier` rounds before force-routing to HITL (default 3 → 3× the primary sec-attempt cap). Raise for projects with dense findings that legitimately need many rounds; lower to fail-fast on false-positive spam. The CommandValidator (allowed_commands / blocked_patterns / allow_all_commands / allow_network_in_build) shares this block; only its defaults are documented in harness/security.py.
+
+### `security.allowlist_rules`
+
+Rule IDs to drop silently before block/warn partitioning. Add a rule here when the LLM cannot fix the flagged location (e.g. an example in docs/ that the patcher's allowlist refuses to edit) and a real repair loop would spin forever. The string must match the scanner's rule_id exactly — grep for `Rule: <id>` in ~/.harness/debug/<session>_*_repair_*.txt to find it.
+
+## `speculative`
+
+Configuration-driven speculative compilation (#12 rebuild). Six independent strategy axes; the shipped defaults aim for positive ROI on typical workloads. (1) trigger decides WHEN speculative engages: 'always' fires every patching pass (high cost); 'first_attempt_only' is the legacy default; 'after_n_repair_failures' (DEFAULT) holds back until sequential repair has stalled — the high-value moment; 'manual' fires only when state.force_speculative is set. n_repair_failures_threshold (default 2) is the gate for the after_n_repair_failures trigger. (2) diversity_mode decides HOW variants differ: 'temperature' spreads temps over one model (legacy); 'prompt' fixes the model but varies a per-variant system-prompt style; 'model' (DEFAULT) routes each variant through a different model from variant_models — real architectural independence beats temperature noise; 'mixed' combines models and styles. (3) cost_strategy decides the COST shape: 'equal_cost' (legacy 3x cost); 'cheap_first_sequential' (DEFAULT) dispatches the cheap_model first, then expensive_model only if needed — expected cost ~1.1x; 'cheap_parallel_then_expensive' fires all-but-one cheap and one expensive in parallel; 'all_cheap' uses cheap_model for every variant; 'gradient_low_to_high' assigns ``variant_models`` in monotonic cost order (variant 0 → variant_models[0], …, variant N → variant_models[N]) so operators can distribute speculative runs across a low→high cost ladder of LLMs without modulo cycling. (4) selection_strategy: 'first_success' (DEFAULT); 'fewest_changes'; 'all_pass'. NOTE: the config validator accepts ONLY these three — 'first_pass' and 'voted' exist in the runtime but are REJECTED at config load, so do not set them here. The runtime-only 'voted' dispatches voting.n_judges adversarial reviewers per passing variant (reuses fanout #11) and picks the highest-vote-rate; 'all_pass' requires every variant to pass. (5) salvage_strategy: 'none' (DEFAULT — fall back to sequential repair against the untouched workspace, strictly safer than the legacy merge); 'fewest_errors'; 'voted_partial'; 'merge' (legacy behaviour; documented failure mode of incoherent workspaces). (6) num_variants ∈ [1, 10]; max_concurrency ∈ [1, 10] caps parallelism; temperature ∈ [0.0, 1.5]. variant_models is a list of model keys used by diversity_mode ∈ {model, mixed}. variant_prompt_styles is a list of styles (e.g. 'minimal-diff', 'balanced', 'thorough') or names from the built-in style library used by diversity_mode ∈ {prompt, mixed}. expensive_model + cheap_model are referenced by the cost_strategy axes. Legacy configs without the new keys auto-upgrade to {trigger: first_attempt_only, diversity_mode: temperature, cost_strategy: equal_cost, salvage_strategy: merge} with a one-time warning so existing operators see exactly today's behaviour.
+
+### `speculative.repair_fanout`
+
+Repair-level best-of-N. When the sequential repair loop accrues repair_fanout_after_rounds consecutive no-progress rounds, sample repair_fanout_variants repair responses (distinct strategy framings), test-compile each in a git worktree seeded with the current dirty workspace, and hand the best response to the normal repair apply path. The fanout REPLACES the round's single sequential dispatch, so the net cost is N-1 extra dispatches + N sandbox compiles per engagement; off by default. Engages at streak == repair_fanout_after_rounds exactly, so it fires once per climb toward the HITL cap and re-arms after any progress.
+
+**`enabled`** — master switch for speculative branching. **`voting.judge_role`** — model role that judges variants in the (runtime-only) `voted` strategy; default `code_reviewer`. **`worktree_base_dir`** — base directory for the per-variant git worktrees.
+
+## `test_generation`
+
+Auto-generate stack-specific unit tests for modified source files after patching. enabled=false disables the test_generation_node entirely (the graph still routes through it but it short-circuits). max_iterations caps how many times the LLM may retry generating valid tests before giving up.
+
+**`property_based_tests`** — toggles the ADR-0003 Tier-3 property-based contract tests (Hypothesis-driven). Requires `hypothesis` in the sandbox; the tier `importorskip`s when it's absent.
+
+## `test_regeneration`
+
+ADR-0001 autonomy ladder. When the repair loop declares a test UNSATISFIABLE_TEST, regenerate the defective UNIT test as a comprehensive suite for its 1:1-mapped code module (via the test-author phase, anchored on the code contract — not the SRS) instead of dead-ending at HITL. enabled=false keeps the legacy straight-to-HITL behaviour. max_attempts_per_test caps regeneration attempts per test path before falling through to HITL. tier_b_auto=false means only machine-PROVABLE defects (contradictory-pair / unparseable — Tier A) auto-regenerate; model-declared-only cases still route to HITL. require_code_linkage rejects a regeneration that drops its `# @tests: <source>` marker (unit tests link to code, never to ACs). coverage_nonregression rejects a regeneration that weakens assertion coverage (the anti-reward-hack gate).
+
+## `traceability`
+
+End-of-run traceability gate (v5 SQL audit over state.db). When enforce=true (default) the session blocks with exit_code=1 if any spec requirement has no satisfying story (an untraced requirement) — and, in the `test` flow ONLY, if any acceptance criterion has no verifying test. enforce_reqs / enforce_acs override each dimension independently and default to the coarse `enforce` value; AC enforcement is ADDITIONALLY always hard-gated to the `test` flow in code, because build/patch flows generate code-linked unit tests, not AC-linked Playwright tests (blocking them on AC gaps produced an unfixable headless auto-resume loop, finsearch 156032347). Set enforce=false (or enforce_reqs=false) to downgrade the block to an advisory that still prints the full report but ships anyway — use when a spec has known-uncovered requirements you are consciously accepting. IMPORTANT: the block is terminal — there is NO auto-remediation for an untraced requirement today. The fix is upstream: decomposition must emit a story that cites the requirement_key, or the spec must be revised. Auto-generating a story for an untraced requirement is a planned follow-up (see docs/adr). The block message and route_after_installation_doc cap (TRACEABILITY_BLOCK_CYCLE_CAP=2) exist so a headless run fires HITL once then exits cleanly instead of ping-ponging (ciod 523e86a7 burned 376 iterations here). Note: per-workspace .harness_config.json is IGNORED — this canonical config is the only place these knobs are read.
+
+## `fanout`
+
+Parallel task fan-out across independent workers (used by code-review, doc-review, test variants, discovery follow-ups). max_concurrency caps how many workers run at once; raise on larger machines / hosted-model paths to speed up wide fan-outs, lower to reduce peak RAM or provider rate-limit risk. timeout_seconds is the per-task wall-clock ceiling before an individual worker is cancelled — raise for slow reasoning models, lower to fail-fast on hung workers.
+
+## `metrics`
+
+Cost-metrics aggregation for the `teane metrics` subcommand. burn_rate_window_minutes is the rolling window for the live burn-rate gauge (clamped to [1, 1440]). metrics_dir is where machine-readable outputs (--json / --prometheus) land — point at e.g. a node_exporter textfile collector directory for Prometheus scraping.
+
+## `debug`
+
+Observability flags for post-mortem analysis. dump_llm_calls=true writes every LLM dispatch (across all roles: planning, patching, repair, doc/code review, test generation, discovery, etc.) as a single .txt file in ~/.harness/debug containing the exact input messages and the response. dump_max_files caps directory size; oldest files (by mtime) are pruned on each write. The deprecated dump_repair_prompts key is honoured as an alias for dump_llm_calls.
+
+## `compiler`
+
+Pre-build smoke checks. run_prod_import_smoke_check=true makes compiler_node first attempt to import every production module inside the sandbox before running the actual build, so module-level errors surface as [prod-import] diagnostics ahead of any cascade-amplified test failures.
+
+**`targeted_tests_first`** — when true, `compiler_node` re-runs the specific failing test node-ids from the prior round FIRST (before the full suite) so a fix is confirmed fast (`harness/graph.py:_targeted_tests_first_selectors`).
+
+## `patcher`
+
+Patcher behaviour. enforce_read_before_edit=true makes the patcher reject REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK on any file the LLM has not been shown this turn (via pre-flight content, READ_FILE results, or a prior closest-match window). Mirrors Claude Code's Read-before-Edit invariant — defaults to ON; flip OFF (lax mode) only if a provider genuinely cannot emit READ_FILE for unfamiliar files. Drift detection (sha256 comparison) runs unconditionally whenever the host has recorded a hash. use_structured_tools=true switches the patching/repair loop to native provider tool-use (function calling): the model receives PATCH_TOOLS plus the read-only retrieval tools (grep, glob, list_dir, find_symbol, file_outline, semantic_search, git_blame, git_log) as real tools and drives them itself, instead of emitting text-DSL blocks. Requires a provider/model that supports tool-use (Anthropic / OpenAI / DeepSeek / Ollama-compatible); providers without tool support transparently fall back to the text DSL. root_files is a list of root-level filenames the patcher is allowed to modify (e.g. Dockerfile, package.json, setup.py). These are merged with dynamically scanned entries (requirements*.txt, node config variants) and the workspace layout's declared source roots to form the final allowlist. Omit or leave empty to use the built-in defaults.
+
+## `web_tools`
+
+Web research tools (web_fetch + web_search) exposed to the planner / patcher / repair LLM via text-DSL blocks like <<<WEB_FETCH url="...">>> and <<<WEB_SEARCH query="...">>>. enabled=false (default) keeps the skills unregistered so the harness behaves byte-identically to pre-tool runs. Flip to true to let the planner pull documentation, RFCs, and search results before deciding on an implementation. max_bytes caps response size per fetch (default 200 KB ≈ 50 K tokens). max_results caps search results. search_backend names the PRIMARY search provider registered in harness/web_tools.py's backend registry — the harness ships ONLY 'duckduckgo_lite' as a built-in (with 'ddg' / 'duckduckgo' aliases), no API key required. Additional providers (Tavily, Brave, SerpAPI, in-house) are pluggable via the user-skills directory: drop a *.py file under ~/.harness/user_skills/ that subclasses harness.web_tools.SearchBackend and calls harness.web_tools.register_backend("tavily", TavilyBackend) at module top-level. The harness itself has zero dependency on any specific provider. After registration, set search_backend to the registered name (e.g. "tavily") and api_key_env to the env var holding the provider's key (e.g. "TAVILY_API_KEY"). An unknown name returned by a backend lookup falls through to the next configured backend (see ``backends`` below) rather than aborting the whole call. The PRIMARY is dispatched first; if it raises (HTTP error, quota, missing key, network outage, unresolved name) the harness walks the ``backends`` array in declared order until one returns without raising. Empty results are treated as success — the chain stops on the first non-raising backend. When every active backend errors, the response is an aggregate ``{"error": ...}`` naming each attempted backend and its cause so the LLM can decide whether to retry, reformulate, or proceed without web context. allow_private_ips opens the SSRF guard for trusted internal targets (e.g. an internal docs portal on 10.0.0.0/8) — leave false on multi-tenant or untrusted-prompt hosts. timeout_seconds bounds each HTTP call (applied per backend, not for the whole chain). tool_call_cap_per_dispatch caps how many tool rounds the LLM may run inside a single graph-node call before the interceptor forces it to proceed.
+
+### `web_tools.search_backend`
+
+Name of the primary search backend. Must match a name registered in harness/web_tools.py's _BACKEND_REGISTRY — either a built-in ('duckduckgo_lite' / 'ddg' / 'duckduckgo') or one added by a user-skill file calling register_backend(). To switch providers, change the string and (re)start the harness; for long-running daemons (`teane web start`, `teane schedule run`) restart the process so the new config is read.
+
+### `web_tools.api_key_env`
+
+Name of the env var holding the API key for the primary backend. Ignored by built-in 'duckduckgo_lite' (no key needed). User-supplied backends are expected to read this name and resolve the value at dispatch time via os.environ.get(). Never put the live key here — only the env var NAME.
+
+### `web_tools.backends`
+
+Ordered fallback chain for the web_search skill. The primary backend is the top-level ``search_backend`` above; every enabled entry in this list is tried in order AFTER the primary if (and only if) the primary raises (HTTP error, quota exhausted, missing API key, unresolved name). Empty results from a backend are NOT treated as failure — zero hits is a legitimate 'nothing matched' outcome and the chain stops there to avoid silently doubling cost on hard queries and hiding the no-match signal from the LLM. Each entry: {name, enabled, search_backend, api_key_env}. ``name`` is an operator label shown in logs / dashboard; ``search_backend`` is the registered name (must resolve through the same _BACKEND_REGISTRY as the primary, built-in or user-supplied via register_backend()); ``api_key_env`` is the env var holding the provider's key. Set ``enabled: false`` to keep an entry in the config but skip it at dispatch. The default entry below (``ddg-fallback`` → ``duckduckgo_lite``) is the shipped no-key fallback: when TAVILY_API_KEY is unset (or Tavily is down / rate-limited), the harness falls through to DuckDuckGo Lite so web_search still works. Remove or disable the entry to hard-require Tavily. When a fallback fires, the response includes a ``fallback_from`` field listing every backend that errored before the one that served, so the LLM and operator can both see what gave up.
+
+## `mcp`
+
+Model Context Protocol client pool. When enabled=true, each entry in 'servers' spawns as a subprocess (stdio transport — HTTP/SSE is a follow-up slice) and the harness registers each advertised tool into the SkillRegistry as mcp__<server>__<tool>. The planner / patcher / repair LLM invokes them via <<<MCP_CALL server="x" tool="y" args='{...}'>>> blocks intercepted in graph._run_tool_loop. Default false keeps the harness byte-identical to pre-MCP runs. tool_call_timeout_seconds bounds every JSON-RPC tools/call. command_allowlist EXTENDS the built-in safe allowlist (npx, npm, node, python, python3, uvx, pipx, docker) with operator-trusted binaries — add a binary basename here to whitelist it. allow_local_filesystem_servers gates the official @modelcontextprotocol/server-filesystem (and lookalikes) because filesystem MCP bypasses the build sandbox and grants the LLM raw host I/O — must be explicit. result_max_bytes caps each tools/call response payload pushed back into the LLM conversation (default 200 KB). servers is a list of {name, transport, command, env, api_key_env} — see harness/mcp_client.py:McpServerConfig for the per-field contract. A failed server start is logged and skipped — one bad server never blocks the rest of the pool.
+
+### `mcp.servers[1].command`
+
+The last arg is the host directory the LLM can read/write via mcp__fs__* tools. Machine-local override: export TEANE_MCP_FS_ROOT (like the API-key env vars); the default after :- applies when unset. Default '~' grants access to the operator's home dir; the harness expands ${TEANE_*}/${HARNESS_*} placeholders and a leading ~ at load time. Narrow this to a specific workspace root (e.g. '~/projects/foo') to reduce the filesystem-MCP blast radius. NEVER leave as '/' or a system-wide root.
+
+## `lsp`
+
+Language Server Protocol client pool for semantic navigation (harness/lsp_client.py) — BROWNFIELD flows only (enabled_flows, default patch/test; the build flow never starts it, keeping greenfield byte-identical). Spawns pyright-langserver (Python) / typescript-language-server (TS/TSX) as stdio subprocesses when the workspace passes an environment-health probe: Python needs a .venv or venv dir at the workspace root (set python_require_venv=false to override, e.g. system-site deps); TypeScript needs tsconfig.json AND node_modules (builds run in Docker, so host-side deps may legitimately be absent — a server without resolvable imports returns garbage, so we skip instead). Powers the planner's <<<LSP_CALL>>> tools (lsp__find_references / lsp__go_to_definition) and semantic upgrades to the diagnostics gate + repair prompts, with the tree-sitter DependencyGraph as the fallback tier everywhere. prefetch_budget_seconds bounds harness-side reference prefetches per repair round. No auto-restart: a dead server degrades silently to heuristics for the rest of the session. jdtls (Java) is deferred to Phase 2 — see harness/lsp_client.py docstring.
+
+## `skills`
+
+Runtime-extensible skill loader. user_skills_dir is the path the SkillRegistry walks at startup; each *.py file under it is imported and may call harness.skills.register(MySkill(...)) to add a ToolSkill / PipelineSkill / SubAgentSkill that the planner can invoke, OR harness.web_tools.register_backend(name, factory) to plug in an alternative web-search backend (Tavily, Brave, SerpAPI, in-house) without forking the harness. Failures (syntax error, missing import) are logged and skipped — one bad file doesn't take down startup. Default ~/.harness/user_skills (named to disambiguate from the bundled markdown scaffolds at harness/skills/ inside the installed package). Existing installs that still have *.py files at the legacy ~/.harness/skills path keep working: the loader falls back to that path when the new default is empty and logs a one-time deprecation INFO.
+
+## `memory`
+
+Per-repository session memory. When enabled=true (default), the planner reads the prior-session log (~/.harness/memory/<repo_id>.md) at the start of every teane run and injects the most recent entries as system context, and cmd_run appends a fresh entry on exit. Repo identity = SHA-256 of `git remote get-url origin` if available, else the workspace path. max_bytes caps the file itself (FIFO trim drops oldest sections). inject_max_bytes caps what the planner sees on each run. compact_after (bytes) is the threshold that triggers deterministic in-place compaction of older sections BEFORE the FIFO trim runs — file-list bullets and Notes lines are stripped from every section outside the compact_keep_recent newest so the recent window (learned-rule notes on the last few runs) stays fully visible. Compaction emits a `memory_compaction_fired` event to ~/.harness/logs/<sid>.jsonl.
+
+## `github`
+
+GitHub integration. Subcommands (teane gh issue / pr-create / pr-comment) shell out to the `gh` CLI; auth is whatever `gh auth status` shows. Set gh_path to point at a non-PATH `gh` binary if needed. default_owner + default_repo supply the fallback when a CLI / web flow creates a PR without specifying a repo explicitly — see harness.github_integration.default_repo().
+
+## `dashboard_writes`
+
+When writes_enabled=true the dashboard adds form-based config editing, memory editing, schedule-job CRUD, and 'Run now / Schedule it' from the browser (Tier B + C). On the harness side, dashboard-spawned runs export HARNESS_HITL_WEBHOOK_URL pointing at the dashboard's /hitl/webhook endpoint so HITL gates surface in the UI instead of the terminal. CSRF: token cookie + X-CSRF-Token header required on every write request; the token is generated per server boot unless csrf_token_env names an env var with a persistent value. hitl_webhook_secret (optional) is the shared secret the harness's HttpChannel includes when POSTing HITL prompts. hitl_webhook_timeout_seconds bounds how long the harness blocks waiting for an operator response before timing out. audit_log_retention_days bounds how long the dashboard's audit log retains write events before pruning. web_db_path is the SQLite store for audit log, saved run presets, queued chat notes, and one-shot scheduled jobs. config_path overrides the canonical config.json location (defaults to the global config). All writes are atomic (tempfile + os.replace) and re-validated through the strict validator before landing.
+
+## `dashboard`
+
+Carbon-styled web UI (`teane web`). Default bind 127.0.0.1:8729 — accidental public exposure is impossible without flipping `host`. For remote access set `token_env` to the name of an env var holding a bearer token; every request then needs `Authorization: Bearer <token>` (constant-time compared). When `token_env` is set but the env var is empty the server refuses to start — fail-closed. writes_enabled=true turns on the Run Harness page (per-flag form), the Configure Harness page (grouped collapsible editor that saves back to this file), memory editing, and schedule-job CRUD. CSRF: token cookie + X-CSRF-Token header on every write; token regenerates per server boot unless csrf_token_env names an env var with a persistent value. web_db_path is the SQLite store for the audit log, queued chat notes, and one-shot scheduled jobs from the Run Harness page. docs_dir empty → falls back to <repo_root>/docs at request time. carbon_css_url / carbon_js_url point at the v10 Carbon CDN; mirror them for air-gapped deploys.
+
+## `schedule`
+
+Cron-style background daemon that fires recurring build jobs. NOTE: the `teane schedule` CLI (including `teane schedule run`) has been REMOVED — jobs are now consumable only via web-driven invocation. The schedule syntax, tick_seconds, history_db, harness_binary, and jobs semantics below remain accurate. Schedule syntax: 'every 15m' / 'every 6h' / 'every 3d' / 'hourly :MM' / 'daily HH:MM' / 'weekly DAY HH:MM' (DAY ∈ mon,tue,...,sun; all times UTC). tick_seconds is the polling interval. history_db is the SQLite store for execution history. harness_binary is the CLI path the daemon shells out to (set to the venv's bin when not on PATH). Default off — drop entries into 'jobs' to enable. The one-shot 'Schedule A Run' button on the Run Harness page enqueues to dashboard.web_db_path (separate store) and does not require this section.
+
+## `repo_index`
+
+Repository semantic-retrieval index. Build with `teane index build`; when enabled, the planner queries the index for top-K chunks relevant to the user prompt and injects them as a system context block. backend = 'tfidf' (zero-dep, pure Python, default) or 'openai_embeddings' (requires OPENAI_API_KEY; falls back to tfidf on missing key). chunk_lines / chunk_overlap shape per-file slicing; top_k bounds the retrieval set; inject_max_bytes caps the planner injection. index_dir is the SQLite store.
+
+## `deployment_defaults`
+
+Optional org-wide deployment policy. Populated fields are treated as RESOLVED by the planning LLM in deployment_discovery_node — it skips emitting the matching interview question. Sections and individual fields are independently optional: omit a section (or leave its keys empty) and the LLM will still emit questions for it. Stack-specific values (Postgres port, Redis volume path, ...) deliberately are NOT here — those are derived from workspace telemetry and asked per-project. Keys starting with '_' are documentation comments stripped at load time. The 'Possible values' lists below are conventions, not enforcement — the harness does NOT validate against an enum, so any string set is passed verbatim to the planning LLM. Stick to the listed values unless you know your toolchain.
+
+### `deployment_defaults.network`
+
+Sector 1: NETWORK TOPOLOGY. Org-wide answers for reverse proxy, TLS, public ports, host-side port allocation, Docker networking, and DNS.
+
+### `deployment_defaults.network.reverse_proxy`
+
+Reverse proxy that fronts the app and terminates TLS. Possible values: caddy | nginx | traefik | envoy | haproxy | none.
+
+### `deployment_defaults.network.tls_strategy`
+
+How TLS certificates are obtained and renewed. Possible values: letsencrypt | self-signed | manual | none.
+
+### `deployment_defaults.network.tls_contact_email`
+
+Email handed to the ACME provider for expiry notices. Free text; REQUIRED when tls_strategy=letsencrypt, ignored otherwise.
+
+### `deployment_defaults.network.public_http_port`
+
+Host port that serves plain HTTP (used by ACME HTTP-01 challenges and HTTP→HTTPS redirects). Integer 1–65535; typically 80, sometimes 8080 on rootless hosts.
+
+### `deployment_defaults.network.public_https_port`
+
+Host port that serves HTTPS. Integer 1–65535; typically 443, sometimes 8443 on rootless hosts.
+
+### `deployment_defaults.network.host_port_range`
+
+Range [min, max] (two integers, 1–65535, min<max) of ephemeral host ports the harness may auto-allocate when publishing per-service containers. Pick a band that does not collide with other tenants on the host.
+
+### `deployment_defaults.network.docker_network_mode`
+
+Docker network driver applied to the project compose stack. Possible values: bridge | host | overlay | macvlan | none.
+
+### `deployment_defaults.network.primary_domain`
+
+Fully-qualified domain name where the deployed app is reachable from the public internet. Free text (FQDN); used as the SAN in the issued certificate and as the default vhost on the reverse proxy.
+
+### `deployment_defaults.network.dns_provider`
+
+DNS provider whose API the harness may call for DNS-01 challenges and record management. Possible values: cloudflare | route53 | gcp | azure | manual | none.
+
+### `deployment_defaults.storage`
+
+Sector 2: DATA & STORAGE PERSISTENCE. Org-wide answers for volume layout, container UID/GID convention, backup destination, and multi-host storage. Stack-specific volume paths (e.g. /var/lib/postgresql/data) are still derived from telemetry — this section captures the policy decisions that wrap them.
+
+### `deployment_defaults.storage.volume_root`
+
+Host path under which the harness lays out per-service data directories (e.g. <volume_root>/postgres, <volume_root>/redis). Default '~/.harness/deploy/volumes'; export TEANE_VOLUME_ROOT to override per machine (the harness expands ${TEANE_*} placeholders and ~ at load time). Point it at a dedicated data mount when the host has one.
+
+### `deployment_defaults.storage.persistence_mode`
+
+How container data is persisted on the host. Possible values: bind (host directory bind-mount) | volume (named Docker volume) | tmpfs (ephemeral RAM, data lost on restart) | none.
+
+### `deployment_defaults.storage.container_uid`
+
+Numeric UID the harness asks containers to run as (and chowns bind-mounts to). Integer ≥ 0; 1000 is the typical first non-root user on Linux. Set to match the host operator account that owns volume_root.
+
+### `deployment_defaults.storage.container_gid`
+
+Numeric GID counterpart of container_uid. Integer ≥ 0; usually identical to container_uid on single-user hosts.
+
+### `deployment_defaults.storage.backup_destination`
+
+Where the backup driver writes service snapshots. Possible values: s3 | gcs | azure_blob | local | none.
+
+### `deployment_defaults.storage.backup_path`
+
+Destination URI matching backup_destination. Examples: 's3://acme-backups/' for s3, 'gs://acme-backups/' for gcs, 'https://<account>.blob.core.windows.net/<container>/' for azure_blob, '~/.harness/deploy/backup/' or absolute path for local. Ignored when backup_destination=none. Default '~/.harness/deploy/backup'; export TEANE_BACKUP_PATH to override per machine.
+
+### `deployment_defaults.storage.multi_host_storage`
+
+Shared storage layer for multi-host deployments. Possible values: none (single-host) | nfs | ceph | glusterfs | longhorn.
+
+### `deployment_defaults.secrets`
+
+Sector 3: SECRETS & IDENTITY MANAGEMENT. Org-wide answers for secret manager choice, CI injection method, rotation policy, and log masking. Specific secret values are NEVER stored here — only the policy describing where and how the harness fetches them.
+
+### `deployment_defaults.secrets.manager`
+
+Backend the harness reads secrets from at deploy time. Possible values: vault (HashiCorp Vault) | aws_secrets_manager | gcp_secret_manager | azure_key_vault | sops (encrypted files in git) | env_file (plain .env) | none.
+
+### `deployment_defaults.secrets.manager_endpoint`
+
+URL of the secret-manager API. Required for vault / aws_secrets_manager / gcp_secret_manager / azure_key_vault; leave empty for sops, env_file, or none.
+
+### `deployment_defaults.secrets.env_file_path`
+
+Path to the .env file the harness loads when manager=env_file, relative to the workspace root. Ignored for all other managers. Free text path.
+
+### `deployment_defaults.secrets.ci_secret_injection`
+
+How secrets are injected into the CI pipeline that builds the app. Possible values: github_actions | gitlab_ci | jenkins | circleci | none.
+
+### `deployment_defaults.secrets.rotation_policy_days`
+
+Maximum age in days before a secret must be rotated. Integer ≥ 0; 0 disables the policy (secrets never expire).
+
+### `deployment_defaults.secrets.mask_in_logs`
+
+Whether the harness's log-redaction layer must scrub matched secret strings before writing them to disk or stdout. Boolean: true | false.
+
+### `deployment_defaults.infra_sync`
+
+Sector 4: PARTIAL INFRASTRUCTURE SYNC. Org-wide policy for handling pre-existing containers, reserved ports, protected volumes, and legacy compatibility. reserved_ports lists host ports the harness must NEVER bind. protect_containers / protect_volumes name resources the harness must NEVER destroy or recreate. conflict_policy ∈ {skip, overwrite, rename, abort} — default 'abort' is the safest (refuses to touch anything contested).
+
+### `deployment_defaults.infra_sync.conflict_policy`
+
+What the harness does when a container/volume/port it wants to create already exists. Possible values: skip (leave the existing resource alone, do not deploy that piece) | overwrite (destroy and recreate) | rename (deploy alongside under a new name) | abort (refuse to proceed; safest default).
+
+### `deployment_defaults.infra_sync.reserved_ports`
+
+Host ports the harness must NEVER bind, even if free. List of integers 1–65535. Use this to fence off ports owned by SSH, the host DB, monitoring agents, etc.
+
+### `deployment_defaults.infra_sync.protect_containers`
+
+Container names the harness must NEVER destroy or recreate, even on conflict. List of strings (Docker container names). Use for legacy containers managed outside the harness.
+
+### `deployment_defaults.infra_sync.protect_volumes`
+
+Volume names the harness must NEVER destroy or recreate. List of strings (Docker named-volume identifiers, or absolute bind-mount paths).
+
+### `deployment_defaults.infra_sync.legacy_compat_mode`
+
+Relaxes shape and naming checks so the harness can co-exist with a pre-existing legacy compose stack. Boolean: true | false. Default false; flip to true only when adopting the harness on an already-running deployment.
+
+## `agile`
+
+Top-level Agile-mode default. When true (and the operator did not pass --agile on the command line), `teane build` and `teane patch` engage story decomposition + per-story TDD. `teane patch` additionally auto-detects agile when the global state DB (~/.harness/state.db) already has story rows for this workspace, regardless of this flag. Defaults to false (today's monolithic patching flow).
+
+## `agile_defaults`
+
+Agile-mode tuning knobs. Replaces the legacy --story-batch-size / --commit-on-story / --story-repair-cap CLI flags. batch_size = max stories the planner picks per dependency-ordered batch. commit_on_story = `git commit` after each green story with `<STORY-N>: <title>` (no-op on non-git workspaces). repair_cap = max repair iterations before a story is parked as `blocked` and the batch advances. Only consulted when agile mode is engaged.
+

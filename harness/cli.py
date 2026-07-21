@@ -892,6 +892,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "traceability": frozenset({
         "enforce", "enforce_reqs", "enforce_acs",
+        # P2 — automated requirement gap-fill (draft a covering story, append
+        # to the spec, re-reconcile) before the P1 fail-fast. Default true.
+        "gap_fill",
     }),
     "fanout": frozenset({
         "max_concurrency",

@@ -24845,6 +24845,9 @@ def build_graph() -> Any:
     from harness.spec_reconciler import (
         spec_reconciler_node as _spec_reconciler_node,
     )
+    from harness.gap_fill import (
+        requirement_gap_fill_node as _requirement_gap_fill_node,
+    )
     from harness.story_loop import (
         batch_planner_node as _batch_planner_node,
         story_loop_node as _story_loop_node,
@@ -24863,6 +24866,9 @@ def build_graph() -> Any:
     # IDs — LLM output becomes ENRICHMENT (scope_files) only. Guards
     # against LLM renumbering / silent story-drop / phantom-feature drift.
     graph.add_node("spec_reconciler_node", _spec_reconciler_node)  # type: ignore[type-var]
+    # Requirement gap-fill (P2): drafts covering stories for uncovered
+    # features, appends them to the spec, and hands back to the reconciler.
+    graph.add_node("requirement_gap_fill_node", _requirement_gap_fill_node)  # type: ignore[type-var]
     graph.add_node("batch_planner_node", _batch_planner_node)  # type: ignore[type-var]
     graph.add_node("story_loop_node", _story_loop_node)  # type: ignore[type-var]
     # Phase F removed ``story_test_first_node``. Its xfail-stub
@@ -25109,13 +25115,14 @@ def build_graph() -> Any:
         STORIES gate — the LLM's output survives untouched in those
         paths, which matches pre-reconciler behavior.
 
-        ``early_req_coverage_gap`` (P1 fail-fast) fires when a requirement
-        has no satisfying story after decomposition and ``enforce_reqs`` is
-        on. The fix is upstream (revise the spec or the decomposition), which
-        no in-session HITL menu can apply, so we END with ``exit_code=1``
-        immediately rather than spend the entire build budget reaching the
-        identical end-of-run traceability gate. That gate remains the
-        backstop for gaps introduced after this point.
+        ``early_req_coverage_gap`` fires when a requirement has no satisfying
+        story after decomposition and ``enforce_reqs`` is on. P2: attempt
+        automated gap-fill (draft a covering story, append to the spec,
+        re-reconcile) up to ``max_requirement_gap_fill_cycles`` before giving
+        up. Once the cap is hit — or gap-fill is disabled — fail fast to END
+        with ``exit_code=1`` (the P1 behavior) rather than spend the whole
+        build budget reaching the identical end-of-run traceability gate. That
+        gate remains the backstop for gaps introduced after this point.
         """
         from langgraph.graph import END
         ns = state.get("node_state", {}) or {}
@@ -25126,10 +25133,25 @@ def build_graph() -> Any:
             )
             return "human_intervention_node"
         if ns.get("early_req_coverage_gap"):
+            tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+            gap_fill_enabled = bool(tr_cfg.get("gap_fill", True))
+            gw = get_gateway()
+            max_cycles = int(getattr(
+                getattr(gw, "config", None),
+                "max_requirement_gap_fill_cycles", 0,
+            ) or 0) if gw else 0
+            cycles = int((state.get("loop_counter") or {}).get(
+                "requirement_gap_fill_cycles", 0) or 0)
+            if gap_fill_enabled and max_cycles > 0 and cycles < max_cycles:
+                logger.info(
+                    "[router] requirement-coverage gap — attempting gap-fill "
+                    "cycle %d/%d before fail-fast.", cycles + 1, max_cycles,
+                )
+                return "requirement_gap_fill_node"
             logger.warning(
-                "[router] requirement-coverage gap detected post-decomposition "
-                "(enforce_reqs=true); failing fast to END with exit_code=1 "
-                "instead of running the full build. See the gap report above."
+                "[router] requirement-coverage gap persists after %d gap-fill "
+                "cycle(s) (enabled=%s); failing fast to END with exit_code=1. "
+                "See the gap report above.", cycles, gap_fill_enabled,
             )
             return END
         return "human_gatekeeper_node"
@@ -25140,9 +25162,13 @@ def build_graph() -> Any:
         {
             "human_gatekeeper_node": "human_gatekeeper_node",
             "human_intervention_node": "human_intervention_node",
+            "requirement_gap_fill_node": "requirement_gap_fill_node",
             END: END,
         },
     )
+    # Gap-fill hands back to the reconciler, which re-reconciles from the
+    # updated spec and re-checks coverage (closing the loop, capped above).
+    graph.add_edge("requirement_gap_fill_node", "spec_reconciler_node")
     graph.add_conditional_edges(
         "batch_planner_node",
         _route_after_batch_planner,

@@ -22,6 +22,7 @@ from harness.cli import (
     _archive_consumed_change_requests,
     _list_pending_change_request_files,
     _resolve_change_requests_dir,
+    _run_requires_pending_change_request,
 )
 from harness.deploy import (
     _build_synthesis_change_request_addendum,
@@ -143,6 +144,37 @@ class TestListPendingChangeRequestFiles:
         result = _list_pending_change_request_files(str(cr_dir))
         # .txt + .md picked up; .json + applied/ skipped; alphabetical.
         assert result == ["alpha.txt", "notes.md", "zeta.txt"]
+
+
+class TestRunRequiresPendingChangeRequest:
+    """Only `teane patch` consumes change requests, so it is the ONLY flow the
+    CR gate can block. Every other target (build/deploy/test, and any future
+    flow) is exempt unconditionally."""
+
+    def test_patch_without_cr_is_blocked(self):
+        assert _run_requires_pending_change_request("patch", False, []) is True
+
+    def test_patch_with_cr_is_allowed(self):
+        assert _run_requires_pending_change_request("patch", False, ["a.txt"]) is False
+
+    def test_patch_with_new_build_is_exempt(self):
+        # Defensive: --new-build uses product_spec_dir, not change_requests/.
+        assert _run_requires_pending_change_request("patch", True, []) is False
+
+    @pytest.mark.parametrize("flow", ["build", "deploy", "test"])
+    def test_non_patch_flows_never_blocked_without_cr(self, flow):
+        # Regression: `teane deploy`/`test`/`build` on a clean workspace must
+        # not demand a change request.
+        assert _run_requires_pending_change_request(flow, False, []) is False
+
+    @pytest.mark.parametrize("flow", ["build", "deploy", "test"])
+    def test_non_patch_flows_ignore_present_crs_too(self, flow):
+        # Presence of CRs is irrelevant for non-patch flows — they never read them.
+        assert _run_requires_pending_change_request(flow, False, ["a.txt"]) is False
+
+    def test_unknown_future_flow_is_exempt(self):
+        # Allowlist semantics: a new flow can't accidentally trip the CR gate.
+        assert _run_requires_pending_change_request("verify", False, []) is False
 
 
 class TestResolveChangeRequestsDir:

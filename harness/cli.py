@@ -5703,6 +5703,34 @@ def _resolve_change_requests_dir(workspace_path: str, config_value: Optional[str
     return os.path.normpath(os.path.join(workspace_path, name))
 
 
+# The one and only flow that consumes change requests. `teane patch` reads
+# every spec file under change_requests/, turns each into a CR-N, and runs it
+# through the gatekeeper. Every other target is exempt: `build` uses
+# product_spec_dir; `deploy` synthesizes artifacts + brings up the dev stack;
+# `test` runs the e2e pack against that stack — none of them read
+# change_requests/, so requiring a CR would wrongly block them.
+_FLOW_CONSUMES_CHANGE_REQUESTS = "patch"
+
+
+def _run_requires_pending_change_request(
+    flow: str,
+    new_build_active: bool,
+    pending_change_requests: list[str],
+) -> bool:
+    """Decide whether a run must abort for lack of a pending change request.
+
+    Only ``teane patch`` consumes change requests, so it is the only flow the
+    gate can block — and only when it is not a fresh ``--new-build`` and no
+    pending CR files exist under ``change_requests/``. All other flows
+    (build/deploy/test) return False unconditionally.
+    """
+    if flow != _FLOW_CONSUMES_CHANGE_REQUESTS:
+        return False
+    if new_build_active:
+        return False
+    return not pending_change_requests
+
+
 def _list_pending_change_request_files(change_requests_dir: str) -> list[str]:
     """Return the sorted list of spec filenames at the top of
     ``change_requests_dir`` (excluding the ``applied/`` archive). Returns
@@ -6928,11 +6956,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # Validate BEFORE initializing checkpointer/gateway/MCP, so early returns
     # don't leave resources hanging and causing cleanup exceptions.
     new_build_active = bool(getattr(args, "new_build", False))
+    flow = getattr(args, "flow", "build")
     cr_dir_abs = _resolve_change_requests_dir(
         workspace_path, config.get("change_requests_dir"),
     )
     pending_change_requests = _list_pending_change_request_files(cr_dir_abs)
-    if not new_build_active and not pending_change_requests:
+    if _run_requires_pending_change_request(
+        flow, new_build_active, pending_change_requests,
+    ):
         print(file=sys.stderr)
         print("=" * 72, file=sys.stderr)
         print(

@@ -2055,14 +2055,16 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     from harness.contract_tests import (
         emit_contract_tests, emit_api_contract_tests, emit_property_tests,
     )
+    from harness.contract_tests_react import emit_react_contract_tests
     # Tier 3 (property-based) is the known-fiddly tier — gated OFF by default
-    # until its false-positive rate is measured (ADR-0003). Tiers 1-2 always on.
+    # until its false-positive rate is measured (ADR-0003). Others always on,
+    # gated on source-language presence rather than the workspace primary.
     _property_based = bool(cfg.get("property_based_tests", False))
     contract_files: list[str] = []
     contract_markers: dict[str, list[str]] = {}
     _contract_covered: list[str] = []
     try:
-        # Tier 1 — schema-declarative unit tests.
+        # Tier 1 — schema-declarative unit tests (Pydantic).
         t1_files, t1_markers = emit_contract_tests(
             workspace_path, source_files, primary,
         )
@@ -2075,15 +2077,21 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             emit_property_tests(workspace_path, source_files, primary)
             if _property_based else ([], {})
         )
-        contract_files = t1_files + t2_files + t3_files
-        contract_markers = {**t1_markers, **t2_markers, **t3_markers}
+        # React tier — component render smoke tests (props-driven components).
+        tr_files, tr_markers = emit_react_contract_tests(
+            workspace_path, source_files, primary,
+        )
+        contract_files = t1_files + t2_files + t3_files + tr_files
+        contract_markers = {
+            **t1_markers, **t2_markers, **t3_markers, **tr_markers,
+        }
         _contract_covered = sorted({
             src for srcs in contract_markers.values() for src in srcs
         })
         if contract_files:
             logger.info(
                 "[test_generation_node] Emitted %d deterministic contract-test "
-                "file(s) (ADR-0003 Tier 1-2%s) covering %s: %s",
+                "file(s) (ADR-0003 Tiers 1-2%s+React) covering %s: %s",
                 len(contract_files), "+3" if _property_based else "",
                 ", ".join(_contract_covered), ", ".join(contract_files),
             )

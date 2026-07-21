@@ -42,6 +42,7 @@
         "max_code_review_cycles": 1,
         "max_discovery_iterations": 1,
         "max_doc_review_cycles": 1,
+        "max_requirement_gap_fill_cycles": 2,
         "max_patch_repair_iterations": 5,
         "max_consecutive_distraction_rounds": 3,
         "max_consecutive_low_signal_rounds": 5,
@@ -215,6 +216,14 @@
         "code_reviewer_mode": "non_thinking",
         "code_reviewer_fallback": "deepseek:deepseek-v4-pro",
         "code_reviewer_fallback_mode": "non_thinking",
+        "decomposition_primary": "deepseek:deepseek-v4-pro",
+        "decomposition_mode": "thinking",
+        "decomposition_fallback": "deepseek:deepseek-v4-pro",
+        "decomposition_fallback_mode": "thinking",
+        "decomposition_reviewer_primary": "",
+        "decomposition_reviewer_mode": "non_thinking",
+        "decomposition_reviewer_fallback": "",
+        "decomposition_reviewer_fallback_mode": "non_thinking",
         "ollama_local_model": "ollama:qwen2.5-coder:14b",
         "ollama_local_backup": "",
         "force_local_only": false
@@ -227,7 +236,9 @@
             "patching": 32768,
             "repair": 32768,
             "doc_reviewer": 32768,
-            "code_reviewer": 32768
+            "code_reviewer": 32768,
+            "decomposition": 32768,
+            "decomposition_reviewer": 8192
         },
         "continue_on_length": {
             "planning": true,

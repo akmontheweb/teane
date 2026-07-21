@@ -810,6 +810,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "max_doc_review_cycles",
         "max_code_review_cycles",
         "max_discovery_iterations",
+        # Requirement gap-fill (P2) — draft→append→reconcile cycle cap.
+        "max_requirement_gap_fill_cycles",
         # Phase G — end-of-session regression repair cap.
         "max_end_of_session_regression_cycles",
         # Phase J — end-of-session repair authority knobs.
@@ -837,6 +839,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "doc_reviewer_fallback_mode",
         "code_reviewer_primary", "code_reviewer_mode", "code_reviewer_fallback",
         "code_reviewer_fallback_mode",
+        # Requirement gap-fill (P2) — two independently-routable roles.
+        "decomposition_primary", "decomposition_mode", "decomposition_fallback",
+        "decomposition_fallback_mode",
+        "decomposition_reviewer_primary", "decomposition_reviewer_mode",
+        "decomposition_reviewer_fallback", "decomposition_reviewer_fallback_mode",
         "ollama_local_model", "ollama_local_backup", "force_local_only",
     }),
     "deployment": frozenset({
@@ -1391,6 +1398,10 @@ _OPTIONAL_ROUTING_FIELDS: tuple[str, ...] = (
     "planning_fallback", "patching_fallback", "repair_fallback",
     "doc_reviewer_primary", "doc_reviewer_fallback",
     "code_reviewer_primary", "code_reviewer_fallback",
+    # Requirement gap-fill (P2). decomposition_primary defaults to
+    # planning_primary; decomposition_reviewer_primary empty == review skipped.
+    "decomposition_primary", "decomposition_fallback",
+    "decomposition_reviewer_primary", "decomposition_reviewer_fallback",
     "ollama_local_model", "ollama_local_backup",
 )
 

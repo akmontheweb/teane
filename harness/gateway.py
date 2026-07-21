@@ -43,6 +43,15 @@ class NodeRole(Enum):
     HUMAN_INTERVENTION = "human_intervention"
     DOC_REVIEWER = "doc_reviewer"
     CODE_REVIEWER = "code_reviewer"
+    # Requirement gap-fill (P2): DECOMPOSITION drafts covering stories for
+    # requirements decomposition left untraced; DECOMPOSITION_REVIEWER reviews
+    # those drafts before they're written into the spec. Two independently-
+    # routable roles so an operator can point generation and review at
+    # different models (config.json model_routing.decomposition_* /
+    # decomposition_reviewer_*). DECOMPOSITION defaults to the planning model
+    # when unconfigured; DECOMPOSITION_REVIEWER empty == review skipped.
+    DECOMPOSITION = "decomposition"
+    DECOMPOSITION_REVIEWER = "decomposition_reviewer"
     # Auxiliary judgment calls (patcher-rejection diagnosis, HITL
     # escalation summary, autofix classification). They reuse the cheap
     # repair model but ship a tiny prompt with no shared system message,
@@ -2199,6 +2208,21 @@ class GatewayConfig:
     code_reviewer_fallback: str = ""
     code_reviewer_fallback_mode: str = ""
     max_code_review_cycles: int = 1
+    # Requirement gap-fill (P2). decomposition_primary is defaulted to
+    # planning_primary at load when left empty, so gap-fill generation always
+    # resolves to a model without extra config. decomposition_reviewer_primary
+    # empty == the review pass is skipped (like doc/code reviewer).
+    decomposition_primary: str = ""
+    decomposition_mode: str = "thinking"
+    decomposition_fallback: str = ""
+    decomposition_fallback_mode: str = ""
+    decomposition_reviewer_primary: str = ""
+    decomposition_reviewer_mode: str = "non_thinking"
+    decomposition_reviewer_fallback: str = ""
+    decomposition_reviewer_fallback_mode: str = ""
+    # Hard ceiling on gap-fill draft→append→reconcile cycles before the
+    # router falls through to the P1 fail-fast END. Clamped [1, 5] at load.
+    max_requirement_gap_fill_cycles: int = 2
     # Hard ceiling on rounds of the discovery interview loop. Without this,
     # a confused user (or hostile LLM) can loop indefinitely on follow-up
     # questions, burning budget. Clamped to [1, 30] at config load.
@@ -2793,6 +2817,14 @@ class Gateway:
             return self.config.doc_reviewer_primary
         elif role == NodeRole.CODE_REVIEWER:
             return self.config.code_reviewer_primary
+        elif role == NodeRole.DECOMPOSITION:
+            # Defaulted to planning_primary at config load when unset, so this
+            # always resolves to a configured model.
+            return self.config.decomposition_primary or self.config.planning_primary
+        elif role == NodeRole.DECOMPOSITION_REVIEWER:
+            # Empty == review not configured; the gap-fill node checks this and
+            # skips the review pass (like doc/code reviewer).
+            return self.config.decomposition_reviewer_primary
         else:
             return self.config.patching_primary  # Default
 
@@ -2812,6 +2844,11 @@ class Gateway:
             return self.config.doc_reviewer_mode.lower() in ("thinking", "thinking_max")
         elif role == NodeRole.CODE_REVIEWER:
             return self.config.code_reviewer_mode.lower() in ("thinking", "thinking_max")
+        elif role == NodeRole.DECOMPOSITION:
+            mode = (self.config.decomposition_mode or self.config.planning_mode).lower()
+            return mode in ("thinking", "thinking_max")
+        elif role == NodeRole.DECOMPOSITION_REVIEWER:
+            return self.config.decomposition_reviewer_mode.lower() in ("thinking", "thinking_max")
         return False
 
     def _max_tokens_for(self, role: NodeRole) -> Optional[int]:
@@ -3648,6 +3685,10 @@ def _validate_routing_keys(
         ("doc_reviewer_fallback", model_routing.get("doc_reviewer_fallback", "")),
         ("code_reviewer_primary", model_routing.get("code_reviewer_primary", "")),
         ("code_reviewer_fallback", model_routing.get("code_reviewer_fallback", "")),
+        ("decomposition_primary", model_routing.get("decomposition_primary", "")),
+        ("decomposition_fallback", model_routing.get("decomposition_fallback", "")),
+        ("decomposition_reviewer_primary", model_routing.get("decomposition_reviewer_primary", "")),
+        ("decomposition_reviewer_fallback", model_routing.get("decomposition_reviewer_fallback", "")),
         ("ollama_local_model", model_routing.get("ollama_local_model", "")),
         ("ollama_local_backup", model_routing.get("ollama_local_backup", "")),
     ]
@@ -4090,6 +4131,22 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         code_reviewer_fallback=model_routing.get("code_reviewer_fallback", ""),
         code_reviewer_fallback_mode=_fallback_mode("code_reviewer", "thinking"),
         max_code_review_cycles=_clamp_cycles(node_throttle.get("max_code_review_cycles", 1), 1),
+        # Requirement gap-fill (P2). decomposition_primary defaults to
+        # planning_primary so it always resolves without extra config.
+        decomposition_primary=(
+            model_routing.get("decomposition_primary", "")
+            or model_routing.get("planning_primary", "")
+        ),
+        decomposition_mode=_mode("decomposition", _mode("planning", "thinking_max")),
+        decomposition_fallback=model_routing.get("decomposition_fallback", ""),
+        decomposition_fallback_mode=_fallback_mode("decomposition", "thinking"),
+        decomposition_reviewer_primary=model_routing.get("decomposition_reviewer_primary", ""),
+        decomposition_reviewer_mode=_mode("decomposition_reviewer", "non_thinking"),
+        decomposition_reviewer_fallback=model_routing.get("decomposition_reviewer_fallback", ""),
+        decomposition_reviewer_fallback_mode=_fallback_mode("decomposition_reviewer", "non_thinking"),
+        max_requirement_gap_fill_cycles=max(1, min(5, int(
+            node_throttle.get("max_requirement_gap_fill_cycles", 2) or 2
+        ))),
         max_discovery_iterations=_clamp_discovery_iterations(
             node_throttle.get("max_discovery_iterations", 10)
         ),

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -1219,22 +1220,76 @@ def link_test_to_ac(
 # Traceability audit queries (v5) — called by harness/traceability.py
 # ---------------------------------------------------------------------------
 
+# Parent marker in a requirement body — a story names its parent feature
+# ("**Parent feature:** FEAT-001"), a feature names its parent epic
+# ("**Parent epic:** EPIC-001"). Case-insensitive so a spec that capitalizes
+# "Feature"/"Epic" still rolls up. Captures the parent req_key either way.
+_PARENT_MARKER_RE = re.compile(
+    r"\*\*Parent (?:feature|epic):\*\*\s*([A-Za-z0-9_-]+)", re.IGNORECASE,
+)
+
+
 def requirements_without_satisfying_story(
     conn: sqlite3.Connection, workspace: str,
 ) -> list[dict[str, Any]]:
     """Requirements that no story satisfies — the untraced-FR gap set.
     Used by the SQL audit replacing the old text-grep at
     ``harness/traceability.py``.
+
+    Coverage rolls UP the requirement hierarchy: a parent requirement is
+    satisfied when any descendant is. The parent chain is read from the
+    requirements' own bodies — a story requirement names its
+    ``**Parent feature:**``, a feature names its ``**Parent epic:**`` — and
+    coverage propagates from directly-satisfied requirements up to the fixed
+    point. So a feature whose child stories are covered is covered, and its
+    epic in turn.
+
+    This runs on the READ path against the requirements table's own parent
+    markers, deliberately NOT the ``features`` / ``stories.feature_id`` tables:
+    lumina 019f82af showed those can be inconsistent (all stories were parked
+    under a synthetic ``PLATFORM`` feature; FEAT-001 / FEAT-002 existed only as
+    requirement rows with no structured story link), so FEAT-001 / FEAT-002
+    read as untraced and blocked the build with exit_code=1 even though five
+    stories covered them. Rolling up via the in-row parent markers is robust
+    to whichever transitive links the reconciler did or didn't write.
     """
-    rows = conn.execute(
+    all_rows = conn.execute(
         f"SELECT {_REQUIREMENT_COLS} FROM requirements r "
-        "WHERE r.workspace = ? AND NOT EXISTS ("
-        "  SELECT 1 FROM story_satisfies_req ssr "
-        "  WHERE ssr.requirement_id = r.id"
-        ") ORDER BY r.id",
+        "WHERE r.workspace = ? ORDER BY r.id",
         (workspace,),
     ).fetchall()
-    return [_row_to_requirement(r) for r in rows]
+    if not all_rows:
+        return []
+    reqs = [_row_to_requirement(r) for r in all_rows]
+
+    # req_keys with a direct satisfying-story link.
+    covered: set[str] = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT rq.req_key FROM story_satisfies_req ssr "
+            "JOIN requirements rq ON rq.id = ssr.requirement_id "
+            "WHERE rq.workspace = ?",
+            (workspace,),
+        ).fetchall()
+    }
+    # child req_key -> parent req_key, from the in-row parent markers.
+    parent_of: dict[str, str] = {}
+    for req in reqs:
+        m = _PARENT_MARKER_RE.search(req["body"] or "")
+        if m:
+            parent_of[req["req_key"]] = m.group(1)
+
+    # Propagate coverage upward to the fixed point: any covered child marks
+    # its parent covered, transitively (story → feature → epic).
+    changed = True
+    while changed:
+        changed = False
+        for child, parent in parent_of.items():
+            if child in covered and parent not in covered:
+                covered.add(parent)
+                changed = True
+
+    return [req for req in reqs if req["req_key"] not in covered]
 
 
 def acs_without_verifying_test(

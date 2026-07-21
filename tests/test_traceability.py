@@ -133,6 +133,87 @@ def test_unsatisfied_requirement_surfaces_as_untraced(workspace: str, app: str):
     assert report.has_failures() is True
 
 
+# ---------------------------------------------------------------------------
+# Hierarchical coverage rollup (lumina 019f82af)
+#
+# A parent requirement is satisfied when a descendant is. The parent chain is
+# read from the requirements' own bodies (a story names its **Parent
+# feature:**, a feature its **Parent epic:**), so a feature whose child
+# stories are covered is covered — even when no DIRECT story→feature link was
+# ever written. lumina left FEAT-001/FEAT-002 falsely untraced and blocked the
+# build though five stories covered them.
+# ---------------------------------------------------------------------------
+def test_feature_covered_via_child_story_rollup(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "FEAT-001", "kind": "feat", "title": "Covered feature",
+             "body": "**Parent epic:** EPIC-001"},
+            {"req_key": "FEAT-002", "kind": "feat", "title": "Empty feature",
+             "body": "**Parent epic:** EPIC-001"},
+            # the child story is itself a requirement row (SAFe convention),
+            # covered only by its identity link — never a direct FEAT link.
+            {"req_key": "STORY-001", "kind": "safe_story", "title": "Add thing",
+             "body": "**Parent feature:** FEAT-001"},
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app, title="Add thing")
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(conn, app, sid, ["STORY-001"])
+    finally:
+        conn.close()
+
+    report = audit_workspace(workspace)
+    # FEAT-001 rolls up from its covered child STORY-001; FEAT-002 has no
+    # covered descendant and stays untraced.
+    assert [u.req_id for u in report.untraced] == ["FEAT-002"]
+
+
+def test_epic_rollup_is_transitive(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "EPIC-001", "kind": "epic", "title": "Epic"},
+            {"req_key": "FEAT-001", "kind": "feat", "title": "Feature",
+             "body": "**Parent epic:** EPIC-001"},
+            {"req_key": "STORY-001", "kind": "safe_story", "title": "Story",
+             "body": "**Parent feature:** FEAT-001"},
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app, title="Story")
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(conn, app, sid, ["STORY-001"])
+    finally:
+        conn.close()
+
+    # story → feature → epic all roll up from the single identity link.
+    assert audit_workspace(workspace).untraced == []
+
+
+def test_rollup_parent_marker_is_case_insensitive(workspace: str, app: str):
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_requirements(conn, app, [
+            {"req_key": "FEAT-001", "kind": "feat", "title": "Feature"},
+            {"req_key": "STORY-001", "kind": "safe_story", "title": "Story",
+             "body": "**Parent Feature:** FEAT-001"},  # capital F
+        ])
+    finally:
+        conn.close()
+    sid = _seed_story_with_ac(app, title="Story")
+    conn = story_state.open_story_db()
+    try:
+        story_state.link_story_to_requirements(conn, app, sid, ["STORY-001"])
+    finally:
+        conn.close()
+
+    assert audit_workspace(workspace).untraced == []
+
+
 def test_nfr_and_cr_synthetic_kinds_preserved(workspace: str, app: str):
     conn = story_state.open_story_db()
     try:

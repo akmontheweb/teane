@@ -80,7 +80,13 @@ _STORY_RE = re.compile(
 )
 
 # ``**Parent feature:** FEAT-001``
-_PARENT_FEAT_RE = re.compile(r"\*\*Parent feature:\*\*\s+(FEAT-\d+)")
+# Case-insensitive: a spec that capitalizes "Feature" must still link its
+# stories to the parent feature. When this silently returned None the
+# story→feature edge was never written and the feature read as untraced
+# (the audit now also rolls coverage up structurally — see
+# story_state.requirements_without_satisfying_story — but the direct edge
+# should still be populated).
+_PARENT_FEAT_RE = re.compile(r"\*\*Parent feature:\*\*\s+(FEAT-\d+)", re.IGNORECASE)
 
 # ``**Parent epic:** EPIC-001`` — declared inside a feature body.
 # Used by the reconciler to write ``story_satisfies_req`` edges from

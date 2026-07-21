@@ -24848,6 +24848,9 @@ def build_graph() -> Any:
     from harness.gap_fill import (
         requirement_gap_fill_node as _requirement_gap_fill_node,
     )
+    from harness.semantic_review import (
+        semantic_coverage_review_node as _semantic_coverage_review_node,
+    )
     from harness.story_loop import (
         batch_planner_node as _batch_planner_node,
         story_loop_node as _story_loop_node,
@@ -24869,6 +24872,9 @@ def build_graph() -> Any:
     # Requirement gap-fill (P2): drafts covering stories for uncovered
     # features, appends them to the spec, and hands back to the reconciler.
     graph.add_node("requirement_gap_fill_node", _requirement_gap_fill_node)  # type: ignore[type-var]
+    # Semantic coverage review (P3): adversarial check that each feature's
+    # stories actually satisfy its intent. Off unless traceability.semantic_review.
+    graph.add_node("semantic_coverage_review_node", _semantic_coverage_review_node)  # type: ignore[type-var]
     graph.add_node("batch_planner_node", _batch_planner_node)  # type: ignore[type-var]
     graph.add_node("story_loop_node", _story_loop_node)  # type: ignore[type-var]
     # Phase F removed ``story_test_first_node``. Its xfail-stub
@@ -25154,6 +25160,11 @@ def build_graph() -> Any:
                 "See the gap report above.", cycles, gap_fill_enabled,
             )
             return END
+        # Coverage is deterministically complete. Optionally run the P3
+        # adversarial semantic-coverage review before handing to the gate.
+        tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+        if bool(tr_cfg.get("semantic_review", False)):
+            return "semantic_coverage_review_node"
         return "human_gatekeeper_node"
 
     graph.add_conditional_edges(
@@ -25163,12 +25174,35 @@ def build_graph() -> Any:
             "human_gatekeeper_node": "human_gatekeeper_node",
             "human_intervention_node": "human_intervention_node",
             "requirement_gap_fill_node": "requirement_gap_fill_node",
+            "semantic_coverage_review_node": "semantic_coverage_review_node",
             END: END,
         },
     )
     # Gap-fill hands back to the reconciler, which re-reconciles from the
     # updated spec and re-checks coverage (closing the loop, capped above).
     graph.add_edge("requirement_gap_fill_node", "spec_reconciler_node")
+
+    def route_after_semantic_review(state: AgentState) -> str:
+        """Semantic review → STORIES gate, unless it flagged an enforced
+        semantic-coverage gap, in which case END with exit_code=1 (the fix is
+        an upstream spec revision, same as the deterministic gate)."""
+        from langgraph.graph import END
+        ns = state.get("node_state", {}) or {}
+        if ns.get("semantic_coverage_gap"):
+            logger.warning(
+                "[router] enforced semantic-coverage gap; failing fast to END "
+                "with exit_code=1. See the semantic-gap report above.")
+            return END
+        return "human_gatekeeper_node"
+
+    graph.add_conditional_edges(
+        "semantic_coverage_review_node",
+        route_after_semantic_review,
+        {
+            "human_gatekeeper_node": "human_gatekeeper_node",
+            END: END,
+        },
+    )
     graph.add_conditional_edges(
         "batch_planner_node",
         _route_after_batch_planner,

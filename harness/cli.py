@@ -988,6 +988,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # P2 — automated requirement gap-fill (draft a covering story, append
         # to the spec, re-reconcile) before the P1 fail-fast. Default true.
         "gap_fill",
+        # P3 — adversarial semantic-coverage review: does each feature's
+        # stories actually satisfy its intent (vs. just cite it)? Off by
+        # default; _enforce blocks the build on a finding instead of warning.
+        "semantic_review", "semantic_review_enforce",
     }),
     "fanout": frozenset({
         "max_concurrency",

@@ -995,16 +995,46 @@ class TestExcludePathsPolicy:
         assert "docs" in p.exclude_paths
         assert "product_spec" in p.exclude_paths
 
+    def test_dependency_dirs_always_excluded(self):
+        # Regression (session 019f85c6): a `teane deploy` created a `.venv/`
+        # in the workspace; bandit/semgrep scanned it and flagged 5 HIGH
+        # findings inside installed packages (weak SHA1/MD5 in
+        # httpx/sqlalchemy/websockets, os.popen in a vendored test file).
+        # Those paths are outside the patcher's allowlist, so every fix
+        # bounced — an unbreakable security HITL ping-pong that burned the
+        # run. Dependency/build dirs must ALWAYS be excluded, on every
+        # construction path.
+        for policy in (
+            SecurityScanPolicy(),
+            SecurityScanPolicy.from_config({}),
+            SecurityScanPolicy(exclude_paths=("custom",)),
+        ):
+            for d in (".venv", "venv", "node_modules", "__pycache__", "dist", "build"):
+                assert d in policy.exclude_paths, (d, policy.exclude_paths)
+
+    def test_always_ignore_dirs_deduped_not_doubled(self):
+        # An operator who lists .venv themselves must not get it twice.
+        p = SecurityScanPolicy.from_config({"exclude_paths": [".venv", "docs"]})
+        assert p.exclude_paths.count(".venv") == 1
+
     def test_from_config_overrides_default_excludes(self):
         p = SecurityScanPolicy.from_config({"exclude_paths": ["fixtures", "examples"]})
-        assert p.exclude_paths == ("fixtures", "examples")
-        # The defaults are NOT merged in — explicit list is authoritative.
+        # The configurable docs/product_spec default is replaced by the
+        # explicit list, but the always-ignore dependency dirs are appended.
+        assert p.exclude_paths[:2] == ("fixtures", "examples")
         assert "docs" not in p.exclude_paths
+        assert ".venv" in p.exclude_paths and "node_modules" in p.exclude_paths
 
-    def test_from_config_empty_list_disables_excludes(self):
-        # Operator who genuinely wants to scan docs/ can opt in.
+    def test_from_config_empty_list_disables_configurable_excludes_only(self):
+        # An operator who genuinely wants to scan docs/ can opt in with [] —
+        # but dependency dirs (.venv/node_modules/...) are STILL excluded:
+        # SAST-ing a virtualenv only produces unfixable library-internal
+        # findings (the security HITL ping-pong this guards against).
         p = SecurityScanPolicy.from_config({"exclude_paths": []})
-        assert p.exclude_paths == ()
+        assert "docs" not in p.exclude_paths
+        assert "product_spec" not in p.exclude_paths
+        assert ".venv" in p.exclude_paths
+        assert "node_modules" in p.exclude_paths
 
     def test_from_config_missing_key_uses_default(self):
         # Legacy config: untouched policies still get the safe default.

@@ -1085,6 +1085,23 @@ _DEFAULT_SCANNERS: tuple[str, ...] = ("gitleaks", "bandit", "semgrep", "trivy")
 # scope: code is in roots[].path; everything else is documentation.
 _DEFAULT_EXCLUDE_PATHS: tuple[str, ...] = ("docs", "product_spec")
 
+# Dependency, build-output, and VCS directories that are NEVER the
+# application's own source: installed packages, vendored deps, compiler
+# output, tool caches. SAST scanners (bandit/semgrep) flag stdlib patterns
+# *inside* these — weak SHA1/MD5 in httpx/sqlalchemy/websockets, os.popen in
+# a vendored test file, tarfile.extractall in a pygments data table — as
+# HIGH severity. Those paths live outside the patcher's spec-driven
+# allowlist, so every attempted fix bounces, producing an unbreakable
+# security HITL ping-pong that burns the whole run. These are ALWAYS
+# excluded, on top of the configurable ``exclude_paths`` (which an operator
+# may even set to ``[]`` to scan docs) — there is no legitimate reason to
+# SAST a virtualenv or node_modules, so this exclusion is not overridable.
+_ALWAYS_IGNORE_DIRS: tuple[str, ...] = (
+    ".venv", "venv", "node_modules", "vendor", ".git", "__pycache__",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "build", "dist", "target", ".next", ".nuxt", ".svelte-kit",
+)
+
 # Multiplier on `max_security_fix_attempts`. When the same finding has
 # survived (max_attempts × this) trips through compile → security_scan →
 # HITL → resume, the loop is thrashing — terminate the run rather than
@@ -1130,6 +1147,18 @@ class SecurityScanPolicy:
     allowlist_rules: frozenset[str] = frozenset()
     max_findings_to_route_to_repair: int = 10
     exclude_paths: tuple[str, ...] = _DEFAULT_EXCLUDE_PATHS
+
+    def __post_init__(self) -> None:
+        # Fold the always-ignored dependency/build dirs into exclude_paths at
+        # a single chokepoint, so every scanner invocation and the post-hoc
+        # finding filter (all of which read ``policy.exclude_paths``) inherit
+        # them regardless of how the policy was constructed — from_config,
+        # direct instantiation, or test fixtures. Order-preserving dedup so
+        # an operator-listed path is not duplicated. See _ALWAYS_IGNORE_DIRS
+        # for why a virtualenv must never be SAST-scanned.
+        self.exclude_paths = tuple(
+            dict.fromkeys((*self.exclude_paths, *_ALWAYS_IGNORE_DIRS))
+        )
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "SecurityScanPolicy":

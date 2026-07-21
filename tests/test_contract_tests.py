@@ -317,3 +317,60 @@ class TestEmitApiToDisk:
         assert emit_api_contract_tests(
             str(tmp_path), ["app/main.py"], "typescript",
         ) == ([], {})
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — property-based round-trip invariants
+# ---------------------------------------------------------------------------
+
+from harness.contract_tests import emit_property_tests, render_property_test  # noqa: E402
+
+
+class TestPropertyTier:
+    def test_plain_scalar_model_gets_roundtrip(self):
+        models = parse_pydantic_models(_PLAIN_MODEL, rel_path="app/w.py")
+        body = render_property_test(models, source_rel="app/w.py")
+        assert body is not None
+        assert 'pytest.importorskip("hypothesis")' in body
+        assert "from hypothesis import given, strategies as st" in body
+        assert "def test_widget_roundtrip(" in body
+        # strategies honour declared constraints
+        assert "st.text(max_size=10)" in body
+        assert "st.integers(min_value=0, max_value=100)" in body
+        assert "st.none() | st.text(max_size=200)" in body  # Optional note
+        assert "Widget(**obj.model_dump()) == obj" in body
+
+    def test_validator_and_alias_models_skipped(self):
+        # validators (imperative) → skip
+        assert render_property_test(
+            parse_pydantic_models(_VALIDATOR_MODEL), source_rel="a.py",
+        ) is None
+        # alias → field-name round-trip would break → skip
+        aliased = (
+            "from pydantic import BaseModel, Field\n"
+            "class A(BaseModel):\n"
+            "    x: str = Field(alias='X')\n"
+        )
+        assert render_property_test(
+            parse_pydantic_models(aliased), source_rel="a.py",
+        ) is None
+
+    def test_non_scalar_field_skips_model(self):
+        src = (
+            "from pydantic import BaseModel\n"
+            "class Holder(BaseModel):\n"
+            "    items: list\n"   # no scalar strategy → skip
+        )
+        assert render_property_test(
+            parse_pydantic_models(src), source_rel="h.py",
+        ) is None
+
+    def test_emit_writes_property_file(self, tmp_path):
+        p = tmp_path / "app" / "w.py"
+        p.parent.mkdir(parents=True)
+        p.write_text(_PLAIN_MODEL)
+        written, markers = emit_property_tests(
+            str(tmp_path), ["app/w.py"], "python",
+        )
+        assert written == ["tests/contract/test_w_property.py"]
+        assert markers["tests/contract/test_w_property.py"] == ["app/w.py"]

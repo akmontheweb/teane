@@ -48,6 +48,9 @@ __all__ = [
     "parse_fastapi_routes",
     "render_api_contract_test",
     "emit_api_contract_tests",
+    # Tier 3 — property-based structural invariants
+    "render_property_test",
+    "emit_property_tests",
 ]
 
 # Pydantic base classes we recognise as "this is a validated model". Kept
@@ -68,6 +71,7 @@ class FieldSpec:
     required: bool                       # non-Optional AND no default
     constraints: dict[str, object] = field(default_factory=dict)
     has_custom_validator: bool = False   # a @field_validator targets this field
+    has_alias: bool = False              # Field(alias=...) — breaks field-name round-trip
 
 
 @dataclass(frozen=True)
@@ -122,15 +126,21 @@ def _base_type(type_str: str) -> str:
     return t.strip()
 
 
-def _extract_field_call_constraints(value: ast.expr) -> tuple[dict[str, object], bool]:
-    """Return (constraints, has_default) from a field's RHS.
+def _extract_field_call_constraints(
+    value: ast.expr,
+) -> tuple[dict[str, object], bool, bool]:
+    """Return ``(constraints, has_default, has_alias)`` from a field's RHS.
 
-    Recognises ``Field(default, max_length=.., ge=.., ...)``. ``has_default``
-    is True when a default value is expressed (first positional arg that isn't
-    ``...``, or a ``default=``/``default_factory=`` kw, or a bare literal RHS).
+    Recognises ``Field(default, max_length=.., ge=.., alias=..)``.
+    ``has_default`` is True when a default is expressed (first positional arg
+    that isn't ``...``, a ``default=``/``default_factory=`` kw, or a bare
+    literal RHS). ``has_alias`` is True for any ``alias``/``validation_alias``/
+    ``serialization_alias`` kw — those break the field-name round-trip Tier 3
+    relies on, so a model with one is skipped there.
     """
     constraints: dict[str, object] = {}
     has_default = False
+    has_alias = False
     if isinstance(value, ast.Call) and _call_name(value) == "Field":
         # positional default: Field(default, ...) — Ellipsis means "required"
         if value.args:
@@ -140,6 +150,8 @@ def _extract_field_call_constraints(value: ast.expr) -> tuple[dict[str, object],
         for kw in value.keywords:
             if kw.arg in ("default", "default_factory"):
                 has_default = True
+            elif kw.arg in ("alias", "validation_alias", "serialization_alias"):
+                has_alias = True
             elif kw.arg in _LEN_CONSTRAINTS + _NUM_CONSTRAINTS:
                 lit = _literal(kw.value)
                 if lit is not None:
@@ -149,7 +161,7 @@ def _extract_field_call_constraints(value: ast.expr) -> tuple[dict[str, object],
     ):
         # Bare default: ``x: int = 5`` — a real default value present.
         has_default = True
-    return constraints, has_default
+    return constraints, has_default, has_alias
 
 
 def _call_name(node: ast.Call) -> Optional[str]:
@@ -249,7 +261,10 @@ def parse_pydantic_models(source: str, *, rel_path: str = "") -> list[ModelSpec]
             if fname.startswith("_") or fname == "model_config":
                 continue
             type_str = _ann_to_str(item.annotation)
-            constraints, has_default = _extract_field_call_constraints(item.value) if item.value is not None else ({}, False)
+            if item.value is not None:
+                constraints, has_default, has_alias = _extract_field_call_constraints(item.value)
+            else:
+                constraints, has_default, has_alias = {}, False, False
             required = not _is_optional(type_str) and not has_default
             fields.append(FieldSpec(
                 name=fname,
@@ -257,6 +272,7 @@ def parse_pydantic_models(source: str, *, rel_path: str = "") -> list[ModelSpec]
                 required=required,
                 constraints=constraints,
                 has_custom_validator=fname in validator_fields,
+                has_alias=has_alias,
             ))
         if fields:
             out.append(ModelSpec(
@@ -834,6 +850,171 @@ def emit_api_contract_tests(
         if not body:
             continue
         out_rel = _api_contract_test_rel_path(rel)
+        out_abs = os.path.join(workspace_path, out_rel)
+        if os.path.exists(out_abs):
+            markers[out_rel] = [rel]
+            continue
+        try:
+            os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+            with open(out_abs, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError:
+            continue
+        written.append(out_rel)
+        markers[out_rel] = [rel]
+    return written, markers
+
+
+# ===========================================================================
+# Tier 3 — property-based structural invariants (ADR-0003)
+#
+# Derives Hypothesis strategies from field types + declarative constraints and
+# asserts a STRUCTURAL invariant that holds regardless of business logic: a
+# validated instance survives a model_dump() → reconstruct round-trip
+# unchanged. Deliberately NOT value-correctness (Tier 4's job).
+#
+# The known-fiddly tier — false positives (a legitimate model quirk failing
+# the property) would block a build, so this ships config-gated, default OFF
+# (test_generation.contract_tests.property_based), and is aggressively
+# conservative: a model is skipped unless EVERY field is a plain scalar
+# (str/int/float/bool or Optional thereof) with a mappable strategy, no
+# custom/model validator, and no alias. The generated file does
+# ``pytest.importorskip("hypothesis")`` so it skips (not errors) where the
+# dependency is absent.
+# ===========================================================================
+
+def _hypothesis_strategy(fs: "FieldSpec") -> Optional[str]:
+    """A Hypothesis strategy expression for a field, or None when its type
+    isn't safely mappable (→ skip the whole model)."""
+    base = _base_type(fs.type_str)
+    c = fs.constraints
+    inner: Optional[str] = None
+    if base == "str":
+        kw: list[str] = []
+        if isinstance(c.get("min_length"), (int, float)):
+            kw.append(f"min_size={int(c['min_length'])}")
+        max_l = c.get("max_length")
+        kw.append(f"max_size={int(max_l)}" if isinstance(max_l, (int, float)) else "max_size=200")
+        inner = f"st.text({', '.join(kw)})"
+    elif base == "int":
+        kw = []
+        if isinstance(c.get("ge"), (int, float)):
+            kw.append(f"min_value={int(c['ge'])}")
+        elif isinstance(c.get("gt"), (int, float)):
+            kw.append(f"min_value={int(c['gt']) + 1}")
+        if isinstance(c.get("le"), (int, float)):
+            kw.append(f"max_value={int(c['le'])}")
+        elif isinstance(c.get("lt"), (int, float)):
+            kw.append(f"max_value={int(c['lt']) - 1}")
+        inner = f"st.integers({', '.join(kw)})"
+    elif base == "float":
+        kw = ["allow_nan=False", "allow_infinity=False"]
+        if isinstance(c.get("ge"), (int, float)):
+            kw.append(f"min_value={float(c['ge'])}")
+        if isinstance(c.get("le"), (int, float)):
+            kw.append(f"max_value={float(c['le'])}")
+        inner = f"st.floats({', '.join(kw)})"
+    elif base == "bool":
+        inner = "st.booleans()"
+    else:
+        return None
+    if _is_optional(fs.type_str):
+        inner = f"st.none() | {inner}"
+    return inner
+
+
+def _property_testable(model: "ModelSpec") -> Optional[dict[str, str]]:
+    """Field-name → strategy expression for a model whose round-trip is a safe
+    structural invariant, or None when the model must be skipped."""
+    if model.has_model_validator:
+        return None
+    strategies: dict[str, str] = {}
+    for fs in model.fields:
+        if fs.has_custom_validator or fs.has_alias:
+            return None
+        strat = _hypothesis_strategy(fs)
+        if strat is None:
+            return None
+        strategies[fs.name] = strat
+    return strategies or None
+
+
+_PROP_HEADER = (
+    "# @tests: {source}\n"
+    '"""Property-based contract tests for {source} (ADR-0003 Tier 3).\n\n'
+    "Structural invariant only — a valid instance survives a model_dump() →\n"
+    "reconstruct round-trip unchanged, for any generated input. Value-\n"
+    "correctness and business rules are the LLM tier's job.\n"
+    '"""\n'
+    "import pytest\n"
+    'pytest.importorskip("hypothesis")\n'
+    "from hypothesis import given, strategies as st\n"
+    "from {module} import {names}\n\n\n"
+)
+
+
+def render_property_test(
+    models: list["ModelSpec"], *, source_rel: str,
+) -> Optional[str]:
+    """Render the property-test file for ``models``, or None if none qualify."""
+    testable: list[tuple[ModelSpec, dict[str, str]]] = []
+    for m in models:
+        strategies = _property_testable(m)
+        if strategies is None:
+            continue
+        testable.append((m, strategies))
+    if not testable:
+        return None
+    module = testable[0][0].module_import or _module_dotted(source_rel)
+    names = ", ".join(sorted({m.name for m, _ in testable}))
+    parts = [_PROP_HEADER.format(source=source_rel, module=module, names=names)]
+    for m, strategies in testable:
+        given_kwargs = ", ".join(f"{k}={v}" for k, v in strategies.items())
+        params = ", ".join(strategies)
+        ctor_kwargs = ", ".join(f"{k}={k}" for k in strategies)
+        parts.append(
+            f"@given({given_kwargs})\n"
+            f"def test_{_snake(m.name)}_roundtrip({params}):\n"
+            f"    obj = {m.name}({ctor_kwargs})\n"
+            f"    assert {m.name}(**obj.model_dump()) == obj\n\n"
+        )
+    return "".join(parts)
+
+
+def _property_test_rel_path(source_rel: str) -> str:
+    stem = os.path.splitext(os.path.basename(source_rel))[0]
+    return os.path.join("tests", "contract", f"test_{stem}_property.py")
+
+
+def emit_property_tests(
+    workspace_path: str,
+    source_files: list[str],
+    primary_stack: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Write property-based round-trip test files for the Pydantic models in
+    ``source_files``. Returns ``(rel_paths_written, tests_markers_by_file)``.
+
+    Python-only; idempotent; best-effort. Gated by the caller (default off);
+    this function itself just emits when asked. Conservative model selection
+    lives in :func:`_property_testable`.
+    """
+    if primary_stack != "python":
+        return [], {}
+    written: list[str] = []
+    markers: dict[str, list[str]] = {}
+    for rel in source_files:
+        if not rel.endswith(".py") or _looks_like_test(rel):
+            continue
+        src = _read_text(os.path.join(workspace_path, rel))
+        if src is None:
+            continue
+        models = parse_pydantic_models(src, rel_path=rel)
+        if not models:
+            continue
+        body = render_property_test(models, source_rel=rel)
+        if not body:
+            continue
+        out_rel = _property_test_rel_path(rel)
         out_abs = os.path.join(workspace_path, out_rel)
         if os.path.exists(out_abs):
             markers[out_rel] = [rel]

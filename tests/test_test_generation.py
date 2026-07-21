@@ -778,6 +778,59 @@ class TestContractTestTier:
         assert "tests/contract/test_api_api_contract.py" in result["generated_tests"]
 
     @pytest.mark.asyncio
+    async def test_property_tests_gated_off_by_default(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "models.py").write_text(self._MODEL)
+        stub_gateway(
+            "<<<CREATE_FILE>>>\nfile: tests/t.py\ncontent:\n"
+            "# @tests: app/models.py\ndef test_x(): assert True\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "ok\n")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["app/models.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+        # Tier 1 file lands; Tier 3 (property) does NOT without the flag.
+        assert (tmp_path / "tests/contract/test_models_contract.py").is_file()
+        assert not (tmp_path / "tests/contract/test_models_property.py").exists()
+        assert not any("property" in f for f in result["generated_tests"])
+
+    @pytest.mark.asyncio
+    async def test_property_tests_emitted_when_flag_on(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "models.py").write_text(self._MODEL)
+        stub_gateway(
+            "<<<CREATE_FILE>>>\nfile: tests/t.py\ncontent:\n"
+            "# @tests: app/models.py\ndef test_x(): assert True\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "ok\n")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["app/models.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+            "test_generation_config": {"property_based_tests": True},
+        })
+        prop = tmp_path / "tests/contract/test_models_property.py"
+        assert prop.is_file()
+        body = prop.read_text()
+        assert 'pytest.importorskip("hypothesis")' in body
+        assert "test_widget_roundtrip" in body
+        assert "tests/contract/test_models_property.py" in result["generated_tests"]
+
+    @pytest.mark.asyncio
     async def test_no_pydantic_models_no_contract_file(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):

@@ -1,6 +1,6 @@
 # ADR-0003: Hybrid Deterministic + LLM Unit-Test Generation
 
-**Status:** Accepted (Tiers 1–2 shipped for Python; Tier 3 + TS phased — see Action Items)
+**Status:** Accepted (Tiers 1–3 shipped for Python, Tier 3 opt-in; TS stack phased — see Action Items)
 **Date:** 2026-07-20
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention)
@@ -226,11 +226,18 @@ persuasion (RULE 6/7) and detection (the contradiction gate) are replaced by
        param), emitted AST-only, executed via ``TestClient`` in the sandbox.
        Verified against lumina's real app (3/3 pass). Success-path codes and
        404-on-missing stay Tier 4 (need live state).
-4. [ ] **Tier 3 (property-based)** — Hypothesis strategies from type hints;
-       structural invariants only; config-gated, default off; false-positive
-       telemetry.
-5. [ ] **Config block** `test_generation.contract_tests`
-       (`enabled`, `tiers`, `property_based=false`) + validation + form schema.
+4. [x] **Tier 3 (property-based)** — Hypothesis strategies from type hints +
+       declarative constraints; a model_dump() → reconstruct round-trip
+       invariant; config-gated (`test_generation.property_based_tests`,
+       default off); conservative model selection (scalar fields only, no
+       validators/aliases); generated file does `pytest.importorskip
+       ("hypothesis")` so it skips where the dep is absent. Verified against
+       lumina's ContactResponse (round-trip holds across generated inputs).
+5. [x] **Config** `test_generation.property_based_tests` (bool, default false)
+       + type-validation + form-schema registration. (Flat key rather than the
+       originally-sketched nested `contract_tests.property_based` — fits the
+       one-level nested-key infra and the dashboard renderability contract.)
+   [ ] Tier-3 false-positive telemetry before considering default-on.
 6. [ ] **Measure** — use the ADR-0002/incident telemetry `test_share` before
        and after to confirm the contract-derivable incident class drops.
 7. [ ] **TS stack** — zod schema + TS route contracts (Tiers 1–2 for TS).

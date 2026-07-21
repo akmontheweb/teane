@@ -2053,8 +2053,11 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # construction declarative tests land regardless of what the LLM emits.
     # Conservative: validator-bearing models are skipped (left to the LLM).
     from harness.contract_tests import (
-        emit_contract_tests, emit_api_contract_tests,
+        emit_contract_tests, emit_api_contract_tests, emit_property_tests,
     )
+    # Tier 3 (property-based) is the known-fiddly tier — gated OFF by default
+    # until its false-positive rate is measured (ADR-0003). Tiers 1-2 always on.
+    _property_based = bool(cfg.get("property_based_tests", False))
     contract_files: list[str] = []
     contract_markers: dict[str, list[str]] = {}
     _contract_covered: list[str] = []
@@ -2067,17 +2070,22 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         t2_files, t2_markers = emit_api_contract_tests(
             workspace_path, source_files, primary,
         )
-        contract_files = t1_files + t2_files
-        contract_markers = {**t1_markers, **t2_markers}
+        # Tier 3 — property-based round-trip invariants (opt-in).
+        t3_files, t3_markers = (
+            emit_property_tests(workspace_path, source_files, primary)
+            if _property_based else ([], {})
+        )
+        contract_files = t1_files + t2_files + t3_files
+        contract_markers = {**t1_markers, **t2_markers, **t3_markers}
         _contract_covered = sorted({
             src for srcs in contract_markers.values() for src in srcs
         })
         if contract_files:
             logger.info(
                 "[test_generation_node] Emitted %d deterministic contract-test "
-                "file(s) (ADR-0003 Tier 1+2) covering %s: %s",
-                len(contract_files), ", ".join(_contract_covered),
-                ", ".join(contract_files),
+                "file(s) (ADR-0003 Tier 1-2%s) covering %s: %s",
+                len(contract_files), "+3" if _property_based else "",
+                ", ".join(_contract_covered), ", ".join(contract_files),
             )
     except Exception as _ct_exc:  # noqa: BLE001 — deterministic tier is best-effort
         logger.warning(

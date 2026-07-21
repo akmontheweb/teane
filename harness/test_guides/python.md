@@ -9,6 +9,7 @@ Write pytest-style unit tests for the Python source files just modified. Tests e
 ### File placement
 - Project root tests directory is `tests/`. If a package layout uses `src/<pkg>/`, mirror it as `tests/<pkg>/`.
 - One test file per source file, named `test_<module>.py`.
+- **Exactly ONE Python tests root for the whole repo.** In a monorepo (e.g. `server/` + `client/`), put backend tests under a single root — either the repo-root `tests/` OR a per-package `server/tests/`, never both. Two `tests` packages collide on the same dotted module name (`tests.conftest`) and abort collection with `ImportPathMismatchError`, or silently drop one tier. The harness auto-writes a `pytest.ini` (`--import-mode=importlib`, `pythonpath = .`) so `from server.app...` imports resolve from either root; do not add a second tests root to "fix" imports.
 
 ### Structure
 - Group cases into classes named `Test<Symbol>` so failures surface in a readable hierarchy.

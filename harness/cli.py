@@ -755,6 +755,12 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # gateway config factory; same previously-unregistered situation as
     # llm_judgment.
     "repair",
+    # End-of-run traceability gate (v5 SQL audit). enforce / enforce_reqs /
+    # enforce_acs control whether a requirement-without-story (or, in the
+    # `test` flow, an AC-without-test) blocks the session with exit_code=1.
+    # Read via state["harness_config"] in installation_doc_node. See
+    # harness/traceability.py.
+    "traceability",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -876,6 +882,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
         "require_code_linkage", "coverage_nonregression",
+    }),
+    "traceability": frozenset({
+        "enforce", "enforce_reqs", "enforce_acs",
     }),
     "fanout": frozenset({
         "max_concurrency",
@@ -1251,6 +1260,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "test_regeneration.tier_b_auto": (bool,),
     "test_regeneration.require_code_linkage": (bool,),
     "test_regeneration.coverage_nonregression": (bool,),
+    # End-of-run traceability gate. See installation_doc_node.
+    "traceability.enforce": (bool,),
+    "traceability.enforce_reqs": (bool,),
+    "traceability.enforce_acs": (bool,),
     # Coverage gate for generated apps (FR-080). See _KNOWN_NESTED_KEYS.
     "coverage.min_pct": (int,),
     "coverage.enforce": (bool,),

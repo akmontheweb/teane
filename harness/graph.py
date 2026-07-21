@@ -6264,19 +6264,135 @@ def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
 # file takes the WHOLE suite down.
 _PARSE_ERROR_CODES = frozenset({"SyntaxError", "IndentationError", "TabError"})
 
+# Collection/import-phase failures. Unlike a parse error these can name a
+# file OTHER than the one that must be edited to fix them (e.g. an
+# ImportPathMismatchError from two `tests` packages colliding, reported
+# against a site-packages `_pytest/pathlib.py`), so the carve-out they open
+# is keyed on file ROLE (test-infrastructure) rather than the diagnostic's
+# path. Matched by error_code or by message substring — parsers name these
+# inconsistently. lumina 019f82af: the ONLY fix for the collection abort was
+# editing conftest.py / __init__.py, which the guard refused, producing a
+# repair loop that ping-ponged through every HITL auto-resume and never
+# converged on the code work (which was in fact already green).
+_COLLECTION_ERROR_CODES = frozenset({
+    "ImportError", "ModuleNotFoundError", "CollectError", "CollectionError",
+    "ConftestImportFailure", "ImportPathMismatchError", "UsageError",
+})
+_COLLECTION_ERROR_MARKERS = (
+    "error collecting",
+    "import file mismatch",
+    "importpathmismatcherror",
+    "conftest",
+    "no module named",
+    "errors during collection",
+)
+# Test-infrastructure basenames — scaffolding that carries fixtures/config,
+# never test assertions. Editing these to fix a collection error cannot
+# reward-hack a red assertion green (there are none), so the collection
+# carve-out permits them while test-CASE files stay protected.
+_TEST_INFRA_BASENAMES = frozenset({
+    "conftest.py", "__init__.py", "pytest.ini", "tox.ini", "setup.cfg",
+    "pyproject.toml",
+})
+_TEST_INFRA_ROOT_CONFIG = frozenset({
+    "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+})
+
+
+def _is_test_infra_file(norm_path: str) -> bool:
+    """True when ``norm_path`` (workspace-relative, normalized) is test
+    *infrastructure* — conftest, a test-tree ``__init__.py``, or a pytest
+    config file — as opposed to a test-CASE file. Used only by the
+    collection-error carve-out; deliberately narrower than
+    :func:`_is_test_artifact`."""
+    if not norm_path:
+        return False
+    p = norm_path.strip().lstrip("./")
+    base = os.path.basename(p)
+    if base == "conftest.py":
+        return True
+    if base == "__init__.py":
+        # Only test-tree package markers, never source-package __init__.py.
+        # Match a tests/ segment ANYWHERE in the path — a nested
+        # server/tests/__init__.py (the second `tests` package that caused the
+        # lumina collision) is not caught by _is_test_path's top-level prefix.
+        segments = p.split("/")[:-1]
+        return any(seg in ("tests", "test", "__tests__") for seg in segments)
+    if base in _TEST_INFRA_ROOT_CONFIG:
+        # Root-level config only — a nested pyproject.toml is a subpackage's.
+        return p == base
+    return False
+
+
+def _workspace_test_infra_files(workspace_path: str) -> frozenset[str]:
+    """All test-infrastructure files present in the workspace, workspace-
+    relative and normalized. Scanned when a collection/import error opens
+    the carve-out but the diagnostic doesn't pinpoint which infra file to
+    edit — the fix for a collection abort is inherently in the scaffolding.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return frozenset()
+    skip = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__", ".tox",
+        ".mypy_cache", ".pytest_cache", "dist", "build", ".ruff_cache",
+    }
+    ws = os.path.normpath(os.path.abspath(workspace_path))
+    out: set[str] = set()
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+        for name in files:
+            if name not in _TEST_INFRA_BASENAMES:
+                continue
+            rel = os.path.normpath(os.path.relpath(os.path.join(root, name), ws))
+            rel = rel.lstrip("./")
+            if _is_test_infra_file(rel):
+                out.add(rel)
+    return frozenset(out)
+
+
+def _has_collection_error(compiler_errors: list[dict[str, Any]]) -> bool:
+    """True when any diagnostic looks like a pytest collection/import-phase
+    failure (by error_code or message marker)."""
+    for d in compiler_errors or []:
+        if not isinstance(d, dict):
+            continue
+        code = str(d.get("error_code") or d.get("code") or "")
+        if code in _COLLECTION_ERROR_CODES:
+            return True
+        msg = str(d.get("message") or "").lower()
+        if any(marker in msg for marker in _COLLECTION_ERROR_MARKERS):
+            return True
+    return False
+
 
 def _syntax_broken_test_files(
     compiler_errors: list[dict[str, Any]], workspace_path: str,
 ) -> frozenset[str]:
-    """Test-artifact paths whose current diagnostic is a PARSE error.
+    """Test paths the repair loop may edit despite the tamper guard.
 
-    Feeds :func:`_reject_test_patch_blocks`'s carve-out. Lumina session
-    019f7054: the harness's own @tests-marker autofix stamped a
-    JS-style ``//`` comment into ``tests/__init__.py``; the repair LLM
-    emitted the correct one-line fix twice and the test guard rejected
-    it both times — a guaranteed zero-patch HITL for a one-character
-    repair the harness itself had caused. Paths are returned in
-    normalized workspace-relative form (see :func:`_normalize_ws_path`).
+    Two carve-outs, both feeding :func:`_reject_test_patch_blocks`:
+
+    1. **Parse errors** (per-file). Any test-artifact path whose CURRENT
+       diagnostic is a ``SyntaxError`` / ``IndentationError`` / ``TabError``.
+       A file that cannot parse cannot have assertions weakened by making it
+       parse again. Lumina 019f7054: the harness's own @tests-marker autofix
+       stamped a JS-style ``//`` comment into ``tests/__init__.py``; the
+       repair LLM emitted the correct one-line fix twice and the guard
+       rejected it both times — a guaranteed zero-patch HITL for a repair the
+       harness itself caused.
+
+    2. **Collection/import errors** (infra-scoped). When any diagnostic is a
+       collection-phase failure, every test-INFRASTRUCTURE file in the
+       workspace (conftest.py, test-tree ``__init__.py``, pytest config) is
+       opened — but NOT test-case files. A collection abort names an
+       inconsistent path (often site-packages), and its only fix lives in the
+       scaffolding; refusing those edits is what deadlocked lumina 019f82af
+       into an endless HITL ping-pong while the production code was already
+       green. Assertions live in test-case files, which stay protected, so
+       this cannot reward-hack a red test green.
+
+    Paths are returned in normalized workspace-relative form (see
+    :func:`_normalize_ws_path`).
     """
     out: set[str] = set()
     for d in compiler_errors or []:
@@ -6291,6 +6407,11 @@ def _syntax_broken_test_files(
         norm = _normalize_ws_path(raw, workspace_path)
         if _is_test_artifact(norm):
             out.add(norm)
+
+    # Collection carve-out: open all workspace test-infra files.
+    if _has_collection_error(compiler_errors):
+        out |= _workspace_test_infra_files(workspace_path)
+
     return frozenset(out)
 
 
@@ -6666,12 +6787,16 @@ def _uv_venv_prefix() -> str:
     sandbox container (``/tmp`` is ephemeral); within a container the
     ``test -d`` guard makes re-activation a no-op.
 
-    Also ensures ``pytest-timeout`` is installed. It's baked into the
-    harness-builder image (``Dockerfile.builder``) so the ``--system-
-    site-packages`` venv typically inherits it for free — the extra
-    ``uv pip install --quiet`` here is a fail-open safety net for
-    operators running against a custom image built before the
-    Dockerfile change landed. Idempotent when already present.
+    Also ensures ``pytest-timeout`` and ``hypothesis`` are installed. Both
+    are baked into the harness-builder image (``Dockerfile.builder``) so the
+    ``--system-site-packages`` venv typically inherits them for free — the
+    extra ``uv pip install --quiet`` here is a fail-open safety net for
+    operators running against a custom image built before the Dockerfile
+    change landed. Idempotent when already present. ``hypothesis`` backs the
+    ADR-0003 Tier-3 property-based contract tests, which emit
+    ``pytest.importorskip("hypothesis")`` and therefore *silently skip* the
+    entire tier when it's absent (lumina 019f82af: the property test skipped
+    unnoticed on a green gate).
     Motivation: ``_PYTEST_RUN`` unconditionally passes
     ``--timeout=30 --timeout-method=thread`` so LLM-generated infinite
     loops fail at the test level with an actionable traceback instead
@@ -6691,7 +6816,7 @@ def _uv_venv_prefix() -> str:
         f"test -d {_PROD_SMOKE_VENV_PATH}/bin "
         f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH} "
         f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate "
-        f"&& uv pip install --quiet pytest-timeout"
+        f"&& uv pip install --quiet pytest-timeout hypothesis"
     )
 
 
@@ -23587,8 +23712,15 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             # flows on ``untested_acs`` produced the unfixable headless
             # auto-resume loop finsearch session 156032347 ended on.
             flow = str(state.get("flow") or "")
-            enforce_reqs = enforce
-            enforce_acs = enforce and flow == "test"
+            # enforce_reqs / enforce_acs can be overridden independently in the
+            # config `traceability` section to soften one dimension without
+            # disabling the whole gate; both default to the coarse `enforce`
+            # knob. AC enforcement stays hard-gated to the `test` flow
+            # regardless of config — build/patch generate code-linked unit
+            # tests, not AC-linked Playwright tests, so blocking them on AC
+            # gaps produced the finsearch 156032347 unfixable loop.
+            enforce_reqs = bool(tr_cfg.get("enforce_reqs", enforce))
+            enforce_acs = bool(tr_cfg.get("enforce_acs", enforce)) and flow == "test"
             block_on_reqs = enforce_reqs and report.has_req_gap()
             block_on_acs = enforce_acs and report.has_ac_gap()
             if report_text:
@@ -23596,8 +23728,9 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
                 if block_on_reqs or block_on_acs:
                     print("==================== TRACEABILITY BLOCK ====================")
                     print(report_text)
-                    print("Set traceability.enforce=false in .harness_config.json")
-                    print("to bypass and ship anyway (NOT RECOMMENDED).")
+                    print("Set traceability.enforce=false (or enforce_reqs=false) in")
+                    print("the harness config (config/config.json) to downgrade this")
+                    print("to an advisory and ship anyway (NOT RECOMMENDED).")
                     print("==========================================================")
                 else:
                     if report.has_ac_gap() and flow != "test":

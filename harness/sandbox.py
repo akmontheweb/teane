@@ -2261,6 +2261,39 @@ class SandboxExecutor:
             self.backend.name, exit_code, elapsed, timed_out, len(diagnostics), log_truncated,
         )
 
+        # Silent-drop guard. A pytest run can exit 0 while quietly collecting
+        # only a subset of the test files that exist on disk — e.g. two test
+        # trees colliding on a package name so one is dropped (lumina 019f82af:
+        # 41 of 78 tests ran, the gate went green, and an entire server/tests/
+        # tier never executed). extract_diagnostics only lifts FAILED/ERROR
+        # rows and never checks collection completeness, so this false-green
+        # passes unnoticed. Detect test files present on disk but absent from
+        # pytest's collected set and fail the build so the repair loop (or the
+        # operator) sees it instead of shipping on partial coverage.
+        if exit_code == 0:
+            dropped = _detect_dropped_test_files(
+                raw_output, build_command, self.workspace_path,
+            )
+            if dropped:
+                shown = ", ".join(dropped[:8])
+                more = f" (+{len(dropped) - 8} more)" if len(dropped) > 8 else ""
+                drop_msg = (
+                    f"pytest exited 0 but {len(dropped)} test file(s) present on "
+                    f"disk were never collected — a silently-dropped test tier "
+                    f"(commonly a test-package name collision that only resolves "
+                    f"under --import-mode=importlib). Uncollected: {shown}{more}."
+                )
+                logger.error("[sandbox] Silent-drop guard tripped: %s", drop_msg)
+                exit_code = 1
+                diagnostics.append(DiagnosticObject(
+                    file=dropped[0],
+                    severity="error",
+                    error_code="TestsSilentlyDropped",
+                    message=drop_msg,
+                ))
+                filtered = (filtered or "") + "\n" + drop_msg + "\n"
+                raw_output = (raw_output or "") + "\n" + drop_msg + "\n"
+
         try:
             from harness.observability import emit_event
             emit_event(
@@ -2297,6 +2330,72 @@ class SandboxExecutor:
             log_truncated=log_truncated,
             full_output=full_output,
         )
+
+
+_DROP_GUARD_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__", ".tox",
+    ".mypy_cache", ".pytest_cache", "dist", "build", ".ruff_cache", ".eggs",
+})
+_PYTEST_NODEID_RE = re.compile(r"([\w./+-]+\.py)::")
+_PY_TEST_FUNC_RE = re.compile(r"^\s*(?:async\s+)?def\s+test", re.MULTILINE)
+
+
+def _detect_dropped_test_files(
+    raw_output: str, build_command: str, workspace_path: str,
+) -> list[str]:
+    """Test files present on disk (``test_*.py`` / ``*_test.py`` containing an
+    actual ``def test`` function) that pytest never referenced in its output —
+    i.e. silently uncollected.
+
+    Only engages for pytest runs whose output actually lists per-test node ids
+    (``path.py::test`` — the harness gate runs ``-vv``, which does). Returns
+    ``[]`` when the run wasn't pytest, produced no verbose node ids (e.g. a
+    ``-q`` run whose passing tests print only dots, so per-file completeness is
+    unknowable), or every on-disk test file appears in the output. Node ids for
+    FAILED/ERROR/SKIPPED tests all carry the file path, so a fully-skipped
+    module (``pytest.importorskip``) still counts as collected and is NOT
+    flagged. Paths are workspace-relative and normalized.
+    """
+    if not raw_output or not workspace_path or not os.path.isdir(workspace_path):
+        return []
+    if "pytest" not in (build_command or "").lower():
+        return []
+
+    collected = {
+        os.path.normpath(m).lstrip("./")
+        for m in _PYTEST_NODEID_RE.findall(raw_output)
+    }
+    # No verbose node ids at all → can't reason about per-file collection
+    # (a green -q run prints only dots). Bail rather than risk a false drop.
+    if not collected:
+        return []
+
+    ws = os.path.normpath(os.path.abspath(workspace_path))
+    dropped: list[str] = []
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [
+            d for d in dirs
+            if d not in _DROP_GUARD_SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            if not (name.startswith("test_") or name.endswith("_test.py")):
+                continue
+            abs_path = os.path.join(root, name)
+            rel = os.path.normpath(os.path.relpath(abs_path, ws)).lstrip("./")
+            if rel in collected:
+                continue
+            # Only flag files that actually contain a test function — skip
+            # empty scaffolds and helper modules that merely match the name.
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    body = f.read(256 * 1024)
+            except OSError:
+                continue
+            if _PY_TEST_FUNC_RE.search(body):
+                dropped.append(rel)
+    return sorted(dropped)
 
 
 # ---------------------------------------------------------------------------

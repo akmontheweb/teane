@@ -95,7 +95,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && "$PY" -m pip install --no-cache-dir --break-system-packages --upgrade \
       pip setuptools wheel \
  && "$PY" -m pip install --no-cache-dir --break-system-packages \
-      pytest pytest-cov pytest-xdist pytest-timeout \
+      pytest pytest-cov pytest-xdist pytest-timeout hypothesis \
  && chmod -R a+rX /opt/uv-python \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
       npx --yes playwright install --with-deps chromium \

@@ -127,7 +127,16 @@ _PYTEST_IMPORTLIB_INI = (
     "# same-named test files in different packages (e.g. tests/models/test_job.py\n"
     "# and tests/schemas/test_job.py) coexist as distinct dotted names instead\n"
     "# of colliding with 'import file mismatch' under the default prepend mode.\n"
+    "#\n"
+    "# pythonpath puts the workspace root on sys.path. importlib mode does NOT\n"
+    "# prepend the rootdir the way the default 'prepend' mode does, so first-\n"
+    "# party imports (e.g. `from server.app import ...`) from a root-level\n"
+    "# tests/ tree would otherwise fail to resolve. A full-stack layout with two\n"
+    "# Python test trees (tests/ + server/tests/) both importing the app package\n"
+    "# is exactly what produced the ImportPathMismatchError + silently-dropped\n"
+    "# server/tests/ tier on lumina (session 019f82af).\n"
     "addopts = --import-mode=importlib\n"
+    "pythonpath = .\n"
 )
 
 
@@ -439,9 +448,42 @@ def backfill_untested_nfr_acs(
     return stub_paths, links_inserted, links_dropped
 
 
+def _workspace_has_python_tests(workspace_path: str) -> bool:
+    """True when the workspace contains at least one Python test file
+    (``test_*.py`` / ``*_test.py`` / ``conftest.py``) anywhere outside the
+    usual vendored/build dirs.
+
+    This is the self-gate for :func:`_ensure_pytest_importlib_config`: the
+    importlib pytest config is only meaningful — and only worth writing — when
+    there is actually a Python test tree to collect. It is deliberately
+    filesystem-based rather than keyed on the workspace's *primary* stack: a
+    full-stack app (Python API + JS/TS frontend) resolves ``primary`` to the
+    frontend, which used to skip this writer entirely and leave the Python
+    tests in default prepend mode (lumina 019f82af — the exact mixed-tree
+    collision this config prevents).
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return False
+    skip_dirs = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__", ".tox",
+        ".mypy_cache", ".pytest_cache", "dist", "build", ".ruff_cache",
+    }
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+        for name in files:
+            if name == "conftest.py":
+                return True
+            if name.endswith(".py") and (
+                name.startswith("test_") or name.endswith("_test.py")
+            ):
+                return True
+    return False
+
+
 def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
-    """Write a minimal ``pytest.ini`` with ``--import-mode=importlib`` if the
-    workspace has no pytest configuration of any kind.
+    """Write a minimal ``pytest.ini`` with ``--import-mode=importlib`` and
+    ``pythonpath = .`` if the workspace has a Python test tree but no pytest
+    configuration of any kind.
 
     Recognises every shape pytest itself looks at:
       - ``pytest.ini``
@@ -450,17 +492,24 @@ def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
       - ``tox.ini`` with a ``[pytest]`` section
 
     Returns the workspace-relative path of the newly-written file, or
-    ``None`` if any existing config was found (no-op).
+    ``None`` if there are no Python tests, or any existing config was found
+    (no-op). When an existing config is found that does NOT already select
+    importlib mode, logs a warning rather than silently leaving the workspace
+    exposed to prepend-mode collection collisions — that config path can't be
+    safely rewritten in-place here, so it's surfaced for the operator/LLM.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
 
-    # Hard signals — file existence wins. pyproject.toml / setup.cfg / tox.ini
-    # only count if they actually contain a pytest section.
-    if os.path.isfile(os.path.join(workspace_path, "pytest.ini")):
+    # Self-gate: nothing to configure if there's no Python test tree. Fires on
+    # Python-test PRESENCE, not on the workspace's primary stack.
+    if not _workspace_has_python_tests(workspace_path):
         return None
 
+    # Hard signals — file existence wins. pyproject.toml / setup.cfg / tox.ini
+    # only count if they actually contain a pytest section.
     section_signals: tuple[tuple[str, str], ...] = (
+        ("pytest.ini", "[pytest]"),
         ("pyproject.toml", "[tool.pytest.ini_options]"),
         ("setup.cfg", "[tool:pytest]"),
         ("tox.ini", "[pytest]"),
@@ -475,7 +524,18 @@ def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
                 content = f.read(256 * 1024)
         except OSError:
             continue
-        if marker in content:
+        # A bare pytest.ini always counts as config; the others only when the
+        # pytest section is actually present.
+        if fname == "pytest.ini" or marker in content:
+            if "importlib" not in content:
+                logger.warning(
+                    "[test_generation_node] %s already configures pytest but does "
+                    "not select --import-mode=importlib. Two test trees or same-"
+                    "named test files can collide under the default prepend mode "
+                    "(ImportPathMismatchError / silently-dropped tier). Add "
+                    "`--import-mode=importlib` (and `pythonpath = .`) to it.",
+                    fname,
+                )
             return None
 
     target = os.path.join(workspace_path, "pytest.ini")
@@ -2651,20 +2711,23 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    # When the stack is Python, ensure pytest has a config that uses the
-    # importlib import mode. Without this, two same-named test files in
+    # Ensure pytest has a config that uses the importlib import mode whenever a
+    # Python test tree is present. Without this, two same-named test files in
     # different directories (e.g. `tests/app/models/test_job.py` and
     # `tests/app/schemas/test_job.py`, both arising from a `job.py` source
     # in each package) collide on collection with the well-known
     # "import file mismatch: imported module 'test_job' has this __file__
-    # attribute" error. importlib mode uses Python's package resolution
-    # so the two coexist as distinct dotted names. Idempotent — leaves any
-    # existing pytest config (pytest.ini / pyproject.toml / setup.cfg)
-    # alone.
-    if primary == "python":
-        ensured = _ensure_pytest_importlib_config(workspace_path)
-        if ensured:
-            new_modified.append(ensured)
+    # attribute" error; and a full-stack app with a flat `tests/` tree plus a
+    # nested `server/tests/` tree hits ImportPathMismatchError (or silently
+    # drops one tier). importlib mode uses Python's package resolution so the
+    # trees coexist as distinct dotted names. Gated on Python-test PRESENCE
+    # (the writer self-checks), NOT on the workspace's primary stack — a
+    # full-stack Python+JS app resolves `primary` to the frontend and used to
+    # skip this entirely (lumina 019f82af). Idempotent — leaves any existing
+    # pytest config (pytest.ini / pyproject.toml / setup.cfg) alone.
+    ensured = _ensure_pytest_importlib_config(workspace_path)
+    if ensured:
+        new_modified.append(ensured)
 
     # JS/TS counterpart: freshly generated .test.ts(x)/.test.js(x) files
     # need their jest/type environment (devDependencies, jest config with

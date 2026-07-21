@@ -488,7 +488,7 @@ def emit_contract_tests(
     overwritten (respects operator edits). Best-effort — IO / parse errors on
     one file skip it without failing the batch.
     """
-    if primary_stack != "python":
+    if not _has_python_source(source_files):
         return [], {}
     written: list[str] = []
     markers: dict[str, list[str]] = {}
@@ -530,6 +530,17 @@ def _looks_like_test(rel_path: str) -> bool:
     if any(seg in ("tests", "test", "__tests__") for seg in parts):
         return True
     return base.startswith("test_") or base.endswith("_test.py")
+
+
+def _has_python_source(source_files: list[str]) -> bool:
+    """True when the batch touched any Python source file. The gate for the
+    Python contract tiers — they fire whenever Python source is present, NOT
+    only when Python is the workspace's *primary* stack. A full-stack app
+    (Python API + JS/TS frontend) resolves ``primary`` to the frontend, which
+    used to skip the Python tiers entirely (lumina 019f8291)."""
+    return any(
+        r.endswith(".py") and not _looks_like_test(r) for r in source_files
+    )
 
 
 # ===========================================================================
@@ -814,7 +825,7 @@ def emit_api_contract_tests(
     files (for the TestClient import); returns ``([], {})`` if none is found.
     Idempotent; best-effort per file.
     """
-    if primary_stack != "python":
+    if not _has_python_source(source_files):
         return [], {}
     py_files = [
         r for r in source_files if r.endswith(".py") and not _looks_like_test(r)
@@ -998,7 +1009,7 @@ def emit_property_tests(
     this function itself just emits when asked. Conservative model selection
     lives in :func:`_property_testable`.
     """
-    if primary_stack != "python":
+    if not _has_python_source(source_files):
         return [], {}
     written: list[str] = []
     markers: dict[str, list[str]] = {}

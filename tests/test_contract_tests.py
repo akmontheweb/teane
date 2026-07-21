@@ -135,9 +135,16 @@ class TestEmitToDisk:
         assert again_written == []
         assert "tests/contract/test_w_contract.py" in again_markers
 
-    def test_non_python_stack_is_noop(self, tmp_path):
+    def test_fires_even_when_primary_stack_is_not_python(self, tmp_path):
+        # lumina 019f8291: a full-stack app resolves `primary` to the JS
+        # frontend, but the Python tiers must still fire on the .py source.
         self._write(tmp_path, "app/w.py", _PLAIN_MODEL)
-        assert emit_contract_tests(str(tmp_path), ["app/w.py"], "typescript") == ([], {})
+        written, _ = emit_contract_tests(str(tmp_path), ["app/w.py"], "typescript")
+        assert written == ["tests/contract/test_w_contract.py"]
+
+    def test_noop_when_no_python_source(self, tmp_path):
+        self._write(tmp_path, "app/ui.ts", "export const x = 1\n")
+        assert emit_contract_tests(str(tmp_path), ["app/ui.ts"], "typescript") == ([], {})
 
     def test_skips_test_files_and_validator_models(self, tmp_path):
         self._write(tmp_path, "app/a.py", _VALIDATOR_MODEL)
@@ -312,10 +319,23 @@ class TestEmitApiToDisk:
             str(tmp_path), ["app/api.py", "app/schemas.py"], "python",
         ) == ([], {})
 
-    def test_non_python_noop(self, tmp_path):
+    def test_fires_when_primary_is_typescript(self, tmp_path):
+        # Full-stack app: primary resolves to the JS frontend, but the API
+        # tiers must still fire on the Python routes (lumina 019f8291).
         self._w(tmp_path, "app/main.py", _MAIN)
+        self._w(tmp_path, "app/api.py", _ROUTES)
+        self._w(tmp_path, "app/schemas.py", _SCHEMAS_FOR_ROUTES)
+        written, _ = emit_api_contract_tests(
+            str(tmp_path),
+            ["app/main.py", "app/api.py", "app/schemas.py"],
+            "typescript",
+        )
+        assert written == ["tests/contract/test_api_api_contract.py"]
+
+    def test_noop_when_no_python_source(self, tmp_path):
+        self._w(tmp_path, "app/ui.ts", "export const x = 1\n")
         assert emit_api_contract_tests(
-            str(tmp_path), ["app/main.py"], "typescript",
+            str(tmp_path), ["app/ui.ts"], "typescript",
         ) == ([], {})
 
 

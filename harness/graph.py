@@ -25099,17 +25099,25 @@ def build_graph() -> Any:
         },
     )
 
-    def route_after_spec_reconciler(state: AgentState) -> Literal[
-        "human_gatekeeper_node", "human_intervention_node"
-    ]:
-        """Route reconciler → STORIES gate on success, HITL on failure.
+    def route_after_spec_reconciler(state: AgentState) -> str:
+        """Route reconciler → STORIES gate on success, HITL on failure,
+        END on an unrecoverable requirement-coverage gap.
 
         ``reconcile_failed`` covers parse / SQL / regen errors from the
         deterministic path. A missing spec file (``skipped_reason ==
         'spec_missing'``) or CR-mode skip both fall through to the
         STORIES gate — the LLM's output survives untouched in those
         paths, which matches pre-reconciler behavior.
+
+        ``early_req_coverage_gap`` (P1 fail-fast) fires when a requirement
+        has no satisfying story after decomposition and ``enforce_reqs`` is
+        on. The fix is upstream (revise the spec or the decomposition), which
+        no in-session HITL menu can apply, so we END with ``exit_code=1``
+        immediately rather than spend the entire build budget reaching the
+        identical end-of-run traceability gate. That gate remains the
+        backstop for gaps introduced after this point.
         """
+        from langgraph.graph import END
         ns = state.get("node_state", {}) or {}
         if ns.get("reconcile_failed"):
             logger.warning(
@@ -25117,6 +25125,13 @@ def build_graph() -> Any:
                 ns.get("error", "unknown"),
             )
             return "human_intervention_node"
+        if ns.get("early_req_coverage_gap"):
+            logger.warning(
+                "[router] requirement-coverage gap detected post-decomposition "
+                "(enforce_reqs=true); failing fast to END with exit_code=1 "
+                "instead of running the full build. See the gap report above."
+            )
+            return END
         return "human_gatekeeper_node"
 
     graph.add_conditional_edges(
@@ -25125,6 +25140,7 @@ def build_graph() -> Any:
         {
             "human_gatekeeper_node": "human_gatekeeper_node",
             "human_intervention_node": "human_intervention_node",
+            END: END,
         },
     )
     graph.add_conditional_edges(

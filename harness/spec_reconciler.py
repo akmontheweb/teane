@@ -621,6 +621,7 @@ def spec_reconciler_node(state: dict[str, Any]) -> dict[str, Any]:
         summary = reconcile_workspace_from_spec(conn, workspace, spec_path)
         story_state.regenerate_markdown_views(conn, workspace_path)
     except Exception as e:
+        conn.close()
         logger.exception("[spec_reconciler] failed: %s", e)
         return {
             "node_state": {
@@ -629,13 +630,66 @@ def spec_reconciler_node(state: dict[str, Any]) -> dict[str, Any]:
                 "error": str(e),
             },
         }
+
+    # P1 fail-fast requirement-coverage check. This is the SAME audit the
+    # end-of-run traceability gate (installation_doc_node) runs — but a full
+    # build and token budget later. Catching an untraced requirement HERE,
+    # right after decomposition+reconcile, lets the operator fix the spec /
+    # decomposition and re-run before spending any of it. Coverage rolls up
+    # the parent hierarchy (story→feature→epic), so only a genuinely
+    # uncovered requirement trips this. Fail-open: a coverage-check error must
+    # never block the run on its own — the end gate stays as the backstop.
+    untraced: list[dict[str, Any]] = []
+    try:
+        untraced = story_state.requirements_without_satisfying_story(
+            conn, workspace,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "[spec_reconciler] early coverage check failed (%s); deferring "
+            "to the end-of-run gate.", e,
+        )
     finally:
         conn.close()
 
-    return {
-        "node_state": {
-            "current_node": "spec_reconciler",
-            "reconciled": True,
-            **summary,
-        },
+    node_state: dict[str, Any] = {
+        "current_node": "spec_reconciler",
+        "reconciled": True,
+        **summary,
     }
+    out: dict[str, Any] = {"node_state": node_state}
+
+    if not untraced:
+        logger.info(
+            "[spec_reconciler] requirement coverage complete — every "
+            "requirement has a satisfying story (hierarchy rollup applied)."
+        )
+        return out
+
+    keys = [str(u.get("req_key")) for u in untraced]
+    tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
+    enforce = bool(tr_cfg.get("enforce", True))
+    enforce_reqs = bool(tr_cfg.get("enforce_reqs", enforce))
+    logger.warning(
+        "[spec_reconciler] %d requirement(s) have no satisfying story after "
+        "decomposition: %s (enforce_reqs=%s)",
+        len(untraced), ", ".join(keys), enforce_reqs,
+    )
+    if enforce_reqs:
+        print()
+        print("========= REQUIREMENT COVERAGE GAP (post-decomposition) =========")
+        print(f"{len(untraced)} requirement(s) have no story that satisfies them:")
+        for u in untraced:
+            print(f"  - {u.get('req_key')} [{u.get('kind')}] {u.get('title')}")
+        print()
+        print("Decomposition produced no story covering these. Revise the spec")
+        print("(docs/SPEC_REQUIREMENTS.md) or the decomposition and re-run.")
+        print("Failing fast now saves the full build budget the end-of-run")
+        print("traceability gate would spend before reporting the same gap.")
+        print("Set traceability.enforce_reqs=false in config/config.json to")
+        print("downgrade this to a warning (NOT RECOMMENDED).")
+        print("=================================================================")
+        node_state["early_req_coverage_gap"] = True
+        out["exit_code"] = 1
+
+    return out

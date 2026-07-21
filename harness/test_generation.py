@@ -2052,21 +2052,30 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # structurally impossible for these models — and (b) the correct-by-
     # construction declarative tests land regardless of what the LLM emits.
     # Conservative: validator-bearing models are skipped (left to the LLM).
-    from harness.contract_tests import emit_contract_tests
+    from harness.contract_tests import (
+        emit_contract_tests, emit_api_contract_tests,
+    )
     contract_files: list[str] = []
     contract_markers: dict[str, list[str]] = {}
     _contract_covered: list[str] = []
     try:
-        contract_files, contract_markers = emit_contract_tests(
+        # Tier 1 — schema-declarative unit tests.
+        t1_files, t1_markers = emit_contract_tests(
             workspace_path, source_files, primary,
         )
+        # Tier 2 — API status-code contracts (FastAPI framework guarantees).
+        t2_files, t2_markers = emit_api_contract_tests(
+            workspace_path, source_files, primary,
+        )
+        contract_files = t1_files + t2_files
+        contract_markers = {**t1_markers, **t2_markers}
         _contract_covered = sorted({
             src for srcs in contract_markers.values() for src in srcs
         })
         if contract_files:
             logger.info(
                 "[test_generation_node] Emitted %d deterministic contract-test "
-                "file(s) (ADR-0003 Tier 1) covering %s: %s",
+                "file(s) (ADR-0003 Tier 1+2) covering %s: %s",
                 len(contract_files), ", ".join(_contract_covered),
                 ", ".join(contract_files),
             )
@@ -2082,15 +2091,18 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     if _contract_covered:
         user_prompt += (
             "\n\n[ALREADY COVERED — DO NOT DUPLICATE]\n"
-            "Deterministic schema-contract tests (field constraints, "
-            "required-field, type validation) have ALREADY been generated for "
+            "Deterministic contract tests have ALREADY been generated for "
             "these source file(s):\n"
             + "\n".join(f"- {s}" for s in _contract_covered)
-            + "\nDo NOT emit schema-construction or field-validation tests for "
-            "their models — those are owned by the deterministic suite. Write "
-            "ONLY business-logic / behavioural assertions (computed values, "
-            "custom-validator semantics, cross-field rules, endpoint "
-            "behaviour) that the declarative contract cannot express.\n"
+            + "\nThose cover, for the models/endpoints involved: schema "
+            "field constraints (max_length, ranges), required-field and type "
+            "validation, and API validation status codes (422 on invalid "
+            "body / bad path-param type). Do NOT re-emit any of those. Write "
+            "ONLY business-logic / behavioural assertions the declarative "
+            "contract cannot express: computed values, custom-validator "
+            "semantics, cross-field rules, success-path responses, and "
+            "stateful endpoint behaviour (e.g. 404 on a missing resource, "
+            "correct 200/201 payloads).\n"
         )
     # Change-request mode: prepend the CR-N attribution rules so generated
     # tests follow the `test_cr_N_*` naming convention and reference the

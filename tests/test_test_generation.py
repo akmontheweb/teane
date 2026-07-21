@@ -724,6 +724,60 @@ class TestContractTestTier:
         assert "tests/test_widget_behaviour.py" in gts
 
     @pytest.mark.asyncio
+    async def test_api_contract_tests_emitted_for_fastapi_routes(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        # A FastAPI app + a route module with a required-body POST and an
+        # int path param → Tier 2 emits the 422 contract file. Emission is
+        # pure AST, so it runs even though fastapi isn't installed here; the
+        # generated file is never executed (sandbox stubbed).
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+        (tmp_path / "app" / "main.py").write_text(
+            "from fastapi import FastAPI\napp = FastAPI()\n"
+        )
+        (tmp_path / "app" / "schemas.py").write_text(
+            "from pydantic import BaseModel\n"
+            "class ItemCreate(BaseModel):\n    name: str\n"
+        )
+        (tmp_path / "app" / "api.py").write_text(
+            "from fastapi import APIRouter\n"
+            "from app.schemas import ItemCreate\n"
+            "router = APIRouter(prefix='/api/items')\n"
+            "@router.post('', status_code=201)\n"
+            "def create(payload: ItemCreate):\n    ...\n"
+            "@router.delete('/{item_id}')\n"
+            "def remove(item_id: int):\n    ...\n"
+        )
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_behaviour.py\n"
+            "content:\n"
+            "# @tests: app/api.py\n"
+            "def test_placeholder():\n    assert True\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "ok\n")
+
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["app/main.py", "app/api.py", "app/schemas.py"],
+            "messages": [],
+            "budget_remaining_usd": 2.0,
+            "token_tracker": {},
+        })
+
+        api_ct = tmp_path / "tests/contract/test_api_api_contract.py"
+        assert api_ct.is_file()
+        body = api_ct.read_text()
+        assert "from app.main import app" in body
+        assert "TestClient(app)" in body
+        assert "test_post_api_items_empty_body_422" in body
+        assert "test_delete_api_items_item_id_bad_type_422" in body
+        assert "tests/contract/test_api_api_contract.py" in result["generated_tests"]
+
+    @pytest.mark.asyncio
     async def test_no_pydantic_models_no_contract_file(
         self, tmp_path, stub_sandbox, stub_gateway,
     ):

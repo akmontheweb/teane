@@ -1,6 +1,6 @@
 # ADR-0003: Hybrid Deterministic + LLM Unit-Test Generation
 
-**Status:** Accepted (Tier 1 / Python schema-declarative prototyped; Tiers 2–3 phased — see Action Items)
+**Status:** Accepted (Tiers 1–2 shipped for Python; Tier 3 + TS phased — see Action Items)
 **Date:** 2026-07-20
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention)
@@ -218,11 +218,14 @@ persuasion (RULE 6/7) and detection (the contradiction gate) are replaced by
        emit boundary/required/type tests with `@tests` markers; conservative
        skip on unsynthesizable fields; idempotent. Wired into
        `test_generation_node` before the LLM dispatch.
-2. [ ] **Narrow the LLM prompt** — tell the Tier-4 dispatch which model
-       surfaces the deterministic pass already covered; instruct it to write
-       only business-logic assertions.
-3. [ ] **Tier 2 (API contract)** — FastAPI/OpenAPI route-derived status-code
-       tests, executed in the sandbox.
+2. [x] **Narrow the LLM prompt** — the Tier-4 dispatch names the covered
+       source files and instructs the LLM to write only business-logic
+       assertions (not schema/API validation, which the deterministic tiers own).
+3. [x] **Tier 2 (API contract)** — FastAPI route-derived 422 status-code
+       tests (empty body on a required-body route; non-numeric int path
+       param), emitted AST-only, executed via ``TestClient`` in the sandbox.
+       Verified against lumina's real app (3/3 pass). Success-path codes and
+       404-on-missing stay Tier 4 (need live state).
 4. [ ] **Tier 3 (property-based)** — Hypothesis strategies from type hints;
        structural invariants only; config-gated, default off; false-positive
        telemetry.

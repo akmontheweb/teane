@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -41,6 +42,12 @@ __all__ = [
     "parse_pydantic_models",
     "render_contract_test",
     "emit_contract_tests",
+    # Tier 2 — API status-code contracts
+    "RouteSpec",
+    "find_fastapi_app",
+    "parse_fastapi_routes",
+    "render_api_contract_test",
+    "emit_api_contract_tests",
 ]
 
 # Pydantic base classes we recognise as "this is a validated model". Kept
@@ -69,6 +76,15 @@ class ModelSpec:
     fields: tuple[FieldSpec, ...]
     module_import: str                   # dotted path guess for the import line
     has_model_validator: bool = False    # a @model_validator can reject any instance
+
+
+def _read_text(abs_path: str) -> Optional[str]:
+    """Read a file as UTF-8 (errors replaced), or None if unreadable."""
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
 
 
 def _ann_to_str(node: Optional[ast.expr]) -> str:
@@ -498,3 +514,336 @@ def _looks_like_test(rel_path: str) -> bool:
     if any(seg in ("tests", "test", "__tests__") for seg in parts):
         return True
     return base.startswith("test_") or base.endswith("_test.py")
+
+
+# ===========================================================================
+# Tier 2 — API status-code contracts (ADR-0003)
+#
+# Deterministic tests for FastAPI's *framework-guaranteed* error contracts:
+# a request that fails validation returns 422 BEFORE the handler runs, so no
+# database or business state is needed — the exact robustness sweet spot.
+#
+#   - POST/PUT/PATCH with a Pydantic body that has >=1 required field:
+#       an empty JSON body {} → 422.
+#   - a route with an int/float path param: a non-numeric value there → 422.
+#
+# Still AST-only at emit time (never imports the app); the *generated test*
+# uses fastapi.testclient.TestClient at run time in the sandbox. Success-path
+# status codes (201/200) are deliberately NOT asserted — they need valid data
+# and live state, which is business-logic-coupled (Tier 4's job).
+# ===========================================================================
+
+_HTTP_METHODS = ("get", "post", "put", "delete", "patch")
+_NUMERIC_PATH_TYPES = frozenset({"int", "float"})
+# Param defaults that mark a function arg as NOT a request body.
+_NON_BODY_DEPENDENCY_CALLS = frozenset({
+    "Depends", "Query", "Path", "Header", "Cookie", "Form", "Security",
+})
+
+
+@dataclass(frozen=True)
+class RouteSpec:
+    method: str                          # 'post', 'put', ...
+    path: str                            # full path incl. router prefix
+    body_model: Optional[str]            # a known-model body param, or None
+    body_required: bool                  # body model has >=1 declared-required field
+    int_path_params: tuple[str, ...]     # path params annotated int/float
+    func_name: str
+
+
+def find_fastapi_app(source: str, *, rel_path: str = "") -> Optional[tuple[str, str]]:
+    """Return ``(module_dotted, app_var)`` for the FastAPI app instance in
+    ``source``, or None. Recognises two module-level patterns:
+
+    - ``app = FastAPI(...)`` — direct instantiation.
+    - ``app = create_app()`` where a ``def create_app(...) -> FastAPI:`` with
+      that return annotation exists in the same module (lumina's factory).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    module = _module_dotted(rel_path) if rel_path else ""
+    # functions annotated `-> FastAPI`
+    fastapi_factories = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _ann_to_str(n.returns) == "FastAPI"
+    }
+    for node in tree.body:  # module-level only
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        val = node.value
+        if isinstance(val, ast.Call):
+            fn = _call_name(val)
+            if fn == "FastAPI" or fn in fastapi_factories:
+                return module, target.id
+    return None
+
+
+def _router_prefixes(tree: ast.Module) -> dict[str, str]:
+    """Map ``APIRouter`` / ``FastAPI`` variable name → path prefix.
+
+    ``router = APIRouter(prefix="/api/contacts")`` → {"router": "/api/contacts"}.
+    A bare ``FastAPI()`` / ``APIRouter()`` maps to "" (no prefix).
+    """
+    prefixes: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or not isinstance(node.value, ast.Call):
+            continue
+        if _call_name(node.value) not in ("APIRouter", "FastAPI"):
+            continue
+        prefix = ""
+        for kw in node.value.keywords:
+            if kw.arg == "prefix" and isinstance(kw.value, ast.Constant):
+                if isinstance(kw.value.value, str):
+                    prefix = kw.value.value
+        prefixes[target.id] = prefix
+    return prefixes
+
+
+def _route_from_decorator(
+    dec: ast.expr,
+) -> Optional[tuple[str, str, str]]:
+    """``@router.post("/x", status_code=201)`` → ("router", "post", "/x").
+    None if the decorator isn't an HTTP-method route decorator."""
+    if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
+        return None
+    method = dec.func.attr
+    if method not in _HTTP_METHODS:
+        return None
+    var = dec.func.value
+    if not isinstance(var, ast.Name):
+        return None
+    path = ""
+    if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
+        path = dec.args[0].value
+    return var.id, method, path
+
+
+def _join_path(prefix: str, route: str) -> str:
+    full = (prefix or "") + (route or "")
+    while "//" in full:
+        full = full.replace("//", "/")
+    return full or "/"
+
+
+def _is_body_param(arg: ast.arg, default: Optional[ast.expr], known_models: set[str]) -> bool:
+    """A function arg is a request body when its annotation is a known
+    Pydantic model AND its default isn't a FastAPI dependency marker."""
+    ann = _ann_to_str(arg.annotation)
+    base = _base_type(ann)
+    if base not in known_models:
+        return False
+    if isinstance(default, ast.Call) and _call_name(default) in _NON_BODY_DEPENDENCY_CALLS:
+        return False
+    return True
+
+
+def parse_fastapi_routes(
+    source: str,
+    *,
+    rel_path: str = "",
+    model_required: Optional[dict[str, bool]] = None,
+) -> list[RouteSpec]:
+    """Extract testable ``RouteSpec``s from a FastAPI route module.
+
+    ``model_required`` maps a Pydantic model name → whether it has >=1
+    declared-required field (from :func:`parse_pydantic_models` over the
+    workspace); used to decide the empty-body 422 test and to recognise body
+    params. Empty when no models are known → body detection is skipped.
+    """
+    model_required = model_required or {}
+    known_models = set(model_required)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    prefixes = _router_prefixes(tree)
+    out: list[RouteSpec] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            parsed = _route_from_decorator(dec)
+            if parsed is None:
+                continue
+            var, method, route_path = parsed
+            prefix = prefixes.get(var, "")
+            full_path = _join_path(prefix, route_path)
+            # Body param + path params from the signature.
+            body_model: Optional[str] = None
+            path_param_types: dict[str, str] = {}
+            args = node.args
+            defaults = list(args.defaults)
+            # align defaults to the tail of positional args
+            pos = args.posonlyargs + args.args
+            pad = [None] * (len(pos) - len(defaults))
+            paired = list(zip(pos, pad + defaults))
+            for a, d in paired:
+                base = _base_type(_ann_to_str(a.annotation))
+                if body_model is None and _is_body_param(a, d, known_models):
+                    body_model = base
+                if base in _NUMERIC_PATH_TYPES:
+                    path_param_types[a.arg] = base
+            # int path params that actually appear in the path template
+            path_names = set(re.findall(r"\{(\w+)\}", full_path))
+            int_params = tuple(
+                p for p in sorted(path_param_types) if p in path_names
+            )
+            out.append(RouteSpec(
+                method=method,
+                path=full_path,
+                body_model=body_model,
+                body_required=bool(body_model and model_required.get(body_model, False)),
+                int_path_params=int_params,
+                func_name=node.name,
+            ))
+    return out
+
+
+def _concrete_path(path: str, *, bad_param: Optional[str] = None) -> str:
+    """Fill a path template with placeholder values. ``bad_param`` gets a
+    non-numeric sentinel (to trigger a 422); every other ``{param}`` gets 1."""
+    def _sub(m: "re.Match[str]") -> str:
+        name = m.group(1)
+        return "not-a-number" if name == bad_param else "1"
+    return re.sub(r"\{(\w+)\}", _sub, path)
+
+
+_API_HEADER = (
+    "# @tests: {source}\n"
+    '"""Deterministic API contract tests for {source} (ADR-0003 Tier 2).\n\n'
+    "FastAPI framework guarantees only — a request that fails validation\n"
+    "returns 422 before the handler runs, so no DB/business state is needed.\n"
+    "Success-path codes and business behaviour are the LLM tier's job.\n"
+    '"""\n'
+    "from fastapi.testclient import TestClient\n"
+    "from {app_module} import {app_var}\n\n"
+    "client = TestClient({app_var})\n\n\n"
+)
+
+
+def render_api_contract_test(
+    routes: list[RouteSpec],
+    *,
+    app_module: str,
+    app_var: str,
+    source_rel: str,
+) -> Optional[str]:
+    """Render the API-contract test file, or None if no route yields a
+    deterministic assertion."""
+    body: list[str] = []
+    for r in routes:
+        # 1. Empty-body → 422 (only when the body model has a required field;
+        #    an all-optional body accepts {} and would NOT 422).
+        if r.method in ("post", "put", "patch") and r.body_required:
+            url = _concrete_path(r.path)
+            body.append(
+                f"def test_{r.method}_{_path_slug(r.path)}_empty_body_422():\n"
+                f'    resp = client.{r.method}("{url}", json={{}})\n'
+                f"    assert resp.status_code == 422\n\n"
+            )
+        # 2. Non-numeric value in an int path param → 422.
+        slug = _path_slug(r.path)
+        for p in r.int_path_params:
+            url = _concrete_path(r.path, bad_param=p)
+            call = (
+                f'client.{r.method}("{url}", json={{}})'
+                if r.method in ("post", "put", "patch")
+                else f'client.{r.method}("{url}")'
+            )
+            # Avoid a name stutter when the slug already ends with the param.
+            suffix = "bad_type" if slug.endswith(p) else f"{p}_bad_type"
+            body.append(
+                f"def test_{r.method}_{slug}_{suffix}_422():\n"
+                f"    resp = {call}\n"
+                f"    assert resp.status_code == 422\n\n"
+            )
+    if not body:
+        return None
+    return _API_HEADER.format(
+        source=source_rel, app_module=app_module, app_var=app_var,
+    ) + "".join(body)
+
+
+def _path_slug(path: str) -> str:
+    """/api/contacts/{contact_id} → api_contacts_contact_id."""
+    s = re.sub(r"[{}]", "", path)
+    s = re.sub(r"[^0-9a-zA-Z]+", "_", s).strip("_")
+    return s.lower() or "root"
+
+
+def _api_contract_test_rel_path(source_rel: str) -> str:
+    stem = os.path.splitext(os.path.basename(source_rel))[0]
+    return os.path.join("tests", "contract", f"test_{stem}_api_contract.py")
+
+
+def emit_api_contract_tests(
+    workspace_path: str,
+    source_files: list[str],
+    primary_stack: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Write deterministic API-contract test files for FastAPI routes in
+    ``source_files``. Returns ``(rel_paths_written, tests_markers_by_file)``,
+    mirroring :func:`emit_contract_tests`.
+
+    Python-only. Needs a discoverable FastAPI app instance among the source
+    files (for the TestClient import); returns ``([], {})`` if none is found.
+    Idempotent; best-effort per file.
+    """
+    if primary_stack != "python":
+        return [], {}
+    py_files = [
+        r for r in source_files if r.endswith(".py") and not _looks_like_test(r)
+    ]
+    # Locate the app instance (usually main.py) across all source files.
+    app_ref: Optional[tuple[str, str]] = None
+    model_required: dict[str, bool] = {}
+    file_source: dict[str, str] = {}
+    for rel in py_files:
+        src = _read_text(os.path.join(workspace_path, rel))
+        if src is None:
+            continue
+        file_source[rel] = src
+        if app_ref is None:
+            app_ref = find_fastapi_app(src, rel_path=rel)
+        for m in parse_pydantic_models(src, rel_path=rel):
+            model_required[m.name] = any(f.required for f in m.fields)
+    if app_ref is None:
+        return [], {}
+    app_module, app_var = app_ref
+
+    written: list[str] = []
+    markers: dict[str, list[str]] = {}
+    for rel, src in file_source.items():
+        routes = parse_fastapi_routes(
+            src, rel_path=rel, model_required=model_required,
+        )
+        if not routes:
+            continue
+        body = render_api_contract_test(
+            routes, app_module=app_module, app_var=app_var, source_rel=rel,
+        )
+        if not body:
+            continue
+        out_rel = _api_contract_test_rel_path(rel)
+        out_abs = os.path.join(workspace_path, out_rel)
+        if os.path.exists(out_abs):
+            markers[out_rel] = [rel]
+            continue
+        try:
+            os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+            with open(out_abs, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError:
+            continue
+        written.append(out_rel)
+        markers[out_rel] = [rel]
+    return written, markers

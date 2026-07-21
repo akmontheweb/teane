@@ -4145,6 +4145,49 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
         }
 
 
+def _dedupe_repeated_preambles(
+    messages: list, *, min_chars: int = 2000,
+) -> tuple[int, int]:
+    """Collapse byte-identical repeated large messages to a stub, keeping only
+    the LAST occurrence in full. Returns ``(messages_stubbed, chars_reclaimed)``.
+
+    patching_node / repair_node re-inject static preambles (the PHASE-1
+    production note, the allowlist+source block, the Impact-Analysis
+    directive) on every round without deduping, so the conversation
+    accumulates 2-3 byte-identical copies of 20-30k-char blocks — lumina
+    019f82af measured ~30k tokens of a 143k patching prompt as duplicated
+    preambles. That is context-window pressure and a "which copy is current"
+    distraction hazard (the stale-mental-model failure the pre-patch guards
+    fight), even though the copies are largely cached.
+
+    Stubbing rather than removing keeps message count and role alternation
+    intact (no orphaned tool pairs, no adjacent-same-role); keeping the last
+    copy preserves the recency the re-injection was reaching for. Only
+    messages with plain string content >= ``min_chars`` are touched, so the
+    small alternation-critical turns are never disturbed. The first stubbed
+    position busts the prompt cache once, then history re-stabilises leaner.
+    """
+    from collections import defaultdict
+    positions: dict[str, list[int]] = defaultdict(list)
+    for i, m in enumerate(messages):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str) and len(c) >= min_chars:
+            positions[c].append(i)
+    stubbed = 0
+    reclaimed = 0
+    for content, idxs in positions.items():
+        if len(idxs) < 2:
+            continue
+        for i in idxs[:-1]:  # keep the last full copy
+            messages[i] = {
+                **messages[i],
+                "content": "[deduplicated — identical block repeated below]",
+            }
+            stubbed += 1
+            reclaimed += len(content)
+    return stubbed, reclaimed
+
+
 async def patching_node(state: AgentState) -> dict[str, Any]:
     """
     Node 2: The Builder.
@@ -4436,6 +4479,14 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "role": "user",
             "content": _TOOL_USE_REMINDER if use_tools else _FORMAT_REMINDER,
         })
+        _stubbed, _reclaimed = _dedupe_repeated_preambles(messages)
+        if _stubbed:
+            logger.info(
+                "[patching_node] Deduped %d repeated preamble block(s) "
+                "(~%d tokens reclaimed) — re-injected static blocks that had "
+                "accumulated identical copies across rounds.",
+                _stubbed, _reclaimed // 4,
+            )
 
         response, new_budget, messages, tool_files_seen = await _patching_tool_loop(
             gateway=gateway,
@@ -16871,6 +16922,13 @@ need to see and have not been shown; everything else, patch directly.
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your fix patches NOW. Only the blocks above. No other text."""
         messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
+        _r_stubbed, _r_reclaimed = _dedupe_repeated_preambles(messages)
+        if _r_stubbed:
+            logger.info(
+                "[repair_node] Deduped %d repeated preamble block(s) "
+                "(~%d tokens reclaimed).",
+                _r_stubbed, _r_reclaimed // 4,
+            )
 
         # Universal LLM-call dump (config.debug.dump_llm_calls) writes the
         # input messages + response to ~/.harness/debug after the dispatch

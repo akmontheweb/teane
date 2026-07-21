@@ -292,3 +292,56 @@ class TestStickyCreateRejections:
         # None of these should be added.
         out = gr._update_sticky_create_rejections(state, failures, [])
         assert out == []
+
+
+class TestDedupeRepeatedPreambles:
+    """lumina 019f82af: patching/repair re-inject static preambles every round
+    without deduping, so the conversation accumulates byte-identical copies of
+    20-30k-char blocks (~30k tokens of a 143k prompt). The helper stubs the
+    older copies, keeping the last full — cutting context-window pressure and
+    the duplicate-file distraction without touching alternation."""
+
+    def test_stubs_all_but_last_identical_copy(self):
+        big = "P" * 3000
+        msgs = [
+            {"role": "system", "content": big},
+            {"role": "user", "content": "small"},
+            {"role": "system", "content": big},
+            {"role": "system", "content": big},  # last → kept
+        ]
+        stubbed, reclaimed = gr._dedupe_repeated_preambles(msgs)
+        assert stubbed == 2
+        assert reclaimed == 6000
+        assert msgs[0]["content"].startswith("[deduplicated")
+        assert msgs[2]["content"].startswith("[deduplicated")
+        assert msgs[3]["content"] == big          # last copy kept full
+        assert msgs[1]["content"] == "small"       # small untouched
+
+    def test_ignores_small_and_unique_messages(self):
+        msgs = [
+            {"role": "user", "content": "a" * 100},   # small
+            {"role": "user", "content": "b" * 5000},  # unique large
+        ]
+        stubbed, _ = gr._dedupe_repeated_preambles(msgs)
+        assert stubbed == 0
+        assert len(msgs[1]["content"]) == 5000
+
+    def test_preserves_message_count_and_roles(self):
+        big = "Q" * 2500
+        msgs = [
+            {"role": "system", "content": big},
+            {"role": "assistant", "content": "resp"},
+            {"role": "system", "content": big},
+        ]
+        gr._dedupe_repeated_preambles(msgs)
+        assert len(msgs) == 3
+        assert [m["role"] for m in msgs] == ["system", "assistant", "system"]
+
+    def test_handles_non_string_content_safely(self):
+        # tool-block content (a list) must not crash the scan.
+        msgs = [
+            {"role": "user", "content": [{"type": "tool_result", "x": 1}]},
+            {"role": "user", "content": "z" * 3000},
+        ]
+        stubbed, _ = gr._dedupe_repeated_preambles(msgs)
+        assert stubbed == 0

@@ -274,6 +274,94 @@ def _clear_workspace_lock_pids_atexit() -> None:
 atexit.register(_clear_workspace_lock_pids_atexit)
 
 
+def _read_workspace_lock_holder(workspace_path: str) -> Optional[int]:
+    """PID recorded in the workspace lock file, but ONLY if that process is
+    still alive; ``None`` otherwise.
+
+    The lock file persists across runs (the advisory ``fcntl.flock`` — not the
+    file's existence — is the real lock), so a hard kill (SIGKILL) or crash
+    leaves a stale ``pid=NNN`` line pointing at a dead process. Any observer
+    that reports a holder must validate liveness first, or it shows a phantom.
+    Returns ``None`` for a missing / empty / malformed file or a dead PID; the
+    PID when the holder is alive (including alive-but-another-user).
+    """
+    lock_path = os.path.join(workspace_path, ".harness_session.lock")
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            content = f.read(256)
+    except OSError:
+        return None
+    m = re.search(r"pid=(\d+)", content or "")
+    if not m:
+        return None
+    pid = int(m.group(1))
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)          # liveness probe — sends no signal
+    except ProcessLookupError:
+        return None              # dead → phantom holder, treat as unheld
+    except PermissionError:
+        return pid               # alive, owned by another user
+    except OSError:
+        return None
+    return pid
+
+
+_LOCK_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _install_lock_signal_handlers() -> None:
+    """Make a terminating signal clear the lock's ``pid=`` line the same way
+    ``atexit`` does on a normal exit.
+
+    A signalled shutdown (``kill <pid>``, init/systemd stop, parent-shell
+    close) bypasses ``atexit``, stranding the ``pid=NNN`` line so observers see
+    a phantom holder until the next run overwrites it. This handler truncates
+    the held lock(s), then re-raises the signal under its default disposition
+    so the process still dies with the conventional 128+signum status (chaining
+    to any previously-installed handler first).
+
+    Scope: SIGTERM / SIGHUP / SIGQUIT only. SIGINT is deliberately left to
+    Python's default (it raises ``KeyboardInterrupt`` → normal exit → ``atexit``
+    already runs, and a custom handler could clear the pid mid-run when code
+    catches the interrupt). SIGKILL / SIGSTOP cannot be caught by any process.
+
+    Idempotent; best-effort — ``signal.signal`` only works in the main thread,
+    so a non-main-thread caller silently skips (``atexit`` still covers clean
+    exits there).
+    """
+    global _LOCK_SIGNAL_HANDLERS_INSTALLED
+    if _LOCK_SIGNAL_HANDLERS_INSTALLED:
+        return
+    import signal as _signal
+
+    def _make_handler(previous: Any):
+        def _handler(signum: int, frame: Any) -> None:
+            _clear_workspace_lock_pids_atexit()
+            if callable(previous):
+                previous(signum, frame)
+                return
+            try:
+                _signal.signal(signum, _signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            except Exception:  # noqa: BLE001
+                os._exit(128 + int(signum))
+        return _handler
+
+    for name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
+        sig = getattr(_signal, name, None)
+        if sig is None:
+            continue                     # platform doesn't define this signal
+        try:
+            previous = _signal.getsignal(sig)
+            _signal.signal(sig, _make_handler(previous))
+        except (ValueError, OSError):
+            # Not the main thread, or the kernel disallows a handler here.
+            pass
+    _LOCK_SIGNAL_HANDLERS_INSTALLED = True
+
+
 def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
     """Acquire an exclusive lock on the workspace.
 
@@ -328,14 +416,16 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
                 fh.close()
                 return False
         else:
+            holder = _read_workspace_lock_holder(workspace_path)
+            holder_str = f" (held by pid {holder})" if holder else ""
             logger.error(
-                "[lock] Workspace %s is locked by another live teane session "
-                "session. Refusing to start so the two don't clobber each "
+                "[lock] Workspace %s is locked by another live teane "
+                "session%s. Refusing to start so the two don't clobber each "
                 "other's patches.\n"
                 "  Wait for the other session to finish, or pass --force-lock "
                 "if you're certain it's stuck (e.g. a previous crash left the "
                 "lock stranded).",
-                workspace_path,
+                workspace_path, holder_str,
             )
             fh.close()
             return False
@@ -359,6 +449,9 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
     except Exception:  # noqa: BLE001
         key = workspace_path
     _WORKSPACE_LOCK_HANDLES[key] = fh
+    # Ensure a signalled shutdown (SIGTERM/SIGHUP/SIGQUIT) clears the pid line
+    # too — atexit alone misses those and strands a phantom holder.
+    _install_lock_signal_handlers()
     logger.info("[lock] Acquired workspace lock: %s (pid=%d)", lock_path, os.getpid())
     return fh
 

@@ -393,6 +393,35 @@ def test_story_loop_auto_completes_story_at_zero_patch_cap(workspace: str):
     assert out["loop_counter"]["story_zero_patch_rounds"] == {}
 
 
+def test_auto_complete_resets_global_zero_patch_counter(workspace: str):
+    """lumina 019f82af: auto-completing a vacuous story cleared the per-story
+    counter but left the GLOBAL consecutive_zero_patch_rounds at the cap, so a
+    downstream node fired a residual zero_patch_loop HITL. Auto-complete must
+    reset the global counter too, since the stall is resolved."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_in_progress(conn, _app(workspace), "STORY-001")
+    finally:
+        conn.close()
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-001",
+        loop_counter={
+            "story_zero_patch_rounds": {"STORY-001": story_loop.STORY_ZERO_PATCH_CAP},
+            "consecutive_zero_patch_rounds": story_loop.STORY_ZERO_PATCH_CAP,
+        },
+    ))
+
+    assert out["node_state"]["auto_completed_story"] == "STORY-001"
+    # The global counter that fed the residual HITL is now cleared.
+    assert out["loop_counter"]["consecutive_zero_patch_rounds"] == 0
+
+
 def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
     """Below the per-story zero-patch cap, the story is NOT auto-completed
     (it stays in_progress in the DB), but the cursor still advances to the

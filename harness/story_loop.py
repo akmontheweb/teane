@@ -442,6 +442,16 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             auto_completed_rounds = cur_rounds
             sz.pop(cur_story_id, None)
             loop_counter["story_zero_patch_rounds"] = sz
+            # Auto-completing a vacuous story RESOLVES its zero-patch stall,
+            # so clear the GLOBAL zero-patch counter too. Without this it
+            # stays at the cap and a downstream node (post-auto-complete
+            # verification) escalates on the stale count — lumina 019f82af:
+            # NFR-005 auto-completed correctly but a residual zero_patch_loop:3
+            # HITL still fired (benign under --yes auto-resume, a spurious
+            # breakpoint in interactive mode). route_after_patching already
+            # defers in story mode (ADR / cc8cf30); this closes the counter
+            # that the deferral leaves elevated.
+            loop_counter["consecutive_zero_patch_rounds"] = 0
 
     # A1 append gate: only mark cur_story_id as "patched this pass" when
     # we're actually advancing off of it — patching produced real code,

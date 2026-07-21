@@ -1414,10 +1414,14 @@ _VALID_SANDBOX_BACKENDS: frozenset[str] = frozenset({
     "auto", "docker", "unshare", "bare",
 })
 
-# Speculative-branching winner-pick strategies. Must match the choices
-# handled in harness/speculative.py:_select_winner.
+# Speculative-branching winner-pick strategies. MUST mirror the runtime
+# authority ``harness/speculative.py:SELECTION_STRATEGIES`` (what ``_pick``
+# validates config against). This set previously omitted ``first_pass`` (the
+# canonical default) and ``voted``, so a config that set either — both fully
+# supported by the runtime — was rejected at load with exit 2. The
+# ``test_selection_strategies_match_runtime`` parity test guards against drift.
 _VALID_SELECTION_STRATEGIES: frozenset[str] = frozenset({
-    "first_success", "fewest_changes", "all_pass",
+    "first_pass", "first_success", "fewest_changes", "voted", "all_pass",
 })
 
 # Providers that DON'T need an API key env var (run locally / on-host).

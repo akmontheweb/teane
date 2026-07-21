@@ -407,3 +407,23 @@ def test_select_winner_fewest_changes_takes_smaller_diff():
     b.patch_results = [PatchResult(success=True, file="x", operation=_Op.CREATE_FILE, lines_changed=10)]
     winner = _select_winner([a, b], SELECT_FEWEST_CHANGES)
     assert winner is b
+
+
+# ---------------------------------------------------------------------------
+# Config-validator ↔ runtime parity (regression: the cli validator used to
+# reject 'first_pass' and 'voted' — both supported by the runtime — so a
+# config that set either failed to load with exit 2).
+# ---------------------------------------------------------------------------
+def test_selection_strategies_match_runtime():
+    """The cli config validator must accept exactly the strategies the
+    runtime supports, or a valid selection_strategy is rejected at load."""
+    from harness.cli import _VALID_SELECTION_STRATEGIES
+    from harness.speculative import SELECTION_STRATEGIES
+    assert _VALID_SELECTION_STRATEGIES == SELECTION_STRATEGIES
+
+
+def test_cli_validator_accepts_voted_and_first_pass():
+    from harness.cli import _VALID_SELECTION_STRATEGIES
+    # Previously rejected; both are real runtime strategies.
+    assert "voted" in _VALID_SELECTION_STRATEGIES
+    assert "first_pass" in _VALID_SELECTION_STRATEGIES

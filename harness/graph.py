@@ -3047,7 +3047,7 @@ _MAX_CONTINUATION_CYCLES = 5
 
 # Per-role default for ``continue_on_length`` when the operator's
 # config.json omits the section or the role entry. Patching's default
-# is True because full-stack blueprints regularly exceed its 16384
+# is True because full-stack blueprints regularly exceed its 32768
 # token cap; every other node defaults to False because the failure
 # mode is more nuanced (see _llm_dispatch_comment in config.json).
 _CONTINUE_ON_LENGTH_DEFAULTS: dict[str, bool] = {
@@ -18303,8 +18303,8 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if _no_progress >= max_repair and not _has_autofixable_now:
         return f"no_progress_repairs:{_no_progress}/{max_repair}"
     # Hard total-iteration ceiling (router L~17864). Sized at
-    # ``max_iterations * total_hard_cap_multiplier`` (default 4 → cap 12
-    # with default max_iterations=3). Must precede the generic
+    # ``max_iterations * total_hard_cap_multiplier`` (default 4 → cap 20
+    # with default max_iterations=5). Must precede the generic
     # ``repair_loop_limit`` fallback since both check ``total_repairs``;
     # this is the more-specific cap that fires when per-round progress
     # signals kept the earlier gates from tripping.

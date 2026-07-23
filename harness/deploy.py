@@ -1432,6 +1432,25 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    # `teane deploy --clean`: tear this workspace's existing stack down
+    # (down --volumes --remove-orphans) before bringing it back up, so the
+    # re-deploy starts from a clean slate. Runs AFTER the approval gate so a
+    # declined deploy never destroys the operator's running stack or dev
+    # volumes. Best-effort: a teardown miss (e.g. nothing running yet) must
+    # not block the fresh `up` that follows.
+    if state.get("clean_deploy", False):
+        logger.info(
+            "[deployment_node] --clean: tearing down existing stack "
+            "(down --volumes --remove-orphans) before re-deploy."
+        )
+        torn_down = await teardown_containers(
+            workspace_path, compose_file, remove_volumes=True,
+        )
+        logger.info(
+            "[deployment_node] --clean teardown %s.",
+            "completed" if torn_down else "found nothing to remove (or failed; continuing)",
+        )
+
     # Build — use shared kill-on-timeout + per-workspace project name.
     # Audit §2.3 / §2.4.
     try:
@@ -1816,22 +1835,33 @@ def _generate_env_file(blueprint: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-async def teardown_containers(workspace_path: str, compose_file: str = "docker-compose.yml") -> bool:
-    """Stop and remove all containers.
+async def teardown_containers(
+    workspace_path: str,
+    compose_file: str = "docker-compose.yml",
+    *,
+    remove_volumes: bool = False,
+) -> bool:
+    """Stop and remove all containers (and, when ``remove_volumes``, the
+    project's named volumes) for THIS workspace's stack.
 
     Kill-on-timeout (§2.3) + per-workspace project name (§2.4) so
-    teardown only ever touches containers belonging to THIS workspace
-    — not another harness session that happens to have a same-basename
-    workspace.
+    teardown only ever touches containers/volumes belonging to THIS
+    workspace — not another harness session that happens to have a
+    same-basename workspace. ``remove_volumes=True`` adds ``--volumes``
+    (the `teane deploy --clean` path) so a from-scratch deploy also wipes
+    dev database data; without it, named volumes survive the teardown.
     """
     compose_path = os.path.join(workspace_path, compose_file)
     if not os.path.isfile(compose_path):
         return False
+    cmd = [*_compose_argv_for(workspace_path), "-f", compose_path,
+           "down", "--remove-orphans"]
+    if remove_volumes:
+        cmd.append("--volumes")
     try:
         from harness.sandbox import run_subprocess_kill_on_timeout
         rc, _stdout, _stderr, timed_out = await run_subprocess_kill_on_timeout(
-            [*_compose_argv_for(workspace_path), "-f", compose_path,
-             "down", "--remove-orphans"],
+            cmd,
             timeout=30.0,
             cwd=workspace_path,
         )

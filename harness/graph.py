@@ -261,6 +261,13 @@ class AgentState(TypedDict, total=False):
     # the `--cd-discovery` CLI flag on `teane run`; default False
     # (matches the new operator-autonomous baseline).
     cd_discovery: bool
+    # `teane deploy --clean`: when True, deployment_node tears this
+    # workspace's compose stack down (down --volumes --remove-orphans)
+    # before `docker-compose up`, so the re-deploy starts from a clean
+    # slate — no leftover containers, orphans, or named volumes (dev DB
+    # data). Only meaningful when dev_deployment is True. Default False —
+    # a normal deploy reuses existing volumes.
+    clean_deploy: bool
     # End-of-run installation-doc synthesis toggle. When True,
     # installation_doc_node fires at the terminal success edges
     # (--deploy-dev=false clean security scan, and after
@@ -460,6 +467,7 @@ def create_initial_state(
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
     cd_discovery: bool = False,
+    clean_deploy: bool = False,
     install_doc: bool = False,
     decomposition_enabled: bool = False,
     stories_db_path: str = "",
@@ -543,6 +551,7 @@ def create_initial_state(
         change_requests_config=dict(change_requests_config or {}),
         dev_deployment=bool(dev_deployment),
         cd_discovery=bool(cd_discovery),
+        clean_deploy=bool(clean_deploy),
         install_doc=bool(install_doc),
         installation_doc_path="",
         pending_mutations=[],
@@ -26155,6 +26164,7 @@ async def run_graph(
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
     cd_discovery: bool = False,
+    clean_deploy: bool = False,
     install_doc: bool = False,
     decomposition_enabled: bool = False,
     commit_on_story: bool = False,
@@ -26214,6 +26224,7 @@ async def run_graph(
         change_requests_config=change_requests_config,
         dev_deployment=dev_deployment,
         cd_discovery=cd_discovery,
+        clean_deploy=clean_deploy,
         install_doc=install_doc,
         decomposition_enabled=decomposition_enabled,
         # Global state.db now — same path regardless of workspace, with

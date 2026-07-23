@@ -7655,6 +7655,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # where present). See route_after_security_scan in
             # harness/graph.py.
             cd_discovery=getattr(args, "cd_discovery", False),
+            # `teane deploy --clean`: tear this workspace's stack down
+            # (down --volumes --remove-orphans) before `docker-compose up`
+            # so the re-deploy starts from scratch. deployment_node reads it
+            # from state. Default False — normal deploys reuse volumes.
+            clean_deploy=getattr(args, "clean_deploy", False),
             # End-of-run INSTALLATION.md synthesis. When --install-doc is
             # unset on the command line (default), follow --new-build —
             # greenfield runs get an install doc; incremental change
@@ -12273,6 +12278,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Prompt the operator at the DEPLOYMENT gate before the dev "
             "deploy fires. Falls back to config.json hitl.deployment, "
             "then to true."
+        ),
+    )
+    deploy_parser.add_argument(
+        "--clean",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="clean_deploy",
+        help=(
+            "Before `docker-compose up`, tear down THIS workspace's existing "
+            "stack (`down --volumes --remove-orphans`) for a from-scratch "
+            "deploy. Removes prior containers, orphans, AND named volumes "
+            "(e.g. dev database data) belonging to this project namespace "
+            "only. Default false — a normal deploy reuses existing volumes. "
+            "Generated artifacts (Dockerfile/compose) are overwritten either "
+            "way; this flag only affects live Docker state."
         ),
     )
 

@@ -4283,7 +4283,18 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     dict(_per_trigger_raw)
                     if isinstance(_per_trigger_raw, dict) else {}
                 )
-                _trigger_taken = int(_per_trigger.get(trigger, 0) or 0)
+                # Cap-account by trigger CLASS (the part before the first
+                # ':'), NOT the full label. Labels like
+                # ``security_fix_limit:8/2`` embed a per-round counter, so
+                # keying on the raw label made every round a "new" trigger —
+                # the per-trigger sub-cap never accumulated, the security
+                # ping-pong evaded it entirely, and only the session cap
+                # (9) stopped the run ~9 rounds in (well past the security
+                # hard ceiling). Grouping by class matches the stated
+                # intent: one exhausted failure CLASS can't monopolize the
+                # auto-resume pool.
+                _trigger_class = trigger.split(":", 1)[0].strip() or trigger
+                _trigger_taken = int(_per_trigger.get(_trigger_class, 0) or 0)
                 _session_cap_hit = _resumes_taken >= _cap
                 _trigger_cap_hit = _trigger_taken >= _cap_per_trigger
                 if _session_cap_hit or _trigger_cap_hit:
@@ -4299,7 +4310,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         f"session cap {_resumes_taken}/{_cap}"
                         if _session_cap_hit else
                         f"per-trigger cap {_trigger_taken}/"
-                        f"{_cap_per_trigger} for '{trigger}'"
+                        f"{_cap_per_trigger} for '{_trigger_class}'"
                     )
                     logger.warning(
                         "[HITL] Auto-resume cap reached (%s) in headless "
@@ -4401,17 +4412,17 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     _lc_for_cap["hitl_auto_resumes_taken"] = (
                         _resumes_taken + 1
                     )
-                    _per_trigger[trigger] = int(
-                        _per_trigger.get(trigger, 0) or 0
+                    _per_trigger[_trigger_class] = int(
+                        _per_trigger.get(_trigger_class, 0) or 0
                     ) + 1
                     _lc_for_cap["hitl_auto_resumes_per_trigger"] = _per_trigger
                     logger.info(
                         "[HITL] Repair menu auto-resumed "
                         "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE "
                         "/ no TTY). Auto-resume %d/%d for this session "
-                        "(trigger '%s' cumulative: %d).",
-                        _resumes_taken + 1, _cap, trigger,
-                        _per_trigger[trigger],
+                        "(trigger '%s' → class '%s' cumulative: %d/%d).",
+                        _resumes_taken + 1, _cap, trigger, _trigger_class,
+                        _per_trigger[_trigger_class], _cap_per_trigger,
                     )
         else:
             # Structured envelope for remote UIs (the dashboard's HITL

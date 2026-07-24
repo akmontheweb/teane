@@ -182,6 +182,45 @@ class TestPerTriggerCap:
         # State reflects the abandon.
         assert result["node_state"]["hitl_auto_resume_cap_hit"] is True
 
+    def test_count_suffixed_trigger_accumulates_by_class(self, monkeypatch):
+        # Regression: labels like ``security_fix_limit:8/2`` embed a
+        # per-round counter. Accounting must key on the CLASS
+        # (``security_fix_limit``) so successive rounds accumulate, instead
+        # of each ``:N/M`` label creating a fresh key that never trips the
+        # sub-cap (the security HITL ping-pong bug).
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="security_fix_limit:8/2",
+            resumes_taken=1, cap=9,
+            per_trigger={"security_fix_limit": 1},
+        )
+        result = cli.hitl_menu_loop(state)
+        per_trig = result["loop_counter"]["hitl_auto_resumes_per_trigger"]
+        assert per_trig.get("security_fix_limit") == 2
+        # The raw counted label must NOT leak in as its own key.
+        assert "security_fix_limit:8/2" not in per_trig
+
+    def test_security_pingpong_trips_per_trigger_cap(self, monkeypatch):
+        # The exact lumina-deploy failure: each security round's label
+        # differs (:2/2, :3/2, ... :9/2) yet they must share one class
+        # budget. With the class fix, the 4th security resume trips the
+        # per-trigger cap (3) and terminates — instead of running to the
+        # session cap (9) as it did before.
+        _force_headless(monkeypatch)
+        state = _minimal_state(
+            trigger="security_fix_limit:9/2",
+            resumes_taken=3, cap=10,
+            per_trigger={"security_fix_limit": 3},
+        )
+        state["hitl_auto_resume_cap_per_trigger"] = 3
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            result = cli.hitl_menu_loop(state)
+        stderr = buf.getvalue()
+        assert "TERMINATED" in stderr
+        assert "per-trigger cap 3/3 for 'security_fix_limit'" in stderr
+        assert result["node_state"]["hitl_auto_resume_cap_hit"] is True
+
     def test_session_cap_still_trips_when_it_hits_first(self, monkeypatch):
         # Session cap 3, per-trigger cap 10. Session cap trips first.
         _force_headless(monkeypatch)

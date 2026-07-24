@@ -4981,15 +4981,14 @@ class TestToolchainAdaptation:
         )
 
     def test_apply_toolchain_adaptation_make_network_readonly_compose(self):
-        """Single call with `make build`: network flips on (via the make
-        bypass) but read_only_root does NOT flip — the Makefile skill
-        (`harness/skills/makefile_python.md`) is Python-focused, so the
-        recipe conventionally invokes pip, which lands in the tmpfs HOME
-        regardless of RO root. Only `npm install -g` at the outer command
-        level triggers the RO-root flip; a Makefile that internally does
-        `npm install -g` should hard-pin `read_only_root=False` in
-        workspace config. (The image half stays no-op — the kitchen-sink
-        BUILDER_IMAGE is picked from DockerBackend's default.)
+        """Single call with `make build`: BOTH network and read_only_root
+        flip. The Makefile skill (`harness/skills/makefile_python.md`)
+        mandates `uv pip install --system`, which writes the system
+        interpreter's site-packages on the read-only root FS — so a make
+        build needs a writable root, just as it needs network. The install
+        is hidden inside the recipe, so we key off the `make` wrapper.
+        (The image half stays no-op — the kitchen-sink BUILDER_IMAGE is
+        picked from DockerBackend's default.)
         """
         from harness.graph import _apply_toolchain_adaptation
         cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
@@ -5002,8 +5001,8 @@ class TestToolchainAdaptation:
         assert not img_adapted  # one-image-fits-all: no per-command swap
         assert net_adapted
         assert allow_net is True
-        assert not ro_adapted
-        assert "read_only_root" not in cfg
+        assert ro_adapted
+        assert cfg["read_only_root"] is False
 
     def test_apply_toolchain_adaptation_cmake_not_bypassed(self):
         """Substring-trap regression: `cmake build` must NOT trigger the
@@ -5024,9 +5023,11 @@ class TestToolchainAdaptation:
         assert allow_net is False
 
     def test_writes_root_fs_recognises_npm_global(self):
-        """The narrow root-FS predicate: only ``npm install -g`` and its
-        aliases return True. Pip / poetry / uv / local `npm install` land
-        under the tmpfs-backed HOME and do not need the RO-root flip.
+        """The root-FS predicate returns True for the three write-root cases:
+        ``npm install -g``, any ``make`` build (recipe uses the skill's
+        ``uv pip install --system``, which writes system site-packages), and
+        a directly-typed ``--system`` install. Pip / poetry / uv WITHOUT
+        ``--system`` land under the tmpfs HOME and do not need the flip.
         """
         from harness.graph import _build_command_writes_root_fs
         # True: every documented spelling of npm-global
@@ -5035,7 +5036,15 @@ class TestToolchainAdaptation:
         assert _build_command_writes_root_fs("npm i -g typescript")
         assert _build_command_writes_root_fs("NPM INSTALL -G FOO")
         assert _build_command_writes_root_fs("  npm install -g  pnpm ")
-        # False: pip / poetry / uv all land under $HOME/.local
+        # True: make builds — the skill's Makefile does `uv pip install
+        # --system`, which writes /usr/local site-packages on the RO root.
+        assert _build_command_writes_root_fs("make build")
+        assert _build_command_writes_root_fs("make")
+        assert _build_command_writes_root_fs("MAKE test")
+        # True: a directly-typed --system install
+        assert _build_command_writes_root_fs("uv pip install --system -r requirements.txt")
+        assert _build_command_writes_root_fs("pip install --system foo")
+        # False: pip / poetry / uv WITHOUT --system land under $HOME/.local
         assert not _build_command_writes_root_fs("pip install -r requirements.txt")
         assert not _build_command_writes_root_fs("pip install -e . && pytest")
         assert not _build_command_writes_root_fs("uv pip install pytest")
@@ -5043,9 +5052,8 @@ class TestToolchainAdaptation:
         # False: local npm install writes to CWD/node_modules (workspace)
         assert not _build_command_writes_root_fs("npm install && npm test")
         assert not _build_command_writes_root_fs("npm ci")
-        # False: make (recipe is Python-focused per the LLM skill; operator
-        # opts in via workspace config if their Makefile does npm -g)
-        assert not _build_command_writes_root_fs("make build")
+        # False: cmake is not make (prefix-match guard)
+        assert not _build_command_writes_root_fs("cmake build")
 
     def test_apply_toolchain_adaptation_npm_global_flips_ro_root(self):
         """Positive case for the narrowed rule: ``npm install -g`` writes

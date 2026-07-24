@@ -5465,27 +5465,38 @@ def _build_command_needs_network(build_command: str) -> bool:
 
 def _build_command_writes_root_fs(build_command: str) -> bool:
     """True when the build command installs into a location that lives on
-    the container's read-only root filesystem — currently just
-    ``npm install -g`` (and its aliases), which writes to
-    ``/usr/local/lib/node_modules``.
+    the container's read-only root filesystem, so the sandbox must drop
+    ``--read-only`` for the build to succeed. Three cases:
 
-    Pip / poetry / uv are intentionally excluded: the sandbox sets
-    ``PIP_USER=1`` and redirects ``HOME`` to ``/tmp/builder-home`` (a
-    writable tmpfs) when the container runs as the host user (see
-    :meth:`DockerBackend._default_user_mode_env`), so pip lands under
-    ``$HOME/.local`` regardless of whether the root FS is read-only.
-    Non-host-user runs mount ``/root`` as tmpfs for the same reason
-    (see :meth:`DockerBackend._build_docker_command`).
+    - ``npm install -g`` (and aliases) → ``/usr/local/lib/node_modules``.
+    - Any ``make``-based build. The LLM authors the Makefile per
+      ``harness/skills/makefile_python.md``, which MANDATES
+      ``uv pip install --system`` — and ``--system`` targets the system
+      interpreter's ``site-packages`` on the read-only root FS, NOT the
+      tmpfs ``$HOME`` (``PIP_USER`` / ``--user`` do not apply to
+      ``--system``). That install lives inside the recipe, invisible to
+      string inspection, so we can't see the ``--system`` from
+      ``make build`` alone — we key off the ``make`` wrapper itself,
+      mirroring the network-side ``make`` bypass in
+      :func:`_apply_toolchain_adaptation`. WITHOUT this the root stays
+      mounted read-only and every ``uv pip install --system`` fails with
+      "Read-only file system", stalling the build until the repair loop
+      rewrites the Makefile to a venv (which then leaks a workspace
+      ``.venv`` into scans). A make recipe that only does a local
+      ``npm install`` doesn't strictly need the flip, but relaxing
+      ``--read-only`` for it is harmless — the container is ``--rm``.
+    - A directly-typed ``--system`` pip/uv install (rare, but honour it).
 
-    ``make`` is also excluded even though ``_build_command_needs_network``
-    treats it as install-needing for the network side. The LLM-authored
-    Makefile skill (``harness/skills/makefile_python.md``) is Python-
-    focused, so its recipe conventionally invokes pip — which lands in
-    the tmpfs HOME anyway. An operator whose Makefile does
-    ``npm install -g`` should pin ``sandbox.read_only_root=False`` in
-    their workspace config.
+    Pip / poetry / uv WITHOUT ``--system`` stay excluded: the sandbox sets
+    ``PIP_USER=1`` and redirects ``HOME`` to a writable tmpfs (see
+    :meth:`DockerBackend._default_user_mode_env`), so a user-install lands
+    under ``$HOME/.local`` regardless of a read-only root.
     """
+    if _command_is_make(build_command):
+        return True
     cmd = re.sub(r"\s+", " ", build_command.strip().lower())
+    if "--system" in cmd and ("pip install" in cmd or "uv pip" in cmd):
+        return True
     return any(token in cmd for token in (
         "npm install -g", "npm install --global", "npm i -g",
     ))

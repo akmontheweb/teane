@@ -1003,7 +1003,15 @@ SEARCH_BLOCK_COPY_RULES = (
     "    (eight leading spaces, full sentence, no `21|` prefix).\n"
     "  - If a whole-line copy of what you want to replace is more "
     "than ~10 lines, prefer a single `REWRITE_FILE` over a "
-    "REPLACE_BLOCK — the copy-fidelity risk grows with SEARCH size."
+    "REPLACE_BLOCK — the copy-fidelity risk grows with SEARCH size.\n"
+    "  - STRUCTURAL config files — `.json`, `.yaml` / `.yml`, `.toml` "
+    "(e.g. docker-compose.yml, tsconfig.json, pyproject.toml): a "
+    "multi-line REPLACE_BLOCK is REJECTED outright — one misplaced "
+    "brace, trailing comma, or indent shift breaks the whole file. Edit "
+    "these with `REWRITE_FILE`, emitting the COMPLETE intended file. The "
+    "ONLY REPLACE_BLOCK allowed on them is a single-value change of ~3 "
+    "lines or fewer; anything larger MUST be REWRITE_FILE. When in doubt "
+    "on a structural file, use REWRITE_FILE."
 )
 """Tightened copy rules for LLM SEARCH-block emission. The single
 source of truth — shared by every path that shows the LLM a

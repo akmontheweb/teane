@@ -70,6 +70,21 @@ class TestSearchBlockCopyRules:
         from harness.patcher import SEARCH_BLOCK_COPY_RULES
         assert "REWRITE_FILE" in SEARCH_BLOCK_COPY_RULES
 
+    def test_biases_structural_files_to_rewrite_file(self):
+        # Proactive counterpart to the patcher's structural-file guard
+        # (which REJECTS a multi-line REPLACE_BLOCK on JSON/YAML/TOML).
+        # Steering the LLM to REWRITE_FILE up front avoids burning a repair
+        # round on the rejection — the lumina deploy stalled a round on a
+        # multi-line REPLACE_BLOCK against docker-compose.yml. Keeps the
+        # proactive guidance aligned with the reactive guard's wording.
+        from harness.patcher import SEARCH_BLOCK_COPY_RULES
+        rules = SEARCH_BLOCK_COPY_RULES
+        assert ".json" in rules and ".toml" in rules
+        assert ".yaml" in rules or ".yml" in rules
+        assert "REJECTED" in rules
+        # Names the single-value exception so it doesn't over-steer 1-3 line edits.
+        assert "single-value" in rules
+
     def test_graph_re_export_is_identical(self):
         # graph.py can't import from itself and patcher.py can't
         # import from graph.py (circular); the re-export is the

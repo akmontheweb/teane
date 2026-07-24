@@ -290,6 +290,11 @@ class AgentState(TypedDict, total=False):
     # load_deployment_defaults() in cli.py for the schema.
     deployment_defaults: dict[str, Any]
     run_prod_import_smoke_check: bool
+    # Client↔server route contract check. When True (default), compiler_node
+    # verifies every high-confidence client HTTP call resolves to a real
+    # backend route (via the app's OpenAPI schema) before the build.
+    # config.compiler.run_route_check.
+    run_route_check: bool
     # Change-request-mode fields. When change_request_mode is True, the
     # graph routes through ingest_change_requests_node instead of the bare
     # patching path; the ingest node populates the remaining fields with
@@ -7005,6 +7010,157 @@ def _classify_smoke_failure(
     return f"DEPS_NOT_INSTALLED:{top}", hint
 
 
+def _find_workspace_fastapi_app(workspace_path: str) -> Optional[tuple[str, str]]:
+    """Locate the FastAPI app instance as ``(module_dotted, app_var)``, or None.
+
+    Walks prod ``.py`` files (conventional entrypoints first) and reuses
+    ``contract_tests.find_fastapi_app`` — the same AST-based detector the
+    contract-test emitter trusts, which handles both ``app = FastAPI(...)``
+    and the ``app = create_app()`` factory. The returned module path is the
+    workspace-root-relative dotted path (``server.app.main``), which is how
+    the sandbox (cwd = workspace root) imports it.
+    """
+    try:
+        from harness.contract_tests import find_fastapi_app
+        from harness.link_check import _NEVER_SOURCE_DIRS as _skip
+    except Exception:  # noqa: BLE001 — best effort
+        return None
+    candidates: list[tuple[int, str, str]] = []
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _skip]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            abs_path = os.path.join(root, fn)
+            rel = os.path.relpath(abs_path, workspace_path)
+            prio = 0 if fn.lower() in ("main.py", "app.py", "asgi.py") else 1
+            candidates.append((prio, abs_path, rel))
+    for _prio, abs_path, rel in sorted(candidates, key=lambda c: c[0]):
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                src = f.read()
+        except OSError:
+            continue
+        try:
+            hit = find_fastapi_app(src, rel_path=rel)
+        except Exception:  # noqa: BLE001 — detector is advisory
+            hit = None
+        if hit:
+            return hit
+    return None
+
+
+def _parse_openapi_between_sentinels(raw: str) -> Optional[dict[str, Any]]:
+    """Extract the OpenAPI JSON emitted between the schema sentinels.
+
+    Robust to interleaved log lines: scans the lines between BEGIN/END and
+    returns the first that parses as a JSON object. None if absent/unparsable.
+    """
+    lines = (raw or "").splitlines()
+    try:
+        b = next(i for i, l in enumerate(lines) if "OPENAPI_SCHEMA_BEGIN" in l)
+        e = next(i for i, l in enumerate(lines) if "OPENAPI_SCHEMA_END" in l)
+    except StopIteration:
+        return None
+    for line in lines[b + 1:e]:
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            doc = json.loads(s)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(doc, dict):
+            return doc
+    return None
+
+
+async def _run_route_contract_check(
+    workspace_path: str,
+    sandbox_config: dict[str, Any],
+    allow_network: bool,
+    install_step: str,
+    session_id: str,
+) -> list[Any]:
+    """Client↔server route contract check.
+
+    Returns ``ROUTE_UNRESOLVED`` diagnostic dicts for high-confidence client
+    HTTP calls that resolve to no backend route (per the app's OpenAPI
+    schema), or ``[]`` on any acquisition failure — degrade-to-skip, so a
+    false positive can never enter the repair loop. Never raises.
+
+    Schema acquisition is framework-agnostic: a committed ``openapi.json``
+    is preferred (free, no sandbox); otherwise the FastAPI adapter imports
+    the app in the sandbox and dumps ``app.openapi()``. Non-Python backends
+    with no committed schema and no adapter simply skip.
+    """
+    try:
+        from harness import route_check
+    except Exception:  # noqa: BLE001
+        return []
+
+    calls = route_check.extract_client_calls(workspace_path)
+    if not calls:
+        return []  # no client HTTP calls — nothing to check, no sandbox spin-up
+
+    doc = route_check._load_committed_openapi(workspace_path)
+    if doc is None:
+        app_ref = _find_workspace_fastapi_app(workspace_path)
+        if app_ref is None:
+            logger.info(
+                "[route-check] No committed OpenAPI schema and no FastAPI app "
+                "found; skipping route contract check."
+            )
+            return []
+        if not install_step:
+            logger.info("[route-check] No install step available; skipping.")
+            return []
+        module, app_var = app_ref
+        py_lines = [
+            "import json",
+            f"from {module} import {app_var} as _app",
+            "print('=== OPENAPI_SCHEMA_BEGIN ===')",
+            "print(json.dumps(_app.openapi()))",
+            "print('=== OPENAPI_SCHEMA_END ===')",
+        ]
+        cmd = f"{install_step} && python3 -c \"{chr(10).join(py_lines)}\""
+        from harness.sandbox import SandboxExecutor
+        executor = SandboxExecutor(
+            workspace_path=workspace_path,
+            allow_network=allow_network,
+            sandbox_config=sandbox_config,
+            session_id=session_id,
+        )
+        logger.info(
+            "[route-check] Acquiring OpenAPI schema from %s:%s in sandbox.",
+            module, app_var,
+        )
+        result = await executor.run(cmd)
+        doc = _parse_openapi_between_sentinels(result.raw_output or "")
+        if doc is None:
+            logger.warning(
+                "[route-check] OpenAPI extraction failed (exit=%s); skipping "
+                "route contract check.", result.exit_code,
+            )
+            return []
+
+    server_routes = route_check.extract_server_routes(doc)
+    if not server_routes:
+        logger.info(
+            "[route-check] OpenAPI schema exposed no routes; treating as "
+            "unreliable and skipping (never mass-flag)."
+        )
+        return []
+    broken = route_check.match_routes(calls, server_routes)
+    diags = route_check.broken_routes_to_diagnostics(broken)
+    if diags:
+        logger.info(
+            "[route-check] %d client HTTP call(s) target a missing backend "
+            "route.", len(diags),
+        )
+    return diags
+
+
 async def _run_prod_import_smoke_check(
     workspace_path: str,
     sandbox_config: dict[str, Any],
@@ -13617,6 +13773,52 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "node_state": short_circuit_state,
                 "loop_counter": loop_counter,
                 **_rotate_diag_fingerprints_delta(state, smoke_errors),
+            }
+
+    # Client↔server route contract check. Every high-confidence client HTTP
+    # call must resolve to a real backend route (checked against the app's
+    # OpenAPI schema). Catches the seam bug the per-component unit tests are
+    # blind to: the frontend calling an endpoint the backend never
+    # implemented (e.g. /api/csrf-token), which ships a silently-broken app.
+    # Runs AFTER prod-smoke so the app is known to import cleanly. Advisory +
+    # degrade-to-skip — any schema-acquisition failure returns no diagnostics
+    # rather than blocking the build. Same short-circuit contract as the
+    # link-check / smoke blocks, so ROUTE_UNRESOLVED flows into repair with
+    # no routing changes.
+    if state.get("run_route_check", True):
+        try:
+            route_install_step = (
+                composed_install_step
+                or _compose_prod_smoke_install_step(workspace)
+            )
+            route_diags = await _run_route_contract_check(
+                workspace_path=workspace,
+                sandbox_config=sandbox_cfg,
+                allow_network=True,
+                install_step=route_install_step or "",
+                session_id=state.get("session_id", "unknown"),
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory, never crash the build
+            logger.warning(
+                "[compiler_node] Route contract check failed (%s); skipping.", exc,
+            )
+            route_diags = []
+        if route_diags:
+            short_circuit_state = dict(state.get("node_state", {}) or {})
+            short_circuit_state["current_node"] = "compiler"
+            short_circuit_state["route_check_failed"] = True
+            short_circuit_state["last_build_output"] = (
+                f"Client↔server route contract check failed: {len(route_diags)} "
+                "client API call(s) target backend routes that do not exist. "
+                "The build was skipped. Add the missing route(s) to the backend "
+                "or correct the client path(s)."
+            )
+            return {
+                "exit_code": 1,
+                "compiler_errors": route_diags,
+                "node_state": short_circuit_state,
+                "loop_counter": loop_counter,
+                **_rotate_diag_fingerprints_delta(state, route_diags),
             }
 
     # Delegate to the sandbox module for actual execution.
@@ -26274,6 +26476,9 @@ async def run_graph(
     # without reaching out to config (which the graph module doesn't
     # touch directly today).
     if compiler_config is not None:
+        initial_state["run_route_check"] = bool(
+            compiler_config.get("run_route_check", True)
+        )
         initial_state["run_prod_import_smoke_check"] = bool(
             compiler_config.get("run_prod_import_smoke_check", True)
         )

@@ -138,7 +138,7 @@ def _apply_teane_diagnostics_env(
 # and only required for multi-host fleets.
 BUILDER_IMAGE = (
     "harness-builder"
-    "@sha256:92f163b2817a13cda603d93d9b34686e4b4f1fae6cfe907f2dccd208a1bcad19"
+    "@sha256:894cb4fe3eda41b73ac90e0862762985828af6d576b857f77d898933b930655d"
 )
 
 
@@ -801,17 +801,26 @@ class DockerBackend(SandboxBackend):
             host_uid = os.getuid()
             host_gid = os.getgid()
             cmd.extend(["--user", f"{host_uid}:{host_gid}"])
+        # The container process is non-root whenever we pass --user
+        # $UID:$GID (Linux host-user mode) OR the image's default USER is
+        # non-root. The builder image bakes ``USER app``, so on macOS /
+        # root hosts — where we do NOT pass --user — the container still
+        # runs as ``app`` instead of root. This drives the writable-HOME
+        # env, the HOME-mkdir wrapper, and skipping the root-only
+        # ownership-restore trailer.
+        non_root = self._container_runs_non_root(run_as_host_user)
 
         if self.read_only_root:
             cmd.append("--read-only")
-            if not run_as_host_user:
-                # When the root FS is RO, pip / npm will try the
-                # per-user fallback (~/.local, ~/.cache, ~/.npm). Without a
-                # writable HOME those installs fail with "Read-only file
-                # system: '/root/...'" *after* downloading every wheel. Give
-                # them a tmpfs to land in. When running as the host user we
-                # set HOME to the existing /tmp tmpfs (see env vars below),
-                # so /root never gets written to.
+            if not non_root:
+                # Genuine-root path only. When the root FS is RO, pip / npm
+                # try the per-user fallback (~/.local, ~/.cache, ~/.npm);
+                # without a writable HOME those installs fail with
+                # "Read-only file system: '/root/...'" after downloading
+                # every wheel, so give /root a tmpfs. Non-root runs (host
+                # user OR the image's ``app`` default) get HOME redirected
+                # to the /tmp tmpfs via _default_user_mode_env below, so
+                # /root is never touched.
                 cmd.extend(["--tmpfs", "/root:exec"])
 
         # Network isolation
@@ -884,7 +893,7 @@ class DockerBackend(SandboxBackend):
         # into per-user mode so the existing build command `pip install X`
         # works without further command rewriting.
         defaults = self._default_pyc_env()
-        if run_as_host_user:
+        if non_root:
             defaults.update(self._default_user_mode_env())
         # Cache-fallback env vars for any /cache/* path that didn't get a
         # writable mount. See loop above.
@@ -920,16 +929,17 @@ class DockerBackend(SandboxBackend):
         # similar if HOME doesn't exist on disk. ``mkdir -p`` is cheap and
         # idempotent.
         wrapped_cmd = shell_cmd
-        if run_as_host_user:
+        if non_root:
             wrapped_cmd = f'mkdir -p "$HOME" && ( {wrapped_cmd} )'
 
-        # When the container runs as root we additionally wrap with an
-        # ownership-restoring trailer so any files the in-container root
-        # process wrote into the bind-mount land owned by the host user.
-        # When we already passed --user to docker every write is host-owned
-        # from the start and the trailer becomes a redundant find walk;
-        # skip it to save the (typically small but non-zero) scan time.
-        if not run_as_host_user:
+        # Only when the container runs as genuine root do we wrap with an
+        # ownership-restoring trailer so files the in-container root process
+        # wrote into the bind-mount land owned by the host user. Any non-root
+        # run — a --user $UID:$GID host-user mode OR the image's ``app``
+        # default (Docker Desktop's FUSE remaps bind-mount ownership on
+        # macOS) — already writes host-resolvable ownership, so the find
+        # walk is redundant; skip it.
+        if not non_root:
             wrapped_cmd = self._wrap_shell_cmd_with_ownership_restore(
                 wrapped_cmd, workspace_path,
             )
@@ -962,6 +972,22 @@ class DockerBackend(SandboxBackend):
         if getuid is None or getgid is None:
             return False
         return getuid() != 0
+
+    def _image_defaults_to_nonroot(self) -> bool:
+        """True when ``self.image`` is the harness builder image, which
+        bakes ``USER app`` (a non-root default). Operator-pinned custom
+        images may run as root and keep the historical root-mode handling.
+        Matches on the ``harness-builder`` repo prefix so a locally rebuilt
+        image (new digest) still resolves.
+        """
+        return (self.image or "").strip().lower().startswith("harness-builder")
+
+    def _container_runs_non_root(self, run_as_host_user: bool) -> bool:
+        """True when the container process is non-root — either because we
+        pass ``--user $UID:$GID`` (Linux host-user mode) or because the
+        image's default USER is non-root (the builder image's ``app``).
+        """
+        return run_as_host_user or self._image_defaults_to_nonroot()
 
     def _default_user_mode_env(self) -> dict[str, str]:
         """Env vars needed when the container runs as a non-root UID with

@@ -96,7 +96,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pip setuptools wheel \
  && "$PY" -m pip install --no-cache-dir --break-system-packages \
       pytest pytest-cov pytest-xdist pytest-timeout hypothesis \
- && chmod -R a+rX /opt/uv-python \
+ && chmod -R a+rwX /opt/uv-python \
+ && chmod a+rwX /usr/local/bin \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
       npx --yes playwright install --with-deps chromium \
  && chmod -R a+rX /opt/playwright-browsers \
@@ -114,3 +115,17 @@ ENV PIP_ROOT_USER_ACTION=ignore \
     npm_config_cache=/cache/npm
 
 WORKDIR /workspace
+
+# Non-root runtime user. Every build/test/repair command — including
+# LLM-authored Makefile recipes — runs as `app`, not root. The baked
+# toolchains (JDK/Node/uv/pytest) stay root-owned and world-readable, and
+# the uv-managed interpreter's tree + /cache/* were made world-writable
+# above, so `uv pip install --system` still works from a non-root UID.
+# On non-root Linux hosts the sandbox additionally passes
+# `--user $UID:$GID` (overriding this); on macOS / root hosts the container
+# now defaults to `app` instead of root. Only affects the BUILD sandbox —
+# the app's own deploy containers are built from their generated
+# Dockerfiles, untouched.
+RUN useradd --create-home --shell /bin/bash app \
+ && chmod a+rwX /workspace
+USER app

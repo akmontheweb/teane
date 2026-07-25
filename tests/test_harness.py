@@ -1324,6 +1324,52 @@ class TestSandboxBackend:
         assert "/tmp:exec" in tmpfs_targets
         assert "/root:exec" not in tmpfs_targets
 
+    def test_docker_cmd_builder_image_runs_nonroot_without_user_flag(self, monkeypatch):
+        # The builder image bakes `USER app`, so even with NO --user passed
+        # (macOS / root host) the container runs non-root. The docker command
+        # must then apply the user-mode env (writable tmpfs HOME + PIP_USER),
+        # skip the root-only /root tmpfs, and skip the ownership-restore
+        # find-chown trailer — none of which apply to a non-root process.
+        from harness.sandbox import DockerBackend, BUILDER_IMAGE
+        monkeypatch.setattr(os, "getuid", lambda: 0)  # would be root under a custom image
+        backend = DockerBackend(image=BUILDER_IMAGE)  # read_only_root default True
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        joined = " ".join(cmd)
+        # No --user flag (we rely on the image's non-root USER), yet the
+        # non-root env is applied.
+        assert "--user" not in cmd
+        expected_home = backend._default_user_mode_env()["HOME"]
+        assert f"HOME={expected_home}" in joined
+        assert "PIP_USER=1" in joined
+        # Root-only /root tmpfs must NOT be added — HOME is the tmpfs instead.
+        tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        assert "/root:exec" not in tmpfs_targets
+        # HOME-mkdir wrapper present; ownership-restore chown trailer absent.
+        sh_cmd = cmd[-1]
+        assert 'mkdir -p "$HOME"' in sh_cmd
+        assert "chown" not in sh_cmd
+
+    def test_docker_cmd_custom_image_keeps_root_path(self, monkeypatch):
+        # A non-builder operator-pinned image keeps the historical root
+        # behavior (we can't assume its USER runs non-root): the root-only
+        # /root tmpfs is added and the non-root user-mode HOME redirect is
+        # NOT applied. Contrast with the builder-image test above.
+        from harness.sandbox import DockerBackend
+        monkeypatch.setattr(os, "getuid", lambda: 0)  # root container path
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        assert "--user" not in cmd  # image default (root) used
+        tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        assert "/root:exec" in tmpfs_targets  # root-only path taken
+        # No HOME-mkdir wrapper on the pure-root path.
+        assert 'mkdir -p "$HOME"' not in cmd[-1]
+
     def test_sandbox_executor_threads_read_only_root_into_docker(self):
         # SandboxExecutor must forward sandbox_config["read_only_root"] to
         # DockerBackend so the auto-adapter's flip actually reaches the

@@ -1895,13 +1895,14 @@ step succeeds but the next step fails with "No module named X" /
 "command not found", and the run wastes a repair iteration.
 
 Audit the build command before writing any manifest:
-  - `uv pip install --system -r requirements.txt && pytest`  → declare
-    every tool the build invokes (pytest-asyncio, ruff, mypy, etc.) in
-    `requirements.txt`. `pytest` itself is pre-installed in the sandbox
-    but adding it to `requirements.txt` is fine — the project will need
-    it when installed outside the sandbox.
-  - `uv pip install --system -e '.[dev]' && pytest`  → declare those
-    tools under `[project.optional-dependencies].dev` in `pyproject.toml`.
+  - `uv pip install --python /usr/local/bin/python3 --break-system-packages -r requirements.txt && pytest`
+    → declare every tool the build invokes (pytest-asyncio, ruff, mypy,
+    etc.) in `requirements.txt`. `pytest` itself is pre-installed in the
+    sandbox but adding it to `requirements.txt` is fine — the project will
+    need it when installed outside the sandbox.
+  - `uv pip install --python /usr/local/bin/python3 --break-system-packages -e '.[dev]' && pytest`
+    → declare those tools under `[project.optional-dependencies].dev` in
+    `pyproject.toml`.
   - `npm install && npm run build && npm test`  → the test runner referenced
     by the `test` script (Vitest) must be in `package.json` `devDependencies`.
   - `mvn -B test`  → Maven Surefire runs JUnit automatically; declare JUnit
@@ -2074,10 +2075,11 @@ the file back to its pre-patch state and reports the block as failed.
   over plain `pip install`, see harness/skills/makefile_python.md):
   ```
   .PHONY: build test
+  PYTHON := /usr/local/bin/python3
   build:
-  	uv pip install --system -r requirements.txt
+  	uv pip install --python $(PYTHON) --break-system-packages -r requirements.txt
   test:
-  	python3 -m pytest -q
+  	$(PYTHON) -m pytest -q
   ```
   Use a TAB to indent recipe lines (not spaces — `make` rejects spaces with `*** missing separator. Stop.`).
 - The `build:` target should perform the install / compile step a CI would need to run before tests. Tests live under `test:` (or a separate target wired into `test:`).
@@ -5470,27 +5472,27 @@ def _build_command_writes_root_fs(build_command: str) -> bool:
 
     - ``npm install -g`` (and aliases) → ``/usr/local/lib/node_modules``.
     - Any ``make``-based build. The LLM authors the Makefile per
-      ``harness/skills/makefile_python.md``, which MANDATES
-      ``uv pip install --system`` — and ``--system`` targets the system
-      interpreter's ``site-packages`` on the read-only root FS, NOT the
-      tmpfs ``$HOME`` (``PIP_USER`` / ``--user`` do not apply to
-      ``--system``). That install lives inside the recipe, invisible to
-      string inspection, so we can't see the ``--system`` from
-      ``make build`` alone — we key off the ``make`` wrapper itself,
-      mirroring the network-side ``make`` bypass in
-      :func:`_apply_toolchain_adaptation`. WITHOUT this the root stays
-      mounted read-only and every ``uv pip install --system`` fails with
-      "Read-only file system", stalling the build until the repair loop
-      rewrites the Makefile to a venv (which then leaks a workspace
-      ``.venv`` into scans). A make recipe that only does a local
-      ``npm install`` doesn't strictly need the flip, but relaxing
-      ``--read-only`` for it is harmless — the container is ``--rm``.
+      ``harness/skills/makefile_python.md``, which installs into the
+      managed interpreter at ``/opt/uv-python`` (``uv pip install --python
+      /usr/local/bin/python3 --break-system-packages``) — a location on
+      the read-only root FS, NOT the tmpfs ``$HOME`` (``PIP_USER`` /
+      ``--user`` don't redirect an explicit ``--python`` target). That
+      install lives inside the recipe, invisible to string inspection, so
+      we can't see it from ``make build`` alone — we key off the ``make``
+      wrapper itself, mirroring the network-side ``make`` bypass in
+      :func:`_apply_toolchain_adaptation`. WITHOUT the flip the root stays
+      mounted read-only and the install fails with "Read-only file
+      system", stalling the build in the repair loop. A make recipe that
+      only does a local ``npm install`` doesn't strictly need the flip,
+      but relaxing ``--read-only`` for it is harmless — the container is
+      ``--rm``.
     - A directly-typed ``--system`` pip/uv install (rare, but honour it).
 
-    Pip / poetry / uv WITHOUT ``--system`` stay excluded: the sandbox sets
-    ``PIP_USER=1`` and redirects ``HOME`` to a writable tmpfs (see
-    :meth:`DockerBackend._default_user_mode_env`), so a user-install lands
-    under ``$HOME/.local`` regardless of a read-only root.
+    Pip / poetry / uv that write only under the tmpfs ``$HOME`` (``--user``
+    installs) stay excluded: the sandbox sets ``PIP_USER=1`` and redirects
+    ``HOME`` to a writable tmpfs (see
+    :meth:`DockerBackend._default_user_mode_env`), so those land under
+    ``$HOME/.local`` regardless of a read-only root.
     """
     if _command_is_make(build_command):
         return True

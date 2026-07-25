@@ -7,13 +7,15 @@ applies_to: [python]
 ### When this skill applies
 The workspace is a Python project — detected via `requirements.txt`, `pyproject.toml`, `setup.py`, or any top-level `.py` file. Applies to FastAPI, Django, Flask, library, and CLI projects alike. The harness runs `make build` by default; without a Makefile it falls back to noisy command-adaptation logic that's harder to reproduce locally.
 
-### Installer: ALWAYS `uv pip install` — NEVER plain `pip install`
-The harness sandbox pre-installs [`uv`](https://github.com/astral-sh/uv) on the system PATH. `uv pip install` is a drop-in replacement for `pip install` that reads the same `requirements.txt` / `pyproject.toml` and writes to the same site-packages, but resolves and installs **10–30× faster** on cold caches. The sandbox also persists `uv`'s download cache between containers, so the second build in a session installs from local wheels.
+### Installer: ALWAYS `uv pip install` into the interpreter the tests use
+The harness sandbox pre-installs [`uv`](https://github.com/astral-sh/uv) on the system PATH. `uv pip install` is a drop-in replacement for `pip install` that reads the same `requirements.txt` / `pyproject.toml`, but resolves and installs **10–30× faster** on cold caches, and the sandbox persists `uv`'s download cache between containers.
+
+The critical part: install into **the same interpreter your tests run on**. In the sandbox, `python3` (and the pre-baked `pytest`) is a **uv-managed CPython** — NOT the base OS `python3`. Install with `--python /usr/local/bin/python3` (the managed interpreter) plus `--break-system-packages` (the managed interpreter is PEP668-marked, so uv requires the override to write into it). Do NOT use `uv pip install --system`: `--system` targets the base OS Python instead, so your deps land in an interpreter the tests never import from and every test fails with `ModuleNotFoundError`.
 
 **Rules — absolute:**
-- Every install line in your Makefile MUST start with `uv pip install` (with `--system` so it targets the container's system Python, not a venv).
-- Do NOT write `pip install`, `pip3 install`, `python3 -m pip install`, `poetry install`, or `pdm install`. The harness recognises `uv pip install` / `uv sync` / `uv add` as install steps and configures the sandbox accordingly; other forms still work but are slower and miss the harness-managed cache.
-- Do NOT create a virtualenv (`python -m venv`, `uv venv`). The container is already isolated and pytest / uv themselves are on PATH; an inner venv just adds latency.
+- Every install line MUST be `uv pip install --python /usr/local/bin/python3 --break-system-packages …`. Define `PYTHON := /usr/local/bin/python3` once and reuse it in both `build:` (install) and `test:` (`$(PYTHON) -m pytest`) so install and test share one interpreter.
+- Do NOT use `--system`, `pip install`, `pip3 install`, `poetry install`, or `pdm install`.
+- Do NOT create a virtualenv (`python -m venv`, `uv venv`). Installing into the managed interpreter as above is both correct and faster; an inner venv just adds latency.
 
 ### Always emit a `Makefile` in your first patch
 Pick the variant matching the dependency manifest you're also creating (or that already exists). Each variant has separate `build:` and `test:` targets plus a `.PHONY:` line, so operators can run `make test` independently.
@@ -25,11 +27,16 @@ Every `test:` target MUST include `--cov=<pkg>` (one flag per top-level source p
 ```make
 .PHONY: build test all clean
 
+# The sandbox's managed CPython — what `python3` resolves to and what the
+# pre-baked pytest runs on. Install into THIS interpreter so deps are
+# importable by the tests.
+PYTHON := /usr/local/bin/python3
+
 build:
-	uv pip install --system -r requirements.txt
+	uv pip install --python $(PYTHON) --break-system-packages -r requirements.txt
 
 test:
-	python3 -m pytest -q --cov=server{{coverage.pytest_fail_flag}}
+	$(PYTHON) -m pytest -q --cov=server{{coverage.pytest_fail_flag}}
 
 all: build test
 
@@ -41,11 +48,13 @@ clean:
 ```make
 .PHONY: build test all clean
 
+PYTHON := /usr/local/bin/python3
+
 build:
-	uv pip install --system -e .
+	uv pip install --python $(PYTHON) --break-system-packages -e .
 
 test:
-	python3 -m pytest -q --cov=src{{coverage.pytest_fail_flag}}
+	$(PYTHON) -m pytest -q --cov=src{{coverage.pytest_fail_flag}}
 
 all: build test
 
@@ -58,11 +67,13 @@ The sandbox already has pytest pre-installed, so `build:` is a no-op. Still emit
 ```make
 .PHONY: build test all
 
+PYTHON := /usr/local/bin/python3
+
 build:
 	@true
 
 test:
-	python3 -m pytest -q --cov=.{{coverage.pytest_fail_flag}}
+	$(PYTHON) -m pytest -q --cov=.{{coverage.pytest_fail_flag}}
 
 all: build test
 ```
@@ -76,9 +87,9 @@ Substitute `--cov=<pkg>` with your actual source root(s). NEVER omit `--cov` —
 
 ### Common patches the LLM gets wrong
 - Using spaces instead of tabs for recipe indentation (silent fail).
-- Calling `pip install` instead of `uv pip install --system` — slower and bypasses the harness's persistent install cache.
-- Forgetting the `--system` flag on `uv pip install` — uv refuses to install into the system Python without it (safety guardrail) and the build fails with "Use `--system` to install into the system Python".
-- Mixing `pytest` and `python -m pytest` across targets — pick one (prefer `python3 -m pytest` so the import path matches `build:`).
+- Using `uv pip install --system` — `--system` targets the base OS Python, NOT the managed `python3` the tests run on, so every test fails with `ModuleNotFoundError`. Always install with `--python /usr/local/bin/python3 --break-system-packages`.
+- Calling plain `pip install` — slower and bypasses the harness's persistent uv cache.
+- Mixing `pytest` and `$(PYTHON) -m pytest` across targets — use `$(PYTHON) -m pytest` so the test import path matches the interpreter `build:` installed into.
 - Forgetting `.PHONY:` and then debugging why `make test` skipped when a `test/` directory exists.
 - Hard-coding a virtualenv path (`venv/bin/pip`) — the harness runs inside a clean Docker container; venvs aren't needed.
 - Adding `pytest` / `pytest-cov` / `pytest-xdist` to `requirements.txt` — they're pre-installed in the sandbox. Only add them as dev dependencies if the project will be installed outside the sandbox too.

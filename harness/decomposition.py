@@ -811,6 +811,16 @@ The supported stacks are Python (backend) + React/TypeScript/Tailwind
   the ``features`` block.
 - Every feature MUST own at least one story.
 - Every story MUST have at least one acceptance_criteria entry.
+- CROSS-CUTTING CONTRACTS (client↔server) must be scoped on BOTH sides.
+  When a requirement spans the frontend and backend — an API endpoint the
+  UI calls, an auth/CSRF token the UI fetches, a request/response shape both
+  sides must agree on — the owning story's ``scope_files`` MUST include the
+  backend PRODUCER (the route/handler that serves it) AND the frontend
+  CONSUMER (the call site that uses it). NEVER scope only one side. A story
+  that adds ``fetch("/api/x")`` on the client with no server route for
+  ``/api/x`` (or a backend endpoint no client ever calls) ships a
+  half-built feature that 404s at runtime — put both sides in this story's
+  scope, or split into paired stories linked via ``depends_on``.
 {req_constraint}
 - ``depends_on`` may reference any other story_key declared in this
   same response (forward or backward — the validator topologically

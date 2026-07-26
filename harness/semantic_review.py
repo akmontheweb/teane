@@ -107,6 +107,13 @@ def _build_review_prompt(coverage: list[dict[str, Any]]) -> str:
         "Judge strictly: a feature is 'partial' if a material part of its intent "
         "has no story/AC, 'unsatisfied' if the stories miss the point entirely.",
         "",
+        "ALSO mark a feature 'partial' when its stories build only ONE SIDE of a "
+        "client↔server contract — e.g. a frontend that calls an API endpoint (or "
+        "fetches an auth/CSRF token) with no story implementing the backend route "
+        "that serves it, or a backend endpoint no story wires the frontend to "
+        "consume. Name the missing side in 'gap'. A half-built contract 404s at "
+        "runtime even though each side looks related to the feature.",
+        "",
     ]
     for f in coverage:
         lines.append(f"FEATURE {f['req_key']}: {f['title']}")

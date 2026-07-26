@@ -1726,6 +1726,18 @@ _CONTRADICTION_RULES = """  6. ONE enforcement layer per validation rule. When a
      test require `X(v)` to RAISE while another requires the same `X(v)` to
      SUCCEED — that pair is self-contradictory and no code can satisfy both."""
 
+_SPEC_FIT_RULE = """  8. SPEC-FIT — reference ONLY what the source above actually defines.
+     Every field name you post or assert (JSON keys, model attributes),
+     every route path, and every function / class / method you call MUST
+     appear in the source files shown above. Do NOT emit generic CRUD
+     scaffolding from memory. If the model defines `first_name` /
+     `date_of_birth` / `relationship`, then a test that posts
+     `{"name": ..., "email": ...}` or asserts `data["email"]` is exercising
+     a DIFFERENT application — it is template contamination, not a test, and
+     will fail against the real code. When unsure whether a field or route
+     exists, look for it in the source above; if it is not there, do not
+     reference it."""
+
 _REMINDER_TAIL = "\n\nGenerate test patches NOW. Only the blocks above. No other text."
 
 
@@ -1741,7 +1753,7 @@ def _build_format_reminder(agile: bool = True) -> str:
     del agile  # retained for signature compatibility; no longer used
     return (
         f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_TESTS_MARKER_RULE}\n"
-        f"{_CONTRADICTION_RULES}{_REMINDER_TAIL}"
+        f"{_CONTRADICTION_RULES}\n{_SPEC_FIT_RULE}{_REMINDER_TAIL}"
     )
 
 

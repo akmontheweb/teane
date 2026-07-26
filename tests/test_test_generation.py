@@ -144,6 +144,16 @@ class TestHelpers:
         assert "Do NOT generate mocks" in reminder
         assert "@tests" in reminder
 
+    def test_format_reminder_carries_spec_fit_rule(self):
+        # Rule 8 (spec-fit) forbids template-contaminated tests that
+        # reference fields/routes absent from the source under test — the
+        # lumina {name, email} scaffolding that didn't match the schema.
+        reminder = _build_format_reminder()
+        assert "SPEC-FIT" in reminder
+        assert "template contamination" in reminder
+        # Uses the concrete contamination example so the model pattern-matches.
+        assert '"email"' in reminder
+
     def test_is_test_file_python(self):
         assert _is_test_file("tests/test_foo.py") is True
         assert _is_test_file("src/foo.py") is False

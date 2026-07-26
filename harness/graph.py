@@ -22822,6 +22822,7 @@ A different LLM drafted the spec; your job is to critique it adversarially.
 Return STRICT JSON with this exact top-level shape and NOTHING else (no prose, no markdown fences):
 {
   "completeness": ["string description of what is missing"],
+  "dropped_requirements": ["user-visible requirement/displayed field/behavior present in the Original Product Spec (when one is provided) but MISSING or WEAKENED in the spec under review"],
   "contradictions": ["..."],
   "ambiguity": ["..."],
   "missing_edge_cases": ["..."],
@@ -22831,6 +22832,13 @@ Return STRICT JSON with this exact top-level shape and NOTHING else (no prose, n
     {"id": "R1", "text": "question for the human author", "critical": true}
   ]
 }
+
+When an "Original Product Spec" section is supplied, treat it as the SOURCE OF TRUTH: \
+the refined spec must be a superset of its user-visible content. Go field by field \
+through the original (every displayed value, computed output, form input, alert, and \
+acceptance criterion) and put anything the refined spec fails to preserve into \
+"dropped_requirements". Refinement may reorganise or clarify, but it must NEVER silently \
+drop a requirement the user would notice was missing.
 
 Each array may be empty if no issues are found in that category. \
 Follow-up questions should be precise and answerable by the human in one or two sentences. \
@@ -22847,6 +22855,38 @@ Output ONLY the revised Markdown — no preamble, no postscript, no code fences.
 ## Reviewer Critique JSON
 {critique_json}
 """
+
+
+# Cap the original product-spec text injected into the review prompts so a
+# large narrative doesn't blow the doc-reviewer budget. The head carries the
+# vision + functional requirements + acceptance criteria that matter for
+# drop-detection; deep appendices rarely define user-visible requirements.
+_PRODUCT_SPEC_REVIEW_CHAR_CAP = 16000
+
+
+def _read_product_spec_text(workspace_path: str) -> str:
+    """Concatenate ``product_spec/*.txt`` (the operator's source-of-truth
+    narrative) for drop-detection during the REQUIREMENTS review. Mirrors
+    the reader in ``reverse_engineer_*``; returns "" when the folder is
+    absent/empty or unreadable. Capped to bound reviewer token cost.
+    """
+    try:
+        spec_dir = os.path.join(workspace_path, "product_spec")
+        if not os.path.isdir(spec_dir):
+            return ""
+        chunks: list[str] = []
+        for name in sorted(os.listdir(spec_dir)):
+            if not name.endswith(".txt"):
+                continue
+            with open(os.path.join(spec_dir, name), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                chunks.append(f"# === {name} ===\n{fh.read().rstrip()}")
+        text = "\n\n".join(chunks)
+    except OSError:
+        return ""
+    if len(text) > _PRODUCT_SPEC_REVIEW_CHAR_CAP:
+        text = text[:_PRODUCT_SPEC_REVIEW_CHAR_CAP] + "\n\n[... product spec truncated ...]"
+    return text
 
 
 def _review_followups_to_discovery_shape(critique: dict[str, Any], gate: str) -> list[dict[str, Any]]:
@@ -22884,6 +22924,7 @@ async def review_and_revise_spec(
     budget_remaining_usd: float,
     user_goal: str,
     llm_dispatch_config: Optional[dict[str, Any]] = None,
+    original_product_spec: str = "",
 ) -> dict[str, Any]:
     """Run the independent doc-reviewer critique + revise pass on a spec
     file. Writes ``SPEC_{REQUIREMENTS,ARCHITECTURE}_REVIEW.md`` alongside
@@ -22925,8 +22966,20 @@ async def review_and_revise_spec(
         logger.warning("[spec_review] Cannot read %s: %s", spec_path, exc)
         return result
 
+    # Drop-detection (REQUIREMENTS gate): give the reviewer the operator's
+    # original product spec as the source of truth so it can flag any
+    # user-visible requirement the refinement silently dropped (the
+    # "next-birthday date vanished from the API contract" class of bug).
+    product_spec_block = ""
+    if gate == "REQUIREMENTS" and original_product_spec.strip():
+        product_spec_block = (
+            "## Original Product Spec (SOURCE OF TRUTH — the refined spec "
+            "must preserve every user-visible requirement here)\n"
+            f"{original_product_spec}\n\n"
+        )
     critique_user_prompt = (
         f"## User Goal\n{user_goal}\n\n"
+        f"{product_spec_block}"
         f"## Specification Under Review ({gate})\n{original_spec}\n\n"
         "Produce the JSON critique now."
     )
@@ -23039,6 +23092,19 @@ async def review_and_revise_spec(
             return result
     result["critique"] = critique
 
+    # Surface dropped-requirement findings prominently — this is the signal
+    # that the refinement narrowed the operator's spec. The revise pass below
+    # is instructed to restore them from the source-of-truth product spec.
+    _dropped = critique.get("dropped_requirements") or []
+    if isinstance(_dropped, list) and _dropped:
+        logger.warning(
+            "[spec_review] Drop-detection: %d user-visible requirement(s) in the "
+            "original product spec were missing/weakened in the refined %s spec; "
+            "revise pass will restore them: %s",
+            len(_dropped), gate, "; ".join(str(d)[:120] for d in _dropped[:5]),
+        )
+        result["dropped_requirements"] = [str(d) for d in _dropped]
+
     review_path = os.path.join(os.path.dirname(spec_path), review_filename)
     try:
         with open(review_path, "w", encoding="utf-8") as f:
@@ -23056,6 +23122,17 @@ async def review_and_revise_spec(
         original_spec=original_spec,
         critique_json=json.dumps(critique, indent=2, sort_keys=True),
     )
+    # For the REQUIREMENTS gate, hand the reviser the operator's original
+    # product spec so it can RESTORE any dropped requirement with the correct
+    # detail (not paraphrase it from the critique bullet alone).
+    if product_spec_block:
+        revise_prompt = (
+            f"{product_spec_block}"
+            "The revised spec MUST preserve every user-visible requirement from "
+            "the Original Product Spec above; restore any listed under "
+            "'dropped_requirements' in the critique.\n\n"
+            f"{revise_prompt}"
+        )
     revise_messages: list[MessageDict] = [
         MessageDict(role="system", content="You are a senior specification author. Output clean Markdown only."),
         MessageDict(role="user", content=revise_prompt),
@@ -23170,7 +23247,9 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
     if len(messages) >= 2:
         user_goal = str(messages[1].get("content", ""))[:1000]
 
-    # Run the shared critique + revise pass.
+    # Run the shared critique + revise pass. Feed the operator's original
+    # product spec so the REQUIREMENTS review can flag + restore any
+    # user-visible requirement the refinement dropped.
     review_result = await review_and_revise_spec(
         spec_path,
         gate,
@@ -23178,6 +23257,9 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
         budget_remaining_usd=budget,
         user_goal=user_goal,
         llm_dispatch_config=state.get("llm_dispatch_config", {}),
+        original_product_spec=_read_product_spec_text(
+            str(state.get("workspace_path") or "")
+        ),
     )
     if not review_result["ok"]:
         # Helper logged the reason; pass through.

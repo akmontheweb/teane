@@ -7425,7 +7425,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     "running pre-flight spec review (up to %d cycle(s)).",
                     doc_reviewer_primary, max_review_cycles,
                 )
-                from harness.graph import review_and_revise_spec
+                from harness.graph import (
+                    review_and_revise_spec,
+                    _read_product_spec_text,
+                )
+                # Read once — the source-of-truth product spec for the
+                # REQUIREMENTS drop-detection is constant across cycles.
+                _orig_product_spec = _read_product_spec_text(workspace_path)
                 for cycle in range(1, max_review_cycles + 1):
                     # Budget gate matches spec_review_node's check at
                     # graph.py:3754 — stop revisiting the reviewer when the
@@ -7448,6 +7454,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                         budget_remaining_usd=budget_usd,
                         user_goal=args.prompt or "",
                         llm_dispatch_config=config.get("llm_dispatch", {}),
+                        original_product_spec=_orig_product_spec,
                     )
                     if review_result["ok"] and review_result.get("review_path"):
                         logger.info(

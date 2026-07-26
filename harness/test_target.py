@@ -93,6 +93,43 @@ async def test_node(state: dict[str, Any]) -> dict[str, Any]:
         len(result.cr_paths), result.exit_code,
     )
 
+    # Self-report acceptance-criteria completeness. The end-of-run
+    # traceability gate is what BLOCKS on uncovered ACs (flow == "test"),
+    # but surfacing coverage here — right after generation + execution —
+    # gives the operator an immediate, per-run signal of how many ACs this
+    # pass actually verified, and flags when a `--scope touched` run left
+    # criteria outside the changed set unverified.
+    ac_coverage_pct = 100.0
+    ac_verified = ac_total = 0
+    uncovered_ac_keys: list[str] = []
+    try:
+        from harness.traceability import audit_workspace
+        report = audit_workspace(workspace_path)
+        if report is not None:
+            ac_coverage_pct = report.ac_coverage_pct
+            ac_verified, ac_total = report.verified_acs, report.total_acs
+            uncovered_ac_keys = [u.ac_key for u in report.untested_acs]
+            if uncovered_ac_keys:
+                logger.warning(
+                    "[test_node] AC coverage %d/%d (%.0f%%) after --scope=%s. "
+                    "%d criteria still unverified: %s%s",
+                    ac_verified, ac_total, ac_coverage_pct, scope,
+                    len(uncovered_ac_keys), ", ".join(uncovered_ac_keys[:8]),
+                    " …" if len(uncovered_ac_keys) > 8 else "",
+                )
+                if scope != "full":
+                    logger.warning(
+                        "[test_node] Run `teane test --scope full` to generate "
+                        "and run a scenario for EVERY acceptance criterion."
+                    )
+            else:
+                logger.info(
+                    "[test_node] AC coverage %d/%d (100%%) — every acceptance "
+                    "criterion has a verifying test.", ac_verified, ac_total,
+                )
+    except Exception as exc:  # noqa: BLE001 — coverage report must never break the run
+        logger.debug("[test_node] AC coverage self-report skipped: %s", exc)
+
     return {
         "exit_code": result.exit_code,
         "node_state": {
@@ -106,6 +143,10 @@ async def test_node(state: dict[str, Any]) -> dict[str, Any]:
                 "base_url": result.base_url,
                 "scope": result.scope,
                 "infra_reason": result.reason if reason == REASON_INFRA else "",
+                "ac_coverage_pct": ac_coverage_pct,
+                "ac_verified": ac_verified,
+                "ac_total": ac_total,
+                "uncovered_acs": uncovered_ac_keys,
             },
         },
     }

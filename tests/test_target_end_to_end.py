@@ -90,6 +90,11 @@ def test_e2e_clean_run_node_returns_exit_0(tmp_path: Path) -> None:
     assert test_state["scope"] == "full"
     assert test_state["passed"] == 1
     assert test_state["failed"] == 0
+    # AC-coverage self-report present with safe defaults when the workspace
+    # has no registered acceptance criteria (no state.db).
+    assert test_state["ac_coverage_pct"] == 100.0
+    assert test_state["ac_total"] == 0
+    assert test_state["uncovered_acs"] == []
 
 
 # ---------------------------------------------------------------------------

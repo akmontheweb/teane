@@ -23947,24 +23947,56 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             enforce_acs = bool(tr_cfg.get("enforce_acs", enforce)) and flow == "test"
             block_on_reqs = enforce_reqs and report.has_req_gap()
             block_on_acs = enforce_acs and report.has_ac_gap()
+            # Scope of the current teane-test run (if any) — used to steer the
+            # operator to --scope full when a touched run left ACs outside the
+            # changed set unverified.
+            test_scope = str(state.get("test_scope", "touched"))
             if report_text:
                 print()
                 if block_on_reqs or block_on_acs:
                     print("==================== TRACEABILITY BLOCK ====================")
                     print(report_text)
+                    if block_on_acs:
+                        print(
+                            f"{len(report.untested_acs)} of {report.total_acs} "
+                            f"acceptance criteria have no passing verifying test "
+                            f"({report.ac_coverage_pct:.0f}% covered)."
+                        )
+                        if test_scope != "full":
+                            print(
+                                f"This run used --scope {test_scope}; re-run with "
+                                "--scope full to generate and run a scenario for "
+                                "EVERY acceptance criterion:"
+                            )
+                            print(f"    teane test -w {workspace_path} --scope full")
                     print("Set traceability.enforce=false (or enforce_reqs=false) in")
                     print("the harness config (config/config.json) to downgrade this")
                     print("to an advisory and ship anyway (NOT RECOMMENDED).")
                     print("==========================================================")
+                elif report.has_ac_gap() and flow != "test":
+                    # AC coverage is closed ONLY by the `teane test` e2e pack;
+                    # build/patch/deploy generate code-linked unit tests, not
+                    # AC-linked scenarios. So they REPORT the gap loudly — this
+                    # is the exact point a run would otherwise ship silently with
+                    # 0% acceptance verification (the lumina failure) — but do
+                    # not block, since no build/patch pass can close it.
+                    print("============= ACCEPTANCE CRITERIA UNVERIFIED =============")
+                    print(
+                        f"{len(report.untested_acs)} of {report.total_acs} "
+                        f"acceptance criteria have NO verifying test "
+                        f"({report.ac_coverage_pct:.0f}% covered). This flow "
+                        f"({flow or 'build'}) generates unit tests only."
+                    )
+                    print(
+                        "To verify the acceptance criteria and make the app "
+                        "release-ready, deploy and then run the e2e pack:"
+                    )
+                    print(f"    teane test -w {workspace_path} --scope full")
+                    print("The app is NOT acceptance-verified until that reaches 100%.")
+                    print("=========================================================")
+                    print(report_text)
                 else:
-                    if report.has_ac_gap() and flow != "test":
-                        print(
-                            "[traceability advisory — AC coverage is closed by "
-                            "`teane test`; build/patch report it but do not "
-                            "block]"
-                        )
-                    else:
-                        print("[traceability advisory — enforce disabled]")
+                    print("[traceability advisory — enforce disabled]")
                     print(report_text)
                 logger.info(
                     "[traceability] reqs %d/%d (%.0f%%), ACs %d/%d (%.0f%%); "

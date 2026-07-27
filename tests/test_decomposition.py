@@ -427,6 +427,45 @@ class TestCrossDomainScopeGuard:
         ]
         assert any("forecast.py" in r.getMessage() for r in warned)
 
+    def test_nfr_story_scope_is_exempt(self, caplog):
+        # lumina 019fa046: STORY-NFR-004 (input sanitization) legitimately
+        # scopes domain-named modules whose paths share no token with the
+        # security concern vocabulary. Those must NOT be dropped, or the NFR
+        # silently goes unimplemented.
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-NFR-004",
+            "title": "Input sanitization against XSS and SQL injection",
+            "acceptance_criteria": [
+                "Stored text is not executed as SQL",
+                "Rendered text does not execute as script",
+            ],
+            "scope_files": [
+                "server/app/schemas/contact.py",
+                "server/app/services/contacts_service.py",
+                "client/src/components/ContactCard.tsx",
+            ],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        # All three domain files survive despite sharing no token with the
+        # NFR's security vocabulary.
+        assert stories[0]["scope_files"] == [
+            "server/app/schemas/contact.py",
+            "server/app/services/contacts_service.py",
+            "client/src/components/ContactCard.tsx",
+        ]
+        assert not [
+            r for r in caplog.records
+            if "cross-domain drop" in r.getMessage()
+            and "STORY-NFR-004" in r.getMessage()
+        ]
+
+    def test_is_nfr_story_key(self):
+        assert decomposition._is_nfr_story_key("STORY-NFR-004")
+        assert decomposition._is_nfr_story_key("NFR-001")
+        assert not decomposition._is_nfr_story_key("STORY-001")
+        assert not decomposition._is_nfr_story_key("STORY-042")
+
 
 class TestCrossTestRootScopeGuard:
     """Finsearch session 156032347 root cause: LLM emitted

@@ -396,6 +396,18 @@ def _drop_test_only_scope_files_in_decomposition(
         )
 
 
+# Agile ``STORY-NFR-NNN`` / waterfall ``NFR-NNN`` — a non-functional,
+# cross-cutting story. Bounded so a domain story like ``STORY-001`` never
+# matches; the hyphen/underscore/edge anchors handle both key schemes.
+_NFR_STORY_KEY_RE = re.compile(r"(?:^|[-_])NFR(?:[-_]|$)", re.IGNORECASE)
+
+
+def _is_nfr_story_key(story_key: str) -> bool:
+    """True when the story key marks a non-functional / cross-cutting story
+    (agile ``STORY-NFR-NNN`` or waterfall ``NFR-NNN``)."""
+    return bool(story_key and _NFR_STORY_KEY_RE.search(story_key))
+
+
 def _drop_cross_domain_scope_files(
     story_key: str,
     scope: list[str],
@@ -420,6 +432,21 @@ def _drop_cross_domain_scope_files(
     """
     if not scope:
         return []
+    # NFR / cross-cutting stories are exempt. A non-functional concern
+    # (security, performance, a11y, reliability) legitimately touches files
+    # across every domain, and its title/ACs speak in concern vocabulary
+    # (xss, injection, sanitize, latency, throughput) that shares no token
+    # with the domain-named modules it must change. Applying the domain-word
+    # drop here strips the story's real scope wholesale and silently
+    # under-implements the requirement (lumina 019fa046: STORY-NFR-004's
+    # input-sanitization scope — schemas/contact.py, contacts_service.py,
+    # ContactCard.tsx — was dropped and no sanitization landed). The
+    # finsearch-B2 hallucination guard the drop provides is category-
+    # inappropriate for a cross-cutting story, so trust the planner's scope
+    # here, exactly as the no-context-tokens branch below already does. The
+    # B2 case (STORY-032) was a FUNCTIONAL story, so it stays guarded.
+    if _is_nfr_story_key(story_key):
+        return scope
     ctx = _context_tokens(
         story_title, feature_name, feature_key, acceptance_criteria,
     )

@@ -118,9 +118,10 @@ class TestPriorVerdictBlockContent:
         assert len(block) < 1500
 
     def test_block_position_after_diagnostics_before_hints(self) -> None:
-        # The judge should see the diagnostics FIRST (fresh signal),
-        # then the anti-repetition context. Prior verdict text
-        # appearing before the diagnostics would bias the read.
+        # Cache-friendly layout: the task/definitions (stable) lead the
+        # prompt, then the EVIDENCE section carries the diagnostics and, after
+        # them, the anti-repetition prior-verdict context. Prior verdict must
+        # still come AFTER the fresh diagnostics so it doesn't bias the read.
         prompt = _build_repair_reflection_prompt(
             **_base_kwargs(),
             prior_reflection_verdict={
@@ -129,12 +130,13 @@ class TestPriorVerdictBlockContent:
                 "recommendation": "prior recommendation",
             },
         )
+        answer_pos = prompt.find("Answer ONE structured question")
         top_errors_pos = prompt.find("Top persistent errors")
         prior_verdict_pos = prompt.find("YOUR PREVIOUS-ROUND VERDICT")
-        answer_pos = prompt.find("Answer ONE structured question")
+        assert answer_pos > 0
         assert top_errors_pos > 0
-        assert prior_verdict_pos > top_errors_pos
-        assert answer_pos > prior_verdict_pos
+        # Stable task/definitions lead; diagnostics then prior-verdict trail.
+        assert answer_pos < top_errors_pos < prior_verdict_pos
 
 
 class TestBackwardsCompat:
@@ -192,3 +194,71 @@ class TestTestAssertionGuardrails:
         # must not render.
         prompt = _build_repair_reflection_prompt(**_base_kwargs())
         assert "A DIFFERENCE IN LIST ORDER OR RETURNED VALUES IS NOT" not in prompt
+
+
+class TestJudgeSourceEvidence:
+    """Fix #7: on a test-assertion round the judge is handed the failing
+    test's source (+ the impl it targets via the @tests marker), so it can
+    read the documented intent instead of guessing from object-repr
+    fingerprints (lumina 019fa046)."""
+
+    def _kw(self, tmp_path) -> dict:
+        (tmp_path / "server" / "app" / "repositories").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "repositories" / "contacts_repository.py").write_text(
+            "class ContactsRepository:\n"
+            "    def list_all(self):\n"
+            "        return self._db.query(Contact).all()\n"
+        )
+        (tmp_path / "server" / "tests").mkdir(parents=True)
+        (tmp_path / "server" / "tests" / "test_repository.py").write_text(
+            "# @tests: server/app/repositories/contacts_repository.py\n"
+            "def test_list_all_sorted():\n"
+            "    # Order: first by last_name (nulls as empty), then first_name\n"
+            "    assert [c.id for c in repo.list_all()] == [c3.id, c2.id, c1.id]\n"
+        )
+        kw = _base_kwargs()
+        kw["top_persisted_diagnostics"] = [{
+            "error_code": "AssertionError",
+            "file": "server/tests/test_repository.py", "line": 4,
+            "message": "assert [<Contact at 0x1>, <Contact at 0x2>] == [<Contact at 0x2>, <Contact at 0x1>]",
+        }]
+        kw["workspace_path"] = str(tmp_path)
+        return kw
+
+    def test_injects_test_and_impl_source(self, tmp_path) -> None:
+        prompt = _build_repair_reflection_prompt(**self._kw(tmp_path))
+        assert "FAILING TEST SOURCE" in prompt
+        # The documented intent — the exact thing that was missing when the
+        # judge misread [3,2,1] as a reversed test.
+        assert "Order: first by last_name" in prompt
+        # The impl resolved via the @tests marker is included too.
+        assert "IMPLEMENTATION UNDER TEST" in prompt
+        assert "def list_all" in prompt
+
+    def test_no_source_without_workspace(self, tmp_path) -> None:
+        kw = self._kw(tmp_path)
+        kw["workspace_path"] = ""
+        prompt = _build_repair_reflection_prompt(**kw)
+        assert "FAILING TEST SOURCE" not in prompt
+
+    def test_no_source_for_non_assertion(self) -> None:
+        # Compile error in a source file → no test-source injection.
+        prompt = _build_repair_reflection_prompt(**_base_kwargs())
+        assert "FAILING TEST SOURCE" not in prompt
+
+
+class TestPromptCacheLayout:
+    """Cache-prefix cleanup: the stable instruction preamble must lead the
+    prompt and the volatile per-round data must trail it, so consecutive
+    judge calls share the cacheable prefix (all 6 calls were cached=0 before
+    — lumina 019fa046)."""
+
+    def test_stable_preamble_precedes_volatile_evidence(self) -> None:
+        prompt = _build_repair_reflection_prompt(**_base_kwargs())
+        intro = prompt.index("You are auditing")
+        grounding = prompt.index("GROUNDING RULES")
+        evidence = prompt.index("=== EVIDENCE (this round) ===")
+        counts = prompt.index("Diagnostics before this round")
+        # Stable instruction blocks come first; volatile counts live inside
+        # the trailing EVIDENCE section.
+        assert intro < grounding < evidence < counts

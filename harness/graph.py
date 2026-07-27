@@ -10717,6 +10717,77 @@ def _ensure_test_package_init_chain(workspace_path: str) -> list[str]:
     return created
 
 
+def _reflection_test_source_evidence(
+    top_persisted_diagnostics: list[dict[str, Any]],
+    workspace_path: str,
+    *,
+    max_test_bytes: int = 6000,
+    max_impl_bytes: int = 5000,
+) -> str:
+    """Source-evidence block for the reflection judge on a pytest-assertion
+    round: the failing TEST's body (so the judge reads its documented intent
+    and the real assertion) plus a snippet of the IMPLEMENTATION it targets
+    (resolved via the ``# @tests:`` marker).
+
+    Without this the judge sees only diagnostic fingerprints — for a
+    list-equality failure, just swapped object reprs / memory addresses
+    (``<Contact object at 0x…>``) — and cannot distinguish an intended sort
+    from a "reversed" test, so it guesses (lumina 019fa046: it read a
+    last_name ordering as a reversed test and told repair to edit the test).
+    Feeding the actual code lets it ground the verdict. Returns ``""`` when
+    it is not a test-assertion round, there is no workspace, or the files
+    can't be read.
+    """
+    if not workspace_path or not top_persisted_diagnostics:
+        return ""
+    top = top_persisted_diagnostics[0] or {}
+    test_rel = str(top.get("file", "") or "").strip()
+    if not test_rel or test_rel.startswith("<"):
+        return ""
+    test_abs = (
+        test_rel if os.path.isabs(test_rel)
+        else os.path.join(workspace_path, test_rel)
+    )
+    try:
+        with open(test_abs, "r", encoding="utf-8", errors="replace") as fh:
+            test_src = fh.read(max_test_bytes + 1)
+    except OSError:
+        return ""
+    if not test_src.strip():
+        return ""
+    test_trunc = len(test_src) > max_test_bytes
+    parts = [
+        "\nFAILING TEST SOURCE — read its comments and the assertion for the "
+        "INTENDED contract before deciding whether the test or the impl is "
+        "wrong (a different order/value almost always means the impl is "
+        "missing behaviour the test documents, NOT that the test is wrong):\n"
+        f"# {test_rel}\n---\n{test_src[:max_test_bytes]}\n"
+        + ("… (truncated)\n" if test_trunc else "")
+        + "---\n",
+    ]
+    impl_rel = _impl_from_tests_marker(test_rel, workspace_path)
+    if impl_rel:
+        try:
+            with open(
+                os.path.join(workspace_path, impl_rel),
+                "r", encoding="utf-8", errors="replace",
+            ) as fh:
+                impl_src = fh.read(max_impl_bytes + 1)
+        except OSError:
+            impl_src = ""
+        if impl_src.strip():
+            impl_trunc = len(impl_src) > max_impl_bytes
+            parts.append(
+                "\nIMPLEMENTATION UNDER TEST (the test's ``# @tests:`` target "
+                "— the fix almost always belongs HERE, not in the test):\n"
+                f"# {impl_rel}\n---\n{impl_src[:max_impl_bytes]}\n"
+                + ("… (truncated)\n" if impl_trunc else "")
+                + "---\n"
+            )
+    parts.append("\n")
+    return "".join(parts)
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -10731,6 +10802,7 @@ def _build_repair_reflection_prompt(
     judge_disagreement_history: Optional[list[dict[str, Any]]] = None,
     judge_ignored_streak: int = 0,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
+    workspace_path: str = "",
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -11130,24 +11202,28 @@ def _build_repair_reflection_prompt(
     else:
         test_assertion_hint_block = ""
 
-    return (
+    # Fix G+ — on a test-assertion round, hand the judge the actual test and
+    # impl source so it can read the documented intent instead of guessing
+    # from object-repr fingerprints (lumina 019fa046). Volatile → in EVIDENCE.
+    source_evidence_block = ""
+    if _is_test_assertion:
+        source_evidence_block = _reflection_test_source_evidence(
+            top_persisted_diagnostics, workspace_path,
+        )
+
+    # Cache-stable layout: the instruction preamble (task + verdict
+    # definitions + grounding rules) is byte-identical every round, so it
+    # leads the prompt and the auto-cache reuses it across the session's judge
+    # calls. The per-round EVIDENCE (counts, fingerprints, source, hints) is
+    # volatile and trails; the output spec is last for format adherence.
+    # Before this, the volatile counts led the prompt and every judge call
+    # re-encoded from token 0 (cached=0 for all 6 calls, lumina 019fa046).
+    stable_preamble = (
         "You are auditing the previous repair iteration's outcome to "
         "tell the harness whether to keep going on the same track or "
         "redirect. The repair LLM applied patches to fix compile/test "
-        "errors; the build was re-run; here is the delta in failing "
-        "diagnostics.\n\n"
-        f"Diagnostics before this round: {prior_diagnostics_count}\n"
-        f"Diagnostics after this round:  {current_diagnostics_count}\n\n"
-        f"Resolved (previous round → gone):\n{res_block}\n\n"
-        f"Persisted (still failing):\n{pers_block}\n\n"
-        f"New (introduced by this round's patches):\n{new_block}\n\n"
-        f"Top persistent errors (with file:line):\n{top_block}\n\n"
-        f"{tail_block}"
-        f"{prior_verdict_block}"
-        f"{disagreement_block}"
-        f"{path_wiring_hint_block}"
-        f"{install_hint_block}"
-        f"{test_assertion_hint_block}"
+        "errors; the build was re-run; the delta in failing diagnostics "
+        "is in the EVIDENCE section below.\n\n"
         "Answer ONE structured question: did the previous round make "
         "PROGRESS on the highest-priority error, or did it spend the "
         "iteration on a distraction? Use these definitions:\n"
@@ -11161,10 +11237,10 @@ def _build_repair_reflection_prompt(
         "exist before, and the original blocker is also unchanged.\n\n"
         "GROUNDING RULES — read carefully, this is where prior versions "
         "of this prompt failed:\n"
-        "  - Your answer must be grounded ONLY in the diagnostic data "
-        "above. The file:line locations shown are the ONLY files you "
-        "may name. Do NOT invent file paths, symbol names, or call-site "
-        "guesses that are not present above.\n"
+        "  - Your answer must be grounded ONLY in the diagnostic data in "
+        "the EVIDENCE section below. The file:line locations shown there "
+        "are the ONLY files you may name. Do NOT invent file paths, "
+        "symbol names, or call-site guesses that are not present there.\n"
         "  - EXCEPTION for install / unresolved-import / test-plugin "
         "errors (TS2307, MISSING_DEP, MODULENOTFOUND, IMPORTERROR, "
         "UV_VERSION_CONSTRAINT and any diagnostic whose message includes "
@@ -11176,18 +11252,36 @@ def _build_repair_reflection_prompt(
         "these codes the fix belongs in the manifest — `package.json`, "
         "`requirements.txt`, `pyproject.toml`, `Cargo.toml`, `pytest.ini` "
         "— or in the build/install command. You MAY name that manifest "
-        "even when it does not appear in the diagnostics above; the "
-        "grounding rule above does not apply to install-class fixes. "
-        "Do NOT recommend editing the import site.\n"
+        "even when it does not appear in the diagnostics; the grounding "
+        "rule above does not apply to install-class fixes. Do NOT "
+        "recommend editing the import site.\n"
+    )
+    evidence = (
+        "\n=== EVIDENCE (this round) ===\n"
+        f"Diagnostics before this round: {prior_diagnostics_count}\n"
+        f"Diagnostics after this round:  {current_diagnostics_count}\n\n"
+        f"Resolved (previous round → gone):\n{res_block}\n\n"
+        f"Persisted (still failing):\n{pers_block}\n\n"
+        f"New (introduced by this round's patches):\n{new_block}\n\n"
+        f"Top persistent errors (with file:line):\n{top_block}\n\n"
+        f"{tail_block}"
+        f"{source_evidence_block}"
+        f"{prior_verdict_block}"
+        f"{disagreement_block}"
+        f"{path_wiring_hint_block}"
+        f"{install_hint_block}"
+        f"{test_assertion_hint_block}"
+    )
+    output_spec = (
         f"{_generic_fallback_rule}"
         "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
         "fences. Shape:\n"
         '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION" '
         '| "WORKING_HYPOTHESIS", '
         '"real_blocker": "<one-sentence description grounded in the '
-        'file:line locations above, OR the literal insufficient-data '
-        'sentence shown in the grounding rules; may be empty when '
-        'verdict=PROGRESS or verdict=WORKING_HYPOTHESIS>", '
+        'file:line locations in the EVIDENCE section, OR the literal '
+        'insufficient-data sentence shown in the grounding rules; may be '
+        'empty when verdict=PROGRESS or verdict=WORKING_HYPOTHESIS>", '
         '"recommendation": "<one short imperative sentence for the next '
         'repair LLM, e.g. \\"Edit src/services/AuthService.ts lines '
         '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
@@ -11196,11 +11290,12 @@ def _build_repair_reflection_prompt(
             ', "impl_file": "<workspace-relative path to the '
             'implementation module the failing test exercises, e.g. '
             'backend/services/edgar.py — REQUIRED per the TEST-ASSERTION '
-            'HINT above unless the test itself is genuinely wrong>"'
+            'HINT unless the test itself is genuinely wrong>"'
             if _is_test_assertion else ""
         )
         + "}\n"
     )
+    return stable_preamble + evidence + output_spec
 
 
 def _hypothesis_fingerprint(
@@ -15130,6 +15225,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 judge_disagreement_history=_judge_disagreement_history,
                 judge_ignored_streak=_judge_ignored_streak,
                 prior_reflection_verdict=_prior_reflection,
+                workspace_path=state.get("workspace_path") or "",
             )
             # Fix C — escalate the reflection judge to the reasoning
             # model at the moment its cheap-mode verdict is most likely

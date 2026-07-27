@@ -2364,6 +2364,12 @@ _DROP_GUARD_SKIP_DIRS = frozenset({
 })
 _PYTEST_NODEID_RE = re.compile(r"([\w./+-]+\.py)::")
 _PY_TEST_FUNC_RE = re.compile(r"^\s*(?:async\s+)?def\s+test", re.MULTILINE)
+# A pytest node-id selector on the *command line* (``path.py::test``) marks a
+# deliberately-scoped run: the targeted-tests-first fast path and the isolation
+# re-runs both append node ids to re-scope the final pytest invocation to a
+# subset. ``.py::`` is unambiguous — the full-suite build command never carries
+# it. Used to suppress the silent-drop guard on such runs (see below).
+_PYTEST_NODEID_SELECTOR_RE = re.compile(r"\.py::")
 
 
 def _detect_dropped_test_files(
@@ -2385,6 +2391,19 @@ def _detect_dropped_test_files(
     if not raw_output or not workspace_path or not os.path.isdir(workspace_path):
         return []
     if "pytest" not in (build_command or "").lower():
+        return []
+    # Targeted/subset run (command carries ``path.py::test`` node-id selectors,
+    # as the targeted-tests-first fast path and the isolation re-runs do):
+    # collecting only the selected node ids is BY DESIGN, so every other on-disk
+    # test file is "uncollected" without any collision. The guard's premise —
+    # "a full-suite run should collect every test file" — does not hold here.
+    # Bailing prevents the guard from false-firing the moment the last targeted
+    # selector starts passing (raw exit 0 + subset collected), which otherwise
+    # promotes the green targeted run to exit 1 and traps the repair loop on a
+    # non-existent drop whose only "fix" (--import-mode=importlib) is already
+    # applied (lumina 019fa046). The full-suite run that follows a passing
+    # targeted run carries no selectors, so the guard still covers it.
+    if _PYTEST_NODEID_SELECTOR_RE.search(build_command or ""):
         return []
 
     collected = {

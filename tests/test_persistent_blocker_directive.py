@@ -353,6 +353,62 @@ class TestFixGTestAssertionMode:
         assert promoted is None
         assert guarded == ["tests/unit/backend/test_edgar.py"]
 
+    def test_seeder_uses_tests_marker_when_impl_file_hallucinated(self, tmp_path):
+        # lumina 019fa046: the judge named a non-existent impl path
+        # (server/repository.py) for an assertion failure whose test file
+        # carries `# @tests: server/app/repositories/contacts_repository.py`.
+        # The marker fallback must recover the real impl and promote it so
+        # repair gets a concrete anchor instead of wandering.
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "server" / "app" / "repositories").mkdir(parents=True)
+        impl = tmp_path / "server" / "app" / "repositories" / "contacts_repository.py"
+        impl.write_text("class ContactsRepository:\n    pass\n")
+        (tmp_path / "server" / "tests").mkdir(parents=True)
+        test_file = tmp_path / "server" / "tests" / "test_repository.py"
+        test_file.write_text(
+            "# @tests: server/app/repositories/contacts_repository.py\n"
+            "def test_list_all_sorted():\n    assert True\n"
+        )
+        verdict = {
+            "real_blocker": "list order [1,2,3] != [3,2,1]",
+            "recommendation": "Edit server/repository.py to reverse the list.",
+            "impl_file": "server/repository.py",  # hallucinated, not on disk
+        }
+        errs = [{
+            "file": "server/tests/test_repository.py",
+            "line": 32,
+            "error_code": "AssertionError",
+            "message": "assert [c.id for c in results] == [3, 2, 1]",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["server/app/repositories/contacts_repository.py"]
+        assert promoted == "server/app/repositories/contacts_repository.py"
+        assert guarded == []
+
+    def test_seeder_marker_fallback_used_when_impl_file_omitted(self, tmp_path):
+        # Even with no impl_file at all, a test-assertion round steers to the
+        # marker's impl rather than mandating (and then guarding) the test.
+        from harness.graph import _effective_judge_named_files
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "svc.py").write_text("x = 1\n")
+        (tmp_path / "server" / "tests").mkdir(parents=True)
+        (tmp_path / "server" / "tests" / "test_svc.py").write_text(
+            "# @tests: server/app/svc.py\ndef test_x():\n    assert True\n"
+        )
+        verdict = {"real_blocker": "wrong value", "recommendation": "fix it"}
+        errs = [{
+            "file": "server/tests/test_svc.py", "line": 3,
+            "error_code": "AssertionError", "message": "assert 1 == 2",
+        }]
+        files, promoted, guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["server/app/svc.py"]
+        assert promoted == "server/app/svc.py"
+        assert guarded == []
+
     def test_seeder_refuses_to_promote_test_path_as_impl(self, tmp_path):
         from harness.graph import _effective_judge_named_files
         (tmp_path / "tests" / "unit").mkdir(parents=True)

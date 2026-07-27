@@ -5,7 +5,7 @@ applies_to: [python]
 ## Python — Unit Test Skill (pytest)
 
 ### When this skill applies
-Any Python workspace (FastAPI, Django, Flask, plain library, CLI). The sandbox pre-installs `pytest`, `pytest-asyncio`, `pytest-cov`, `pytest-mock`, `freezegun`, and `responses` — do NOT add them to `requirements.txt` unless the project ships outside the sandbox too.
+Any Python workspace (FastAPI, Django, Flask, plain library, CLI). The sandbox pre-installs `pytest`, `pytest-asyncio`, `pytest-cov`, `pytest-mock`, `pytest-xdist`, `pytest-timeout`, `hypothesis`, `httpx`, `freezegun`, and `responses` — do NOT add them to `requirements.txt` unless the project ships outside the sandbox too. (`httpx` is what FastAPI/Starlette `TestClient` needs at import time; `freezegun` freezes time for date-dependent tests; `responses` mocks outbound HTTP.)
 
 ### Coverage gate
 The operator's `coverage.enforce` setting decides whether under-threshold builds fail:

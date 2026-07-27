@@ -6814,16 +6814,29 @@ def _uv_venv_prefix() -> str:
     sandbox container (``/tmp`` is ephemeral); within a container the
     ``test -d`` guard makes re-activation a no-op.
 
-    Also ensures ``pytest-timeout`` and ``hypothesis`` are installed. Both
-    are baked into the harness-builder image (``Dockerfile.builder``) so the
+    Also ensures the harness-owned test-support tools are installed:
+    ``pytest-timeout``, ``hypothesis``, ``httpx``, ``pytest-asyncio``,
+    ``pytest-mock``, ``freezegun`` and ``responses``. All are baked into the
+    harness-builder image (``Dockerfile.builder``) so the
     ``--system-site-packages`` venv typically inherits them for free — the
     extra ``uv pip install --quiet`` here is a fail-open safety net for
     operators running against a custom image built before the Dockerfile
-    change landed. Idempotent when already present. ``hypothesis`` backs the
-    ADR-0003 Tier-3 property-based contract tests, which emit
-    ``pytest.importorskip("hypothesis")`` and therefore *silently skip* the
-    entire tier when it's absent (lumina 019f82af: the property test skipped
-    unnoticed on a green gate).
+    change landed. These are exactly the tools the Python unit-test skill
+    promises are pre-installed (so the LLM is told NOT to add them to
+    ``requirements.txt``); baking them keeps that promise and avoids a
+    ModuleNotFoundError repair cycle on every project whose generated tests
+    use time-freezing (``freezegun``), HTTP mocking (``responses``), async
+    (``pytest-asyncio``), or FastAPI ``TestClient`` (``httpx``). Idempotent
+    when already present.
+    ``hypothesis`` backs the ADR-0003 Tier-3 property-based contract tests,
+    which emit ``pytest.importorskip("hypothesis")`` and therefore *silently
+    skip* the entire tier when it's absent (lumina 019f82af: the property test
+    skipped unnoticed on a green gate). ``httpx`` is required at IMPORT time by
+    Starlette / FastAPI's ``TestClient``, which the ADR-0003 Tier-1/2 contract
+    tests instantiate — without it those tests raise ``RuntimeError: the
+    starlette.testclient module requires the httpx package`` on collection and
+    burn a repair round on every FastAPI project (lumina 019fa046). The
+    harness generates these tests itself, so it owns the dependency.
     Motivation: ``_PYTEST_RUN`` unconditionally passes
     ``--timeout=30 --timeout-method=thread`` so LLM-generated infinite
     loops fail at the test level with an actionable traceback instead
@@ -6843,7 +6856,8 @@ def _uv_venv_prefix() -> str:
         f"test -d {_PROD_SMOKE_VENV_PATH}/bin "
         f"|| uv venv --system-site-packages {_PROD_SMOKE_VENV_PATH} "
         f"&& . {_PROD_SMOKE_VENV_PATH}/bin/activate "
-        f"&& uv pip install --quiet pytest-timeout hypothesis"
+        f"&& uv pip install --quiet pytest-timeout hypothesis httpx "
+        f"pytest-asyncio pytest-mock freezegun responses"
     )
 
 
@@ -11092,7 +11106,26 @@ def _build_repair_reflection_prompt(
             "(bad expectation, typo, off-by-one in fixture data), omit "
             "``impl_file`` and say so explicitly in ``recommendation``. "
             "When in doubt, prefer naming an impl file — the harness "
-            "will drop the field silently if the path doesn't exist.\n\n"
+            "will drop the field silently if the path doesn't exist.\n"
+            "  A DIFFERENCE IN LIST ORDER OR RETURNED VALUES IS NOT "
+            "EVIDENCE THE TEST IS WRONG. If the implementation returns "
+            "the right elements in a different order than the test "
+            "asserts, it is almost certainly missing the sort/ordering "
+            "the test documents — fix the impl to produce the asserted "
+            "order. Read the test's own comments and assertion for its "
+            "intended contract before ever concluding it is 'reversed' "
+            "or 'backwards': a numeric summary like [1,2,3] vs [3,2,1] "
+            "hides the real sort key (by-name, by-date, nulls-first) and "
+            "must never be the basis for calling a test wrong.\n"
+            "  The repair loop CANNOT modify test files — they are "
+            "tamper-guarded and any edit to them is rejected. NEVER "
+            "phrase ``recommendation`` as editing, updating, changing, "
+            "weakening, or deleting a test or its assertions; such a "
+            "recommendation is unactionable and burns the round. If you "
+            "are genuinely certain the test encodes a wrong expectation, "
+            "say so for human review AND still name in ``impl_file`` the "
+            "implementation module the test exercises — do not direct a "
+            "test edit.\n\n"
         )
     else:
         test_assertion_hint_block = ""
@@ -11515,6 +11548,52 @@ def _resolve_impl_file_in_workspace(
     return matches[0] if matches else None
 
 
+def _impl_from_tests_marker(
+    test_path: str, workspace_path: str,
+) -> Optional[str]:
+    """Return the implementation module a failing test maps to via its
+    ``# @tests: <source>`` marker, or None.
+
+    A DETERMINISTIC alternative to the reflection judge's ``impl_file``
+    guess: every harness-generated test records the code it exercises in
+    a traceability marker at the top of the file. For an assertion
+    failure whose only diagnostic anchor is the test itself, this
+    recovers the real fix target even when the judge omitted ``impl_file``
+    or hallucinated a path — lumina 019fa046: the judge named the
+    non-existent ``server/repository.py`` for a failure whose test was
+    marked ``# @tests: server/app/repositories/contacts_repository.py``,
+    leaving the repair loop with no scope anchor so it wandered into
+    unrelated client files and burned iterations.
+
+    Returns the first marked path that exists on disk under the workspace
+    and is not itself a test artifact; None otherwise.
+    """
+    if not test_path or not workspace_path:
+        return None
+    abs_test = (
+        test_path if os.path.isabs(test_path)
+        else os.path.join(workspace_path, test_path)
+    )
+    try:
+        with open(abs_test, "r", encoding="utf-8", errors="replace") as fh:
+            body = fh.read(64 * 1024)
+    except OSError:
+        return None
+    try:
+        from harness.test_generation import _parse_tests_marker
+    except Exception:  # noqa: BLE001 — import guard for partial builds
+        return None
+    for cand in _parse_tests_marker(body):
+        rel = cand.replace("\\", "/").lstrip("./")
+        if not rel or os.path.isabs(cand) or ".." in rel.split("/"):
+            continue
+        if _is_test_path(rel) or _TEST_FILENAME_RE.search(rel):
+            continue
+        if os.path.isfile(os.path.join(workspace_path, rel)):
+            return rel
+    return None
+
+
 def _effective_judge_named_files(
     verdict: dict[str, str],
     compiler_errors: list[dict[str, Any]],
@@ -11624,16 +11703,33 @@ def _effective_judge_named_files(
     if not _top_error_is_test_assertion(top_persisted_diagnostics):
         kept, guarded = _drop_guarded_tests(base_files)
         return kept, None, guarded
-    impl_file = str(verdict.get("impl_file", "") or "").strip()
-    if not impl_file or not workspace_path:
+
+    # Test-assertion round: the fix belongs in the impl the test
+    # exercises, not the test (which is only the assertion anchor).
+    # Prefer the judge's ``impl_file``; when it is missing or will not
+    # resolve, fall back to the failing test's own ``# @tests:`` marker —
+    # a deterministic pointer to the impl that beats the judge's guess and
+    # keeps repair from wandering into unrelated files for lack of an
+    # anchor (lumina 019fa046).
+    _failing_test = str(
+        (top_persisted_diagnostics[0] or {}).get("file", "") or ""
+    ).strip()
+    marker_impl = _impl_from_tests_marker(_failing_test, workspace_path)
+
+    def _giveup() -> tuple[list[str], Optional[str], list[str]]:
+        if marker_impl:
+            return [marker_impl], marker_impl, []
         kept, guarded = _drop_guarded_tests(base_files)
         return kept, None, guarded
+
+    impl_file = str(verdict.get("impl_file", "") or "").strip()
+    if not impl_file or not workspace_path:
+        return _giveup()
     # Normalise + workspace-relative check. Reject absolute paths,
     # traversal, and non-existent files — the LLM occasionally
     # hallucinates plausible-looking paths.
     if os.path.isabs(impl_file) or ".." in impl_file.split("/"):
-        kept, guarded = _drop_guarded_tests(base_files)
-        return kept, None, guarded
+        return _giveup()
     abs_path = os.path.join(workspace_path, impl_file)
     if not os.path.isfile(abs_path):
         # The judge's guess doesn't exist verbatim — try a unique
@@ -11643,8 +11739,7 @@ def _effective_judge_named_files(
         # possible answer (lumina 019f7109 rounds 12-13).
         resolved = _resolve_impl_file_in_workspace(impl_file, workspace_path)
         if resolved is None:
-            kept, guarded = _drop_guarded_tests(base_files)
-            return kept, None, guarded
+            return _giveup()
         impl_file = resolved
     # Guard: refuse to promote a test path as the impl target (the judge
     # would only do this by mistake, but we should never end up back
@@ -11652,8 +11747,7 @@ def _effective_judge_named_files(
     if _is_test_path(impl_file) or _TEST_FILENAME_RE.search(
         impl_file.replace(os.sep, "/")
     ):
-        kept, guarded = _drop_guarded_tests(base_files)
-        return kept, None, guarded
+        return _giveup()
     # When ``impl_file`` is a valid, on-disk, non-test path, replace
     # ``base_files`` wholesale — the judge has explicitly named where
     # the fix belongs, and the LLM should focus on it rather than
@@ -13842,6 +13936,29 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         allow_network=allow_network,
         sandbox_config=sandbox_cfg,
     )
+
+    # Bulletproof the pytest import mode at the collection choke point.
+    # test_generation_node writes a pytest.ini with --import-mode=importlib,
+    # but it can be bypassed depending on which control-flow path that node
+    # takes for a given batch/stack (lumina 019fa046: two Python test trees —
+    # server/tests/ + tests/contract/ — collided under default prepend mode
+    # and a whole tier was silently dropped while pytest still exited 0).
+    # Re-asserting here, immediately before ANY pytest invocation, guarantees
+    # the config exists no matter how the tests got onto disk. Idempotent and
+    # self-gating on Python-test presence, so it's a no-op for non-Python
+    # builds and when a config already exists.
+    if "pytest" in (build_cmd or "").lower():
+        try:
+            from harness.test_generation import _ensure_pytest_importlib_config
+            _ensured_ini = _ensure_pytest_importlib_config(workspace)
+            if _ensured_ini:
+                logger.info(
+                    "[compiler_node] Ensured %s (--import-mode=importlib) "
+                    "before pytest to prevent same-basename collection "
+                    "collisions across test trees.", _ensured_ini,
+                )
+        except Exception:  # noqa: BLE001 — never block the build on this
+            pass
 
     # Fail-to-pass fast path (SWE-bench methodology): when EVERY failure
     # from the previous round carries a pytest nodeid (≤ 5 of them), run

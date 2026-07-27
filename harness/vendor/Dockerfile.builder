@@ -95,7 +95,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && "$PY" -m pip install --no-cache-dir --break-system-packages --upgrade \
       pip setuptools wheel \
  && "$PY" -m pip install --no-cache-dir --break-system-packages \
-      pytest pytest-cov pytest-xdist pytest-timeout hypothesis \
+      pytest pytest-cov pytest-xdist pytest-timeout hypothesis httpx \
+      pytest-asyncio pytest-mock freezegun responses \
  && chmod -R a+rwX /opt/uv-python \
  && chmod a+rwX /usr/local/bin \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \

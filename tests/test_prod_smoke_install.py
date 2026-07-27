@@ -28,6 +28,10 @@ class TestComposeProdSmokeInstallStep:
         assert "/tmp/teane-venv/bin/activate" in step
         assert "uv pip install -r requirements.txt" in step
         assert "uv pip install pytest" in step
+        # httpx is a harness-owned test-support dep: FastAPI/Starlette
+        # TestClient (used by the generated contract tests) needs it at
+        # import time, else collection raises RuntimeError (lumina 019fa046).
+        assert "httpx" in step
         # `--system` on `uv pip install` would route writes to /usr/local —
         # non-root sandboxes can't write there. (`uv venv --system-site-
         # packages` is fine — it only widens import resolution, not writes.)

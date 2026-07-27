@@ -2675,6 +2675,20 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             and _inside_workspace(rel, workspace_path)
         ]
 
+    # Ensure a pytest.ini selecting --import-mode=importlib exists whenever a
+    # Python test tree is present — this MUST run before the early returns
+    # below. A full-stack app resolves ``primary`` to the frontend, so
+    # ``_stack_test_command(primary)`` returns None and the node returns at the
+    # ``no_runner_command_for_stack`` branch; when the writer lived only at the
+    # tail, that path left the Python trees in default prepend mode and they
+    # collided on collection (lumina 019fa046: server/tests/ + tests/contract/
+    # silently dropped while pytest still exited 0). Tests are already on disk
+    # here (process_llm_patch_output ran above); the writer self-gates on
+    # Python-test presence and is idempotent, so it's safe on every path.
+    _importlib_ini = _ensure_pytest_importlib_config(workspace_path)
+    if _importlib_ini and _importlib_ini not in new_modified:
+        new_modified.append(_importlib_ini)
+
     # --- Skip deterministic run when no tests landed ---
     if not generated_tests:
         logger.info(
@@ -2723,23 +2737,10 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    # Ensure pytest has a config that uses the importlib import mode whenever a
-    # Python test tree is present. Without this, two same-named test files in
-    # different directories (e.g. `tests/app/models/test_job.py` and
-    # `tests/app/schemas/test_job.py`, both arising from a `job.py` source
-    # in each package) collide on collection with the well-known
-    # "import file mismatch: imported module 'test_job' has this __file__
-    # attribute" error; and a full-stack app with a flat `tests/` tree plus a
-    # nested `server/tests/` tree hits ImportPathMismatchError (or silently
-    # drops one tier). importlib mode uses Python's package resolution so the
-    # trees coexist as distinct dotted names. Gated on Python-test PRESENCE
-    # (the writer self-checks), NOT on the workspace's primary stack — a
-    # full-stack Python+JS app resolves `primary` to the frontend and used to
-    # skip this entirely (lumina 019f82af). Idempotent — leaves any existing
-    # pytest config (pytest.ini / pyproject.toml / setup.cfg) alone.
-    ensured = _ensure_pytest_importlib_config(workspace_path)
-    if ensured:
-        new_modified.append(ensured)
+    # (pytest.ini with --import-mode=importlib is now ensured earlier, before
+    # the ``no_runner_command_for_stack`` / ``no_tests_generated`` early
+    # returns — see the _ensure_pytest_importlib_config call above. Leaving it
+    # only here missed the full-stack early-return path — lumina 019fa046.)
 
     # JS/TS counterpart: freshly generated .test.ts(x)/.test.js(x) files
     # need their jest/type environment (devDependencies, jest config with

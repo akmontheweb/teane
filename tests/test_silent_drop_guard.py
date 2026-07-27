@@ -95,6 +95,42 @@ def test_noop_when_command_is_not_pytest(tmp_path):
     assert _detect_dropped_test_files("build ok", "make build", ws) == []
 
 
+def test_bails_on_targeted_run_with_nodeid_selectors(tmp_path):
+    # A targeted/subset run (command carries ``path.py::test`` node-id
+    # selectors — the targeted-tests-first fast path and isolation re-runs)
+    # collects only the selected node ids by design. Every other on-disk test
+    # file is legitimately uncollected, so the guard must NOT flag them —
+    # otherwise a passing targeted run (raw exit 0) gets promoted to a failure
+    # and the repair loop churns on a phantom drop (lumina 019fa046).
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "server", "tests", "test_repository.py"))
+    _write(os.path.join(ws, "server", "tests", "test_models.py"))
+    _write(os.path.join(ws, "tests", "contract", "test_api.py"))
+    output = (
+        "server/tests/test_repository.py::TestRepo::test_list_all_sorted PASSED\n"
+        "===== 1 passed in 0.01s =====\n"
+    )
+    cmd = (
+        "python3 -m pytest -vv -p no:cacheprovider "
+        "'server/tests/test_repository.py::TestRepo::test_list_all_sorted'"
+    )
+    assert _detect_dropped_test_files(output, cmd, ws) == []
+
+
+def test_full_suite_after_targeted_still_guarded(tmp_path):
+    # The full-suite run that follows a passing targeted run carries no
+    # selectors, so the guard must still catch a genuine silent drop there.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "test_a.py"))
+    _write(os.path.join(ws, "server", "tests", "test_b.py"))
+    output = (
+        "tests/test_a.py::test_ok PASSED\n"
+        "===== 1 passed in 0.01s =====\n"
+    )
+    dropped = _detect_dropped_test_files(output, "python3 -m pytest -vv", ws)
+    assert dropped == [os.path.join("server", "tests", "test_b.py")]
+
+
 def test_ignores_vendored_dirs(tmp_path):
     # Test files under .venv/node_modules are dependencies, not our suite.
     ws = str(tmp_path)

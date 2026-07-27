@@ -157,3 +157,38 @@ class TestBackwardsCompat:
                 **_base_kwargs(), prior_reflection_verdict=bogus,  # type: ignore[arg-type]
             )
             assert "YOUR PREVIOUS-ROUND VERDICT" not in prompt
+
+
+class TestTestAssertionGuardrails:
+    """When the top persisted diagnostic is an assertion failure inside a
+    test file, the TEST-ASSERTION HINT must (a) forbid concluding the test
+    is 'reversed/wrong' from a mere order/value difference, and (b) forbid
+    recommending a test edit (the repair loop can't modify test files).
+    Regression for lumina 019fa046: the judge misread [3,2,1] (last_name
+    order) as a reversed test and recommended editing the assertion.
+    """
+
+    def _test_assertion_kwargs(self) -> dict:
+        kw = _base_kwargs()
+        kw["top_persisted_diagnostics"] = [
+            {"error_code": "AssertionError",
+             "file": "server/tests/test_repository.py", "line": 32,
+             "message": "assert [c.id for c in results] == [3, 2, 1]"},
+        ]
+        return kw
+
+    def test_order_difference_not_evidence_test_wrong(self) -> None:
+        prompt = _build_repair_reflection_prompt(**self._test_assertion_kwargs())
+        assert "A DIFFERENCE IN LIST ORDER OR RETURNED VALUES IS NOT" in prompt
+        assert "[1,2,3] vs [3,2,1]" in prompt
+
+    def test_never_recommend_editing_a_test(self) -> None:
+        prompt = _build_repair_reflection_prompt(**self._test_assertion_kwargs())
+        assert "repair loop CANNOT modify test files" in prompt
+        assert "do not direct a test edit" in prompt
+
+    def test_guardrails_absent_for_source_assertion(self) -> None:
+        # Top error in a non-test file → hint block (and its guardrails)
+        # must not render.
+        prompt = _build_repair_reflection_prompt(**_base_kwargs())
+        assert "A DIFFERENCE IN LIST ORDER OR RETURNED VALUES IS NOT" not in prompt

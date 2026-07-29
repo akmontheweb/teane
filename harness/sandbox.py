@@ -138,7 +138,7 @@ def _apply_teane_diagnostics_env(
 # and only required for multi-host fleets.
 BUILDER_IMAGE = (
     "harness-builder"
-    "@sha256:894cb4fe3eda41b73ac90e0862762985828af6d576b857f77d898933b930655d"
+    "@sha256:b9911f9f0a2a52a5c8b016b2dea8cd5ae4dbb50d7e4cd316606e2d0b5f46ad10"
 )
 
 

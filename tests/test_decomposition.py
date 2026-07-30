@@ -467,6 +467,161 @@ class TestCrossDomainScopeGuard:
         assert not decomposition._is_nfr_story_key("STORY-042")
 
 
+class TestNfrClassifier:
+    """ADR-0004 _classify_nfr: constraint (property of a behaviour) vs
+    capability (architectural work item); ambiguous → capability."""
+
+    def test_constraint_signals(self):
+        assert decomposition._classify_nfr(
+            "Input sanitization",
+            ["stored text is not executed as SQL; escape on render"],
+        ) == "constraint"
+        assert decomposition._classify_nfr(
+            "Field validation", ["reject invalid input with a 422 error response"],
+        ) == "constraint"
+
+    def test_capability_signals(self):
+        assert decomposition._classify_nfr(
+            "Offline operation", ["no network calls are made"],
+        ) == "capability"
+        assert decomposition._classify_nfr(
+            "Performance", ["dashboard interactive within 2 seconds; p95 latency low"],
+        ) == "capability"
+        assert decomposition._classify_nfr(
+            "Durability", ["SQLite survives unexpected shutdown"],
+        ) == "capability"
+
+    def test_ambiguous_defaults_to_capability(self):
+        assert decomposition._classify_nfr("Some quality", ["it should be nice"]) == "capability"
+        assert decomposition._classify_nfr("", []) == "capability"
+
+    def test_constraint_wins_only_when_strictly_higher(self):
+        assert decomposition._classify_nfr(
+            "Sanitize and validate all input; escape output; reject injection",
+            ["logging is acceptable"],  # one capability signal, many constraint
+        ) == "constraint"
+
+
+class TestEmbedConstraintNfrs:
+    """ADR-0004 _embed_constraint_nfrs transform (pure)."""
+
+    def _story(self, title, acs, scope, feature="core", reqs=None):
+        return {
+            "title": title, "feature": feature, "description": None,
+            "acceptance_criteria": list(acs), "requirement_keys": list(reqs or []),
+            "depends_on": [], "scope_files": list(scope), "external_ref": None,
+        }
+
+    def test_disabled_is_noop(self):
+        s = self._story("Create contact", ["can create"], ["server/contacts.py"])
+        keys, cleaned = decomposition._embed_constraint_nfrs(
+            ["STORY-001"], [s], enabled=False,
+        )
+        assert keys == ["STORY-001"] and cleaned == [s]
+
+    def test_constraint_folds_into_overlapping_functional_story(self):
+        fs = self._story("Create contact", ["Given valid data, contact is created"],
+                         ["server/contacts.py"], reqs=["FR-001"])
+        nfr = self._story("Input sanitization against XSS injection",
+                          ["Submitting <script> is stored as literal text and rendered escaped"],
+                          ["server/contacts.py"], reqs=["NFR-004"])
+        keys, cleaned = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+        )
+        assert keys == ["STORY-001"]  # NFR story dropped
+        assert len(cleaned) == 1
+        acs = cleaned[0]["acceptance_criteria"]
+        assert any(a.startswith("[NFR]") and "literal text" in a for a in acs)
+        assert "NFR-004" in cleaned[0]["requirement_keys"]  # traceability merged
+
+    def test_no_overlap_keeps_nfr(self):
+        fs = self._story("Create contact", ["ok"], ["server/contacts.py"])
+        nfr = self._story("Sanitize input injection xss escape", ["escape"],
+                          ["client/unrelated.tsx"])
+        keys, _ = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+        )
+        assert keys == ["STORY-001", "STORY-NFR-004"]  # fail-safe: kept
+
+    def test_capability_nfr_kept(self):
+        fs = self._story("Create contact", ["ok"], ["server/contacts.py"])
+        nfr = self._story("Runs offline with low latency",
+                          ["no network; p95 latency under budget"], ["server/contacts.py"])
+        keys, _ = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-005"], [fs, nfr], enabled=True,
+        )
+        assert keys == ["STORY-001", "STORY-NFR-005"]  # capability → enabler kept
+
+    def test_empty_scope_nfr_kept(self):
+        fs = self._story("Create contact", ["ok"], ["server/contacts.py"])
+        nfr = self._story("Sanitize injection xss escape", ["reject"], [])
+        keys, _ = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+        )
+        assert "STORY-NFR-004" in keys  # no scope to match → fail-safe keep
+
+    def test_no_duplicate_ac_on_repeat(self):
+        fs = self._story("Create contact",
+                         ["[NFR] Submitting <script> is stored literally"],
+                         ["server/contacts.py"])
+        nfr = self._story("Sanitize input xss injection",
+                          ["Submitting <script> is stored literally"],
+                          ["server/contacts.py"])
+        _, cleaned = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+        )
+        # The already-present tagged AC must not be duplicated.
+        acs = cleaned[0]["acceptance_criteria"]
+        assert acs.count("[NFR] Submitting <script> is stored literally") == 1
+
+
+class TestEmbedConstraintNfrsEndToEnd:
+    """The flag threaded through _validate_stories_payload."""
+
+    def _payload(self, features):
+        return {
+            "features": features,
+            "stories": [
+                {"story_key": "STORY-001", "title": "Create contact", "feature": "core",
+                 "acceptance_criteria": ["Given valid data, a contact is created"],
+                 "requirement_keys": ["FR-001"], "scope_files": ["server/contact.py"]},
+                {"story_key": "STORY-NFR-004",
+                 "title": "Input sanitization against XSS injection",
+                 "feature": "core",
+                 "acceptance_criteria": ["Submitting a script tag is stored as literal text and rendered escaped"],
+                 "requirement_keys": ["NFR-004"], "scope_files": ["server/contact.py"]},
+            ],
+        }
+
+    def test_flag_on_embeds_and_drops(self):
+        payload = self._payload([{"feature_key": "core", "name": "Core"}])
+        _, stories = decomposition._validate_stories_payload(
+            payload, embed_constraint_nfrs=True,
+        )
+        assert len(stories) == 1
+        assert any(a.startswith("[NFR]") for a in stories[0]["acceptance_criteria"])
+
+    def test_flag_off_preserves_nfr_story(self):
+        payload = self._payload([{"feature_key": "core", "name": "Core"}])
+        _, stories = decomposition._validate_stories_payload(payload)  # default off
+        assert len(stories) == 2
+
+    def test_orphan_feature_pruned_after_embed(self):
+        # NFR under its own 'security' feature, overlapping the core functional
+        # story. After embedding, 'security' owns no story and must be pruned
+        # (not raise the orphan-feature error).
+        payload = self._payload([
+            {"feature_key": "core", "name": "Core"},
+            {"feature_key": "security", "name": "Security"},
+        ])
+        payload["stories"][1]["feature"] = "security"
+        features, stories = decomposition._validate_stories_payload(
+            payload, embed_constraint_nfrs=True,
+        )
+        assert {f["feature_key"] for f in features} == {"core"}
+        assert len(stories) == 1
+
+
 class TestCrossTestRootScopeGuard:
     """Finsearch session 156032347 root cause: LLM emitted
     ``server/app/services/tests/test_filing_service.py`` on one story

@@ -356,6 +356,9 @@
     "traceability": {
         "enforce": true
     },
+    "planning": {
+        "embed_constraint_nfrs": false
+    },
     "fanout": {
         "max_concurrency": 8,
         "timeout_seconds": 180

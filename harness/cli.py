@@ -854,6 +854,8 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Read via state["harness_config"] in installation_doc_node. See
     # harness/traceability.py.
     "traceability",
+    # ADR-0004 — decomposition-time planning behaviour (NFR embedding).
+    "planning",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -992,6 +994,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # stories actually satisfy its intent (vs. just cite it)? Off by
         # default; _enforce blocks the build on a finding instead of warning.
         "semantic_review", "semantic_review_enforce",
+    }),
+    # ADR-0004 — fold constraint-class NFRs into functional-story ACs instead
+    # of scheduling separate NFR stories. Read in decomposition_node.
+    "planning": frozenset({
+        "embed_constraint_nfrs",
     }),
     "fanout": frozenset({
         "max_concurrency",

@@ -408,6 +408,125 @@ def _is_nfr_story_key(story_key: str) -> bool:
     return bool(story_key and _NFR_STORY_KEY_RE.search(story_key))
 
 
+# ADR-0004 — NFR embedding. A "constraint" NFR is a property of a specific
+# behaviour (sanitisation, validation, error-shaping, encoding) and belongs as
+# an acceptance criterion on the functional story it constrains. A "capability"
+# NFR is architectural work with no single functional home (offline mode, load
+# budget, durability, observability, rate-limiting) and stays a separate enabler
+# story. Strong, low-ambiguity signals only; scoring + the fail-safe below
+# handle the middle.
+_NFR_CONSTRAINT_SIGNALS: tuple[str, ...] = (
+    "sanitiz", "escap", "validat", "injection", "xss", "csrf", "forbidden",
+    "reject", "literal text", "not execute", "not executed", "error response",
+    "error handling", "status code", "422", "400", "401", "403", "required field",
+    "input validation", "encoding", "malicious",
+)
+_NFR_CAPABILITY_SIGNALS: tuple[str, ...] = (
+    "offline", "latency", "performance", "throughput", "concurrent", "scalab",
+    "durab", "survive", "shutdown", "backup", "restore", "observ", "logging",
+    "monitor", "metric", "rate limit", "availab", "uptime", "caching",
+    "startup", "load time", "response time", "millisecond", "boot", "benchmark",
+    "within 2 second", "seconds", "p95", "p99",
+)
+
+
+def _classify_nfr(
+    story_title: str, acceptance_criteria: Optional[list[str]] = None,
+) -> str:
+    """Classify an NFR as ``"constraint"`` or ``"capability"`` (ADR-0004).
+
+    Deterministic keyword scoring over the title + ACs. ``constraint`` wins only
+    when it strictly out-scores ``capability``; every ambiguous case (a tie, or
+    no signal either way) resolves to ``capability`` — the documented fail-safe,
+    because an explicit tracked enabler story is a recoverable outcome whereas a
+    constraint embedded into a functional AC and then dropped is not.
+    """
+    text = " ".join(
+        [story_title or ""] + [str(a) for a in (acceptance_criteria or [])]
+    ).lower()
+    constraint = sum(1 for s in _NFR_CONSTRAINT_SIGNALS if s in text)
+    capability = sum(1 for s in _NFR_CAPABILITY_SIGNALS if s in text)
+    return "constraint" if constraint > capability else "capability"
+
+
+def _embed_constraint_nfrs(
+    story_keys: list[str],
+    cleaned: list[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """ADR-0004 — fold constraint-class NFR stories into the functional stories
+    they constrain, dropping the separate NFR story.
+
+    ``story_keys`` and ``cleaned`` are parallel lists (same order); the cleaned
+    dicts don't carry the key, so it's threaded alongside. For each NFR story
+    (``_is_nfr_story_key``) classified ``constraint``, every functional
+    (non-NFR) story whose ``scope_files`` overlap the NFR's gets the NFR's
+    acceptance criteria appended (prefixed ``[NFR] ``, de-duplicated) and its
+    ``requirement_keys`` merged, so the constraint is built and verified inside
+    the functional pass and stays linked to the AC-coverage gate. The NFR story
+    is then removed.
+
+    Fail-safe: an NFR that matches NO functional story (empty or non-overlapping
+    scope) is KEPT as-is — never silently drop coverage (the lumina 019fa046
+    failure this whole change prevents). ``capability`` NFRs are always kept.
+    ``enabled=False`` is a pure no-op, so the default-off flag changes nothing.
+    """
+    if not enabled or len(story_keys) != len(cleaned):
+        return story_keys, cleaned
+
+    # Index functional (non-NFR) stories by position for scope-overlap matching.
+    functional_idx = [
+        i for i, k in enumerate(story_keys) if not _is_nfr_story_key(k)
+    ]
+    drop_positions: set[int] = set()
+    for i, key in enumerate(story_keys):
+        if not _is_nfr_story_key(key):
+            continue
+        story = cleaned[i]
+        if _classify_nfr(
+            story.get("title", ""), story.get("acceptance_criteria"),
+        ) != "constraint":
+            continue  # capability NFR — keep as an enabler story
+        nfr_scope = {str(p) for p in (story.get("scope_files") or [])}
+        if not nfr_scope:
+            continue  # fail-safe: no scope to match on → keep the NFR story
+        matched = [
+            j for j in functional_idx
+            if nfr_scope & {str(p) for p in (cleaned[j].get("scope_files") or [])}
+        ]
+        if not matched:
+            continue  # fail-safe: nothing to attach to → keep the NFR story
+        nfr_acs = [str(a) for a in (story.get("acceptance_criteria") or [])]
+        nfr_reqs = list(story.get("requirement_keys") or [])
+        for j in matched:
+            target = cleaned[j]
+            existing_ac = set(target.get("acceptance_criteria") or [])
+            for ac in nfr_acs:
+                tagged = ac if ac.startswith("[NFR]") else f"[NFR] {ac}"
+                if tagged not in existing_ac:
+                    target.setdefault("acceptance_criteria", []).append(tagged)
+                    existing_ac.add(tagged)
+            if nfr_reqs:
+                merged = list(target.get("requirement_keys") or [])
+                for rk in nfr_reqs:
+                    if rk not in merged:
+                        merged.append(rk)
+                target["requirement_keys"] = merged
+        drop_positions.add(i)
+        logger.info(
+            "[decomposition] embedded constraint NFR %s into %d functional "
+            "story(ies) %s (ADR-0004) — %d AC(s) folded in; NFR story dropped.",
+            key, len(matched), [story_keys[j] for j in matched], len(nfr_acs),
+        )
+
+    if not drop_positions:
+        return story_keys, cleaned
+    new_keys = [k for i, k in enumerate(story_keys) if i not in drop_positions]
+    new_cleaned = [s for i, s in enumerate(cleaned) if i not in drop_positions]
+    return new_keys, new_cleaned
+
+
 def _drop_cross_domain_scope_files(
     story_key: str,
     scope: list[str],
@@ -1353,6 +1472,7 @@ def _validate_stories_payload(
     data: Any,
     *,
     known_req_keys: Optional[set[str]] = None,
+    embed_constraint_nfrs: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Sanity-check the LLM's JSON. Returns ``(features, stories)``.
 
@@ -1429,6 +1549,33 @@ def _validate_stories_payload(
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
     _drop_test_only_scope_files_in_decomposition(cleaned)
+    # ADR-0004 — fold constraint-class NFR stories into the functional stories
+    # they constrain (behind planning.embed_constraint_nfrs; default off → this
+    # is a pure no-op). Runs after the scope-file guards so the overlap match
+    # sees the final scopes. Dropping stories requires re-deriving the parallel
+    # key/deps structures and stripping now-dangling depends_on references.
+    if embed_constraint_nfrs:
+        _owners_before = {_s.get("feature") for _s in cleaned if _s.get("feature")}
+        story_keys_in_order, cleaned = _embed_constraint_nfrs(
+            story_keys_in_order, cleaned, enabled=True,
+        )
+        seen_keys = set(story_keys_in_order)
+        for _s in cleaned:
+            _s["depends_on"] = [
+                d for d in (_s.get("depends_on") or []) if d in seen_keys
+            ]
+        deps_in_order = [list(_s.get("depends_on") or []) for _s in cleaned]
+        # A feature whose only story was an embedded constraint NFR is now
+        # legitimately empty — prune it so the orphan-feature check below
+        # doesn't reject the plan. Only prune features orphaned BY embedding;
+        # a feature that was already orphaned (a planning error) still trips.
+        _owners_after = {_s.get("feature") for _s in cleaned if _s.get("feature")}
+        _embed_orphaned = _owners_before - _owners_after
+        if _embed_orphaned:
+            features_cleaned = [
+                f for f in features_cleaned
+                if f["feature_key"] not in _embed_orphaned
+            ]
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,
@@ -1611,6 +1758,20 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     from harness import story_state
 
     workspace = state.get("workspace_path") or os.getcwd()
+    # ADR-0004 — read the embed-constraint-NFRs flag (default off). Lazy import
+    # of the config loader avoids a module-level dependency on cli; any failure
+    # falls back to disabled so decomposition never breaks on config problems.
+    embed_constraint_nfrs = False
+    try:
+        from harness.cli import load_raw_config, _strip_comments
+        _cfg = _strip_comments(load_raw_config())
+        _planning = _cfg.get("planning") if isinstance(_cfg, dict) else None
+        if isinstance(_planning, dict):
+            embed_constraint_nfrs = bool(
+                _planning.get("embed_constraint_nfrs", False)
+            )
+    except Exception:  # noqa: BLE001 — config read must never break planning
+        embed_constraint_nfrs = False
     spec_req = _read_text(os.path.join(workspace, "docs", "SPEC_REQUIREMENTS.md"))
     if not spec_req.strip():
         logger.warning("[decomposition] SPEC_REQUIREMENTS.md is empty or missing")
@@ -1795,7 +1956,9 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 known_req_keys=known_req_keys,
             )
         return _validate_stories_payload(
-            payload, known_req_keys=known_req_keys,
+            payload,
+            known_req_keys=known_req_keys,
+            embed_constraint_nfrs=embed_constraint_nfrs,
         )
 
     try:

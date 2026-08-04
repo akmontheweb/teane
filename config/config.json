@@ -357,7 +357,7 @@
         "enforce": true
     },
     "planning": {
-        "embed_constraint_nfrs": false
+        "embed_constraint_nfrs": true
     },
     "fanout": {
         "max_concurrency": 8,

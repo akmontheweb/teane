@@ -1,6 +1,6 @@
 # ADR-0004: Embed Constraint NFRs as Story Acceptance Criteria
 
-**Status:** Proposed — fully implemented behind `planning.embed_constraint_nfrs` (default off); pending only the lumina A/B before flipping the default. Landed: classify+embed (`1d1275c`), deterministic→LLM classifier at refinement (`e6aa635`), shared-policy primitive + build-context injection (`2ed24df`, `a5386c3`), augment-path parity + coverage/traceability visibility (this change).
+**Status:** Accepted — fully implemented; `planning.embed_constraint_nfrs` now defaults **true** (flipped ahead of the originally-planned lumina A/B at operator direction; revert with `false`). Landed: classify+embed (`1d1275c`), deterministic→LLM classifier at refinement (`e6aa635`), shared-policy primitive + build-context injection (`2ed24df`, `a5386c3`), augment-path parity + coverage/traceability visibility (`0b6ed6f`). Follow-up: validate on a real lumina rebuild and update [[ADR-0003]] cross-links.
 **Date:** 2026-07-29
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0003]] (hybrid test generation — NFR ACs become Tier-1/4 tests), [[ADR-0002]] (generation-side contradiction prevention), decomposition NFR cross-domain-drop exemption (`df33a89`), drop-detection (`146f5cd`), paired producer+consumer decomposition (`13d0525`)

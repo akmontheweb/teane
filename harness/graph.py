@@ -21649,6 +21649,56 @@ def _build_change_request_preamble(state: AgentState, phase: str) -> str:
     )
 
 
+def _build_nfr_policy_block(ac_texts: list[str], workspace: str) -> str:
+    """ADR-0004 #2 — render the authoritative NFR-policy definitions that a
+    story's embedded ``[NFR:<id>]`` acceptance criteria derive from, so the
+    patcher implements each constraint to its FULL policy — consistently across
+    every story that shares it — instead of just the one folded-in AC line.
+
+    Empty string when the story carries no policy-tagged ACs, there is no
+    workspace, or the spec / registry can't be resolved (all non-fatal).
+    """
+    try:
+        from harness.decomposition import (
+            _nfr_policy_id_of, _nfr_policy_registry,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    ids: list[str] = []
+    for t in ac_texts:
+        pid = _nfr_policy_id_of(str(t or ""))
+        if pid and pid not in ids:
+            ids.append(pid)
+    if not ids or not workspace:
+        return ""
+    try:
+        with open(
+            os.path.join(workspace, "docs", "SPEC_REQUIREMENTS.md"),
+            "r", encoding="utf-8", errors="replace",
+        ) as f:
+            spec = f.read()
+    except OSError:
+        return ""
+    registry = _nfr_policy_registry(spec)
+    policies = [(pid, registry[pid]) for pid in ids if pid in registry]
+    if not policies:
+        return ""
+    lines = [
+        "### Applicable NFR policies (authoritative)",
+        "The `[NFR:<id>]` acceptance criteria above are constraints drawn from "
+        "the shared policies below. Implement each to its FULL definition, and "
+        "apply it consistently wherever the same policy appears across stories:",
+    ]
+    for pid, p in policies:
+        lines.append(f"- **[{pid}] {p.get('title', '')}**")
+        txt = (p.get("text") or "").strip()
+        # Drop the internal **Class:** marker from the operator-facing render.
+        txt = re.sub(r"^\*\*Class:\*\*[^\n]*\n?", "", txt, count=1, flags=re.MULTILINE).strip()
+        if txt:
+            lines.append(f"  {txt[:700].rstrip()}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_story_preamble(state: AgentState, phase: str) -> str:
     """Return the per-story scoping preamble for ``phase`` (one of
     ``"patching"``, ``"tests"``). Empty string when no story is active.
@@ -21745,6 +21795,11 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
 
     rules = "\n".join(marker_lines)
 
+    # ADR-0004 #2 — surface the authoritative NFR-policy definitions behind any
+    # embedded [NFR:<id>] acceptance criteria (empty for stories without them).
+    _ac_texts = [str(r.get("text", "")) for r in ac_rows] if ac_rows else list(ac)
+    policy_block = _build_nfr_policy_block(_ac_texts, workspace)
+
     return (
         f"## Story Scope: {story_key} — {story.get('title', '')}\n\n"
         "This patching turn is scoped to ONE story. Focus on the "
@@ -21752,6 +21807,7 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
         "whole specification in a single pass.\n\n"
         "### Acceptance criteria\n"
         f"{ac_block}\n\n"
+        f"{policy_block}"
         "### File scope (advisory)\n"
         f"{scope_block}\n\n"
         "Editing files outside this list is allowed when an "

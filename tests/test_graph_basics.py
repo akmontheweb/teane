@@ -2201,3 +2201,40 @@ class TestImportConventionsSection:
         )
         section = _import_conventions_section(str(tmp_path))
         assert "@testing-library/react" in section
+
+
+class TestNfrPolicyBlock:
+    """ADR-0004 #2b — the authoritative NFR-policy block injected into the
+    per-story patching preamble for stories with embedded [NFR:<id>] ACs."""
+
+    def _spec(self, tmp_path, body):
+        (tmp_path / "docs").mkdir(exist_ok=True)
+        (tmp_path / "docs" / "SPEC_REQUIREMENTS.md").write_text(body)
+
+    def test_renders_authoritative_policy_for_tagged_ac(self, tmp_path):
+        from harness.graph import _build_nfr_policy_block
+        self._spec(tmp_path,
+            "## R\n\n#### Enabler Story: STORY-NFR-002 — Input Validation\n"
+            "**Class:** constraint\n"
+            "**Description:** sanitize and escape all input; reject injection with 422.\n")
+        block = _build_nfr_policy_block(
+            ["[NFR:NFR-002] submitting a script tag is stored literally", "plain AC"],
+            str(tmp_path),
+        )
+        assert "Applicable NFR policies" in block
+        assert "[NFR-002] Input Validation" in block
+        assert "sanitize and escape" in block
+        assert "**Class:**" not in block          # internal marker stripped
+
+    def test_empty_without_policy_tags(self, tmp_path):
+        from harness.graph import _build_nfr_policy_block
+        self._spec(tmp_path, "## R\n")
+        assert _build_nfr_policy_block(["a plain AC"], str(tmp_path)) == ""
+
+    def test_capability_nfr_is_not_a_policy(self, tmp_path):
+        from harness.graph import _build_nfr_policy_block
+        self._spec(tmp_path,
+            "## R\n\n#### Enabler Story: STORY-NFR-001 — Performance\n"
+            "**Class:** capability\n**Description:** respond fast.\n")
+        # Even a tag pointing at it renders nothing — capability NFRs aren't policies.
+        assert _build_nfr_policy_block(["[NFR:NFR-001] respond fast"], str(tmp_path)) == ""

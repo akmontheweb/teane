@@ -210,9 +210,10 @@ The policy block is the single-owner primitive that makes embedding safe.
    (`planning.embed_constraint_nfrs`, default off). (`e6aa635`)
 3. [x] Define the shared NFR-policy structure and the per-story AC attribution
    syntax (`[NFR:<policy-id>]` tag; `_nfr_policy_registry` as the single source;
-   drift-safe by single-pass derivation). **Remaining:** inject the
-   consolidated policy definitions into the functional stories' build context
-   (the registry exists; the prompt wiring is pending).
+   drift-safe by single-pass derivation), AND inject the consolidated
+   authoritative policy definitions into the per-story patching preamble
+   (`_build_nfr_policy_block`) so the constraint is implemented to its full
+   policy consistently across every story that shares it. #2 complete.
 4. [x] Teach decomposition to emit constraint-NFR-derived ACs on functional
    stories and to stop emitting separate `STORY-NFR-NNN` for the constraint
    class; keep capability NFRs as sequenced enablers. (`1d1275c`) **Remaining:**

@@ -5433,6 +5433,128 @@ updated SPEC_REQUIREMENTS.md document."""
     return content
 
 
+async def _llm_classify_ambiguous_nfrs(
+    ambiguous: list[dict[str, Any]],
+    gateway: Any,
+    budget_usd: float,
+    *,
+    user_goal: str = "",
+) -> tuple[dict[str, str], float]:
+    """One batched LLM call (doc_reviewer role) classifying the ambiguous NFR
+    band as constraint|capability (ADR-0004 #1). Returns ``({id: label}, new
+    budget)``. Any dispatch/parse failure returns ``({}, budget)`` so the caller
+    keeps the deterministic fail-safe."""
+    from harness.gateway import NodeRole
+    from harness.trust import strip_code_fences
+    listing = "\n\n".join(
+        f"ID: {it['id']}\nTitle: {it.get('title','')}\n"
+        f"Details: {' '.join(str(a) for a in it.get('acceptance_criteria', []))[:600]}"
+        for it in ambiguous
+    )
+    prompt = (
+        "Classify each non-functional requirement (NFR) below as EXACTLY one of:\n"
+        '- "constraint": a property of a specific behaviour (input sanitisation, '
+        "validation, error-shaping, encoding, correctness rules) that belongs as "
+        "an acceptance criterion ON the functional story it constrains — built and "
+        "tested in the same pass.\n"
+        '- "capability": standalone architectural work with no single functional '
+        "home (offline mode, performance/latency budget, durability, "
+        "observability, rate-limiting, deployment).\n\n"
+        'When genuinely unsure, answer "capability".\n\n'
+        f"Product goal (context): {(user_goal or '')[:400]}\n\n"
+        f"NFRs:\n{listing}\n\n"
+        "Respond with STRICT JSON ONLY — no prose, no code fences: an object "
+        'mapping each ID to "constraint" or "capability". '
+        'Example: {"STORY-NFR-001": "capability"}'
+    )
+    try:
+        response, budget_usd = await gateway.dispatch(
+            messages=[{"role": "user", "content": prompt}],
+            role=NodeRole.DOC_REVIEWER,
+            budget_remaining_usd=budget_usd,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break refinement on this
+        logger.info(
+            "[requirements] NFR LLM classification dispatch failed (%s) — "
+            "deterministic fallback stands.", exc,
+        )
+        return {}, budget_usd
+    raw = strip_code_fences((response.content or "").strip()).strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return {}, budget_usd
+    out: dict[str, str] = {}
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            if isinstance(v, str) and v.strip().lower() in ("constraint", "capability"):
+                out[str(k)] = v.strip().lower()
+    return out, budget_usd
+
+
+async def _classify_and_tag_nfrs_in_spec(
+    spec_path: str,
+    gateway: Any,
+    config: dict[str, Any],
+    budget_usd: float,
+    *,
+    user_goal: str = "",
+) -> float:
+    """ADR-0004 #1 — at requirements-refinement, classify each NFR enabler block
+    (deterministic keyword scoring first, LLM only for the ambiguous band) and
+    write a ``**Class:** constraint|capability`` marker into the spec so
+    decomposition can embed constraint NFRs deterministically.
+
+    Gated on ``planning.embed_constraint_nfrs``. Entirely non-fatal: a missing
+    spec, no NFR blocks, or any dispatch/IO error leaves the spec untouched and
+    returns the budget unchanged. Returns the (possibly reduced) budget."""
+    from harness import decomposition as _decomp
+    if not bool((config.get("planning", {}) or {}).get("embed_constraint_nfrs", False)):
+        return budget_usd
+    try:
+        with open(spec_path, "r", encoding="utf-8", errors="replace") as f:
+            spec = f.read()
+    except OSError:
+        return budget_usd
+    blocks = _decomp._parse_spec_nfr_blocks(spec)
+    if not blocks:
+        return budget_usd
+    items = [
+        {"id": b["key"], "title": b["title"], "acceptance_criteria": [b["text"]]}
+        for b in blocks
+    ]
+    # Deterministic pass locates the ambiguous band; the LLM is called ONLY if
+    # there is one, then its verdicts are fed through the tested cascade (which
+    # re-applies the same fail-safe) rather than trusted blindly.
+    ambiguous = [
+        it for it in items
+        if _decomp._classify_nfr_banded(it["title"], it["acceptance_criteria"])[1]
+    ]
+    overrides: dict[str, str] = {}
+    if ambiguous:
+        overrides, budget_usd = await _llm_classify_ambiguous_nfrs(
+            ambiguous, gateway, budget_usd, user_goal=user_goal,
+        )
+    labels = _decomp.classify_nfrs_cascade(
+        items, (lambda _amb: overrides) if overrides else None,
+    )
+    tagged = _decomp._inject_nfr_class_markers(spec, labels)
+    if tagged != spec:
+        try:
+            with open(spec_path, "w", encoding="utf-8") as f:
+                f.write(tagged)
+        except OSError:
+            return budget_usd
+    n_constraint = sum(1 for v in labels.values() if v == "constraint")
+    logger.info(
+        "[requirements] NFR classification (ADR-0004): %d NFR(s) tagged "
+        "(%d constraint, %d capability%s).",
+        len(labels), n_constraint, len(labels) - n_constraint,
+        f"; {len(ambiguous)} resolved via LLM" if ambiguous and overrides else "",
+    )
+    return budget_usd
+
+
 async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
     """
     Interactive terminal review loop for SPEC_REQUIREMENTS.md.
@@ -7489,6 +7611,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 logger.info(
                     "[requirements] max_doc_review_cycles=0 — skipping pre-flight spec review."
                 )
+            # ADR-0004 #1 — classify NFRs and write **Class:** markers into the
+            # (now reviewed) spec before it is locked, so decomposition can embed
+            # constraint NFRs. Gated + non-fatal; no-op when the flag is off.
+            budget_usd = await _classify_and_tag_nfrs_in_spec(
+                spec_path, gateway, config, budget_usd,
+                user_goal=args.prompt or "",
+            )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
             _raw_reviewed_spec = await interactive_review_loop(spec_path, gateway)
             spec_override = _slim_spec_for_prompt(_raw_reviewed_spec)

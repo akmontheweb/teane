@@ -449,11 +449,180 @@ def _classify_nfr(
     return "constraint" if constraint > capability else "capability"
 
 
+def _classify_nfr_banded(
+    story_title: str, acceptance_criteria: Optional[list[str]] = None,
+) -> tuple[str, bool]:
+    """Like :func:`_classify_nfr` but also reports whether the deterministic
+    call is *ambiguous* — the signal on which the requirements-refinement
+    cascade decides whether to escalate to the LLM (ADR-0004 follow-up #1).
+
+    Returns ``(label, ambiguous)``. A call is UNAMBIGUOUS only when the signals
+    point one way and not at all the other (constraint hits with zero capability
+    hits, or vice-versa). Mixed signals (both sides) or no signal at all (a bare
+    "the system should be robust") are ambiguous — exactly the band a keyword
+    classifier cannot resolve and the LLM should. ``label`` is the deterministic
+    best guess (same rule as ``_classify_nfr``), used as-is for unambiguous
+    calls and as the fail-safe when the LLM is absent or declines to answer.
+    """
+    text = " ".join(
+        [story_title or ""] + [str(a) for a in (acceptance_criteria or [])]
+    ).lower()
+    constraint = sum(1 for s in _NFR_CONSTRAINT_SIGNALS if s in text)
+    capability = sum(1 for s in _NFR_CAPABILITY_SIGNALS if s in text)
+    label = "constraint" if constraint > capability else "capability"
+    ambiguous = not ((constraint > 0) ^ (capability > 0))
+    return label, ambiguous
+
+
+def classify_nfrs_cascade(
+    items: list[dict[str, Any]],
+    llm_fn: Optional[Any] = None,
+) -> dict[str, str]:
+    """Two-layer NFR classification (ADR-0004 follow-up #1): deterministic
+    keyword scoring first, LLM only for the ambiguous minority.
+
+    ``items`` — ``[{"id": str, "title": str, "acceptance_criteria": [str]}]``.
+    Every item is classified deterministically via :func:`_classify_nfr_banded`;
+    the label is taken as final for unambiguous items. The ambiguous ones (and
+    ONLY those) are handed as a batch to ``llm_fn`` — a callable
+    ``list[item] -> {id: "constraint"|"capability"}`` — so clear NFRs never cost
+    a model call. Fail-safe: no ``llm_fn``, an ``llm_fn`` that raises, or an
+    item the LLM omits/returns garbage for → keep the deterministic label. The
+    LLM can only refine the ambiguous band, never break the pipeline.
+
+    Returns ``{id: label}`` for every input id.
+    """
+    result: dict[str, str] = {}
+    ambiguous: list[dict[str, Any]] = []
+    for it in items:
+        _id = str(it.get("id", "")).strip()
+        if not _id:
+            continue
+        label, amb = _classify_nfr_banded(
+            it.get("title", ""), it.get("acceptance_criteria"),
+        )
+        result[_id] = label
+        if amb:
+            ambiguous.append(it)
+    if ambiguous and llm_fn is not None:
+        try:
+            llm_labels = llm_fn(ambiguous) or {}
+        except Exception:  # noqa: BLE001 — LLM must never break classification
+            llm_labels = {}
+        if isinstance(llm_labels, dict):
+            for it in ambiguous:
+                lab = str(llm_labels.get(str(it.get("id", "")), "")).strip().lower()
+                if lab in ("constraint", "capability"):
+                    result[str(it["id"])] = lab  # override the fail-safe guess
+    return result
+
+
+# ADR-0004 follow-up #1 — the class is recorded inline in SPEC_REQUIREMENTS.md
+# as a ``**Class:** constraint|capability`` field on each NFR enabler block, so
+# refinement's output is self-describing and decomposition can read it back
+# deterministically (mirrors the existing parent-feature / @verifies markers).
+_SPEC_NFR_HEADING_RE = re.compile(
+    r"^(?P<hashes>#{2,6})\s+.*?(?P<key>(?:STORY-)?NFR-\d+)\b[^\n]*$",
+    re.MULTILINE,
+)
+_SPEC_CLASS_MARKER_RE = re.compile(
+    r"^\*\*Class:\*\*\s*(?P<label>constraint|capability)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_spec_nfr_blocks(spec_text: str) -> list[dict[str, Any]]:
+    """Parse the NFR enabler blocks out of ``SPEC_REQUIREMENTS.md``.
+
+    Returns ``[{"key", "title", "text", "start", "heading_end", "existing_class"}]``
+    — one per ``#### … NFR-NNN …`` heading. ``text`` is the block body up to the
+    next heading of the same-or-shallower depth (or EOF), used as the
+    classification input; ``existing_class`` is the block's current
+    ``**Class:**`` label if already tagged, else ``None``.
+    """
+    if not spec_text:
+        return []
+    matches = list(_SPEC_NFR_HEADING_RE.finditer(spec_text))
+    blocks: list[dict[str, Any]] = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        heading_end = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(spec_text)
+        # Also stop at the next heading of same/shallower depth between NFRs.
+        depth = len(m.group("hashes"))
+        boundary = re.compile(rf"^#{{1,{depth}}}\s", re.MULTILINE)
+        nxt = boundary.search(spec_text, heading_end, body_end)
+        if nxt:
+            body_end = nxt.start()
+        block_text = spec_text[heading_end:body_end]
+        cls_m = _SPEC_CLASS_MARKER_RE.search(block_text)
+        heading_line = spec_text[start:heading_end]
+        title = heading_line.split("—", 1)[-1].split(":", 1)[-1].strip() \
+            if ("—" in heading_line or ":" in heading_line) else heading_line.strip()
+        blocks.append({
+            "key": m.group("key"),
+            "title": title,
+            "text": block_text,
+            "start": start,
+            "heading_end": heading_end,
+            "existing_class": cls_m.group("label").lower() if cls_m else None,
+        })
+    return blocks
+
+
+def _parse_nfr_class_markers(spec_text: str) -> dict[str, str]:
+    """Map ``NFR-key -> "constraint"|"capability"`` for every NFR block in the
+    spec that carries a ``**Class:**`` marker. Keys are normalised to bare
+    ``NFR-NNN`` (the ``STORY-`` prefix, if present, is stripped) so both the
+    spec's ``STORY-NFR-004`` heading and a decomposition ``STORY-NFR-004`` key
+    resolve to the same entry."""
+    out: dict[str, str] = {}
+    for b in _parse_spec_nfr_blocks(spec_text):
+        if b["existing_class"]:
+            out[_norm_nfr_key(b["key"])] = b["existing_class"]
+    return out
+
+
+def _norm_nfr_key(key: str) -> str:
+    """``STORY-NFR-004`` / ``NFR-004`` → ``NFR-004`` (upper, prefix-stripped)."""
+    m = re.search(r"NFR-\d+", (key or "").upper())
+    return m.group(0) if m else (key or "").upper()
+
+
+def _inject_nfr_class_markers(
+    spec_text: str, class_by_key: dict[str, str],
+) -> str:
+    """Return ``spec_text`` with a ``**Class:** <label>`` line inserted right
+    after each NFR heading (replacing an existing marker in the block if
+    present). Idempotent. Blocks whose key isn't in ``class_by_key`` are left
+    untouched. Rebuilds back-to-front so earlier offsets stay valid."""
+    if not class_by_key:
+        return spec_text
+    class_by_key = {_norm_nfr_key(k): v for k, v in class_by_key.items()}
+    blocks = _parse_spec_nfr_blocks(spec_text)
+    result = spec_text
+    for b in reversed(blocks):
+        label = class_by_key.get(_norm_nfr_key(b["key"]))
+        if label not in ("constraint", "capability"):
+            continue
+        block_text = b["text"]
+        if b["existing_class"]:
+            new_block = _SPEC_CLASS_MARKER_RE.sub(
+                f"**Class:** {label}", block_text, count=1,
+            )
+        else:
+            # Insert as the first field line after the heading's trailing newline.
+            new_block = f"\n**Class:** {label}" + block_text
+        result = result[: b["heading_end"]] + new_block + result[b["heading_end"] + len(block_text):]
+    return result
+
+
 def _embed_constraint_nfrs(
     story_keys: list[str],
     cleaned: list[dict[str, Any]],
     *,
     enabled: bool,
+    nfr_class_by_key: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """ADR-0004 — fold constraint-class NFR stories into the functional stories
     they constrain, dropping the separate NFR story.
@@ -474,6 +643,7 @@ def _embed_constraint_nfrs(
     """
     if not enabled or len(story_keys) != len(cleaned):
         return story_keys, cleaned
+    nfr_class_by_key = nfr_class_by_key or {}
 
     # Index functional (non-NFR) stories by position for scope-overlap matching.
     functional_idx = [
@@ -484,9 +654,16 @@ def _embed_constraint_nfrs(
         if not _is_nfr_story_key(key):
             continue
         story = cleaned[i]
-        if _classify_nfr(
-            story.get("title", ""), story.get("acceptance_criteria"),
-        ) != "constraint":
+        # Prefer the class the requirements-refinement cascade recorded in the
+        # spec (deterministic + LLM for the ambiguous band); fall back to the
+        # standalone deterministic classifier for untagged NFRs and the
+        # augment/CR path that doesn't re-run refinement (ADR-0004 #1).
+        cls = nfr_class_by_key.get(_norm_nfr_key(key))
+        if cls not in ("constraint", "capability"):
+            cls = _classify_nfr(
+                story.get("title", ""), story.get("acceptance_criteria"),
+            )
+        if cls != "constraint":
             continue  # capability NFR — keep as an enabler story
         nfr_scope = {str(p) for p in (story.get("scope_files") or [])}
         if not nfr_scope:
@@ -1473,6 +1650,7 @@ def _validate_stories_payload(
     *,
     known_req_keys: Optional[set[str]] = None,
     embed_constraint_nfrs: bool = False,
+    nfr_class_by_key: Optional[dict[str, str]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Sanity-check the LLM's JSON. Returns ``(features, stories)``.
 
@@ -1558,6 +1736,7 @@ def _validate_stories_payload(
         _owners_before = {_s.get("feature") for _s in cleaned if _s.get("feature")}
         story_keys_in_order, cleaned = _embed_constraint_nfrs(
             story_keys_in_order, cleaned, enabled=True,
+            nfr_class_by_key=nfr_class_by_key,
         )
         seen_keys = set(story_keys_in_order)
         for _s in cleaned:
@@ -1773,6 +1952,11 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 — config read must never break planning
         embed_constraint_nfrs = False
     spec_req = _read_text(os.path.join(workspace, "docs", "SPEC_REQUIREMENTS.md"))
+    # ADR-0004 #1 — NFR class markers written by requirements-refinement. Empty
+    # when refinement didn't tag (untagged NFRs fall back to _classify_nfr).
+    nfr_class_by_key = (
+        _parse_nfr_class_markers(spec_req) if embed_constraint_nfrs else {}
+    )
     if not spec_req.strip():
         logger.warning("[decomposition] SPEC_REQUIREMENTS.md is empty or missing")
         return {
@@ -1959,6 +2143,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             payload,
             known_req_keys=known_req_keys,
             embed_constraint_nfrs=embed_constraint_nfrs,
+            nfr_class_by_key=nfr_class_by_key,
         )
 
     try:

@@ -502,6 +502,150 @@ class TestNfrClassifier:
         ) == "constraint"
 
 
+class TestNfrClassifierBanded:
+    """ADR-0004 #1 — the deterministic step now reports ambiguity so the
+    cascade knows when to escalate to the LLM."""
+
+    def test_confident_constraint(self):
+        assert decomposition._classify_nfr_banded(
+            "Input sanitization", ["escape and reject injection"]
+        ) == ("constraint", False)
+
+    def test_confident_capability(self):
+        assert decomposition._classify_nfr_banded(
+            "Offline mode", ["no network; low latency budget"]
+        ) == ("capability", False)
+
+    def test_mixed_signals_are_ambiguous(self):
+        _, amb = decomposition._classify_nfr_banded(
+            "Sanitize with low latency", ["escape input; p95 within budget"]
+        )
+        assert amb is True
+
+    def test_no_signal_is_ambiguous_and_capability(self):
+        label, amb = decomposition._classify_nfr_banded(
+            "Leap day handling", ["handle Feb 29 correctly"]
+        )
+        assert amb is True and label == "capability"
+
+
+class TestClassifyNfrsCascade:
+    """ADR-0004 #1 — deterministic-first, LLM only for the ambiguous band."""
+
+    def _items(self):
+        return [
+            {"id": "NFR-001", "title": "Performance",
+             "acceptance_criteria": ["p95 latency under budget"]},
+            {"id": "NFR-002", "title": "Input sanitization",
+             "acceptance_criteria": ["escape injection; reject with 422"]},
+            {"id": "NFR-004", "title": "Leap day handling",
+             "acceptance_criteria": ["handle Feb 29"]},
+        ]
+
+    def test_deterministic_only_no_llm(self):
+        out = decomposition.classify_nfrs_cascade(self._items())
+        assert out == {"NFR-001": "capability", "NFR-002": "constraint",
+                       "NFR-004": "capability"}
+
+    def test_llm_called_only_for_ambiguous(self):
+        seen = {}
+
+        def llm(amb):
+            seen["ids"] = [i["id"] for i in amb]
+            return {i["id"]: "constraint" for i in amb}
+
+        out = decomposition.classify_nfrs_cascade(self._items(), llm)
+        assert seen["ids"] == ["NFR-004"]           # only the ambiguous one
+        assert out["NFR-004"] == "constraint"        # LLM override applied
+        assert out["NFR-002"] == "constraint"        # confident, untouched
+
+    def test_llm_failure_keeps_fail_safe(self):
+        def llm(amb):
+            raise RuntimeError("provider down")
+
+        out = decomposition.classify_nfrs_cascade(self._items(), llm)
+        assert out["NFR-004"] == "capability"        # deterministic fail-safe
+
+    def test_llm_garbage_ignored(self):
+        out = decomposition.classify_nfrs_cascade(
+            self._items(), lambda amb: {"NFR-004": "banana"},
+        )
+        assert out["NFR-004"] == "capability"
+
+
+class TestSpecNfrMarkers:
+    """ADR-0004 #1 — inline **Class:** markers in SPEC_REQUIREMENTS.md."""
+
+    SPEC = (
+        "## Requirements\n\n"
+        "#### Enabler Story: STORY-NFR-001 — Dashboard Performance\n"
+        "**Type:** Architecture\n"
+        "**Description:** respond within 200 ms at p95.\n"
+        "**Linked features:** FEAT-002\n\n"
+        "---\n\n"
+        "#### Enabler Story: STORY-NFR-002 — Input Validation\n"
+        "**Type:** Architecture\n"
+        "**Description:** sanitize input; reject SQL injection with 422.\n"
+        "**Linked features:** FEAT-001\n"
+    )
+
+    def test_parse_blocks(self):
+        blocks = decomposition._parse_spec_nfr_blocks(self.SPEC)
+        assert [b["key"] for b in blocks] == ["STORY-NFR-001", "STORY-NFR-002"]
+        assert blocks[0]["existing_class"] is None
+
+    def test_inject_and_parse_roundtrip(self):
+        tagged = decomposition._inject_nfr_class_markers(
+            self.SPEC, {"NFR-001": "capability", "NFR-002": "constraint"},
+        )
+        assert decomposition._parse_nfr_class_markers(tagged) == {
+            "NFR-001": "capability", "NFR-002": "constraint",
+        }
+
+    def test_inject_is_idempotent(self):
+        t1 = decomposition._inject_nfr_class_markers(self.SPEC, {"NFR-001": "capability"})
+        t2 = decomposition._inject_nfr_class_markers(t1, {"NFR-001": "constraint"})
+        assert t2.count("**Class:**") == 1                  # replaced, not dup'd
+        assert decomposition._parse_nfr_class_markers(t2) == {"NFR-001": "constraint"}
+
+    def test_norm_key(self):
+        assert decomposition._norm_nfr_key("STORY-NFR-004") == "NFR-004"
+        assert decomposition._norm_nfr_key("NFR-004") == "NFR-004"
+
+
+class TestEmbedUsesClassMarker:
+    """ADR-0004 #1 — the spec marker overrides the standalone classifier."""
+
+    def _pair(self):
+        fs = {"title": "Create contact", "feature": "core",
+              "acceptance_criteria": ["contact is created"], "requirement_keys": [],
+              "depends_on": [], "scope_files": ["server/contact.py"], "external_ref": None}
+        nfr = {"title": "Leap day handling", "feature": "core",
+               "acceptance_criteria": ["handle Feb 29 for birthday math"],
+               "requirement_keys": ["NFR-004"], "depends_on": [],
+               "scope_files": ["server/contact.py"], "external_ref": None}
+        return fs, nfr
+
+    def test_marker_constraint_embeds_a_deterministically_ambiguous_nfr(self):
+        fs, nfr = self._pair()
+        # "Leap day handling" is deterministically capability/ambiguous, but the
+        # refinement marker says constraint → it must embed + drop.
+        keys, _ = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+            nfr_class_by_key={"NFR-004": "constraint"},
+        )
+        assert keys == ["STORY-001"]
+
+    def test_marker_capability_keeps_a_constraint_looking_nfr(self):
+        fs, nfr = self._pair()
+        nfr["title"] = "Sanitize input against xss injection"  # constraint-looking
+        keys, _ = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
+            nfr_class_by_key={"NFR-004": "capability"},
+        )
+        assert "STORY-NFR-004" in keys  # marker wins over the keyword signal
+
+
 class TestEmbedConstraintNfrs:
     """ADR-0004 _embed_constraint_nfrs transform (pure)."""
 

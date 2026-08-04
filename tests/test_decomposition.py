@@ -612,6 +612,21 @@ class TestSpecNfrMarkers:
         assert decomposition._norm_nfr_key("STORY-NFR-004") == "NFR-004"
         assert decomposition._norm_nfr_key("NFR-004") == "NFR-004"
 
+    def test_unicode_hyphen_keys_are_parsed_and_normalised(self):
+        # The synthesis LLM sometimes renders keys with U+2011 (non-breaking
+        # hyphen): "STORY‑NFR‑002". The parser/normaliser/recogniser must
+        # tolerate it or the whole classify/embed/policy pipeline no-ops
+        # silently (lumina 019fce5c).
+        spec = (
+            "## R\n\n"
+            "### STORY‑NFR‑002 — Input Validation\n"
+            "**Description:** sanitize input; reject SQL injection with 422.\n"
+        )
+        blocks = decomposition._parse_spec_nfr_blocks(spec)
+        assert len(blocks) == 1
+        assert decomposition._norm_nfr_key(blocks[0]["key"]) == "NFR-002"
+        assert decomposition._is_nfr_story_key("STORY‑NFR‑002")
+
 
 class TestNfrPolicyPrimitive:
     """ADR-0004 #2 — shared NFR-policy primitive: every embedded AC is

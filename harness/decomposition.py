@@ -404,8 +404,12 @@ _NFR_STORY_KEY_RE = re.compile(r"(?:^|[-_])NFR(?:[-_]|$)", re.IGNORECASE)
 
 def _is_nfr_story_key(story_key: str) -> bool:
     """True when the story key marks a non-functional / cross-cutting story
-    (agile ``STORY-NFR-NNN`` or waterfall ``NFR-NNN``)."""
-    return bool(story_key and _NFR_STORY_KEY_RE.search(story_key))
+    (agile ``STORY-NFR-NNN`` or waterfall ``NFR-NNN``). Folds Unicode hyphens
+    to ASCII first so ``STORY‑NFR‑001`` (U+2011) is recognised (lumina
+    019fce5c)."""
+    from harness.req_ids import normalize_dashes
+    key = normalize_dashes(story_key or "")
+    return bool(key and _NFR_STORY_KEY_RE.search(key))
 
 
 # ADR-0004 — NFR embedding. A "constraint" NFR is a property of a specific
@@ -521,8 +525,14 @@ def classify_nfrs_cascade(
 # as a ``**Class:** constraint|capability`` field on each NFR enabler block, so
 # refinement's output is self-describing and decomposition can read it back
 # deterministically (mirrors the existing parent-feature / @verifies markers).
+# Hyphen/dash family the spec-synthesis LLM reaches for instead of ASCII `-`
+# (e.g. ``STORY‑NFR‑001`` with U+2011) — left un-tolerated, the NFR key regexes
+# silently miss and the whole classify/embed/policy pipeline no-ops (lumina
+# 019fce5c). Mirrors harness.req_ids._DASH_TRANSLATE; keys are folded to ASCII
+# via ``normalize_dashes`` before any comparison downstream.
+_NFR_HYPHENS = "\\-\u2010\u2011\u2012\u2013\u2014\u2015\u2043\u2212\uFE58\uFE63\uFF0D"
 _SPEC_NFR_HEADING_RE = re.compile(
-    r"^(?P<hashes>#{2,6})\s+.*?(?P<key>(?:STORY-)?NFR-\d+)\b[^\n]*$",
+    rf"^(?P<hashes>#{{2,6}})\s+.*?(?P<key>(?:STORY[{_NFR_HYPHENS}])?NFR[{_NFR_HYPHENS}]\d+)\b[^\n]*$",
     re.MULTILINE,
 )
 _SPEC_CLASS_MARKER_RE = re.compile(
@@ -584,9 +594,12 @@ def _parse_nfr_class_markers(spec_text: str) -> dict[str, str]:
 
 
 def _norm_nfr_key(key: str) -> str:
-    """``STORY-NFR-004`` / ``NFR-004`` → ``NFR-004`` (upper, prefix-stripped)."""
-    m = re.search(r"NFR-\d+", (key or "").upper())
-    return m.group(0) if m else (key or "").upper()
+    """``STORY-NFR-004`` / ``NFR-004`` / ``STORY‑NFR‑004`` → ``NFR-004`` (upper,
+    prefix-stripped, Unicode hyphens folded to ASCII — lumina 019fce5c)."""
+    from harness.req_ids import normalize_dashes
+    norm = normalize_dashes(key or "").upper()
+    m = re.search(r"NFR-\d+", norm)
+    return m.group(0) if m else norm
 
 
 def _inject_nfr_class_markers(

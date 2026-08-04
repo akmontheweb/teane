@@ -1,6 +1,6 @@
 # ADR-0004: Embed Constraint NFRs as Story Acceptance Criteria
 
-**Status:** Proposed
+**Status:** Proposed — implementation in progress behind `planning.embed_constraint_nfrs` (default off). Landed: classify+embed (`1d1275c`), deterministic→LLM classifier at refinement (`e6aa635`), shared-policy primitive (this change). Pending: augment-path parity, coverage/traceability extension, lumina A/B before flipping the default.
 **Date:** 2026-07-29
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0003]] (hybrid test generation — NFR ACs become Tier-1/4 tests), [[ADR-0002]] (generation-side contradiction prevention), decomposition NFR cross-domain-drop exemption (`df33a89`), drop-detection (`146f5cd`), paired producer+consumer decomposition (`13d0525`)
@@ -66,12 +66,25 @@ Split NFRs by kind at requirements-refinement time and route them differently.
 
 2. **Constraint NFRs become acceptance criteria on the functional story /
    requirement they constrain**, sourced from a **shared NFR policy** so the rule
-   has one authored owner. The policy is one block (e.g. `POLICY-SEC-1: all
-   user-supplied string fields are stored verbatim and rendered escaped; SQL is
-   parameterised`); each affected functional story gets a concrete, testable AC
-   that references it (`AC: submitting <script> as first_name stores it literally
-   and renders it escaped — per POLICY-SEC-1`). One definition, applied and
-   verified inside every functional flow.
+   has one authored owner. Concretely (as implemented):
+   - The **policy is the constraint NFR's single definition** — its
+     `#### … NFR-NNN` block in `SPEC_REQUIREMENTS.md`, tagged `**Class:**
+     constraint` at refinement. The **policy id is the normalised NFR key**
+     (`NFR-002`). `_nfr_policy_registry(spec)` returns these as the queryable
+     single source.
+   - Embedding **derives every copy from that one definition in a single
+     deterministic pass**, so the rule cannot drift across stories by
+     construction — the failure mode a naïve "copy the AC into each story"
+     invites. Each folded-in AC is **attributed to its owner** with an
+     `[NFR:<policy-id>]` tag (`[NFR:NFR-002] submitting <script> is stored
+     literally and rendered escaped`), making the single-ownership explicit and
+     machine-checkable: all `[NFR:NFR-002]` ACs across the plan trace to the one
+     NFR-002 policy. `_nfr_policy_id_of(ac)` recovers the owner.
+   - The AC text stays **self-contained** (not a bare "see POLICY-SEC-1"
+     reference) so it remains individually testable by the AC-coverage gate and
+     test-gen; the tag supplies provenance without hollowing out the AC.
+   One definition, applied and verified inside every functional flow, with
+   provenance preserved.
 
 3. **Capability NFRs remain enabler stories**, but are **sequenced as
    dependencies** (built before/around the functional stories they govern) and
@@ -190,21 +203,25 @@ The policy block is the single-owner primitive that makes embedding safe.
 
 ## Action Items
 
-1. [ ] Land this ADR as **Proposed**; socialise the constraint/capability
-   boundary and the "eliminate-all vs keep-capability-enablers" fork.
-2. [ ] Add the NFR classifier to requirements-refinement (LLM + keyword
-   fallback, ambiguous → capability), behind a config flag
-   (`planning.embed_constraint_nfrs`, default off initially).
-3. [ ] Define the shared NFR-policy structure and the per-story AC reference
-   syntax; wire policy injection into the functional stories' build context.
-4. [ ] Teach decomposition to emit constraint-NFR-derived ACs on functional
+1. [x] Land this ADR as **Proposed**; socialise the constraint/capability
+   boundary and the "eliminate-all vs keep-capability-enablers" fork. (`4fc46eb`)
+2. [x] Add the NFR classifier to requirements-refinement (deterministic-first,
+   LLM only for the ambiguous band, ambiguous → capability), behind a config flag
+   (`planning.embed_constraint_nfrs`, default off). (`e6aa635`)
+3. [x] Define the shared NFR-policy structure and the per-story AC attribution
+   syntax (`[NFR:<policy-id>]` tag; `_nfr_policy_registry` as the single source;
+   drift-safe by single-pass derivation). **Remaining:** inject the
+   consolidated policy definitions into the functional stories' build context
+   (the registry exists; the prompt wiring is pending).
+4. [x] Teach decomposition to emit constraint-NFR-derived ACs on functional
    stories and to stop emitting separate `STORY-NFR-NNN` for the constraint
-   class; keep capability NFRs as sequenced enablers.
+   class; keep capability NFRs as sequenced enablers. (`1d1275c`) **Remaining:**
+   augment/CR-path parity (`_validate_augment_payload`).
 5. [ ] Extend the AC-coverage gate and `test_verifies_ac` traceability to the
-   embedded NFR ACs; confirm no coverage regression vs a run that used separate
-   NFR stories.
+   embedded `[NFR:<id>]` ACs; confirm no coverage regression vs a run that used
+   separate NFR stories.
 6. [ ] Prototype behind the flag and **A/B against a lumina rebuild** — verify
-   `STORY-NFR-004`-class sanitization now lands in the functional pass and is
+   `STORY-NFR-002`-class sanitization now lands in the functional pass and is
    test-enforced.
 7. [ ] On green A/B, flip the flag default and update [[ADR-0003]] cross-links
    (embedded NFR ACs are new inputs to the Tier-1/Tier-4 test emitters).

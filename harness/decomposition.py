@@ -617,6 +617,52 @@ def _inject_nfr_class_markers(
     return result
 
 
+# ADR-0004 #2 — shared NFR-policy primitive. A constraint NFR is a *policy*
+# with one authoritative definition (its NFR block in the spec / its NFR story),
+# identified by the normalised NFR key (``NFR-002``). When embedded into N
+# functional stories, every folded-in AC is attributed to that policy via an
+# ``[NFR:<policy-id>]`` tag, so the single-ownership is explicit and
+# machine-checkable: all ``[NFR:NFR-002]`` ACs across the plan derive from the
+# one NFR-002 definition, in one deterministic embed pass, so they cannot drift.
+# The tag also carries provenance for the AC-coverage gate + traceability (#4).
+_NFR_AC_TAG_RE = re.compile(r"^\[NFR(?::(?P<pid>[A-Za-z0-9_-]+))?\]\s*")
+
+
+def _nfr_policy_id_of(ac: str) -> Optional[str]:
+    """Policy id an embedded AC is attributed to (``NFR-002`` from
+    ``[NFR:NFR-002] …``), or None when the AC isn't an embedded NFR constraint
+    (or carries only the legacy untagged ``[NFR] `` prefix)."""
+    m = _NFR_AC_TAG_RE.match(ac or "")
+    return m.group("pid") if (m and m.group("pid")) else None
+
+
+def _strip_nfr_ac_tag(ac: str) -> str:
+    """Remove a leading ``[NFR]`` / ``[NFR:<id>]`` tag so re-embedding is
+    idempotent (never double-tags)."""
+    return _NFR_AC_TAG_RE.sub("", ac or "", count=1)
+
+
+def _nfr_policy_registry(spec_text: str) -> dict[str, dict[str, str]]:
+    """The constraint-class NFR *policies* declared in the spec — the single
+    authoritative source each ``[NFR:<id>]`` AC derives from.
+
+    Returns ``{policy_id: {"key", "title", "text"}}`` for every NFR block whose
+    ``**Class:**`` marker is ``constraint``. Capability NFRs are NOT policies
+    (they stay standalone enabler stories). Used to attribute embedded ACs to
+    one owner and, downstream, to link them in traceability (#4) and inject the
+    authoritative definitions into the build context.
+    """
+    reg: dict[str, dict[str, str]] = {}
+    for b in _parse_spec_nfr_blocks(spec_text):
+        if b.get("existing_class") == "constraint":
+            reg[_norm_nfr_key(b["key"])] = {
+                "key": b["key"],
+                "title": b["title"],
+                "text": (b["text"] or "").strip(),
+            }
+    return reg
+
+
 def _embed_constraint_nfrs(
     story_keys: list[str],
     cleaned: list[dict[str, Any]],
@@ -674,13 +720,16 @@ def _embed_constraint_nfrs(
         ]
         if not matched:
             continue  # fail-safe: nothing to attach to → keep the NFR story
+        policy_id = _norm_nfr_key(key)  # ADR-0004 #2 — the single owner
         nfr_acs = [str(a) for a in (story.get("acceptance_criteria") or [])]
         nfr_reqs = list(story.get("requirement_keys") or [])
         for j in matched:
             target = cleaned[j]
             existing_ac = set(target.get("acceptance_criteria") or [])
             for ac in nfr_acs:
-                tagged = ac if ac.startswith("[NFR]") else f"[NFR] {ac}"
+                # Attribute every copy to its policy so the single-ownership is
+                # explicit; strip any prior tag first for idempotent re-embeds.
+                tagged = f"[NFR:{policy_id}] {_strip_nfr_ac_tag(ac)}"
                 if tagged not in existing_ac:
                     target.setdefault("acceptance_criteria", []).append(tagged)
                     existing_ac.add(tagged)

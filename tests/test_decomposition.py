@@ -613,6 +613,71 @@ class TestSpecNfrMarkers:
         assert decomposition._norm_nfr_key("NFR-004") == "NFR-004"
 
 
+class TestNfrPolicyPrimitive:
+    """ADR-0004 #2 — shared NFR-policy primitive: every embedded AC is
+    attributed to one policy owner, and the same policy across N stories
+    derives from a single definition (no drift)."""
+
+    def _story(self, title, acs, scope, reqs=None):
+        return {
+            "title": title, "feature": "core", "description": None,
+            "acceptance_criteria": list(acs), "requirement_keys": list(reqs or []),
+            "depends_on": [], "scope_files": list(scope), "external_ref": None,
+        }
+
+    def test_policy_id_parse(self):
+        assert decomposition._nfr_policy_id_of("[NFR:NFR-002] escape input") == "NFR-002"
+        assert decomposition._nfr_policy_id_of("[NFR] legacy untagged") is None
+        assert decomposition._nfr_policy_id_of("plain AC") is None
+
+    def test_strip_tag_idempotent_reembed(self):
+        # An AC that already carries a tag is re-tagged to its owner, not
+        # double-prefixed.
+        fs = self._story("Create contact", ["contact created"], ["server/contact.py"])
+        nfr = self._story("Sanitize xss injection",
+                          ["[NFR:OLD] escape all input"], ["server/contact.py"],
+                          reqs=["NFR-002"])
+        _, cleaned = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-NFR-002"], [fs, nfr], enabled=True,
+        )
+        tagged = [a for a in cleaned[0]["acceptance_criteria"]
+                  if decomposition._nfr_policy_id_of(a)]
+        assert tagged == ["[NFR:NFR-002] escape all input"]  # re-owned, single tag
+
+    def test_one_policy_spans_stories_without_drift(self):
+        # One constraint NFR overlapping two functional stories: both get the
+        # SAME policy-tagged AC, attributed to the SAME owner.
+        a = self._story("Create contact", ["created"], ["server/contact.py"])
+        b = self._story("Import contacts", ["imported"], ["server/contact.py", "server/import.py"])
+        nfr = self._story("Sanitize input against xss injection",
+                          ["User input is stored literally and rendered escaped"],
+                          ["server/contact.py"], reqs=["NFR-002"])
+        _, cleaned = decomposition._embed_constraint_nfrs(
+            ["STORY-001", "STORY-002", "STORY-NFR-002"], [a, b, nfr], enabled=True,
+        )
+        embedded = [
+            [ac for ac in s["acceptance_criteria"]
+             if decomposition._nfr_policy_id_of(ac) == "NFR-002"]
+            for s in cleaned
+        ]
+        # Both functional stories carry exactly the same single-owner AC.
+        assert embedded[0] == embedded[1] == [
+            "[NFR:NFR-002] User input is stored literally and rendered escaped"
+        ]
+
+    def test_policy_registry_lists_only_constraints(self):
+        spec = (
+            "## R\n\n"
+            "#### Enabler Story: STORY-NFR-002 — Input Validation\n"
+            "**Class:** constraint\n**Description:** sanitize input.\n\n---\n\n"
+            "#### Enabler Story: STORY-NFR-001 — Performance\n"
+            "**Class:** capability\n**Description:** respond fast.\n"
+        )
+        reg = decomposition._nfr_policy_registry(spec)
+        assert set(reg) == {"NFR-002"}                 # capability excluded
+        assert reg["NFR-002"]["title"] == "Input Validation"
+
+
 class TestEmbedUsesClassMarker:
     """ADR-0004 #1 — the spec marker overrides the standalone classifier."""
 
@@ -675,7 +740,11 @@ class TestEmbedConstraintNfrs:
         assert keys == ["STORY-001"]  # NFR story dropped
         assert len(cleaned) == 1
         acs = cleaned[0]["acceptance_criteria"]
-        assert any(a.startswith("[NFR]") and "literal text" in a for a in acs)
+        # Embedded AC is attributed to its policy owner (ADR-0004 #2).
+        assert any(
+            decomposition._nfr_policy_id_of(a) == "NFR-004" and "literal text" in a
+            for a in acs
+        )
         assert "NFR-004" in cleaned[0]["requirement_keys"]  # traceability merged
 
     def test_no_overlap_keeps_nfr(self):
@@ -706,7 +775,7 @@ class TestEmbedConstraintNfrs:
 
     def test_no_duplicate_ac_on_repeat(self):
         fs = self._story("Create contact",
-                         ["[NFR] Submitting <script> is stored literally"],
+                         ["[NFR:NFR-004] Submitting <script> is stored literally"],
                          ["server/contacts.py"])
         nfr = self._story("Sanitize input xss injection",
                           ["Submitting <script> is stored literally"],
@@ -714,9 +783,9 @@ class TestEmbedConstraintNfrs:
         _, cleaned = decomposition._embed_constraint_nfrs(
             ["STORY-001", "STORY-NFR-004"], [fs, nfr], enabled=True,
         )
-        # The already-present tagged AC must not be duplicated.
+        # The already-present policy-tagged AC must not be duplicated.
         acs = cleaned[0]["acceptance_criteria"]
-        assert acs.count("[NFR] Submitting <script> is stored literally") == 1
+        assert acs.count("[NFR:NFR-004] Submitting <script> is stored literally") == 1
 
 
 class TestEmbedConstraintNfrsEndToEnd:
@@ -743,7 +812,9 @@ class TestEmbedConstraintNfrsEndToEnd:
             payload, embed_constraint_nfrs=True,
         )
         assert len(stories) == 1
-        assert any(a.startswith("[NFR]") for a in stories[0]["acceptance_criteria"])
+        assert any(
+            a.startswith("[NFR:") for a in stories[0]["acceptance_criteria"]
+        )
 
     def test_flag_off_preserves_nfr_story(self):
         payload = self._payload([{"feature_key": "core", "name": "Core"}])

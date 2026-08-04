@@ -41,6 +41,16 @@ from typing import Any, Optional
 from harness import story_state
 from harness.req_ids import canonicalize_req_key
 
+# Unicode HYPHEN variants (U+2010/2011/2012/2043/2212/FE63/FF0D) the synthesis
+# LLM emits in identifier keys instead of ASCII `-`. Folded to `-` before the
+# key regexes below run. Deliberately EXCLUDES em/en-dash (U+2013/2014/2015)
+# because those serve as the key/title SEPARATOR in the heading patterns —
+# folding them would break parsing rather than fix it (lumina 019fce5c).
+_KEY_HYPHEN_TO_ASCII = str.maketrans({
+    "‐": "-", "‑": "-", "‒": "-", "⁃": "-",
+    "−": "-", "﹣": "-", "－": "-",
+})
+
 logger = logging.getLogger(__name__)
 
 
@@ -134,6 +144,16 @@ def parse_spec_requirements(text: str) -> dict[str, Any]:
             ],
         }
     """
+    # Fold Unicode HYPHEN variants (but NOT em/en-dash) to ASCII `-` before the
+    # identifier regexes run. The synthesis LLM sometimes writes keys with
+    # U+2011 non-breaking hyphens (``STORY‑001``); the ASCII-`-` key patterns
+    # then miss every heading, parse_spec_requirements returns nothing, and the
+    # reconciler fail-fasts the whole build on a phantom requirement-coverage gap
+    # (lumina 019fce5c). A hyphen-ONLY fold is required — the regexes use the
+    # em-dash ``—`` as the key/title separator, so a blanket normalize_dashes
+    # (which folds em/en-dash too) would destroy the separator instead. Length-
+    # preserving, so any offsets stay valid.
+    text = text.translate(_KEY_HYPHEN_TO_ASCII)
     features: list[dict[str, Any]] = []
     feat_matches = list(_FEAT_RE.finditer(text))
     for i, m in enumerate(feat_matches):

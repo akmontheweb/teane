@@ -187,3 +187,22 @@ class TestStructuralParentInference:
                 conn.close()
         finally:
             os.unlink(tmp.name)
+
+
+def test_parse_tolerates_unicode_hyphens_in_keys():
+    # The synthesis LLM sometimes renders keys with U+2011 non-breaking hyphens
+    # ("STORY‑001") while keeping the em-dash title separator. The parser must
+    # fold the key hyphen to ASCII (WITHOUT touching the em-dash separator) or
+    # it finds zero stories and the reconciler fail-fasts the build on a phantom
+    # requirement-coverage gap (lumina 019fce5c).
+    spec = (
+        "## User Stories\n\n"
+        "### Story: STORY‑001 — Display the Dashboard\n"
+        "As a user, I want the dashboard.\n\n"
+        "### Story: STORY‑002 — Add a Contact\n"
+        "As a user, I want to add contacts.\n"
+    )
+    parsed = parse_spec_requirements(spec)
+    assert [s["story_key"] for s in parsed["stories"]] == ["STORY-001", "STORY-002"]
+    # Titles (after the em-dash) survive intact.
+    assert parsed["stories"][0]["title"] == "Display the Dashboard"

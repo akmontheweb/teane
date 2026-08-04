@@ -1591,6 +1591,8 @@ def _validate_augment_payload(
     *,
     existing_feature_keys: Optional[set[str]] = None,
     known_req_keys: Optional[set[str]] = None,
+    embed_constraint_nfrs: bool = False,
+    nfr_class_by_key: Optional[dict[str, str]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Augment-mode validator: same shape as _validate_stories_payload
     but tolerates an empty stories list as a legitimate "no new work"
@@ -1681,6 +1683,30 @@ def _validate_augment_payload(
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
     _drop_test_only_scope_files_in_decomposition(cleaned)
+    # ADR-0004 #3 — augment/CR-path parity: fold constraint NFRs into the
+    # functional stories in THIS response (existing already-built stories aren't
+    # in `cleaned`, so an NFR with no in-response match fail-safe-keeps). Same
+    # bookkeeping as the main validator; embed-orphaned NEW features are pruned.
+    if embed_constraint_nfrs:
+        _owners_before = {_s.get("feature") for _s in cleaned if _s.get("feature")}
+        story_keys_in_order, cleaned = _embed_constraint_nfrs(
+            story_keys_in_order, cleaned, enabled=True,
+            nfr_class_by_key=nfr_class_by_key,
+        )
+        seen_keys = set(story_keys_in_order)
+        for _s in cleaned:
+            _s["depends_on"] = [
+                d for d in (_s.get("depends_on") or []) if d in seen_keys
+            ]
+        deps_in_order = [list(_s.get("depends_on") or []) for _s in cleaned]
+        _embed_orphaned = _owners_before - {
+            _s.get("feature") for _s in cleaned if _s.get("feature")
+        }
+        if _embed_orphaned:
+            features_cleaned = [
+                f for f in features_cleaned
+                if f["feature_key"] not in _embed_orphaned
+            ]
     _check_depends_on_acyclic(
         story_keys_in_order, deps_in_order,
         valid_targets=seen_keys,
@@ -2187,6 +2213,8 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 payload,
                 existing_feature_keys=existing_keys,
                 known_req_keys=known_req_keys,
+                embed_constraint_nfrs=embed_constraint_nfrs,
+                nfr_class_by_key=nfr_class_by_key,
             )
         return _validate_stories_payload(
             payload,

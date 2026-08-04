@@ -698,3 +698,22 @@ class TestTraceabilityMdCoverageSections:
         assert "`STORY-001.AC-2`" in body
         assert "`tests/test_x.py`" in body
         assert "— (gap)" in body  # STORY-001.AC-2 has no test
+
+
+# ---------------------------------------------------------------------------
+# ADR-0004 #4 — embedded NFR constraints are first-class ACs in the gate,
+# and the report attributes them to their policy.
+# ---------------------------------------------------------------------------
+def test_embedded_nfr_ac_counted_and_policy_annotated(workspace: str, app: str):
+    _seed_story_with_ac(app, title="Create contact", ac=[
+        "Given valid data, a contact is created",
+        "[NFR:NFR-002] submitting a script tag is stored literally and rendered escaped",
+    ])
+    report = audit_workspace(workspace)
+    # First-class in the coverage gate: counted and flagged untested (no
+    # verifying test yet), exactly like any other AC.
+    assert report.total_acs == 2
+    assert any(u.text.startswith("[NFR:NFR-002]") for u in report.untested_acs)
+    # The report attributes the embedded constraint to its shared policy.
+    out = format_report(report)
+    assert "(NFR policy NFR-002)" in out

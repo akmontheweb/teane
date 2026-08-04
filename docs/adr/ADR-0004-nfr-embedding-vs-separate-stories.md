@@ -1,6 +1,6 @@
 # ADR-0004: Embed Constraint NFRs as Story Acceptance Criteria
 
-**Status:** Proposed — implementation in progress behind `planning.embed_constraint_nfrs` (default off). Landed: classify+embed (`1d1275c`), deterministic→LLM classifier at refinement (`e6aa635`), shared-policy primitive (this change). Pending: augment-path parity, coverage/traceability extension, lumina A/B before flipping the default.
+**Status:** Proposed — fully implemented behind `planning.embed_constraint_nfrs` (default off); pending only the lumina A/B before flipping the default. Landed: classify+embed (`1d1275c`), deterministic→LLM classifier at refinement (`e6aa635`), shared-policy primitive + build-context injection (`2ed24df`, `a5386c3`), augment-path parity + coverage/traceability visibility (this change).
 **Date:** 2026-07-29
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0003]] (hybrid test generation — NFR ACs become Tier-1/4 tests), [[ADR-0002]] (generation-side contradiction prevention), decomposition NFR cross-domain-drop exemption (`df33a89`), drop-detection (`146f5cd`), paired producer+consumer decomposition (`13d0525`)
@@ -216,11 +216,14 @@ The policy block is the single-owner primitive that makes embedding safe.
    policy consistently across every story that shares it. #2 complete.
 4. [x] Teach decomposition to emit constraint-NFR-derived ACs on functional
    stories and to stop emitting separate `STORY-NFR-NNN` for the constraint
-   class; keep capability NFRs as sequenced enablers. (`1d1275c`) **Remaining:**
-   augment/CR-path parity (`_validate_augment_payload`).
-5. [ ] Extend the AC-coverage gate and `test_verifies_ac` traceability to the
-   embedded `[NFR:<id>]` ACs; confirm no coverage regression vs a run that used
-   separate NFR stories.
+   class; keep capability NFRs as sequenced enablers. (`1d1275c`); augment/CR-path
+   parity in `_validate_augment_payload`.
+5. [x] AC-coverage gate + `test_verifies_ac` traceability already cover the
+   embedded `[NFR:<id>]` ACs automatically — embedding makes them first-class AC
+   rows (`create_stories` → `acceptance_criteria`), so the `COUNT(*)`-based audit
+   counts them and test-gen writes verifying tests with no special handling.
+   `format_report` now attributes an untested embedded constraint to its policy
+   (`(NFR policy NFR-002)`) so a shared under-verified rule is legible.
 6. [ ] Prototype behind the flag and **A/B against a lumina rebuild** — verify
    `STORY-NFR-002`-class sanitization now lands in the functional pass and is
    test-enforced.

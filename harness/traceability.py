@@ -301,6 +301,13 @@ def format_report(report: TraceabilityReport) -> str:
             "test was never generated, the marker is missing/malformed, "
             "or the generated test failed and its link was dropped."
         )
+        # ADR-0004 #4 — attribute embedded NFR constraints to their policy so
+        # an under-verified shared constraint (e.g. sanitisation) is legible in
+        # the report, not buried as an anonymous AC on one functional story.
+        try:
+            from harness.decomposition import _nfr_policy_id_of
+        except Exception:  # noqa: BLE001
+            _nfr_policy_id_of = lambda _t: None  # noqa: E731
         by_story: dict[str, list[UntestedCriterion]] = {}
         for ac in report.untested_acs:
             by_story.setdefault(ac.story_key, []).append(ac)
@@ -308,6 +315,8 @@ def format_report(report: TraceabilityReport) -> str:
             lines.append(f"\n#### {story_key}")
             for ac in by_story[story_key]:
                 snippet = ac.text or "(no text)"
-                lines.append(f"- `{ac.ac_key}` — {snippet}")
+                pid = _nfr_policy_id_of(ac.text or "")
+                tag = f" _(NFR policy {pid})_" if pid else ""
+                lines.append(f"- `{ac.ac_key}`{tag} — {snippet}")
 
     return "\n".join(lines) + "\n"

@@ -837,6 +837,38 @@ class TestEmbedConstraintNfrsEndToEnd:
         assert len(stories) == 1
 
 
+class TestAugmentEmbedParity:
+    """ADR-0004 #3 — the augment/CR validator embeds constraint NFRs too."""
+
+    def _payload(self):
+        return {
+            "features": [{"feature_key": "core", "name": "Core"}],
+            "stories": [
+                {"story_key": "STORY-001", "title": "Create contact", "feature": "core",
+                 "acceptance_criteria": ["a contact is created"],
+                 "requirement_keys": ["FR-001"], "scope_files": ["server/contact.py"]},
+                {"story_key": "STORY-NFR-002",
+                 "title": "Input sanitization against xss injection", "feature": "core",
+                 "acceptance_criteria": ["input is stored literally and rendered escaped"],
+                 "requirement_keys": ["NFR-002"], "scope_files": ["server/contact.py"]},
+            ],
+        }
+
+    def test_augment_embeds_constraint_nfr(self):
+        _, stories = decomposition._validate_augment_payload(
+            self._payload(), embed_constraint_nfrs=True,
+        )
+        assert len(stories) == 1  # NFR embedded + dropped
+        assert any(
+            decomposition._nfr_policy_id_of(a) == "NFR-002"
+            for a in stories[0]["acceptance_criteria"]
+        )
+
+    def test_augment_flag_off_keeps_nfr(self):
+        _, stories = decomposition._validate_augment_payload(self._payload())
+        assert len(stories) == 2
+
+
 class TestCrossTestRootScopeGuard:
     """Finsearch session 156032347 root cause: LLM emitted
     ``server/app/services/tests/test_filing_service.py`` on one story

@@ -287,6 +287,27 @@ def _extract_test_scope_suffix(rel_path: str) -> Optional[str]:
     return None
 
 
+def _tests_root_is_repo_root(rel_path: str) -> bool:
+    """True when the leftmost tests-root segment sits at the repo root
+    (``tests/test_x.py``) rather than nested under a package
+    (``server/tests/test_x.py``).
+
+    Full-stack layouts (``client/`` + ``server/``) put the backend's
+    canonical tests under the package — ``server/tests/`` — because that
+    is where ``test_generation`` writes them and where the importlib
+    pytest.ini resolves them. A repo-root ``tests/`` mirror of the same
+    module is the non-canonical copy that the patcher's
+    DUPLICATE_TEST_ROOT guard rejects, trapping the repair loop
+    (lumina 019fd344). Used to disprefer the repo-root copy when choosing
+    the canonical among a cross-root collision.
+    """
+    parts = re.split(r"[/\\]", rel_path)
+    for i, seg in enumerate(parts):
+        if seg in _TEST_ROOT_SEGMENTS:
+            return i == 0
+    return False
+
+
 def _drop_cross_test_root_scope_files_in_decomposition(
     stories: list[dict[str, Any]],
 ) -> None:
@@ -319,10 +340,18 @@ def _drop_cross_test_root_scope_files_in_decomposition(
     for suffix, entries in by_suffix.items():
         if len(entries) < 2:
             continue
-        # Canonical = shortest path, break ties lexically.
+        # Canonical selection, in priority order:
+        #   1. Prefer a package-nested tests root over a repo-root ``tests/``
+        #      mirror (full-stack backends test under ``server/tests/``; the
+        #      repo-root copy is what DUPLICATE_TEST_ROOT rejects — lumina
+        #      019fd344).
+        #   2. Among equally-rooted candidates, the shortest (least-nested)
+        #      path wins — e.g. ``server/app/tests/`` beats
+        #      ``server/app/services/tests/``.
+        #   3. Ties broken lexically for determinism.
         canonical_path = min(
             (path for _, _, path in entries),
-            key=lambda p: (len(p), p),
+            key=lambda p: (_tests_root_is_repo_root(p), len(p), p),
         )
         for idx, story_key, path in entries:
             if path == canonical_path:

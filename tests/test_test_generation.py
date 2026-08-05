@@ -12,7 +12,9 @@ from harness.test_generation import (
     _PRIMARY_STACK_PRIORITY,
     _STACK_TEST_COMMANDS,
     _build_format_reminder,
+    _existing_tests_for_preflight,
     _is_test_file,
+    _nested_python_test_candidates,
     _parse_verifies_marker,
     _persist_verifies_links,
     _pick_primary_stack,
@@ -2151,3 +2153,31 @@ class TestTestsMarkerHelpers:
         assert _guess_sources_for_test("tests/test_misc.py", sources) == [
             "a.py", "b.py", "c.py",
         ]
+
+
+class TestPackageNestedTestPreflight:
+    """lumina 019fd344: a full-stack backend tests under ``server/tests/``,
+    which the flat repo-root templates miss — so the preflight failed to
+    surface the real test and the repair LLM CREATE-d a colliding repo-root
+    mirror. The nested probe closes that gap."""
+
+    def test_nested_candidates_walk_ancestor_packages(self):
+        cands = _nested_python_test_candidates("server/app/services.py")
+        # Nearest package first, then up the tree — repo root excluded.
+        assert "server/app/tests/test_services.py" in cands
+        assert "server/tests/test_services.py" in cands
+        assert "tests/test_services.py" not in cands
+
+    def test_preflight_finds_package_nested_test(self, tmp_path):
+        ws = str(tmp_path)
+        nested = tmp_path / "server" / "tests"
+        nested.mkdir(parents=True)
+        (nested / "test_database.py").write_text("def test_x(): pass\n")
+        (tmp_path / "server").joinpath("database.py").write_text("x = 1\n")
+        found = _existing_tests_for_preflight(
+            workspace_path=ws,
+            source_files=["server/database.py"],
+            modified_files=[],
+            primary_stack="typescript",  # full-stack primary is the frontend
+        )
+        assert "server/tests/test_database.py" in found

@@ -944,6 +944,51 @@ class TestCrossTestRootScopeGuard:
             r.getMessage() for r in warned
         )
 
+    def test_prefers_package_nested_root_over_repo_root_mirror(self, caplog):
+        # lumina 019fd344: one story scopes the repo-root mirror
+        # (`tests/test_database.py`) while another scopes the canonical
+        # package-nested test (`server/tests/test_database.py`). The
+        # repo-root copy is what DUPLICATE_TEST_ROOT rejects, so it must be
+        # the one dropped — even though it is the SHORTER path (which the
+        # old "shortest wins" rule would have kept).
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Database canonical",
+                "acceptance_criteria": ["DB initialises"],
+                "scope_files": [
+                    "server/database.py",
+                    "server/tests/test_database.py",
+                ],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Database mirror",
+                "acceptance_criteria": ["DB idempotent"],
+                "scope_files": [
+                    "tests/test_database.py",
+                ],
+            },
+        ])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        by_key = {s["title"]: s for s in stories}
+        # Package-nested canonical is kept.
+        assert (
+            "server/tests/test_database.py"
+            in by_key["Database canonical"]["scope_files"]
+        )
+        # Repo-root mirror is dropped despite being the shorter path.
+        assert (
+            "tests/test_database.py"
+            not in by_key["Database mirror"]["scope_files"]
+        )
+        assert any(
+            "cross-test-root drop" in r.getMessage()
+            and "tests/test_database.py" in r.getMessage()
+            for r in caplog.records
+        )
+
     def test_does_not_touch_stories_with_different_test_suffixes(self):
         # Two stories, both with test files, but DIFFERENT basenames.
         # Neither collides — both scope_files entries survive. Each

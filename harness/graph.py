@@ -4369,6 +4369,21 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
             "smoke check with ``ModuleNotFoundError`` even though the "
             "file is on disk, and the repair loop cannot recover from "
             "this without your help.\n\n"
+            "[TEST-PATH CONVENTION — STRICTLY ENFORCED]\n"
+            "Tests live in ONE canonical location per module. In a "
+            "package layout (e.g. a ``server/`` backend beside a "
+            "``client/`` frontend), a module's tests belong in the "
+            "package-nested tests root that mirrors the source — "
+            "``server/database.py`` is tested by "
+            "``server/tests/test_database.py``, NOT a repo-root "
+            "``tests/test_database.py``. Do NOT CREATE a repo-root "
+            "``tests/`` mirror of a module that already has a test under a "
+            "package tests root: the patcher rejects it with "
+            "``DUPLICATE_TEST_ROOT`` and the repair loop cannot converge. "
+            "If a test for the module already exists on disk (see the "
+            "workspace inventory / current-content sections), REPLACE_BLOCK "
+            "that file in place — never emit a second copy under a "
+            "different tests root.\n\n"
         )
         # Fix 5b: preflight the current on-disk bodies of story-scope
         # files that already exist, so the LLM's first patch attempt

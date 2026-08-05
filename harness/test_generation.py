@@ -880,6 +880,36 @@ _TEST_PATH_TEMPLATES_BY_STACK: dict[str, tuple[str, ...]] = {
 }
 
 
+def _nested_python_test_candidates(src_rel: str) -> list[str]:
+    """Package-nested conventional test paths for a Python source file.
+
+    ``_TEST_PATH_TEMPLATES_BY_STACK['python']`` only knows the repo-root
+    ``tests/`` convention, so for a full-stack layout (``client/`` +
+    ``server/``) it never finds the backend's real tests under
+    ``server/tests/``. The preflight then reports "no existing test" and
+    the repair LLM CREATEs a repo-root mirror the patcher's
+    DUPLICATE_TEST_ROOT guard rejects — the loop that trapped lumina
+    019fd344.
+
+    For ``server/app/services.py`` this yields, nearest package first,
+    ``server/app/tests/test_services.py`` and ``server/tests/test_services.py``
+    (plus ``tests/unit`` and ``test`` variants under each ancestor). Callers
+    only keep paths that exist on disk, so over-generating is harmless.
+    """
+    norm = src_rel.replace("\\", "/")
+    stem = os.path.splitext(os.path.basename(norm))[0]
+    ancestors = norm.split("/")[:-1]  # drop the filename; keep dir segments
+    out: list[str] = []
+    # Walk from the nearest package dir up to (but excluding) the repo root;
+    # the repo-root ``tests/`` case is already covered by the flat templates.
+    for i in range(len(ancestors), 0, -1):
+        base = "/".join(ancestors[:i])
+        out.append(f"{base}/tests/test_{stem}.py")
+        out.append(f"{base}/tests/unit/test_{stem}.py")
+        out.append(f"{base}/test/test_{stem}.py")
+    return out
+
+
 def _existing_tests_for_preflight(
     workspace_path: str,
     source_files: list[str],
@@ -934,6 +964,13 @@ def _existing_tests_for_preflight(
                 dir_no_prefix=dir_no_prefix,
             )
             _add(candidate)
+        # Full-stack backends test under a package-nested root
+        # (``server/tests/``) the flat python templates above don't cover.
+        # Probe those too so an existing test is surfaced instead of the LLM
+        # CREATE-ing a repo-root mirror the patcher rejects (lumina 019fd344).
+        if src_rel.endswith(".py"):
+            for candidate in _nested_python_test_candidates(src_rel):
+                _add(candidate)
     return out
 
 

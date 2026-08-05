@@ -59,10 +59,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # ``### Feature: FEAT-001 — Company Search & Filing Discovery``
+#
+# 2026-08-05 fix (lumina 019fd333) — the synthesis LLM emitted feature
+# headings at level-2 (``## Feature: FEAT-001 — …``) while this pattern
+# floored at 3 hashes. Result: ZERO features parsed, every story orphaned
+# onto the synthesised PLATFORM feature, and FEAT-001..003 + their parent
+# EPIC flagged as having no satisfying story — a spurious coverage gap that
+# gap-fill can't close (its appended stories are orphaned too), forcing a
+# needless HITL. A ``FEAT-\d+`` key with a dash + title is unambiguously a
+# feature heading, so accepting level-2 carries no false-promotion risk
+# (unlike the bare ``## Story:`` page-title case guarded above).
 _FEAT_RE = re.compile(
     # Same format-variance tolerance as the story pattern above: optional
     # section number, optional ``Feature:`` label, any dash separator.
-    r"^#{3,6}\s+(?:[\d.]+\s+)?(?:Feature:\s+)?(FEAT-\d+)\s*[–—\-]\s*(.+?)\s*$",
+    r"^#{2,6}\s+(?:[\d.]+\s+)?(?:Feature:\s+)?(FEAT-\d+)\s*[–—\-]\s*(.+?)\s*$",
     re.M,
 )
 

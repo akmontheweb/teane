@@ -25732,10 +25732,16 @@ def build_graph() -> Any:
         story after decomposition and ``enforce_reqs`` is on. P2: attempt
         automated gap-fill (draft a covering story, append to the spec,
         re-reconcile) up to ``max_requirement_gap_fill_cycles`` before giving
-        up. Once the cap is hit — or gap-fill is disabled — fail fast to END
-        with ``exit_code=1`` (the P1 behavior) rather than spend the whole
-        build budget reaching the identical end-of-run traceability gate. That
-        gate remains the backstop for gaps introduced after this point.
+        up. Once the cap is hit — or gap-fill is disabled — route to HITL
+        (``human_intervention_node``) so the operator can fix the spec or accept
+        the gap and proceed, rather than silently terminating: this matches the
+        ``reconcile_failed`` branch and the coverage-OK branch (both hand off to
+        a human node). It fails fast in the sense of not spending the whole
+        build budget reaching the identical end-of-run traceability gate, but a
+        human is given the chance to intervene first. In a truly headless run
+        the HITL node itself fail-closes (exit_code=1), preserving the old
+        no-human behavior. The end-of-run traceability gate remains the backstop
+        for gaps introduced after this point.
         """
         from langgraph.graph import END
         ns = state.get("node_state", {}) or {}
@@ -25763,10 +25769,11 @@ def build_graph() -> Any:
                 return "requirement_gap_fill_node"
             logger.warning(
                 "[router] requirement-coverage gap persists after %d gap-fill "
-                "cycle(s) (enabled=%s); failing fast to END with exit_code=1. "
+                "cycle(s) (enabled=%s); routing to HITL for operator "
+                "intervention (fix the spec, or accept the gap and proceed). "
                 "See the gap report above.", cycles, gap_fill_enabled,
             )
-            return END
+            return "human_intervention_node"
         # Coverage is deterministically complete. Optionally run the P3
         # adversarial semantic-coverage review before handing to the gate.
         tr_cfg = (state.get("harness_config") or {}).get("traceability", {})

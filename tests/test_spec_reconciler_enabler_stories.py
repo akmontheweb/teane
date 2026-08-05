@@ -189,20 +189,28 @@ class TestStructuralParentInference:
             os.unlink(tmp.name)
 
 
-def test_parse_tolerates_unicode_hyphens_in_keys():
-    # The synthesis LLM sometimes renders keys with U+2011 non-breaking hyphens
-    # ("STORY‑001") while keeping the em-dash title separator. The parser must
-    # fold the key hyphen to ASCII (WITHOUT touching the em-dash separator) or
+def test_parse_tolerates_llm_heading_format_variance():
+    # The synthesis LLM produces a different heading shape each run
+    # (lumina 019fce5c / 019fd299): U+2011 non-breaking hyphens in keys, a
+    # bare NFR heading with no "Story:" label, a section number before the key,
+    # and en-dash vs em-dash separators. The parser must tolerate all of them or
     # it finds zero stories and the reconciler fail-fasts the build on a phantom
-    # requirement-coverage gap (lumina 019fce5c).
+    # requirement-coverage gap.
     spec = (
         "## User Stories\n\n"
-        "### Story: STORY‑001 — Display the Dashboard\n"
+        "### Story: STORY‑001 — Display the Dashboard\n"   # labelled, U+2011, em-dash
         "As a user, I want the dashboard.\n\n"
-        "### Story: STORY‑002 — Add a Contact\n"
-        "As a user, I want to add contacts.\n"
+        "### 5.2 STORY‑002 – Add a Contact\n"              # section number, en-dash
+        "As a user, I want to add contacts.\n\n"
+        "## Non-Functional Requirements\n\n"
+        "### STORY‑NFR‑001 – Input Sanitisation\n"         # bare NFR, no label, en-dash
+        "Sanitise all input.\n"
     )
     parsed = parse_spec_requirements(spec)
-    assert [s["story_key"] for s in parsed["stories"]] == ["STORY-001", "STORY-002"]
-    # Titles (after the em-dash) survive intact.
+    assert [s["story_key"] for s in parsed["stories"]] == [
+        "STORY-001", "STORY-002", "STORY-NFR-001",
+    ]
+    # Title after the separator survives intact for each variant.
     assert parsed["stories"][0]["title"] == "Display the Dashboard"
+    assert parsed["stories"][1]["title"] == "Add a Contact"
+    assert parsed["stories"][2]["title"] == "Input Sanitisation"

@@ -60,7 +60,9 @@ logger = logging.getLogger(__name__)
 
 # ``### Feature: FEAT-001 — Company Search & Filing Discovery``
 _FEAT_RE = re.compile(
-    r"^###\s+Feature:\s+(FEAT-\d+)\s+—\s+(.+?)\s*$",
+    # Same format-variance tolerance as the story pattern above: optional
+    # section number, optional ``Feature:`` label, any dash separator.
+    r"^#{3,6}\s+(?:[\d.]+\s+)?(?:Feature:\s+)?(FEAT-\d+)\s*[–—\-]\s*(.+?)\s*$",
     re.M,
 )
 
@@ -85,7 +87,19 @@ _FEAT_RE = re.compile(
 # 6 (Markdown's max h6). Uses a bounded quantifier so a stray
 # ``## Story:`` at page-title level doesn't get promoted.
 _STORY_RE = re.compile(
-    r"^#{3,6}\s+(?:Enabler\s+)?Story:\s+(STORY-[\w-]+)\s+—\s+(.+?)\s*$",
+    # Tolerant of the synthesis LLM's heading-format variance — each run rolls
+    # a different shape (lumina 019fce5c / 019fd299):
+    #   ``### Story: STORY-001 — Title``        (labelled, em-dash)
+    #   ``### STORY-NFR-001 — Title``           (bare NFR, no label)
+    #   ``### 5.1 STORY-001 – Title``           (section number, en-dash)
+    # So: an optional section number (``5.1 ``), an optional ``(Enabler )Story:``
+    # label, and ANY dash variant (en/em/ASCII) as the key/title separator are
+    # all accepted. The ``STORY-`` key is still required (folded to ASCII
+    # upstream), so this can't false-match non-story headings; without it the
+    # reconciler can't rebuild the story from the spec, its requirement gets no
+    # satisfying story, and the coverage gate trips.
+    r"^#{3,6}\s+(?:[\d.]+\s+)?(?:(?:Enabler\s+)?Story:\s+)?"
+    r"(STORY-[\w-]+)\s*[–—\-]\s*(.+?)\s*$",
     re.M,
 )
 

@@ -21,7 +21,10 @@ end-to-end status message the LLM sees.
 
 from __future__ import annotations
 
-from harness.graph import _reject_test_patch_blocks
+from harness.graph import (
+    _reject_test_patch_blocks,
+    _should_offer_unsatisfiable_escape,
+)
 from harness.patch_feedback import _DIRECTIVE_BY_TAG, compose_patch_feedback
 from harness.patcher import OperationType, PatchResult, _classify_patch_failure
 
@@ -219,3 +222,54 @@ class TestFeedbackSurfacesGuard:
         assert "reward-hacking" in status
         # The refused edit is a genuine failure, not a silent no-op.
         assert any(f["file"] == "tests/test_service.py" for f in failures)
+
+
+class TestUnsatisfiableEscapeGate:
+    """lumina 019fd37d: repair thrashed 13 rounds on a test that misused a
+    FastAPI ``get_db(request)`` dependency as a no-arg context manager — a
+    tamper-guarded blocker no prod change could satisfy. The judge kept
+    naming *some* prod file (DISTRACTION), so ``has_mandatable_target`` stayed
+    True and the UNSATISFIABLE_TEST escape never fired.
+    ``_should_offer_unsatisfiable_escape`` adds the distraction-streak clause.
+    """
+
+    def test_no_offer_without_guarded_blocker(self):
+        # The escape is test-file specific; never offered when the blocker
+        # isn't in a protected test.
+        assert not _should_offer_unsatisfiable_escape(
+            has_guarded_blocker=False,
+            has_mandatable_target=False,
+            distraction_streak=9,
+        )
+
+    def test_offer_when_nothing_mandatable_remains(self):
+        # Original lumina 019f7109 condition — no prod target to name.
+        assert _should_offer_unsatisfiable_escape(
+            has_guarded_blocker=True,
+            has_mandatable_target=False,
+            distraction_streak=0,
+        )
+
+    def test_no_offer_on_first_distraction_with_prod_target(self):
+        # A single distraction round with a real prod target still means
+        # "fix prod" — don't let the model cop out early.
+        assert not _should_offer_unsatisfiable_escape(
+            has_guarded_blocker=True,
+            has_mandatable_target=True,
+            distraction_streak=1,
+        )
+
+    def test_offer_after_distraction_streak_despite_prod_target(self):
+        # The 019fd37d fix: two+ consecutive DISTRACTION rounds on a
+        # protected-test blocker force the escape even though the judge still
+        # names a (distraction) prod file.
+        assert _should_offer_unsatisfiable_escape(
+            has_guarded_blocker=True,
+            has_mandatable_target=True,
+            distraction_streak=2,
+        )
+        assert _should_offer_unsatisfiable_escape(
+            has_guarded_blocker=True,
+            has_mandatable_target=True,
+            distraction_streak=5,
+        )

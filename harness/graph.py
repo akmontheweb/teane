@@ -6536,6 +6536,44 @@ def _reject_test_patch_blocks(
     return kept, rejections
 
 
+def _should_offer_unsatisfiable_escape(
+    *,
+    has_guarded_blocker: bool,
+    has_mandatable_target: bool,
+    distraction_streak: int,
+    distraction_threshold: int = 2,
+) -> bool:
+    """Decide whether the defective-test banner should offer the
+    ``UNSATISFIABLE_TEST`` escape this round.
+
+    The escape is offered when the failing assertion sits in a tamper-guarded
+    test file (``has_guarded_blocker``) AND either:
+
+      * nothing mandatable remains — no production target the LLM could be
+        told to fix instead (the original lumina 019f7109 condition), OR
+      * the reflection judge has returned DISTRACTION for
+        ``distraction_threshold``+ rounds. A persistent distraction streak
+        on a protected-test blocker proves the nominally-"mandatable" prod
+        targets are NOT the fix: the loop keeps naming *some* prod file and
+        poking it without progress. Without this second clause,
+        ``has_mandatable_target`` stays True forever, the escape never fires,
+        and repair thrashes to budget exhaustion — lumina 019fd37d spent 13
+        rounds (escalating cheap→reasoning model each cycle) on a test that
+        called a FastAPI ``get_db(request)`` dependency as a no-arg context
+        manager, a misuse no production change could satisfy without breaking
+        the dependency contract, and which the tamper guard forbade fixing.
+
+    Keyed on the CONSECUTIVE-distraction counter the reflection loop already
+    maintains; a plain repair-round count would fire on legitimately-hard
+    prod work too.
+    """
+    if not has_guarded_blocker:
+        return False
+    if not has_mandatable_target:
+        return True
+    return distraction_streak >= distraction_threshold
+
+
 # Declared-dead-end marker for the repair loop (lumina 019f7109). Offered
 # by the defective-test banner directive ONLY when every judge-named
 # location is a tamper-guarded test file; honoured ONLY on rounds where
@@ -17170,7 +17208,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     judge_named_files or _persistent_lines
                     or _persistent_files_only
                 )
-                if _has_mandatable_target:
+                _distraction_streak = int(
+                    loop_counter.get("consecutive_distraction_rounds", 0) or 0
+                )
+                # A protected-test blocker that survives repeated DISTRACTION
+                # verdicts means the prod targets aren't the fix — offer the
+                # UNSATISFIABLE_TEST escape instead of another futile prod
+                # round (lumina 019fd37d). See
+                # :func:`_should_offer_unsatisfiable_escape`.
+                _offer_unsat = _should_offer_unsatisfiable_escape(
+                    has_guarded_blocker=True,
+                    has_mandatable_target=_has_mandatable_target,
+                    distraction_streak=_distraction_streak,
+                )
+                if _has_mandatable_target and _offer_unsat:
+                    logger.warning(
+                        "[repair_node] Protected-test blocker at %s survived "
+                        "%d consecutive DISTRACTION round(s); offering "
+                        "UNSATISFIABLE_TEST escape instead of another prod "
+                        "distraction round.",
+                        _guarded_display, _distraction_streak,
+                    )
+                if _has_mandatable_target and not _offer_unsat:
                     reflection_banner_lines.append(
                         "PROTECTED TEST LOCATION — the failing assertion "
                         f"lives at {_guarded_display}, which is a test "

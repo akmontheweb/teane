@@ -302,3 +302,90 @@ async def test_node_no_unsatisfiable_is_noop(monkeypatch):
         st["node_state"] = {}
         out = await regeneration_node(st)
         assert "unsatisfiable_test" not in out.get("node_state", {})
+
+
+class _QueueResp:
+    """Response stand-in exposing an empty/queued content + reasoning channel."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.reasoning_content = "planned the fix but emitted no block"
+        self.usage = {}
+
+
+class _QueueGateway:
+    """Records each dispatch's messages; returns queued contents (then '').
+
+    Distinct from the module's single-shot ``_FakeGateway`` — this one lets a
+    test drive a sequence of responses (e.g. empty→empty) and count calls.
+    """
+
+    def __init__(self, contents):
+        self._contents = list(contents)
+        self.calls = []
+
+    async def dispatch(self, messages=None, role=None, budget_remaining_usd=1.0):
+        self.calls.append(messages)
+        c = self._contents.pop(0) if self._contents else ""
+        return _QueueResp(c), budget_remaining_usd
+
+    def aggregate_tokens(self, tt, usage):
+        return tt or {}
+
+
+def _regen_setup(ws, rel):
+    """Write app/m.py + a mapped defective test at rel; return node state."""
+    os.makedirs(os.path.join(ws, "tests"), exist_ok=True)
+    os.makedirs(os.path.join(ws, "app"), exist_ok=True)
+    with open(os.path.join(ws, "app/m.py"), "w") as fh:
+        fh.write("class Widget:\n    def go(self):\n        return 1\n")
+    with open(os.path.join(ws, rel), "w") as fh:
+        fh.write("# @tests: app/m.py\n" + ORIGINAL)
+    return _state(ws, rel)
+
+
+class TestEmptyContentRetry:
+    """lumina 019fd587: deepseek-v4-pro front-loaded its whole response into the
+    reasoning channel and returned an EMPTY content — no REWRITE_FILE block —
+    silently burning the one regeneration attempt. The node now retries once
+    with a block-only nudge before giving up."""
+
+    @pytest.mark.asyncio
+    async def test_empty_first_response_triggers_one_retry(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            fake = _QueueGateway(contents=["", ""])  # empty both times
+            import harness.graph as g
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            result = await regeneration_node(state)
+        # Retry fired — dispatched exactly twice (not the old single shot).
+        assert len(fake.calls) == 2
+        # The second dispatch carried the block-only nudge.
+        assert any(
+            isinstance(m, dict) and "ONLY the single" in str(m.get("content", ""))
+            for m in fake.calls[1]
+        )
+        # Both empty ⇒ still gives up as no_patch (deferring to the ladder).
+        assert result["node_state"]["test_regeneration"]["status"] == "no_patch"
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_first_response_has_block(self, monkeypatch):
+        good = (
+            "# @tests: app/m.py\n"
+            "class TestWidget:\n"
+            "    def test_go(self):\n"
+            "        assert Widget().go() == 1\n"
+            "    def test_type(self):\n"
+            "        assert isinstance(Widget(), Widget)\n"
+        )
+        block = f"<<<REWRITE_FILE>>>\nfile: tests/t.py\ncontent:\n{good}<<<END_REWRITE_FILE>>>"
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            fake = _QueueGateway(contents=[block])
+            import harness.graph as g
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            await regeneration_node(state)
+        # A good first response must NOT trigger a second dispatch.
+        assert len(fake.calls) == 1

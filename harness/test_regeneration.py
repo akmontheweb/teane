@@ -375,22 +375,54 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
 
     budget = float(state.get("budget_remaining_usd", 2.00))
     token_tracker = state.get("token_tracker", {})
-    try:
-        response, budget = await gateway.dispatch(
-            messages=messages, role=NodeRole.PATCHING,
-            budget_remaining_usd=budget,
-        )
-    except Exception as exc:  # noqa: BLE001 — a gateway error must not crash the graph
-        return _give_up("gateway_error", str(exc))
-    token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
-    content = response.content or ""
 
-    # --- Pre-apply gate: only the declared test path may be touched ---
-    targets = {_norm(t, workspace) for t in patch_target_paths(content)}
-    stray = {t for t in targets if t != _norm(rel, workspace)}
-    if stray:
-        return _give_up("targeted_other_files",
-                        f"regeneration tried to touch {sorted(stray)}")
+    # The patching-role model (deepseek-v4-pro) is a reasoning model that
+    # sometimes front-loads its whole response into the hidden reasoning
+    # channel and returns an EMPTY ``content`` — it plans the rewrite but never
+    # emits the <<<REWRITE_FILE>>> block (lumina 019fd587: finish=stop,
+    # reasoning ended at "We'll regenerate the file.", content empty). That
+    # silently burns the single regeneration attempt and drops to HITL on a
+    # test the model had already worked out how to fix. Give it one terse,
+    # block-only nudge before giving up.
+    _retry_nudge = (
+        "You did not emit a patch block. Output ONLY the single "
+        f"<<<REWRITE_FILE>>> block for {rel} now — the complete rewritten "
+        "file body between the markers, with no analysis, prose, or "
+        "explanation before or after it."
+    )
+    content = ""
+    targets: set[str] = set()
+    for _attempt in range(2):
+        _msgs = (
+            messages if _attempt == 0
+            else messages + [{"role": "user", "content": _retry_nudge}]
+        )
+        try:
+            response, budget = await gateway.dispatch(
+                messages=_msgs, role=NodeRole.PATCHING,
+                budget_remaining_usd=budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — a gateway error must not crash the graph
+            return _give_up("gateway_error", str(exc))
+        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        content = response.content or ""
+
+        # --- Pre-apply gate: only the declared test path may be touched ---
+        targets = {_norm(t, workspace) for t in patch_target_paths(content)}
+        stray = {t for t in targets if t != _norm(rel, workspace)}
+        if stray:
+            return _give_up("targeted_other_files",
+                            f"regeneration tried to touch {sorted(stray)}")
+        if targets:
+            break
+        if _attempt == 0:
+            logger.warning(
+                "[test_regeneration_node] first response emitted no "
+                "REWRITE_FILE block (content=%d chars, reasoning=%d chars) — "
+                "retrying once with a block-only nudge.",
+                len(content),
+                len(getattr(response, "reasoning_content", "") or ""),
+            )
     if not targets:
         return _give_up("no_patch", "regeneration emitted no REWRITE_FILE block")
 

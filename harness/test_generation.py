@@ -1730,9 +1730,19 @@ RULES — absolute:
   3. Cover the typical paths AND the edge cases (empty input, zero/negative
      values, error branches). Skip cases that would require mocking external
      services.
-  4. Match the stack-canonical layout and naming convention."""
+  4. Match the stack-canonical layout and naming convention.
+  5. ONE canonical test location per module. Each source module's tests
+     live in exactly ONE file, in the package-nested tests root that
+     mirrors the source: `server/database.py` is tested by
+     `server/tests/test_database.py` — NOT also `tests/test_database.py`,
+     `tests/unit/test_database.py`, or any other tree. Do NOT scatter a
+     module's tests across multiple `tests/` trees and do NOT create two
+     test files with the SAME basename under different directories: pytest
+     collides them on collection and silently drops one tier, so half your
+     tests never run. Pick the mirror-the-source location and put all of
+     that module's tests there."""
 
-_TESTS_MARKER_RULE = """  5. EVERY generated test file MUST carry a `@tests` marker at the top
+_TESTS_MARKER_RULE = """  6. EVERY generated test file MUST carry a `@tests` marker at the top
      of the file (after the module docstring / imports, within the first
      50 non-blank lines) naming the workspace-relative source file(s)
      whose functions / classes the file's tests exercise. Use the

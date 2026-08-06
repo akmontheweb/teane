@@ -371,6 +371,63 @@ def _drop_cross_test_root_scope_files_in_decomposition(
             )
 
 
+def _drop_repo_root_test_mirror_when_package_nested_exists(
+    stories: list[dict[str, Any]],
+) -> None:
+    """In-place: when the same test BASENAME is scoped both under a
+    package-nested tests root (``server/tests/test_x.py``) AND a generic
+    repo-root tests tree (``tests/test_x.py``, ``tests/unit/test_x.py``,
+    ``test/test_x.py``), drop the repo-root copies and keep the
+    package-nested canonical.
+
+    Complements :func:`_drop_cross_test_root_scope_files_in_decomposition`,
+    which groups by the FULL test-scoped suffix and therefore misses
+    same-basename / different-suffix mirrors like ``server/tests/test_x.py``
+    vs ``tests/unit/test_x.py``. Those slip past the patcher's
+    DUPLICATE_TEST_ROOT guard (different suffixes) but collide on pytest
+    COLLECTION by basename — pytest silently drops one tier, the gate goes
+    green on partial coverage, and the silent-drop guard later fails the
+    build with no test file the repair loop is allowed to touch
+    (lumina 019fd344). Operating on ``scope_files`` assignments BEFORE any
+    test is authored means no coverage is lost: the module is simply
+    assigned one canonical test location. The paired test-generation prompt
+    rule keeps the LLM from re-scattering after this normalisation.
+    """
+    # basename -> {(idx, story_key, path)}
+    by_base: dict[str, list[tuple[int, str, str]]] = {}
+    for idx, story in enumerate(stories):
+        for path in (story.get("scope_files") or []):
+            base = os.path.basename(path)
+            if not _is_test_scope_basename(base):
+                continue
+            if _extract_test_scope_suffix(path) is None:
+                continue
+            by_base.setdefault(base, []).append(
+                (idx, str(story.get("story_key") or f"idx{idx}"), path)
+            )
+
+    for base, entries in by_base.items():
+        distinct_paths = {p for _, _, p in entries}
+        if len(distinct_paths) < 2:
+            continue
+        # Only act when a package-nested canonical exists for this basename;
+        # if every copy is repo-root, the suffix-based guard (or nothing)
+        # owns it — there is no package-nested target to consolidate onto.
+        if not any(not _tests_root_is_repo_root(p) for p in distinct_paths):
+            continue
+        for idx, story_key, path in entries:
+            if _tests_root_is_repo_root(path):
+                scope = stories[idx].get("scope_files") or []
+                stories[idx]["scope_files"] = [s for s in scope if s != path]
+                logger.warning(
+                    "[decomposition] repo-root test mirror drop: %s scope_files "
+                    "entry %r shares basename %r with a package-nested canonical "
+                    "test; dropping the repo-root copy so pytest doesn't collide "
+                    "the two on collection (same basename, different trees).",
+                    story_key, path, base,
+                )
+
+
 # Lumina session 019f7caa: STORY-NFR-001 was planned with
 # ``scope_files=['tests/performance/test_contacts_perf.py']`` — a single
 # test path and nothing else. That deadlocks the patcher: phase 1 is
@@ -1724,6 +1781,7 @@ def _validate_augment_payload(
             "external_ref": s.get("external_ref") or None,
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
+    _drop_repo_root_test_mirror_when_package_nested_exists(cleaned)
     _drop_test_only_scope_files_in_decomposition(cleaned)
     # ADR-0004 #3 — augment/CR-path parity: fold constraint NFRs into the
     # functional stories in THIS response (existing already-built stories aren't
@@ -1843,6 +1901,7 @@ def _validate_stories_payload(
             "external_ref": s.get("external_ref") or None,
         })
     _drop_cross_test_root_scope_files_in_decomposition(cleaned)
+    _drop_repo_root_test_mirror_when_package_nested_exists(cleaned)
     _drop_test_only_scope_files_in_decomposition(cleaned)
     # ADR-0004 — fold constraint-class NFR stories into the functional stories
     # they constrain (behind planning.embed_constraint_nfrs; default off → this

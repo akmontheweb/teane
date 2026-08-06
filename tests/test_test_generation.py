@@ -2155,6 +2155,20 @@ class TestTestsMarkerHelpers:
         ]
 
 
+class TestSingleCanonicalTreeRule:
+    """lumina 019fd344: the test-gen prompt must tell the LLM to author each
+    module's tests in ONE canonical package-nested location, so it stops
+    scattering same-basename copies across trees (server/tests/ + tests/unit/)
+    that pytest silently drops on collection."""
+
+    def test_prompt_carries_single_canonical_location_rule(self):
+        from harness.test_generation import _PROMPT_FORMAT_REMINDER_BASE
+        text = _PROMPT_FORMAT_REMINDER_BASE.lower()
+        assert "one canonical test location" in text
+        assert "same basename" in text
+        assert "server/tests/test_database.py" in _PROMPT_FORMAT_REMINDER_BASE
+
+
 class TestPackageNestedTestPreflight:
     """lumina 019fd344: a full-stack backend tests under ``server/tests/``,
     which the flat repo-root templates miss — so the preflight failed to

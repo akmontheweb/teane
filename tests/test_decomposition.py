@@ -989,6 +989,67 @@ class TestCrossTestRootScopeGuard:
             for r in caplog.records
         )
 
+    def test_drops_repo_root_mirror_sharing_basename_with_package_nested(
+        self, caplog,
+    ):
+        # lumina 019fd344 silent-drop: the SAME basename is scoped under a
+        # package-nested root (server/tests/) and a generic repo-root tree
+        # (tests/unit/). Different suffixes, so the suffix guard misses it,
+        # but pytest collides them on collection. The repo-root copy must be
+        # dropped in favour of the package-nested canonical.
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Database canonical",
+                "acceptance_criteria": ["DB initialises"],
+                "scope_files": [
+                    "server/database.py",
+                    "server/tests/test_database.py",
+                ],
+            },
+            {
+                "story_key": "STORY-002",
+                "title": "Database extra",
+                "acceptance_criteria": ["DB idempotent"],
+                "scope_files": [
+                    "server/database.py",
+                    "tests/unit/test_database.py",
+                ],
+            },
+        ])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        by_key = {s["title"]: s for s in stories}
+        assert (
+            "server/tests/test_database.py"
+            in by_key["Database canonical"]["scope_files"]
+        )
+        assert (
+            "tests/unit/test_database.py"
+            not in by_key["Database extra"]["scope_files"]
+        )
+        assert any(
+            "repo-root test mirror drop" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_keeps_repo_root_test_when_no_package_nested_counterpart(self):
+        # Only a repo-root tests tree in play (no package-nested copy of the
+        # same basename) — nothing to canonicalize onto, so the entry stays.
+        payload = _payload_with_one_feature([
+            {
+                "story_key": "STORY-001",
+                "title": "Utils tests",
+                "acceptance_criteria": ["Utils work"],
+                "scope_files": [
+                    "utils.py",
+                    "tests/test_utils.py",
+                ],
+            },
+        ])
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert "tests/test_utils.py" in stories[0]["scope_files"]
+
     def test_does_not_touch_stories_with_different_test_suffixes(self):
         # Two stories, both with test files, but DIFFERENT basenames.
         # Neither collides — both scope_files entries survive. Each

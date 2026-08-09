@@ -135,8 +135,18 @@ _PYTEST_IMPORTLIB_INI = (
     "# Python test trees (tests/ + server/tests/) both importing the app package\n"
     "# is exactly what produced the ImportPathMismatchError + silently-dropped\n"
     "# server/tests/ tier on lumina (session 019f82af).\n"
+    "#\n"
+    "# asyncio_mode=auto: the test-gen LLM writes bare ``async def test_*``\n"
+    "# functions WITHOUT a per-test ``@pytest.mark.asyncio`` marker. Under\n"
+    "# pytest-asyncio's default strict mode those are never collected — pytest\n"
+    "# reports 'async def functions are not natively supported' and the whole\n"
+    "# async suite silently fails, deadlocking repair on a config gap it can't\n"
+    "# edit (lumina 019fd740). auto mode treats every async def test as an\n"
+    "# asyncio test, no marker required. Harmless when no async tests exist;\n"
+    "# an unknown-option warning (not an error) if pytest-asyncio is absent.\n"
     "addopts = --import-mode=importlib\n"
     "pythonpath = .\n"
+    "asyncio_mode = auto\n"
 )
 
 

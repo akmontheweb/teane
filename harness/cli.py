@@ -2541,8 +2541,20 @@ def resolve_build_command(
         # Install pytest-timeout alongside pytest so ``_PYTEST_RUN``'s
         # ``--timeout=30`` flag doesn't error out with "unrecognized
         # argument" on the very first compile — before any venv or
-        # manifest is wired up.
-        else f"python3 -m pip install pytest pytest-timeout && {_PYTEST_RUN}"
+        # manifest is wired up. Then install the project's OWN declared deps
+        # (root or one level deep, e.g. ``server/requirements.txt``) once the
+        # scaffolder writes a manifest — guarded with ``[ -f ]``/``|| true``
+        # so the first greenfield compile (no manifest yet) still can't
+        # exit-127. Without this the test env lacks the app's runtime deps
+        # (aiosqlite / fastapi / pytest-asyncio …) so pytest can't even
+        # collect, deadlocking repair on a build-command gap it can't edit
+        # (lumina 019fd740).
+        else (
+            "python3 -m pip install pytest pytest-timeout && "
+            "for r in requirements.txt */requirements.txt; do "
+            '[ -f "$r" ] && python3 -m pip install -r "$r" || true; done && '
+            f"{_PYTEST_RUN}"
+        )
     )
     logger.info(
         "[cli] Workspace has no build markers yet; seeding build command "

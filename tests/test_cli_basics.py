@@ -741,6 +741,19 @@ class TestGreenfieldBrownfieldSplit:
         assert gf != "make build"
         assert bf == "make build"
 
+    def test_greenfield_seed_installs_project_requirements(self, tmp_path):
+        # No build markers → greenfield Python seed. It must install the
+        # project's OWN requirements (root or one level deep) before pytest,
+        # or runtime/async deps (aiosqlite / fastapi / pytest-asyncio) are
+        # missing and pytest can't even collect — deadlocking repair on a
+        # build-command gap it can't edit (lumina 019fd740). Guards keep the
+        # first greenfield compile (no manifest yet) from exit-127.
+        seed = resolve_build_command({}, str(tmp_path), is_greenfield=True)
+        assert "pip install pytest pytest-timeout" in seed
+        assert "*/requirements.txt" in seed
+        assert "pip install -r" in seed
+        assert "|| true" in seed  # greenfield first-compile guard
+
     def test_makefile_without_build_target_falls_through_in_both_modes(
         self, tmp_path,
     ):

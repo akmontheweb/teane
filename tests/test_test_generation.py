@@ -2155,6 +2155,18 @@ class TestTestsMarkerHelpers:
         ]
 
 
+class TestPytestIniAsyncioMode:
+    """lumina 019fd740: bare ``async def test_*`` (no @pytest.mark.asyncio)
+    are silently uncollected under strict mode. The auto-written pytest.ini
+    must set asyncio_mode=auto so they run."""
+
+    def test_importlib_ini_enables_asyncio_auto_mode(self):
+        from harness.test_generation import _PYTEST_IMPORTLIB_INI
+        assert "asyncio_mode = auto" in _PYTEST_IMPORTLIB_INI
+        # And still keeps the importlib import-mode it already had.
+        assert "--import-mode=importlib" in _PYTEST_IMPORTLIB_INI
+
+
 class TestSingleCanonicalTreeRule:
     """lumina 019fd344: the test-gen prompt must tell the LLM to author each
     module's tests in ONE canonical package-nested location, so it stops

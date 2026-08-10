@@ -2549,10 +2549,18 @@ def resolve_build_command(
         # (aiosqlite / fastapi / pytest-asyncio …) so pytest can't even
         # collect, deadlocking repair on a build-command gap it can't edit
         # (lumina 019fd740).
+        # Each ``;``/``&&``-separated segment must start with a binary in the
+        # sandbox security whitelist (harness.security.DEFAULT_ALLOWED_COMMANDS)
+        # — ``for``/``find``/``xargs`` are NOT whitelisted and get the whole
+        # command rejected, so guards use ``[`` + ``python3`` (both allowed).
+        # ``;`` (not ``&&``) between install and pytest so a missing manifest
+        # on the first greenfield compile doesn't stop the run. Covers the
+        # flat (root) and the harness's canonical ``server/`` monorepo layout.
         else (
-            "python3 -m pip install pytest pytest-timeout && "
-            "for r in requirements.txt */requirements.txt; do "
-            '[ -f "$r" ] && python3 -m pip install -r "$r" || true; done && '
+            "python3 -m pip install pytest pytest-timeout ; "
+            "[ -f requirements.txt ] && python3 -m pip install -r requirements.txt ; "
+            "[ -f server/requirements.txt ] && "
+            "python3 -m pip install -r server/requirements.txt ; "
             f"{_PYTEST_RUN}"
         )
     )

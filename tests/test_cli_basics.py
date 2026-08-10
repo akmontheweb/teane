@@ -750,9 +750,12 @@ class TestGreenfieldBrownfieldSplit:
         # first greenfield compile (no manifest yet) from exit-127.
         seed = resolve_build_command({}, str(tmp_path), is_greenfield=True)
         assert "pip install pytest pytest-timeout" in seed
-        assert "*/requirements.txt" in seed
-        assert "pip install -r" in seed
-        assert "|| true" in seed  # greenfield first-compile guard
+        assert "pip install -r requirements.txt" in seed
+        assert "pip install -r server/requirements.txt" in seed
+        assert "[ -f requirements.txt ]" in seed  # guard for greenfield compile
+        # Must pass the sandbox security validator (no `for`/`find`/`xargs`).
+        from harness.security import CommandValidator
+        assert CommandValidator().validate(seed).allowed, seed
 
     def test_makefile_without_build_target_falls_through_in_both_modes(
         self, tmp_path,

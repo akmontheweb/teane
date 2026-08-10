@@ -2535,32 +2535,34 @@ def resolve_build_command(
             )
             return detected
     backend = resolve_core_languages(config)["backend_language"]
+    # Local import: harness.graph imports cli-level helpers, so importing it at
+    # module top would risk a cycle. Reuses the same venv prefix the prod-smoke
+    # install step is built on so the test run and prod-smoke share one env.
+    from harness.graph import _uv_venv_prefix
     seed = (
         "mvn -B test"
         if backend == "Java"
-        # Install pytest-timeout alongside pytest so ``_PYTEST_RUN``'s
-        # ``--timeout=30`` flag doesn't error out with "unrecognized
-        # argument" on the very first compile — before any venv or
-        # manifest is wired up. Then install the project's OWN declared deps
-        # (root or one level deep, e.g. ``server/requirements.txt``) once the
-        # scaffolder writes a manifest — guarded with ``[ -f ]``/``|| true``
-        # so the first greenfield compile (no manifest yet) still can't
-        # exit-127. Without this the test env lacks the app's runtime deps
-        # (aiosqlite / fastapi / pytest-asyncio …) so pytest can't even
-        # collect, deadlocking repair on a build-command gap it can't edit
-        # (lumina 019fd740).
-        # Each ``;``/``&&``-separated segment must start with a binary in the
-        # sandbox security whitelist (harness.security.DEFAULT_ALLOWED_COMMANDS)
-        # — ``for``/``find``/``xargs`` are NOT whitelisted and get the whole
-        # command rejected, so guards use ``[`` + ``python3`` (both allowed).
-        # ``;`` (not ``&&``) between install and pytest so a missing manifest
-        # on the first greenfield compile doesn't stop the run. Covers the
-        # flat (root) and the harness's canonical ``server/`` monorepo layout.
+        # The build/test command MUST run inside the same sandbox venv the
+        # prod-import smoke check populates (``_uv_venv_prefix`` /
+        # ``_PROD_SMOKE_VENV_PATH`` in harness.graph). Running bare
+        # ``python3 -m pip install`` against the builder image's system
+        # interpreter fails silently — it's PEP668-marked ("externally
+        # managed"), so the project's own runtime deps (aiosqlite / fastapi /
+        # pydantic …) never install and pytest can't even collect, deadlocking
+        # repair on a build-command/env gap it cannot edit (lumina 019fd740
+        # abandoned; 019fecc0 recurrence). The venv prefix creates+activates
+        # the venv and installs the harness test tools; then install the
+        # project's OWN manifests there via ``uv`` (root + the canonical
+        # ``server/`` monorepo layout). Guarded with ``[ -f ]`` + ``;`` so the
+        # first greenfield compile (no manifest yet) still proceeds. Every
+        # ``;``/``&&`` segment starts with a whitelisted binary
+        # (harness.security.DEFAULT_ALLOWED_COMMANDS) — no
+        # ``for``/``find``/``xargs`` (those get the whole command rejected).
         else (
-            "python3 -m pip install pytest pytest-timeout ; "
-            "[ -f requirements.txt ] && python3 -m pip install -r requirements.txt ; "
+            f"{_uv_venv_prefix()} ; "
+            "[ -f requirements.txt ] && uv pip install --quiet -r requirements.txt ; "
             "[ -f server/requirements.txt ] && "
-            "python3 -m pip install -r server/requirements.txt ; "
+            "uv pip install --quiet -r server/requirements.txt ; "
             f"{_PYTEST_RUN}"
         )
     )

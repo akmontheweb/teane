@@ -749,9 +749,13 @@ class TestGreenfieldBrownfieldSplit:
         # build-command gap it can't edit (lumina 019fd740). Guards keep the
         # first greenfield compile (no manifest yet) from exit-127.
         seed = resolve_build_command({}, str(tmp_path), is_greenfield=True)
-        assert "pip install pytest pytest-timeout" in seed
-        assert "pip install -r requirements.txt" in seed
-        assert "pip install -r server/requirements.txt" in seed
+        # Runs inside the shared sandbox venv (same one prod-smoke populates),
+        # so ``uv pip install`` targets a writable location instead of the
+        # PEP668-marked system interpreter (bare ``pip install`` silently fails
+        # there — lumina 019fd740/019fecc0).
+        assert "uv venv --system-site-packages" in seed
+        assert "uv pip install --quiet -r requirements.txt" in seed
+        assert "uv pip install --quiet -r server/requirements.txt" in seed
         assert "[ -f requirements.txt ]" in seed  # guard for greenfield compile
         # Must pass the sandbox security validator (no `for`/`find`/`xargs`).
         from harness.security import CommandValidator

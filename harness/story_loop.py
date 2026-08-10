@@ -30,6 +30,7 @@ from typing import Any, Optional
 from harness import story_state
 from harness.batch_sizing import DETERMINISTIC_BATCH_SIZE as DEFAULT_BATCH_SIZE
 from harness.loop_counter_keys import PER_BATCH_CAP_COUNTERS
+from harness.req_ids import STORY_NFR_ID_RE
 
 logger = logging.getLogger(__name__)
 
@@ -846,6 +847,38 @@ def story_complete_node(state: dict[str, Any]) -> dict[str, Any]:
                         session_id=session_id,
                         message=f"{story_key}: {story.get('title', '')}",
                     )
+        elif repair_total >= repair_cap and STORY_NFR_ID_RE.fullmatch(story_key):
+            # NFR (SAFe enabler) deferral. A non-functional requirement that
+            # exhausted its repair budget can't be satisfied by the build's
+            # code/unit-test acceptance gate: capability NFRs (performance,
+            # security posture, availability) have no naturally unit-testable
+            # surface, and the harness's own design puts NFR verification in
+            # the ``teane test`` functional pack, NOT the build (see the
+            # NFR-only-batch guardrail in test_generation). Marking them
+            # ``blocked`` turned every such NFR into an operator-action defect
+            # on an otherwise-green build (lumina 019fecd6:
+            # STORY-NFR-001/002/003 all blocked on a fully-passing app). Mark
+            # done and record a low-severity deferral note so traceability
+            # still shows a human / the functional pack owes real verification
+            # — but the build is not reported as failed.
+            story_state.mark_done(conn, workspace, story_key)
+            defect_id = story_state.record_defect(
+                conn,
+                workspace=workspace,
+                story_key=story_key,
+                session_id=session_id,
+                severity="nfr_deferred_to_functional_pack",
+                summary=(
+                    f"{story_key} is a non-functional requirement; build-time "
+                    f"unit-test verification is not applicable — deferred to "
+                    f"`teane test`. exit_code={exit_code}"
+                ),
+                diagnostic={
+                    "exit_code": exit_code,
+                    "repair_total": repair_total,
+                },
+            )
+            outcome = "nfr_deferred"
         elif repair_total >= repair_cap:
             story_state.mark_blocked(conn, workspace, story_key)
             defect_id = story_state.record_defect(

@@ -184,6 +184,73 @@ def test_complete_marks_blocked_on_repair_cap(workspace: str):
     assert defects == [("repair_cap_exceeded", "open")]
 
 
+def _rename_story_key(workspace: str, old_key: str, new_key: str) -> None:
+    """Rename a seeded story's key (create_stories only mints STORY-NNN, but
+    the NFR-deferral branch keys on STORY-NFR-NNN)."""
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        conn.execute(
+            "UPDATE stories SET story_key = ? WHERE workspace = ? "
+            "AND story_key = ?",
+            (new_key, app, old_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_complete_defers_nfr_instead_of_blocking_on_repair_cap(workspace: str):
+    # lumina 019fecd6: capability NFRs (perf/security/availability) can't pass
+    # the build's code/unit-test gate, hit the repair cap, and were marked
+    # blocked — turning a fully-green app into "operator action required". An
+    # NFR story that exhausts repair must be DEFERRED (done + note), not
+    # blocked, since NFR verification is owned by `teane test`.
+    key = _seed_one_story(workspace)
+    _rename_story_key(workspace, key, "STORY-NFR-001")
+    app = _app(workspace)
+    out = story_loop.story_complete_node(_complete_state(
+        workspace, "STORY-NFR-001",
+        exit_code=1,
+        loop_counter={"total_repairs": 3},
+        story_repair_cap=3,
+    ))
+    assert out["node_state"]["outcome"] == "nfr_deferred"
+
+    conn = story_state.open_story_db()
+    try:
+        s = story_state.get_story(conn, app, "STORY-NFR-001")
+        defects = conn.execute(
+            "SELECT severity, status FROM defects"
+        ).fetchall()
+    finally:
+        conn.close()
+    # Marked done (NOT blocked) so the build isn't reported as failed, with a
+    # deferral breadcrumb rather than a repair-cap defect.
+    assert s["status"] == "done"
+    assert defects == [("nfr_deferred_to_functional_pack", "open")]
+
+
+def test_complete_still_blocks_functional_story_on_repair_cap(workspace: str):
+    # Guard: the NFR carve-out must NOT leak to functional stories — they still
+    # block on the repair cap.
+    key = _seed_one_story(workspace)  # STORY-NNN, not an NFR key
+    app = _app(workspace)
+    out = story_loop.story_complete_node(_complete_state(
+        workspace, key,
+        exit_code=1,
+        loop_counter={"total_repairs": 3},
+        story_repair_cap=3,
+    ))
+    assert out["node_state"]["outcome"] == "blocked"
+    conn = story_state.open_story_db()
+    try:
+        s = story_state.get_story(conn, app, key)
+    finally:
+        conn.close()
+    assert s["status"] == "blocked"
+
+
 def test_complete_incomplete_when_failing_but_under_cap(workspace: str):
     key = _seed_one_story(workspace)
     app = _app(workspace)

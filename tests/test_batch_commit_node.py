@@ -262,6 +262,68 @@ class TestStoryMarking:
         ), defect_rows
         assert len(defect_rows) == len(keys)
 
+    def test_empty_batch_defers_nfr_stories_instead_of_blocking(
+        self, tmp_path: Path,
+    ):
+        """lumina 019fed44: an NFR-only batch produces no code BY DESIGN
+        (capability NFRs aren't build-time implementable). It must not park
+        those stories ``blocked`` — that turned every NFR into "operator
+        action required" on a fully-green app. They defer to ``teane test``:
+        marked ``done`` with a low-severity ``nfr_deferred`` note."""
+        ws = str(tmp_path)
+        bid, keys = _seed_batch(ws)
+        app = _app(ws)
+        # create_stories only mints STORY-NNN; rename to NFR keys so the
+        # deferral carve-out (keyed on STORY_NFR_ID_RE) applies.
+        conn = story_state.open_story_db()
+        try:
+            for i, k in enumerate(keys, start=1):
+                conn.execute(
+                    "UPDATE stories SET story_key = ? WHERE workspace = ? "
+                    "AND story_key = ?",
+                    (f"STORY-NFR-00{i}", app, k),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        nfr_keys = [f"STORY-NFR-00{i}" for i in range(1, len(keys) + 1)]
+
+        out = batch_commit_node(_state(ws, bid, batch_modified_files=[]))
+        assert out["node_state"]["blocked_count"] == 0
+        assert out["node_state"]["marked_done"] == len(nfr_keys)
+
+        conn = story_state.open_story_db()
+        try:
+            for k in nfr_keys:
+                assert story_state.get_story(conn, app, k)["status"] == "done", (
+                    f"{k} should be deferred (done), not blocked"
+                )
+            sev = [r[0] for r in conn.execute(
+                "SELECT severity FROM defects WHERE session_id = 'sess-1'"
+            ).fetchall()]
+        finally:
+            conn.close()
+        assert sev and all(s == "nfr_deferred_to_functional_pack" for s in sev), sev
+
+    def test_empty_batch_still_blocks_functional_story(self, tmp_path: Path):
+        """Guard: the NFR carve-out must NOT leak to functional stories in an
+        empty batch — a functional story with no code still blocks."""
+        ws = str(tmp_path)
+        bid, keys = _seed_batch(ws, stories=[{"title": "Add login"}])
+        app = _app(ws)  # key stays STORY-001 (functional)
+        out = batch_commit_node(_state(ws, bid, batch_modified_files=[]))
+        assert out["node_state"]["blocked_count"] == 1
+        conn = story_state.open_story_db()
+        try:
+            st = story_state.get_story(conn, app, keys[0])["status"]
+            sev = [r[0] for r in conn.execute(
+                "SELECT severity FROM defects WHERE session_id = 'sess-1'"
+            ).fetchall()]
+        finally:
+            conn.close()
+        assert st == "blocked"
+        assert sev == ["empty_batch_seal"]
+
     def test_batch_files_populate_file_links(self, tmp_path: Path):
         """Batch-mode runs bypass story_complete_node (the per-story
         linker). seal_batch_atomically must link every batch file to

@@ -2131,6 +2131,39 @@ def seal_batch_atomically(
                 continue
             sid = row[0]
             if empty_batch:
+                from harness.req_ids import STORY_NFR_ID_RE
+                if STORY_NFR_ID_RE.fullmatch(key):
+                    # NFR (SAFe enabler) stories legitimately produce no code:
+                    # capability NFRs (performance, security posture,
+                    # availability) have no build-time implementable surface,
+                    # and the harness's own design puts their verification in
+                    # the ``teane test`` functional pack, not the build (see the
+                    # NFR-only-batch guardrail in test_generation). An NFR-only
+                    # batch is therefore ``empty_batch`` BY DESIGN, not a
+                    # failure. Blocking here turned every capability NFR into
+                    # "operator action required" on a fully-green app
+                    # (lumina 019fecd6 / 019fed44: STORY-NFR-001/002/003). Mark
+                    # done and record a low-severity deferral note so
+                    # traceability still shows verification is owed — without
+                    # reporting the build as failed. (story_complete_node has
+                    # the mirror carve-out for the non-batch per-story path.)
+                    conn.execute(
+                        "UPDATE stories SET status = 'done', completed_at = ? "
+                        "WHERE workspace = ? AND story_key = ?",
+                        (now, workspace, key),
+                    )
+                    conn.execute(
+                        "INSERT INTO defects(workspace, story_id, session_id, "
+                        "severity, summary, created_at, status) "
+                        "VALUES(?, ?, ?, ?, ?, ?, 'open')",
+                        (workspace, sid, session_id,
+                         "nfr_deferred_to_functional_pack",
+                         f"{key} is a non-functional requirement; no build-time "
+                         "code/tests expected — verification deferred to "
+                         "`teane test`.", now),
+                    )
+                    done_keys.append(key)
+                    continue
                 conn.execute(
                     "UPDATE stories SET status = 'blocked' "
                     "WHERE workspace = ? AND story_key = ?",

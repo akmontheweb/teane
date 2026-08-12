@@ -1932,6 +1932,89 @@ def _findings_to_diagnostics(
     return diagnostics
 
 
+# Inline-suppression comment syntax by file extension. semgrep and bandit
+# both honour an end-of-line ``nosemgrep`` / ``nosec`` marker on the finding's
+# first line. A ``#`` comment is valid at the end of ANY physical Python line
+# (even mid-statement inside parens), and ``//`` likewise for JS/TS, so
+# appending the marker can't break syntax.
+_SUPPRESS_COMMENT_PREFIX: dict[str, str] = {
+    ".py": "#", ".pyi": "#",
+    ".ts": "//", ".tsx": "//", ".js": "//", ".jsx": "//", ".mjs": "//",
+}
+
+
+def _apply_stuck_suppressions(
+    diagnostics: list[dict[str, Any]],
+    workspace_path: str,
+) -> list[dict[str, Any]]:
+    """Last-resort escape for the security-fix loop.
+
+    A blocking finding that survives the whole LLM repair budget is either a
+    false positive no code change can satisfy — e.g. a dynamic ``UPDATE``
+    built only from HARDCODED column names with every value parameterized,
+    which semgrep's raw-query rule flags on the f-string regardless (lumina
+    019fed44 abandoned an otherwise-green app on exactly this) — or genuinely
+    beyond the model. Thrashing to the HITL hard ceiling and abandoning the
+    whole build is worse than silencing the specific rule@line and surfacing
+    it for human audit. Same "unfixable → escalate, don't thrash" philosophy
+    as the UNSATISFIABLE_TEST escape (commit 8014620).
+
+    Adds a SCOPED inline suppression (``# nosemgrep: <rule>`` / ``# nosec
+    <rule>``) to each finding's first line. ONLY semgrep + bandit findings are
+    suppressible; gitleaks (secrets) and trivy (CVEs) are NEVER auto-silenced
+    — a leaked key or a vulnerable dependency is not a false positive. Returns
+    the applied suppressions (``already=True`` when the line was already
+    marked) for the audit trail; entries with ``already`` were NOT newly
+    written, so the caller can detect a suppression that isn't taking and fall
+    back to the normal escalation instead of looping.
+    """
+    applied: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for d in diagnostics:
+        rel = str(d.get("file") or "")
+        line = int(d.get("line") or 0)
+        code = str(d.get("error_code") or "")  # "SCANNER:rule_id"
+        if not rel or line < 1 or ":" not in code:
+            continue
+        scanner, _, rule_id = code.partition(":")
+        scanner = scanner.lower()
+        if scanner not in ("semgrep", "bandit"):
+            continue  # never auto-suppress secrets / CVEs
+        ext = os.path.splitext(rel)[1].lower()
+        prefix = _SUPPRESS_COMMENT_PREFIX.get(ext)
+        if prefix is None:
+            continue  # unknown language — no safe inline comment
+        key = (rel, line)
+        marker = (
+            f"nosec {rule_id}" if scanner == "bandit"
+            else f"nosemgrep: {rule_id}"
+        )
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        if line > len(lines):
+            continue
+        body = lines[line - 1].rstrip("\n")
+        newline = "\n" if lines[line - 1].endswith("\n") else ""
+        if key in seen or "nosemgrep" in body or "nosec" in body:
+            applied.append({"file": rel, "line": line, "scanner": scanner,
+                            "rule_id": rule_id, "already": True})
+            continue
+        lines[line - 1] = f"{body}  {prefix} {marker}{newline}"
+        try:
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+        except OSError:
+            continue
+        seen.add(key)
+        applied.append({"file": rel, "line": line, "scanner": scanner,
+                        "rule_id": rule_id})
+    return applied
+
+
 async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
     """LangGraph node: deterministic security gate.
 
@@ -2156,6 +2239,52 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # Otherwise hand the unhandled tail to the LLM repair path.
     diagnostics = unhandled_diagnostics
+
+    # Last-resort escape: once the LLM repair loop has exhausted its attempts
+    # on these findings, thrashing to the HITL hard ceiling and abandoning an
+    # otherwise-green build is worse than silencing the specific rule@line and
+    # surfacing it for human audit — the same "unfixable → escalate, don't
+    # thrash" philosophy as the UNSATISFIABLE_TEST escape (8014620). Only fires
+    # for suppressible scanners (semgrep/bandit); secrets/CVEs are never
+    # auto-silenced. Gated by ``security.suppress_stuck_findings`` (default
+    # True). ``newly`` guards against a suppression that isn't taking effect
+    # (already-marked line still flagged) — in that case fall through to the
+    # normal escalation rather than loop (lumina 019fed44: a semgrep raw-query
+    # false positive on a hardcoded-column dynamic UPDATE abandoned the build).
+    if (
+        loop_counter["security"] >= max_attempts
+        and bool(sec_cfg.get("suppress_stuck_findings", True))
+        and diagnostics
+    ):
+        suppressed = _apply_stuck_suppressions(diagnostics, workspace_path)
+        newly = [s for s in suppressed if not s.get("already")]
+        if newly:
+            for sf in sorted({s["file"] for s in newly}):
+                if sf not in autofix_modified_files:
+                    autofix_modified_files.append(sf)
+            logger.warning(
+                "[security_scan_node] Security fix loop exhausted (%d/%d) on "
+                "%d finding(s); applied %d SCOPED inline suppression(s) and "
+                "PASSING for human audit rather than abandoning the build: %s",
+                loop_counter["security"], max_attempts, len(diagnostics),
+                len(newly),
+                ", ".join(
+                    f"{s['scanner']}/{s['rule_id']}@{s['file']}:{s['line']}"
+                    for s in newly[:8]
+                ),
+            )
+            return {
+                "modified_files": autofix_modified_files,
+                "loop_counter": loop_counter,
+                "node_state": {
+                    "security_scan": {
+                        "passed": True,
+                        "stuck_suppressed": newly,
+                        "autofix_applied": len(applied_fixes),
+                        **summary,
+                    },
+                },
+            }
 
     logger.warning(
         "[security_scan_node] %d blocking finding(s) (warn=%d, dropped=%d). "

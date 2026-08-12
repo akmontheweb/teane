@@ -1299,3 +1299,66 @@ class TestRouterHardCeiling:
         # no-deployment installation_doc destination.
         state["loop_counter"]["end_of_session_regression_repair"] = 1
         assert route_after_security_scan(state) == "installation_doc_node"
+
+
+class TestApplyStuckSuppressions:
+    """lumina 019fed44: the security-fix loop thrashed to the HITL hard
+    ceiling and abandoned an otherwise-green build on a semgrep raw-query
+    FALSE POSITIVE (a dynamic UPDATE built only from hardcoded column names,
+    all values parameterized). The last-resort escape applies a scoped inline
+    suppression instead of abandoning."""
+
+    def _diag(self, file, line, scanner, rule):
+        return {"file": file, "line": line, "error_code": f"{scanner.upper()}:{rule}"}
+
+    def test_semgrep_python_gets_nosemgrep(self, tmp_path):
+        from harness.security import _apply_stuck_suppressions
+        p = tmp_path / "routes.py"
+        p.write_text('await db.execute(f"UPDATE t SET {c}", v)\n')
+        applied = _apply_stuck_suppressions(
+            [self._diag("routes.py", 1, "semgrep", "py.raw-query")], str(tmp_path),
+        )
+        assert applied and not applied[0].get("already")
+        assert "# nosemgrep: py.raw-query" in p.read_text()
+
+    def test_bandit_python_gets_nosec(self, tmp_path):
+        from harness.security import _apply_stuck_suppressions
+        p = tmp_path / "routes.py"
+        p.write_text('q = "SELECT " + name\n')
+        _apply_stuck_suppressions(
+            [self._diag("routes.py", 1, "bandit", "B608")], str(tmp_path),
+        )
+        assert "# nosec B608" in p.read_text()
+
+    def test_typescript_uses_slash_comment(self, tmp_path):
+        from harness.security import _apply_stuck_suppressions
+        p = tmp_path / "api.ts"
+        p.write_text("const x = raw(userInput);\n")
+        _apply_stuck_suppressions(
+            [self._diag("api.ts", 1, "semgrep", "ts.injection")], str(tmp_path),
+        )
+        assert "// nosemgrep: ts.injection" in p.read_text()
+
+    def test_secrets_and_cves_are_never_suppressed(self, tmp_path):
+        from harness.security import _apply_stuck_suppressions
+        p = tmp_path / "config.py"
+        original = 'KEY = "AKIA..."\n'
+        p.write_text(original)
+        applied = _apply_stuck_suppressions(
+            [self._diag("config.py", 1, "gitleaks", "aws-key"),
+             self._diag("config.py", 1, "trivy", "CVE-2024-1")],
+            str(tmp_path),
+        )
+        assert applied == []          # neither suppressed
+        assert p.read_text() == original  # file untouched
+
+    def test_already_suppressed_line_reports_already(self, tmp_path):
+        from harness.security import _apply_stuck_suppressions
+        p = tmp_path / "routes.py"
+        p.write_text('await db.execute(q, v)  # nosemgrep: py.raw-query\n')
+        applied = _apply_stuck_suppressions(
+            [self._diag("routes.py", 1, "semgrep", "py.raw-query")], str(tmp_path),
+        )
+        assert applied and applied[0].get("already") is True
+        # not double-appended
+        assert p.read_text().count("nosemgrep") == 1

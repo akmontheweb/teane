@@ -51,6 +51,7 @@ __all__ = [
     "public_symbols",
     "symbol_coverage",
     "patch_target_paths",
+    "salvage_canonical_rewrite",
 ]
 
 _REGEN_ATTEMPTS_KEY = "test_regen_attempts"
@@ -59,6 +60,12 @@ _REGEN_ATTEMPTS_KEY = "test_regen_attempts"
 # REPLACE_BLOCK). Used to confirm the regeneration only touches the declared
 # test path.
 _BLOCK_FILE_RE = re.compile(r"^\s*file:\s*(?P<path>.+?)\s*$", re.MULTILINE)
+
+# A fenced-code opener (```python) / closer (```) that a reasoning model wraps
+# the rewritten body in instead of the canonical ``content:`` field. Used only
+# by the salvage path below to strip such wrappers.
+_FENCE_OPEN_RE = re.compile(r"^\s*```[\w.+-]*\s*$")
+_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +187,60 @@ def patch_target_paths(patch_text: str) -> set[str]:
     return {m.group("path") for m in _BLOCK_FILE_RE.finditer(patch_text or "")}
 
 
+def salvage_canonical_rewrite(content: str, rel: str) -> str | None:
+    """Recover a canonical REWRITE_FILE block from a non-canonical emission.
+
+    The regeneration target file is already known (``rel``), so the model does
+    not need to name it correctly — only the rewritten body matters. Reasoning
+    models routinely wrap that body in a dialect the strict patcher grammar
+    (``<<<REWRITE_FILE>>>`` / ``file:`` / ``content:`` / ``<<<END_REWRITE_FILE>>>``)
+    rejects: the path inlined on the marker line (``<<<REWRITE_FILE>>> a/b.py``),
+    or the body fenced in ```` ```python ````, with no ``file:``/``content:``
+    header and often no closing marker (lumina 019ff418: both regeneration
+    attempts emitted a correct body this way and were dropped as ``no_patch``).
+
+    Strip the wrapper tokens and re-emit the body as a canonical block targeting
+    ``rel``. Returns None when no body can be recovered; the caller's post-apply
+    gates still validate whatever is salvaged, so a bad recovery is rolled back
+    rather than landed. This is only invoked when the model did NOT emit a
+    parseable ``file:`` header, so it never rewrites a well-formed block.
+    """
+    if not content or "<<<REWRITE_FILE>>>" not in content:
+        return None
+    after = content.split("<<<REWRITE_FILE>>>", 1)[1]
+    # Drop a trailing END marker and anything past it.
+    after = re.split(r"<<<END_REWRITE_FILE>>>", after, maxsplit=1)[0]
+    lines = after.split("\n")
+    # The marker-line remainder (text left on the ``<<<REWRITE_FILE>>>`` line) is
+    # always a header token — an inline path or a fence opener — never body.
+    if lines and lines[0].strip():
+        lines = lines[1:]
+    # Drop leading blanks, a fenced-code opener, and any partial canonical
+    # header labels the model emitted before the real body.
+    while lines:
+        first = lines[0].strip()
+        if (not first
+                or _FENCE_OPEN_RE.match(lines[0])
+                or first.startswith("file:")
+                or first == "content:"):
+            lines.pop(0)
+            continue
+        break
+    # Drop a trailing fenced-code closer and trailing blank lines.
+    while lines and (not lines[-1].strip() or _FENCE_CLOSE_RE.match(lines[-1])):
+        lines.pop()
+    body = "\n".join(lines).strip("\n")
+    if not body.strip():
+        return None
+    return (
+        "<<<REWRITE_FILE>>>\n"
+        f"file: {rel}\n"
+        "content:\n"
+        f"{body}\n"
+        "<<<END_REWRITE_FILE>>>"
+    )
+
+
 def _norm(path: str, workspace: str) -> str:
     from harness.graph import _normalize_ws_path
     return _normalize_ws_path(path, workspace)
@@ -205,8 +266,15 @@ _REGEN_SYSTEM = (
     "when the code contract is genuinely ambiguous. Never CITE a story/FR/AC "
     "id in the test — unit tests link to code, not to acceptance criteria.\n\n"
     "RULES:\n"
-    "1. Emit exactly one <<<REWRITE_FILE>>> block for the named test file and "
-    "nothing else. Touch no other file.\n"
+    "1. Emit exactly one block for the named test file and nothing else, in "
+    "EXACTLY this shape — three header lines, the body, then the closing "
+    "marker, with NO ``` code fences and NO path on the marker line:\n"
+    "<<<REWRITE_FILE>>>\n"
+    "file: <the test file path>\n"
+    "content:\n"
+    "<the complete rewritten file body>\n"
+    "<<<END_REWRITE_FILE>>>\n"
+    "Touch no other file.\n"
     "2. Keep the `# @tests: <source path>` marker at the top — it records the "
     "1:1 code linkage. Do NOT add @verifies / STORY / AC references.\n"
     "3. Cover the module comprehensively: exercise every public function and "
@@ -253,7 +321,9 @@ def build_regeneration_messages(
         )
     parts.append(
         "Rewrite the ONE test file as a comprehensive unit suite for the module "
-        "above, anchored on its contract. Emit only the <<<REWRITE_FILE>>> block."
+        "above, anchored on its contract. Emit only the canonical "
+        "<<<REWRITE_FILE>>> / file: / content: / <<<END_REWRITE_FILE>>> block "
+        "described in the rules — no ``` fences, no prose."
     )
     return [
         {"role": "system", "content": _REGEN_SYSTEM},
@@ -383,12 +453,19 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     # reasoning ended at "We'll regenerate the file.", content empty). That
     # silently burns the single regeneration attempt and drops to HITL on a
     # test the model had already worked out how to fix. Give it one terse,
-    # block-only nudge before giving up.
+    # block-only nudge before giving up. The nudge restates the EXACT grammar
+    # (header lines + closing marker, no ``` fences) because the parseable
+    # failure mode is usually a wrong dialect, not silence (lumina 019ff418).
     _retry_nudge = (
-        "You did not emit a patch block. Output ONLY the single "
-        f"<<<REWRITE_FILE>>> block for {rel} now — the complete rewritten "
-        "file body between the markers, with no analysis, prose, or "
-        "explanation before or after it."
+        "You did not emit a parseable patch block. Output ONLY this, with no "
+        "prose, no analysis, and no ``` code fences — the header lines exactly "
+        "as shown, then the complete rewritten file body, then the closing "
+        "marker:\n"
+        "<<<REWRITE_FILE>>>\n"
+        f"file: {rel}\n"
+        "content:\n"
+        "<the complete rewritten file body>\n"
+        "<<<END_REWRITE_FILE>>>"
     )
     content = ""
     targets: set[str] = set()
@@ -414,6 +491,21 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             return _give_up("targeted_other_files",
                             f"regeneration tried to touch {sorted(stray)}")
         if targets:
+            break
+
+        # No parseable ``file:`` header, but the model may still have produced a
+        # correct body in a non-canonical dialect (inline path on the marker
+        # line, or a ```lang fence). The target is known — salvage the body and
+        # re-wrap it canonically rather than burning the escape to HITL.
+        salvaged = salvage_canonical_rewrite(content, rel)
+        if salvaged is not None:
+            logger.warning(
+                "[test_regeneration_node] recovered non-canonical REWRITE_FILE "
+                "emission (%d chars) → canonical block for %s.",
+                len(content), rel,
+            )
+            content = salvaged
+            targets = {_norm(rel, workspace)}
             break
         if _attempt == 0:
             logger.warning(

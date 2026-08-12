@@ -19,8 +19,12 @@ from harness.test_regeneration import (
     public_symbols,
     symbol_coverage,
     patch_target_paths,
+    salvage_canonical_rewrite,
     build_regeneration_messages,
 )
+from harness.patcher import _BLOCK_PATTERNS, OperationType
+
+_REWRITE_RE = _BLOCK_PATTERNS[OperationType.REWRITE_FILE]
 
 # The node itself is named ``test_regeneration_node`` — aliased so pytest
 # doesn't collect it as a test case (and mis-read its ``state`` arg as a
@@ -154,6 +158,78 @@ class TestPatchTargets:
     def test_multiple_targets(self):
         patch = "file: a.py\nfile: b.py\n"
         assert patch_target_paths(patch) == {"a.py", "b.py"}
+
+
+class TestSalvageCanonicalRewrite:
+    """A reasoning model emits a correct body in a non-canonical dialect the
+    strict patcher grammar rejects; salvage recovers it targeting the KNOWN
+    file so the tier-B escape lands instead of dropping to HITL (lumina
+    019ff418: both regen attempts emitted a valid body this way, parsed as
+    zero targets, and stalled the build at reflection_distraction_loop)."""
+
+    REL = "tests/unit/test_database.py"
+
+    def _parses_to(self, salvaged, rel):
+        assert salvaged is not None
+        m = _REWRITE_RE.search(salvaged)
+        assert m is not None, f"salvaged output does not parse:\n{salvaged}"
+        assert m.group("file").strip() == rel
+        return m.group("content")
+
+    def test_dialect_fence_glued_to_marker(self):
+        # `<<<REWRITE_FILE>>>```python` + path only in the @tests comment.
+        raw = (
+            "<<<REWRITE_FILE>>>```python\n"
+            "# @tests: server/app/database.py\n"
+            "import pytest\n\n"
+            "def test_x():\n    assert True\n"
+            "```"
+        )
+        assert patch_target_paths(raw) == set()          # reproduces the bug
+        assert _REWRITE_RE.search(raw) is None
+        body = self._parses_to(salvage_canonical_rewrite(raw, self.REL), self.REL)
+        assert "@tests:" in body and "def test_x" in body
+        assert "```" not in body                          # fence stripped
+
+    def test_dialect_inline_path_on_marker(self):
+        # `<<<REWRITE_FILE>>> path` with no file:/content: and no END marker.
+        raw = (
+            "<<<REWRITE_FILE>>> tests/unit/test_database.py\n"
+            "# @tests: server/app/database.py\n"
+            "def test_y():\n    assert 1 == 1\n"
+        )
+        assert patch_target_paths(raw) == set()
+        body = self._parses_to(salvage_canonical_rewrite(raw, self.REL), self.REL)
+        assert "def test_y" in body
+
+    def test_canonical_input_still_parses_after_salvage(self):
+        raw = (
+            "<<<REWRITE_FILE>>>\n"
+            "file: tests/unit/test_database.py\n"
+            "content:\n"
+            "# @tests: server/app/database.py\n"
+            "def test_z():\n    assert True\n"
+            "<<<END_REWRITE_FILE>>>"
+        )
+        # Canonical input already parses; salvage must not corrupt it.
+        assert patch_target_paths(raw) == {self.REL}
+        self._parses_to(salvage_canonical_rewrite(raw, self.REL), self.REL)
+
+    def test_salvage_forces_known_target_over_wrong_inline_path(self):
+        raw = (
+            "<<<REWRITE_FILE>>> some/wrong/other_path.py\n"
+            "# @tests: server/app/database.py\n"
+            "def test_a():\n    assert True\n"
+        )
+        # Even if the model names the wrong path, salvage binds to rel.
+        self._parses_to(salvage_canonical_rewrite(raw, self.REL), self.REL)
+
+    def test_no_marker_returns_none(self):
+        assert salvage_canonical_rewrite("just prose, no block", self.REL) is None
+
+    def test_empty_body_returns_none(self):
+        assert salvage_canonical_rewrite("<<<REWRITE_FILE>>>```python\n```", self.REL) is None
+        assert salvage_canonical_rewrite("<<<REWRITE_FILE>>>\n\n\n", self.REL) is None
 
 
 class TestMessageAssembly:
@@ -361,9 +437,12 @@ class TestEmptyContentRetry:
             result = await regeneration_node(state)
         # Retry fired — dispatched exactly twice (not the old single shot).
         assert len(fake.calls) == 2
-        # The second dispatch carried the block-only nudge.
+        # The second dispatch carried the block-only nudge (which now restates
+        # the exact canonical grammar).
         assert any(
-            isinstance(m, dict) and "ONLY the single" in str(m.get("content", ""))
+            isinstance(m, dict)
+            and "Output ONLY this" in str(m.get("content", ""))
+            and "<<<END_REWRITE_FILE>>>" in str(m.get("content", ""))
             for m in fake.calls[1]
         )
         # Both empty ⇒ still gives up as no_patch (deferring to the ladder).

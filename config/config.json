@@ -344,7 +344,9 @@
     "test_generation": {
         "enabled": true,
         "max_iterations": 5,
-        "property_based_tests": true
+        "property_based_tests": true,
+        "pre_repair_triage": false,
+        "triage_gate_max_regens": 3
     },
     "test_regeneration": {
         "enabled": true,

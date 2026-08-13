@@ -100,6 +100,15 @@ class TestOverrideAndDictInput:
         r = classify_diagnostic(d, is_test_file=True)
         assert r.fclass is FailureClass.TEST_BUG
 
+    def test_strips_test_failure_prefix(self):
+        # test_generation_node tags routed diagnostics as TEST_FAILURE:<type>;
+        # the classifier must still match the underlying fingerprint.
+        d = _diag("tests/unit/test_database.py", "TEST_FAILURE:TypeError",
+                  "tuple indices must be integers or slices, not str")
+        r = classify_diagnostic(d)
+        assert r.fclass is FailureClass.TEST_BUG
+        assert r.fingerprint == "test-raw-row-subscript"
+
     def test_accepts_dict_diagnostic(self):
         d = {
             "file": "tests/unit/test_database.py",

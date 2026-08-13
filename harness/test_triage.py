@@ -146,6 +146,13 @@ def classify_diagnostic(
     error_code = _field(diag, "error_code") or ""
     message = _field(diag, "message") or ""
 
+    # Diagnostics routed from test_generation_node carry a ``TEST_FAILURE:``
+    # prefix on error_code (the graph tags them so repair's framing knows they
+    # came from the test runner). Strip it before fingerprint matching so the
+    # exact-match fingerprints fire on both the raw and the tagged form.
+    if error_code.startswith("TEST_FAILURE:"):
+        error_code = error_code[len("TEST_FAILURE:"):]
+
     in_test = _is_test_artifact(file) if is_test_file is None else is_test_file
 
     # A failure whose innermost user frame is in SOURCE is, by definition, a

@@ -114,6 +114,8 @@ Auto-generate stack-specific unit tests for modified source files after patching
 
 **`property_based_tests`** — toggles the ADR-0003 Tier-3 property-based contract tests (Hypothesis-driven). Requires `hypothesis` in the sandbox; the tier `importorskip`s when it's absent.
 
+**`pre_repair_triage`** — toggles the ADR-0005 pre-repair triage gate (default off). When the freshly generated tests fail, the gate classifies each failure as a test-authoring bug vs a real code-gap and regenerates only the unambiguous test-bugs (via the ADR-0001 machinery), re-running once before routing the residual failures to the repair loop. Conservative — ambiguous failures always go to repair, so it can never mask a code defect. `triage_gate_max_regens` caps how many distinct test files it regenerates in one pass (default 3).
+
 ## `test_regeneration`
 
 ADR-0001 autonomy ladder. When the repair loop declares a test UNSATISFIABLE_TEST, regenerate the defective UNIT test as a comprehensive suite for its 1:1-mapped code module (via the test-author phase, anchored on the code contract — not the SRS) instead of dead-ending at HITL. enabled=false keeps the legacy straight-to-HITL behaviour. max_attempts_per_test caps regeneration attempts per test path before falling through to HITL. tier_b_auto=false means only machine-PROVABLE defects (contradictory-pair / unparseable — Tier A) auto-regenerate; model-declared-only cases still route to HITL. require_code_linkage rejects a regeneration that drops its `# @tests: <source>` marker (unit tests link to code, never to ACs). coverage_nonregression rejects a regeneration that weakens assertion coverage (the anti-reward-hack gate).

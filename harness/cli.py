@@ -979,7 +979,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "test_generation": frozenset({
         "enabled", "max_iterations", "max_contradiction_reprompts",
-        "property_based_tests",
+        "property_based_tests", "pre_repair_triage", "triage_gate_max_regens",
     }),
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
@@ -1368,6 +1368,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "test_generation.max_contradiction_reprompts": (int,),
     # ADR-0003 Tier 3: property-based round-trip tests (opt-in, default off).
     "test_generation.property_based_tests": (bool,),
+    # ADR-0005 item #2: pre-repair test-triage gate (opt-in, default off) —
+    # regenerate unambiguous test-authoring bugs before the repair loop.
+    "test_generation.pre_repair_triage": (bool,),
+    "test_generation.triage_gate_max_regens": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.
     "test_regeneration.enabled": (bool,),
     "test_regeneration.max_attempts_per_test": (int,),

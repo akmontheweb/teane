@@ -1882,6 +1882,119 @@ def _synth_diag(
 
 
 # ---------------------------------------------------------------------------
+# ADR-0005: pre-repair test-triage gate
+# ---------------------------------------------------------------------------
+
+async def _run_pre_repair_triage_gate(
+    *,
+    state: dict[str, Any],
+    build_result: Any,
+    executor: Any,
+    test_cmd: str,
+    workspace_path: str,
+    loop_counter: dict[str, Any],
+    token_tracker: dict[str, Any],
+    budget: float,
+    max_regens: int,
+) -> Optional[tuple[Any, dict[str, Any], float, list[str], dict[str, Any]]]:
+    """ADR-0005 item #2. Before routing a failed test run to the expensive
+    repair loop, divert unambiguous test-authoring bugs to proactive
+    regeneration (reusing the ADR-0001 machinery), then re-run once.
+
+    Returns ``(new_build_result, token_tracker, budget, extra_modified,
+    summary)`` when at least one test file was rewritten, else ``None`` (the
+    caller keeps the original ``build_result`` and routes to repair unchanged).
+    Conservative: only failures the classifier labels ``TEST_BUG`` are
+    diverted; everything ambiguous stays with repair, so this can never hide a
+    real code defect.
+    """
+    from harness.test_triage import classify_diagnostic, FailureClass
+    from harness.test_regeneration import test_regeneration_node
+
+    # Distinct test files carrying an unambiguous test-authoring bug (keep the
+    # first reason seen per file).
+    targets: dict[str, str] = {}
+    for d in build_result.diagnostics:
+        res = classify_diagnostic(d)
+        if res.fclass is FailureClass.TEST_BUG:
+            f = getattr(d, "file", "") or ""
+            if f and f not in targets:
+                targets[f] = f"{res.fingerprint}: {res.reason}"
+
+    if not targets:
+        return None
+
+    ordered = list(targets.items())[: max(1, max_regens)]
+    logger.info(
+        "[test_generation_node:triage-gate] %d test-authoring bug(s) detected; "
+        "regenerating %d before repair: %s",
+        len(targets), len(ordered), ", ".join(f for f, _ in ordered),
+    )
+
+    extra_modified: list[str] = []
+    regen_statuses: dict[str, str] = {}
+    for test_rel, reason in ordered:
+        regen_state = {
+            "node_state": {
+                "unsatisfiable_test": test_rel,
+                "unsatisfiable_test_reason": reason,
+            },
+            "workspace_path": workspace_path,
+            "loop_counter": loop_counter,
+            "test_regeneration_config": state.get("test_regeneration_config", {}) or {},
+            "messages": state.get("messages", []) or [],
+            "budget_remaining_usd": budget,
+            "token_tracker": token_tracker,
+            "modified_files": [],
+        }
+        try:
+            out = await test_regeneration_node(regen_state)
+        except Exception:  # noqa: BLE001 — a regen fault must not sink the build
+            logger.warning(
+                "[test_generation_node:triage-gate] regeneration raised for %s; "
+                "leaving it for repair.", test_rel, exc_info=True,
+            )
+            regen_statuses[test_rel] = "error"
+            continue
+        token_tracker = out.get("token_tracker", token_tracker)
+        budget = float(out.get("budget_remaining_usd", budget))
+        loop_counter.update(out.get("loop_counter", {}) or {})
+        for m in out.get("modified_files", []) or []:
+            if m not in extra_modified:
+                extra_modified.append(m)
+        regen_statuses[test_rel] = (
+            (out.get("node_state") or {})
+            .get("test_regeneration", {})
+            .get("status", "unknown")
+        )
+
+    if not extra_modified:
+        logger.info(
+            "[test_generation_node:triage-gate] no test file was rewritten "
+            "(statuses=%s); routing failures to repair unchanged.",
+            regen_statuses,
+        )
+        return None
+
+    logger.info(
+        "[test_generation_node:triage-gate] rewrote %d test file(s); "
+        "re-running the test command.", len(extra_modified),
+    )
+    new_build = await executor.run(test_cmd)
+    loop_counter["triage_gate_regenerated"] = (
+        loop_counter.get("triage_gate_regenerated", 0) + len(extra_modified)
+    )
+    summary = {
+        "detected": len(targets),
+        "regenerated": len(extra_modified),
+        "statuses": regen_statuses,
+        "exit_before": build_result.exit_code,
+        "exit_after": new_build.exit_code,
+    }
+    return new_build, token_tracker, budget, extra_modified, summary
+
+
+# ---------------------------------------------------------------------------
 # Public node
 # ---------------------------------------------------------------------------
 
@@ -2869,6 +2982,35 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         primary, test_cmd,
     )
     build_result = await executor.run(test_cmd)
+
+    # ADR-0005 pre-repair triage gate (config-gated, default off). When the
+    # freshly generated tests fail, divert unambiguous test-authoring bugs to
+    # proactive regeneration and re-run BEFORE the expensive repair loop sees
+    # them, so repair only ever fixes real code-vs-spec gaps. Replacing
+    # build_result here lets the existing pass/fail logic below handle the
+    # improved result unchanged — if regeneration turns the suite green, the
+    # passed branch fires automatically.
+    if bool(cfg.get("pre_repair_triage", False)) and build_result.exit_code != 0:
+        _gate = await _run_pre_repair_triage_gate(
+            state=state,
+            build_result=build_result,
+            executor=executor,
+            test_cmd=test_cmd,
+            workspace_path=workspace_path,
+            loop_counter=loop_counter,
+            token_tracker=token_tracker,
+            budget=new_budget,
+            max_regens=int(cfg.get("triage_gate_max_regens", 3)),
+        )
+        if _gate is not None:
+            build_result, token_tracker, new_budget, _gate_modified, _gate_summary = _gate
+            new_modified = list(new_modified)
+            for _m in _gate_modified:
+                if _m not in new_modified:
+                    new_modified.append(_m)
+            logger.info(
+                "[test_generation_node:triage-gate] outcome: %s", _gate_summary,
+            )
 
     if build_result.exit_code == 0:
         logger.info(

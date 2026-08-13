@@ -1,6 +1,6 @@
 # ADR-0005: Shift-Left Test Quality to Minimize the Repair Loop
 
-**Status:** Proposed
+**Status:** Accepted (items 1–2 shipped, gate default off pending a validation run; suite right-sizing 4–6 phased — see Action Items)
 **Date:** 2026-08-13
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention), [[ADR-0003]] (hybrid deterministic + LLM test generation)
@@ -247,18 +247,26 @@ later once the loop is doing genuine work.
 
 ## Action Items
 
-1. [ ] **Repair-cost telemetry, split by oracle class.** Extend the ADR-0002/
-       incident telemetry so each repair round is tagged `test-bug` vs
-       `code-gap`. This is the baseline that proves (or refutes) the 77%→target
-       drop; land it *before* the gate so the effect is measurable.
-2. [ ] **Pre-repair test-triage gate** in `test_generation_node`: run new tests
-       once, classify failures with the conservative deterministic heuristics,
-       regenerate `test-bug` clusters via the ADR-0001 machinery, pass only
-       `code-gap` downstream. Config-gated, default off until telemetry lands.
-3. [ ] **`test-bug` fingerprint library** — start with the observed set
-       (unresolved `patch()` target; asserted-but-never-raised exception via
-       AST; raw-row access without `row_factory`; test-module import/collection
-       error) and grow it from telemetry.
+1. [x] **Repair-cost telemetry, split by oracle class.** `repair_node` now
+       classifies each round's diagnostics (`harness/test_triage.py`) and
+       accumulates `triage_test_bug_diags` / `triage_code_gap_diags` /
+       `triage_rounds_with_test_bug` into `loop_counter` → `last_build.json`,
+       plus a per-round `[repair_node:triage]` log line. Observational only;
+       lands the measurement baseline for the 77%→target drop.
+2. [x] **Pre-repair test-triage gate** in `test_generation_node`
+       (`_run_pre_repair_triage_gate`): on a failed test run, classify
+       failures, regenerate `TEST_BUG` clusters via the ADR-0001 machinery
+       (`test_regeneration_node`), re-run once, and pass only the residual
+       (code-gap) failures to repair. Config-gated
+       `test_generation.pre_repair_triage` (default off) +
+       `triage_gate_max_regens` (default 3). Conservative: only unambiguous
+       test-authoring bugs are diverted, so it can never mask a code defect.
+3. [~] **`test-bug` fingerprint library** — shipped with the two proven
+       high-confidence fingerprints (`test-undefined-name`,
+       `test-raw-row-subscript`, grounded in the real 019ff418 diagnostics).
+       Still to add and grow from telemetry: unresolved `patch()` target (AST),
+       asserted-but-never-raised exception (AST), test-module import/collection
+       error.
 4. [ ] **Canonical single-suite authoring** — one test file per source module;
        deterministic tiers emit into it; eliminate the `server/tests` vs
        `tests/unit` split at authoring time (fold the recurring split-tree fix).
@@ -268,3 +276,7 @@ later once the loop is doing genuine work.
        regeneration to in-memory SQLite + `TestClient`.
 7. [ ] **Measure and decide on Option C** — from the post-gate residual repair
        share, decide whether contract-first co-generation is worth building.
+
+**Status note (2026-08-13):** items 1–2 shipped; 3 partial. The gate defaults
+off pending a validation run with the telemetry to confirm the test-bug-vs-
+code-gap split and the regeneration hit-rate before enabling by default.

@@ -383,15 +383,31 @@ def _insert_features(
     features: list[dict[str, Any]],
     now: str,
 ) -> dict[str, int]:
-    """Insert features. Returns ``feature_key → feature_id``."""
+    """Insert features. Returns ``feature_key → feature_id``.
+
+    Deduplicates by ``feature_key`` (first wins). A spec parse can emit two
+    features sharing a key (duplicate or merged headings); the table carries a
+    ``UNIQUE(workspace, feature_key)`` constraint, so a raw re-insert raises
+    ``IntegrityError``, aborts reconcile, and leaves the build with zero
+    stories → no code generated at all (lumina 019ff55f crashed here at
+    decomposition). Skipping the duplicate self-heals, mirroring the story_key
+    dedup in ``reconcile_workspace_from_spec``.
+    """
     ids: dict[str, int] = {}
     for f in features:
+        fk = f["feature_key"]
+        if fk in ids:
+            logger.warning(
+                "[spec_reconciler] duplicate feature_key %r in parsed spec — "
+                "keeping first, skipping duplicate.", fk,
+            )
+            continue
         cur = conn.execute(
             "INSERT INTO features(workspace, feature_key, name, description, created_at)"
             " VALUES(?, ?, ?, ?, ?)",
-            (workspace, f["feature_key"], f["name"], f.get("description", ""), now),
+            (workspace, fk, f["name"], f.get("description", ""), now),
         )
-        ids[f["feature_key"]] = int(cur.lastrowid)
+        ids[fk] = int(cur.lastrowid)
     return ids
 
 
@@ -509,6 +525,7 @@ def reconcile_workspace_from_spec(
         }
         stories_written = 0
         links_written = 0
+        seen_story_keys: set[str] = set()
         for spec in parsed["stories"]:
             fk = spec["feature"]
             if fk not in feature_id_by_key:
@@ -518,6 +535,17 @@ def reconcile_workspace_from_spec(
             # form; ``_canon`` is idempotent so this is defence-in-
             # depth against a future spec parser change.
             spec_key = story_state._canon(spec["story_key"])
+            # Dedupe by canonical story_key (first wins). ``stories`` carries a
+            # ``UNIQUE(workspace, story_key)`` constraint, so a duplicate spec
+            # story would raise ``IntegrityError`` and abort reconcile exactly
+            # like the feature_key case above. Skipping self-heals instead.
+            if spec_key in seen_story_keys:
+                logger.warning(
+                    "[spec_reconciler] duplicate story_key %r in parsed spec — "
+                    "keeping first, skipping duplicate.", spec_key,
+                )
+                continue
+            seen_story_keys.add(spec_key)
             llm_hit = matches.get(spec["story_key"])
             scope_files = (llm_hit or {}).get("scope_files", []) or []
             story_id = _insert_story(

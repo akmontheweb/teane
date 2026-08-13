@@ -15843,6 +15843,39 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # The LLM only sees the unhandled tail.
     errors = cast("list[DiagnosticObjectDict]", unhandled)
 
+    # ADR-0005 telemetry (observational). Classify this round's failures as
+    # test-bug (a defect in the generated test's OWN authoring) vs code-gap (a
+    # real code-vs-spec mismatch). Logged per round and accumulated into
+    # loop_counter so the repair-cost split reaches last_build.json — the
+    # baseline that measures whether the shift-left triage gate moves the
+    # measured ~77% repair share. Pure measurement: changes no routing, and is
+    # wrapped so a classifier fault can never break the repair loop.
+    try:
+        from harness.test_triage import summarize_failures
+        _triage = summarize_failures(errors)
+        if errors:
+            logger.info(
+                "[repair_node:triage] round %d: test_bug=%d code_gap=%d%s",
+                loop_counter.get("total_repairs", 0),
+                _triage["test_bug"], _triage["code_gap"],
+                (f" fingerprints={_triage['fingerprints']}"
+                 if _triage["fingerprints"] else ""),
+            )
+        loop_counter["triage_test_bug_diags"] = (
+            loop_counter.get("triage_test_bug_diags", 0) + _triage["test_bug"]
+        )
+        loop_counter["triage_code_gap_diags"] = (
+            loop_counter.get("triage_code_gap_diags", 0) + _triage["code_gap"]
+        )
+        if _triage["test_bug"]:
+            loop_counter["triage_rounds_with_test_bug"] = (
+                loop_counter.get("triage_rounds_with_test_bug", 0) + 1
+            )
+    except Exception:  # noqa: BLE001 — telemetry must never break repair
+        logger.debug(
+            "[repair_node:triage] classification skipped", exc_info=True
+        )
+
     # Promote the wider-context file-content snippets from prior patch
     # failures to a top-of-prompt section BEFORE the diagnostic block.
     # The LLM's anchoring behaviour benefits from seeing the actual

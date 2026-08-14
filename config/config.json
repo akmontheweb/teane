@@ -345,7 +345,7 @@
         "enabled": true,
         "max_iterations": 5,
         "property_based_tests": true,
-        "pre_repair_triage": false,
+        "pre_repair_triage": true,
         "triage_gate_max_regens": 3
     },
     "test_regeneration": {

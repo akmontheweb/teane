@@ -1,6 +1,6 @@
 # ADR-0005: Shift-Left Test Quality to Minimize the Repair Loop
 
-**Status:** Accepted (items 1–2 shipped, gate default off pending a validation run; suite right-sizing 4–6 phased — see Action Items)
+**Status:** Accepted (items 1–2 shipped, gate default **on** as of 2026-08-13 — pending first live validation; suite right-sizing 4–6 phased — see Action Items)
 **Date:** 2026-08-13
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention), [[ADR-0003]] (hybrid deterministic + LLM test generation)
@@ -277,6 +277,9 @@ later once the loop is doing genuine work.
 7. [ ] **Measure and decide on Option C** — from the post-gate residual repair
        share, decide whether contract-first co-generation is worth building.
 
-**Status note (2026-08-13):** items 1–2 shipped; 3 partial. The gate defaults
-off pending a validation run with the telemetry to confirm the test-bug-vs-
-code-gap split and the regeneration hit-rate before enabling by default.
+**Status note (2026-08-13):** items 1–2 shipped; 3 partial. The gate was
+enabled by default (`test_generation.pre_repair_triage: true`) to exercise it on
+the next build; it had not yet run live at flip time, so the first run with the
+telemetry is the real validation of the test-bug-vs-code-gap split and the
+regeneration hit-rate. Revert to `false` if that run shows a poor hit-rate or
+any false-divert.

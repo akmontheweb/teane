@@ -866,6 +866,18 @@ _TESTS_ROOT_SEGMENTS: frozenset[str] = frozenset({
     "tests", "test", "__tests__",
 })
 
+# Tier subdirectories that sit *inside* a tests root and split one module's
+# tests across parallel files (``tests/unit/test_x.py`` vs ``tests/test_x.py``
+# vs ``tests/integration/test_x.py``). ADR-0005 item #4: the same module tested
+# under different tiers is the recurring split-tree bug, so the duplicate-root
+# check normalises these away before comparing. Distinctly-NAMED tier tests
+# (e.g. ADR-0003 ``tests/contract/test_x_contract.py``) keep their own basename
+# and are unaffected.
+_TEST_TIER_SUBDIRS: frozenset[str] = frozenset({
+    "unit", "integration", "contract", "functional", "e2e",
+    "component", "smoke", "acceptance",
+})
+
 # Directories the workspace walk should NOT descend into. Mirrors
 # ``harness/graph.py``'s ``_HITL_SKIP_DIRS`` so this walk stays fast on
 # realistic monorepos.
@@ -895,6 +907,20 @@ def _extract_test_scoped_suffix(rel_path: str) -> Optional[str]:
         if seg in _TESTS_ROOT_SEGMENTS:
             return "/".join(parts[i:])
     return None
+
+
+def _canonical_test_suffix(suffix: str) -> str:
+    """Normalise a test-scoped suffix so the same module tested under different
+    tiers compares equal (ADR-0005 item #4). Strips a single tier subdirectory
+    immediately after the leading tests-root segment:
+    ``tests/unit/test_x.py`` and ``tests/integration/test_x.py`` both fold to
+    ``tests/test_x.py`` — matching a package-nested ``server/tests/test_x.py``.
+    Only the one tier segment right after the root is dropped; deeper package
+    structure and the basename are preserved."""
+    parts = suffix.split("/")
+    if len(parts) >= 3 and parts[1] in _TEST_TIER_SUBDIRS:
+        parts = [parts[0]] + parts[2:]
+    return "/".join(parts)
 
 
 def _detect_duplicate_test_root(
@@ -927,6 +953,11 @@ def _detect_duplicate_test_root(
     new_suffix = _extract_test_scoped_suffix(new_rel_path)
     if new_suffix is None:
         return None
+    # ADR-0005 item #4: compare tier-normalised suffixes so the same module
+    # tested under different tiers (unit/integration/…) or roots (repo-root
+    # ``tests/`` vs package-nested ``server/tests/``) is caught as ONE split
+    # tree, not missed because an intermediate ``unit/`` differs.
+    new_suffix_canon = _canonical_test_suffix(new_suffix)
     if not os.path.isdir(workspace_root):
         return None
     # Normalise for suffix comparison — POSIX separators throughout.
@@ -943,7 +974,8 @@ def _detect_duplicate_test_root(
         if candidate_norm == new_rel_norm:
             continue  # same path — that's the ``already exists`` case, not a duplicate root
         candidate_suffix = _extract_test_scoped_suffix(candidate_norm)
-        if candidate_suffix == new_suffix:
+        if candidate_suffix is not None and \
+                _canonical_test_suffix(candidate_suffix) == new_suffix_canon:
             duplicates.append(candidate_norm)
         if len(duplicates) >= 3:
             break  # bound the message payload

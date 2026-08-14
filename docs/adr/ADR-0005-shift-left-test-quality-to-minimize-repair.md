@@ -1,6 +1,6 @@
 # ADR-0005: Shift-Left Test Quality to Minimize the Repair Loop
 
-**Status:** Accepted (items 1–3 shipped, gate default **on** as of 2026-08-13 — pending first live validation; suite right-sizing 4–6 phased — see Action Items)
+**Status:** Accepted (items 1–4 shipped, gate default **on** as of 2026-08-13 — pending first live validation; items 5–6 phased — see Action Items)
 **Date:** 2026-08-13
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention), [[ADR-0003]] (hybrid deterministic + LLM test generation)
@@ -281,9 +281,19 @@ later once the loop is doing genuine work.
        regeneration), and the 019ff418 evidence agrees — every `DID NOT RAISE`
        there was a downstream symptom of the async-connection code bug. It
        stays `CODE_GAP`.
-4. [ ] **Canonical single-suite authoring** — one test file per source module;
-       deterministic tiers emit into it; eliminate the `server/tests` vs
-       `tests/unit` split at authoring time (fold the recurring split-tree fix).
+4. [x] **Canonical single-suite authoring (split-tree scope)** — the land-time
+       `DUPLICATE_TEST_ROOT` guard (`patcher._detect_duplicate_test_root`) now
+       compares TIER-NORMALISED test-scoped suffixes (`_canonical_test_suffix`
+       strips one `unit/`/`integration/`/`contract/`… segment after the tests
+       root), so the same module tested under `tests/unit/` **and**
+       `server/tests/` **and** `tests/integration/` is caught as ONE split tree
+       — the intermediate tier dir no longer lets it slip past. Distinctly-named
+       tier tests (ADR-0003 `tests/contract/test_x_contract.py`) keep their own
+       basename and are unaffected. Enforces the existing "one canonical
+       location per module" prompt convention that the guard previously
+       under-enforced. (Aggressive cross-tier *content* collapse — folding
+       unit+integration+contract for a module into one file — was scoped out to
+       item #5 to avoid breaking legitimate multi-tier layouts.)
 5. [ ] **Tier collapse by app size** — thresholds that drop near-duplicative
        integration/contract tiers for small greenfield builds.
 6. [ ] **No-mock static gate** — reject internal-module mocks; steer

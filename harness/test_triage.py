@@ -93,6 +93,13 @@ _UNDEFINED_NAME_RE = re.compile(r"name '([^']+)' is not defined")
 _TUPLE_SUBSCRIPT_RE = re.compile(
     r"tuple indices must be integers or slices, not str"
 )
+# unittest.mock raises this exact phrasing when ``patch("mod.attr")`` names an
+# attribute the module does not define — distinctive to a bad patch target.
+_PATCH_TARGET_MISS_RE = re.compile(r"does not have the attribute")
+# ``ImportError: cannot import name 'X' from 'Y'`` — Y was found but does not
+# export X (a renamed/nonexistent symbol the test imported). Distinct from
+# ``No module named`` (a missing module/dependency), which stays a code-gap.
+_BAD_SYMBOL_IMPORT_RE = re.compile(r"cannot import name ['\"]([^'\"]+)['\"]")
 
 
 def _classify_test_frame(
@@ -126,6 +133,30 @@ def _classify_test_frame(
             "test subscripts a tuple row by name — its own connection never "
             "set row_factory (raw sqlite3/aiosqlite rows are tuples)",
         )
+
+    # AttributeError: <module 'x'> does not have the attribute 'Y' — a
+    # ``patch("x.Y")`` aimed at a target the module never defines. The phrasing
+    # is unittest.mock-specific, so within a test frame it is a test-side
+    # mistake (wrong/renamed patch target), not a production gap.
+    if code == "AttributeError" and _PATCH_TARGET_MISS_RE.search(msg):
+        return TriageResult(
+            FailureClass.TEST_BUG, "test-unresolved-patch-target", "high",
+            "test patches a target the module does not define "
+            "(unittest.mock 'does not have the attribute')",
+        )
+
+    # ImportError: cannot import name 'X' from 'Y' — the module Y resolved but
+    # does not export X: the test imports a renamed/nonexistent symbol. Only the
+    # ``cannot import name`` shape qualifies; a bare ``No module named`` is a
+    # missing module/dependency and stays a code-gap (repair/env owns it).
+    if code in ("ImportError", "ModuleNotFoundError"):
+        m = _BAD_SYMBOL_IMPORT_RE.search(msg)
+        if m:
+            return TriageResult(
+                FailureClass.TEST_BUG, "test-bad-symbol-import", "high",
+                f"test imports name {m.group(1)!r} that its target module "
+                f"does not export",
+            )
 
     return None
 

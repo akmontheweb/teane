@@ -1,6 +1,6 @@
 # ADR-0005: Shift-Left Test Quality to Minimize the Repair Loop
 
-**Status:** Accepted (items 1–2 shipped, gate default **on** as of 2026-08-13 — pending first live validation; suite right-sizing 4–6 phased — see Action Items)
+**Status:** Accepted (items 1–3 shipped, gate default **on** as of 2026-08-13 — pending first live validation; suite right-sizing 4–6 phased — see Action Items)
 **Date:** 2026-08-13
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0001]] (repair-side test regeneration), [[ADR-0002]] (generation-side contradiction prevention), [[ADR-0003]] (hybrid deterministic + LLM test generation)
@@ -261,12 +261,26 @@ later once the loop is doing genuine work.
        `test_generation.pre_repair_triage` (default off) +
        `triage_gate_max_regens` (default 3). Conservative: only unambiguous
        test-authoring bugs are diverted, so it can never mask a code defect.
-3. [~] **`test-bug` fingerprint library** — shipped with the two proven
-       high-confidence fingerprints (`test-undefined-name`,
-       `test-raw-row-subscript`, grounded in the real 019ff418 diagnostics).
-       Still to add and grow from telemetry: unresolved `patch()` target (AST),
-       asserted-but-never-raised exception (AST), test-module import/collection
-       error.
+3. [x] **`test-bug` fingerprint library** — four high-confidence, distinctive
+       fingerprints, all message-based (no AST/workspace context needed, so
+       fully unit-testable): `test-undefined-name` (`NameError: name 'x' is not
+       defined`), `test-raw-row-subscript` (the `row_factory` `TypeError`),
+       `test-unresolved-patch-target` (unittest.mock `does not have the
+       attribute` — a `patch()` at a target the module doesn't define), and
+       `test-bad-symbol-import` (`ImportError: cannot import name 'X' from 'Y'`
+       — Y resolved but doesn't export X). A bare `No module named` stays a
+       code-gap (missing module/dependency — repair/env owns it), and grow
+       further from telemetry.
+       **Deliberately NOT a fingerprint — asserted-but-never-raised
+       (`DID NOT RAISE E`):** it is fundamentally ambiguous. "The test invented
+       a bogus contract" and "the code should raise E but doesn't (a real gap)"
+       are indistinguishable from the failure alone, and even AST evidence
+       ("the code module never mentions E") cannot separate a bogus assertion
+       from a missing-validation code-gap. Diverting it would violate the
+       conservative-default safety property (never send a code-gap to
+       regeneration), and the 019ff418 evidence agrees — every `DID NOT RAISE`
+       there was a downstream symptom of the async-connection code bug. It
+       stays `CODE_GAP`.
 4. [ ] **Canonical single-suite authoring** — one test file per source module;
        deterministic tiers emit into it; eliminate the `server/tests` vs
        `tests/unit` split at authoring time (fold the recurring split-tree fix).
@@ -277,7 +291,8 @@ later once the loop is doing genuine work.
 7. [ ] **Measure and decide on Option C** — from the post-gate residual repair
        share, decide whether contract-first co-generation is worth building.
 
-**Status note (2026-08-13):** items 1–2 shipped; 3 partial. The gate was
+**Status note (2026-08-13):** items 1–3 shipped (item 3 excludes the
+deliberately-deferred asserted-but-never-raised case; see item 3). The gate was
 enabled by default (`test_generation.pre_repair_triage: true`) to exercise it on
 the next build; it had not yet run live at flip time, so the first run with the
 telemetry is the real validation of the test-bug-vs-code-gap split and the

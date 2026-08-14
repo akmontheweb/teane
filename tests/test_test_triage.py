@@ -45,6 +45,29 @@ class TestTestBugFingerprints:
         assert r.fclass is FailureClass.TEST_BUG
         assert r.fingerprint == "test-raw-row-subscript"
 
+    def test_unresolved_patch_target_is_test_bug(self):
+        # AttributeError: <module 'server.app.services'> does not have the attribute 'foo'
+        d = _diag(
+            "tests/unit/test_contact_service.py", "AttributeError",
+            "<module 'server.app.services.contact_service'> does not have the "
+            "attribute 'nonexistent'",
+        )
+        r = classify_diagnostic(d)
+        assert r.fclass is FailureClass.TEST_BUG
+        assert r.fingerprint == "test-unresolved-patch-target"
+
+    def test_bad_symbol_import_is_test_bug(self):
+        # ImportError: cannot import name 'ContactModelz' from 'server.app.models.contact'
+        d = _diag(
+            "tests/unit/test_contact_model.py", "ImportError",
+            "cannot import name 'ContactModelz' from "
+            "'server.app.models.contact'",
+        )
+        r = classify_diagnostic(d)
+        assert r.fclass is FailureClass.TEST_BUG
+        assert r.fingerprint == "test-bad-symbol-import"
+        assert "ContactModelz" in r.reason
+
     def test_same_typeerror_in_source_is_code_gap(self):
         # The row-subscript message in a SOURCE file is not a test-authoring
         # bug — repair owns it.
@@ -80,6 +103,21 @@ class TestConservativeDefaults:
             "'coroutine' object does not support the asynchronous context "
             "manager protocol",
         )
+        assert classify_diagnostic(d).fclass is FailureClass.CODE_GAP
+
+    def test_missing_module_import_stays_code_gap(self):
+        # 'No module named X' is a missing module/dependency (repair/env owns
+        # it), NOT a test-authoring bug — must not be diverted to regeneration.
+        d = _diag("tests/unit/test_x.py", "ModuleNotFoundError",
+                  "No module named 'aiosqlite'")
+        assert classify_diagnostic(d).fclass is FailureClass.CODE_GAP
+
+    def test_asserted_but_never_raised_stays_code_gap(self):
+        # DID NOT RAISE is fundamentally ambiguous — "test invented a bogus
+        # contract" vs "code should raise but doesn't (a real gap)" are
+        # indistinguishable from the failure alone. Conservative default holds.
+        d = _diag("tests/unit/test_contact_service.py", "Failed",
+                  "DID NOT RAISE ValueError")
         assert classify_diagnostic(d).fclass is FailureClass.CODE_GAP
 
     def test_unknown_test_exception_defaults_to_code_gap(self):

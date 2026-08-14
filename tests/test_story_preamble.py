@@ -82,6 +82,36 @@ def test_preamble_includes_key_title_and_criteria(workspace: str):
     assert "src/auth/register.py" in preamble
 
 
+def test_preamble_no_acs_avoids_contradiction(tmp_path: Path):
+    # A story with NO recorded acceptance criteria must NOT tell the model to
+    # "focus on the acceptance criteria below" and then show "(none recorded)"
+    # — that self-contradiction sent the model hunting the spec for criteria
+    # the block implied were missing (lumina 019fff37 empty patching output).
+    ws_dir = tmp_path / "noac-ws"
+    ws_dir.mkdir()
+    ws = str(ws_dir)
+    app = story_state.app_name_for_workspace(ws)
+    conn = story_state.open_story_db()
+    try:
+        story_state.create_features(conn, app, [{"feature_key": "f", "name": "F"}])
+        story_state.create_stories(conn, app, [{
+            "title": "Display upcoming birthdays dashboard",
+            "feature": "f",
+            "acceptance_criteria": [],
+            "scope_files": ["src/dashboard.py"],
+            "external_ref": None,
+        }])
+    finally:
+        conn.close()
+    state = {"workspace_path": ws, "current_story_id": "STORY-1"}
+    p = _build_story_preamble(state, "patching")
+    assert "Display upcoming birthdays dashboard" in p     # title still shown
+    assert "(none recorded)" not in p                      # no misleading bullet
+    assert "Focus on the acceptance criteria below" not in p
+    assert "Implement the behaviour its title describes" in p
+    assert "Do NOT go hunting" in p                        # counters the hunt
+
+
 def test_preamble_marker_contract_for_patching(workspace: str):
     state = {
         "workspace_path": workspace,

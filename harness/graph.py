@@ -21981,13 +21981,40 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     _ac_texts = [str(r.get("text", "")) for r in ac_rows] if ac_rows else list(ac)
     policy_block = _build_nfr_policy_block(_ac_texts, workspace)
 
+    # When no acceptance criteria are recorded for this story, DON'T tell the
+    # model to "focus on the acceptance criteria below" and then show
+    # "(none recorded)" — that self-contradiction sent deepseek hunting the
+    # spec for criteria the block implied were missing (lumina 019fff37 empty
+    # patching output). Point it at the story title + the spec already in
+    # context, and explicitly tell it not to go reading more files.
+    has_acs = bool(ac_rows or ac)
+    if has_acs:
+        intro = (
+            "This patching turn is scoped to ONE story. Focus on the "
+            "acceptance criteria below; do not attempt to deliver the "
+            "whole specification in a single pass."
+        )
+        ac_section = f"### Acceptance criteria\n{ac_block}\n\n"
+    else:
+        intro = (
+            "This patching turn is scoped to ONE story. Implement the "
+            "behaviour its title describes; do not attempt to deliver the "
+            "whole specification in a single pass."
+        )
+        ac_section = (
+            "### Acceptance criteria\n"
+            "Not separately recorded for this story — derive the required "
+            "behaviour from the story title above and the full specification "
+            "already provided in the system prompt (vision, schema, API "
+            "contracts and per-story detail are all in context). Do NOT go "
+            "hunting for additional files to read to find them; the spec in "
+            "context is authoritative.\n\n"
+        )
+
     return (
         f"## Story Scope: {story_key} — {story.get('title', '')}\n\n"
-        "This patching turn is scoped to ONE story. Focus on the "
-        "acceptance criteria below; do not attempt to deliver the "
-        "whole specification in a single pass.\n\n"
-        "### Acceptance criteria\n"
-        f"{ac_block}\n\n"
+        f"{intro}\n\n"
+        f"{ac_section}"
         f"{policy_block}"
         "### File scope (advisory)\n"
         f"{scope_block}\n\n"

@@ -2860,6 +2860,36 @@ class Gateway:
             return self.config.decomposition_reviewer_mode.lower() in ("thinking", "thinking_max")
         return False
 
+    def _role_fallback(self, role: NodeRole) -> tuple[str, Optional[bool]]:
+        """The configured fallback model key + its thinking mode for ``role``,
+        or ``("", None)`` when no fallback is set.
+
+        Consumed by :meth:`dispatch` when the primary returns nothing usable,
+        so ``<role>_fallback`` actually covers a primary that isn't working
+        (lumina 019fff37: deepseek-v4-pro returned empty patching responses;
+        the moonshot:kimi-k3 fallback was configured but never fired). Judgment
+        reuses the repair fallback, mirroring :meth:`select_model`."""
+        def _thinks(mode: str) -> bool:
+            return (mode or "").lower() in ("thinking", "thinking_max")
+        c = self.config
+        if role == NodeRole.PATCHING:
+            return c.patching_fallback, _thinks(c.patching_fallback_mode)
+        if role in (NodeRole.REPAIR, NodeRole.JUDGMENT):
+            return c.repair_fallback, _thinks(c.repair_fallback_mode)
+        if role == NodeRole.PLANNING:
+            return c.planning_fallback, _thinks(c.planning_fallback_mode)
+        if role == NodeRole.DOC_REVIEWER:
+            return c.doc_reviewer_fallback, _thinks(c.doc_reviewer_fallback_mode)
+        if role == NodeRole.CODE_REVIEWER:
+            return c.code_reviewer_fallback, _thinks(c.code_reviewer_fallback_mode)
+        if role == NodeRole.DECOMPOSITION:
+            return (c.decomposition_fallback,
+                    _thinks(c.decomposition_fallback_mode))
+        if role == NodeRole.DECOMPOSITION_REVIEWER:
+            return (c.decomposition_reviewer_fallback,
+                    _thinks(c.decomposition_reviewer_fallback_mode))
+        return "", None
+
     def _max_tokens_for(self, role: NodeRole) -> Optional[int]:
         """Resolve the per-call max_tokens ceiling for ``role``.
 
@@ -2909,6 +2939,7 @@ class Gateway:
         model_override: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
         cache_family: Optional[str] = None,
+        _thinking_override: Optional[bool] = None,
         **llm_kwargs: Any,
     ) -> tuple[LLMResponse, float]:
         """
@@ -2994,7 +3025,10 @@ class Gateway:
             model_key = model_override
         else:
             model_key = self.select_model(role, force_local=force_local)
-        thinking = self.should_use_thinking(role)
+        thinking = (
+            _thinking_override if _thinking_override is not None
+            else self.should_use_thinking(role)
+        )
 
         # If budget is low and not forcing local, fall back to ollama to preserve budget
         if budget_remaining_usd < 0.05 and not force_local and not self.config.force_local_only:
@@ -3452,6 +3486,33 @@ class Gateway:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Auto-fallback: the primary produced nothing usable after retries,
+            # so try the configured ``<role>_fallback`` model once before
+            # surfacing to HITL — that is exactly what a fallback is for
+            # (lumina 019fff37: deepseek-v4-pro returned empty patching
+            # responses for ~7 min each while the kimi-k3 fallback sat idle).
+            # Guard on ``model_override is None`` so a fallback attempt (which
+            # sets model_override) never recurses into a second fallback.
+            _fb_model, _fb_thinking = self._role_fallback(role)
+            if (model_override is None and not force_local
+                    and _fb_model and _fb_model != model_key):
+                logger.warning(
+                    "[gateway] Primary %s returned empty content for role=%s "
+                    "after retries; falling back to %s.",
+                    model_key, role.value, _fb_model,
+                )
+                return await self.dispatch(
+                    messages=messages,
+                    role=role,
+                    budget_remaining_usd=max(
+                        0.0, budget_remaining_usd - accumulated_cost),
+                    force_local=force_local,
+                    model_override=_fb_model,
+                    tools=tools,
+                    cache_family=cache_family,
+                    _thinking_override=_fb_thinking,
+                    **llm_kwargs,
+                )
             if last_retry_exc is not None:
                 # Surface the actual transport / rate-limit failure
                 # rather than the downstream "empty content" symptom.

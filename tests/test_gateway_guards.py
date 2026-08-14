@@ -107,6 +107,79 @@ async def test_empty_llm_response_raises_after_retries():
 
 
 @pytest.mark.asyncio
+async def test_empty_primary_falls_back_to_fallback_model():
+    """lumina 019fff37: when the primary returns empty content after retries
+    and a ``<role>_fallback`` is configured, dispatch falls back to it instead
+    of raising to HITL — that is what the fallback is for."""
+    empty = TokenUsage(input_tokens=10, output_tokens=0, model_name="stub:primary", cost_usd=0.0)
+    fb_usage = TokenUsage(input_tokens=10, output_tokens=20, model_name="stub:fb", cost_usd=0.0002)
+    primary = _StubProvider([
+        LLMResponse(content="", usage=empty, model="stub:primary"),
+        LLMResponse(content="", usage=empty, model="stub:primary"),
+        LLMResponse(content="", usage=empty, model="stub:primary"),
+    ])
+    fb = _StubProvider([
+        LLMResponse(content="FALLBACK OUTPUT", usage=fb_usage, model="stub:fb"),
+    ])
+    _stub_model("stub:primary")
+    _stub_model("stub:fb")
+    cfg = GatewayConfig(
+        patching_primary="stub:primary",
+        patching_fallback="stub:fb",
+        patching_fallback_mode="non_thinking",
+    )
+    gateway = Gateway(cfg)
+    gateway._providers["stub:primary"] = primary  # type: ignore[index]
+    gateway._providers["stub:fb"] = fb  # type: ignore[index]
+    response, _ = await gateway.dispatch(
+        messages=[{"role": "system", "content": "s"},
+                  {"role": "user", "content": "u"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+    )
+    assert response.content == "FALLBACK OUTPUT"
+    assert primary.calls >= 3   # primary exhausted its empty-retries first
+    assert fb.calls == 1        # fallback invoked exactly once
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_does_not_recurse():
+    """If the fallback ALSO returns empty, dispatch raises — the fallback call
+    sets model_override, so it must not recurse into a second fallback."""
+    empty_p = TokenUsage(model_name="stub:primary")
+    empty_f = TokenUsage(model_name="stub:fb")
+    primary = _StubProvider([LLMResponse(content="", usage=empty_p, model="stub:primary")] * 3)
+    fb = _StubProvider([LLMResponse(content="", usage=empty_f, model="stub:fb")] * 3)
+    _stub_model("stub:primary")
+    _stub_model("stub:fb")
+    cfg = GatewayConfig(patching_primary="stub:primary", patching_fallback="stub:fb")
+    gateway = Gateway(cfg)
+    gateway._providers["stub:primary"] = primary  # type: ignore[index]
+    gateway._providers["stub:fb"] = fb  # type: ignore[index]
+    with pytest.raises(EmptyLLMResponseError):
+        await gateway.dispatch(
+            messages=[{"role": "system", "content": "s"},
+                      {"role": "user", "content": "u"}],
+            role=NodeRole.PATCHING,
+            budget_remaining_usd=1.0,
+        )
+    assert fb.calls >= 1  # the fallback WAS tried before giving up
+
+
+def test_role_fallback_reads_config():
+    _stub_model("stub:fb")
+    cfg = GatewayConfig(
+        patching_fallback="stub:fb", patching_fallback_mode="thinking",
+        repair_fallback="stub:fb", repair_fallback_mode="non_thinking",
+    )
+    gw = Gateway(cfg)
+    assert gw._role_fallback(NodeRole.PATCHING) == ("stub:fb", True)
+    assert gw._role_fallback(NodeRole.REPAIR) == ("stub:fb", False)
+    # Judgment reuses the repair fallback (mirrors select_model).
+    assert gw._role_fallback(NodeRole.JUDGMENT) == ("stub:fb", False)
+
+
+@pytest.mark.asyncio
 async def test_empty_then_recovers_succeeds():
     """One empty response followed by real content should NOT raise — the
     empty-retry loop is expected to recover gracefully when the provider

@@ -292,6 +292,67 @@ def test_normalize_messages_converts_assistant_tool_use_blocks():
     }
 
 
+def test_normalize_messages_preserves_reasoning_content():
+    """DeepSeek thinking mode requires the assistant turn's reasoning_content
+    to be echoed back on the wire (lumina 019ffb1a HTTP 400)."""
+    msgs = [
+        {"role": "assistant",
+         "reasoning_content": "First I will read the file, then edit it.",
+         "content": [
+             {"type": "tool_use", "id": "tu_1", "name": "read_file",
+              "input": {"file_path": "a"}},
+         ]},
+    ]
+    out = _normalize_messages_for_openai_tools(msgs)
+    assert out[0]["reasoning_content"] == \
+        "First I will read the file, then edit it."
+    assert out[0]["tool_calls"][0]["id"] == "tu_1"
+
+
+def test_normalize_messages_omits_reasoning_content_when_absent():
+    """A plain (non-reasoning) assistant tool turn must NOT gain a
+    reasoning_content field — OpenAI/Ollama would choke on it."""
+    msgs = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "tu_1", "name": "read_file",
+             "input": {"file_path": "a"}},
+        ]},
+    ]
+    out = _normalize_messages_for_openai_tools(msgs)
+    assert "reasoning_content" not in out[0]
+
+
+def test_build_assistant_tool_turn_carries_reasoning_content():
+    from harness.graph import _build_assistant_tool_turn
+
+    class _Resp:
+        content = "Reading first."
+        reasoning_content = "The user wants an edit; inspect the file."
+        tool_calls = [{"id": "tu_1", "name": "read_file",
+                       "input": {"file_path": "a"}}]
+
+    turn = _build_assistant_tool_turn(_Resp())
+    assert turn["reasoning_content"] == \
+        "The user wants an edit; inspect the file."
+    # Round-trips through the normalizer onto the wire.
+    out = _normalize_messages_for_openai_tools([turn])
+    assert out[0]["reasoning_content"] == \
+        "The user wants an edit; inspect the file."
+
+
+def test_build_assistant_tool_turn_no_reasoning_is_clean():
+    from harness.graph import _build_assistant_tool_turn
+
+    class _Resp:
+        content = ""
+        reasoning_content = ""
+        tool_calls = [{"id": "tu_1", "name": "read_file",
+                       "input": {"file_path": "a"}}]
+
+    turn = _build_assistant_tool_turn(_Resp())
+    assert "reasoning_content" not in turn
+
+
 def test_normalize_messages_converts_tool_result_to_role_tool():
     msgs = [
         {"role": "user", "content": [

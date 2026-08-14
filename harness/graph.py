@@ -73,6 +73,11 @@ class MessageDict(TypedDict, total=False):
     name: Optional[str]
     tool_calls: Optional[list[dict[str, Any]]]
     tool_call_id: Optional[str]
+    # DeepSeek-family thinking mode requires the assistant turn's
+    # ``reasoning_content`` to be echoed back on later turns of a multi-turn
+    # conversation. Carried here on a reconstructed assistant tool turn so the
+    # OpenAI-compat normalizer can re-emit it; absent for non-reasoning turns.
+    reasoning_content: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -3319,7 +3324,17 @@ def _build_assistant_tool_turn(response: Any) -> "MessageDict":
             "name": call.get("name") or "",
             "input": call.get("input") or {},
         })
-    return MessageDict(role="assistant", content=blocks)
+    turn = MessageDict(role="assistant", content=blocks)
+    # DeepSeek-v4-pro (and the reasoner family) in thinking mode rejects a
+    # multi-turn request whose prior assistant turn omits the reasoning it
+    # produced: HTTP 400 "The reasoning_content in the thinking mode must be
+    # passed back to the API" (lumina 019ffb1a died here in the patching tool
+    # loop). Carry it forward so _normalize_messages_for_openai_tools re-emits
+    # it on the wire. Non-reasoning providers never populate it → no-op.
+    reasoning = getattr(response, "reasoning_content", "") or ""
+    if reasoning:
+        turn["reasoning_content"] = reasoning
+    return turn
 
 
 def _build_patch_tool_results(

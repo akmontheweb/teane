@@ -627,6 +627,15 @@ def _normalize_messages_for_openai_tools(
                         "content": ("\n".join(text_parts) or None),
                         "tool_calls": tool_calls,
                     }
+                    # DeepSeek thinking mode requires the reasoning it produced
+                    # on this assistant turn to be echoed back on the wire, or
+                    # the next multi-turn request 400s. Only present when a
+                    # reasoning provider produced it (carried by
+                    # _build_assistant_tool_turn), so this is a no-op for plain
+                    # OpenAI / Ollama tool turns.
+                    reasoning = msg.get("reasoning_content")
+                    if reasoning:
+                        msg_out["reasoning_content"] = reasoning
                     out.append(msg_out)
                     continue
             elif role == "user":

@@ -112,6 +112,16 @@ def test_preamble_no_acs_avoids_contradiction(tmp_path: Path):
     assert "Do NOT go hunting" in p                        # counters the hunt
 
 
+def test_preamble_reconciles_build_everything_with_one_story(workspace: str):
+    # Prompt defect #3: the standing "build the software" task must be
+    # reconciled with per-turn scoping so the model doesn't try to build the
+    # whole spec in one story turn.
+    state = {"workspace_path": workspace, "current_story_id": "STORY-1"}
+    p = _build_story_preamble(state, "patching")
+    assert "delivered INCREMENTALLY, one story per turn" in p
+    assert "this turn does NOT build the whole spec" in p
+
+
 def test_preamble_marker_contract_for_patching(workspace: str):
     state = {
         "workspace_path": workspace,

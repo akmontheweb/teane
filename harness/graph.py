@@ -1673,6 +1673,32 @@ instead of guessing from file reads:
 """
 
 
+# Injected into the system prompt when native tool-use is active, so the
+# patcher contract that follows is framed as tools from the start instead of a
+# text DSL the end-of-prompt reminder then contradicts (prompt defect #3). Also
+# documents the read-only navigation tools (list_dir/glob/…) the model uses but
+# the prompt never named.
+_NATIVE_TOOL_MODE_BRIDGE = """
+## How to emit changes — NATIVE TOOL-USE MODE (authoritative)
+Native tool-use is ENABLED. Emit every change by CALLING a tool — never by
+writing the `<<<...>>>` text markers. Each change operation is a tool:
+  - `create_file`      — a new file with its full content       (= CREATE_FILE)
+  - `edit_file`        — exact-byte search/replace in a file     (= REPLACE_BLOCK)
+  - `delete_block`     — remove an exact-byte span               (= DELETE_BLOCK)
+  - `insert_at_block`  — insert relative to an anchor            (= INSERT_AT_BLOCK)
+Read-only navigation (never changes files, available the whole turn):
+`read_file` (fetch a file's current bytes), plus `list_dir`, `glob`, `grep`,
+`find_symbol`, and `file_outline` for exploring the workspace.
+
+The "Patch Syntax" and "Edit Invariants" sections below document the FIELDS and
+RULES of each operation (file / search / replace / content / anchor / count …).
+Those fields map 1:1 to the tool arguments, and the Edit Invariants —
+exact-byte matching, stripping any `  N| ` line-number prefix, read-before-edit
+— apply to `edit_file` exactly as written. Read them to understand each
+operation's semantics, but DO NOT reproduce the `<<<>>>` markers: call the tools.
+"""
+
+
 def _build_system_prompt(
     workspace_path: str,
     build_command: str,
@@ -1880,6 +1906,16 @@ def _build_system_prompt(
     except Exception:  # noqa: BLE001 — prompt build must never break on LSP
         pass
 
+    # When native tool-use is active (the default), the operations below are
+    # exposed as tools — reconcile the two so the model isn't taught a text DSL
+    # in the system prompt and then told to use tools instead (prompt defect
+    # #3: dual interface). A stable per-run config value, so the anchored
+    # prompt stays cache-stable within a run.
+    _uses_tools = bool(
+        (config or {}).get("patcher", {}).get("use_structured_tools", True)
+    )
+    tool_mode_bridge = _NATIVE_TOOL_MODE_BRIDGE if _uses_tools else ""
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
 {core_languages_directive}
@@ -1922,9 +1958,9 @@ must be installable by the build command.
 ## Your Role
 You are an autonomous coding agent. You will receive tasks and must:
 1. Plan the implementation strategy before writing code.
-2. Generate precise code patches using a strict SEARCH/REPLACE syntax.
+2. Generate precise code patches (via the change operations described below).
 3. Only modify files that need changes — never touch unrelated code.
-
+{tool_mode_bridge}
 ## Edit Invariants — read before writing any REPLACE_BLOCK
 
 These rules are not style guidance — they are the contract the patcher
@@ -21993,17 +22029,29 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     # spec for criteria the block implied were missing (lumina 019fff37 empty
     # patching output). Point it at the story title + the spec already in
     # context, and explicitly tell it not to go reading more files.
+    # Reconcile the standing "build the software described in the product
+    # spec" task with per-turn scoping (prompt defect #3): the full spec is
+    # delivered incrementally, one story per turn — so "build everything" and
+    # "this turn is one story" are not in conflict.
+    _incremental = (
+        "The overall goal — building the full product spec — is delivered "
+        "INCREMENTALLY, one story per turn; earlier stories are already on "
+        "disk and later ones come in their own turns. So this turn does NOT "
+        "build the whole spec. "
+    )
     has_acs = bool(ac_rows or ac)
     if has_acs:
         intro = (
-            "This patching turn is scoped to ONE story. Focus on the "
+            _incremental
+            + "This patching turn is scoped to ONE story. Focus on the "
             "acceptance criteria below; do not attempt to deliver the "
             "whole specification in a single pass."
         )
         ac_section = f"### Acceptance criteria\n{ac_block}\n\n"
     else:
         intro = (
-            "This patching turn is scoped to ONE story. Implement the "
+            _incremental
+            + "This patching turn is scoped to ONE story. Implement the "
             "behaviour its title describes; do not attempt to deliver the "
             "whole specification in a single pass."
         )

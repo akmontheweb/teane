@@ -558,6 +558,38 @@ class TestBuildPatchToolResults:
         assert "Ignored" in out[2]["content"]
         assert out[-1]["content"].endswith("[Harness]: go on.")
 
+    def test_nav_result_feeds_content_instead_of_ignored(self):
+        # A read_file call mid-emission (None block) whose id is in nav_results
+        # must get the resolved file content back, NOT "Ignored — not a patch
+        # operation" (lumina 019ffee7: rejecting read_file starved deepseek
+        # into empty output).
+        calls = [
+            _create_call("c1", "server/a.py"),
+            {"id": "rf1", "name": "read_file",
+             "input": {"file_path": "docs/SPEC.md"}},
+            {"id": "rf2", "name": "read_file",
+             "input": {"file_path": "docs/MISSING.md"}},
+        ]
+        from harness.tool_schemas import tool_call_to_patch_block
+        call_blocks = [tool_call_to_patch_block(calls[0]), None, None]
+        kept = frozenset([id(call_blocks[0])])
+        results = [
+            PatchResult(
+                success=True, file="server/a.py",
+                operation=OperationType.CREATE_FILE, lines_changed=1,
+            ),
+        ]
+        out = _build_patch_tool_results(
+            calls, call_blocks, kept, results,
+            nav_results={"rf1": "# SPEC contents here"},
+        )
+        assert "Applied" in out[0]["content"]
+        # Resolved read_file → content fed back, not "Ignored".
+        assert out[1]["content"] == "# SPEC contents here"
+        assert "Ignored" not in out[1]["content"]
+        # A None block with NO nav result still gets the Ignored message.
+        assert "Ignored" in out[2]["content"]
+
     def test_failure_carries_patcher_error(self):
         calls = [_create_call("c1", "server/a.py")]
         from harness.tool_schemas import tool_call_to_patch_block

@@ -3343,6 +3343,7 @@ def _build_patch_tool_results(
     kept_block_ids: frozenset[int],
     round_results: list[Any],
     harness_note: str = "",
+    nav_results: Optional[dict[str, str]] = None,
 ) -> list[dict[str, Any]]:
     """Per-call ``tool_result`` blocks for one patch-emission round.
 
@@ -3364,14 +3365,27 @@ def _build_patch_tool_results(
     queues: dict[tuple[str, Any], deque] = {}
     for r in round_results or []:
         queues.setdefault((r.file, r.operation), deque()).append(r)
+    _nav = nav_results or {}
     out: list[dict[str, Any]] = []
     for call, block in zip(calls, call_blocks):
         if block is None:
-            content = (
-                "Ignored — not a patch operation. Emit patch tool calls "
-                "(create_file / edit_file / …) or, if the story's "
-                "production code is complete, reply with no tool calls."
-            )
+            _cid = call.get("id") or ""
+            if _cid in _nav:
+                # A read-only navigation call (read_file / grep / …) the model
+                # emitted mid-emission. It is NOT a patch, but it IS a valid
+                # tool the harness offers — feed the resolved content back
+                # instead of "Ignored", so the model can fetch the context it
+                # needs and then emit patches. Answering "not a patch
+                # operation" here starved deepseek-v4-pro into empty output
+                # (lumina 019ffee7: read_file worked during exploration, then
+                # was rejected during emission, and the model gave up).
+                content = _nav[_cid]
+            else:
+                content = (
+                    "Ignored — not a patch operation. Emit patch tool calls "
+                    "(create_file / edit_file / …) or, if the story's "
+                    "production code is complete, reply with no tool calls."
+                )
         elif id(block) not in kept_block_ids:
             content = (
                 "REJECTED — test-artifact path. Test files are written "
@@ -4665,10 +4679,46 @@ Generate your patches NOW. Only the blocks above. No other text."""
             _write_credits: dict[str, str] = {}
             _emission_round = 0
             _futile_rounds = 0
+            from harness.retrieval_tools import (
+                RETRIEVAL_TOOL_NAMES as _RETRIEVAL_TOOL_NAMES,
+                resolve_retrieval_call as _resolve_retrieval_call,
+            )
+            _retrieval_cfg_em = {
+                "retrieval_tools": (state.get("retrieval_tools_config") or {}),
+            }
             while _resp_tool_calls:
                 _emission_round += 1
+                # Resolve any read-only navigation calls (read_file + retrieval
+                # tools) the model emitted this round, so it can fetch context
+                # DURING emission and then patch — rather than being told
+                # "not a patch operation" and stalling into empty output
+                # (lumina 019ffee7). These are not patch blocks.
+                _nav_results_em: dict[str, str] = {}
+                for _c in _resp_tool_calls:
+                    _nm = _c.get("name")
+                    if _nm == "read_file":
+                        _rt = _resolve_read_file_call(_c, workspace)
+                    elif _nm in _RETRIEVAL_TOOL_NAMES:
+                        _rt = await _resolve_retrieval_call(
+                            _c, workspace, config=_retrieval_cfg_em,
+                        )
+                    else:
+                        continue
+                    _nav_results_em[_c.get("id") or ""] = _rt
+                    if _nm == "read_file":
+                        _args = _c.get("input") or {}
+                        _rel = str(_args.get("file_path") or "").strip()
+                        if _rel and not _rt.startswith("Error:"):
+                            try:
+                                import hashlib as _hl
+                                tool_files_seen[_rel] = _hl.sha256(
+                                    _rt.encode("utf-8")
+                                ).hexdigest()
+                            except Exception:  # noqa: BLE001 — best-effort
+                                pass
                 _call_blocks = [
-                    None if c.get("name") == "read_file"
+                    None if (c.get("name") == "read_file"
+                             or c.get("name") in _RETRIEVAL_TOOL_NAMES)
                     else _to_patch_block(c)
                     for c in _resp_tool_calls
                 ]
@@ -4708,7 +4758,15 @@ Generate your patches NOW. Only the blocks above. No other text."""
                     1 for r in round_results
                     if r.success and not getattr(r, "no_op", False)
                 )
-                _futile_rounds = 0 if _round_real else _futile_rounds + 1
+                # A pure-navigation round (the model read files this round and
+                # emitted no landable patch) is progress, not futility — don't
+                # let it trip the two-futile-rounds break, or reading two files
+                # in a row would abandon the story. The emission cap still
+                # bounds total rounds.
+                _navigated_em = bool(_nav_results_em)
+                _futile_rounds = (
+                    0 if (_round_real or _navigated_em) else _futile_rounds + 1
+                )
                 if _emission_round >= _emission_cap:
                     logger.info(
                         "[patching_node] Emission cap of %d round(s) hit; "
@@ -4742,6 +4800,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                             "When it is complete, reply with a one-line "
                             "summary and NO tool calls."
                         ),
+                        nav_results=_nav_results_em,
                     ),
                 ))
                 try:

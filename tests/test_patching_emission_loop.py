@@ -529,6 +529,34 @@ class TestScopeUncoveredHelper:
         ) == []
 
 
+class TestNativeToolUsePromptContract:
+    """The native-tool-use prompt must state the real read_file contract
+    (prompt defect #2b): read_file works the WHOLE turn (post-1d4b1e7), is
+    never rejected as 'not a patch operation', is budgeted, and does not itself
+    produce code — so the model reads what it needs then emits patches instead
+    of looping on reads or giving up when a read seems ignored."""
+
+    def _src(self):
+        import inspect
+        return inspect.getsource(graph_mod.patching_node)
+
+    def test_states_read_file_available_whole_turn(self):
+        src = self._src()
+        assert "stays available for the WHOLE turn" in src
+        assert 'not a patch operation' in src  # reassures it is not rejected
+
+    def test_states_read_budget_and_no_code_from_reads(self):
+        src = self._src()
+        assert "Reads are budgeted per turn" in src
+        assert "read_file` alone never produces code" in src
+
+    def test_drops_misleading_lead_with_framing(self):
+        src = self._src()
+        # The old "Lead with read_file for any file ... have not yet been
+        # shown this turn" start-only framing must be gone.
+        assert "have not yet\n            \"been shown this turn" not in src
+
+
 class TestBuildPatchToolResults:
     def test_maps_success_failure_and_dropped(self):
         calls = [

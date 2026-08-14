@@ -64,6 +64,8 @@ Headless projects (CLI tool, library, batch worker, MCP server) set `frontend: n
 
 If `docs/SPEC_REQUIREMENTS.md` is missing or empty, write `RSD_MISSING` into the §1 header and stop — do not invent requirements.
 
+**Requirements are authoritative on BEHAVIOUR; this document describes STRUCTURE.** The RSD (`docs/SPEC_REQUIREMENTS.md`) is the single source of truth for WHAT the system does — business rules, validation thresholds, sort / rounding order, and every edge-case policy it fixes (e.g. leap-day / February-29 observation, timezone handling, empty-input behaviour, off-by-one boundaries). Where the RSD already decides such a policy, **restate it VERBATIM here and NEVER re-decide, "improve", or contradict it** — not in prose, not in a test-strategy example, not in an inline note. If an RSD policy looks wrong or is genuinely ambiguous, do NOT silently substitute a different value: record it as an ADR in §12 flagging the conflict for a human, and otherwise follow the RSD exactly. Decomposition, patching, and test generation read BOTH documents, so a contradiction between them — e.g. the RSD says a Feb-29 birthday is observed on **March 1** in non-leap years but this document says **February 28** — produces incoherent code and tests and traps the repair loop.
+
 ---
 
 ## Outputs produced

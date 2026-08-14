@@ -95,3 +95,48 @@ def test_requirements_without_product_spec_no_injection(tmp_path):
     gw = _StubGateway(json.dumps({"followup_questions": []}), "# Revised")
     _run(gw, str(spec), "REQUIREMENTS", product_spec="")
     assert all("Original Product Spec" not in p for p in _doc_user_prompts(gw))
+
+
+def test_architecture_gate_injects_requirements_as_source_of_truth(tmp_path):
+    # Prompt defect #4: the architecture reviewer must be fed SPEC_REQUIREMENTS.md
+    # so it can flag a policy the architecture contradicts (Feb-29 → March 1 in
+    # the RSD vs Feb 28 in the architecture).
+    (tmp_path / "SPEC_REQUIREMENTS.md").write_text(
+        "R2: February 29 birthdays are observed on March 1 in non-leap years."
+    )
+    arch = tmp_path / "SPEC_ARCHITECTURE.md"
+    arch.write_text("Feb-29 birthdays are observed on February 28 in non-leap years.")
+    critique = json.dumps({
+        "contradictions": ["arch says Feb 28 but requirements say March 1"],
+        "followup_questions": [],
+    })
+    gw = _StubGateway(critique, "# Revised architecture that observes March 1")
+    res = _run(gw, str(arch), "ARCHITECTURE")
+    assert res["ok"]
+    prompts = _doc_user_prompts(gw)
+    # The requirements doc is injected as the behavioural source of truth, with
+    # the contradiction instruction and its actual content.
+    assert any(
+        "BEHAVIOURAL SOURCE OF TRUTH" in p and "March 1" in p for p in prompts
+    )
+
+
+def test_architecture_gate_without_requirements_file_no_injection(tmp_path):
+    # No SPEC_REQUIREMENTS.md next to the arch doc → no block (graceful).
+    arch = tmp_path / "SPEC_ARCHITECTURE.md"
+    arch.write_text("# Architecture")
+    gw = _StubGateway(json.dumps({"followup_questions": []}), "# Revised")
+    _run(gw, str(arch), "ARCHITECTURE")
+    assert all(
+        "BEHAVIOURAL SOURCE OF TRUTH" not in p for p in _doc_user_prompts(gw)
+    )
+
+
+def test_arch_doc_skill_forbids_re_deciding_requirements_policy():
+    # The generation-side root cause: the architecture skill must forbid
+    # re-deciding a behavioural policy the requirements already fixed.
+    import pathlib
+    skill = pathlib.Path("harness/skills/docgen/arch_doc.md").read_text()
+    assert "Requirements are authoritative on BEHAVIOUR" in skill
+    assert "NEVER re-decide" in skill
+    assert "February-29" in skill or "Feb-29" in skill

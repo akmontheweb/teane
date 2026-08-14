@@ -23508,9 +23508,37 @@ async def review_and_revise_spec(
             "must preserve every user-visible requirement here)\n"
             f"{original_product_spec}\n\n"
         )
+    # Cross-doc consistency (ARCHITECTURE gate): give the reviewer the
+    # REQUIREMENTS spec as the behavioural source of truth so it can flag any
+    # architecture statement that contradicts a policy the requirements already
+    # fixed (lumina: RSD says a Feb-29 birthday is observed on March 1 in
+    # non-leap years, the architecture said Feb 28 — incoherent code + tests,
+    # repair-loop trap). Without this the architecture reviewer never sees the
+    # requirements and CANNOT detect the divergence.
+    requirements_block = ""
+    if gate == "ARCHITECTURE":
+        _req_path = os.path.join(
+            os.path.dirname(spec_path), "SPEC_REQUIREMENTS.md"
+        )
+        try:
+            with open(_req_path, "r", encoding="utf-8") as _rf:
+                _req_text = _rf.read()
+        except OSError:
+            _req_text = ""
+        if _req_text.strip():
+            requirements_block = (
+                "## Requirements Specification (BEHAVIOURAL SOURCE OF TRUTH — "
+                "the architecture under review must NOT contradict any business "
+                "rule, edge-case policy, threshold, or ordering fixed here; list "
+                "every architecture statement that does under \"contradictions\", "
+                "quoting both the requirements value and the conflicting "
+                "architecture value)\n"
+                f"{_req_text[:60000]}\n\n"
+            )
     critique_user_prompt = (
         f"## User Goal\n{user_goal}\n\n"
         f"{product_spec_block}"
+        f"{requirements_block}"
         f"## Specification Under Review ({gate})\n{original_spec}\n\n"
         "Produce the JSON critique now."
     )

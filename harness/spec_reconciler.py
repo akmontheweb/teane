@@ -135,6 +135,63 @@ _GHERKIN_BLOCK_RE = re.compile(r"```gherkin\s*\n(.+?)\n```", re.S)
 # ``Scenario: <title>`` inside a Gherkin block
 _SCENARIO_RE = re.compile(r"^\s*Scenario:\s*(.+?)\s*$", re.M)
 
+# A ``Scenario:`` / ``Scenario Outline:`` header in ANY of the shapes an
+# LLM-authored SPEC_REQUIREMENTS.md actually uses — anywhere in the story body,
+# NOT only inside a ```gherkin fence:
+#   Scenario: X                (plain, e.g. inside a fence)
+#   **Scenario: X**            (bold — what the generator emits by default)
+#   - **Scenario: X**          (bulleted bold)
+#   ### Scenario: X            (heading)
+# The old parser matched only plain ``Scenario:`` inside a ```gherkin block, so
+# the generator's bold ``**Scenario: X**`` + Given/When/Then-bullet format
+# yielded ZERO acceptance criteria for every story (lumina 019fff37: the scope
+# block showed "(none recorded)" while the spec listed 5 scenarios per story).
+_SCENARIO_TITLE_RE = re.compile(
+    r"^[ \t]*"                          # indent
+    r"(?:[-*][ \t]+)?"                  # optional bullet
+    r"(?:\*{1,3}|#{2,6}[ \t]*)?"        # optional bold / heading marker
+    r"Scenario(?:[ \t]+Outline)?[ \t]*:[ \t]*"
+    r"(?P<title>.+?)"                   # scenario title
+    r"[ \t]*\*{0,3}[ \t]*$",            # optional trailing bold
+    re.M | re.I,
+)
+
+# Fallback for specs that list plain acceptance-criteria bullets rather than
+# named scenarios: the body under an ``Acceptance Criteria`` label/heading, up
+# to the next heading / bold label / end of story.
+_AC_SECTION_RE = re.compile(
+    r"(?:\*{1,3}[ \t]*|#{2,6}[ \t]*)?Acceptance Criteria[ \t]*:?[ \t]*"
+    r"\*{0,3}[ \t]*\n(?P<body>.+?)(?=\n[ \t]*(?:#{1,6}[ \t]|\*\*[A-Z])|\Z)",
+    re.S | re.I,
+)
+_AC_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]+(?P<text>.+?)[ \t]*$", re.M)
+
+
+def _extract_acceptance_criteria(body: str) -> list[str]:
+    """Acceptance-criteria titles from a story body, robust to the markup an
+    LLM-authored SPEC_REQUIREMENTS.md actually produces (bold/heading/bulleted
+    ``Scenario:`` headers, with or without a ```gherkin fence). Falls back to
+    the bullet items under an ``Acceptance Criteria`` label when a story lists
+    plain criteria instead of named scenarios. Returns [] only when a story
+    genuinely records none."""
+    acs: list[str] = []
+    for m in _SCENARIO_TITLE_RE.finditer(body):
+        title = m.group("title").strip().strip("*").strip()
+        if title:
+            acs.append(title)
+    if acs:
+        return acs
+    sec = _AC_SECTION_RE.search(body)
+    if sec:
+        return [
+            b.strip().strip("*").strip()
+            for b in (
+                m.group("text") for m in _AC_BULLET_RE.finditer(sec.group("body"))
+            )
+            if b.strip().strip("*").strip()
+        ]
+    return []
+
 # Story intent lines — reconstructed into ``description``
 _AS_A_RE = re.compile(r"\*\*As a\*\*\s+(.+?)\s*\n", re.M)
 _I_WANT_RE = re.compile(r"\*\*I want\*\*\s+(.+?)\s*\n", re.M)
@@ -233,10 +290,7 @@ def parse_spec_requirements(text: str) -> dict[str, Any]:
         pf = _PARENT_FEAT_RE.search(body)
         parent_feature = pf.group(1) if pf else None
 
-        acs: list[str] = []
-        for gb in _GHERKIN_BLOCK_RE.findall(body):
-            for s in _SCENARIO_RE.finditer(gb):
-                acs.append(s.group(1).strip())
+        acs = _extract_acceptance_criteria(body)
 
         description = _reconstruct_intent(body)
 

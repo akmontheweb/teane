@@ -468,10 +468,59 @@ def _snake(name: str) -> str:
     return "".join(out)
 
 
-def _contract_test_rel_path(source_rel: str) -> str:
-    """tests/contract/test_<module>_contract.py for a Python source file."""
+def _mirrored_test_root(source_rel: str, source_roots: "frozenset[str] | set[str]") -> str:
+    """Package-root prefix under which a source file's generated tests belong,
+    or ``""`` for a flat / repo-root layout.
+
+    The deterministic contract/property tiers MUST land in the same test tree
+    as the LLM-authored unit tests. The unit tier mirrors package-nested
+    backends into ``<root>/tests/`` (e.g. ``server/app/x.py`` ->
+    ``server/tests/``, per decomposition._tests_root_is_repo_root); hardcoding
+    these tiers to a repo-root ``tests/`` splits a full-stack workspace into
+    two Python test trees (``tests/`` + ``server/tests/``) — the
+    ImportPathMismatchError / silently-dropped-tier failure seen on lumina
+    (019f82af / 019fd344). Mirror the source's top-level source root so both
+    tiers share one canonical tree per package root.
+
+    ``source_roots`` is the set from :func:`harness.impact._detect_source_roots`
+    — the same resolver the patcher allowlist uses — so this stays consistent
+    with where the unit tier and the allowlist agree the source lives. When the
+    source sits at the workspace root (flat layout), or under a directory that
+    is not a detected source root, this returns ``""`` and the tier keeps the
+    canonical repo-root ``tests/`` location.
+    """
+    norm = source_rel.replace("\\", "/")
+    first = norm.split("/", 1)[0] if "/" in norm else ""
+    return first if first and first in source_roots else ""
+
+
+def _source_roots_for(workspace_path: str) -> "frozenset[str]":
+    """Detected top-level source roots for the workspace, as a frozenset.
+
+    Lazy import keeps ``harness.impact`` out of this module's import surface
+    (the pure AST/render path stays harness-import-free) and sidesteps the
+    impact<->test_generation module cycle. Fail-open to an empty set, which
+    degrades to the previous repo-root ``tests/`` behaviour rather than
+    breaking emission.
+    """
+    try:
+        from harness.impact import _detect_source_roots
+        return frozenset(_detect_source_roots(workspace_path))
+    except Exception:
+        return frozenset()
+
+
+def _contract_test_rel_path(
+    source_rel: str, source_roots: "frozenset[str] | set[str]" = frozenset(),
+) -> str:
+    """``<root>/tests/contract/test_<module>_contract.py`` for a Python source
+    file, mirroring the source's package root (see :func:`_mirrored_test_root`)
+    so this tier shares the unit tier's tree. Repo-root ``tests/`` for flat
+    layouts."""
     stem = os.path.splitext(os.path.basename(source_rel))[0]
-    return os.path.join("tests", "contract", f"test_{stem}_contract.py")
+    root = _mirrored_test_root(source_rel, source_roots)
+    segs = [s for s in (root, "tests", "contract", f"test_{stem}_contract.py") if s]
+    return os.path.join(*segs)
 
 
 def emit_contract_tests(
@@ -490,6 +539,7 @@ def emit_contract_tests(
     """
     if not _has_python_source(source_files):
         return [], {}
+    source_roots = _source_roots_for(workspace_path)
     written: list[str] = []
     markers: dict[str, list[str]] = {}
     for rel in source_files:
@@ -507,7 +557,7 @@ def emit_contract_tests(
         body = render_contract_test(models, source_rel=rel)
         if not body:
             continue
-        out_rel = _contract_test_rel_path(rel)
+        out_rel = _contract_test_rel_path(rel, source_roots)
         out_abs = os.path.join(workspace_path, out_rel)
         if os.path.exists(out_abs):
             # Idempotent — record the marker edge but don't clobber.
@@ -807,9 +857,13 @@ def _path_slug(path: str) -> str:
     return s.lower() or "root"
 
 
-def _api_contract_test_rel_path(source_rel: str) -> str:
+def _api_contract_test_rel_path(
+    source_rel: str, source_roots: "frozenset[str] | set[str]" = frozenset(),
+) -> str:
     stem = os.path.splitext(os.path.basename(source_rel))[0]
-    return os.path.join("tests", "contract", f"test_{stem}_api_contract.py")
+    root = _mirrored_test_root(source_rel, source_roots)
+    segs = [s for s in (root, "tests", "contract", f"test_{stem}_api_contract.py") if s]
+    return os.path.join(*segs)
 
 
 def emit_api_contract_tests(
@@ -827,6 +881,7 @@ def emit_api_contract_tests(
     """
     if not _has_python_source(source_files):
         return [], {}
+    source_roots = _source_roots_for(workspace_path)
     py_files = [
         r for r in source_files if r.endswith(".py") and not _looks_like_test(r)
     ]
@@ -860,7 +915,7 @@ def emit_api_contract_tests(
         )
         if not body:
             continue
-        out_rel = _api_contract_test_rel_path(rel)
+        out_rel = _api_contract_test_rel_path(rel, source_roots)
         out_abs = os.path.join(workspace_path, out_rel)
         if os.path.exists(out_abs):
             markers[out_rel] = [rel]
@@ -992,9 +1047,13 @@ def render_property_test(
     return "".join(parts)
 
 
-def _property_test_rel_path(source_rel: str) -> str:
+def _property_test_rel_path(
+    source_rel: str, source_roots: "frozenset[str] | set[str]" = frozenset(),
+) -> str:
     stem = os.path.splitext(os.path.basename(source_rel))[0]
-    return os.path.join("tests", "contract", f"test_{stem}_property.py")
+    root = _mirrored_test_root(source_rel, source_roots)
+    segs = [s for s in (root, "tests", "contract", f"test_{stem}_property.py") if s]
+    return os.path.join(*segs)
 
 
 def emit_property_tests(
@@ -1011,6 +1070,7 @@ def emit_property_tests(
     """
     if not _has_python_source(source_files):
         return [], {}
+    source_roots = _source_roots_for(workspace_path)
     written: list[str] = []
     markers: dict[str, list[str]] = {}
     for rel in source_files:
@@ -1025,7 +1085,7 @@ def emit_property_tests(
         body = render_property_test(models, source_rel=rel)
         if not body:
             continue
-        out_rel = _property_test_rel_path(rel)
+        out_rel = _property_test_rel_path(rel, source_roots)
         out_abs = os.path.join(workspace_path, out_rel)
         if os.path.exists(out_abs):
             markers[out_rel] = [rel]

@@ -717,7 +717,7 @@ class TestContractTestTier:
         })
 
         # 1. The deterministic contract-test file landed on disk.
-        ct = tmp_path / "tests/contract/test_models_contract.py"
+        ct = tmp_path / "app/tests/contract/test_models_contract.py"
         assert ct.is_file()
         body = ct.read_text()
         assert "# @tests: app/models.py" in body
@@ -732,7 +732,7 @@ class TestContractTestTier:
 
         # 3. Both the deterministic and the LLM test are in generated_tests.
         gts = result["generated_tests"]
-        assert "tests/contract/test_models_contract.py" in gts
+        assert "app/tests/contract/test_models_contract.py" in gts
         assert "tests/test_widget_behaviour.py" in gts
 
     @pytest.mark.asyncio
@@ -780,14 +780,14 @@ class TestContractTestTier:
             "token_tracker": {},
         })
 
-        api_ct = tmp_path / "tests/contract/test_api_api_contract.py"
+        api_ct = tmp_path / "app/tests/contract/test_api_api_contract.py"
         assert api_ct.is_file()
         body = api_ct.read_text()
         assert "from app.main import app" in body
         assert "TestClient(app)" in body
         assert "test_post_api_items_empty_body_422" in body
         assert "test_delete_api_items_item_id_bad_type_422" in body
-        assert "tests/contract/test_api_api_contract.py" in result["generated_tests"]
+        assert "app/tests/contract/test_api_api_contract.py" in result["generated_tests"]
 
     @pytest.mark.asyncio
     async def test_property_tests_gated_off_by_default(
@@ -810,8 +810,8 @@ class TestContractTestTier:
             "token_tracker": {},
         })
         # Tier 1 file lands; Tier 3 (property) does NOT without the flag.
-        assert (tmp_path / "tests/contract/test_models_contract.py").is_file()
-        assert not (tmp_path / "tests/contract/test_models_property.py").exists()
+        assert (tmp_path / "app/tests/contract/test_models_contract.py").is_file()
+        assert not (tmp_path / "app/tests/contract/test_models_property.py").exists()
         assert not any("property" in f for f in result["generated_tests"])
 
     @pytest.mark.asyncio
@@ -835,12 +835,12 @@ class TestContractTestTier:
             "token_tracker": {},
             "test_generation_config": {"property_based_tests": True},
         })
-        prop = tmp_path / "tests/contract/test_models_property.py"
+        prop = tmp_path / "app/tests/contract/test_models_property.py"
         assert prop.is_file()
         body = prop.read_text()
         assert 'pytest.importorskip("hypothesis")' in body
         assert "test_widget_roundtrip" in body
-        assert "tests/contract/test_models_property.py" in result["generated_tests"]
+        assert "app/tests/contract/test_models_property.py" in result["generated_tests"]
 
     @pytest.mark.asyncio
     async def test_no_pydantic_models_no_contract_file(

@@ -5021,6 +5021,17 @@ For each module the implementation will contain:
 - Unit-test layout (directory, naming convention).
 - Integration / E2E coverage targets.
 - Fixtures / fakes / mocks the test suite will rely on.
+- ONE canonical test root per source package. In a multi-package / full-stack
+  layout, each package roots its own tests under itself — e.g. a backend under
+  `server/` tests in `server/tests/`, NOT a repo-root `tests/`. Never specify
+  two Python test trees for the same backend (a repo-root `tests/` AND a
+  `server/tests/`): pytest collects same-named modules from both, silently
+  drops one tier, and first-party imports mismatch across the trees.
+- The harness ALSO auto-emits a deterministic contract/property test tier
+  (Pydantic schema contracts, FastAPI status-code contracts) alongside the
+  unit tests, under `<package-root>/tests/contract/`. Keep the unit-test root
+  you specify consistent with that so both tiers live in one tree per package;
+  frontend component tests are co-located beside their source.
 
 ### 7. Build & Run
 - Dependency manifest file(s) — list every runtime AND dev dependency.

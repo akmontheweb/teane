@@ -123,9 +123,9 @@ class TestEmitToDisk:
         written, markers = emit_contract_tests(
             str(tmp_path), ["app/w.py"], "python",
         )
-        assert written == ["tests/contract/test_w_contract.py"]
-        assert markers["tests/contract/test_w_contract.py"] == ["app/w.py"]
-        out = (tmp_path / "tests/contract/test_w_contract.py").read_text()
+        assert written == ["app/tests/contract/test_w_contract.py"]
+        assert markers["app/tests/contract/test_w_contract.py"] == ["app/w.py"]
+        out = (tmp_path / "app/tests/contract/test_w_contract.py").read_text()
         assert "# @tests: app/w.py" in out
 
         # Second run: file exists → not overwritten, but marker edge recorded.
@@ -133,14 +133,14 @@ class TestEmitToDisk:
             str(tmp_path), ["app/w.py"], "python",
         )
         assert again_written == []
-        assert "tests/contract/test_w_contract.py" in again_markers
+        assert "app/tests/contract/test_w_contract.py" in again_markers
 
     def test_fires_even_when_primary_stack_is_not_python(self, tmp_path):
         # lumina 019f8291: a full-stack app resolves `primary` to the JS
         # frontend, but the Python tiers must still fire on the .py source.
         self._write(tmp_path, "app/w.py", _PLAIN_MODEL)
         written, _ = emit_contract_tests(str(tmp_path), ["app/w.py"], "typescript")
-        assert written == ["tests/contract/test_w_contract.py"]
+        assert written == ["app/tests/contract/test_w_contract.py"]
 
     def test_noop_when_no_python_source(self, tmp_path):
         self._write(tmp_path, "app/ui.ts", "export const x = 1\n")
@@ -306,7 +306,7 @@ class TestEmitApiToDisk:
             ["app/main.py", "app/api.py", "app/schemas.py"],
             "python",
         )
-        assert written == ["tests/contract/test_api_api_contract.py"]
+        assert written == ["app/tests/contract/test_api_api_contract.py"]
         out = (tmp_path / written[0]).read_text()
         assert "from app.main import app" in out
         assert "empty_body_422" in out
@@ -330,13 +330,66 @@ class TestEmitApiToDisk:
             ["app/main.py", "app/api.py", "app/schemas.py"],
             "typescript",
         )
-        assert written == ["tests/contract/test_api_api_contract.py"]
+        assert written == ["app/tests/contract/test_api_api_contract.py"]
 
     def test_noop_when_no_python_source(self, tmp_path):
         self._w(tmp_path, "app/ui.ts", "export const x = 1\n")
         assert emit_api_contract_tests(
             str(tmp_path), ["app/ui.ts"], "typescript",
         ) == ([], {})
+
+
+class TestSourceRootMirroring:
+    """The deterministic tiers co-locate with the unit tier's tree: a
+    package-nested source root (``server/``) tests under ``server/tests/``,
+    NOT a divergent repo-root ``tests/`` that would split a full-stack
+    workspace into two Python test trees — the ImportPathMismatchError /
+    silently-dropped-tier failure from lumina (019f82af / 019fd344)."""
+
+    def _w(self, tmp_path, rel, body):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+
+    def test_contract_test_mirrors_backend_package_root(self, tmp_path):
+        # Full-stack layout: server/ (Python backend) + web/ (TS frontend).
+        # _detect_source_roots -> {'server', 'web'}; the contract test for a
+        # server/ module lands under server/tests/, matching where the unit
+        # tier and the patcher allowlist agree the backend lives.
+        self._w(tmp_path, "server/app/models.py", _PLAIN_MODEL)
+        self._w(tmp_path, "server/app/main.py", "x = 1\n")
+        self._w(tmp_path, "web/src/a.ts", "export const a = 1\n")
+        self._w(tmp_path, "web/src/b.ts", "export const b = 2\n")
+        written, markers = emit_contract_tests(
+            str(tmp_path), ["server/app/models.py"], "typescript",
+        )
+        assert written == ["server/tests/contract/test_models_contract.py"]
+        assert (tmp_path / written[0]).is_file()
+        # The repo-root split location must NOT be created.
+        assert not (tmp_path / "tests/contract/test_models_contract.py").exists()
+
+    def test_api_contract_test_mirrors_backend_package_root(self, tmp_path):
+        self._w(tmp_path, "server/app/main.py", _MAIN)
+        self._w(tmp_path, "server/app/api.py", _ROUTES)
+        self._w(tmp_path, "server/app/schemas.py", _SCHEMAS_FOR_ROUTES)
+        self._w(tmp_path, "web/src/a.ts", "export const a = 1\n")
+        self._w(tmp_path, "web/src/b.ts", "export const b = 2\n")
+        written, _ = emit_api_contract_tests(
+            str(tmp_path),
+            ["server/app/main.py", "server/app/api.py", "server/app/schemas.py"],
+            "typescript",
+        )
+        assert written == ["server/tests/contract/test_api_api_contract.py"]
+        # Import stays workspace-absolute (pythonpath=.), so relocating the
+        # test file does not break resolution.
+        assert "from server.app.main import app" in (tmp_path / written[0]).read_text()
+
+    def test_flat_layout_keeps_repo_root_tests(self, tmp_path):
+        # Source at the workspace root (no source-root subdir) — repo-root
+        # tests/ is the canonical Python location; nothing to mirror.
+        self._w(tmp_path, "models.py", _PLAIN_MODEL)
+        written, _ = emit_contract_tests(str(tmp_path), ["models.py"], "python")
+        assert written == ["tests/contract/test_models_contract.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -392,5 +445,5 @@ class TestPropertyTier:
         written, markers = emit_property_tests(
             str(tmp_path), ["app/w.py"], "python",
         )
-        assert written == ["tests/contract/test_w_property.py"]
-        assert markers["tests/contract/test_w_property.py"] == ["app/w.py"]
+        assert written == ["app/tests/contract/test_w_property.py"]
+        assert markers["app/tests/contract/test_w_property.py"] == ["app/w.py"]

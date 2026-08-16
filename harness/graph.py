@@ -4728,29 +4728,55 @@ Generate your patches NOW. Only the blocks above. No other text."""
             _retrieval_cfg_em = {
                 "retrieval_tools": (state.get("retrieval_tools_config") or {}),
             }
+            # (tool, args) fingerprints of navigation calls already resolved this
+            # turn. A repeat means the model is looping on exploration instead of
+            # emitting code (lumina 01a00022: deepseek re-ran ``glob '**/*'`` to
+            # empty output in a greenfield workspace, never writing a file).
+            _nav_seen: set[str] = set()
+            _NAV_REPEAT_STEER = (
+                "You already ran this exact query this turn; its result is "
+                "unchanged and is shown above. STOP exploring and emit patch "
+                "tool calls NOW — create_file for a file that does not exist "
+                "yet, edit_file for one that does. Exploration emits no code, "
+                "and a greenfield story starts from an empty workspace: you "
+                "will NOT find the story's files by listing them, you must "
+                "CREATE them."
+            )
+            _NO_CODE_STEER = (
+                " THIS ROUND EMITTED NO CODE — only navigation. Stop exploring "
+                "and emit create_file / edit_file now: create the files that do "
+                "not exist yet (a greenfield story starts from an empty "
+                "workspace), edit the ones that do. Navigation alone makes no "
+                "progress and this emission phase is bounded."
+            )
             while _resp_tool_calls:
                 _emission_round += 1
-                # Resolve any read-only navigation calls (read_file + retrieval
-                # tools) the model emitted this round, so it can fetch context
-                # DURING emission and then patch — rather than being told
-                # "not a patch operation" and stalling into empty output
-                # (lumina 019ffee7). These are not patch blocks.
+                # Resolve read-only navigation calls (read_file + retrieval)
+                # emitted this round so the model can fetch context DURING
+                # emission and then patch — rather than being told "not a patch
+                # operation" and stalling (lumina 019ffee7). NOT patch blocks.
+                # A NEW read_file is context progress; EXPLORATION (list_dir /
+                # glob / grep) is not, and a REPEAT of either is a loop — steer
+                # it to emit code instead of re-resolving.
                 _nav_results_em: dict[str, str] = {}
+                _nav_progress = False
                 for _c in _resp_tool_calls:
                     _nm = _c.get("name")
+                    if _nm != "read_file" and _nm not in _RETRIEVAL_TOOL_NAMES:
+                        continue
+                    _cid = _c.get("id") or ""
+                    _fp = f"{_nm}:{json.dumps(_c.get('input') or {}, sort_keys=True)}"
+                    if _fp in _nav_seen:
+                        _nav_results_em[_cid] = _NAV_REPEAT_STEER
+                        continue
+                    _nav_seen.add(_fp)
                     if _nm == "read_file":
                         _rt = _resolve_read_file_call(_c, workspace)
-                    elif _nm in _RETRIEVAL_TOOL_NAMES:
-                        _rt = await _resolve_retrieval_call(
-                            _c, workspace, config=_retrieval_cfg_em,
-                        )
-                    else:
-                        continue
-                    _nav_results_em[_c.get("id") or ""] = _rt
-                    if _nm == "read_file":
+                        _nav_results_em[_cid] = _rt
                         _args = _c.get("input") or {}
                         _rel = str(_args.get("file_path") or "").strip()
                         if _rel and not _rt.startswith("Error:"):
+                            _nav_progress = True  # new file read = context progress
                             try:
                                 import hashlib as _hl
                                 tool_files_seen[_rel] = _hl.sha256(
@@ -4758,6 +4784,10 @@ Generate your patches NOW. Only the blocks above. No other text."""
                                 ).hexdigest()
                             except Exception:  # noqa: BLE001 — best-effort
                                 pass
+                    else:  # first-time exploration — resolve, but NOT progress
+                        _nav_results_em[_cid] = await _resolve_retrieval_call(
+                            _c, workspace, config=_retrieval_cfg_em,
+                        )
                 _call_blocks = [
                     None if (c.get("name") == "read_file"
                              or c.get("name") in _RETRIEVAL_TOOL_NAMES)
@@ -4800,15 +4830,16 @@ Generate your patches NOW. Only the blocks above. No other text."""
                     1 for r in round_results
                     if r.success and not getattr(r, "no_op", False)
                 )
-                # A pure-navigation round (the model read files this round and
-                # emitted no landable patch) is progress, not futility — don't
-                # let it trip the two-futile-rounds break, or reading two files
-                # in a row would abandon the story. The emission cap still
-                # bounds total rounds.
-                _navigated_em = bool(_nav_results_em)
-                _futile_rounds = (
-                    0 if (_round_real or _navigated_em) else _futile_rounds + 1
-                )
+                # Progress = a landable patch OR a NEW read_file (legit context
+                # for an edit). Pure workspace EXPLORATION (list_dir/glob/grep)
+                # and repeated nav calls are NOT progress — otherwise the model
+                # loops on them forever without emitting code, especially in a
+                # greenfield workspace where exploration finds nothing (lumina
+                # 01a00022). This restores the brake the pre-1d4b1e7 "Ignored —
+                # not a patch operation" behaviour provided, without
+                # re-breaking a genuine read-before-edit.
+                _made_progress = bool(_round_real or _nav_progress)
+                _futile_rounds = 0 if _made_progress else _futile_rounds + 1
                 if _emission_round >= _emission_cap:
                     logger.info(
                         "[patching_node] Emission cap of %d round(s) hit; "
@@ -4817,12 +4848,14 @@ Generate your patches NOW. Only the blocks above. No other text."""
                         _emission_cap, len(patch_results),
                     )
                     break
-                if _futile_rounds >= 2:
+                # Bound to 3 non-progress rounds (was 2) so the no-code steer
+                # below gets two rounds to land before we give up.
+                if _futile_rounds >= 3:
                     logger.info(
-                        "[patching_node] Two consecutive emission rounds "
-                        "with no real patch successes; stopping "
-                        "continuation and proceeding with %d result(s).",
-                        len(patch_results),
+                        "[patching_node] %d consecutive emission rounds with "
+                        "no code emitted (exploration-only / no landable "
+                        "patch); stopping and proceeding with %d result(s).",
+                        _futile_rounds, len(patch_results),
                     )
                     break
                 messages.append(_build_assistant_tool_turn(response))
@@ -4841,6 +4874,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                             "continue NOW with further patch tool calls. "
                             "When it is complete, reply with a one-line "
                             "summary and NO tool calls."
+                            + ("" if _made_progress else _NO_CODE_STEER)
                         ),
                         nav_results=_nav_results_em,
                     ),

@@ -264,10 +264,11 @@ class TestEmissionContinuation:
         assert counter["n"] == 3
         assert result["node_state"]["patch_success"] == 3
 
-    def test_two_futile_rounds_stop_continuation(self, monkeypatch, tmp_path):
-        """Two consecutive rounds with zero real successes end the loop
-        (here: edits against a file the model was never shown, rejected
-        by read-before-edit both times)."""
+    def test_futile_rounds_stop_continuation(self, monkeypatch, tmp_path):
+        """Consecutive rounds with zero real successes end the loop (here:
+        edits against a file the model was never shown, rejected by
+        read-before-edit). Bounded at 3 non-progress rounds so the no-code
+        steer gets two rounds to land."""
         _install_gateway(monkeypatch, enforce_read_before_edit=True)
         counter = {"n": 0}
 
@@ -293,9 +294,57 @@ class TestEmissionContinuation:
 
         result = asyncio.run(graph_mod.patching_node(_state(tmp_path)))
 
-        assert counter["n"] == 2
+        assert counter["n"] == 3
         assert result["node_state"]["patch_success"] == 0
         assert result["loop_counter"]["consecutive_zero_patch_rounds"] == 1
+
+    def test_exploration_loop_is_bounded_and_steered(self, monkeypatch, tmp_path):
+        """A model that only EXPLORES (repeats glob) and never emits code must
+        be bounded — not loop forever — and steered to create files (lumina
+        01a00022: deepseek re-ran ``glob '**/*'`` to empty output in a
+        greenfield workspace, never writing a file; the pre-1d4b1e7 brake was
+        lost when exploration started resetting the futile counter)."""
+        _install_gateway(monkeypatch)
+        counter = {"n": 0}
+        seen_tool_results: list[str] = []
+
+        async def explore_only_tool_loop(**kwargs):
+            counter["n"] += 1
+            for m in kwargs["messages"]:
+                if isinstance(m.get("content"), list):
+                    for b in m["content"]:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            seen_tool_results.append(str(b.get("content", "")))
+            # Same glob every round → a repeat the harness must recognise.
+            return (
+                _Response(
+                    tool_calls=[{
+                        "id": f"g{counter['n']}", "name": "glob",
+                        "input": {"pattern": "**/*"},
+                    }],
+                    finish_reason="tool_calls",
+                ),
+                kwargs["budget"] - 0.01,
+                kwargs["messages"],
+                {},
+            )
+
+        monkeypatch.setattr(
+            graph_mod, "_patching_tool_loop", explore_only_tool_loop,
+        )
+
+        result = asyncio.run(graph_mod.patching_node(_state(tmp_path)))
+
+        # Bounded (not infinite): stops within a handful of rounds.
+        assert counter["n"] <= 4, counter["n"]
+        assert result["node_state"]["patch_success"] == 0
+        # The model was steered to stop exploring and emit code.
+        joined = " ".join(seen_tool_results)
+        assert (
+            "STOP exploring" in joined
+            or "EMITTED NO CODE" in joined
+            or "you must" in joined
+        ), joined
 
     def test_continuation_turns_survive_openai_normalizer(
         self, monkeypatch, tmp_path,

@@ -120,6 +120,12 @@ def test_preamble_reconciles_build_everything_with_one_story(workspace: str):
     p = _build_story_preamble(state, "patching")
     assert "delivered INCREMENTALLY, one story per turn" in p
     assert "this turn does NOT build the whole spec" in p
+    # Must NOT assert earlier code is present (false when earlier gen failed /
+    # the workspace is still empty — the model correctly distrusts it and loops
+    # re-listing the workspace; lumina 01a00022).
+    assert "earlier stories are already on disk" not in p
+    assert "MAY STILL BE EMPTY OR SPARSE" in p
+    assert "CREATE it" in p
 
 
 def test_preamble_marker_contract_for_patching(workspace: str):

@@ -22069,9 +22069,13 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     # "this turn is one story" are not in conflict.
     _incremental = (
         "The overall goal — building the full product spec — is delivered "
-        "INCREMENTALLY, one story per turn; earlier stories are already on "
-        "disk and later ones come in their own turns. So this turn does NOT "
-        "build the whole spec. "
+        "INCREMENTALLY, one story per turn. So this turn does NOT build the "
+        "whole spec: implement only the story scoped below. Any code from "
+        "earlier stories that exists is on disk, but the workspace MAY STILL "
+        "BE EMPTY OR SPARSE — do not assume a file exists; if the file this "
+        "story needs is not present, CREATE it (a greenfield build starts "
+        "from an empty workspace). Do not loop re-listing the workspace to "
+        "look for code that has not been written yet. "
     )
     has_acs = bool(ac_rows or ac)
     if has_acs:

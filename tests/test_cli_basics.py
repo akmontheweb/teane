@@ -1119,7 +1119,7 @@ class TestInteractiveReviewLoopAsync:
 
         set_channel(_Channel())
 
-        async def fake_refine(spec_path_arg, notes, gateway):
+        async def fake_refine(spec_path_arg, notes, gateway, **kwargs):
             with open(spec_path_arg, "w", encoding="utf-8") as f:
                 f.write("# Refined\nA + " + notes + "\n")
             return open(spec_path_arg, encoding="utf-8").read()

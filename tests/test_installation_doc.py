@@ -255,6 +255,42 @@ class TestSynthesizeInstallation:
         # block so the prompt knows to skip §5.
         assert "\nnone\n" in user_msg
 
+    def test_threads_caller_budget_into_dispatch(self, tmp_path, stub_gateway):
+        # Regression (session 01a007f3): synthesize_installation hardcoded a
+        # local $1.00 envelope, so the emitted budget_remaining_usd event
+        # misrepresented the run's real global budget (looked like it cratered
+        # to $0.99). The caller's real remaining budget must reach dispatch.
+        ws = self._seed_workspace(tmp_path)
+        gw = stub_gateway("# Installation\n\nbody\n")
+        asyncio.run(
+            synthesize_installation(
+                workspace_path=str(ws),
+                architecture_path=str(ws / "docs" / "SPEC_ARCHITECTURE.md"),
+                output_dir=str(ws / "docs"),
+                gateway=gw,
+                blueprint=None,
+                budget_remaining_usd=8.42,
+            )
+        )
+        assert gw.dispatched, "gateway was never called"
+        assert gw.dispatched[0]["budget"] == 8.42
+
+    def test_defaults_to_local_envelope_when_budget_unset(self, tmp_path, stub_gateway):
+        # Back-compat: callers that don't thread a budget keep the prior
+        # $1.00 envelope so the doc still generates.
+        ws = self._seed_workspace(tmp_path)
+        gw = stub_gateway("# Installation\n\nbody\n")
+        asyncio.run(
+            synthesize_installation(
+                workspace_path=str(ws),
+                architecture_path=str(ws / "docs" / "SPEC_ARCHITECTURE.md"),
+                output_dir=str(ws / "docs"),
+                gateway=gw,
+                blueprint=None,
+            )
+        )
+        assert gw.dispatched[0]["budget"] == 1.00
+
     def test_passes_blueprint_through_when_provided(self, tmp_path, stub_gateway):
         ws = self._seed_workspace(tmp_path)
         gw = stub_gateway("# Installation\n\nbody\n")

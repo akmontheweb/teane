@@ -24581,6 +24581,14 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             output_dir=output_dir,
             gateway=gateway,
             blueprint=blueprint,
+            # Thread the run's real remaining budget so the emitted
+            # `budget_remaining_usd` event reflects the global budget (not a
+            # hardcoded local envelope) and the doc-gen isn't artificially
+            # capped below what the run actually has left. Floor at the prior
+            # $1.00 envelope when state hasn't seeded a budget.
+            budget_remaining_usd=max(
+                float(state.get("budget_remaining_usd", 0.0) or 0.0), 1.00
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — never fail the run on a doc miss
         logger.warning(

@@ -4748,6 +4748,7 @@ async def synthesize_requirements(
     *,
     agile: bool = False,
     workspace_path: Optional[str] = None,
+    budget_remaining_usd: float = 2.00,
 ) -> str:
     """
     Read raw notes from a manifest file, route to LLM for synthesis,
@@ -4809,7 +4810,7 @@ async def synthesize_requirements(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=2.00,
+            budget_remaining_usd=budget_remaining_usd,
             log_label="requirements",
             cache_family="planning:requirements_synthesis",
         )
@@ -5058,6 +5059,8 @@ async def synthesize_architecture(
     requirements_path: str,
     output_dir: str,
     gateway: Any,
+    *,
+    budget_remaining_usd: float = 2.00,
 ) -> str:
     """
     Read the approved SPEC_REQUIREMENTS.md and synthesize SPEC_ARCHITECTURE.md.
@@ -5117,7 +5120,7 @@ async def synthesize_architecture(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=2.00,
+            budget_remaining_usd=budget_remaining_usd,
             log_label="architecture",
             cache_family="planning:architecture_synthesis",
         )
@@ -5309,6 +5312,7 @@ async def synthesize_installation(
     gateway: Any,
     *,
     blueprint: Optional[dict[str, Any]] = None,
+    budget_remaining_usd: float = 1.00,
 ) -> str:
     """
     Synthesize ``INSTALLATION.md`` for a freshly generated greenfield app.
@@ -5381,7 +5385,7 @@ async def synthesize_installation(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=1.00,
+            budget_remaining_usd=budget_remaining_usd,
             log_label="installation",
             cache_family="planning:installation_synthesis",
         )
@@ -5414,6 +5418,8 @@ async def _refine_requirements(
     spec_path: str,
     additional_notes: str,
     gateway: Any,
+    *,
+    budget_remaining_usd: float = 2.00,
 ) -> str:
     """
     Refine an existing SPEC_REQUIREMENTS.md with additional user notes.
@@ -5449,7 +5455,7 @@ updated SPEC_REQUIREMENTS.md document."""
         gateway=gateway,
         messages=messages,
         role=NodeRole.PLANNING,
-        budget_remaining_usd=2.00,
+        budget_remaining_usd=budget_remaining_usd,
         log_label="requirements:refine",
         cache_family="planning:requirements_refine",
     )
@@ -5592,7 +5598,9 @@ async def _classify_and_tag_nfrs_in_spec(
     return budget_usd
 
 
-async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
+async def interactive_review_loop(
+    spec_path: str, gateway: Any, *, budget_remaining_usd: float = 2.00,
+) -> str:
     """
     Interactive terminal review loop for SPEC_REQUIREMENTS.md.
 
@@ -5678,7 +5686,10 @@ async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
                 # Async path: the surrounding cmd_run loop owns the event
                 # loop, so we await directly. Earlier code wrapped this in
                 # asyncio.run() and tripped "loop already running".
-                updated = await _refine_requirements(spec_path, notes, gateway)
+                updated = await _refine_requirements(
+                    spec_path, notes, gateway,
+                    budget_remaining_usd=budget_remaining_usd,
+                )
                 print(f"[Refine] Specification updated ({len(updated):,} chars).")
             except Exception as exc:
                 print(f"[Refine] Error: {exc}")
@@ -7564,6 +7575,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 # (ISO 29148) otherwise.
                 agile=bool(getattr(args, "decomposition_enabled", False)),
                 workspace_path=workspace_path,
+                budget_remaining_usd=budget_usd,
             )
             # Pre-flight spec review: fire whenever doc_reviewer_primary is
             # configured, regardless of whether --spec-discovery was passed.
@@ -7656,7 +7668,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 user_goal=args.prompt or "",
             )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
-            _raw_reviewed_spec = await interactive_review_loop(spec_path, gateway)
+            _raw_reviewed_spec = await interactive_review_loop(
+                spec_path, gateway, budget_remaining_usd=budget_usd,
+            )
             spec_override = _slim_spec_for_prompt(_raw_reviewed_spec)
             logger.info(
                 "[requirements] Specification locked. %d characters "
@@ -7681,6 +7695,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                         requirements_path=spec_path,
                         output_dir=output_dir,
                         gateway=gateway,
+                        budget_remaining_usd=budget_usd,
                     )
                     # Same adversarial doc-reviewer pass we run on
                     # requirements — the architecture spec drives every

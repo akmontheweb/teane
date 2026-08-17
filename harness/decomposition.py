@@ -333,7 +333,14 @@ def _drop_cross_test_root_scope_files_in_decomposition(
             suffix = _extract_test_scope_suffix(path)
             if suffix is None:
                 continue
-            by_suffix.setdefault(suffix, []).append(
+            # Colocated ``__tests__`` tests live next to their source, so their
+            # identity is the FULL path — ``src/__tests__/x.test.ts`` and
+            # ``src/hooks/__tests__/x.test.ts`` share the ``__tests__/x.test.ts``
+            # suffix but test DIFFERENT modules and must NOT be collapsed.
+            # Centralized ``tests/`` keeps the root-independent suffix identity.
+            norm = path.replace("\\", "/")
+            group_key = norm if suffix.split("/", 1)[0] == "__tests__" else suffix
+            by_suffix.setdefault(group_key, []).append(
                 (idx, str(story.get("story_key") or f"idx{idx}"), path)
             )
 
@@ -1857,7 +1864,24 @@ def _validate_stories_payload(
         if not isinstance(key, str) or not key.startswith("STORY-"):
             raise ValueError(f"story #{i} has invalid story_key: {key!r}")
         if key in seen_keys:
-            raise ValueError(f"duplicate story_key {key}")
+            # The synthesis LLM occasionally restarts numbering mid-payload and
+            # emits the same story_key twice (the recurring STORY-001 dup). The
+            # payload key is ADVISORY — create_stories reassigns canonical DB
+            # keys via _next_story_key — so re-key the duplicate to a unique
+            # synthetic key and keep the story, instead of raising and burning a
+            # whole headless auto-resume. depends_on references to the original
+            # key resolve to the FIRST occurrence (which keeps the key).
+            _orig = key
+            _n = 2
+            while f"{_orig}-dup{_n}" in seen_keys:
+                _n += 1
+            key = f"{_orig}-dup{_n}"
+            logger.warning(
+                "[decomposition] LLM emitted duplicate story_key %r; re-keyed "
+                "the duplicate to %r (DB keys are auto-assigned downstream; "
+                "depends_on to %r resolves to the first occurrence).",
+                _orig, key, _orig,
+            )
         seen_keys.add(key)
         title = s.get("title")
         if not isinstance(title, str) or not title.strip():

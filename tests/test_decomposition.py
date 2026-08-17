@@ -316,13 +316,19 @@ def test_validate_rejects_dependency_cycle():
         )
 
 
-def test_validate_rejects_duplicate_keys():
+def test_validate_repairs_duplicate_keys_instead_of_raising():
+    # The LLM occasionally restarts numbering and emits the same story_key
+    # twice. The payload key is advisory (create_stories reassigns canonical DB
+    # keys), so decomposition re-keys the duplicate and KEEPS both stories
+    # rather than failing the whole pass (which burned a headless auto-resume
+    # every run). Both titles must survive.
     payload = _payload_with_one_feature([
         {"story_key": "STORY-001", "title": "a", "acceptance_criteria": ["x"]},
         {"story_key": "STORY-001", "title": "b", "acceptance_criteria": ["y"]},
     ])
-    with pytest.raises(ValueError, match="duplicate"):
-        decomposition._validate_stories_payload(payload)
+    _features, cleaned = decomposition._validate_stories_payload(payload)
+    assert len(cleaned) == 2, "both stories must survive the duplicate repair"
+    assert {s["title"] for s in cleaned} == {"a", "b"}
 
 
 # ---------------------------------------------------------------------------

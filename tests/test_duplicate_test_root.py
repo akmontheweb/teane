@@ -97,3 +97,24 @@ class TestDetectDuplicateTestRoot:
         assert _detect_duplicate_test_root(
             "tests/conftest.py", str(tmp_path),
         ) is None
+
+    def test_colocated_tests_under_different_parents_not_flagged(self, tmp_path):
+        # TS colocated fix: src/x.ts and src/hooks/x.ts each have a colocated
+        # __tests__/x.test.ts. They share the __tests__/x.test.ts suffix but
+        # test DIFFERENT modules — must NOT be flagged as a duplicate tree.
+        _touch(str(tmp_path), "client/src/__tests__/x.test.ts")
+        msg = _detect_duplicate_test_root(
+            "client/src/hooks/__tests__/x.test.ts", str(tmp_path),
+        )
+        assert msg is None, (
+            "colocated __tests__ under different parents test different modules "
+            f"and must not be rejected as duplicates; got: {msg}"
+        )
+
+    def test_colocated_exact_same_location_not_flagged(self, tmp_path):
+        # Editing the file that already exists at the same colocated path is the
+        # 'already exists' case, not a cross-root duplicate.
+        _touch(str(tmp_path), "client/src/__tests__/x.test.ts")
+        assert _detect_duplicate_test_root(
+            "client/src/__tests__/x.test.ts", str(tmp_path),
+        ) is None

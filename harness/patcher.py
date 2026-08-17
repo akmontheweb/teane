@@ -909,6 +909,26 @@ def _extract_test_scoped_suffix(rel_path: str) -> Optional[str]:
     return None
 
 
+def _test_dedup_identity(rel_norm: str, suffix: str) -> str:
+    """Identity for cross-root duplicate-test detection.
+
+    CENTRALIZED roots (``tests``/``test``): a module's tests are root-independent,
+    so fold to the tier-normalized suffix — ``tests/test_x.py`` and
+    ``server/tests/test_x.py`` collide (the split-tree bug this guard exists for).
+
+    COLOCATED ``__tests__``: the test lives NEXT TO its source, so its identity is
+    the FULL path. ``src/__tests__/x.test.ts`` (tests ``src/x``) and
+    ``src/hooks/__tests__/x.test.ts`` (tests ``src/hooks/x``) share the
+    ``__tests__/x.test.ts`` suffix but test DIFFERENT modules — they must NOT be
+    flagged as duplicates. Using the full path means only an exact same-location
+    copy could match, and that case is already excluded upstream. (Fixes the TS
+    colocated-mirror false positive.)"""
+    first = suffix.split("/", 1)[0]
+    if first == "__tests__":
+        return rel_norm
+    return _canonical_test_suffix(suffix)
+
+
 def _canonical_test_suffix(suffix: str) -> str:
     """Normalise a test-scoped suffix so the same module tested under different
     tiers compares equal (ADR-0005 item #4). Strips a single tier subdirectory
@@ -957,11 +977,14 @@ def _detect_duplicate_test_root(
     # tested under different tiers (unit/integration/…) or roots (repo-root
     # ``tests/`` vs package-nested ``server/tests/``) is caught as ONE split
     # tree, not missed because an intermediate ``unit/`` differs.
-    new_suffix_canon = _canonical_test_suffix(new_suffix)
     if not os.path.isdir(workspace_root):
         return None
     # Normalise for suffix comparison — POSIX separators throughout.
     new_rel_norm = re.sub(r"[/\\]", "/", new_rel_path).lstrip("/")
+    # Colocated ``__tests__`` tests are identified by their FULL path (they live
+    # next to their source); centralized ``tests/`` tests by tier-normalized
+    # suffix. See _test_dedup_identity.
+    new_ident = _test_dedup_identity(new_rel_norm, new_suffix)
     duplicates: list[str] = []
     for root, dirs, files in os.walk(workspace_root, followlinks=False):
         # Prune skip dirs in-place so the walk stays cheap.
@@ -975,7 +998,7 @@ def _detect_duplicate_test_root(
             continue  # same path — that's the ``already exists`` case, not a duplicate root
         candidate_suffix = _extract_test_scoped_suffix(candidate_norm)
         if candidate_suffix is not None and \
-                _canonical_test_suffix(candidate_suffix) == new_suffix_canon:
+                _test_dedup_identity(candidate_norm, candidate_suffix) == new_ident:
             duplicates.append(candidate_norm)
         if len(duplicates) >= 3:
             break  # bound the message payload

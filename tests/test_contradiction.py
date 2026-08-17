@@ -169,6 +169,77 @@ class TestConservativeBoundaries:
         )
         assert find_contradictions(src) == []
 
+    def test_monkeypatch_env_pair_not_flagged(self):
+        # The lumina 01a00e33 false positive: get_settings() reads os.environ,
+        # so "raises on bad PORT" and "succeeds on unset PORT" are complementary,
+        # not contradictory. The differing input lives in monkeypatch, not the
+        # call signature — must not be flagged.
+        src = (
+            "class TestGetSettings:\n"
+            "    def test_defaults_are_offline_safe(self, monkeypatch):\n"
+            "        monkeypatch.delenv('LUMINA_PORT', raising=False)\n"
+            "        settings = get_settings()\n"
+            "    def test_invalid_port_raises(self, monkeypatch):\n"
+            "        monkeypatch.setenv('LUMINA_PORT', 'not-a-number')\n"
+            "        with pytest.raises(ValueError, match='LUMINA_PORT'):\n"
+            "            get_settings()\n"
+        )
+        assert find_contradictions(src) == []
+        assert machine_unsatisfiable_reason(src, filename="test_config.py") is None
+
+    def test_monkeypatch_fixture_param_alone_suppresses(self):
+        # Even without an explicit mutator call in the raising test, declaring
+        # the monkeypatch fixture marks the test as ambient-driven.
+        src = (
+            "class T:\n"
+            "    def test_a(self, monkeypatch):\n"
+            "        obj = build()\n"
+            "    def test_b(self, monkeypatch):\n"
+            "        with pytest.raises(E):\n"
+            "            build()\n"
+        )
+        assert find_contradictions(src) == []
+
+    def test_os_environ_subscript_mutation_suppresses(self):
+        src = (
+            "class T:\n"
+            "    def test_a(self):\n"
+            "        os.environ['PORT'] = '8000'\n"
+            "        cfg = load()\n"
+            "    def test_b(self):\n"
+            "        os.environ['PORT'] = 'bad'\n"
+            "        with pytest.raises(ValueError):\n"
+            "            load()\n"
+        )
+        assert find_contradictions(src) == []
+
+    def test_mock_patch_context_suppresses(self):
+        src = (
+            "class T:\n"
+            "    def test_a(self):\n"
+            "        with patch('m.dep', return_value=1):\n"
+            "            run()\n"
+            "    def test_b(self):\n"
+            "        with patch('m.dep', side_effect=Boom):\n"
+            "            with pytest.raises(Boom):\n"
+            "                run()\n"
+        )
+        assert find_contradictions(src) == []
+
+    def test_ambient_setup_still_flags_genuine_literal_arg_conflict(self):
+        # Ambient setup on ONE side must not mask a genuine same-literal-input
+        # conflict driven by the call argument itself. Here neither the input
+        # nor the outcome is explained by the (unrelated) monkeypatch use.
+        src = (
+            "class T:\n"
+            "    def test_a(self):\n"
+            "        obj = Parse('  ')\n"
+            "    def test_b(self):\n"
+            "        with pytest.raises(ValueError):\n"
+            "            Parse('  ')\n"
+        )
+        assert len(find_contradictions(src)) == 1
+
 
 class TestUnparseable:
     def test_syntax_error_reported(self):

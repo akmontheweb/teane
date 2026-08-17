@@ -53,6 +53,67 @@ _HELPER_CALL_NAMES = frozenset({
     "assertRaises", "assertRaisesRegex", "assertWarns",
 })
 
+# A test that reconfigures ambient state (environment variables, patched
+# attributes, working dir, mocked globals) does NOT expose its real input in
+# the call signature: ``get_settings()`` reads ``os.environ`` and behaves
+# differently under ``monkeypatch.setenv("PORT", "bad")`` vs
+# ``monkeypatch.delenv("PORT")``. Two such tests with opposite outcomes are
+# COMPLEMENTARY, not a proven same-input contradiction. Since this module only
+# ever reports *proven* contradictions (see ``machine_unsatisfiable_reason``),
+# it must decline to claim "identical input" whenever ambient state is in play
+# and let the case fall through to normal repair/HITL.
+_AMBIENT_METHOD_NAMES = frozenset({
+    # pytest monkeypatch mutators
+    "setenv", "delenv", "setattr", "delattr", "chdir",
+    "syspath_prepend", "syspath_append",
+})
+_AMBIENT_FIXTURE_NAMES = frozenset({"monkeypatch", "mocker"})
+
+
+def _mutates_ambient(node: ast.Call) -> bool:
+    """True if ``node`` is a call that reconfigures ambient state the subject
+    under test might read: a monkeypatch env/attr mutator, ``mock.patch(...)``,
+    ``patch.object/dict(...)``, or the ``setattr``/``delattr`` builtins."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in _AMBIENT_METHOD_NAMES:
+            return True
+        if func.attr == "patch":  # mock.patch(...) / unittest.mock.patch(...)
+            return True
+        if func.attr in ("object", "dict", "multiple"):
+            # patch.object(...) / patch.dict(...) — root callable is ``patch``.
+            root = func.value
+            if isinstance(root, ast.Name) and root.id == "patch":
+                return True
+            if isinstance(root, ast.Attribute) and root.attr == "patch":
+                return True
+        return False
+    if isinstance(func, ast.Name):
+        return func.id in ("patch", "setattr", "delattr")
+    return False
+
+
+def _is_environ_subscript(target: ast.expr) -> bool:
+    """True for an ``os.environ[...]`` / ``environ[...]`` assignment target."""
+    if not isinstance(target, ast.Subscript):
+        return False
+    base = target.value
+    if isinstance(base, ast.Attribute) and base.attr == "environ":
+        return True
+    if isinstance(base, ast.Name) and base.id == "environ":
+        return True
+    return False
+
+
+def _has_ambient_fixture(node: ast.AST) -> bool:
+    """True if a test function declares a ``monkeypatch``/``mocker`` fixture
+    parameter — a strong signal the test drives the subject via ambient state."""
+    args = getattr(node, "args", None)
+    if args is None:
+        return False
+    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    return any(a.arg in _AMBIENT_FIXTURE_NAMES for a in params)
+
 
 def _is_raises_call(node: ast.expr) -> bool:
     """True if ``node`` is a ``pytest.raises(...)`` / bare ``raises(...)`` /
@@ -146,6 +207,10 @@ class _TestFnScanner(ast.NodeVisitor):
     def __init__(self) -> None:
         # test function name -> {"raise": set[str], "success": set[str]}
         self.by_fn: dict[str, dict[str, set[str]]] = {}
+        # test function names whose body/params reconfigure ambient state —
+        # their call signatures do not capture the real input, so they must
+        # not participate in a "proven same-input contradiction".
+        self.ambient_fns: set[str] = set()
         self._fn_stack: list[str] = []
         self._in_raises = 0
         self._in_try = 0
@@ -156,6 +221,8 @@ class _TestFnScanner(ast.NodeVisitor):
         if is_test:
             self._fn_stack.append(node.name)
             self.by_fn.setdefault(node.name, {"raise": set(), "success": set()})
+            if _has_ambient_fixture(node):
+                self.ambient_fns.add(node.name)
         for child in node.body:
             self.visit(child)
         if is_test:
@@ -190,6 +257,12 @@ class _TestFnScanner(ast.NodeVisitor):
         for stmt in (*node.handlers, *node.orelse, *node.finalbody):
             self.visit(stmt)
 
+    # --- ambient-state detection ------------------------------------------
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        if self._fn_stack and _mutates_ambient(node):
+            self.ambient_fns.add(self._fn_stack[-1])
+        self.generic_visit(node)
+
     # --- statement classification -----------------------------------------
     def _record(self, kind: str, call: ast.Call) -> None:
         if not self._fn_stack:
@@ -205,6 +278,9 @@ class _TestFnScanner(ast.NodeVisitor):
                 self._record("raise", node.value)
             else:
                 self._record("success", node.value)
+        # Direct ``os.environ["X"] = ...`` mutation is ambient setup too.
+        if self._fn_stack and any(_is_environ_subscript(t) for t in node.targets):
+            self.ambient_fns.add(self._fn_stack[-1])
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
@@ -227,13 +303,11 @@ class _TestFnScanner(ast.NodeVisitor):
         return _is_raises_call(node) and len(node.args) >= 2
 
 
-def _scan_by_fn(
-    source: str,
-) -> Optional[dict[str, dict[str, set[str]]]]:
-    """Parse ``source`` and return the per-test-function raise/success
-    signature sets (``_TestFnScanner.by_fn``), or None if it doesn't parse.
-    Shared by the single-file and cross-file detectors so both classify
-    identically."""
+def _scan(source: str) -> Optional[_TestFnScanner]:
+    """Parse ``source`` and return the populated scanner (per-test-function
+    raise/success signature sets plus the ``ambient_fns`` set), or None if it
+    doesn't parse. Shared by the single-file and cross-file detectors so both
+    classify identically."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -246,7 +320,7 @@ def _scan_by_fn(
         if isinstance(node, ast.ClassDef):
             for child in node.body:
                 scanner.visit(child)
-    return scanner.by_fn
+    return scanner
 
 
 def find_contradictions(
@@ -254,9 +328,11 @@ def find_contradictions(
 ) -> list[Contradiction]:
     """Return proven same-input / opposite-expectation contradictions in
     ``source``. Empty on parse failure (see :func:`unparseable_reason`)."""
-    by_fn = _scan_by_fn(source)
-    if by_fn is None:
+    scanner = _scan(source)
+    if scanner is None:
         return []
+    by_fn = scanner.by_fn
+    ambient = scanner.ambient_fns
 
     # Aggregate per-signature the set of tests that expect raise vs success.
     raise_tests: dict[str, list[str]] = {}
@@ -275,7 +351,13 @@ def find_contradictions(
         # functions — a single function that both raises and succeeds on the
         # same call is usually a copy-paste inside one assertion group, not a
         # spec contradiction. Cross-function is the strong, provable signal.
-        distinct = [(r, s) for r in rt for s in st if r != s]
+        # Also drop pairs where either side reconfigures ambient state: the
+        # call signature doesn't capture env/patched-global input, so the two
+        # outcomes are complementary, not a proven same-input contradiction.
+        distinct = [
+            (r, s) for r in rt for s in st
+            if r != s and r not in ambient and s not in ambient
+        ]
         if not distinct:
             continue
         r, s = distinct[0]
@@ -310,15 +392,20 @@ def find_contradictions_across(
     # sig -> list of (file, test_fn) locations
     raise_loc: dict[str, list[tuple[str, str]]] = {}
     success_loc: dict[str, list[tuple[str, str]]] = {}
+    # (file, test_fn) locations that reconfigure ambient state — excluded from
+    # contradiction pairing for the same reason as the single-file detector.
+    ambient_loc: set[tuple[str, str]] = set()
     for fname in sorted(files):
-        by_fn = _scan_by_fn(files[fname])
-        if by_fn is None:
+        scanner = _scan(files[fname])
+        if scanner is None:
             continue
-        for fn, kinds in by_fn.items():
+        for fn, kinds in scanner.by_fn.items():
             for sig in kinds["raise"]:
                 raise_loc.setdefault(sig, []).append((fname, fn))
             for sig in kinds["success"]:
                 success_loc.setdefault(sig, []).append((fname, fn))
+        for fn in scanner.ambient_fns:
+            ambient_loc.add((fname, fn))
 
     out: list[Contradiction] = []
     for sig in sorted(set(raise_loc) & set(success_loc)):
@@ -327,7 +414,12 @@ def find_contradictions_across(
         # Distinct (file, fn) locations only — the same call both raising and
         # succeeding inside ONE test fn is an intra-assertion artefact, not a
         # spec contradiction (mirrors find_contradictions' cross-fn rule).
-        distinct = [(r, s) for r in rl for s in sl if r != s]
+        # Exclude ambient-mutating locations: their input isn't in the call
+        # signature, so the opposite outcomes aren't a proven contradiction.
+        distinct = [
+            (r, s) for r in rl for s in sl
+            if r != s and r not in ambient_loc and s not in ambient_loc
+        ]
         if not distinct:
             continue
         # Prefer a cross-FILE pair for the report — that's the signal this

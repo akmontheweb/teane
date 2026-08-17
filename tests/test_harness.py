@@ -3202,6 +3202,126 @@ class TestGatekeeperAutoApprove:
         # Anthropic requires temperature=1.0 when thinking is on
         assert captured["payload"]["temperature"] == 1.0
 
+    def _deepseek_capture_thinking(self, *, spec_kwargs, thinking):
+        """Run DeepSeekProvider.chat_completion with a fake client and return
+        the outbound payload's ``thinking`` value (or None if absent)."""
+        from harness.gateway import DeepSeekProvider, ModelSpec
+        spec = ModelSpec(
+            provider="deepseek", model_id="deepseek-v4-pro",
+            context_window=1_000_000, input_cost_per_1m=0.4, output_cost_per_1m=0.9,
+            **spec_kwargs,
+        )
+        provider = DeepSeekProvider(spec)
+        captured: dict = {}
+
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        class FakeClient:
+            async def post(self, url, json, **_kwargs):
+                captured["payload"] = json
+                return FakeResponse()
+
+        async def fake_get_client():
+            return FakeClient()
+
+        provider._get_client = fake_get_client  # type: ignore[assignment]
+        asyncio.run(provider.chat_completion(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=thinking, temperature=0.0, max_tokens=100,
+        ))
+        return captured["payload"].get("thinking")
+
+    def test_deepseek_suppresses_reasoning_on_nonthinking_role(self):
+        # Fix A: a reasoning-by-default model with suppress_reasoning_when_off
+        # must be told NOT to reason on a non-thinking role, so its output
+        # budget produces the patch instead of chain-of-thought that truncates
+        # at finish_reason=length with empty content (lumina 01a00fdc).
+        assert self._deepseek_capture_thinking(
+            spec_kwargs={"suppress_reasoning_when_off": True}, thinking=False,
+        ) == {"type": "disabled"}
+
+    def test_deepseek_no_thinking_key_without_flags(self):
+        # Neither supports_thinking nor suppress flag → no thinking key at all
+        # (unchanged legacy behaviour for ordinary models).
+        assert self._deepseek_capture_thinking(spec_kwargs={}, thinking=False) is None
+
+    def test_deepseek_enabled_when_thinking_supported_and_requested(self):
+        assert self._deepseek_capture_thinking(
+            spec_kwargs={"supports_thinking": True, "suppress_reasoning_when_off": True},
+            thinking=True,
+        ) == {"type": "enabled"}
+
+    def test_deepseek_suppress_flag_does_not_change_thinking_on_behaviour(self):
+        # suppress_reasoning_when_off is independent of supports_thinking: with
+        # only the suppress flag, a thinking=True call must NOT force enabled
+        # (the model isn't marked thinking-capable) — it stays keyless.
+        assert self._deepseek_capture_thinking(
+            spec_kwargs={"suppress_reasoning_when_off": True}, thinking=True,
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_identical_retries_on_length_truncation(self):
+        # Fix B: an empty response with finish_reason=="length" is a truncation,
+        # not a provider null. Retrying the identical request just re-truncates,
+        # so the empty-retry loop must be skipped — the primary is called ONCE,
+        # not 1 + empty_content_retries times (lumina 01a00fdc).
+        from harness.gateway import (
+            Gateway, GatewayConfig, NodeRole, ModelSpec, register_model,
+            LLMResponse, TokenUsage, EmptyLLMResponseError,
+        )
+        from harness.redactor import create_redactor_from_config
+        create_redactor_from_config({})
+
+        register_model(
+            "ollama:len-trunc-test",
+            ModelSpec(provider="ollama", model_id="lt", context_window=4096,
+                      input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+        # No *_fallback configured → after empty handling, no fallback model.
+        gateway = Gateway(GatewayConfig(
+            patching_primary="ollama:len-trunc-test",
+            empty_content_retries=2,
+        ))
+
+        calls = {"n": 0}
+        original = gateway._get_provider
+
+        async def spy_get_provider(model_key):
+            provider = await original(model_key)
+
+            async def spy_chat(**kwargs):
+                calls["n"] += 1
+                return LLMResponse(
+                    content="",  # empty content
+                    model="lt",
+                    usage=TokenUsage(input_tokens=10, output_tokens=4096,
+                                     cached_tokens=0, cache_creation_tokens=0,
+                                     cost_usd=0.0),
+                    finish_reason="length",  # ...because it was truncated
+                    reasoning_content="x" * 500,
+                )
+
+            provider.chat_completion = spy_chat  # type: ignore[assignment]
+            return provider
+
+        gateway._get_provider = spy_get_provider  # type: ignore[assignment]
+
+        with pytest.raises(EmptyLLMResponseError):
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "x"}],
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=1.0,
+            )
+        assert calls["n"] == 1, (
+            f"finish_reason=length must skip the identical empty-retries; "
+            f"expected 1 call, got {calls['n']}"
+        )
+
     def test_anthropic_version_read_from_spec(self):
         from harness.gateway import AnthropicProvider, ModelSpec
         spec = ModelSpec(

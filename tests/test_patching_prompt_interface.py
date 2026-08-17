@@ -49,6 +49,20 @@ class TestNativeToolBridge:
         assert "Edit Invariants" in _prompt(tmp_path, True)
         assert "Edit Invariants" in _prompt(tmp_path, False)
 
+    def test_role_enforces_code_not_commentary(self, tmp_path: Path):
+        """The harness applies change operations, not prose. The Your Role
+        section must tell the model to emit changes directly and NOT narrate a
+        plan/reasoning — a planning preamble lands zero patches and, on
+        reasoning-by-default models, exhausts the output budget before any
+        change is emitted (lumina 01a00fdc)."""
+        for mode in (True, False):
+            p = _prompt(tmp_path, mode)
+            assert "does\nNOT read prose" in p or "does NOT read prose" in p
+            # It must NOT still instruct the model to plan out loud first.
+            assert "Plan the implementation strategy before writing code" not in p
+            # And it must name the failure mode it's preventing.
+            assert "FAILED turn" in p
+
     def test_native_tool_list_matches_patch_tools(self, tmp_path: Path):
         """Every tool advertised in PATCH_TOOLS must be enumerated by name in
         the prompt's authoritative native-tool list. Guards against schema↔prompt

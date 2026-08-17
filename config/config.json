@@ -134,6 +134,7 @@
             "cached_input_cost_per_1m": 0.003625,
             "api_base_url": "https://api.deepseek.com/v1",
             "supports_thinking": false,
+            "suppress_reasoning_when_off": true,
             "api_key": "",
             "supports_cache": true
         },

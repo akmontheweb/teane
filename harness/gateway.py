@@ -154,6 +154,17 @@ class ModelSpec:
     api_base_url: str = ""
     api_key: str = ""  # Optional: API key stored in config (env var takes precedence)
     supports_thinking: bool = False
+    # Reasoning-by-default models (DeepSeek v4/R1 family) emit chain-of-thought
+    # even when the role does NOT ask for thinking, consuming the whole
+    # max_tokens output budget on reasoning and returning finish_reason=length
+    # with EMPTY content/tool_calls (lumina 01a00fdc: 135k reasoning chars, 0
+    # content, every patch fell over to the fallback). When true, the
+    # OpenAI-compat payload builder explicitly sends ``thinking={"type":
+    # "disabled"}`` for non-thinking roles (patching/repair/reviewers) so the
+    # full budget goes to the patch/tool-call instead of reasoning. Distinct
+    # from ``supports_thinking`` so enabling the suppression for a model does
+    # NOT change its thinking-ON (planning) behaviour.
+    suppress_reasoning_when_off: bool = False
     supports_cache: bool = False
     # B6 capability flag — true for models that accept native function/tool
     # calling on their wire format. Anthropic 3.x+/4.x all support it;
@@ -239,6 +250,7 @@ def load_model_prices(prices_path: Optional[str] = None, override: bool = False)
                 api_base_url=spec_dict.get("api_base_url", ""),
                 api_key=spec_dict.get("api_key", ""),
                 supports_thinking=bool(spec_dict.get("supports_thinking", False)),
+                suppress_reasoning_when_off=bool(spec_dict.get("suppress_reasoning_when_off", False)),
                 supports_cache=bool(spec_dict.get("supports_cache", False)),
                 supports_tools=bool(spec_dict.get("supports_tools", False)),
                 anthropic_version=spec_dict.get("anthropic_version", "2023-06-01"),
@@ -339,6 +351,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                     "api_base_url": baseline.api_base_url,
                     "api_key": baseline.api_key,
                     "supports_thinking": baseline.supports_thinking,
+                    "suppress_reasoning_when_off": baseline.suppress_reasoning_when_off,
                     "supports_cache": baseline.supports_cache,
                     "supports_tools": baseline.supports_tools,
                     "anthropic_version": baseline.anthropic_version,
@@ -358,6 +371,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 api_base_url=merged.get("api_base_url", ""),
                 api_key=merged.get("api_key", ""),
                 supports_thinking=bool(merged.get("supports_thinking", False)),
+                suppress_reasoning_when_off=bool(merged.get("suppress_reasoning_when_off", False)),
                 supports_cache=bool(merged.get("supports_cache", False)),
                 supports_tools=bool(merged.get("supports_tools", False)),
                 anthropic_version=merged.get("anthropic_version", "2023-06-01"),
@@ -900,6 +914,13 @@ class DeepSeekProvider(BaseLLM):
         }
         if thinking and self.spec.supports_thinking:
             payload["thinking"] = {"type": "enabled"}
+        elif self.spec.suppress_reasoning_when_off and not thinking:
+            # Reasoning-by-default model on a non-thinking role: tell it NOT to
+            # reason so the max_tokens budget produces the patch/tool-call
+            # instead of chain-of-thought that truncates at finish_reason=length
+            # with empty content (lumina 01a00fdc). Mirrors the {"type":
+            # "enabled"} shape the backend already accepts.
+            payload["thinking"] = {"type": "disabled"}
         if tools:
             from harness.tool_schemas import to_openai_tools
             payload["tools"] = to_openai_tools(tools)
@@ -3704,6 +3725,27 @@ class Gateway:
         # the cost-per-call slipped past the local budget enforcer.
         accumulated_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
         empty_retry_attempts = self.config.empty_content_retries
+        # An empty response with finish_reason=="length" is a TRUNCATION, not a
+        # provider null: the model used its whole max_tokens output budget
+        # (e.g. reasoning-by-default chain-of-thought — lumina 01a00fdc: 135k
+        # reasoning chars, 0 content) before emitting content or a tool_call.
+        # Retrying the IDENTICAL request just truncates identically, and the
+        # continuation loop can't help when there is zero content to continue
+        # from — so skip the futile null-retries and route straight to the
+        # fallback model, with a diagnostic that names the real cause.
+        if _is_empty(response) and getattr(response, "finish_reason", "") == "length":
+            logger.warning(
+                "[gateway] Empty response from %s role=%s is a LENGTH TRUNCATION "
+                "(finish_reason=length, %d reasoning chars, %d tokens_out) — the "
+                "model spent its output budget without emitting content/tool_calls. "
+                "Skipping identical retries; routing to fallback. If this is a "
+                "reasoning-by-default model, set suppress_reasoning_when_off=true "
+                "for it in the model registry.",
+                response.model, role.value,
+                len(getattr(response, "reasoning_content", "") or ""),
+                getattr(response.usage, "output_tokens", 0),
+            )
+            empty_retry_attempts = 0
         last_retry_exc: Optional[BaseException] = None
         while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(

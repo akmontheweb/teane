@@ -104,6 +104,37 @@ CREATE_FILE_SCHEMA: dict[str, Any] = {
     },
 }
 
+REWRITE_FILE_SCHEMA: dict[str, Any] = {
+    "name": "rewrite_file",
+    "description": (
+        "Overwrite an EXISTING file wholesale with new content. "
+        "Equivalent to <<<REWRITE_FILE>>> in the text DSL. This is the "
+        "escape hatch for whole-file replacement — prefer edit_file for "
+        "surgical changes and reach for this only when a file needs to be "
+        "rebuilt end-to-end (or when a stuck-file REPLACE_BLOCK loop has "
+        "unlocked it). You MUST supply the COMPLETE corrected contents "
+        "(imports, every class, every def, every existing test) — a "
+        "partial rewrite deletes whatever you leave out. Emitting content "
+        "byte-identical to what is already on disk is rejected as a no-op, "
+        "so change something or pick a different target. Post-patch parse "
+        "validation still applies: unparseable output is rolled back."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path to the existing file.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete new file contents to write.",
+            },
+        },
+        "required": ["file_path", "content"],
+    },
+}
+
 DELETE_BLOCK_SCHEMA: dict[str, Any] = {
     "name": "delete_block",
     "description": (
@@ -310,6 +341,7 @@ PATCH_TOOLS: list[dict[str, Any]] = [
     READ_FILE_SCHEMA,
     EDIT_FILE_SCHEMA,
     CREATE_FILE_SCHEMA,
+    REWRITE_FILE_SCHEMA,
     DELETE_BLOCK_SCHEMA,
     INSERT_AT_BLOCK_SCHEMA,
     INSERT_AT_LINE_SCHEMA,

@@ -1684,8 +1684,14 @@ Native tool-use is ENABLED. Emit every change by CALLING a tool — never by
 writing the `<<<...>>>` text markers. Each change operation is a tool:
   - `create_file`      — a new file with its full content       (= CREATE_FILE)
   - `edit_file`        — exact-byte search/replace in a file     (= REPLACE_BLOCK)
+  - `rewrite_file`     — overwrite an EXISTING file wholesale    (= REWRITE_FILE)
   - `delete_block`     — remove an exact-byte span               (= DELETE_BLOCK)
   - `insert_at_block`  — insert relative to an anchor            (= INSERT_AT_BLOCK)
+  - `insert_at_line`   — insert before a 1-indexed line          (= INSERT_AT_LINE)
+  - `replace_line_range` — replace a 1-indexed inclusive range   (= REPLACE_LINE_RANGE)
+`rewrite_file` is the escape hatch for whole-file replacement — prefer
+`edit_file` for surgical changes; `insert_at_line` / `replace_line_range`
+are for when you only have line coordinates (a scanner/compiler span).
 Read-only navigation (never changes files, available the whole turn):
 `read_file` (fetch a file's current bytes), plus `list_dir`, `glob`, `grep`,
 `find_symbol`, and `file_outline` for exploring the workspace.
@@ -2093,7 +2099,7 @@ the file back to its pre-patch state and reports the block as failed.
 - `CREATE_FILE` is for files that **do not yet exist**.
 - If a file already exists with the **same** content, `CREATE_FILE` is a safe no-op (used for resumes).
 - If a file already exists with **different** content, `CREATE_FILE` will be **REJECTED** by the patcher with the error "File already exists with different content". The patcher will NOT overwrite.
-- To change an existing file, use **`REPLACE_BLOCK`** (find the exact lines you want to change, replace them with the new lines). If you need to rewrite the whole file, emit one `REPLACE_BLOCK` whose `search:` matches the current file contents.
+- To change an existing file, use **`REPLACE_BLOCK`** (find the exact lines you want to change, replace them with the new lines). If you need to replace an existing file **wholesale**, use **`REWRITE_FILE`** (the escape hatch documented above) — do NOT force a whole-file `REPLACE_BLOCK` whose `search:` has to byte-match the entire file, which is brittle and misses on the smallest drift.
 - **If you created a file in a previous turn**, that file now exists — any subsequent edit to it must use `REPLACE_BLOCK`, not `CREATE_FILE`. The "## Files currently in workspace" section in your repair prompt (when present) is authoritative on what exists.
 - **Never emit two `CREATE_FILE` blocks for the same path in a single response.** Each path gets exactly one block per response. The patcher applies blocks in order, so the SECOND `CREATE_FILE` for the same path will be REJECTED ("File already exists with different content") even though it was you who just created the file moments earlier. If you need to refine the content as you draft, edit your own response before submitting; if you need two variants, pick the one you want and emit just that. Symptom: an initial patching round logs `Applied N-2/N patches` with the rejected file appearing in the "Failed" list paired with itself.
 

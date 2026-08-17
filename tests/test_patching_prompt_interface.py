@@ -48,3 +48,38 @@ class TestNativeToolBridge:
         # The exact-byte contract still governs edit_file, so it must survive.
         assert "Edit Invariants" in _prompt(tmp_path, True)
         assert "Edit Invariants" in _prompt(tmp_path, False)
+
+    def test_native_tool_list_matches_patch_tools(self, tmp_path: Path):
+        """Every tool advertised in PATCH_TOOLS must be enumerated by name in
+        the prompt's authoritative native-tool list. Guards against schema↔prompt
+        drift like the ``rewrite_file`` gap (session 01a00e33): a tool the model
+        is told to use but never offered, or offered but never explained.
+        """
+        from harness.tool_schemas import PATCH_TOOLS
+
+        p = _prompt(tmp_path, True)
+        for tool in PATCH_TOOLS:
+            name = tool["name"]
+            assert f"`{name}`" in p, (
+                f"{name} is advertised in PATCH_TOOLS but not named in the "
+                f"native-tool system prompt"
+            )
+
+    def test_rewrite_file_is_a_callable_tool_not_just_prose(self, tmp_path: Path):
+        """The prompt tells the model to use REWRITE_FILE for whole-file
+        overwrites; that only works if ``rewrite_file`` is a real advertised
+        tool (native mode forbids emitting the raw ``<<<>>>`` markers).
+        """
+        from harness.tool_schemas import PATCH_TOOLS, tool_call_to_patch_block
+
+        assert any(t["name"] == "rewrite_file" for t in PATCH_TOOLS), (
+            "rewrite_file missing from PATCH_TOOLS"
+        )
+        # The name-dispatch must translate a rewrite_file call into a patch.
+        block = tool_call_to_patch_block(
+            {"name": "rewrite_file", "input": {"file_path": "a.py", "content": "x = 1\n"}}
+        )
+        assert block is not None and block.file == "a.py"
+
+        p = _prompt(tmp_path, True)
+        assert "`rewrite_file`" in p and "= REWRITE_FILE" in p

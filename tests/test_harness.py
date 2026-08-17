@@ -5525,8 +5525,9 @@ class TestClaudeCodeStyleEditPipeline:
         from harness.tool_schemas import PATCH_TOOLS
         names = [t["name"] for t in PATCH_TOOLS]
         assert names == [
-            "read_file", "edit_file", "create_file", "delete_block",
-            "insert_at_block", "insert_at_line", "replace_line_range",
+            "read_file", "edit_file", "create_file", "rewrite_file",
+            "delete_block", "insert_at_block", "insert_at_line",
+            "replace_line_range",
         ]
 
     def test_b6_anthropic_shape_keeps_input_schema(self):

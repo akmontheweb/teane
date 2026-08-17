@@ -530,10 +530,15 @@ Use <<<CREATE_FILE>>> blocks to create the documentation file."""
     ]
 
     try:
+        from harness.gateway import DEFAULT_SYNTHESIS_ENVELOPE_USD
+        _synth_budget = float(getattr(
+            getattr(gateway, "config", None),
+            "synthesis_envelope_usd", DEFAULT_SYNTHESIS_ENVELOPE_USD,
+        ))
         response, budget = await gateway.dispatch(
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=2.00,
+            budget_remaining_usd=_synth_budget,
         )
 
         # Validate and write the generated document

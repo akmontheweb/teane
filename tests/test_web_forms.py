@@ -183,11 +183,20 @@ def test_parse_section_post_round_trip():
         "token_budget.hard_cap_usd": "5.0",
         "token_budget.context_window_threshold_pct": "0.9",
         "token_budget.stages": '{"planning": 0.2, "patching": 0.3}',
+        # Budget-cap knobs promoted to config (2026-08-17); the UI submits
+        # every rendered field, so a full round-trip includes them.
+        "token_budget.default_hard_cap_usd": "2.0",
+        "token_budget.synthesis_envelope_usd": "2.0",
+        "token_budget.installation_doc_floor_usd": "1.0",
+        "token_budget.fanout_default_budget_usd": "1.0",
+        "token_budget.gates": '{"force_local_below_usd": 0.05}',
     })
     assert errors == []
     assert parsed["hard_cap_usd"] == pytest.approx(5.0)
     assert parsed["context_window_threshold_pct"] == pytest.approx(0.9)
     assert parsed["stages"] == {"planning": 0.2, "patching": 0.3}
+    assert parsed["default_hard_cap_usd"] == pytest.approx(2.0)
+    assert parsed["gates"] == {"force_local_below_usd": 0.05}
 
 
 def test_parse_section_post_collects_errors_but_returns_dict():
@@ -195,6 +204,14 @@ def test_parse_section_post_collects_errors_but_returns_dict():
     parsed, errors = parse_section_post(section, {
         "token_budget.hard_cap_usd": "not a number",
         "token_budget.context_window_threshold_pct": "0.85",
+        # Supply the remaining rendered fields with valid values so the ONLY
+        # error is the intentionally-bad hard_cap_usd.
+        "token_budget.stages": "{}",
+        "token_budget.default_hard_cap_usd": "2.0",
+        "token_budget.synthesis_envelope_usd": "2.0",
+        "token_budget.installation_doc_floor_usd": "1.0",
+        "token_budget.fanout_default_budget_usd": "1.0",
+        "token_budget.gates": "{}",
     })
     assert len(errors) == 1
     assert errors[0].dotted_key == "token_budget.hard_cap_usd"

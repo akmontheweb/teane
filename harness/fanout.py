@@ -95,6 +95,22 @@ def _default_timeout_seconds() -> float:
     return float(getattr(gw_cfg, "fanout_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))
 
 
+def _default_budget_usd() -> float:
+    """Resolve the fanout tool's default $ budget from gateway config
+    (``token_budget.fanout_default_budget_usd``), falling back to the named
+    default when config isn't loaded. No budget cap is hardcoded here."""
+    from harness.gateway import DEFAULT_FANOUT_BUDGET_USD
+    try:
+        from harness.graph import get_gateway_config
+    except Exception:
+        return DEFAULT_FANOUT_BUDGET_USD
+    gw_cfg = get_gateway_config()
+    if gw_cfg is None:
+        return DEFAULT_FANOUT_BUDGET_USD
+    return float(getattr(
+        gw_cfg, "fanout_default_budget_usd", DEFAULT_FANOUT_BUDGET_USD))
+
+
 # ---------------------------------------------------------------------------
 # 1. Public dataclasses
 # ---------------------------------------------------------------------------
@@ -439,7 +455,7 @@ def make_fanout_skill() -> "Any":
             else:
                 return {"error": f"prompts[{i}] must be string or object"}
 
-        budget = float(kwargs.get("budget_usd", 1.00))
+        budget = float(kwargs.get("budget_usd", _default_budget_usd()))
         max_concurrency = int(kwargs.get(
             "max_concurrency", _default_max_concurrency(),
         ))

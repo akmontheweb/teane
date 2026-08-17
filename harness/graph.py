@@ -2416,6 +2416,33 @@ def get_gateway_config() -> Optional[Any]:
     return _gateway_config
 
 
+def _budget_knob(field: str) -> float:
+    """Read an operator-controlled budget cap/threshold off the active
+    GatewayConfig (populated from config ``token_budget`` — see config.json),
+    falling back to the named default constant only when no config is injected
+    (e.g. in unit tests). Keeps every budget literal out of graph nodes so
+    operators control them via config."""
+    from harness.gateway import (
+        DEFAULT_HARD_CAP_USD, DEFAULT_LOW_BUDGET_SKIP_USD,
+        DEFAULT_MIN_CALL_BUDGET_USD, DEFAULT_INSTALLATION_DOC_FLOOR_USD,
+    )
+    fallbacks = {
+        "default_hard_cap_usd": DEFAULT_HARD_CAP_USD,
+        "low_budget_skip_usd": DEFAULT_LOW_BUDGET_SKIP_USD,
+        "min_call_budget_usd": DEFAULT_MIN_CALL_BUDGET_USD,
+        "installation_doc_floor_usd": DEFAULT_INSTALLATION_DOC_FLOOR_USD,
+    }
+    default = fallbacks[field]
+    cfg = get_gateway_config()
+    if cfg is None:
+        gw = get_gateway()
+        cfg = getattr(gw, "config", None) if gw is not None else None
+    try:
+        return float(getattr(cfg, field, default)) if cfg is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 async def _maybe_discovery_saturation_check(
     *,
     gate: str,
@@ -2451,7 +2478,7 @@ async def _maybe_discovery_saturation_check(
         return complete, budget
     if not bool(getattr(gw.config, "llm_judgment_discovery_saturation", True)):
         return complete, budget
-    if budget < 0.01:
+    if budget < _budget_knob("min_call_budget_usd"):
         return complete, budget
 
     modules = discovery_data.get("modules") if isinstance(discovery_data, dict) else None
@@ -2614,7 +2641,7 @@ async def _maybe_discovery_followup_focus(
         return None, budget
     if not bool(getattr(gw.config, "llm_judgment_discovery_followup_focus", True)):
         return None, budget
-    if budget < 0.01:
+    if budget < _budget_knob("min_call_budget_usd"):
         return None, budget
 
     sector_list = "\n".join(f"- {name}" for name in sectors)
@@ -2743,7 +2770,7 @@ async def _maybe_judgment_llm(
     gw = get_gateway()
     if gw is None or not str(getattr(gw.config, "repair_primary", "") or "").strip():
         return None, budget_remaining_usd
-    if budget_remaining_usd < 0.01:
+    if budget_remaining_usd < _budget_knob("min_call_budget_usd"):
         return None, budget_remaining_usd
     try:
         from harness.gateway import NodeRole
@@ -2795,7 +2822,7 @@ async def _repair_malformed_json(
     """
     if not raw_text or not raw_text.strip():
         return None, budget_remaining_usd
-    if budget_remaining_usd < 0.01:
+    if budget_remaining_usd < _budget_knob("min_call_budget_usd"):
         return None, budget_remaining_usd
     truncated = raw_text.strip()
     if len(truncated) > 8000:
@@ -4071,7 +4098,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.debug("[planning_node] repo_index injection skipped: %s", exc)
 
-        budget = state.get("budget_remaining_usd", 2.00)
+        budget = state.get("budget_remaining_usd", _budget_knob("default_hard_cap_usd"))
         response, new_budget = await gateway.dispatch(
             messages=list(messages),
             role=NodeRole.PLANNING,
@@ -4298,7 +4325,7 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         from harness.patcher import apply_patch_blocks
 
         messages = list(state.get("messages", []))
-        budget = state.get("budget_remaining_usd", 2.00)
+        budget = state.get("budget_remaining_usd", _budget_knob("default_hard_cap_usd"))
         # B6 — decide once per node call whether to use native tool-use.
         # Gated on (a) the operator's config switch, (b) the patching role's
         # routed model supporting native tools (the gateway will silently
@@ -16686,7 +16713,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # arguing with its own round-4 assistant message. See
         # harness/repair_context.py for the rationale.
         from harness.repair_context import condense_repair_messages
-        budget = state.get("budget_remaining_usd", 2.00)
+        budget = state.get("budget_remaining_usd", _budget_knob("default_hard_cap_usd"))
         _condense_budget = {"value": budget}
 
         async def _condense_call(prompt: str) -> Optional[str]:
@@ -23830,7 +23857,7 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
     if counter >= max_cycles:
         logger.info("[spec_review] cycle cap reached (%d/%d) — passing through.", counter, max_cycles)
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
-    if budget < 0.10:
+    if budget < _budget_knob("low_budget_skip_usd"):
         logger.info("[spec_review] budget too low ($%.4f) — skipping.", budget)
         return {"node_state": {"current_node": "spec_review", "skipped": True}}
     if not spec_path or not os.path.isfile(spec_path):
@@ -24041,7 +24068,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
     if counter >= max_cycles:
         logger.info("[code_review] cycle cap reached (%d/%d) — passing through.", counter, max_cycles)
         return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
-    if budget < 0.10:
+    if budget < _budget_knob("low_budget_skip_usd"):
         logger.info("[code_review] budget too low ($%.4f) — skipping.", budget)
         return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
     if not modified_files:
@@ -24587,7 +24614,8 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             # capped below what the run actually has left. Floor at the prior
             # $1.00 envelope when state hasn't seeded a budget.
             budget_remaining_usd=max(
-                float(state.get("budget_remaining_usd", 0.0) or 0.0), 1.00
+                float(state.get("budget_remaining_usd", 0.0) or 0.0),
+                _budget_knob("installation_doc_floor_usd"),
             ),
         )
     except Exception as exc:  # noqa: BLE001 — never fail the run on a doc miss

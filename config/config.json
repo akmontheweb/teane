@@ -34,7 +34,17 @@
     "token_budget": {
         "hard_cap_usd": 10.0,
         "context_window_threshold_pct": 0.85,
-        "stages": {}
+        "stages": {},
+        "default_hard_cap_usd": 2.0,
+        "synthesis_envelope_usd": 2.0,
+        "installation_doc_floor_usd": 1.0,
+        "fanout_default_budget_usd": 1.0,
+        "gates": {
+            "force_local_below_usd": 0.05,
+            "refuse_if_est_cost_fraction_over": 0.8,
+            "low_budget_skip_usd": 0.10,
+            "min_call_budget_usd": 0.01
+        }
     },
     "node_throttle": {
         "max_code_review_cycles": 1,
@@ -502,7 +512,8 @@
         ],
         "request_timeout_seconds": 15,
         "python_require_venv": true,
-        "prefetch_budget_seconds": 20
+        "prefetch_budget_seconds": 20,
+        "prefetch_budget_seconds_max": 10
     },
     "skills": {
         "user_skills_dir": "~/.harness/user_skills"

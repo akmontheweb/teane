@@ -224,3 +224,83 @@ class TestFanoutRuntimeResolution:
             assert _default_timeout_seconds() == _DEFAULT_TIMEOUT_SECONDS
         finally:
             set_gateway_config(None)
+
+
+class TestBudgetCapPromotions:
+    """2026-08-17 promotion: every hardcoded budget cap / threshold moved to
+    ``config.json`` ``token_budget`` (and ``token_budget.gates``) so operators
+    control them. Same shape as the throttle promotions above."""
+
+    def test_dataclass_defaults(self):
+        from harness.gateway import (
+            DEFAULT_HARD_CAP_USD, DEFAULT_SYNTHESIS_ENVELOPE_USD,
+            DEFAULT_INSTALLATION_DOC_FLOOR_USD, DEFAULT_FANOUT_BUDGET_USD,
+            DEFAULT_FORCE_LOCAL_BELOW_USD, DEFAULT_REFUSE_EST_COST_FRACTION,
+            DEFAULT_LOW_BUDGET_SKIP_USD, DEFAULT_MIN_CALL_BUDGET_USD,
+        )
+        cfg = GatewayConfig()
+        assert cfg.default_hard_cap_usd == DEFAULT_HARD_CAP_USD
+        assert cfg.synthesis_envelope_usd == DEFAULT_SYNTHESIS_ENVELOPE_USD
+        assert cfg.installation_doc_floor_usd == DEFAULT_INSTALLATION_DOC_FLOOR_USD
+        assert cfg.fanout_default_budget_usd == DEFAULT_FANOUT_BUDGET_USD
+        assert cfg.force_local_below_usd == DEFAULT_FORCE_LOCAL_BELOW_USD
+        assert cfg.refuse_if_est_cost_fraction_over == DEFAULT_REFUSE_EST_COST_FRACTION
+        assert cfg.low_budget_skip_usd == DEFAULT_LOW_BUDGET_SKIP_USD
+        assert cfg.min_call_budget_usd == DEFAULT_MIN_CALL_BUDGET_USD
+
+    def test_budget_caps_from_config(self):
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "token_budget": {
+                "hard_cap_usd": 25.0,
+                "default_hard_cap_usd": 3.0,
+                "synthesis_envelope_usd": 4.0,
+                "installation_doc_floor_usd": 1.5,
+                "fanout_default_budget_usd": 2.5,
+                "gates": {
+                    "force_local_below_usd": 0.02,
+                    "refuse_if_est_cost_fraction_over": 0.9,
+                    "low_budget_skip_usd": 0.20,
+                    "min_call_budget_usd": 0.03,
+                },
+            },
+        })
+        assert gw.config.hard_cap_usd == 25.0
+        assert gw.config.default_hard_cap_usd == 3.0
+        assert gw.config.synthesis_envelope_usd == 4.0
+        assert gw.config.installation_doc_floor_usd == 1.5
+        assert gw.config.fanout_default_budget_usd == 2.5
+        assert gw.config.force_local_below_usd == 0.02
+        assert gw.config.refuse_if_est_cost_fraction_over == 0.9
+        assert gw.config.low_budget_skip_usd == 0.20
+        assert gw.config.min_call_budget_usd == 0.03
+
+    def test_missing_budget_keys_fall_back_to_defaults(self):
+        from harness.gateway import (
+            DEFAULT_SYNTHESIS_ENVELOPE_USD, DEFAULT_LOW_BUDGET_SKIP_USD,
+        )
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "token_budget": {"hard_cap_usd": 10.0},
+        })
+        assert gw.config.hard_cap_usd == 10.0
+        assert gw.config.synthesis_envelope_usd == DEFAULT_SYNTHESIS_ENVELOPE_USD
+        assert gw.config.low_budget_skip_usd == DEFAULT_LOW_BUDGET_SKIP_USD
+
+    def test_refuse_fraction_clamps_to_unit_interval(self):
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "token_budget": {"gates": {"refuse_if_est_cost_fraction_over": 5.0}},
+        })
+        assert gw.config.refuse_if_est_cost_fraction_over == 1.0
+
+    def test_resolve_hard_cap_usd_precedence(self):
+        from harness.gateway import resolve_hard_cap_usd, DEFAULT_HARD_CAP_USD
+        # hard_cap_usd wins
+        assert resolve_hard_cap_usd({"hard_cap_usd": 12.0}) == 12.0
+        # falls back to default_hard_cap_usd when hard_cap_usd absent
+        assert resolve_hard_cap_usd({"default_hard_cap_usd": 3.0}) == 3.0
+        # then to the named constant when both absent
+        assert resolve_hard_cap_usd({}) == DEFAULT_HARD_CAP_USD
+        # garbage → constant, never crashes
+        assert resolve_hard_cap_usd({"hard_cap_usd": "oops"}) == DEFAULT_HARD_CAP_USD

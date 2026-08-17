@@ -2182,6 +2182,39 @@ def _delay_from_rate_limit_headers(
 # 12. Gateway Orchestrator
 # ---------------------------------------------------------------------------
 
+# Budget-cap defaults. These are the ONLY place a budget literal lives; every
+# runtime value is read from config ``token_budget`` (see config.json) and
+# falls back to these named constants when a key is absent. No budget cap is
+# hardcoded at a call site — operators control every cap via config.
+DEFAULT_HARD_CAP_USD = 2.00               # fallback total run budget
+DEFAULT_SYNTHESIS_ENVELOPE_USD = 2.00     # local budget for doc/spec synthesis
+DEFAULT_INSTALLATION_DOC_FLOOR_USD = 1.00 # floor for the terminal install-doc synth
+DEFAULT_FANOUT_BUDGET_USD = 1.00          # default $ budget for the fanout tool
+DEFAULT_FORCE_LOCAL_BELOW_USD = 0.05      # switch to local model below this
+DEFAULT_REFUSE_EST_COST_FRACTION = 0.80   # warn/refuse when est_cost > frac × remaining
+DEFAULT_LOW_BUDGET_SKIP_USD = 0.10        # skip optional review / node work below this
+DEFAULT_MIN_CALL_BUDGET_USD = 0.01        # minimum remaining to attempt a call
+DEFAULT_PREFETCH_BUDGET_SECONDS_MAX = 10.0  # hard ceiling on LSP prefetch time budget
+
+
+def resolve_hard_cap_usd(token_budget: dict) -> float:
+    """Resolve the run's total budget cap from a ``token_budget`` config dict.
+
+    ``hard_cap_usd`` wins; when absent, ``default_hard_cap_usd`` (also
+    config-controlled) applies; only when BOTH are missing does the named
+    :data:`DEFAULT_HARD_CAP_USD` constant apply. Centralises the fallback so
+    it can never drift between call sites (it previously diverged: config
+    shipped 10.0 while ~8 call sites hardcoded 2.00)."""
+    tb = token_budget or {}
+    val = tb.get("hard_cap_usd")
+    if val is None:
+        val = tb.get("default_hard_cap_usd", DEFAULT_HARD_CAP_USD)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return DEFAULT_HARD_CAP_USD
+
+
 @dataclass
 class GatewayConfig:
     """Runtime configuration for the LLM gateway, parsed from .harness_config.json.
@@ -2333,6 +2366,18 @@ class GatewayConfig:
     ollama_local_backup: str = ""
     force_local_only: bool = False
     hard_cap_usd: float = 2.00
+    # Budget caps promoted from hardcoded literals (2026-08-17) so operators
+    # control every cap via config ``token_budget`` / ``token_budget.gates``.
+    # Defaults mirror the historical literals — behaviour is unchanged unless
+    # the operator overrides. See config.json and :func:`resolve_hard_cap_usd`.
+    default_hard_cap_usd: float = DEFAULT_HARD_CAP_USD
+    synthesis_envelope_usd: float = DEFAULT_SYNTHESIS_ENVELOPE_USD
+    installation_doc_floor_usd: float = DEFAULT_INSTALLATION_DOC_FLOOR_USD
+    fanout_default_budget_usd: float = DEFAULT_FANOUT_BUDGET_USD
+    force_local_below_usd: float = DEFAULT_FORCE_LOCAL_BELOW_USD
+    refuse_if_est_cost_fraction_over: float = DEFAULT_REFUSE_EST_COST_FRACTION
+    low_budget_skip_usd: float = DEFAULT_LOW_BUDGET_SKIP_USD
+    min_call_budget_usd: float = DEFAULT_MIN_CALL_BUDGET_USD
     # Optional per-stage soft budget allocation (C4 scaffold). Maps
     # NodeRole values to target fractions of hard_cap_usd. Today only
     # surfaces warnings when a stage exceeds its share; hard enforcement
@@ -3031,7 +3076,7 @@ class Gateway:
         )
 
         # If budget is low and not forcing local, fall back to ollama to preserve budget
-        if budget_remaining_usd < 0.05 and not force_local and not self.config.force_local_only:
+        if budget_remaining_usd < self.config.force_local_below_usd and not force_local and not self.config.force_local_only:
             # Audit §4.8: skip the rewrite when ``ollama_local_model`` isn't
             # configured. Without the guard, ``model_key = "ollama:"``
             # crashed in ``_get_provider`` with a cryptic ValueError exactly
@@ -3310,7 +3355,7 @@ class Gateway:
                 )
             # Early warning when we land within 20% of the cap. Helps the
             # operator notice they're approaching the wall before HITL fires.
-            if budget_remaining_usd > 0 and est_cost > 0.8 * budget_remaining_usd:
+            if budget_remaining_usd > 0 and est_cost > self.config.refuse_if_est_cost_fraction_over * budget_remaining_usd:
                 logger.warning(
                     "[gateway] Pre-flight estimate $%.4f is within 20%% of remaining "
                     "budget $%.4f (role=%s, model=%s). Consider raising the cap or "
@@ -4286,7 +4331,51 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
         force_local_only=model_routing.get("force_local_only", False),
-        hard_cap_usd=token_budget.get("hard_cap_usd", 2.00),
+        hard_cap_usd=resolve_hard_cap_usd(token_budget),
+        default_hard_cap_usd=_clamp_positive_float(
+            token_budget.get("default_hard_cap_usd", DEFAULT_HARD_CAP_USD),
+            name="token_budget.default_hard_cap_usd",
+            default=DEFAULT_HARD_CAP_USD, floor=0.01, ceiling=100000.0,
+        ),
+        synthesis_envelope_usd=_clamp_positive_float(
+            token_budget.get("synthesis_envelope_usd", DEFAULT_SYNTHESIS_ENVELOPE_USD),
+            name="token_budget.synthesis_envelope_usd",
+            default=DEFAULT_SYNTHESIS_ENVELOPE_USD, floor=0.01, ceiling=100000.0,
+        ),
+        installation_doc_floor_usd=_clamp_positive_float(
+            token_budget.get("installation_doc_floor_usd", DEFAULT_INSTALLATION_DOC_FLOOR_USD),
+            name="token_budget.installation_doc_floor_usd",
+            default=DEFAULT_INSTALLATION_DOC_FLOOR_USD, floor=0.01, ceiling=100000.0,
+        ),
+        fanout_default_budget_usd=_clamp_positive_float(
+            token_budget.get("fanout_default_budget_usd", DEFAULT_FANOUT_BUDGET_USD),
+            name="token_budget.fanout_default_budget_usd",
+            default=DEFAULT_FANOUT_BUDGET_USD, floor=0.01, ceiling=100000.0,
+        ),
+        force_local_below_usd=_clamp_positive_float(
+            (token_budget.get("gates", {}) or {}).get(
+                "force_local_below_usd", DEFAULT_FORCE_LOCAL_BELOW_USD),
+            name="token_budget.gates.force_local_below_usd",
+            default=DEFAULT_FORCE_LOCAL_BELOW_USD, floor=0.0, ceiling=100000.0,
+        ),
+        refuse_if_est_cost_fraction_over=_clamp_positive_float(
+            (token_budget.get("gates", {}) or {}).get(
+                "refuse_if_est_cost_fraction_over", DEFAULT_REFUSE_EST_COST_FRACTION),
+            name="token_budget.gates.refuse_if_est_cost_fraction_over",
+            default=DEFAULT_REFUSE_EST_COST_FRACTION, floor=0.0, ceiling=1.0,
+        ),
+        low_budget_skip_usd=_clamp_positive_float(
+            (token_budget.get("gates", {}) or {}).get(
+                "low_budget_skip_usd", DEFAULT_LOW_BUDGET_SKIP_USD),
+            name="token_budget.gates.low_budget_skip_usd",
+            default=DEFAULT_LOW_BUDGET_SKIP_USD, floor=0.0, ceiling=100000.0,
+        ),
+        min_call_budget_usd=_clamp_positive_float(
+            (token_budget.get("gates", {}) or {}).get(
+                "min_call_budget_usd", DEFAULT_MIN_CALL_BUDGET_USD),
+            name="token_budget.gates.min_call_budget_usd",
+            default=DEFAULT_MIN_CALL_BUDGET_USD, floor=0.0, ceiling=100000.0,
+        ),
         stages={
             str(k): float(v)
             for k, v in (token_budget.get("stages") or {}).items()

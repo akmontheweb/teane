@@ -533,10 +533,15 @@ Design the optimal container architecture. Return ONLY a valid JSON object match
     ]
 
     try:
+        from harness.gateway import DEFAULT_SYNTHESIS_ENVELOPE_USD
+        _synth_budget = float(getattr(
+            getattr(gateway, "config", None),
+            "synthesis_envelope_usd", DEFAULT_SYNTHESIS_ENVELOPE_USD,
+        ))
         response, budget = await gateway.dispatch(
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=2.00,
+            budget_remaining_usd=_synth_budget,
         )
 
         # Parse the JSON response

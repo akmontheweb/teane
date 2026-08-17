@@ -131,6 +131,10 @@ class LspPoolConfig:
     request_timeout_seconds: float = _DEFAULT_REQUEST_TIMEOUT
     python_require_venv: bool = True
     prefetch_budget_seconds: float = 20.0
+    # Hard ceiling on the per-call prefetch time budget, applied by
+    # diagnostics_gate. Operator-controlled (was a hardcoded 10.0s min that
+    # silently overrode ``prefetch_budget_seconds``).
+    prefetch_budget_seconds_max: float = 10.0
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "LspPoolConfig":
@@ -146,6 +150,9 @@ class LspPoolConfig:
             python_require_venv=bool(section.get("python_require_venv", True)),
             prefetch_budget_seconds=max(
                 1.0, float(section.get("prefetch_budget_seconds", 20.0)),
+            ),
+            prefetch_budget_seconds_max=max(
+                1.0, float(section.get("prefetch_budget_seconds_max", 10.0)),
             ),
         )
 

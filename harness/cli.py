@@ -890,6 +890,16 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # is a follow-up. Example: {"planning": 0.2, "patching": 0.2,
         # "repair": 0.5, "doc_reviewer": 0.05, "code_reviewer": 0.05}.
         "stages",
+        # Budget caps promoted from hardcoded literals (2026-08-17) so every
+        # cap is operator-controlled. ``default_hard_cap_usd`` is the fallback
+        # when ``hard_cap_usd`` is absent; ``synthesis_envelope_usd`` /
+        # ``installation_doc_floor_usd`` bound the doc/spec synth calls;
+        # ``fanout_default_budget_usd`` is the fanout tool's default;
+        # ``prefetch_budget_seconds_max`` caps LSP prefetch time; ``gates`` is
+        # a nested dict of budget-enforcement thresholds (see below).
+        "default_hard_cap_usd", "synthesis_envelope_usd",
+        "installation_doc_floor_usd", "fanout_default_budget_usd",
+        "gates",
     }),
     "node_throttle": frozenset({
         "max_patch_repair_iterations",
@@ -963,6 +973,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "lsp": frozenset({
         "enabled", "enabled_flows", "request_timeout_seconds",
         "python_require_venv", "prefetch_budget_seconds",
+        "prefetch_budget_seconds_max",
     }),
     "post_mortem": frozenset({
         "enabled", "max_cost_usd", "retire_on_clean_run",
@@ -1310,6 +1321,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "token_budget.hard_cap_usd": (int, float),
     "token_budget.stages": (dict,),
     "token_budget.context_window_threshold_pct": (int, float),
+    "token_budget.default_hard_cap_usd": (int, float),
+    "token_budget.synthesis_envelope_usd": (int, float),
+    "token_budget.installation_doc_floor_usd": (int, float),
+    "token_budget.fanout_default_budget_usd": (int, float),
+    "token_budget.gates": (dict,),
     "node_throttle.max_patch_repair_iterations": (int,),
     "node_throttle.max_consecutive_distraction_rounds": (int,),
     "node_throttle.max_consecutive_low_signal_rounds": (int,),
@@ -4133,7 +4149,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     # hardcoded $2.00 — the latter was misleading for runs configured
     # with a higher hard_cap_usd in .harness_config.json. Falls back
     # to $2.00 only for legacy states that don't carry the field.
-    budget_initial = float(state.get("budget_initial_usd", 2.00) or 2.00)
+    from harness.gateway import DEFAULT_HARD_CAP_USD
+    budget_initial = float(
+        state.get("budget_initial_usd", DEFAULT_HARD_CAP_USD)
+        or DEFAULT_HARD_CAP_USD
+    )
     loop_counter = state.get("loop_counter", {})
     errors = state.get("compiler_errors", [])
     exit_code = state.get("exit_code", -1)
@@ -4741,6 +4761,31 @@ def _load_requirements_doc_prompt(*, agile: bool, workspace_path: Optional[str] 
     return body + _REQUIREMENTS_OUTPUT_LANGUAGE_SUFFIX
 
 
+def _resolve_synth_budget(
+    explicit: Optional[float], gateway: Any, field: str,
+) -> float:
+    """Resolve a doc/spec-synthesis call's budget.
+
+    When the caller threads an explicit remaining budget (the main path), use
+    it. Otherwise fall back to the operator-controlled envelope from config
+    (``token_budget.synthesis_envelope_usd`` / ``installation_doc_floor_usd``,
+    surfaced on ``gateway.config``), and only to the named default constant
+    when no gateway/config is available. No budget cap is hardcoded here."""
+    if explicit is not None:
+        return float(explicit)
+    from harness.gateway import (
+        DEFAULT_SYNTHESIS_ENVELOPE_USD, DEFAULT_INSTALLATION_DOC_FLOOR_USD,
+    )
+    fallbacks = {
+        "synthesis_envelope_usd": DEFAULT_SYNTHESIS_ENVELOPE_USD,
+        "installation_doc_floor_usd": DEFAULT_INSTALLATION_DOC_FLOOR_USD,
+    }
+    cfg = getattr(gateway, "config", None)
+    if cfg is not None:
+        return float(getattr(cfg, field, fallbacks[field]))
+    return float(fallbacks[field])
+
+
 async def synthesize_requirements(
     manifest_path: str,
     output_dir: str,
@@ -4748,7 +4793,7 @@ async def synthesize_requirements(
     *,
     agile: bool = False,
     workspace_path: Optional[str] = None,
-    budget_remaining_usd: float = 2.00,
+    budget_remaining_usd: Optional[float] = None,
 ) -> str:
     """
     Read raw notes from a manifest file, route to LLM for synthesis,
@@ -4810,7 +4855,8 @@ async def synthesize_requirements(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=budget_remaining_usd,
+            budget_remaining_usd=_resolve_synth_budget(
+                budget_remaining_usd, gateway, "synthesis_envelope_usd"),
             log_label="requirements",
             cache_family="planning:requirements_synthesis",
         )
@@ -5060,7 +5106,7 @@ async def synthesize_architecture(
     output_dir: str,
     gateway: Any,
     *,
-    budget_remaining_usd: float = 2.00,
+    budget_remaining_usd: Optional[float] = None,
 ) -> str:
     """
     Read the approved SPEC_REQUIREMENTS.md and synthesize SPEC_ARCHITECTURE.md.
@@ -5120,7 +5166,8 @@ async def synthesize_architecture(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=budget_remaining_usd,
+            budget_remaining_usd=_resolve_synth_budget(
+                budget_remaining_usd, gateway, "synthesis_envelope_usd"),
             log_label="architecture",
             cache_family="planning:architecture_synthesis",
         )
@@ -5312,7 +5359,7 @@ async def synthesize_installation(
     gateway: Any,
     *,
     blueprint: Optional[dict[str, Any]] = None,
-    budget_remaining_usd: float = 1.00,
+    budget_remaining_usd: Optional[float] = None,
 ) -> str:
     """
     Synthesize ``INSTALLATION.md`` for a freshly generated greenfield app.
@@ -5385,7 +5432,8 @@ async def synthesize_installation(
             gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
-            budget_remaining_usd=budget_remaining_usd,
+            budget_remaining_usd=_resolve_synth_budget(
+                budget_remaining_usd, gateway, "installation_doc_floor_usd"),
             log_label="installation",
             cache_family="planning:installation_synthesis",
         )
@@ -5419,7 +5467,7 @@ async def _refine_requirements(
     additional_notes: str,
     gateway: Any,
     *,
-    budget_remaining_usd: float = 2.00,
+    budget_remaining_usd: Optional[float] = None,
 ) -> str:
     """
     Refine an existing SPEC_REQUIREMENTS.md with additional user notes.
@@ -5455,7 +5503,8 @@ updated SPEC_REQUIREMENTS.md document."""
         gateway=gateway,
         messages=messages,
         role=NodeRole.PLANNING,
-        budget_remaining_usd=budget_remaining_usd,
+        budget_remaining_usd=_resolve_synth_budget(
+            budget_remaining_usd, gateway, "synthesis_envelope_usd"),
         log_label="requirements:refine",
         cache_family="planning:requirements_refine",
     )
@@ -5599,7 +5648,7 @@ async def _classify_and_tag_nfrs_in_spec(
 
 
 async def interactive_review_loop(
-    spec_path: str, gateway: Any, *, budget_remaining_usd: float = 2.00,
+    spec_path: str, gateway: Any, *, budget_remaining_usd: Optional[float] = None,
 ) -> str:
     """
     Interactive terminal review loop for SPEC_REQUIREMENTS.md.
@@ -7219,8 +7268,17 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
 
     # Extract budget and sandbox settings
+    from harness.gateway import (
+        resolve_hard_cap_usd, DEFAULT_LOW_BUDGET_SKIP_USD,
+    )
     token_budget = config.get("token_budget", {})
-    budget_usd = token_budget.get("hard_cap_usd", 2.00)
+    budget_usd = resolve_hard_cap_usd(token_budget)
+    # Config-controlled threshold below which optional spec/architecture
+    # review cycles are skipped to preserve budget (was a hardcoded $0.10).
+    low_budget_skip_usd = float(
+        (token_budget.get("gates") or {}).get(
+            "low_budget_skip_usd", DEFAULT_LOW_BUDGET_SKIP_USD)
+    )
     # --allow-network is a real bool now (default true). Drop the
     # OR-truthy coalesce against config — the CLI default IS the
     # config-equivalent, and an explicit --allow-network false must
@@ -7615,7 +7673,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     # graph.py:3754 — stop revisiting the reviewer when the
                     # remaining session budget is below the reviewer's
                     # minimum useful cost.
-                    if budget_usd < 0.10:
+                    if budget_usd < low_budget_skip_usd:
                         logger.info(
                             "[requirements] Budget too low ($%.4f) — "
                             "skipping remaining review cycles.", budget_usd,
@@ -7709,7 +7767,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                             doc_reviewer_primary, max_review_cycles,
                         )
                         for cycle in range(1, max_review_cycles + 1):
-                            if budget_usd < 0.10:
+                            if budget_usd < low_budget_skip_usd:
                                 logger.info(
                                     "[architecture] Budget too low ($%.4f) — "
                                     "skipping remaining review cycles.", budget_usd,
@@ -8533,8 +8591,9 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         return 1
 
     build_command = resolve_build_command(config, workspace_path)
+    from harness.gateway import resolve_hard_cap_usd
     token_budget = config.get("token_budget", {})
-    budget_usd = token_budget.get("hard_cap_usd", 2.00)
+    budget_usd = resolve_hard_cap_usd(token_budget)
     # --allow-network is a real bool (default true). Drop the
     # OR-truthy coalesce: an explicit --allow-network false must NOT be
     # silently overridden by a stale `allow_network: true` in config.
@@ -11235,9 +11294,10 @@ async def cmd_chat(args: argparse.Namespace) -> int:
         logger.warning("[cli:chat] redactor init skipped: %s", exc)
     pool = await _maybe_start_mcp_pool(config, workspace_path=workspace_path)  # noqa: F841
 
+    from harness.gateway import resolve_hard_cap_usd
     budget = (
         float(args.budget) if getattr(args, "budget", None) is not None
-        else float((config.get("token_budget") or {}).get("hard_cap_usd", 2.00))
+        else resolve_hard_cap_usd(config.get("token_budget") or {})
     )
     try:
         from harness.chat import run_chat
@@ -12033,7 +12093,8 @@ async def cmd_metrics(args: argparse.Namespace) -> int:
         else metrics_cfg.get("burn_rate_window_minutes", 10)
     )
     window_minutes = max(1, min(1440, window_minutes))
-    hard_cap_usd = float(token_budget_cfg.get("hard_cap_usd", 2.00))
+    from harness.gateway import resolve_hard_cap_usd
+    hard_cap_usd = resolve_hard_cap_usd(token_budget_cfg)
 
     if args.all and args.session_id:
         logger.error("Pass --session-id OR --all, not both.")

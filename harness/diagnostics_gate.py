@@ -391,7 +391,10 @@ async def _expand_with_impacted_lsp(
         if pool is None or not pool.healthy():
             return None
         ws = os.path.abspath(workspace_path)
-        budget = min(float(getattr(pool.config, "prefetch_budget_seconds", 20.0)), 10.0)
+        budget = min(
+            float(getattr(pool.config, "prefetch_budget_seconds", 20.0)),
+            float(getattr(pool.config, "prefetch_budget_seconds_max", 10.0)),
+        )
         deadline = time.monotonic() + budget
         caller_rels: set[str] = set()
         for f in files[:10]:

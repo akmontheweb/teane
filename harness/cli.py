@@ -1104,6 +1104,15 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # empty_content_retries = re-dispatches on empty provider content.
         "max_retries", "retry_base_delay_seconds", "retry_max_delay_seconds",
         "retry_max_total_seconds", "empty_content_retries",
+        # Per-call HTTP timeouts (generous; a slow reasoning model is not a
+        # failure) + network-stall failover. request_timeout_per_role overrides
+        # request_timeout_seconds per role (e.g. patching gets the largest read
+        # budget). retry_network_cooloff_seconds is the wait before retrying the
+        # primary on a network stall; fallback_on_timeout routes a persistent
+        # timeout to the <role>_fallback model (this call only) then HITL.
+        "request_timeout_seconds", "connect_timeout_seconds",
+        "request_timeout_per_role", "retry_network_cooloff_seconds",
+        "network_cooloff_attempts", "fallback_on_timeout",
     }),
     # Observability knobs. dump_llm_calls captures every LLM dispatch
     # (across all roles) to ~/.harness/debug for post-mortem analysis;
@@ -1448,6 +1457,12 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.retry_max_delay_seconds": (int, float),
     "llm_dispatch.retry_max_total_seconds": (int, float),
     "llm_dispatch.empty_content_retries": (int,),
+    "llm_dispatch.request_timeout_seconds": (int, float),
+    "llm_dispatch.connect_timeout_seconds": (int, float),
+    "llm_dispatch.request_timeout_per_role": (dict,),
+    "llm_dispatch.retry_network_cooloff_seconds": (int, float),
+    "llm_dispatch.network_cooloff_attempts": (int,),
+    "llm_dispatch.fallback_on_timeout": (bool,),
     "web_tools.enabled": (bool,),
     "web_tools.max_bytes": (int,),
     "web_tools.max_results": (int,),

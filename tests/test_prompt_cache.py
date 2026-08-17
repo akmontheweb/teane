@@ -62,7 +62,7 @@ class _RecordingAnthropicClient:
         self.last_payload: dict[str, Any] | None = None
         self._response_payload = response_payload
 
-    async def post(self, _path: str, json: dict[str, Any]) -> _StubHttpResponse:
+    async def post(self, _path: str, json: dict[str, Any], **_kwargs: Any) -> _StubHttpResponse:
         self.last_payload = json
         return _StubHttpResponse(self._response_payload)
 

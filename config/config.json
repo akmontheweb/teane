@@ -260,7 +260,16 @@
         "retry_base_delay_seconds": 1.0,
         "retry_max_delay_seconds": 60.0,
         "retry_max_total_seconds": 300.0,
-        "empty_content_retries": 2
+        "empty_content_retries": 2,
+        "request_timeout_seconds": 600.0,
+        "connect_timeout_seconds": 10.0,
+        "request_timeout_per_role": {
+            "patching": 900.0,
+            "repair": 900.0
+        },
+        "retry_network_cooloff_seconds": 60.0,
+        "network_cooloff_attempts": 1,
+        "fallback_on_timeout": true
     },
     "persistence": {
         "db_path": "~/.harness/checkpoints.db",

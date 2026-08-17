@@ -481,3 +481,128 @@ class TestPerProviderCircuitBreakers:
             gw._record_rate_limit_failure("google")
         assert gw._circuit_is_open("google") is True
         assert gw._circuit_is_open("ollama") is False
+
+
+# ---------------------------------------------------------------------------
+# Timeout classification + failover (2026-08-17). ReadTimeout = LLM-response
+# (fall over to the fallback model this call only); ConnectError = network
+# (cool off + retry the PRIMARY); both non-responsive = HITL.
+# ---------------------------------------------------------------------------
+
+import httpx  # noqa: E402
+
+
+class _ScriptedProvider:
+    """Provider double whose chat_completion replays a script of LLMResponse
+    objects or raises scripted exceptions (one per call, last item repeats)."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._idx = 0
+        self.calls = 0
+        self.spec = ModelSpec(
+            provider="stub", model_id="fast", context_window=128_000,
+            input_cost_per_1m=0.5, output_cost_per_1m=1.0,
+            api_base_url="", api_key="x",
+        )
+        self.api_key = "x"
+
+    async def chat_completion(self, **_kwargs):
+        self.calls += 1
+        item = self._script[min(self._idx, len(self._script) - 1)]
+        self._idx += 1
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def close(self):
+        return None
+
+
+def _good(model="stub:fb"):
+    return LLMResponse(
+        content="OK OUTPUT",
+        usage=TokenUsage(input_tokens=10, output_tokens=20, model_name=model, cost_usd=0.0),
+        model=model,
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_fails_over_to_fallback():
+    # ReadTimeout on the primary = model stuck → use the fallback for this call.
+    primary = _ScriptedProvider([httpx.ReadTimeout("silent")])
+    fb = _ScriptedProvider([_good("stub:fb")])
+    _stub_model("stub:primary")
+    _stub_model("stub:fb")
+    cfg = GatewayConfig(
+        patching_primary="stub:primary", patching_fallback="stub:fb",
+        max_retries=0, base_delay=0.0, retry_network_cooloff_seconds=0.0,
+        fallback_on_timeout=True,
+    )
+    gateway = Gateway(cfg)
+    gateway._providers["stub:primary"] = primary  # type: ignore[index]
+    gateway._providers["stub:fb"] = fb  # type: ignore[index]
+    response, _ = await gateway.dispatch(
+        messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+    )
+    assert response.content == "OK OUTPUT"
+    assert fb.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_both_nonresponsive_raises_for_hitl():
+    # Primary AND fallback both time out → EmptyLLMResponseError → HITL.
+    primary = _ScriptedProvider([httpx.ReadTimeout("silent")])
+    fb = _ScriptedProvider([httpx.ReadTimeout("silent too")])
+    _stub_model("stub:primary")
+    _stub_model("stub:fb")
+    cfg = GatewayConfig(
+        patching_primary="stub:primary", patching_fallback="stub:fb",
+        max_retries=0, base_delay=0.0, retry_network_cooloff_seconds=0.0,
+        fallback_on_timeout=True,
+    )
+    gateway = Gateway(cfg)
+    gateway._providers["stub:primary"] = primary  # type: ignore[index]
+    gateway._providers["stub:fb"] = fb  # type: ignore[index]
+    with pytest.raises(EmptyLLMResponseError):
+        await gateway.dispatch(
+            messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+            role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_network_error_cools_off_and_retries_primary():
+    # ConnectError = network → cool off (0s in test) and retry the PRIMARY;
+    # the retry succeeds, so NO failover to a different model happens.
+    primary = _ScriptedProvider([httpx.ConnectError("no route"), _good("stub:primary")])
+    _stub_model("stub:primary")
+    cfg = GatewayConfig(
+        patching_primary="stub:primary",
+        max_retries=0, base_delay=0.0,
+        retry_network_cooloff_seconds=0.0, network_cooloff_attempts=1,
+        fallback_on_timeout=True,
+    )
+    gateway = Gateway(cfg)
+    gateway._providers["stub:primary"] = primary  # type: ignore[index]
+    response, _ = await gateway.dispatch(
+        messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+    )
+    assert response.content == "OK OUTPUT"
+    assert primary.calls == 2   # first raised ConnectError, cool-off retry succeeded
+
+
+def test_request_timeout_for_resolves_per_role():
+    _stub_model("stub:fast")
+    cfg = GatewayConfig(
+        planning_primary="stub:fast", patching_primary="stub:fast",
+        request_timeout_seconds=600.0, connect_timeout_seconds=10.0,
+        request_timeout_per_role={"patching": 900.0},
+    )
+    gateway = Gateway(cfg)
+    patch_t = gateway._request_timeout_for(NodeRole.PATCHING)
+    plan_t = gateway._request_timeout_for(NodeRole.PLANNING)
+    assert patch_t.read == 900.0 and patch_t.connect == 10.0
+    assert plan_t.read == 600.0   # falls back to the global default

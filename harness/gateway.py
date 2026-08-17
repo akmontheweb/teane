@@ -421,6 +421,17 @@ class BaseLLM(ABC):
             )
         return self._client
 
+    @staticmethod
+    def _post_timeout(kwargs: dict[str, Any]) -> Any:
+        """Per-call HTTP timeout for a chat_completion request. The gateway
+        passes a resolved ``httpx.Timeout`` via ``request_timeout`` (per-role,
+        config-controlled — see Gateway._request_timeout_for). When absent
+        (e.g. a provider used directly in a test), fall back to the client's
+        configured default rather than ``None`` (which httpx reads as 'no
+        timeout')."""
+        rt = kwargs.get("request_timeout")
+        return rt if rt is not None else httpx.USE_CLIENT_DEFAULT
+
     def _build_headers(self) -> dict[str, str]:
         """Construct provider-specific HTTP headers."""
         headers: dict[str, str] = {
@@ -894,7 +905,7 @@ class DeepSeekProvider(BaseLLM):
 
         logger.debug("[deepseek] Sending completion request. model=%s tokens_est=%d", self.spec.model_id, len(messages))
 
-        response = await client.post("/chat/completions", json=payload)
+        response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
@@ -1101,7 +1112,7 @@ class AnthropicProvider(BaseLLM):
         logger.debug("[anthropic] Sending completion request. model=%s thinking=%s",
                      self.spec.model_id, thinking and self.spec.supports_thinking)
 
-        response = await client.post("/messages", json=payload)
+        response = await client.post("/messages", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
@@ -1236,7 +1247,7 @@ class OpenAIProvider(BaseLLM):
 
         logger.debug("[openai] Sending completion request. model=%s", self.spec.model_id)
 
-        response = await client.post("/chat/completions", json=payload)
+        response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
@@ -1393,7 +1404,7 @@ class OllamaProvider(BaseLLM):
 
         logger.debug("[ollama] Sending completion request. model=%s", self.spec.model_id)
 
-        response = await client.post("/chat/completions", json=payload)
+        response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
@@ -2203,6 +2214,15 @@ DEFAULT_RETRY_BASE_DELAY_SECONDS = 1.0     # initial backoff delay
 DEFAULT_RETRY_MAX_DELAY_SECONDS = 60.0     # per-attempt backoff ceiling
 DEFAULT_RETRY_MAX_TOTAL_SECONDS = 300.0    # cumulative-sleep ceiling before giving up
 DEFAULT_EMPTY_CONTENT_RETRIES = 2          # re-dispatches on empty provider content
+# HTTP request timeouts for LLM calls (generous — a slow reasoning model taking a
+# minute+ is NOT a failure; don't misread a working call as a timeout).
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0    # read/overall per-call HTTP timeout
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0     # connection-establishment timeout
+# Network-stall recovery: on a connect/network error surviving fast retries, wait
+# this long and retry the PRIMARY (network issues usually clear in ~a minute)
+# before failing over to the fallback model.
+DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS = 60.0
+DEFAULT_NETWORK_COOLOFF_ATTEMPTS = 1
 
 
 def resolve_hard_cap_usd(token_budget: dict) -> float:
@@ -2434,6 +2454,16 @@ class GatewayConfig:
     retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
     retry_max_total_seconds: float = DEFAULT_RETRY_MAX_TOTAL_SECONDS
     empty_content_retries: int = DEFAULT_EMPTY_CONTENT_RETRIES
+    # Per-call HTTP timeouts (config-controlled; previously hardcoded 300/10 at
+    # the httpx client). request_timeout_per_role overrides request_timeout_seconds
+    # for specific roles — e.g. give patching the largest read budget.
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    request_timeout_per_role: dict[str, float] = field(default_factory=dict)
+    # Network-stall recovery + timeout failover.
+    retry_network_cooloff_seconds: float = DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS
+    network_cooloff_attempts: int = DEFAULT_NETWORK_COOLOFF_ATTEMPTS
+    fallback_on_timeout: bool = True
     # TLS: set to a CA bundle path (str) for corporate proxies, or False to
     # disable verification in air-gapped envs (not recommended for production).
     ssl_verify: Union[bool, str] = True
@@ -2948,6 +2978,64 @@ class Gateway:
                     _thinks(c.decomposition_reviewer_fallback_mode))
         return "", None
 
+    async def _fallback_dispatch(
+        self, *, reason: str, role: NodeRole, model_key: str,
+        model_override: Optional[str], force_local: bool,
+        messages: list[dict[str, Any]], budget_remaining_usd: float,
+        accumulated_cost: float, tools: Any, cache_family: Any,
+        llm_kwargs: dict[str, Any],
+    ) -> LLMResponse:
+        """Fail over to the ``<role>_fallback`` model for THIS call only.
+
+        ``model_override`` is not sticky across dispatch calls, so the next
+        round automatically returns to the primary (the user's "come back to
+        the original patching LLM after one round" contract). When no fallback
+        is configured — or when we are ALREADY in a fallback attempt
+        (``model_override`` set) and it too failed — raise
+        :class:`EmptyLLMResponseError`, which routes to HITL: primary and
+        fallback both unavailable needs another model or external handling.
+        """
+        _fb_model, _fb_thinking = self._role_fallback(role)
+        if (model_override is None and not force_local
+                and _fb_model and _fb_model != model_key):
+            logger.warning(
+                "[gateway] %s (role=%s, model=%s); falling back to %s "
+                "for this call (reverts to primary next round).",
+                reason, role.value, model_key, _fb_model,
+            )
+            return await self.dispatch(
+                messages=messages,
+                role=role,
+                budget_remaining_usd=max(0.0, budget_remaining_usd - accumulated_cost),
+                force_local=force_local,
+                model_override=_fb_model,
+                tools=tools,
+                cache_family=cache_family,
+                _thinking_override=_fb_thinking,
+                **llm_kwargs,
+            )
+        raise EmptyLLMResponseError(
+            f"{reason} (role={role.value}, model={model_key}). "
+            + ("Fallback model was also non-responsive"
+               if model_override is not None else "No fallback model configured")
+            + " — primary and fallback both unavailable; needs another model "
+            "or external handling."
+        )
+
+    def _request_timeout_for(self, role: NodeRole) -> "httpx.Timeout":
+        """Resolve the per-call HTTP timeout for ``role`` as an ``httpx.Timeout``.
+
+        Read/overall = ``llm_dispatch.request_timeout_per_role.<role>`` when set,
+        else ``llm_dispatch.request_timeout_seconds``; connect =
+        ``llm_dispatch.connect_timeout_seconds``. Generous by design — a slow
+        reasoning model that takes a minute+ is a working call, not a failure,
+        so we never treat a long-but-progressing dispatch as a timeout.
+        """
+        per_role = self.config.request_timeout_per_role or {}
+        role_key = role.value if hasattr(role, "value") else str(role)
+        read = float(per_role.get(role_key, self.config.request_timeout_seconds))
+        return httpx.Timeout(read, connect=float(self.config.connect_timeout_seconds))
+
     def _max_tokens_for(self, role: NodeRole) -> Optional[int]:
         """Resolve the per-call max_tokens ceiling for ``role``.
 
@@ -3408,6 +3496,10 @@ class Gateway:
                 messages=messages,
                 thinking=thinking,
                 tools=effective_tools,
+                # Per-role, config-controlled HTTP timeout (resolved fresh here
+                # so a fallback re-dispatch re-resolves for its own role rather
+                # than inheriting a stale value via llm_kwargs).
+                request_timeout=self._request_timeout_for(role),
                 **llm_kwargs,
             )
 
@@ -3483,6 +3575,77 @@ class Gateway:
                     f"help. Response body: {body}"
                 ) from exc
             raise
+        except (
+            httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError,
+            httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+        ) as exc:
+            # NETWORK failure surviving fast retries (can't establish / hold a
+            # connection). Rule 1: network → wait ~a minute and retry the
+            # PRIMARY (transient network usually clears) before failing over.
+            response = None
+            cooloffs = self.config.network_cooloff_attempts
+            while cooloffs > 0 and response is None:
+                cooloffs -= 1
+                cool = self.config.retry_network_cooloff_seconds
+                logger.warning(
+                    "[gateway] Network error for role=%s model=%s after fast "
+                    "retries (%s). Cooling off %.0fs then retrying primary.",
+                    role.value, model_key, type(exc).__name__, cool,
+                )
+                if cool > 0:
+                    await asyncio.sleep(cool)
+                try:
+                    response = await retry_with_backoff(
+                        _call,
+                        max_retries=self.config.max_retries,
+                        base_delay=self.config.base_delay,
+                        max_delay=self.config.retry_max_delay_seconds,
+                        max_total_seconds=self.config.retry_max_total_seconds,
+                        rate_limit_observer=_observer,
+                    )
+                except (
+                    httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+                    httpx.WriteError, httpx.RemoteProtocolError,
+                ) as exc2:
+                    exc = exc2
+                    response = None
+            if response is None:
+                # Persistent network failure → provider likely unhealthy → fail
+                # over to the fallback model (a different provider), else HITL.
+                # _fallback_dispatch returns dispatch's (response, budget) tuple
+                # (already fully post-processed), so return it directly.
+                if not self.config.fallback_on_timeout:
+                    raise
+                return await self._fallback_dispatch(
+                    reason=(
+                        f"primary unreachable after network cool-off "
+                        f"({type(exc).__name__})"
+                    ),
+                    role=role, model_key=model_key, model_override=model_override,
+                    force_local=force_local, messages=messages,
+                    budget_remaining_usd=budget_remaining_usd, accumulated_cost=0.0,
+                    tools=tools, cache_family=cache_family, llm_kwargs=llm_kwargs,
+                )
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+            # LLM-RESPONSE failure: the connection is fine but the model
+            # produced nothing within the (generous, per-role) request timeout —
+            # it is stuck on this prompt. Rule 2: LLM issue → use the fallback
+            # model for THIS call (reverts to primary next round). Both
+            # non-responsive → HITL (handled inside _fallback_dispatch).
+            if not self.config.fallback_on_timeout:
+                raise
+            # Returns dispatch's (response, budget) tuple, already fully
+            # post-processed — return directly rather than re-run the guards.
+            return await self._fallback_dispatch(
+                reason=(
+                    f"read-timeout — model silent past request timeout "
+                    f"({type(exc).__name__})"
+                ),
+                role=role, model_key=model_key, model_override=model_override,
+                force_local=force_local, messages=messages,
+                budget_remaining_usd=budget_remaining_usd, accumulated_cost=0.0,
+                tools=tools, cache_family=cache_family, llm_kwargs=llm_kwargs,
+            )
 
         # Empty-content guard (P1.5). retry_with_backoff handles transport
         # failures (429 / 5xx / connection) but not "200 OK with empty
@@ -4416,6 +4579,34 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             llm_dispatch.get("empty_content_retries", DEFAULT_EMPTY_CONTENT_RETRIES),
             name="llm_dispatch.empty_content_retries",
             default=DEFAULT_EMPTY_CONTENT_RETRIES, floor=0, ceiling=20,
+        ),
+        request_timeout_seconds=_clamp_positive_float(
+            llm_dispatch.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            name="llm_dispatch.request_timeout_seconds",
+            default=DEFAULT_REQUEST_TIMEOUT_SECONDS, floor=1.0, ceiling=86400.0,
+        ),
+        connect_timeout_seconds=_clamp_positive_float(
+            llm_dispatch.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS),
+            name="llm_dispatch.connect_timeout_seconds",
+            default=DEFAULT_CONNECT_TIMEOUT_SECONDS, floor=1.0, ceiling=3600.0,
+        ),
+        request_timeout_per_role={
+            str(k): float(v)
+            for k, v in (llm_dispatch.get("request_timeout_per_role") or {}).items()
+            if isinstance(v, (int, float)) and float(v) > 0
+        },
+        retry_network_cooloff_seconds=_clamp_positive_float(
+            llm_dispatch.get("retry_network_cooloff_seconds", DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS),
+            name="llm_dispatch.retry_network_cooloff_seconds",
+            default=DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS, floor=0.0, ceiling=3600.0,
+        ),
+        network_cooloff_attempts=_clamp_positive_int(
+            llm_dispatch.get("network_cooloff_attempts", DEFAULT_NETWORK_COOLOFF_ATTEMPTS),
+            name="llm_dispatch.network_cooloff_attempts",
+            default=DEFAULT_NETWORK_COOLOFF_ATTEMPTS, floor=0, ceiling=10,
+        ),
+        fallback_on_timeout=bool(
+            llm_dispatch.get("fallback_on_timeout", True)
         ),
         stages={
             str(k): float(v)

@@ -5586,6 +5586,21 @@ Generate your patches NOW. Only the blocks above. No other text."""
             },
         }
     except RuntimeError as exc:
+        # EmptyLLMResponseError (empty content OR primary+fallback both
+        # non-responsive after the resilience ladder) → route to HITL as
+        # llm_silent with a precise cause, not a misleading budget-exhausted.
+        from harness.gateway import EmptyLLMResponseError
+        if isinstance(exc, EmptyLLMResponseError):
+            logger.warning("[patching_node] LLM non-responsive: %s", exc)
+            return {
+                "node_state": {
+                    "current_node": "patching",
+                    "error": str(exc),
+                    "llm_silent": True,
+                    "hitl_trigger": "llm_silent",
+                },
+                "loop_counter": loop_counter,
+            }
         logger.warning("[patching_node] Gateway refused: %s", exc)
         return {
             "node_state": {"current_node": "patching", "error": str(exc), "budget_exhausted": True},

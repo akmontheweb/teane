@@ -43,7 +43,7 @@ class _RecordingClient:
         self.last_payload = None
         self._response_payload = response_payload
 
-    async def post(self, _path, json):
+    async def post(self, _path, json, **_kwargs):
         self.last_payload = json
         return _StubHttpResponse(self._response_payload)
 

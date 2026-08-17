@@ -365,3 +365,40 @@ class TestResilienceAndTimeoutPromotions:
             {"sandbox": {"test_timeout_seconds": 77}}, str(tmp_path),
         )
         assert "--timeout=77" in cmd2
+
+
+class TestTimeoutAndFailoverConfig:
+    """2026-08-17: per-role HTTP timeouts + network-stall / timeout failover
+    knobs land on GatewayConfig from llm_dispatch."""
+
+    def test_defaults(self):
+        from harness.gateway import (
+            DEFAULT_REQUEST_TIMEOUT_SECONDS, DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS,
+        )
+        cfg = GatewayConfig()
+        assert cfg.request_timeout_seconds == DEFAULT_REQUEST_TIMEOUT_SECONDS
+        assert cfg.connect_timeout_seconds == DEFAULT_CONNECT_TIMEOUT_SECONDS
+        assert cfg.request_timeout_per_role == {}
+        assert cfg.retry_network_cooloff_seconds == DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS
+        assert cfg.fallback_on_timeout is True
+
+    def test_from_config(self):
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "llm_dispatch": {
+                "request_timeout_seconds": 720,
+                "connect_timeout_seconds": 15,
+                "request_timeout_per_role": {"patching": 900, "repair": 800, "bad": -1},
+                "retry_network_cooloff_seconds": 45,
+                "network_cooloff_attempts": 2,
+                "fallback_on_timeout": False,
+            },
+        })
+        assert gw.config.request_timeout_seconds == 720
+        assert gw.config.connect_timeout_seconds == 15
+        # positive-only entries kept; non-positive dropped.
+        assert gw.config.request_timeout_per_role == {"patching": 900.0, "repair": 800.0}
+        assert gw.config.retry_network_cooloff_seconds == 45
+        assert gw.config.network_cooloff_attempts == 2
+        assert gw.config.fallback_on_timeout is False

@@ -3184,7 +3184,7 @@ class TestGatekeeperAutoApprove:
                         "usage": {"input_tokens": 1, "output_tokens": 1}}
 
         class FakeClient:
-            async def post(self, url, json):
+            async def post(self, url, json, **_kwargs):
                 captured["payload"] = json
                 return FakeResponse()
 

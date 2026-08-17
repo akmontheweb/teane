@@ -866,6 +866,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "sandbox": frozenset({
         "backend", "docker_image", "docker_memory_limit", "docker_cpu_limit",
         "docker_pids_limit", "readonly_cache_mounts", "timeout_seconds",
+        # Per-test execution timeout baked into the pytest build command
+        # (was a hardcoded --timeout=30). Operator-controlled (2026-08-17).
+        "test_timeout_seconds",
         "pgid_kill_on_timeout", "log_buffer_max_mb",
         # P1.3: opt-in for auto-enabling network on detected pip/npm install.
         "auto_enable_network_for_install",
@@ -1094,6 +1097,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # silences the prefix-stability drift events. Single-flag
         # rollback if a provider rejects the cache_control directives.
         "prompt_cache_enabled",
+        # Provider retry / backoff resilience promoted from hardcoded
+        # constants (2026-08-17). max_retries = provider retries per dispatch
+        # (attempts = N+1); retry_base/max_delay_seconds bound the backoff;
+        # retry_max_total_seconds caps cumulative sleep before giving up;
+        # empty_content_retries = re-dispatches on empty provider content.
+        "max_retries", "retry_base_delay_seconds", "retry_max_delay_seconds",
+        "retry_max_total_seconds", "empty_content_retries",
     }),
     # Observability knobs. dump_llm_calls captures every LLM dispatch
     # (across all roles) to ~/.harness/debug for post-mortem analysis;
@@ -1310,6 +1320,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "sandbox.docker_pids_limit": (int,),
     "sandbox.readonly_cache_mounts": (list,),
     "sandbox.timeout_seconds": (int,),
+    "sandbox.test_timeout_seconds": (int,),
     "sandbox.pgid_kill_on_timeout": (bool,),
     "sandbox.log_buffer_max_mb": (int,),
     "sandbox.auto_enable_network_for_install": (bool,),
@@ -1432,6 +1443,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.patching_emission_rounds": (int,),
     "llm_dispatch.read_file_rounds": (int,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
+    "llm_dispatch.max_retries": (int,),
+    "llm_dispatch.retry_base_delay_seconds": (int, float),
+    "llm_dispatch.retry_max_delay_seconds": (int, float),
+    "llm_dispatch.retry_max_total_seconds": (int, float),
+    "llm_dispatch.empty_content_retries": (int,),
     "web_tools.enabled": (bool,),
     "web_tools.max_bytes": (int,),
     "web_tools.max_results": (int,),
@@ -2150,10 +2166,20 @@ def _makefile_has_target(workspace_path: str, target: str) -> bool:
 # images that lack it will error out with "unrecognized argument
 # --timeout" — operators can fix that with a one-line
 # ``python3 -m pip install pytest-timeout`` in their build command.
-_PYTEST_RUN = (
-    "python3 -m pytest -vv --tb=long --showlocals "
-    "--timeout=30 --timeout-method=thread"
-)
+# Per-test execution timeout (seconds). Operator-controlled via
+# ``sandbox.test_timeout_seconds`` (2026-08-17); was a hardcoded ``--timeout=30``
+# that silently killed any generated test legitimately running longer.
+DEFAULT_PYTEST_TIMEOUT_SECONDS = 30
+
+
+def _pytest_run(test_timeout_seconds: int = DEFAULT_PYTEST_TIMEOUT_SECONDS) -> str:
+    """The pytest invocation with a config-controlled per-test timeout.
+    ``--timeout-method=thread`` also works inside asyncio-run tests where
+    signals would be intercepted by the loop."""
+    return (
+        "python3 -m pytest -vv --tb=long --showlocals "
+        f"--timeout={int(test_timeout_seconds)} --timeout-method=thread"
+    )
 
 
 _SUBDIR_BUILD_SKIP = frozenset({
@@ -2303,7 +2329,10 @@ def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> 
     return f"{prefix}{subdir_install}npm install && npm run build && {tail}"
 
 
-def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
+def _detect_subdir_build_command(
+    workspace_path: str, *,
+    test_timeout_seconds: int = DEFAULT_PYTEST_TIMEOUT_SECONDS,
+) -> Optional[str]:
     """Probe first-level subdirectories for a recognised manifest when
     the workspace root has none. Returns a ``cd <subdir> && ...`` form
     that installs deps and runs the test command, or ``None`` if no
@@ -2358,7 +2387,7 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
             )
             return (
                 f"{_uv_venv_prefix()} && (cd {entry} && uv pip install -e .)"
-                f"{dev_step} && {_PYTEST_RUN}"
+                f"{dev_step} && {_pytest_run(test_timeout_seconds)}"
             )
         if os.path.isfile(os.path.join(full, "requirements.txt")):
             dev_step = (
@@ -2368,7 +2397,7 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
             )
             return (
                 f"{_uv_venv_prefix()} && (cd {entry} && uv pip install -r requirements.txt)"
-                f"{dev_step} && {_PYTEST_RUN}"
+                f"{dev_step} && {_pytest_run(test_timeout_seconds)}"
             )
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
@@ -2397,6 +2426,7 @@ def _detect_default_build_command(
     workspace_path: str,
     *,
     is_greenfield: bool = False,
+    test_timeout_seconds: int = DEFAULT_PYTEST_TIMEOUT_SECONDS,
 ) -> Optional[str]:
     """Pick a build command by sniffing workspace markers for the locked
     core stack.
@@ -2459,15 +2489,15 @@ def _detect_default_build_command(
         except Exception:  # noqa: BLE001 — composer is best-effort; fall through on any failure
             _union_install = None
         if _union_install:
-            return f"{_union_install} && {_PYTEST_RUN}"
+            return f"{_union_install} && {_pytest_run(test_timeout_seconds)}"
         # Fallback: composer returned None despite root manifest existing
         # (transient FS error, symlink loop). Use the historical narrow
         # install so the build can at least attempt to run.
         if has("pyproject.toml"):
             dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
-            return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
+            return f"{_uv_venv_prefix()} && uv pip install -e .{dev_step} && {_pytest_run(test_timeout_seconds)}"
         dev_step = " && uv pip install -r requirements-dev.txt" if has("requirements-dev.txt") else ""
-        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && {_PYTEST_RUN}"
+        return f"{_uv_venv_prefix()} && uv pip install -r requirements.txt{dev_step} && {_pytest_run(test_timeout_seconds)}"
     # Java — Maven first, then Gradle (wrapper if present).
     if has("pom.xml"):
         return "mvn -B test"
@@ -2490,7 +2520,9 @@ def _detect_default_build_command(
     # the LLM scaffolds a split backend/frontend layout — without this
     # probe the detector falls through to the bare-pytest fallback and
     # the project's actual deps are never installed.
-    subdir_cmd = _detect_subdir_build_command(workspace_path)
+    subdir_cmd = _detect_subdir_build_command(
+        workspace_path, test_timeout_seconds=test_timeout_seconds,
+    )
     if subdir_cmd:
         return subdir_cmd
     # Last-chance Python heuristic: any .py file (top level OR one
@@ -2500,7 +2532,7 @@ def _detect_default_build_command(
     # unnecessary. The legacy substring is kept in the fallback below
     # only for the (rare) case where the harness runs outside the
     # builder image and the operator hasn't pre-installed pytest.
-    fallback = f"{_uv_venv_prefix()} && uv pip install pytest && {_PYTEST_RUN}"
+    fallback = f"{_uv_venv_prefix()} && uv pip install pytest && {_pytest_run(test_timeout_seconds)}"
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):
@@ -2544,9 +2576,16 @@ def resolve_build_command(
     command. See :func:`_detect_default_build_command` for the
     greenfield/brownfield contract.
     """
+    # Per-test execution timeout — operator-controlled via
+    # sandbox.test_timeout_seconds (falls back to the historical 30s).
+    test_timeout_seconds = int(
+        (config.get("sandbox") or {}).get(
+            "test_timeout_seconds", DEFAULT_PYTEST_TIMEOUT_SECONDS)
+    )
     if workspace_path:
         detected = _detect_default_build_command(
             workspace_path, is_greenfield=is_greenfield,
+            test_timeout_seconds=test_timeout_seconds,
         )
         if detected:
             logger.info(
@@ -2583,7 +2622,7 @@ def resolve_build_command(
             "[ -f requirements.txt ] && uv pip install --quiet -r requirements.txt ; "
             "[ -f server/requirements.txt ] && "
             "uv pip install --quiet -r server/requirements.txt ; "
-            f"{_PYTEST_RUN}"
+            f"{_pytest_run(test_timeout_seconds)}"
         )
     )
     logger.info(

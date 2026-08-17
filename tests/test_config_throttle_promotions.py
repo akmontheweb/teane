@@ -304,3 +304,64 @@ class TestBudgetCapPromotions:
         assert resolve_hard_cap_usd({}) == DEFAULT_HARD_CAP_USD
         # garbage → constant, never crashes
         assert resolve_hard_cap_usd({"hard_cap_usd": "oops"}) == DEFAULT_HARD_CAP_USD
+
+
+class TestResilienceAndTimeoutPromotions:
+    """2026-08-17: provider retry/backoff (llm_dispatch) and the pytest
+    per-test timeout (sandbox.test_timeout_seconds) moved from hardcoded
+    literals to config."""
+
+    def test_retry_dataclass_defaults(self):
+        from harness.gateway import (
+            DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_DELAY_SECONDS,
+            DEFAULT_RETRY_MAX_DELAY_SECONDS, DEFAULT_RETRY_MAX_TOTAL_SECONDS,
+            DEFAULT_EMPTY_CONTENT_RETRIES,
+        )
+        cfg = GatewayConfig()
+        assert cfg.max_retries == DEFAULT_MAX_RETRIES
+        assert cfg.base_delay == DEFAULT_RETRY_BASE_DELAY_SECONDS
+        assert cfg.retry_max_delay_seconds == DEFAULT_RETRY_MAX_DELAY_SECONDS
+        assert cfg.retry_max_total_seconds == DEFAULT_RETRY_MAX_TOTAL_SECONDS
+        assert cfg.empty_content_retries == DEFAULT_EMPTY_CONTENT_RETRIES
+
+    def test_retry_from_config(self):
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "llm_dispatch": {
+                "max_retries": 8,
+                "retry_base_delay_seconds": 2.0,
+                "retry_max_delay_seconds": 90.0,
+                "retry_max_total_seconds": 600.0,
+                "empty_content_retries": 4,
+            },
+        })
+        assert gw.config.max_retries == 8
+        assert gw.config.base_delay == 2.0
+        assert gw.config.retry_max_delay_seconds == 90.0
+        assert gw.config.retry_max_total_seconds == 600.0
+        assert gw.config.empty_content_retries == 4
+
+    def test_retry_clamps(self):
+        gw = create_gateway_from_config({
+            **_stub_routing(),
+            "llm_dispatch": {"max_retries": -1, "empty_content_retries": 999},
+        })
+        assert gw.config.max_retries == 0        # floor
+        assert gw.config.empty_content_retries == 20  # ceiling
+
+    def test_pytest_run_uses_given_timeout(self):
+        from harness.cli import _pytest_run, DEFAULT_PYTEST_TIMEOUT_SECONDS
+        assert "--timeout=45" in _pytest_run(45)
+        assert f"--timeout={DEFAULT_PYTEST_TIMEOUT_SECONDS}" in _pytest_run()
+
+    def test_build_command_threads_test_timeout(self, tmp_path):
+        from harness.cli import _detect_default_build_command, resolve_build_command
+        (tmp_path / "main.py").write_text("print('hi')\n")
+        # Helper honours an explicit timeout...
+        cmd = _detect_default_build_command(str(tmp_path), test_timeout_seconds=45)
+        assert cmd is not None and "--timeout=45" in cmd
+        # ...and resolve_build_command reads it from config.sandbox.
+        cmd2 = resolve_build_command(
+            {"sandbox": {"test_timeout_seconds": 77}}, str(tmp_path),
+        )
+        assert "--timeout=77" in cmd2

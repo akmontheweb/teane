@@ -13897,14 +13897,22 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         and is_greenfield_compile
         and "uv pip install -r" in build_cmd
     ):
-        from harness.cli import _detect_default_build_command
+        from harness.cli import (
+            _detect_default_build_command, _pytest_run,
+            DEFAULT_PYTEST_TIMEOUT_SECONDS,
+        )
+        # Per-test timeout is operator-controlled (sandbox.test_timeout_seconds).
+        _test_timeout = int(
+            ((state.get("harness_config") or {}).get("sandbox") or {}).get(
+                "test_timeout_seconds", DEFAULT_PYTEST_TIMEOUT_SECONDS)
+        )
         re_detected = _detect_default_build_command(
             workspace, is_greenfield=True,
+            test_timeout_seconds=_test_timeout,
         )
         # Source of truth lives in harness/cli.py — single import avoids
         # the two sides drifting if the canonical pytest invocation changes.
-        from harness.cli import _PYTEST_RUN as _CLI_PYTEST_RUN
-        tail = f" && {_CLI_PYTEST_RUN}"
+        tail = f" && {_pytest_run(_test_timeout)}"
         if (
             re_detected
             and re_detected != build_cmd

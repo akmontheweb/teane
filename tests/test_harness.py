@@ -5205,10 +5205,10 @@ class TestMakefileBuildTargetDetection:
         # the required substrings instead of exact string equality so the
         # composer can grow additional steps without breaking this test.
         from harness.graph import _uv_venv_prefix
-        from harness.cli import _PYTEST_RUN
+        from harness.cli import _pytest_run
         assert _uv_venv_prefix() in cmd
         assert "uv pip install -e ." in cmd
-        assert cmd.endswith(f" && {_PYTEST_RUN}")
+        assert cmd.endswith(f" && {_pytest_run()}")
 
     def test_makefile_with_build_target_still_returns_make_build(self, tmp_path):
         from harness.cli import _detect_default_build_command
@@ -7340,12 +7340,12 @@ class TestCLI:
         # and wedges the repair loop (the LLM keeps editing manifests
         # the build_command never consults). Installer is `uv pip install`
         # now (see harness/skills/makefile_python.md).
-        from harness.cli import _detect_default_build_command, _PYTEST_RUN
+        from harness.cli import _detect_default_build_command, _pytest_run
         from harness.graph import _uv_venv_prefix
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "main.py").write_text("print('hi')\n")
             assert _detect_default_build_command(tmpdir) == (
-                f"{_uv_venv_prefix()} && uv pip install pytest && {_PYTEST_RUN}"
+                f"{_uv_venv_prefix()} && uv pip install pytest && {_pytest_run()}"
             )
 
     def test_detect_build_command_no_hints_returns_none(self):

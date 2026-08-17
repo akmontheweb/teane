@@ -74,8 +74,12 @@ def _python_test_command() -> str:
     """Pull the canonical pytest invocation from cli so the test-generation
     runner stays in sync with the main build-command builder. Same import
     pattern as compiler_node's mid-session command-upgrade matcher."""
-    from harness.cli import _PYTEST_RUN
-    return _PYTEST_RUN
+    # NOTE: this builds a module-level constant at import time, so it uses the
+    # default per-test timeout. The main build command (resolve_build_command)
+    # honours sandbox.test_timeout_seconds; this runner mirrors the historical
+    # fixed invocation.
+    from harness.cli import _pytest_run
+    return _pytest_run()
 
 
 _STACK_TEST_COMMANDS: dict[str, str] = {

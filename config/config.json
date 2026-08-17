@@ -28,6 +28,7 @@
         "cache_volumes": false,
         "cache_volumes_prefix": "harness",
         "timeout_seconds": 300,
+        "test_timeout_seconds": 30,
         "pgid_kill_on_timeout": true,
         "restore_workspace_ownership": true
     },
@@ -254,7 +255,12 @@
         "patching_read_file_cap": 20,
         "patching_emission_rounds": 10,
         "read_file_rounds": 6,
-        "prompt_cache_enabled": true
+        "prompt_cache_enabled": true,
+        "max_retries": 5,
+        "retry_base_delay_seconds": 1.0,
+        "retry_max_delay_seconds": 60.0,
+        "retry_max_total_seconds": 300.0,
+        "empty_content_retries": 2
     },
     "persistence": {
         "db_path": "~/.harness/checkpoints.db",

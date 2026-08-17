@@ -2196,6 +2196,14 @@ DEFAULT_LOW_BUDGET_SKIP_USD = 0.10        # skip optional review / node work bel
 DEFAULT_MIN_CALL_BUDGET_USD = 0.01        # minimum remaining to attempt a call
 DEFAULT_PREFETCH_BUDGET_SECONDS_MAX = 10.0  # hard ceiling on LSP prefetch time budget
 
+# Provider retry / backoff resilience defaults. Config-controlled via
+# ``llm_dispatch`` (see config.json) — no retry cap is hardcoded at a call site.
+DEFAULT_MAX_RETRIES = 5                    # provider retries per dispatch (attempts = N+1)
+DEFAULT_RETRY_BASE_DELAY_SECONDS = 1.0     # initial backoff delay
+DEFAULT_RETRY_MAX_DELAY_SECONDS = 60.0     # per-attempt backoff ceiling
+DEFAULT_RETRY_MAX_TOTAL_SECONDS = 300.0    # cumulative-sleep ceiling before giving up
+DEFAULT_EMPTY_CONTENT_RETRIES = 2          # re-dispatches on empty provider content
+
 
 def resolve_hard_cap_usd(token_budget: dict) -> float:
     """Resolve the run's total budget cap from a ``token_budget`` config dict.
@@ -2419,8 +2427,13 @@ class GatewayConfig:
     # patcher.use_structured_tools=false to force the legacy text DSL.
     use_structured_tools: bool = True
     context_window_threshold_pct: float = 0.85
-    max_retries: int = 5
-    base_delay: float = 1.0
+    # Provider retry / backoff resilience — config-controlled via llm_dispatch
+    # (2026-08-17); previously these were hardcoded defaults with no config key.
+    max_retries: int = DEFAULT_MAX_RETRIES
+    base_delay: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
+    retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
+    retry_max_total_seconds: float = DEFAULT_RETRY_MAX_TOTAL_SECONDS
+    empty_content_retries: int = DEFAULT_EMPTY_CONTENT_RETRIES
     # TLS: set to a CA bundle path (str) for corporate proxies, or False to
     # disable verification in air-gapped envs (not recommended for production).
     ssl_verify: Union[bool, str] = True
@@ -3420,6 +3433,8 @@ class Gateway:
                 _call,
                 max_retries=self.config.max_retries,
                 base_delay=self.config.base_delay,
+                max_delay=self.config.retry_max_delay_seconds,
+                max_total_seconds=self.config.retry_max_total_seconds,
                 rate_limit_observer=_observer,
             )
         except httpx.HTTPStatusError as exc:
@@ -3493,7 +3508,7 @@ class Gateway:
         # code deducted only the LAST response's cost so up to 2x of
         # the cost-per-call slipped past the local budget enforcer.
         accumulated_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
-        empty_retry_attempts = 2
+        empty_retry_attempts = self.config.empty_content_retries
         last_retry_exc: Optional[BaseException] = None
         while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(
@@ -4375,6 +4390,32 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
                 "min_call_budget_usd", DEFAULT_MIN_CALL_BUDGET_USD),
             name="token_budget.gates.min_call_budget_usd",
             default=DEFAULT_MIN_CALL_BUDGET_USD, floor=0.0, ceiling=100000.0,
+        ),
+        # Provider retry / backoff resilience (llm_dispatch).
+        max_retries=_clamp_positive_int(
+            llm_dispatch.get("max_retries", DEFAULT_MAX_RETRIES),
+            name="llm_dispatch.max_retries", default=DEFAULT_MAX_RETRIES,
+            floor=0, ceiling=50,
+        ),
+        base_delay=_clamp_positive_float(
+            llm_dispatch.get("retry_base_delay_seconds", DEFAULT_RETRY_BASE_DELAY_SECONDS),
+            name="llm_dispatch.retry_base_delay_seconds",
+            default=DEFAULT_RETRY_BASE_DELAY_SECONDS, floor=0.0, ceiling=600.0,
+        ),
+        retry_max_delay_seconds=_clamp_positive_float(
+            llm_dispatch.get("retry_max_delay_seconds", DEFAULT_RETRY_MAX_DELAY_SECONDS),
+            name="llm_dispatch.retry_max_delay_seconds",
+            default=DEFAULT_RETRY_MAX_DELAY_SECONDS, floor=0.0, ceiling=3600.0,
+        ),
+        retry_max_total_seconds=_clamp_positive_float(
+            llm_dispatch.get("retry_max_total_seconds", DEFAULT_RETRY_MAX_TOTAL_SECONDS),
+            name="llm_dispatch.retry_max_total_seconds",
+            default=DEFAULT_RETRY_MAX_TOTAL_SECONDS, floor=1.0, ceiling=86400.0,
+        ),
+        empty_content_retries=_clamp_positive_int(
+            llm_dispatch.get("empty_content_retries", DEFAULT_EMPTY_CONTENT_RETRIES),
+            name="llm_dispatch.empty_content_retries",
+            default=DEFAULT_EMPTY_CONTENT_RETRIES, floor=0, ceiling=20,
         ),
         stages={
             str(k): float(v)

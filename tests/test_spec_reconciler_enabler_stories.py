@@ -217,14 +217,22 @@ def test_parse_tolerates_llm_heading_format_variance():
 
 
 class TestConstraintNfrEmbedCarryForward:
-    """ADR-0004 NFR-002 double-handling fix (session 01a007f3). Decomposition
-    folds a constraint NFR's ACs into the functional stories it constrains and
-    DROPS the standalone NFR story from the DB. reconcile_workspace_from_spec
-    re-parses the raw spec (which still lists the NFR), so without carry-forward
-    it resurrected the NFR as a standalone PLATFORM story and lost the fold.
-    With embed_constraint_nfrs=True it must honor the drop and carry the folded
-    [NFR:...] ACs onto the functional stories."""
+    """ADR-0004 NFR-002 double-handling fix + the 01a00dfb regression follow-up.
 
+    Decomposition embeds ONLY constraint-class NFRs into the functional stories
+    they constrain (tagging each folded AC ``[NFR:<policy>]``) and does not
+    create NFR story rows in the DB at all. reconcile re-parses the raw spec
+    (which lists every NFR enabler story). It must:
+      * drop ONLY the NFRs actually embedded (detected via the [NFR:...] tags),
+        not every NFR absent from the DB — dropping a *capability* NFR left its
+        requirement uncovered and fail-fasted the build (01a00dfb);
+      * carry the folded [NFR:...] ACs onto the functional stories; and
+      * link those functional stories as SATISFYING the embedded NFR's
+        requirement (the dropped standalone story no longer self-links it).
+    """
+
+    # STORY-NFR-001 = embedded (a functional story carries its [NFR:NFR-001] AC).
+    # STORY-NFR-002 = capability (no functional story absorbs it) → kept.
     _SPEC = (
         "# Spec\n\n"
         "## Epic: EPIC-001 — Root\n\n"
@@ -236,7 +244,10 @@ class TestConstraintNfrEmbedCarryForward:
         "## Enabler Stories\n"
         "### Enabler Story: STORY-NFR-001 — Input sanitisation\n"
         "**Parent feature:** FEAT-001\n"
-        "**As a** operator\n**I want** sanitised input\n**So that** no injection.\n"
+        "**As a** operator\n**I want** sanitised input\n**So that** no injection.\n\n"
+        "### Enabler Story: STORY-NFR-002 — Accessibility baseline\n"
+        "**Parent feature:** FEAT-001\n"
+        "**As a** user\n**I want** accessible UI\n**So that** everyone can use it.\n"
     )
 
     def _run(self, tmp_path, monkeypatch, *, embed: bool):
@@ -257,8 +268,9 @@ class TestConstraintNfrEmbedCarryForward:
             conn = story_state.open_story_db()
             try:
                 # Seed decomposition's POST-embed DB: FEAT-001 + functional
-                # STORY-001 carrying a folded [NFR:...] AC; STORY-NFR-001 is
-                # intentionally ABSENT (decomposition dropped it).
+                # STORY-001 carrying STORY-NFR-001's folded AC (real tag form,
+                # policy = _norm_nfr_key = "NFR-001"). NO NFR story rows exist —
+                # decomposition only writes functional stories.
                 story_state.create_features(
                     conn, "app-nfr", [{"feature_key": "FEAT-001", "name": "Contacts"}],
                 )
@@ -268,7 +280,7 @@ class TestConstraintNfrEmbedCarryForward:
                     "scope_files": ["app/contacts.py"],
                     "acceptance_criteria": [
                         "Contact is added",
-                        "[NFR:story-nfr-001] All input is sanitised",
+                        "[NFR:NFR-001] All input is sanitised",
                     ],
                 }])
                 spec_reconciler.reconcile_workspace_from_spec(
@@ -281,26 +293,43 @@ class TestConstraintNfrEmbedCarryForward:
                     a["text"]
                     for a in story_state.list_acceptance_criteria(conn, "app-nfr", s1["id"])
                 ]
-                return keys, acs
+                uncovered = {
+                    r["req_key"]
+                    for r in story_state.requirements_without_satisfying_story(
+                        conn, "app-nfr",
+                    )
+                }
+                return keys, acs, uncovered
             finally:
                 conn.close()
         finally:
             os.unlink(tmp.name)
 
-    def test_embed_on_drops_nfr_and_carries_folded_ac(self, tmp_path, monkeypatch):
-        keys, acs = self._run(tmp_path, monkeypatch, embed=True)
+    def test_embedded_nfr_dropped_capability_kept_all_covered(self, tmp_path, monkeypatch):
+        keys, acs, uncovered = self._run(tmp_path, monkeypatch, embed=True)
+        # Embedded constraint NFR is NOT resurrected as a standalone story...
         assert "STORY-NFR-001" not in keys, (
-            "an embedded constraint NFR decomposition dropped must NOT be "
-            "resurrected as a standalone story by reconcile"
+            "the embedded constraint NFR must not be resurrected as a standalone story"
+        )
+        # ...but the capability NFR (not embedded) IS kept.
+        assert "STORY-NFR-002" in keys, (
+            "a capability NFR that was NOT embedded must be reconciled in, not "
+            "dropped — dropping it left its requirement uncovered (01a00dfb)"
         )
         assert "STORY-001" in keys
-        assert any(a.startswith("[NFR:story-nfr-001]") for a in acs), (
-            "the folded [NFR:...] AC must be carried onto the functional story "
-            f"so coverage survives the wipe; got {acs}"
+        # The folded AC survives on the functional story.
+        assert any(a.startswith("[NFR:NFR-001]") for a in acs), acs
+        # BOTH NFR requirements are covered: NFR-001 via the functional story's
+        # satisfies-req edge, NFR-002 via its own standalone story.
+        assert "STORY-NFR-001" not in uncovered, (
+            "the embedded NFR's requirement must be covered by the functional "
+            f"story that absorbed it; uncovered={uncovered}"
         )
+        assert "STORY-NFR-002" not in uncovered, uncovered
 
     def test_embed_off_preserves_legacy_behavior(self, tmp_path, monkeypatch):
         # Baseline: with the flag off, reconcile behaves exactly as before —
-        # the spec's NFR story is (re)inserted (attached to its parent feature).
-        keys, _acs = self._run(tmp_path, monkeypatch, embed=False)
+        # every spec NFR story is (re)inserted under its parent feature.
+        keys, _acs, _uncovered = self._run(tmp_path, monkeypatch, embed=False)
         assert "STORY-NFR-001" in keys
+        assert "STORY-NFR-002" in keys

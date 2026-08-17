@@ -122,6 +122,12 @@ _STORY_RE = re.compile(
 # should still be populated).
 _PARENT_FEAT_RE = re.compile(r"\*\*Parent feature:\*\*\s+(FEAT-\d+)", re.IGNORECASE)
 
+# ADR-0004: a constraint NFR embedded into a functional story tags each folded
+# acceptance criterion ``[NFR:<policy>] …`` (policy = decomposition._norm_nfr_key,
+# e.g. ``NFR-002``). Used to detect which NFRs were actually embedded and to
+# carry their requirement coverage onto the absorbing functional stories.
+_NFR_AC_TAG_RE = re.compile(r"\[NFR:([^\]]+)\]")
+
 # ``**Parent epic:** EPIC-001`` — declared inside a feature body.
 # Used by the reconciler to write ``story_satisfies_req`` edges from
 # each story up through its feature to the enclosing epic, so
@@ -541,22 +547,19 @@ def reconcile_workspace_from_spec(
     matches = _match_llm_to_spec(parsed["stories"], llm_stories)
 
     # ADR-0004 carry-forward — honor decomposition's constraint-NFR embed so
-    # this reconcile doesn't resurrect an embedded NFR as a standalone story.
+    # this reconcile doesn't resurrect an embedded NFR as a standalone story,
+    # while KEEPING capability NFRs and preserving requirement coverage.
     folded_nfr_acs_by_llm_key: dict[str, list[str]] = {}
+    embedded_nfr_policies: set[str] = set()
     if embed_constraint_nfrs:
-        from harness.decomposition import _is_nfr_story_key
-        llm_keys_canon = {
-            story_state._canon(ll["story_key"]) for ll in llm_stories
-        }
-        embedded_nfr_keys = {
-            story_state._canon(s["story_key"])
-            for s in parsed["stories"]
-            if _is_nfr_story_key(s["story_key"])
-            and story_state._canon(s["story_key"]) not in llm_keys_canon
-        }
-        # Snapshot the folded ``[NFR:...]`` ACs decomposition wrote onto the
-        # functional stories (BEFORE the wipe below cascades them away) so we can
-        # re-attach them to the spec counterparts.
+        from harness.decomposition import _is_nfr_story_key, _norm_nfr_key
+        # Snapshot the folded ``[NFR:<policy>]`` ACs decomposition wrote onto the
+        # functional stories (BEFORE the wipe below cascades them away). Their
+        # presence is the AUTHORITATIVE signal of which NFRs were ACTUALLY
+        # embedded — NOT "absent from the DB": decomposition writes only
+        # functional stories, so EVERY spec NFR story is absent (capability ones
+        # included). Keying off absence wrongly dropped capability NFRs too and
+        # left their requirements uncovered → fail-fast (regression 01a00dfb).
         for ll in llm_stories:
             try:
                 acs = story_state.list_acceptance_criteria(
@@ -571,6 +574,21 @@ def reconcile_workspace_from_spec(
             ]
             if folded:
                 folded_nfr_acs_by_llm_key[ll["story_key"]] = folded
+        # The NFR policies that were actually embedded = those tagged onto a
+        # functional story's ACs.
+        for _acs in folded_nfr_acs_by_llm_key.values():
+            for _ac in _acs:
+                _m = _NFR_AC_TAG_RE.match(_ac.lstrip())
+                if _m:
+                    embedded_nfr_policies.add(_norm_nfr_key(_m.group(1)))
+        # Drop ONLY spec NFR stories that were embedded; capability NFRs stay and
+        # reconcile normally (their standalone story self-satisfies its req).
+        embedded_nfr_keys = {
+            story_state._canon(s["story_key"])
+            for s in parsed["stories"]
+            if _is_nfr_story_key(s["story_key"])
+            and _norm_nfr_key(s["story_key"]) in embedded_nfr_policies
+        }
         if embedded_nfr_keys:
             parsed["stories"] = [
                 s for s in parsed["stories"]
@@ -578,8 +596,9 @@ def reconcile_workspace_from_spec(
             ]
             logger.info(
                 "[spec_reconciler] ADR-0004: honoring decomposition's embed — "
-                "not resurrecting %d dropped constraint-NFR story(ies) "
-                "(their ACs are folded into functional stories): %s",
+                "not resurrecting %d embedded constraint-NFR story(ies) "
+                "(folded into functional stories; requirement coverage carried "
+                "onto them): %s",
                 len(embedded_nfr_keys), ", ".join(sorted(embedded_nfr_keys)),
             )
 
@@ -633,6 +652,17 @@ def reconcile_workspace_from_spec(
             r["req_key"]: r["id"]
             for r in story_state.list_requirements(conn, workspace)
         }
+        # ADR-0004: map each embedded-NFR policy (e.g. ``NFR-002``) back to its
+        # requirement key (e.g. ``STORY-NFR-002``) so a functional story that
+        # absorbed the NFR can be linked as SATISFYING that requirement — the
+        # standalone NFR story we dropped no longer provides the self-identity
+        # link, so without this the requirement is left uncovered (01a00dfb).
+        nfr_req_by_policy: dict[str, str] = {}
+        if embed_constraint_nfrs and embedded_nfr_policies:
+            from harness.decomposition import _is_nfr_story_key, _norm_nfr_key
+            for _rk in req_id_by_key:
+                if _is_nfr_story_key(_rk):
+                    nfr_req_by_policy[_norm_nfr_key(_rk)] = _rk
         stories_written = 0
         links_written = 0
         seen_story_keys: set[str] = set()
@@ -706,6 +736,17 @@ def reconcile_workspace_from_spec(
                 canonical = canonicalize_req_key(str(llm_key))
                 if canonical in req_id_by_key:
                     candidate_req_keys.add(canonical)
+            # ADR-0004: this functional story absorbed one or more embedded
+            # constraint NFRs (each folded AC is tagged ``[NFR:<policy>]``); it
+            # therefore SATISFIES those NFR requirements. Restores the coverage
+            # the dropped standalone NFR stories used to provide via self-links.
+            if nfr_req_by_policy and llm_hit:
+                for _ac in folded_nfr_acs_by_llm_key.get(llm_hit["story_key"], []):
+                    _m = _NFR_AC_TAG_RE.match(_ac.lstrip())
+                    if _m:
+                        _rk = nfr_req_by_policy.get(_norm_nfr_key(_m.group(1)))
+                        if _rk:
+                            candidate_req_keys.add(_rk)
             # Structural parent inference (2026-07-04) — the ciod v12
             # 15/26 traceability report showed 5 requirement rows
             # (1 EPIC + 4 FEATs) untraced because coverage was only

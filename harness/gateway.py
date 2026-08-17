@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import random
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -2774,15 +2775,26 @@ class Gateway:
         role: "NodeRole",
         cost_usd: float,
         elapsed_ms: int,
+        note: str = "",
     ) -> None:
         """Persist a single LLM dispatch (input messages + response) to
-        ``~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt``.
+        ``~/.harness/debug/<sid>_<seqno>_<role>_<model>[__<tag>].txt``.
 
         Gated by ``config.dump_llm_calls``. Best-effort: any I/O failure logs
         at debug and returns silently so dispatch is never blocked by dump
         problems. The file format mirrors the legacy
         ``_dump_repair_prompt_to_disk`` layout so existing tooling that reads
         ``repair_<sid>_<iter>.txt`` works on the unified files too.
+
+        ``note`` marks a non-final capture — most importantly the EMPTY /
+        pre-fallback responses that would otherwise be discarded before the
+        end-of-dispatch dump ever runs. It is written into the header and
+        slugified into a filename tag so ``ls`` surfaces the empties directly
+        (e.g. ``..._deepseek-v4-pro__empty-retry-2.txt``). Diagnosing why a
+        provider returns nothing is impossible without the exact
+        ``reasoning_content`` / ``finish_reason`` / tool-call state captured
+        here — an LLM emitting no content AND no tool call is the symptom this
+        section makes legible.
         """
         if not bool(getattr(self.config, "dump_llm_calls", False)):
             return
@@ -2801,24 +2813,29 @@ class Gateway:
             if isinstance(getattr(response, "model", None), str)
             else "unknown"
         )
+        tag = re.sub(r"[^a-z0-9]+", "-", note.lower()).strip("-") if note else ""
 
         debug_dir = os.path.expanduser("~/.harness/debug")
         os.makedirs(debug_dir, exist_ok=True)
-        path = os.path.join(
-            debug_dir,
-            f"{sid_short}_{seqno:04d}_{role_str}_{model_short}.txt",
-        )
+        fname = f"{sid_short}_{seqno:04d}_{role_str}_{model_short}"
+        if tag:
+            fname += f"__{tag}"
+        path = os.path.join(debug_dir, f"{fname}.txt")
 
         usage = response.usage
+        tool_calls = getattr(response, "tool_calls", None) or []
         header = (
             f"# LLM call {seqno}\n"
             f"# session: {sid}\n"
-            f"# role: {role_str}  model: {response.model}  "
+            + (f"# NOTE: {note}\n" if note else "")
+            + f"# role: {role_str}  model: {response.model}  "
             f"finish: {response.finish_reason}\n"
             f"# tokens_in={usage.input_tokens}  "
             f"tokens_out={usage.output_tokens}  "
             f"cached={usage.cached_tokens}  "
             f"cost=${cost_usd:.6f}  elapsed_ms={elapsed_ms}\n"
+            f"# tool_calls={len(tool_calls)}  "
+            f"content_chars={len(response.content) if isinstance(response.content, str) else 0}\n"
         )
         sections = [header]
         for i, msg in enumerate(messages):
@@ -2841,6 +2858,21 @@ class Gateway:
         reasoning_text = getattr(response, "reasoning_content", "") or ""
         sections.append(
             f"\n---\n## reasoning_content  ({len(reasoning_text)} chars)\n---\n{reasoning_text}\n"
+        )
+        # tool_calls — a tool-only turn is legitimately content-empty, so this
+        # distinguishes "emitted a tool call" from a true null (no content AND
+        # no tool call), which is the failure the empty-response capture exists
+        # to explain.
+        try:
+            tc_repr = json.dumps(
+                [{"name": (c or {}).get("name"), "input": (c or {}).get("input")}
+                 for c in tool_calls],
+                indent=2, default=str,
+            )
+        except Exception:  # noqa: BLE001 — dump formatting must never raise
+            tc_repr = str(tool_calls)
+        sections.append(
+            f"\n---\n## tool_calls  ({len(tool_calls)})\n---\n{tc_repr}\n"
         )
 
         with open(path, "w", encoding="utf-8") as f:
@@ -3679,6 +3711,20 @@ class Gateway:
                 "Retrying (%d remaining).",
                 response.model, role.value, empty_retry_attempts,
             )
+            # Capture the empty response before the retry discards it — its
+            # reasoning_content / finish_reason / tool_calls are the only
+            # evidence of WHY the provider returned nothing (a confused model
+            # that reasoned then quit vs a hard provider null). The end-of-
+            # dispatch dump only ever sees the FINAL (post-fallback) response.
+            try:
+                await self._dump_llm_call_to_disk(
+                    messages=messages, response=response, role=role,
+                    cost_usd=float(getattr(response.usage, "cost_usd", 0.0) or 0.0),
+                    elapsed_ms=0,
+                    note=f"empty-content retry ({empty_retry_attempts} left)",
+                )
+            except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
+                logger.debug("[gateway] empty-response dump skipped: %s", exc)
             empty_retry_attempts -= 1
             try:
                 response = await retry_with_backoff(
@@ -3699,6 +3745,18 @@ class Gateway:
                 break
 
         if _is_empty(response):
+            # The last attempt is still empty and about to be abandoned for the
+            # fallback model — capture it too (the retry loop only dumps the
+            # attempts it discards *before* re-calling, not this final one).
+            try:
+                await self._dump_llm_call_to_disk(
+                    messages=messages, response=response, role=role,
+                    cost_usd=float(getattr(response.usage, "cost_usd", 0.0) or 0.0),
+                    elapsed_ms=0,
+                    note="empty-content final (pre-fallback)",
+                )
+            except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
+                logger.debug("[gateway] empty-response dump skipped: %s", exc)
             try:
                 from harness.observability import log_failure
                 log_failure(

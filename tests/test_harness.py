@@ -6170,6 +6170,54 @@ class TestPriorPatchFailureSurfacing:
         files = sorted(debug_dir.iterdir())
         assert len(files) == 2, files
 
+    def test_dump_captures_empty_response_with_note_and_reasoning(self, monkeypatch, tmp_path):
+        # The whole point of the empty-response capture: a provider returning
+        # NO content and NO tool call must still be dumped — with its
+        # reasoning_content, finish_reason and a filename tag — so the "why did
+        # it return nothing" question is answerable instead of discarded.
+        from harness.observability import active_session_scope
+        from harness.gateway import NodeRole, LLMResponse, TokenUsage
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        gw, asyncio = self._make_gateway_with_dump_config(dump_on=True)
+        empty = LLMResponse(
+            content="",  # the symptom: no text
+            model="deepseek-v4-pro",
+            usage=TokenUsage(
+                input_tokens=45000, output_tokens=800, cached_tokens=0,
+                cache_creation_tokens=0, cost_usd=0.0,
+            ),
+            finish_reason="length",
+            reasoning_content="I need to decide which file to create first...",
+            tool_calls=[],  # and no tool call either → a true null
+        )
+
+        async def _go():
+            with active_session_scope("emptyabc-rest"):
+                await gw._dump_llm_call_to_disk(
+                    messages=[{"role": "system", "content": "big patching prompt"}],
+                    response=empty,
+                    role=NodeRole.PATCHING,
+                    cost_usd=0.0,
+                    elapsed_ms=0,
+                    note="empty-content retry (2 left)",
+                )
+
+        asyncio.run(_go())
+
+        files = sorted((tmp_path / ".harness" / "debug").iterdir())
+        assert len(files) == 1, files
+        out = files[0]
+        # Filename carries a slugified tag so `ls` surfaces the empties.
+        assert "__empty-content-retry-2-left" in out.name
+        body = out.read_text()
+        assert "# NOTE: empty-content retry (2 left)" in body
+        assert "finish: length" in body
+        assert "tool_calls=0" in body and "content_chars=0" in body
+        # The reasoning that explains WHY it produced nothing is preserved.
+        assert "which file to create first" in body
+        assert "## tool_calls  (0)" in body
+
     def test_closest_match_returns_window_for_large_files(self):
         # Files larger than the whole-file caps fall back to a window
         # around the closest match.

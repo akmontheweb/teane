@@ -509,12 +509,25 @@ def reconcile_workspace_from_spec(
     conn: sqlite3.Connection,
     workspace: str,
     spec_path: str,
+    *,
+    embed_constraint_nfrs: bool = False,
 ) -> dict[str, Any]:
     """Overwrite the workspace's stories/features rows with spec-authored data.
 
     LLM's ``scope_files`` are carried over by ``story_key`` (exact) or
     fuzzy title match. Everything else in ``stories`` / ``features`` /
     ``acceptance_criteria`` comes from the spec.
+
+    ``embed_constraint_nfrs`` (ADR-0004): when true, honor decomposition's
+    constraint-NFR embed across the wipe. Decomposition folds a constraint NFR's
+    ACs into the functional stories it constrains and DROPS the standalone NFR
+    story from the DB — but this function re-parses the raw spec (which still
+    lists that NFR), so without carry-forward it resurrects the NFR as a
+    standalone PLATFORM story and loses the fold (the NFR-002 double-handling on
+    session 01a007f3). We detect NFR stories decomposition dropped (in the spec
+    but absent from the DB) and skip re-inserting them, and carry the folded
+    ``[NFR:...]`` ACs from the DB functional stories onto their spec
+    counterparts so coverage is preserved.
     """
     with open(spec_path, "r", encoding="utf-8") as fh:
         spec_text = fh.read()
@@ -526,6 +539,49 @@ def reconcile_workspace_from_spec(
         "feature_count": len(story_state.list_features(conn, workspace)),
     }
     matches = _match_llm_to_spec(parsed["stories"], llm_stories)
+
+    # ADR-0004 carry-forward — honor decomposition's constraint-NFR embed so
+    # this reconcile doesn't resurrect an embedded NFR as a standalone story.
+    folded_nfr_acs_by_llm_key: dict[str, list[str]] = {}
+    if embed_constraint_nfrs:
+        from harness.decomposition import _is_nfr_story_key
+        llm_keys_canon = {
+            story_state._canon(ll["story_key"]) for ll in llm_stories
+        }
+        embedded_nfr_keys = {
+            story_state._canon(s["story_key"])
+            for s in parsed["stories"]
+            if _is_nfr_story_key(s["story_key"])
+            and story_state._canon(s["story_key"]) not in llm_keys_canon
+        }
+        # Snapshot the folded ``[NFR:...]`` ACs decomposition wrote onto the
+        # functional stories (BEFORE the wipe below cascades them away) so we can
+        # re-attach them to the spec counterparts.
+        for ll in llm_stories:
+            try:
+                acs = story_state.list_acceptance_criteria(
+                    conn, workspace, ll["id"],
+                )
+            except Exception:  # noqa: BLE001 — never fail reconcile on a snapshot
+                continue
+            folded = [
+                a["text"] for a in acs
+                if isinstance(a.get("text"), str)
+                and a["text"].lstrip().startswith("[NFR")
+            ]
+            if folded:
+                folded_nfr_acs_by_llm_key[ll["story_key"]] = folded
+        if embedded_nfr_keys:
+            parsed["stories"] = [
+                s for s in parsed["stories"]
+                if story_state._canon(s["story_key"]) not in embedded_nfr_keys
+            ]
+            logger.info(
+                "[spec_reconciler] ADR-0004: honoring decomposition's embed — "
+                "not resurrecting %d dropped constraint-NFR story(ies) "
+                "(their ACs are folded into functional stories): %s",
+                len(embedded_nfr_keys), ", ".join(sorted(embedded_nfr_keys)),
+            )
 
     feature_keys = {f["feature_key"] for f in parsed["features"]}
     orphan_stories = [
@@ -611,9 +667,19 @@ def reconcile_workspace_from_spec(
                 scope_files=scope_files,
                 now=now,
             )
+            # ADR-0004: re-attach the folded [NFR:...] ACs decomposition wrote
+            # onto this functional story so the embedded constraint survives the
+            # wipe (dedup against the spec's own ACs).
+            acs_to_insert = list(spec["acceptance_criteria"])
+            if embed_constraint_nfrs and llm_hit:
+                _existing = set(acs_to_insert)
+                for _ac in folded_nfr_acs_by_llm_key.get(llm_hit["story_key"], []):
+                    if _ac not in _existing:
+                        acs_to_insert.append(_ac)
+                        _existing.add(_ac)
             _insert_acs(
                 conn, workspace, story_id, spec_key,
-                spec["acceptance_criteria"],
+                acs_to_insert,
             )
             stories_written += 1
             # Root-cause fix (2026-07-04) — ``_wipe_workspace`` above
@@ -742,9 +808,15 @@ def spec_reconciler_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    embed_nfrs = bool(
+        ((state.get("harness_config") or {}).get("planning") or {}).get(
+            "embed_constraint_nfrs", False)
+    )
     conn = story_state.open_story_db()
     try:
-        summary = reconcile_workspace_from_spec(conn, workspace, spec_path)
+        summary = reconcile_workspace_from_spec(
+            conn, workspace, spec_path, embed_constraint_nfrs=embed_nfrs,
+        )
         story_state.regenerate_markdown_views(conn, workspace_path)
     except Exception as e:
         conn.close()

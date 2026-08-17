@@ -494,6 +494,104 @@ def _workspace_has_python_tests(workspace_path: str) -> bool:
     return False
 
 
+_IMPORT_MODE_OPT = "--import-mode=importlib"
+
+
+def _append_import_mode_addopts(line: str, is_toml: bool) -> Optional[str]:
+    """Return ``line`` (an existing ``addopts = ...`` entry) with
+    ``--import-mode=importlib`` appended, or None when the value is in a form
+    this text-merge can't safely rewrite (a TOML array or multiline/triple-
+    quoted string). INI ``addopts`` is a plain option list — appending to the
+    line is always safe, including the ``addopts =`` continuation-list shape.
+    """
+    if is_toml:
+        # Single-line quoted string only: addopts = "..."  /  '...'
+        m = re.match(
+            r'^(\s*addopts\s*=\s*)(["\'])(.*)(\2)(\s*(?:#.*)?)$', line
+        )
+        if not m:
+            return None  # array / multiline / triple-quoted → leave to the LLM
+        pre, quote, value, _close, tail = m.groups()
+        value = (value + " " + _IMPORT_MODE_OPT).strip()
+        return f"{pre}{quote}{value}{quote}{tail}"
+    return line.rstrip() + " " + _IMPORT_MODE_OPT
+
+
+def _merge_importlib_into_pytest_config(
+    path: str, fname: str, content: str,
+) -> bool:
+    """Surgically add ``--import-mode=importlib`` (and ``pythonpath`` when
+    absent) to the pytest section already present in ``content``, writing the
+    file in place. Returns True on a safe, recognised edit; False when the
+    section's ``addopts`` is in a form this text-merge can't rewrite safely
+    (caller then falls back to a warning).
+
+    Editing in place — rather than writing a competing ``pytest.ini`` — is
+    essential: pytest uses the FIRST config file it finds (``pytest.ini`` beats
+    ``pyproject.toml``), so a fresh file would shadow an existing
+    ``[tool.pytest.ini_options]`` table wholesale and silently drop settings
+    like ``asyncio_mode = "auto"``, breaking every async test. Only the two
+    keys the collision fix needs are touched; every existing key is preserved.
+    """
+    is_toml = fname == "pyproject.toml"
+    if fname == "pyproject.toml":
+        header = "[tool.pytest.ini_options]"
+    elif fname == "setup.cfg":
+        header = "[tool:pytest]"
+    else:  # pytest.ini, tox.ini
+        header = "[pytest]"
+
+    lines = content.splitlines()
+    hdr = next((i for i, ln in enumerate(lines) if ln.strip() == header), -1)
+    if hdr < 0:
+        return False
+    # The section runs until the next section header line, or EOF.
+    end = len(lines)
+    for j in range(hdr + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = j
+            break
+
+    prefix, body, suffix = lines[: hdr + 1], lines[hdr + 1 : end], lines[end:]
+
+    addopts_idx: Optional[int] = None
+    has_pythonpath = False
+    for j, ln in enumerate(body):
+        key = ln.split("=", 1)[0].strip() if "=" in ln else ""
+        if key == "addopts":
+            addopts_idx = j
+        elif key == "pythonpath":
+            has_pythonpath = True
+
+    inserts: list[str] = []
+    if addopts_idx is None:
+        inserts.append(
+            f'addopts = "{_IMPORT_MODE_OPT}"' if is_toml
+            else f"addopts = {_IMPORT_MODE_OPT}"
+        )
+    elif _IMPORT_MODE_OPT not in body[addopts_idx]:
+        merged = _append_import_mode_addopts(body[addopts_idx], is_toml)
+        if merged is None:
+            return False
+        body[addopts_idx] = merged
+    if not has_pythonpath:
+        inserts.append('pythonpath = ["."]' if is_toml else "pythonpath = .")
+
+    new_lines = prefix + inserts + body + suffix
+    new_content = "\n".join(new_lines)
+    if content.endswith("\n") and not new_content.endswith("\n"):
+        new_content += "\n"
+    if new_content == content:
+        return False
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError:
+        return False
+    return True
+
+
 def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
     """Write a minimal ``pytest.ini`` with ``--import-mode=importlib`` and
     ``pythonpath = .`` if the workspace has a Python test tree but no pytest
@@ -505,12 +603,13 @@ def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
       - ``setup.cfg`` with a ``[tool:pytest]`` section
       - ``tox.ini`` with a ``[pytest]`` section
 
-    Returns the workspace-relative path of the newly-written file, or
-    ``None`` if there are no Python tests, or any existing config was found
-    (no-op). When an existing config is found that does NOT already select
-    importlib mode, logs a warning rather than silently leaving the workspace
-    exposed to prepend-mode collection collisions — that config path can't be
-    safely rewritten in-place here, so it's surfaced for the operator/LLM.
+    Returns the workspace-relative path of the newly-written file (or of an
+    existing config that was updated in place), or ``None`` if there are no
+    Python tests, or a config already selects importlib mode. When an existing
+    config is found that does NOT select importlib mode, this MERGES the flag
+    into that file in place (preserving ``asyncio_mode`` and every other key —
+    see :func:`_merge_importlib_into_pytest_config`); only if its ``addopts`` is
+    in a form that can't be rewritten safely does it fall back to a warning.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
@@ -542,12 +641,26 @@ def _ensure_pytest_importlib_config(workspace_path: str) -> Optional[str]:
         # pytest section is actually present.
         if fname == "pytest.ini" or marker in content:
             if "importlib" not in content:
+                # Deterministic, known fix — merge it into the EXISTING config
+                # in place (preserving asyncio_mode etc.) rather than warning and
+                # deferring to the LLM, which cost lumina 019f82af ~20 redundant
+                # warnings plus a collision-driven repair detour before an
+                # end-of-session pass finally added the flag.
+                if _merge_importlib_into_pytest_config(path, fname, content):
+                    logger.info(
+                        "[test_generation_node] Added --import-mode=importlib "
+                        "(and pythonpath) to the existing pytest config in %s so "
+                        "duplicate test basenames coexist — existing settings "
+                        "preserved.", fname,
+                    )
+                    return fname
                 logger.warning(
-                    "[test_generation_node] %s already configures pytest but does "
-                    "not select --import-mode=importlib. Two test trees or same-"
-                    "named test files can collide under the default prepend mode "
-                    "(ImportPathMismatchError / silently-dropped tier). Add "
-                    "`--import-mode=importlib` (and `pythonpath = .`) to it.",
+                    "[test_generation_node] %s configures pytest but does not "
+                    "select --import-mode=importlib, and its addopts form could "
+                    "not be auto-merged safely (array/multiline). Add "
+                    "`--import-mode=importlib` (and `pythonpath = .`) to it. "
+                    "Two test trees or same-named test files can otherwise "
+                    "collide under the default prepend mode.",
                     fname,
                 )
             return None

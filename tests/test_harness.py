@@ -7002,6 +7002,56 @@ class TestDeployValidation:
         )
         assert any("Dockerfile" in e for e in errs), errs
 
+    def test_detect_service_language_from_build_context(self, tmp_path):
+        # Each service's language comes from its OWN context, not the global
+        # primary language (lumina 01a02272: React client → Python template).
+        from harness.deploy import _detect_service_language
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text("{}")
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        assert _detect_service_language(tmp_path, "./client", "python") == "node"
+        assert _detect_service_language(tmp_path, "./server", "node") == "python"
+        assert _detect_service_language(tmp_path, "./missing", "python") == "python"
+
+    def test_node_dockerfile_is_lockfile_safe_and_serves_spa(self):
+        # Regression (lumina 01a02272): npm ci fails without a lockfile, and a
+        # Vite/React SPA is served statically, not `node dist/index.js`.
+        from harness.deploy import _generate_dockerfile
+        df = _generate_dockerfile(
+            "client", {"build_context": "./client", "ports": ["3000:3000"]},
+            "node", "/ws",
+        )
+        assert "npm ci --only=production" not in df
+        assert "if [ -f package-lock.json ]; then npm ci; else npm install; fi" in df
+        assert "serve -s dist -l 3000" in df
+        assert "requirements.txt" not in df
+
+    def test_multistack_blueprint_renders_client_as_node(self, tmp_path):
+        # End-to-end: a python-server + node-client blueprint must render the
+        # client with the node template, never the python one.
+        import os
+        from harness.deploy import generate_assets_from_blueprint
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text('{"name":"c"}')
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        bp = {"services": {
+            "server": {"base_image": "python:3.12-slim",
+                       "build_context": "./server", "ports": ["8000:8000"]},
+            "client": {"base_image": "node:20-alpine",
+                       "build_context": "./client", "ports": ["3000:3000"]},
+        }}
+        result = generate_assets_from_blueprint(
+            bp, {"languages": ["python", "node"]}, str(tmp_path),
+        )
+        assert result["success"], result
+        dfs = {f: (tmp_path / f).read_text()
+               for f in os.listdir(tmp_path) if f.startswith("Dockerfile")}
+        client_df = next((c for f, c in dfs.items() if "client" in f), "")
+        assert "FROM node" in client_df, list(dfs)
+        assert "requirements.txt" not in client_df
+
     def test_compose_respects_per_service_limit_override(self):
         from harness.deploy import _generate_compose_file
         bp = {

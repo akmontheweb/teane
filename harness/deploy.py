@@ -665,24 +665,25 @@ CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{por
 """,
 
     "node": """# Multi-stage Node.js Dockerfile
-FROM node:20-alpine AS deps
-WORKDIR /app
-COPY {build_context}/package.json {build_context}/package-lock.json* ./
-RUN npm ci --only=production
-
 FROM node:20-alpine AS builder
 WORKDIR /app
+COPY {build_context}/package.json {build_context}/package-lock.json* ./
+# `npm ci` requires a committed package-lock.json; greenfield apps have only a
+# package.json, so fall back to `npm install`. Install ALL deps (build tools
+# like vite/tsc are devDependencies) so `npm run build` can run.
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY {build_context}/ .
-COPY --from=deps /app/node_modules ./node_modules
 RUN npm run build 2>/dev/null || true
 
 FROM node:20-alpine
 WORKDIR /app
-COPY --from=builder /app/dist ./dist 2>/dev/null || COPY --from=builder /app ./
-COPY --from=deps /app/node_modules ./node_modules
+RUN npm install -g serve
+COPY --from=builder /app ./
 ENV NODE_ENV=production
 {healthcheck}
-CMD ["node", "dist/index.js"]
+# Serve a built SPA (Vite `dist/`, CRA `build/`) as static files; otherwise run
+# the app's own start script (a Node server on the same port).
+CMD sh -c 'if [ -d dist ]; then serve -s dist -l {port}; elif [ -d build ]; then serve -s build -l {port}; else npm start; fi'
 """,
 
     "java": """# Multi-stage Java Dockerfile
@@ -699,6 +700,22 @@ COPY --from=builder /app/target/*.jar app.jar 2>/dev/null
 CMD ["java", "-jar", "app.jar"]
 """,
 }
+
+
+def _detect_service_language(workspace: Path, build_ctx: str, fallback: str) -> str:
+    """Detect a service's language from the manifest files in its OWN build
+    context, so a multi-stack app renders each service with the right template.
+
+    The previous logic assigned every service the global ``primary_lang`` (the
+    first telemetry language), so lumina 01a02272 rendered its React client with
+    the Python Dockerfile template (COPY requirements.txt → build failure). A
+    filesystem check on the service's context is deterministic and correct.
+    """
+    ctx = workspace if build_ctx in (".", "", None) else workspace / str(build_ctx).strip("/")
+    for lang, manifests in _PACKAGE_MANIFESTS.items():
+        if any((ctx / m).is_file() for m in manifests):
+            return lang
+    return fallback
 
 
 def _generate_dockerfile(
@@ -1004,11 +1021,12 @@ def generate_assets_from_blueprint(
         if not svc_spec.get("build_context"):
             continue
 
-        # Determine language for this service
-        svc_lang = primary_lang
+        # Determine language for this service from its own build context's
+        # manifests (package.json → node, requirements.txt → python, …) rather
+        # than the global primary language, which mis-renders every service in
+        # a multi-stack app (lumina 01a02272: React client → Python template).
         build_ctx = svc_spec.get("build_context", ".")
-        if build_ctx == ".":
-            svc_lang = primary_lang
+        svc_lang = _detect_service_language(workspace, build_ctx, primary_lang)
 
         dockerfile_content = _generate_dockerfile(
             svc_name, svc_spec, svc_lang, workspace_path,
@@ -1617,6 +1635,16 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 **_rotate_diag_fingerprints_delta(state, _diags),
             }
         if rc != 0:
+            _summary = _summarize_compose_failure(stdout, stderr)
+            # Surface the distilled build error in the log — the telemetry
+            # event carries only exit_code, so without this the operator sees
+            # "build_failed exit 1" and none of the actual docker build stderr
+            # (lumina 01a02272: the "package-lock.json not found" / npm ci
+            # failure was invisible until manually reproduced).
+            logger.error(
+                "[deployment_node] `docker compose up --build` failed (exit=%d):\n%s",
+                rc, _summary,
+            )
             _emit_deployment_outcome(
                 outcome="failed", reason="build_failed", phase="docker_build",
                 exit_code=rc,
@@ -1625,7 +1653,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "file": compose_file, "line": 0, "column": 0, "severity": "error",
                 "error_code": "DEPLOYMENT_BUILD_FAILED",
                 "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={rc}).",
-                "semantic_context": _summarize_compose_failure(stdout, stderr),
+                "semantic_context": _summary,
             }]
             return {
                 "compiler_errors": _diags,

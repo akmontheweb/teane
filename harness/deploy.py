@@ -852,8 +852,14 @@ def _generate_compose_file(
 
         if svc_spec.get("requires_healthcheck_cmd"):
             health_cmd = svc_spec["requires_healthcheck_cmd"]
+            # Escape backslashes and double-quotes so a command containing its
+            # own quotes (e.g. ``python -c "import ..."``) renders as a valid
+            # YAML double-quoted scalar. Without this the inner ``"`` closed the
+            # flow string early and ``docker compose`` failed to parse the file
+            # (lumina 01a0225f: the server healthcheck broke the whole compose).
+            _esc = health_cmd.replace("\\", "\\\\").replace('"', '\\"')
             lines.append("    healthcheck:")
-            lines.append(f"      test: [\"CMD-SHELL\", \"{health_cmd}\"]")
+            lines.append(f'      test: ["CMD-SHELL", "{_esc}"]')
             lines.append("      interval: 10s")
             lines.append("      timeout: 5s")
             lines.append("      retries: 3")
@@ -1091,6 +1097,101 @@ def _compose_argv() -> tuple[str, ...]:
     # error message is the modern one. The caller's error handling will
     # surface "command not found".
     return ("docker", "compose")
+
+
+def validate_deployment_artifacts(
+    workspace_path: str,
+    compose_file: str,
+    generated_files: list[str],
+) -> list[str]:
+    """Deterministically validate the generated deploy artifacts BEFORE the
+    preview/bring-up. Returns a list of human-readable error strings (empty ==
+    valid). Zero LLM tokens — this is the artifact "review cycle": Phase 3
+    renders Dockerfile/compose/Caddyfile with no validation, so a rendering or
+    blueprint fault (e.g. lumina 01a0225f's unescaped ``python -c "…"``
+    healthcheck, which produced unparseable YAML) otherwise reaches disk and
+    only fails at ``docker compose up`` — after the approval gate.
+
+    Checks, cheapest first, all deterministic and false-positive-free:
+      1. ``yaml.safe_load`` every generated compose file — pure-Python YAML
+         syntax gate, needs no Docker.
+      2. ``docker compose config -q`` — full Compose-schema validation (bad
+         port maps, unknown keys, bad depends_on). Skipped only when Docker is
+         absent, which cannot happen on the deploy path.
+      3. Dockerfile syntax floor — each generated Dockerfile must be non-empty
+         and open with FROM/ARG.
+
+    ``docker build --check`` / hadolint lint are intentionally NOT run here:
+    they load the build context (potentially ``node_modules``) and treat
+    best-practice warnings as failures, which would slow deploys and produce
+    false blocks. Correctness (does it parse / is it schema-valid) is what this
+    gate guarantees.
+    """
+    errors: list[str] = []
+    ws = Path(workspace_path)
+
+    compose_paths: list[Path] = []
+    primary = ws / compose_file
+    if primary.is_file():
+        compose_paths.append(primary)
+    for rel in generated_files or []:
+        p = ws / rel
+        if p.is_file() and p.suffix in (".yml", ".yaml") and p not in compose_paths:
+            compose_paths.append(p)
+
+    # --- 1. pure-Python YAML syntax (floor; no Docker needed) ---
+    try:
+        import yaml  # noqa: PLC0415 — optional, lazily imported
+        for p in compose_paths:
+            try:
+                yaml.safe_load(p.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                errors.append(f"{p.name}: invalid YAML — {str(exc).splitlines()[0]}")
+            except OSError as exc:
+                errors.append(f"{p.name}: unreadable — {exc}")
+    except ImportError:
+        pass  # PyYAML absent; `docker compose config` below still parses YAML.
+
+    # --- 2. docker compose config (schema + YAML) ---
+    if primary.is_file() and (shutil.which("docker") or shutil.which("docker-compose")):
+        argv = [*_compose_argv(), "-f", str(primary), "config", "-q"]
+        try:
+            result = subprocess.run(
+                argv, cwd=workspace_path, capture_output=True,
+                text=True, timeout=30.0, check=False,
+            )
+            if result.returncode != 0:
+                msg = (result.stderr or result.stdout or "").strip()
+                errors.append(f"`docker compose config` rejected {compose_file}: {msg[:400]}")
+        except subprocess.TimeoutExpired:
+            errors.append("`docker compose config` timed out after 30s")
+        except OSError as exc:
+            errors.append(f"`docker compose config` could not run: {exc}")
+
+    # --- 3. Dockerfile syntax floor ---
+    for rel in generated_files or []:
+        name = os.path.basename(rel)
+        if not (name == "Dockerfile" or name.startswith("Dockerfile.")):
+            continue
+        dpath = ws / rel
+        try:
+            text = dpath.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"{rel}: unreadable — {exc}")
+            continue
+        instructions = [
+            ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if not instructions:
+            errors.append(f"{rel}: empty Dockerfile (no instructions)")
+        elif instructions[0].split(None, 1)[0].upper() not in ("FROM", "ARG"):
+            errors.append(
+                f"{rel}: first instruction must be FROM or ARG, got "
+                f"{instructions[0].split(None, 1)[0]!r}"
+            )
+
+    return errors
 
 
 def _compose_project_name(workspace_path: str) -> str:
@@ -1409,6 +1510,41 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "compiler_errors": _diags,
             "loop_counter": _bump_deployment_counter(state),
+            **_rotate_diag_fingerprints_delta(state, _diags),
+        }
+
+    # --- Phase 3.4: Deterministic artifact validation gate ---
+    # Phase 3 renders the artifacts with no validation, so a rendering or
+    # blueprint fault reaches disk and would only fail at `docker compose up`
+    # (after the approval gate). Validate deterministically here — parse the
+    # compose YAML, run `docker compose config`, and syntax-check Dockerfiles —
+    # and route a failure through the deployment repair loop (same shape as the
+    # generation/no-compose faults above) instead of shipping a broken artifact.
+    _artifact_errors = validate_deployment_artifacts(
+        workspace_path, compose_file, gen_result.get("generated", []),
+    )
+    if _artifact_errors:
+        _emit_deployment_outcome(
+            outcome="failed", reason="artifact_validation", phase="post_generation",
+            detail="; ".join(_artifact_errors)[:200],
+        )
+        logger.error(
+            "[deployment_node] Generated artifacts failed validation:\n  - %s",
+            "\n  - ".join(_artifact_errors),
+        )
+        _diags = [{
+            "file": compose_file, "line": 0, "column": 0, "severity": "error",
+            "error_code": "DEPLOYMENT_ARTIFACT_INVALID",
+            "message": (
+                "[DEPLOYMENT FAULT]: generated deployment artifacts did not "
+                "validate: " + "; ".join(_artifact_errors)
+            ),
+            "semantic_context": "\n".join(_artifact_errors),
+        }]
+        return {
+            "compiler_errors": _diags,
+            "loop_counter": _bump_deployment_counter(state),
+            "node_state": {"deployment": {"phase": "artifact_validation_failed"}},
             **_rotate_diag_fingerprints_delta(state, _diags),
         }
 

@@ -6950,6 +6950,58 @@ class TestDeployValidation:
         assert "cpus:" in compose
         assert "pids_limit:" in compose
 
+    def test_compose_healthcheck_with_inner_quotes_is_valid_yaml(self):
+        # Regression (lumina 01a0225f): a healthcheck such as python -c "..."
+        # embeds double quotes that, unescaped, closed the flow string early and
+        # broke the whole compose YAML. The rendered `test:` must parse as valid
+        # YAML and round-trip the exact command.
+        import yaml
+        from harness.deploy import _generate_compose_file
+        cmd = ('python -c "import urllib.request; '
+               "urllib.request.urlopen('http://localhost:8000/docs')\" || exit 1")
+        bp = {"services": {"api": {
+            "base_image": "python:3.12-slim",
+            "ports": ["8000:8000"],
+            "requires_healthcheck_cmd": cmd,
+        }}}
+        compose = _generate_compose_file(bp)
+        loaded = yaml.safe_load(compose)  # must not raise
+        assert loaded["services"]["api"]["healthcheck"]["test"] == ["CMD-SHELL", cmd]
+
+    def test_validate_artifacts_flags_invalid_compose_yaml(self, tmp_path):
+        # The deterministic gate must catch the unescaped-quote class before the
+        # bring-up (the pure-Python YAML floor works with or without Docker).
+        from harness.deploy import validate_deployment_artifacts
+        (tmp_path / "docker-compose.yml").write_text(
+            'services:\n  api:\n    healthcheck:\n'
+            '      test: ["CMD-SHELL", "python -c "import x"" || exit 1"]\n'
+        )
+        errs = validate_deployment_artifacts(
+            str(tmp_path), "docker-compose.yml", ["docker-compose.yml"],
+        )
+        assert errs and any("YAML" in e or "compose config" in e for e in errs), errs
+
+    def test_validate_artifacts_accepts_valid_artifacts(self, tmp_path):
+        from harness.deploy import validate_deployment_artifacts
+        (tmp_path / "docker-compose.yml").write_text(
+            'services:\n  api:\n    image: python:3.12-slim\n'
+            '    ports:\n      - "8000:8000"\n'
+        )
+        (tmp_path / "Dockerfile").write_text('FROM python:3.12-slim\nCMD ["python"]\n')
+        errs = validate_deployment_artifacts(
+            str(tmp_path), "docker-compose.yml", ["docker-compose.yml", "Dockerfile"],
+        )
+        assert errs == [], errs
+
+    def test_validate_artifacts_flags_empty_dockerfile(self, tmp_path):
+        from harness.deploy import validate_deployment_artifacts
+        (tmp_path / "docker-compose.yml").write_text("services:\n  api:\n    image: x\n")
+        (tmp_path / "Dockerfile").write_text("# only a comment, no FROM\n")
+        errs = validate_deployment_artifacts(
+            str(tmp_path), "docker-compose.yml", ["Dockerfile"],
+        )
+        assert any("Dockerfile" in e for e in errs), errs
+
     def test_compose_respects_per_service_limit_override(self):
         from harness.deploy import _generate_compose_file
         bp = {

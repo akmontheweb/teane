@@ -1454,6 +1454,55 @@ class TestRunParserSurface:
         assert rc == 2
         assert "--yes can only be used with --new-build true" in buf.getvalue()
 
+    def test_deploy_and_test_reuse_specs_and_never_overwrite(self, tmp_path, monkeypatch):
+        # deploy/test operate on an already-built workspace: the docs/ specs
+        # are authoritative and must NEVER be overwritten. Both must set
+        # args.reuse_docs=True when a spec exists, so the requirements +
+        # architecture nodes reuse (read) them instead of regenerating —
+        # regeneration is wasteful, lossy, and the fragile network step that
+        # took down a deploy (session 01a012e9).
+        import argparse
+        import asyncio
+        from harness import cli as cli_mod
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "SPEC_REQUIREMENTS.md").write_text("# spec\n")
+
+        captured: dict = {}
+
+        async def spy_cmd_run(a):
+            captured["args"] = a
+            return 0
+
+        monkeypatch.setattr(cli_mod, "cmd_run", spy_cmd_run)
+
+        for cmd in (cli_mod.cmd_deploy, cli_mod.cmd_test):
+            a = argparse.Namespace(workspace=str(tmp_path))
+            rc = asyncio.run(cmd(a))
+            assert rc == 0
+            assert getattr(captured["args"], "reuse_docs") is True, (
+                f"{cmd.__name__} must reuse existing specs, not regenerate them"
+            )
+
+    def test_deploy_regenerates_only_when_no_prior_spec(self, tmp_path, monkeypatch):
+        # With no prior build (no spec on disk) reuse resolves False — that is
+        # creation, never an overwrite (there is nothing to overwrite).
+        import argparse
+        import asyncio
+        from harness import cli as cli_mod
+
+        captured: dict = {}
+
+        async def spy_cmd_run(a):
+            captured["args"] = a
+            return 0
+
+        monkeypatch.setattr(cli_mod, "cmd_run", spy_cmd_run)
+        a = argparse.Namespace(workspace=str(tmp_path))  # no docs/ present
+        asyncio.run(cli_mod.cmd_deploy(a))
+        assert getattr(captured["args"], "reuse_docs") is False
+
     def test_removed_flags_rejected(self):
         # Every dropped/renamed flag must fail loudly so operators
         # relying on the legacy names see the rename immediately.

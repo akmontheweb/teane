@@ -8499,6 +8499,16 @@ async def cmd_deploy(args: argparse.Namespace) -> int:
     for dest in ("hitl_requirement", "hitl_architecture", "hitl_repair", "hitl_layout_divergence"):
         if not hasattr(args, dest):
             setattr(args, dest, False)
+    # Deploy runs on an already-built workspace: docs/ specs were synthesized
+    # AND reviewed by the prior build and are authoritative. Reuse them instead
+    # of regenerating — regeneration wastes two LLM calls (requirements synth +
+    # doc-review), clobbers the build's richer spec with a leaner one, and adds
+    # a fragile network step the deploy does not need (the deployment blueprint
+    # is built from workspace telemetry + SPEC_ARCHITECTURE.md, never from the
+    # requirements spec). ``_resolve_reuse_docs`` drops to regeneration only if
+    # no spec marker exists (no prior build to reuse from).
+    workspace_path = os.path.abspath(getattr(args, "workspace", None) or os.getcwd())
+    args.reuse_docs = _resolve_reuse_docs(workspace_path, reuse_specs_override=True)
     return await cmd_run(args)
 
 
@@ -8532,6 +8542,13 @@ async def cmd_test(args: argparse.Namespace) -> int:
     ):
         if not hasattr(args, dest):
             setattr(args, dest, False)
+    # Test runs on an already-built/deployed workspace: the docs/ specs are
+    # authoritative and MUST NOT be overwritten here. Reuse them so the
+    # requirements + architecture nodes skip synthesis instead of clobbering
+    # the build's specs with regenerated ones. Only creates a spec if none
+    # exists (no prior build) — creation, never overwrite.
+    workspace_path = os.path.abspath(getattr(args, "workspace", None) or os.getcwd())
+    args.reuse_docs = _resolve_reuse_docs(workspace_path, reuse_specs_override=True)
     return await cmd_run(args)
 
 

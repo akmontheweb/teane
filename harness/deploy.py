@@ -377,7 +377,8 @@ _ARCHITECTURE_JSON_SCHEMA = """
       "environment_keys_needed": ["DB_HOST", "REDIS_URL"],
       "depends_on_services": ["postgres"],
       "requires_healthcheck_cmd": "curl -f http://localhost:8000/health || exit 1",
-      "volumes": ["./api:/app"]
+      "volumes": ["./api:/app"],
+      "dockerfile": "FROM python:3.12-slim\\nWORKDIR /app\\n... complete Dockerfile for THIS service following the Deployment skill; COPY paths are workspace-root-relative; omit for pull-only images (no build_context)"
     }
   },
   "volumes": {
@@ -445,6 +446,27 @@ def _build_synthesis_change_request_addendum(
     return rules, schema
 
 
+def _load_deployment_skill(workspace_path: str = "") -> str:
+    """Load the deployment skill markdown (Dockerfile/compose patterns).
+
+    Prefers a per-project override at ``{workspace}/skills/deployment.md``,
+    else the shipped ``harness/skills/deployment.md``. Returns "" if neither is
+    readable, so synthesis degrades to schema-only guidance (the deterministic
+    templates remain the fallback in Phase 3).
+    """
+    candidates: list[str] = []
+    if workspace_path:
+        candidates.append(os.path.join(workspace_path, "skills", "deployment.md"))
+    candidates.append(os.path.join(os.path.dirname(__file__), "skills", "deployment.md"))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            continue
+    return ""
+
+
 async def synthesize_architecture(
     telemetry: dict[str, Any],
     workspace_path: str,
@@ -495,6 +517,20 @@ async def synthesize_architecture(
     if cr_schema:
         schema_for_prompt = _ARCHITECTURE_JSON_SCHEMA.rstrip().rstrip("}") + cr_schema + "\n}"
 
+    deployment_skill = _load_deployment_skill(workspace_path)
+    skill_block = (
+        f"\n## Deployment Skill (author each service's `dockerfile` per these patterns)\n{deployment_skill}\n"
+        if deployment_skill else ""
+    )
+    dockerfile_rule = (
+        "\n9. For EVERY service that has a `build_context`, author a complete, "
+        "correct `dockerfile` string following the Deployment Skill above — "
+        "tailored to that service's real stack and file layout (inspect the "
+        "telemetry). Use `\\n` for newlines. Omit `dockerfile` only for "
+        "pull-only images with no build_context."
+        if deployment_skill else ""
+    )
+
     # Build the prompt
     prompt = f"""You are a Principal DevOps Architect. Analyze the workspace telemetry below
 and the project's SPEC_ARCHITECTURE.md to design the complete container infrastructure.
@@ -506,7 +542,7 @@ and the project's SPEC_ARCHITECTURE.md to design the complete container infrastr
 
 ## SPEC_ARCHITECTURE.md
 {spec_content if spec_content else "(no SPEC_ARCHITECTURE.md found)"}
-
+{skill_block}
 ## Your Task
 Design the optimal container architecture. Return ONLY a valid JSON object matching this EXACT schema:
 
@@ -522,7 +558,7 @@ Design the optimal container architecture. Return ONLY a valid JSON object match
 5. Link services via depends_on_services where dependencies exist.
 6. If the workspace has a web framework, add a web router/proxy service (Caddy or Nginx).
 7. Use port_hints from telemetry to set correct port mappings.
-8. Do NOT include any text outside the JSON object. Only return valid JSON.{cr_rules}"""
+8. Do NOT include any text outside the JSON object. Only return valid JSON.{dockerfile_rule}{cr_rules}"""
 
     logger.info("[deploy:compose] Synthesizing architecture with planning LLM...")
 
@@ -648,20 +684,15 @@ def _fallback_blueprint(telemetry: dict[str, Any]) -> dict[str, Any]:
 
 # Language-specific Dockerfile templates
 _DOCKERFILE_TEMPLATES = {
-    "python": """# Multi-stage Python Dockerfile
-FROM python:{python_version}-slim AS builder
+    "python": """# Python service
+FROM python:{python_version}-slim
 WORKDIR /app
 COPY {build_context}/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-
-FROM python:{python_version}-slim
-WORKDIR /app
-COPY --from=builder /usr/local/lib/python*/site-packages /usr/local/lib/python*/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
 COPY {build_context}/ .
 ENV PYTHONUNBUFFERED=1
 {healthcheck}
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{port}"]
+CMD ["python", "-m", "uvicorn", "{entrypoint}", "--host", "0.0.0.0", "--port", "{port}"]
 """,
 
     "node": """# Multi-stage Node.js Dockerfile
@@ -759,6 +790,38 @@ def _detect_service_language(workspace: Path, build_ctx: str, fallback: str) -> 
     return fallback
 
 
+def _detect_python_entrypoint(workspace: Path, build_ctx: str) -> str:
+    """Return the ``module:attr`` for uvicorn to import.
+
+    The build context root is COPYed to ``/app``, so a nested
+    ``server/app/main.py`` is imported as ``app.main:app`` (its path relative to
+    the COPYed root), NOT ``main:app`` — which crashed the container on lumina
+    01a02295. Prefers the file that constructs ``app = FastAPI(...)``; falls
+    back to a ``main.py`` module, then to ``main:app``.
+    """
+    import re as _re
+    ctx = workspace if build_ctx in (".", "", None) else workspace / str(build_ctx).strip("/")
+    app_re = _re.compile(r"^\s*app\s*=\s*(?:FastAPI|Starlette)\s*\(", _re.M)
+    skip = {"__pycache__", ".venv", "venv", "node_modules", "tests", "test", ".git"}
+    fallback: Optional[str] = None
+    try:
+        for py in sorted(ctx.rglob("*.py")):
+            if any(part in skip for part in py.parts):
+                continue
+            try:
+                text = py.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            module = ".".join(py.relative_to(ctx).with_suffix("").parts)
+            if app_re.search(text):
+                return f"{module}:app"
+            if py.name == "main.py" and fallback is None:
+                fallback = f"{module}:app"
+    except OSError:
+        pass
+    return fallback or "main:app"
+
+
 def _generate_dockerfile(
     service_name: str,
     service_spec: dict[str, Any],
@@ -789,6 +852,15 @@ def _generate_dockerfile(
 
     python_version = "3.12"
 
+    # ASGI entrypoint for the python template. The build context is COPYed to
+    # /app, so a nested ``server/app/main.py`` is imported as ``app.main:app``,
+    # not ``main:app`` (which crashed the container — lumina 01a02295).
+    entrypoint = "main:app"
+    if language == "python":
+        entrypoint = _detect_python_entrypoint(
+            Path(workspace_path), service_spec.get("build_context", "."),
+        )
+
     healthcheck_cmd = service_spec.get("requires_healthcheck_cmd", "")
     if healthcheck_cmd:
         healthcheck = f'HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD {healthcheck_cmd}'
@@ -800,6 +872,7 @@ def _generate_dockerfile(
         build_context=build_context,
         port=port,
         healthcheck=healthcheck,
+        entrypoint=entrypoint,
     )
     if cr_attribution:
         marker = cr_attribution.get(service_name)
@@ -1084,10 +1157,22 @@ def generate_assets_from_blueprint(
         elif svc_name == blueprint.get("proxy_service"):
             svc_lang = svc_name if svc_name in _DOCKERFILE_TEMPLATES else "caddy"
 
-        dockerfile_content = _generate_dockerfile(
-            svc_name, svc_spec, svc_lang, workspace_path,
-            cr_attribution=cr_attribution,
-        )
+        # Prefer the skill-guided, LLM-authored Dockerfile when the blueprint
+        # supplies one — it adapts to the app's real layout (module paths, SPA
+        # build, non-root perms) in ways the deterministic templates can't. Fall
+        # back to the templates (a valid, if simpler, artifact) when absent or
+        # blank. The deterministic validation gate guards either path.
+        llm_dockerfile = svc_spec.get("dockerfile")
+        if isinstance(llm_dockerfile, str) and llm_dockerfile.strip():
+            dockerfile_content = llm_dockerfile if llm_dockerfile.endswith("\n") else llm_dockerfile + "\n"
+            if cr_attribution and cr_attribution.get(svc_name):
+                dockerfile_content = f"# {cr_attribution[svc_name]}\n" + dockerfile_content
+            logger.info("[deploy:generate] Using skill-authored Dockerfile for service '%s'.", svc_name)
+        else:
+            dockerfile_content = _generate_dockerfile(
+                svc_name, svc_spec, svc_lang, workspace_path,
+                cr_attribution=cr_attribution,
+            )
         dockerfile_name = _dockerfile_name_for(svc_name, services)
         dockerfile_path = workspace / dockerfile_name
         dockerfile_path.write_text(dockerfile_content, encoding="utf-8")

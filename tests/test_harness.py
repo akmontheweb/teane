@@ -7104,6 +7104,53 @@ class TestDeployValidation:
         assert "FROM caddy" in caddy_df, list(dfs)
         assert "requirements.txt" not in caddy_df
 
+    def test_detect_python_entrypoint_for_nested_app(self, tmp_path):
+        # server/app/main.py is imported as app.main:app after the context root
+        # is COPYed to /app — not main:app (which crashed lumina 01a02295).
+        from harness.deploy import _detect_python_entrypoint
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "main.py").write_text(
+            "from fastapi import FastAPI\napp = FastAPI()\n")
+        assert _detect_python_entrypoint(tmp_path, "./server") == "app.main:app"
+        (tmp_path / "empty").mkdir()
+        assert _detect_python_entrypoint(tmp_path, "./empty") == "main:app"
+
+    def test_python_template_single_stage_with_detected_entrypoint(self, tmp_path):
+        # The python template must not use the broken multi-stage site-packages
+        # copy (python* glob is literal in the dest → unimportable), and must
+        # invoke the detected ASGI module.
+        from harness.deploy import _generate_dockerfile
+        (tmp_path / "server" / "app").mkdir(parents=True)
+        (tmp_path / "server" / "app" / "main.py").write_text(
+            "from fastapi import FastAPI\napp = FastAPI()\n")
+        df = _generate_dockerfile(
+            "server", {"build_context": "./server", "ports": ["8000:8000"]},
+            "python", str(tmp_path),
+        )
+        assert "site-packages" not in df
+        assert "COPY --from=builder" not in df
+        assert "app.main:app" in df
+
+    def test_deployment_skill_loads(self):
+        from harness.deploy import _load_deployment_skill
+        s = _load_deployment_skill()
+        assert "uvicorn" in s and "npm install" in s and "app.main:app" in s
+
+    def test_phase3_prefers_skill_authored_dockerfile(self, tmp_path):
+        # When the blueprint supplies a per-service dockerfile (skill-guided
+        # LLM), Phase 3 writes it verbatim rather than a template.
+        from harness.deploy import generate_assets_from_blueprint
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        custom = 'FROM python:3.12-slim\n# skill-authored marker\nCMD ["echo", "hi"]'
+        bp = {"services": {"server": {
+            "base_image": "python:3.12-slim", "build_context": "./server",
+            "ports": ["8000:8000"], "dockerfile": custom,
+        }}}
+        r = generate_assets_from_blueprint(bp, {"languages": ["python"]}, str(tmp_path))
+        assert r["success"], r
+        assert "# skill-authored marker" in (tmp_path / "Dockerfile").read_text()
+
     def test_compose_respects_per_service_limit_override(self):
         from harness.deploy import _generate_compose_file
         bp = {

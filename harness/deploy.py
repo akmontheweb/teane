@@ -699,6 +699,20 @@ COPY --from=builder /app/target/*.jar app.jar 2>/dev/null
 {healthcheck}
 CMD ["java", "-jar", "app.jar"]
 """,
+
+    # Reverse proxies are not language apps: build from the proxy base image
+    # and let the config (Caddyfile / nginx.conf) be bind-mounted at runtime by
+    # compose. Rendering these with a language template (COPY requirements.txt)
+    # was a build failure (lumina 01a02295: caddy → Python template).
+    "caddy": """# Caddy reverse proxy — Caddyfile is bind-mounted by compose.
+FROM caddy:2-alpine
+{healthcheck}
+""",
+
+    "nginx": """# Nginx reverse proxy — nginx.conf is bind-mounted by compose.
+FROM nginx:alpine
+{healthcheck}
+""",
 }
 
 
@@ -1062,6 +1076,13 @@ def generate_assets_from_blueprint(
         # a multi-stack app (lumina 01a02272: React client → Python template).
         build_ctx = svc_spec.get("build_context", ".")
         svc_lang = _detect_service_language(workspace, build_ctx, primary_lang)
+        # The reverse-proxy service is not a language app — render it from its
+        # proxy base image (caddy/nginx), never a python/node template, so its
+        # empty build context doesn't fall back to the primary language.
+        if svc_name in ("caddy", "nginx"):
+            svc_lang = svc_name
+        elif svc_name == blueprint.get("proxy_service"):
+            svc_lang = svc_name if svc_name in _DOCKERFILE_TEMPLATES else "caddy"
 
         dockerfile_content = _generate_dockerfile(
             svc_name, svc_spec, svc_lang, workspace_path,

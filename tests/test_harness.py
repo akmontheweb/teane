@@ -7081,6 +7081,29 @@ class TestDeployValidation:
         di = di_path.read_text()
         assert "node_modules" in di and ".git" in di
 
+    def test_proxy_service_renders_from_proxy_image_not_language(self, tmp_path):
+        # A reverse-proxy service has no language manifest, so it must render
+        # from the caddy/nginx base image — not fall back to the primary
+        # language's template (lumina 01a02295: caddy → Python template).
+        import os
+        from harness.deploy import generate_assets_from_blueprint
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        (tmp_path / "Caddyfile").write_text(":80 { respond 200 }\n")
+        bp = {"proxy_service": "caddy", "services": {
+            "server": {"base_image": "python:3.12-slim",
+                       "build_context": "./server", "ports": ["8000:8000"]},
+            "caddy": {"base_image": "caddy:2-alpine",
+                      "build_context": ".", "ports": ["80:80"]},
+        }}
+        result = generate_assets_from_blueprint(bp, {"languages": ["python"]}, str(tmp_path))
+        assert result["success"], result
+        dfs = {f: (tmp_path / f).read_text()
+               for f in os.listdir(tmp_path) if f.startswith("Dockerfile")}
+        caddy_df = next((c for f, c in dfs.items() if "caddy" in f), "")
+        assert "FROM caddy" in caddy_df, list(dfs)
+        assert "requirements.txt" not in caddy_df
+
     def test_compose_respects_per_service_limit_override(self):
         from harness.deploy import _generate_compose_file
         bp = {

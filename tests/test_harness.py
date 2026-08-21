@@ -7052,6 +7052,35 @@ class TestDeployValidation:
         assert "FROM node" in client_df, list(dfs)
         assert "requirements.txt" not in client_df
 
+    def test_compose_build_context_is_workspace_root(self):
+        # Compose resolves `dockerfile:` relative to `context:`; the generated
+        # Dockerfiles live at the root and COPY root-relative paths, so the
+        # build context must be `.` — a per-service context builds the wrong
+        # (stale/absent) Dockerfile (lumina 01a02288).
+        from harness.deploy import _generate_compose_file
+        bp = {"services": {"client": {
+            "base_image": "node:20-alpine", "build_context": "./client",
+            "ports": ["3000:3000"],
+        }}}
+        compose = _generate_compose_file(bp)
+        assert "context: ." in compose
+        assert "context: ./client" not in compose
+
+    def test_generate_assets_writes_root_dockerignore(self, tmp_path):
+        from harness.deploy import generate_assets_from_blueprint
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text("{}")
+        bp = {"services": {"client": {
+            "base_image": "node:20-alpine", "build_context": "./client",
+            "ports": ["3000:3000"],
+        }}}
+        result = generate_assets_from_blueprint(bp, {"languages": ["node"]}, str(tmp_path))
+        assert result["success"], result
+        di_path = tmp_path / ".dockerignore"
+        assert di_path.is_file()
+        di = di_path.read_text()
+        assert "node_modules" in di and ".git" in di
+
     def test_compose_respects_per_service_limit_override(self):
         from harness.deploy import _generate_compose_file
         bp = {

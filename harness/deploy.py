@@ -702,6 +702,33 @@ CMD ["java", "-jar", "app.jar"]
 }
 
 
+# Root .dockerignore for the workspace-root build context. Keeps the context
+# lean (VCS, dependency dirs, venvs, caches, build output, local data) so the
+# daemon transfer is fast and ``COPY`` never captures stale artifacts.
+_DOCKERIGNORE_CONTENT = """.git
+.gitignore
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/dist
+**/build
+.harness_session.lock
+.teane
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+.env
+docs
+product_spec
+"""
+
+
 def _detect_service_language(workspace: Path, build_ctx: str, fallback: str) -> str:
     """Detect a service's language from the manifest files in its OWN build
     context, so a multi-stack app renders each service with the right template.
@@ -829,7 +856,15 @@ def _generate_compose_file(
         has_build_context = bool(svc_spec.get("build_context"))
         if has_build_context:
             lines.append("    build:")
-            lines.append(f"      context: {svc_spec.get('build_context', '.')}")
+            # Build context is the workspace ROOT, not the service subdir: the
+            # generated Dockerfiles live at the root and their templates COPY
+            # root-relative paths (``COPY ./client/package.json ...``). Compose
+            # resolves ``dockerfile:`` relative to ``context:``, so a per-service
+            # context would look for ``./client/Dockerfile.client`` (which the
+            # generator never writes there) and the COPY paths would double the
+            # prefix — lumina 01a02288 built a stale ``client/Dockerfile.client``
+            # instead of the regenerated root one.
+            lines.append("      context: .")
             lines.append(f"      dockerfile: {_dockerfile_name_for(svc_name, services)}")
         else:
             lines.append(f"    image: {svc_spec.get('base_image', 'alpine:3.20')}")
@@ -1046,6 +1081,15 @@ def generate_assets_from_blueprint(
     compose_path.write_text(compose_content, encoding="utf-8")
     generated.append("docker-compose.yml")
     logger.info("[deploy:generate] Generated docker-compose.yml (%d services)", len(services))
+
+    # Generate a root .dockerignore for the workspace-root build context — with
+    # `context: .`, without it the daemon would receive .git / node_modules /
+    # venvs / caches. Never overwrite an operator-authored file.
+    dockerignore_path = workspace / ".dockerignore"
+    if not dockerignore_path.exists():
+        dockerignore_path.write_text(_DOCKERIGNORE_CONTENT, encoding="utf-8")
+        generated.append(".dockerignore")
+        logger.info("[deploy:generate] Generated .dockerignore")
 
     # Generate .env from the union of services[*].environment_keys_needed
     # so docker-compose doesn't warn (and DB images don't refuse to start)

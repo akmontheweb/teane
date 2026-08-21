@@ -381,6 +381,17 @@
         "require_code_linkage": true,
         "coverage_nonregression": true
     },
+    "acceptance": {
+        "enabled": false,
+        "scenario_source": "fallback",
+        "seed_source": "fallback",
+        "altitudes": ["integration", "e2e"],
+        "max_scenarios_per_story": 24,
+        "max_seed_rows_per_table": 20,
+        "integration_dir": "tests/acceptance",
+        "max_repair_rounds_per_batch": 2,
+        "db_path_env": ""
+    },
     "traceability": {
         "enforce": true
     },

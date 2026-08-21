@@ -47,7 +47,7 @@ from typing import Any, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 """Bump when adding columns. Add a ``_migrate_to_vN`` function and
 register it in ``_MIGRATIONS`` below. Forward-only.
 
@@ -357,10 +357,29 @@ CREATE TABLE IF NOT EXISTS test_verifies_ac (
     test_path TEXT NOT NULL,
     test_function_name TEXT NOT NULL DEFAULT '',
     ac_id INTEGER NOT NULL REFERENCES acceptance_criteria(id) ON DELETE CASCADE,
+    -- ADR-0006: how the edge was verified. '' = legacy/unit (build unit-test
+    -- @verifies marker); 'build' = in-build acceptance run (integration
+    -- altitude); 'test' = post-deploy `teane test` browser pass. Added additively
+    -- in the v5->v6 migration for existing DBs; present in the DDL for fresh ones.
+    provenance TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (test_path, test_function_name, ac_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tva_workspace ON test_verifies_ac(workspace);
 CREATE INDEX IF NOT EXISTS idx_tva_ac ON test_verifies_ac(ac_id);
+
+-- ADR-0006: acceptance criteria the in-build acceptance run could not verify
+-- this batch but did NOT fail on (a prerequisite isn't built yet, or the AC is
+-- ui-only). Persisted so a later batch re-attempts them and TRACEABILITY renders
+-- them as pending-not-failed. status is a harness.acceptance_run STATUS_* value.
+CREATE TABLE IF NOT EXISTS acceptance_deferrals (
+    workspace TEXT NOT NULL,
+    ac_id INTEGER NOT NULL REFERENCES acceptance_criteria(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace, ac_id)
+);
+CREATE INDEX IF NOT EXISTS idx_acc_defer_workspace ON acceptance_deferrals(workspace);
 """
 
 
@@ -512,9 +531,33 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Additive migration: add ``provenance`` to ``test_verifies_ac``.
+
+    Unlike the v3→v4 / v4→v5 clean-slate resets, this preserves existing
+    traceability edges — an ``ALTER TABLE ADD COLUMN`` with a default. Idempotent:
+    skips when the column already exists (``executescript(_SCHEMA_SQL)`` also runs
+    on the same connection right after, and would otherwise double-add). No-op on a
+    fresh DB where ``test_verifies_ac`` doesn't exist yet.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(test_verifies_ac)").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    if not cols:
+        return  # table not created yet — the DDL will include the column
+    if any(c[1] == "provenance" for c in cols):
+        return  # already migrated
+    conn.execute(
+        "ALTER TABLE test_verifies_ac ADD COLUMN provenance TEXT NOT NULL DEFAULT ''"
+    )
+    conn.commit()
+
+
 _MIGRATIONS: list[tuple[int, Any]] = [
     (4, _migrate_v3_to_v4),
     (5, _migrate_v4_to_v5),
+    (6, _migrate_v5_to_v6),
 ]
 """(target_version, callable(conn) -> None). Append-only; never rewrite
 history. v1 → v2 and v2 → v3 only existed for per-workspace DBs that
@@ -1201,19 +1244,110 @@ def link_test_to_ac(
     test_path: str,
     ac_id: int,
     test_function_name: str = "",
+    provenance: str = "",
 ) -> bool:
     """Record that ``test_path`` (optionally a specific test function)
     verifies ``ac_id``. Idempotent on the composite PK. Returns True
     when a new row was inserted, False on duplicate.
+
+    ``provenance`` (ADR-0006) records HOW the edge was verified: ``''`` for a
+    legacy/unit ``@verifies`` marker, ``'build'`` for an in-build acceptance run,
+    ``'test'`` for the post-deploy browser pass. On a duplicate PK the row is
+    left unchanged (INSERT OR IGNORE); :func:`set_test_ac_provenance` upgrades an
+    existing edge's provenance when a stronger verification lands.
     """
     cur = conn.execute(
         "INSERT OR IGNORE INTO test_verifies_ac"
-        "(workspace, test_path, test_function_name, ac_id) "
-        "VALUES(?, ?, ?, ?)",
-        (workspace, test_path, test_function_name, int(ac_id)),
+        "(workspace, test_path, test_function_name, ac_id, provenance) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (workspace, test_path, test_function_name, int(ac_id), provenance),
     )
     conn.commit()
     return bool(cur.rowcount)
+
+
+def acs_verified_with_provenance(
+    conn: sqlite3.Connection, workspace: str, provenance: str,
+) -> set[str]:
+    """Return the set of ``ac_key``s with at least one edge of ``provenance``.
+
+    Used by the in-build acceptance run to skip ACs it already verified
+    (run-each-AC-once).
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT ac.ac_key FROM test_verifies_ac tva "
+        "JOIN acceptance_criteria ac ON ac.id = tva.ac_id "
+        "WHERE tva.workspace = ? AND tva.provenance = ?",
+        (workspace, provenance),
+    ).fetchall()
+    return {r[0] for r in rows if r and r[0]}
+
+
+# ---------------------------------------------------------------------------
+# ADR-0006 acceptance deferrals — pending-not-failed ACs, persisted for re-queue
+# ---------------------------------------------------------------------------
+
+
+def story_keys_for_batch(
+    conn: sqlite3.Connection, workspace: str, batch_id: int,
+) -> list[str]:
+    """Ordered ``story_key``s belonging to ``batch_id`` (ADR-0006 batch scoping).
+
+    Mirrors the ``batch_stories``→``stories`` join used by the story loop, so
+    acceptance verification scopes to exactly the stories the batch built.
+    """
+    rows = conn.execute(
+        "SELECT s.story_key FROM batch_stories bs "
+        "JOIN stories s ON s.id = bs.story_id "
+        "WHERE bs.batch_id = ? AND s.workspace = ? "
+        "ORDER BY bs.sequence",
+        (int(batch_id), workspace),
+    ).fetchall()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def record_acceptance_deferral(
+    conn: sqlite3.Connection,
+    workspace: str,
+    ac_id: int,
+    status: str,
+    detail: str = "",
+) -> None:
+    """Upsert a deferral row for ``ac_id`` (a later batch re-attempts it)."""
+    conn.execute(
+        "INSERT INTO acceptance_deferrals(workspace, ac_id, status, detail, updated_at) "
+        "VALUES(?, ?, ?, ?, ?) "
+        "ON CONFLICT(workspace, ac_id) DO UPDATE SET "
+        "status=excluded.status, detail=excluded.detail, updated_at=excluded.updated_at",
+        (workspace, int(ac_id), status, detail, _utcnow_iso()),
+    )
+    conn.commit()
+
+
+def clear_acceptance_deferral(conn: sqlite3.Connection, workspace: str, ac_id: int) -> None:
+    """Remove a deferral (the AC has since been verified)."""
+    conn.execute(
+        "DELETE FROM acceptance_deferrals WHERE workspace = ? AND ac_id = ?",
+        (workspace, int(ac_id)),
+    )
+    conn.commit()
+
+
+def list_acceptance_deferrals(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """All deferral rows for ``workspace`` (joined to their ``ac_key``)."""
+    rows = conn.execute(
+        "SELECT ad.ac_id, ac.ac_key, ad.status, ad.detail, ad.updated_at "
+        "FROM acceptance_deferrals ad "
+        "JOIN acceptance_criteria ac ON ac.id = ad.ac_id "
+        "WHERE ad.workspace = ? ORDER BY ac.ac_key",
+        (workspace,),
+    ).fetchall()
+    return [
+        {"ac_id": r[0], "ac_key": r[1], "status": r[2], "detail": r[3], "updated_at": r[4]}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -180,6 +180,10 @@ class AgentState(TypedDict, total=False):
     # ADR-0001 test-author regeneration parameters. Loaded from the
     # "test_regeneration" section of config/config.json.
     test_regeneration_config: dict[str, Any]
+    # ADR-0006 in-build acceptance verification. Loaded from the
+    # "acceptance" section of config/config.json. Read by acceptance_node;
+    # empty/enabled=false makes the node a pass-through no-op.
+    acceptance_config: dict[str, Any]
     # Speculative-execution branching parameters. Loaded from the
     # "speculative" section of config/config.json. Keys: num_variants
     # (default 3), temperature (default 0.3), selection_strategy
@@ -25859,6 +25863,13 @@ def build_graph() -> Any:
     from harness.semantic_review import (
         semantic_coverage_review_node as _semantic_coverage_review_node,
     )
+    # ADR-0006 in-build acceptance verification. Inert unless
+    # ``acceptance.enabled`` — the node self-guards to a pass-through no-op, and
+    # the compiler-green edge only reaches it in batch mode.
+    from harness.acceptance_node import (
+        acceptance_node as _acceptance_node,
+        route_after_acceptance as _route_after_acceptance,
+    )
     from harness.story_loop import (
         batch_planner_node as _batch_planner_node,
         story_loop_node as _story_loop_node,
@@ -25883,6 +25894,9 @@ def build_graph() -> Any:
     # Semantic coverage review (P3): adversarial check that each feature's
     # stories actually satisfy its intent. Off unless traceability.semantic_review.
     graph.add_node("semantic_coverage_review_node", _semantic_coverage_review_node)  # type: ignore[type-var]
+    # ADR-0006 acceptance_node: runs per-batch integration ACs between a green
+    # compile and code review. Pass-through no-op unless acceptance.enabled.
+    graph.add_node("acceptance_node", _acceptance_node)  # type: ignore[type-var]
     graph.add_node("batch_planner_node", _batch_planner_node)  # type: ignore[type-var]
     graph.add_node("story_loop_node", _story_loop_node)  # type: ignore[type-var]
     # Phase F removed ``story_test_first_node``. Its xfail-stub
@@ -26417,8 +26431,11 @@ def build_graph() -> Any:
         "compiler_node",
         route_after_compiler,
         {
-            # Clean compile → code reviewer (no-op pass-through if unconfigured).
-            "security_scan_node": "code_review_node",
+            # Clean compile → ADR-0006 acceptance_node (pass-through no-op unless
+            # acceptance.enabled) → code review. The router literal is still
+            # "security_scan_node" for backwards-compat; only the mapping target
+            # changed, so route_after_compiler is untouched.
+            "security_scan_node": "acceptance_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
             # pytest exit=5 with source present → generate tests instead of
@@ -26426,6 +26443,19 @@ def build_graph() -> Any:
             "test_generation_node": "test_generation_node",
             # ADR-0001: provably-unsatisfiable test → regenerate from spec.
             "test_regeneration_node": "test_regeneration_node",
+        },
+    )
+
+    # ADR-0006: after acceptance runs, attributable failures (under the per-batch
+    # cap) route to repair to fix the production code; otherwise proceed to code
+    # review. When acceptance.enabled is false the node no-ops and this returns
+    # "code_review_node", preserving the exact pre-ADR-0006 compiler→review edge.
+    graph.add_conditional_edges(
+        "acceptance_node",
+        _route_after_acceptance,
+        {
+            "repair_node": "repair_node",
+            "code_review_node": "code_review_node",
         },
     )
 
@@ -27162,6 +27192,7 @@ async def run_graph(
     sandbox_config: Optional[dict[str, Any]] = None,
     test_generation_config: Optional[dict[str, Any]] = None,
     test_regeneration_config: Optional[dict[str, Any]] = None,
+    acceptance_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
     compiler_config: Optional[dict[str, Any]] = None,
     change_request_mode: bool = False,
@@ -27261,6 +27292,8 @@ async def run_graph(
         initial_state["test_generation_config"] = test_generation_config
     if test_regeneration_config is not None:
         initial_state["test_regeneration_config"] = test_regeneration_config
+    if acceptance_config is not None:
+        initial_state["acceptance_config"] = acceptance_config
     if speculative_config is not None:
         initial_state["speculative_config"] = speculative_config
     if change_requests_config is not None:

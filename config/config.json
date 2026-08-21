@@ -582,7 +582,7 @@
         "jobs": []
     },
     "repo_index": {
-        "enabled": false,
+        "enabled": true,
         "backend": "tfidf",
         "top_k": 5,
         "chunk_lines": 200,

@@ -4314,6 +4314,78 @@ def _dedupe_repeated_preambles(
     return stubbed, reclaimed
 
 
+async def _inject_repo_index_grounding(
+    state: "AgentState",
+    messages: list,
+    *,
+    query: str,
+    consumer: str,
+) -> bool:
+    """Inject the top-K semantically-retrieved existing-code chunks as a system
+    message so a code-generating node writes CONSISTENT with the codebase.
+
+    Mirrors ``planning_node``'s retrieval, but for the generation path (patching /
+    repair), which historically only *updated* the index and never *queried* it —
+    so the generator had no automatic neighbour-code grounding (it relied on the
+    directory tree + its own grepping). ``query`` should describe what is about to
+    be written (the story preamble for patching; the failing-file diagnostics for
+    repair). Gated on ``repo_index.enabled``; fully fail-open — any error, or an
+    empty index / empty query, injects nothing and returns False.
+    """
+    try:
+        workspace_path = state.get("workspace_path", "")
+        idx_cfg_dict = state.get("repo_index_config") or {}
+        if not (workspace_path and bool(idx_cfg_dict.get("enabled", False)) and query.strip()):
+            return False
+        from harness.repo_index import (
+            RepoIndexConfig,
+            async_query_top_chunks,
+            render_results_for_injection,
+        )
+        idx_cfg = RepoIndexConfig(
+            enabled=True,
+            backend=str(idx_cfg_dict.get("backend", "tfidf")),
+            top_k=int(idx_cfg_dict.get("top_k", 5)),
+            chunk_lines=int(idx_cfg_dict.get("chunk_lines", 200)),
+            chunk_overlap=int(idx_cfg_dict.get("chunk_overlap", 20)),
+            inject_max_bytes=int(idx_cfg_dict.get("inject_max_bytes", 4000)),
+            index_dir=str(idx_cfg_dict.get("index_dir", "~/.harness/repo_index")),
+        )
+        results = await async_query_top_chunks(workspace_path, query, cfg=idx_cfg)
+        block = render_results_for_injection(results, max_bytes=idx_cfg.inject_max_bytes)
+        if not block:
+            return False
+        # Insert right after the leading system prompt(s), before the task turns.
+        insert_at = 0
+        for i, m in enumerate(messages):
+            if m.get("role") == "system":
+                insert_at = i + 1
+            else:
+                break
+        messages.insert(
+            insert_at,
+            MessageDict(
+                role="system",
+                content=(
+                    "### Repository context (semantic retrieval)\n\n"
+                    "Existing code chunks most relevant to what you are about to "
+                    "write. MIRROR the conventions, helpers, imports, and patterns "
+                    "shown here rather than inventing new ones — reuse existing "
+                    "utilities instead of re-implementing them. Lower scores = less "
+                    "relevant; ignore a chunk if it is not useful.\n\n" + block
+                ),
+            ),
+        )
+        logger.info(
+            "[%s] repo_index grounding injected (%d chunk(s), %d bytes).",
+            consumer, len(results), len(block),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — grounding must never break generation
+        logger.debug("[%s] repo_index grounding skipped: %s", consumer, exc)
+        return False
+
+
 async def patching_node(state: AgentState) -> dict[str, Any]:
     """
     Node 2: The Builder.
@@ -4626,6 +4698,21 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "role": "user",
             "content": _TOOL_USE_REMINDER if use_tools else _FORMAT_REMINDER,
         })
+        # Ground generation in the existing codebase (Wave-1 grounding): retrieve
+        # neighbour code for what this story builds and inject it. No-op unless
+        # repo_index.enabled; the incremental index update after each patch keeps
+        # later stories grounded in earlier ones. Query on the story preamble
+        # (agile) or the operator's task message (monolithic) — never the format
+        # boilerplate, which would retrieve nothing useful.
+        _grounding_query = story_preamble
+        if not _grounding_query:
+            for _m in reversed(state.get("messages", []) or []):
+                if _m.get("role") == "user":
+                    _grounding_query = _m.get("content", "") or ""
+                    break
+        await _inject_repo_index_grounding(
+            state, messages, query=_grounding_query, consumer="patching_node",
+        )
         _stubbed, _reclaimed = _dedupe_repeated_preambles(messages)
         if _stubbed:
             logger.info(
@@ -17809,6 +17896,12 @@ need to see and have not been shown; everything else, patch directly.
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your fix patches NOW. Only the blocks above. No other text."""
         messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
+        # Ground the fix in neighbouring code (Wave-1 grounding). Query on the
+        # diagnostic head (file:line + error text) so retrieval surfaces code
+        # related to the failure. No-op unless repo_index.enabled.
+        await _inject_repo_index_grounding(
+            state, messages, query=(error_summary or "")[:2000], consumer="repair_node",
+        )
         _r_stubbed, _r_reclaimed = _dedupe_repeated_preambles(messages)
         if _r_stubbed:
             logger.info(

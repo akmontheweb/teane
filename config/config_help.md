@@ -216,7 +216,7 @@ Cron-style background daemon that fires recurring build jobs. NOTE: the `teane s
 
 ## `repo_index`
 
-Repository semantic-retrieval index. Build with `teane index build`; when enabled, the planner queries the index for top-K chunks relevant to the user prompt and injects them as a system context block. backend = 'tfidf' (zero-dep, pure Python, default) or 'openai_embeddings' (requires OPENAI_API_KEY; falls back to tfidf on missing key). chunk_lines / chunk_overlap shape per-file slicing; top_k bounds the retrieval set; inject_max_bytes caps the planner injection. index_dir is the SQLite store.
+Repository semantic-retrieval index — **grounding** for both planning and code generation. Enabled by default. When enabled, the planner AND the code-generation path (`patching_node`, `repair_node`) query the index for the top-K chunks most relevant to the task (planner: user prompt; patching: story preamble / task; repair: the failing diagnostics) and inject them as a system context block so the model mirrors existing conventions and reuses existing helpers instead of generating blind. The index is populated incrementally as code is written (so later stories are grounded in earlier ones); for a brownfield repo run `teane index build` once at the start so existing code is grounded too. backend = 'tfidf' (zero-dep, pure Python, default) or 'openai_embeddings' (requires OPENAI_API_KEY; falls back to tfidf on missing key). chunk_lines / chunk_overlap shape per-file slicing; top_k bounds the retrieval set; inject_max_bytes caps the injected block. index_dir is the SQLite store. Injection is fail-open — an empty index or any retrieval error injects nothing and never blocks generation. Set enabled=false to disable grounding entirely.
 
 ## `deployment_defaults`
 

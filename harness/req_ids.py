@@ -119,13 +119,12 @@ STORY_NFR_ID_RE = re.compile(r"\bSTORY-NFR-\d{1,4}\b")
 # ``parse_spec_requirements`` — see below).
 #
 # Order in the alternation matters: STORY-NFR-NNN before STORY-NNN
-# because the former is a strict superset prefix.
-_HEADING_RE = re.compile(
-    r"^\s*#{2,}\s+"
-    # Optional label prefix (e.g. ``Epic:``, ``Feature:``, ``Story:``,
-    # ``Enabler Story:``) — matched permissively and discarded.
-    r"(?:[A-Za-z][A-Za-z ]{0,30}:\s+)?"
-    r"(?P<id>"
+# because the former is a strict superset prefix. Extracted to a single
+# constant so the heading parser, the declaration-form fallback, and the
+# free-text token scanner all recognise the exact same identifier
+# vocabulary — the waterfall (FR/NFR/US) AND agile (EPIC/FEAT/STORY/
+# STORY-NFR) families in one place, with no way for the three to drift.
+_ID_ALTERNATION = (
     r"FR-\d{1,4}"
     r"|NFR-[A-Z]+-\d{1,4}"
     r"|US-\d{1,3}-\d{1,3}"
@@ -133,10 +132,57 @@ _HEADING_RE = re.compile(
     r"|FEAT-\d{1,4}"
     r"|STORY-NFR-\d{1,4}"
     r"|STORY-\d{1,4}"
-    r")"
+)
+
+_HEADING_RE = re.compile(
+    r"^\s*#{2,}\s+"
+    # Optional label prefix (e.g. ``Epic:``, ``Feature:``, ``Story:``,
+    # ``Enabler Story:``) — matched permissively and discarded.
+    r"(?:[A-Za-z][A-Za-z ]{0,30}:\s+)?"
+    rf"(?P<id>{_ID_ALTERNATION})"
     # Title separator: ``:``, em-dash, or `` -`` (markdown header style).
     r"\s*(?:[:\-]|—)\s*(?P<title>.+?)\s*$"
 )
+
+# Declaration-form fallback. When ``parse_spec_requirements`` finds ZERO
+# canonical headings — a reused or hand-authored spec that lists its
+# requirement IDs as bold labels (``**FR-001**: …``), bullets
+# (``- FR-001 — …``), table cells (``| FR-001 | … |``), or bare headings
+# with no title separator (``### FR-001``) — this salvages the
+# identifiers so the requirements table (and the decomposition
+# validator's known-key set) is populated for BOTH families instead of
+# collapsing to an empty registry that rejects every story.
+#
+# Anchored to the START of a line after optional markdown decoration
+# (heading ``#``, blockquote ``>``, list bullet, leading table pipe,
+# bold ``**``/``__``) so an incidental mid-prose mention
+# ("…as described in FR-001, the system…") is NOT harvested as a
+# declared requirement — only tokens sitting in a declaration position
+# are picked up.
+_DECL_LINE_RE = re.compile(
+    r"^\s*"
+    r"(?:[#>]+\s*)?"            # heading hashes and/or blockquote markers
+    r"(?:[-*+]\s+)?"           # list bullet
+    r"(?:\|\s*)?"              # leading table pipe
+    r"(?:\*\*|__)?\s*"         # bold-open decoration
+    rf"(?P<id>{_ID_ALTERNATION})"
+    r"(?:\*\*|__)?"            # bold-close decoration
+    # Optional title. The separator between id and title may be
+    # punctuation (``:``, ``-`` — em/en dashes are already folded to
+    # ``-`` by ``normalize_dashes``), a table-cell pipe, or plain
+    # whitespace (``- STORY-101 Sign in``). ``\S`` forces a real title
+    # start; a trailing ``|`` from a table row is stripped by the
+    # caller. A bare id with no title (``### FR-001``) matches via the
+    # trailing ``\s*$`` with the group skipped.
+    r"(?:[\s:|-]+(?P<title>\S.*?))?\s*$"
+)
+
+# Free-text scanner: every requirement token anywhere in the text,
+# regardless of position. Used to distinguish "the spec genuinely
+# declares no requirements" from "the spec clearly references
+# requirement IDs but none parsed" (a format problem the validator
+# must degrade gracefully around rather than dead-end on).
+_ANY_ID_RE = re.compile(rf"\b(?:{_ID_ALTERNATION})\b")
 
 
 # Terminators that close out the body of the current requirement. Any
@@ -350,4 +396,74 @@ def parse_spec_requirements(
             source_line=i + 1,  # 1-indexed
         ))
         i = j
+    # Canonical-heading path found nothing. Rather than return an empty
+    # registry — which makes the decomposition validator reject EVERY
+    # story with "Known req_keys in this workspace: []" and dead-end the
+    # build — fall back to a declaration-scoped token scan that recovers
+    # IDs from bold/bullet/table/heading-without-title layouts. Applies
+    # equally to the waterfall (FR/NFR/US) and agile (EPIC/FEAT/STORY)
+    # families. Only runs when the strict pass is empty so a
+    # well-formed spec's precise heading titles/bodies are never
+    # second-guessed by the looser scan.
+    if not out:
+        out = _parse_declaration_fallback(lines)
     return out
+
+
+def _parse_declaration_fallback(lines: list[str]) -> list[ParsedRequirement]:
+    """Salvage requirement identifiers from non-heading declaration
+    layouts when the canonical heading parse yields nothing.
+
+    ``lines`` must already be dash-normalised (the sole caller,
+    :func:`parse_spec_requirements`, normalises before splitting).
+    First occurrence of each canonical key wins; ``body`` is left empty
+    because a declaration line carries only the id and an optional
+    title. The recovered rows are enough to populate the ``requirements``
+    table and the validator's known-key set — the two things a missing
+    registry breaks.
+    """
+    out: list[ParsedRequirement] = []
+    seen: set[str] = set()
+    for idx, line in enumerate(lines):
+        m = _DECL_LINE_RE.match(line)
+        if not m:
+            continue
+        req_key = canonicalize_req_key(m.group("id"))
+        if req_key in seen:
+            continue
+        kind = kind_for(req_key)
+        if kind is None:
+            continue
+        seen.add(req_key)
+        raw_title = (m.group("title") or "").strip()
+        # A table row (``| FR-001 | title |``) leaves a trailing pipe on
+        # the captured title; trim it and any cell padding.
+        title = raw_title.rstrip("|").strip()
+        out.append(ParsedRequirement(
+            req_key=req_key,
+            kind=kind,
+            title=title,
+            body="",
+            source_line=idx + 1,  # 1-indexed
+        ))
+    return out
+
+
+def scan_requirement_tokens(text: str) -> set[str]:
+    """Return every canonical requirement identifier that appears
+    anywhere in ``text`` — heading, table, prose, or otherwise.
+
+    Distinct from :func:`parse_spec_requirements`: that extracts
+    *declared* requirements (headings, then the declaration fallback);
+    this is a permissive presence check used to tell "the spec declares
+    no requirements at all" apart from "the spec plainly references
+    requirement IDs but the parser recovered none" (a format problem).
+    The decomposition node uses the difference to decide between a hard
+    empty-registry failure and a graceful shape-only fallback.
+    """
+    found: set[str] = set()
+    for m in _ANY_ID_RE.finditer(normalize_dashes(text)):
+        key = canonicalize_req_key(m.group(0))
+        if kind_for(key) is not None:
+            found.add(key)
+    return found

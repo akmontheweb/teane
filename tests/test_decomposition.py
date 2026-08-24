@@ -1682,6 +1682,155 @@ def test_decomposition_node_unknown_req_key_repair_skipped_when_budget_zero(
 
 
 # ---------------------------------------------------------------------------
+# Fix A — two-format registry robustness + honest degradation + guards
+# ---------------------------------------------------------------------------
+
+# A spec that lists its FR requirements as bold labels / bullets rather
+# than canonical ``### FR-001: title`` headings. Before Fix A1 the ingest
+# parser recovered ZERO keys from this layout, the validator rejected
+# every story against an empty registry, and the build dead-ended at HITL
+# (the exact reuse-specs failure seen on lumina). The declaration-form
+# fallback must now populate the registry so ``_valid_payload`` validates.
+_NONHEADING_FR_SPEC = (
+    "# Reused TODO API spec\n\n"
+    "## Functional requirements\n\n"
+    "- **FR-001** — Create a TODO\n"
+    "- **FR-002** — List TODOs\n"
+)
+
+
+def test_decomposition_node_recovers_nonheading_fr_spec(workspace: str):
+    """A1: a reused FR spec that uses bullets/bold (not headings) still
+    populates the registry, so a valid payload commits instead of
+    dead-ending on an empty known-key set."""
+    from harness.graph import set_gateway
+    _write_spec(workspace, body=_NONHEADING_FR_SPEC)
+    gw = _FakeGateway([_valid_payload()])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["current_gate"] == "STORIES"
+    assert out["node_state"]["decomposition_complete"] is True
+    assert out["node_state"]["story_count"] == 2
+    # Registry really was populated from the non-heading layout.
+    app = story_state.app_name_for_workspace(workspace)
+    conn = story_state.open_story_db()
+    try:
+        keys = {r["req_key"] for r in story_state.list_requirements(conn, app)}
+    finally:
+        conn.close()
+    assert {"FR-001", "FR-002"} <= keys
+    # Single call — no auto-repair round was needed.
+    assert len(gw.calls) == 1
+
+
+# A spec that only *mentions* its requirement IDs inside prose — neither
+# the heading parser nor the declaration fallback can recover a row, so
+# the registry stays empty. Fix A5: rather than reject every story and
+# fire an unsatisfiable repair, the node drops to shape-only validation
+# for the run (and logs LOUDLY) so a legitimate payload still commits.
+_PROSE_ONLY_FR_SPEC = (
+    "# TODO API\n\n"
+    "The FR-001 create-a-todo behaviour and the FR-002 list-todos "
+    "behaviour are implemented inline by the service layer.\n"
+)
+
+
+def test_decomposition_node_shape_only_fallback_when_tokens_unparsed(
+    workspace: str, caplog,
+):
+    """A5: spec references FR ids only in prose → empty registry, but the
+    node degrades to shape-only validation and commits rather than
+    dead-ending."""
+    import logging
+    from harness.graph import set_gateway
+    _write_spec(workspace, body=_PROSE_ONLY_FR_SPEC)
+    gw = _FakeGateway([_valid_payload()])
+    set_gateway(gw)
+
+    with caplog.at_level(logging.ERROR):
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+
+    assert out["current_gate"] == "STORIES"
+    assert out["node_state"]["decomposition_complete"] is True
+    assert out["node_state"]["story_count"] == 2
+    # One call — shape-only means no unknown-key rejection, no repair.
+    assert len(gw.calls) == 1
+    # The degradation is surfaced, not silent.
+    assert any(
+        "non-declaration format" in r.message or
+        "shape-only requirement_key validation" in r.message
+        for r in caplog.records
+    )
+
+
+def test_decomposition_node_empty_response_is_named(workspace: str):
+    """A3: an empty model response yields a clear ``empty_response`` error
+    instead of the opaque ``Expecting value: line 1 column 1``."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)
+    set_gateway(_FakeGateway([""]))
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+    assert out["node_state"]["decomposition_failed"] is True
+    assert out["node_state"]["error"] == "empty_response"
+    app = story_state.app_name_for_workspace(workspace)
+    conn = story_state.open_story_db()
+    try:
+        assert story_state.list_stories(conn, app) == []
+    finally:
+        conn.close()
+
+
+def test_decomposition_node_unknown_req_key_repair_skipped_when_registry_empty(
+    workspace: str,
+):
+    """A3: when the registry is genuinely empty (spec declares AND
+    references no requirement ids), an unknown-key rejection must NOT
+    trigger the unsatisfiable auto-repair — it would embed an empty valid
+    list and the model would return nothing, surfacing an opaque JSON
+    error. Fail honestly in one call instead."""
+    from harness.graph import set_gateway
+    # Spec with no requirement identifiers at all.
+    _write_spec(workspace, body="# TODO API\n\nJust prose, no ids here.\n")
+    gw = _FakeGateway([_valid_payload()])  # cites FR-001/FR-002
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    err = out["node_state"]["error"]
+    assert err.startswith("validation:")
+    # No repair was attempted (unsatisfiable against an empty registry).
+    assert "repair_failed" not in err
+    assert len(gw.calls) == 1
+
+
+def test_decomposition_node_empty_repair_response_reported_clearly(
+    workspace: str,
+):
+    """A3: when a satisfiable unknown-key repair is attempted but the
+    model returns an empty response, the failure names the empty response
+    rather than surfacing an opaque JSON-decode error."""
+    from harness.graph import set_gateway
+    _write_spec(workspace)  # declares FR-001/FR-002 → repair IS satisfiable
+    gw = _FakeGateway([_payload_with_bogus_req_key(), ""])
+    set_gateway(gw)
+
+    out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+
+    assert out["node_state"]["decomposition_failed"] is True
+    err = out["node_state"]["error"]
+    assert err.startswith("validation:")
+    assert "repair_failed" in err
+    assert "empty response" in err.lower()
+    # Original + one repair attempt.
+    assert len(gw.calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # Too-many-features auto-repair — same 1-shot contract as cycles/unknown-keys
 # ---------------------------------------------------------------------------
 

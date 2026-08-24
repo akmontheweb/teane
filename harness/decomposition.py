@@ -2259,6 +2259,36 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         augment_existing_features = []
         known_req_keys = set()
 
+    # Honest degradation when the registry is empty but the spec clearly
+    # references requirement IDs. The ingest parser (headings + the
+    # declaration-form fallback in ``req_ids``) recovers keys from every
+    # normal layout; if it STILL finds nothing while the spec plainly
+    # cites identifiers (they only appear inside prose, say), rejecting
+    # every story against ``[]`` and firing an unsatisfiable
+    # unknown_req_key auto-repair would dead-end the build at HITL.
+    # Instead, drop to shape-only requirement_key validation for this
+    # run and log LOUDLY so the operator fixes the spec format. When the
+    # spec references NO requirement IDs at all we keep the strict
+    # (empty) set so bogus keys are still rejected — that is a genuine
+    # spec gap worth surfacing, not a parser miss. ``None`` selects
+    # shape-only validation in ``_validate_story_requirement_keys``.
+    known_req_keys_for_validation: Optional[set[str]] = known_req_keys
+    if not known_req_keys:
+        from harness import req_ids as _req_ids
+        spec_req_tokens = _req_ids.scan_requirement_tokens(spec_req or "")
+        if spec_req_tokens:
+            logger.error(
+                "[decomposition] SPEC_REQUIREMENTS.md references %d "
+                "requirement identifier(s) (e.g. %s) but none parsed into "
+                "the requirements registry — the spec likely lists them in "
+                "a non-declaration format. Falling back to shape-only "
+                "requirement_key validation for this run; restore canonical "
+                "``### FR-001: title`` / ``### Story: STORY-001 - title`` "
+                "headings to re-enable strict cross-checking.",
+                len(spec_req_tokens), ", ".join(sorted(spec_req_tokens)[:5]),
+            )
+            known_req_keys_for_validation = None
+
     augment_mode = bool(augment_existing)
     if augment_mode:
         logger.info(
@@ -2302,6 +2332,25 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     raw = strip_json_fence(getattr(response, "content", "") or "")
+    if not raw.strip():
+        # An empty model response would otherwise surface as the opaque
+        # ``Expecting value: line 1 column 1 (char 0)`` from json.loads,
+        # hiding the real cause (the model returned nothing). Name it.
+        logger.error(
+            "[decomposition] LLM returned an empty response — no JSON to "
+            "parse. Treating as a decomposition failure."
+        )
+        return {
+            "exit_code": 1,
+            "node_state": {
+                "current_node": "decomposition",
+                "decomposition_complete": False,
+                "decomposition_failed": True,
+                "error": "empty_response",
+                "story_count": 0,
+            },
+            "budget_remaining_usd": budget,
+        }
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -2333,17 +2382,22 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     def _run_validator(payload: dict[str, Any]) -> tuple[list[dict], list[dict]]:
+        # ``known_req_keys_for_validation`` is the degradation-aware set:
+        # the real registry normally, or ``None`` (shape-only) when the
+        # spec references requirement IDs the parser couldn't recover
+        # (see the A5 fallback above). Never dead-end a story against an
+        # empty set when the spec plainly declares requirements.
         if augment_mode:
             return _validate_augment_payload(
                 payload,
                 existing_feature_keys=existing_keys,
-                known_req_keys=known_req_keys,
+                known_req_keys=known_req_keys_for_validation,
                 embed_constraint_nfrs=embed_constraint_nfrs,
                 nfr_class_by_key=nfr_class_by_key,
             )
         return _validate_stories_payload(
             payload,
-            known_req_keys=known_req_keys,
+            known_req_keys=known_req_keys_for_validation,
             embed_constraint_nfrs=embed_constraint_nfrs,
             nfr_class_by_key=nfr_class_by_key,
         )
@@ -2365,7 +2419,18 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         cycle_err = exc_str.startswith("depends_on cycle detected:")
         unknown_req_err = _UNKNOWN_REQ_KEY_ERR_MARKER in exc_str
         too_many_features_err = exc_str.startswith(_TOO_MANY_FEATURES_ERR_PREFIX)
-        if (cycle_err or unknown_req_err or too_many_features_err) and budget > 0:
+        # An unknown-req-key repair is only satisfiable when there IS a
+        # non-empty valid-key universe to remap the offending keys onto.
+        # Against an empty registry the repair prompt would embed an empty
+        # valid list and demand an impossible swap — the model returns
+        # nothing and we'd surface an opaque ``Expecting value…`` instead
+        # of the real cause. Skip straight to the honest failure below.
+        # (The A5 fallback means we only land here with an empty registry
+        # when the spec declares NO requirement IDs at all.)
+        unknown_req_repairable = unknown_req_err and bool(
+            known_req_keys_for_validation
+        )
+        if (cycle_err or unknown_req_repairable or too_many_features_err) and budget > 0:
             if cycle_err:
                 repair_kind = "cycle"
             elif unknown_req_err:
@@ -2381,7 +2446,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 repair_prompt = _build_cycle_repair_prompt(raw, exc_str)
             elif unknown_req_err:
                 repair_prompt = _build_unknown_req_repair_prompt(
-                    raw, exc_str, known_req_keys,
+                    raw, exc_str, known_req_keys_for_validation or set(),
                 )
             else:
                 repair_prompt = _build_too_many_features_repair_prompt(
@@ -2400,6 +2465,12 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 repaired_raw = strip_json_fence(
                     getattr(response, "content", "") or ""
                 )
+                if not repaired_raw.strip():
+                    # Convert an empty repair response into a clear
+                    # message rather than the opaque JSON-decode error.
+                    raise ValueError(
+                        "auto-repair returned an empty response (no JSON)"
+                    )
                 data = json.loads(repaired_raw)
                 features_cleaned, cleaned = _run_validator(data)
                 raw = repaired_raw

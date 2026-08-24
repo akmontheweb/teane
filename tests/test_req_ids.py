@@ -362,3 +362,117 @@ class TestCanonicalizeReqKey:
             "EPIC-001", "FEAT-002", "STORY-001",
             "STORY-NFR-001", "FR-003",
         }
+
+
+# ---------------------------------------------------------------------------
+# Declaration-form fallback (Fix A1) — when a spec lists its requirement
+# IDs in a non-heading layout, the strict heading parse returns nothing;
+# the fallback recovers the IDs so the requirements registry (and the
+# decomposition validator's known-key set) is populated for BOTH the
+# waterfall (FR/NFR/US) and agile (EPIC/FEAT/STORY) families instead of
+# collapsing to the empty set that dead-ends the build.
+# ---------------------------------------------------------------------------
+class TestDeclarationFallback:
+    def _keys(self, spec: str) -> set[str]:
+        return {r.req_key for r in parse_spec_requirements(spec)}
+
+    def test_bold_labels_waterfall(self):
+        spec = (
+            "# Requirements\n\n"
+            "**FR-001**: The system authenticates users.\n\n"
+            "**FR-002** — The system logs out users.\n\n"
+            "**NFR-SEC-001**: Encrypt tokens at rest.\n"
+        )
+        assert self._keys(spec) == {"FR-001", "FR-002", "NFR-SEC-001"}
+
+    def test_bullets_agile_family(self):
+        spec = (
+            "## Backlog\n\n"
+            "- FEAT-014 — Password reset\n"
+            "- STORY-101 Operator can reset a password\n"
+            "- STORY-NFR-1 TLS 1.3 everywhere\n"
+        )
+        assert self._keys(spec) == {"FEAT-014", "STORY-101", "STORY-NFR-001"}
+
+    def test_table_rows(self):
+        spec = (
+            "| ID | Title | Priority |\n"
+            "| --- | --- | --- |\n"
+            "| FR-001 | Login | must |\n"
+            "| FR-002 | Logout | must |\n"
+        )
+        assert self._keys(spec) == {"FR-001", "FR-002"}
+
+    def test_heading_without_title_separator(self):
+        # A bare ``### FR-001`` (no ``: title``) misses the strict
+        # heading regex but is still a declaration.
+        spec = "### FR-001\n\nsome prose\n\n### FR-002\n"
+        assert self._keys(spec) == {"FR-001", "FR-002"}
+
+    def test_fallback_recovers_title_best_effort(self):
+        rows = {
+            r.req_key: r.title
+            for r in parse_spec_requirements(
+                "- STORY-101 Sign in with email\n"
+                "| FR-002 | Logout now | must |\n"
+                "### FR-003\n"
+            )
+        }
+        assert rows["STORY-101"] == "Sign in with email"
+        assert rows["FR-003"] == ""
+        # Trailing table pipe trimmed off the recovered title.
+        assert not rows["FR-002"].endswith("|")
+
+    def test_mid_prose_mentions_are_not_harvested(self):
+        # An identifier buried in a sentence is a reference, not a
+        # declaration — the fallback must not invent a requirement row.
+        spec = (
+            "The system as described in FR-001 and FR-002 will do "
+            "things.\nMore explanatory prose that mentions FR-003.\n"
+        )
+        assert self._keys(spec) == set()
+
+    def test_fallback_does_not_fire_when_headings_present(self):
+        # A single good heading suppresses the looser scan entirely, so
+        # an incidental in-body mention is never mistaken for a second
+        # requirement.
+        spec = (
+            "### FR-001: Real heading\n"
+            "This body incidentally names FR-999 which is not declared.\n"
+        )
+        assert self._keys(spec) == {"FR-001"}
+
+    def test_empty_spec_stays_empty(self):
+        assert self._keys("") == set()
+        assert self._keys("# Title\n\njust prose, no ids\n") == set()
+
+
+# ---------------------------------------------------------------------------
+# scan_requirement_tokens (Fix A5 helper) — permissive presence check
+# used to tell "spec declares no requirements" apart from "spec
+# references requirement IDs the parser couldn't recover".
+# ---------------------------------------------------------------------------
+class TestScanRequirementTokens:
+    def test_finds_tokens_even_in_prose(self):
+        from harness.req_ids import scan_requirement_tokens
+        text = "The FR-001 and STORY-007 requirements matter here."
+        assert scan_requirement_tokens(text) == {"FR-001", "STORY-007"}
+
+    def test_canonicalises_and_dedupes(self):
+        from harness.req_ids import scan_requirement_tokens
+        # ``STORY-7`` and ``STORY-007`` fold to one canonical key.
+        text = "STORY-7 appears, then STORY-007 again, plus FR-3."
+        assert scan_requirement_tokens(text) == {"STORY-007", "FR-003"}
+
+    def test_empty_when_no_identifiers(self):
+        from harness.req_ids import scan_requirement_tokens
+        assert scan_requirement_tokens("no identifiers at all") == set()
+
+    def test_distinguishes_unparsed_from_absent(self):
+        # The exact A5 signal: a spec whose IDs live only in prose parses
+        # to an empty registry, yet the scanner proves it is NOT a
+        # requirement-free spec.
+        from harness.req_ids import scan_requirement_tokens
+        prose_only = "Implements the FR-001 and FR-002 behaviours inline."
+        assert parse_spec_requirements(prose_only) == []
+        assert scan_requirement_tokens(prose_only) == {"FR-001", "FR-002"}

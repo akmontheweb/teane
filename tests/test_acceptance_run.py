@@ -123,6 +123,36 @@ class TestRunAcceptance:
         assert all(o.status == STATUS_DEFERRED_DEP for o in res.outcomes)
         assert res.has_attributable() is False
 
+    def test_collection_error_signal_defers_as_collection_error(self):
+        # Fix B3: a runner that could not run the suite at all raises the
+        # typed signal → every AC is recorded as deferred:collection-error
+        # (its own honest bucket), NOT the misleading blocked-by-dependency.
+        scen = [
+            _int_scen("STORY-1.AC-1", "test_add"),
+            _int_scen("STORY-1.AC-2", "test_edit"),
+        ]
+
+        def _collect_err(paths, ws):
+            raise ar.AcceptanceCollectionError("ModuleNotFoundError: fastapi")
+
+        res = ar.run_acceptance(scen, ["f.py"], "/ws", runner=_collect_err,
+                                story_keys=["STORY-1"])
+        assert {o.status for o in res.outcomes} == {
+            ar.STATUS_DEFERRED_COLLECTION,
+        }
+        # Distinct from blocked-by-dependency, still a deferral (never a
+        # hard failure), and the cause is preserved in the detail.
+        assert res.outcomes[0].status != STATUS_DEFERRED_DEP
+        assert all(o.is_deferred for o in res.outcomes)
+        assert not res.has_attributable()
+        assert "fastapi" in res.outcomes[0].detail
+
+    def test_collection_error_status_is_a_deferral(self):
+        # The new status must live in the deferred family so it never
+        # manufactures a hard failure that stalls a headless run.
+        o = ar.ACOutcome("STORY-1.AC-1", ar.STATUS_DEFERRED_COLLECTION)
+        assert o.is_deferred is True
+
     def test_nothing_runnable_returns_not_ran(self):
         scen = [AcceptanceScenario("STORY-1.AC-1", "e2e", ALTITUDE_E2E, CLASS_UI, "expect(x)")]
         res = ar.run_acceptance(scen, [], "/ws", runner=_runner([]))

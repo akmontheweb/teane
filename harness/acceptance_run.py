@@ -48,12 +48,36 @@ logger = logging.getLogger(__name__)
 STATUS_PASSED = "passed"
 STATUS_ATTRIBUTABLE = "attributable"
 STATUS_DEFERRED_DEP = "deferred:blocked-by-dependency"
+STATUS_DEFERRED_COLLECTION = "deferred:collection-error"
 STATUS_DEFERRED_UI = "deferred:needs-browser"
 STATUS_TEST_BUG = "test-bug"
 
 # The statuses that mean "not verified, but not this batch's fault" — parked,
 # re-queued, or handed to the post-deploy browser pass.
-_DEFERRED = frozenset({STATUS_DEFERRED_DEP, STATUS_DEFERRED_UI, STATUS_TEST_BUG})
+#
+# ``deferred:collection-error`` is distinct from ``blocked-by-dependency`` on
+# purpose (Fix B): the latter means a genuine prerequisite isn't built yet, the
+# former means the acceptance SUITE ITSELF could not be collected/executed
+# (the app didn't import, the sandbox lacked the app's deps, an install step
+# failed). Both defer — the never-hard-fail safety property is preserved — but
+# conflating them hid the real signal: "acceptance ran and everything was fine"
+# vs "acceptance never actually ran". Keeping them apart makes the batch
+# summary and traceability honest and lets the re-queue path retry a suite that
+# was merely under-provisioned.
+_DEFERRED = frozenset({
+    STATUS_DEFERRED_DEP, STATUS_DEFERRED_COLLECTION,
+    STATUS_DEFERRED_UI, STATUS_TEST_BUG,
+})
+
+
+class AcceptanceCollectionError(Exception):
+    """Raised by a runner when the acceptance suite could not be
+    collected/executed at all — a whole-suite import/collection failure or a
+    failed environment provisioning step, as opposed to individual test
+    failures. ``run_acceptance`` catches it and marks every runnable AC
+    :data:`STATUS_DEFERRED_COLLECTION` (honest "not run", still deferred)
+    rather than silently fanning the batch out to ``blocked-by-dependency``.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +244,21 @@ def run_acceptance(
 
     try:
         outcomes = runner(written_paths, workspace_path)
+    except AcceptanceCollectionError as exc:
+        # The suite never ran (import/collection failure or a failed
+        # provisioning step). Record it as its own honest bucket instead of
+        # the misleading "a prerequisite isn't built yet" — the app may well
+        # be complete; the run itself is what failed.
+        logger.warning(
+            "[acceptance_run] suite did not run (collection/provisioning "
+            "error) — recording %d AC(s) as %s, not blocked-by-dependency.",
+            len(runnable), STATUS_DEFERRED_COLLECTION,
+        )
+        return AcceptanceRunResult(
+            story_keys=list(story_keys or []),
+            outcomes=[ACOutcome(s.verifies, STATUS_DEFERRED_COLLECTION,
+                                s.altitude, str(exc)[:500]) for s in runnable],
+        )
     except Exception as exc:  # noqa: BLE001 — a runner crash defers the batch, never fails it
         logger.warning("[acceptance_run] runner crashed: %s — deferring batch", exc)
         return AcceptanceRunResult(
@@ -374,7 +413,8 @@ def summarize(result: AcceptanceRunResult) -> dict[str, Any]:
 
 __all__ = [
     "STATUS_PASSED", "STATUS_ATTRIBUTABLE", "STATUS_DEFERRED_DEP",
-    "STATUS_DEFERRED_UI", "STATUS_TEST_BUG",
+    "STATUS_DEFERRED_COLLECTION", "STATUS_DEFERRED_UI", "STATUS_TEST_BUG",
+    "AcceptanceCollectionError",
     "TestOutcome", "ACOutcome", "AcceptanceRunResult", "AcceptanceRunner",
     "classify_acceptance_failure", "select_runnable", "run_acceptance", "summarize",
     "parse_pytest_outcomes", "is_collection_error",

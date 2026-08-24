@@ -151,3 +151,95 @@ class TestWriteSuite:
         (tmp_path / "readme.md").write_text("no app here")
         assert an._write_integration_suite(str(tmp_path), "tests/acceptance",
                                            [_int_scen("STORY-1.AC-1", "test_a")], {}) == []
+
+
+# ---------------------------------------------------------------------------
+# Sandbox runner — Fix B provisioning (B1) + collection-error signal (B3)
+# ---------------------------------------------------------------------------
+
+class _CaptureExecutor:
+    """Fake SandboxExecutor that records the command + network policy and
+    returns a preset pytest output."""
+
+    last: dict = {}
+    output: str = ""
+
+    def __init__(self, *, workspace_path, allow_network, sandbox_config):
+        _CaptureExecutor.last = {
+            "allow_network": allow_network,
+            "workspace": workspace_path,
+        }
+
+    async def run(self, cmd):
+        _CaptureExecutor.last["cmd"] = cmd
+
+        class _R:
+            full_output = _CaptureExecutor.output
+            raw_output = _CaptureExecutor.output
+
+        return _R()
+
+
+class TestSandboxRunnerProvisioning:
+    def _patch(self, monkeypatch, *, install_step, output):
+        _CaptureExecutor.output = output
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", _CaptureExecutor)
+        monkeypatch.setattr(
+            "harness.graph._compose_prod_smoke_install_step",
+            lambda ws: install_step,
+        )
+
+    def test_install_step_prepended_and_network_forced(self, monkeypatch):
+        # B1: the acceptance run installs the app's deps (like the compiler
+        # smoke check) and forces network on, so the ephemeral sandbox has
+        # fastapi/etc. and the conftest import doesn't collection-error.
+        self._patch(
+            monkeypatch,
+            install_step="uv pip install -r server/requirements.txt",
+            output="PASSED tests/acceptance/test_s1.py::test_add",
+        )
+        runner = an._make_sandbox_runner(
+            {"sandbox_config": {}, "allow_network": False}, "tests/acceptance")
+        outcomes = runner(["tests/acceptance/test_s1.py"], "/ws")
+
+        cmd = _CaptureExecutor.last["cmd"]
+        assert cmd.startswith("uv pip install -r server/requirements.txt && ")
+        assert "python -m pytest tests/acceptance" in cmd
+        assert _CaptureExecutor.last["allow_network"] is True
+        assert len(outcomes) == 1 and outcomes[0].passed
+
+    def test_no_manifest_falls_back_to_bare_pytest(self, monkeypatch):
+        # No Python manifest → composer returns None → bare pytest command
+        # with the build's own network policy (here False).
+        self._patch(
+            monkeypatch, install_step=None,
+            output="PASSED tests/acceptance/test_s1.py::test_add",
+        )
+        runner = an._make_sandbox_runner(
+            {"sandbox_config": {}, "allow_network": False}, "tests/acceptance")
+        runner(["tests/acceptance/test_s1.py"], "/ws")
+        cmd = _CaptureExecutor.last["cmd"]
+        assert cmd.startswith("python -m pytest tests/acceptance")
+        assert "uv pip install" not in cmd
+        assert _CaptureExecutor.last["allow_network"] is False
+
+    def test_collection_banner_raises_collection_error(self, monkeypatch):
+        # B3: a pytest collection banner → the runner raises the typed signal
+        # instead of returning [] (which used to fan out to blocked-by-dep).
+        self._patch(
+            monkeypatch, install_step="uv pip install -e .",
+            output="ERROR collecting tests/acceptance/test_s1.py\n"
+                   "ImportError: cannot import name create_app",
+        )
+        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        with pytest.raises(ar.AcceptanceCollectionError):
+            runner(["tests/acceptance/test_s1.py"], "/ws")
+
+    def test_empty_output_raises_collection_error(self, monkeypatch):
+        # B3: a run that produced no pytest summary at all (e.g. the install
+        # step failed and short-circuited before pytest) is also a "suite did
+        # not run" case, not a per-test deferral.
+        self._patch(monkeypatch, install_step="uv pip install -e .", output="")
+        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        with pytest.raises(ar.AcceptanceCollectionError):
+            runner(["tests/acceptance/test_s1.py"], "/ws")

@@ -73,11 +73,15 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
         else:
             story_keys = list(state.get("batch_patched_story_keys") or [])
         already_passed = story_state.acs_verified_with_provenance(conn, app_name, "build")
-        # Re-queue: previously dependency-blocked ACs get another attempt now.
+        # Re-queue: previously dependency-blocked ACs — and ACs whose suite
+        # merely failed to collect/provision last time (Fix B) — get another
+        # attempt now that more of the app (and its deps) may be in place.
         deferred_before = {
             d["ac_key"]: d["ac_id"]
             for d in story_state.list_acceptance_deferrals(conn, app_name)
-            if d["status"] == ar.STATUS_DEFERRED_DEP
+            if d["status"] in (
+                ar.STATUS_DEFERRED_DEP, ar.STATUS_DEFERRED_COLLECTION,
+            )
         }
     finally:
         _close(conn)
@@ -287,8 +291,34 @@ def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner
         from harness.sandbox import SandboxExecutor
 
         sandbox_cfg = dict(state.get("sandbox_config", {}) or {})
-        allow_network = bool(state.get("allow_network", False))
-        cmd = f"python -m pytest {integ_dir_rel} -rA --tb=short -p no:cacheprovider -q"
+        pytest_cmd = (
+            f"python -m pytest {integ_dir_rel} "
+            "-rA --tb=short -p no:cacheprovider -q"
+        )
+        # Fix B1 — provision the acceptance sandbox to match the environment
+        # the compiler proved importable. Each sandbox invocation is an
+        # ephemeral container, so an install activated during compile does
+        # NOT persist here: without re-installing, pytest collection-errors
+        # on the conftest's ``from fastapi.testclient import TestClient`` /
+        # ``from <app> import create_app`` even though the identical import
+        # was green seconds earlier. Reuse the prod-import smoke check's
+        # install composer (root + first-level Python manifests) and force
+        # network on for that install — matching the exact provisioning the
+        # smoke check used. Falls back to the bare pytest command if the
+        # composer is unavailable or the workspace has no Python manifest.
+        install_step: Optional[str] = None
+        try:
+            from harness.graph import _compose_prod_smoke_install_step
+            install_step = _compose_prod_smoke_install_step(workspace)
+        except Exception as exc:  # noqa: BLE001 — provisioning is best-effort
+            logger.debug("[acceptance] install-step compose skipped: %s", exc)
+        if install_step:
+            cmd = f"{install_step} && {pytest_cmd}"
+            allow_network = True  # the composed `uv pip install` needs PyPI
+        else:
+            cmd = pytest_cmd
+            allow_network = bool(state.get("allow_network", False))
+
         executor = SandboxExecutor(
             workspace_path=workspace,
             allow_network=allow_network,
@@ -300,10 +330,28 @@ def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner
             logger.warning("[acceptance] sandbox run failed: %s — deferring.", exc)
             return []
         raw = getattr(build_result, "full_output", "") or getattr(build_result, "raw_output", "")
-        if ar.is_collection_error(raw):
-            logger.info("[acceptance] collection error — deferring the batch's ACs.")
-            return []
-        return ar.parse_pytest_outcomes(raw)
+        outcomes = ar.parse_pytest_outcomes(raw)
+        # Fix B3 — distinguish "the suite could not run" from "a prerequisite
+        # isn't built yet". A pytest collection banner, OR zero parsed
+        # outcomes when there WAS a runnable suite (a failed install step
+        # short-circuits before pytest, or a whole-file import error drops
+        # every test), both mean the suite never executed. Signal that
+        # distinctly so run_acceptance records ``deferred:collection-error``
+        # (honest, still deferred) instead of silently fanning every AC out
+        # to ``blocked-by-dependency`` — which read as "not our fault" and
+        # left the batch with zero real verification.
+        if ar.is_collection_error(raw) or not outcomes:
+            tail = (raw or "").strip()[-400:]
+            logger.warning(
+                "[acceptance] suite did not run (collection/provisioning "
+                "error); the app or its test deps did not import in the "
+                "acceptance sandbox. Recording as collection-error, not "
+                "blocked-by-dependency. Tail:\n%s", tail,
+            )
+            raise ar.AcceptanceCollectionError(
+                tail or "acceptance suite produced no test outcomes"
+            )
+        return outcomes
 
     return _run
 

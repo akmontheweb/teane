@@ -382,8 +382,8 @@
         "coverage_nonregression": true
     },
     "acceptance": {
-        "enabled": false,
-        "scenario_source": "fallback",
+        "enabled": true,
+        "scenario_source": "llm",
         "seed_source": "fallback",
         "altitudes": ["integration", "e2e"],
         "max_scenarios_per_story": 24,
@@ -393,7 +393,7 @@
         "db_path_env": ""
     },
     "decomposition": {
-        "quality_review": false,
+        "quality_review": true,
         "quality_enforce": false,
         "max_stories_per_review": 60
     },

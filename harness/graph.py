@@ -184,6 +184,10 @@ class AgentState(TypedDict, total=False):
     # "acceptance" section of config/config.json. Read by acceptance_node;
     # empty/enabled=false makes the node a pass-through no-op.
     acceptance_config: dict[str, Any]
+    # ADR-0007 decomposition-quality review. Loaded from the "decomposition"
+    # section. Read by decomposition_quality_review_node; quality_review=false
+    # makes the node a pass-through no-op.
+    decomposition_config: dict[str, Any]
     # Speculative-execution branching parameters. Loaded from the
     # "speculative" section of config/config.json. Keys: num_variants
     # (default 3), temperature (default 0.3), selection_strategy
@@ -4384,6 +4388,16 @@ async def _inject_repo_index_grounding(
     except Exception as exc:  # noqa: BLE001 — grounding must never break generation
         logger.debug("[%s] repo_index grounding skipped: %s", consumer, exc)
         return False
+
+
+def _decomp_quality_target(state: "AgentState") -> str:
+    """The node the decomposition path routes to before the STORIES gate:
+    ``decomposition_quality_review_node`` when ADR-0007 review is on, else the
+    gate directly (``human_gatekeeper_node``)."""
+    cfg = (state.get("decomposition_config") or {}) if isinstance(state, dict) else {}
+    if bool(cfg.get("quality_review", False)):
+        return "decomposition_quality_review_node"
+    return "human_gatekeeper_node"
 
 
 async def patching_node(state: AgentState) -> dict[str, Any]:
@@ -25956,6 +25970,12 @@ def build_graph() -> Any:
     from harness.semantic_review import (
         semantic_coverage_review_node as _semantic_coverage_review_node,
     )
+    # ADR-0007 decomposition-quality review. Inert unless
+    # decomposition.quality_review — the node self-guards to a pass-through.
+    from harness.decomposition_review import (
+        decomposition_quality_review_node as _decomposition_quality_review_node,
+        route_after_decomposition_quality as _route_after_decomposition_quality,
+    )
     # ADR-0006 in-build acceptance verification. Inert unless
     # ``acceptance.enabled`` — the node self-guards to a pass-through no-op, and
     # the compiler-green edge only reaches it in batch mode.
@@ -25987,6 +26007,9 @@ def build_graph() -> Any:
     # Semantic coverage review (P3): adversarial check that each feature's
     # stories actually satisfy its intent. Off unless traceability.semantic_review.
     graph.add_node("semantic_coverage_review_node", _semantic_coverage_review_node)  # type: ignore[type-var]
+    # ADR-0007 decomposition-quality review: runs after reconcile/semantic-review,
+    # before the STORIES gate. Pass-through no-op unless decomposition.quality_review.
+    graph.add_node("decomposition_quality_review_node", _decomposition_quality_review_node)  # type: ignore[type-var]
     # ADR-0006 acceptance_node: runs per-batch integration ACs between a green
     # compile and code review. Pass-through no-op unless acceptance.enabled.
     graph.add_node("acceptance_node", _acceptance_node)  # type: ignore[type-var]
@@ -26287,7 +26310,9 @@ def build_graph() -> Any:
         tr_cfg = (state.get("harness_config") or {}).get("traceability", {})
         if bool(tr_cfg.get("semantic_review", False)):
             return "semantic_coverage_review_node"
-        return "human_gatekeeper_node"
+        # ADR-0007: interpose the decomposition-quality review before the gate
+        # when enabled (else straight to the STORIES gate).
+        return _decomp_quality_target(state)
 
     graph.add_conditional_edges(
         "spec_reconciler_node",
@@ -26297,6 +26322,7 @@ def build_graph() -> Any:
             "human_intervention_node": "human_intervention_node",
             "requirement_gap_fill_node": "requirement_gap_fill_node",
             "semantic_coverage_review_node": "semantic_coverage_review_node",
+            "decomposition_quality_review_node": "decomposition_quality_review_node",
             END: END,
         },
     )
@@ -26315,11 +26341,23 @@ def build_graph() -> Any:
                 "[router] enforced semantic-coverage gap; failing fast to END "
                 "with exit_code=1. See the semantic-gap report above.")
             return END
-        return "human_gatekeeper_node"
+        # ADR-0007: chain the decomposition-quality review after coverage review.
+        return _decomp_quality_target(state)
 
     graph.add_conditional_edges(
         "semantic_coverage_review_node",
         route_after_semantic_review,
+        {
+            "human_gatekeeper_node": "human_gatekeeper_node",
+            "decomposition_quality_review_node": "decomposition_quality_review_node",
+            END: END,
+        },
+    )
+    # ADR-0007: quality review -> STORIES gate, unless an enforced high-severity
+    # gap failed fast to END.
+    graph.add_conditional_edges(
+        "decomposition_quality_review_node",
+        _route_after_decomposition_quality,
         {
             "human_gatekeeper_node": "human_gatekeeper_node",
             END: END,
@@ -27286,6 +27324,7 @@ async def run_graph(
     test_generation_config: Optional[dict[str, Any]] = None,
     test_regeneration_config: Optional[dict[str, Any]] = None,
     acceptance_config: Optional[dict[str, Any]] = None,
+    decomposition_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
     compiler_config: Optional[dict[str, Any]] = None,
     change_request_mode: bool = False,
@@ -27387,6 +27426,8 @@ async def run_graph(
         initial_state["test_regeneration_config"] = test_regeneration_config
     if acceptance_config is not None:
         initial_state["acceptance_config"] = acceptance_config
+    if decomposition_config is not None:
+        initial_state["decomposition_config"] = decomposition_config
     if speculative_config is not None:
         initial_state["speculative_config"] = speculative_config
     if change_requests_config is not None:

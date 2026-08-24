@@ -734,6 +734,8 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "test_generation", "test_regeneration", "metrics", "llm_dispatch",
     # ADR-0006 build-time acceptance verification (Phase 0: generators).
     "acceptance",
+    # ADR-0007 decomposition-quality review (deterministic gate + LLM review).
+    "decomposition",
     # 2026-07-06 — parallel-agent fan-out defaults promoted from
     # harness/fanout.py constants. See GatewayConfig.fanout_max_concurrency
     # / fanout_timeout_seconds for semantics.
@@ -1009,6 +1011,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "scenario_source", "seed_source", "altitudes",
         "max_scenarios_per_story", "max_seed_rows_per_table", "integration_dir",
         "max_repair_rounds_per_batch", "db_path_env",
+    }),
+    # ADR-0007 decomposition-quality review. Off by default; advisory unless
+    # quality_enforce. Phase-2 auto-remediation keys land with that phase.
+    "decomposition": frozenset({
+        "quality_review", "quality_enforce", "max_stories_per_review",
     }),
     "traceability": frozenset({
         "enforce", "enforce_reqs", "enforce_acs",
@@ -1435,6 +1442,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "acceptance.integration_dir": (str,),
     "acceptance.max_repair_rounds_per_batch": (int,),
     "acceptance.db_path_env": (str,),
+    # ADR-0007 decomposition-quality review.
+    "decomposition.quality_review": (bool,),
+    "decomposition.quality_enforce": (bool,),
+    "decomposition.max_stories_per_review": (int,),
     # End-of-run traceability gate. See installation_doc_node.
     "traceability.enforce": (bool,),
     "traceability.enforce_reqs": (bool,),
@@ -8026,6 +8037,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             test_generation_config=config.get("test_generation", {}),
             test_regeneration_config=config.get("test_regeneration", {}),
             acceptance_config=config.get("acceptance", {}),
+            decomposition_config=config.get("decomposition", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
             change_request_mode=change_request_mode,
@@ -8898,6 +8910,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             test_generation_config=config.get("test_generation", {}),
             test_regeneration_config=config.get("test_regeneration", {}),
             acceptance_config=config.get("acceptance", {}),
+            decomposition_config=config.get("decomposition", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
             llm_dispatch_config=config.get("llm_dispatch", {}),

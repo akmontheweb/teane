@@ -392,6 +392,11 @@
         "max_repair_rounds_per_batch": 2,
         "db_path_env": ""
     },
+    "decomposition": {
+        "quality_review": false,
+        "quality_enforce": false,
+        "max_stories_per_review": 60
+    },
     "traceability": {
         "enforce": true
     },

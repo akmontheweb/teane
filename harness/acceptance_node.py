@@ -284,8 +284,30 @@ def _write_integration_suite(
 # ---------------------------------------------------------------------------
 
 
+# Shell markers echoed between the provisioning steps so a single sandbox
+# run can tell WHICH step failed: install → app-import preflight → pytest.
+# Unique tokens that never appear in pytest's own output and never parse as
+# a test-summary line.
+_INSTALL_OK_MARKER = "__ACCEPTANCE_INSTALL_OK__"
+_IMPORT_OK_MARKER = "__ACCEPTANCE_APP_IMPORT_OK__"
+
+
 def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner:
-    """Build the sandbox runner closure the engine calls to execute the suite."""
+    """Build the sandbox runner closure the engine calls to execute the suite.
+
+    The composed command runs, in one ephemeral sandbox:
+      1. (B1) install the workspace's Python deps + a marker, so the run has
+         the same environment the compiler proved importable;
+      2. (B2/B4) an import preflight that replicates the conftest's app
+         import (``from <module> import <symbol>``) + a marker, so a bad or
+         unbuilt entrypoint is pinpointed and the expensive seeded run is
+         skipped when the app can't even import;
+      3. the pytest suite itself.
+    Missing markers in the output localise the failure to the install step
+    or the app import; either raises :class:`ar.AcceptanceCollectionError`
+    with a precise message, keeping a "the suite could not run" outcome
+    honestly distinct from "a prerequisite isn't built yet".
+    """
 
     def _run(paths: list[str], workspace: str) -> list[ar.TestOutcome]:
         from harness.sandbox import SandboxExecutor
@@ -295,6 +317,7 @@ def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner
             f"python -m pytest {integ_dir_rel} "
             "-rA --tb=short -p no:cacheprovider -q"
         )
+
         # Fix B1 — provision the acceptance sandbox to match the environment
         # the compiler proved importable. Each sandbox invocation is an
         # ephemeral container, so an install activated during compile does
@@ -303,21 +326,38 @@ def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner
         # ``from <app> import create_app`` even though the identical import
         # was green seconds earlier. Reuse the prod-import smoke check's
         # install composer (root + first-level Python manifests) and force
-        # network on for that install — matching the exact provisioning the
-        # smoke check used. Falls back to the bare pytest command if the
-        # composer is unavailable or the workspace has no Python manifest.
+        # network on for that install. Falls back to the bare pytest command
+        # if the composer is unavailable or there's no Python manifest.
         install_step: Optional[str] = None
         try:
             from harness.graph import _compose_prod_smoke_install_step
             install_step = _compose_prod_smoke_install_step(workspace)
         except Exception as exc:  # noqa: BLE001 — provisioning is best-effort
             logger.debug("[acceptance] install-step compose skipped: %s", exc)
+
+        # Fix B2/B4 — import preflight. Replicate the conftest's app import
+        # EXACTLY (``from <module> import <symbol>``, from the same regex
+        # discovery the conftest was rendered from), so a probe failure ⟺ a
+        # real collection failure — no false negatives — and a wrong/unbuilt
+        # entrypoint is reported as such rather than as a generic collection
+        # error. ``&&`` short-circuits the (seeded) pytest run when the app
+        # can't import, so the expensive path is skipped on the failure case.
+        discovery = ag.discover_app_factory(workspace)
+        app_module = discovery.get("module") if discovery else None
+        app_symbol = discovery.get("symbol") if discovery else None
+
+        parts: list[str] = []
         if install_step:
-            cmd = f"{install_step} && {pytest_cmd}"
+            parts.append(install_step)
+            parts.append(f"echo {_INSTALL_OK_MARKER}")
             allow_network = True  # the composed `uv pip install` needs PyPI
         else:
-            cmd = pytest_cmd
             allow_network = bool(state.get("allow_network", False))
+        if app_module and app_symbol:
+            parts.append(f'python -c "from {app_module} import {app_symbol}"')
+            parts.append(f"echo {_IMPORT_OK_MARKER}")
+        parts.append(pytest_cmd)
+        cmd = " && ".join(parts)
 
         executor = SandboxExecutor(
             workspace_path=workspace,
@@ -330,23 +370,38 @@ def _make_sandbox_runner(state: dict, integ_dir_rel: str) -> ar.AcceptanceRunner
             logger.warning("[acceptance] sandbox run failed: %s — deferring.", exc)
             return []
         raw = getattr(build_result, "full_output", "") or getattr(build_result, "raw_output", "")
-        outcomes = ar.parse_pytest_outcomes(raw)
-        # Fix B3 — distinguish "the suite could not run" from "a prerequisite
-        # isn't built yet". A pytest collection banner, OR zero parsed
-        # outcomes when there WAS a runnable suite (a failed install step
-        # short-circuits before pytest, or a whole-file import error drops
-        # every test), both mean the suite never executed. Signal that
-        # distinctly so run_acceptance records ``deferred:collection-error``
-        # (honest, still deferred) instead of silently fanning every AC out
-        # to ``blocked-by-dependency`` — which read as "not our fault" and
-        # left the batch with zero real verification.
-        if ar.is_collection_error(raw) or not outcomes:
-            tail = (raw or "").strip()[-400:]
+        tail = (raw or "").strip()[-400:]
+
+        # B1 — the install step failed and short-circuited before anything ran.
+        if install_step and _INSTALL_OK_MARKER not in raw:
             logger.warning(
-                "[acceptance] suite did not run (collection/provisioning "
-                "error); the app or its test deps did not import in the "
-                "acceptance sandbox. Recording as collection-error, not "
+                "[acceptance] dependency provisioning failed in the "
+                "acceptance sandbox — recording as collection-error, not "
                 "blocked-by-dependency. Tail:\n%s", tail,
+            )
+            raise ar.AcceptanceCollectionError(
+                f"acceptance dependency install failed: {tail}"
+            )
+        # B4 — the discovered app entrypoint (or a dep it needs) did not
+        # import; the conftest would fail identically at collection.
+        if app_module and app_symbol and _IMPORT_OK_MARKER not in raw:
+            logger.warning(
+                "[acceptance] discovered app entrypoint '%s:%s' did not "
+                "import in the acceptance sandbox — recording as "
+                "collection-error. Tail:\n%s", app_module, app_symbol, tail,
+            )
+            raise ar.AcceptanceCollectionError(
+                f"discovered app entrypoint '{app_module}:{app_symbol}' did "
+                f"not import in the acceptance sandbox: {tail}"
+            )
+        # B3 — the app imported cleanly but the suite still didn't run (a
+        # test-file or conftest-only import problem, or a collection banner).
+        outcomes = ar.parse_pytest_outcomes(raw)
+        if ar.is_collection_error(raw) or not outcomes:
+            logger.warning(
+                "[acceptance] suite did not run (collection error) despite a "
+                "clean app import — likely a generated test-file import "
+                "issue. Recording as collection-error. Tail:\n%s", tail,
             )
             raise ar.AcceptanceCollectionError(
                 tail or "acceptance suite produced no test outcomes"

@@ -180,6 +180,20 @@ class _CaptureExecutor:
         return _R()
 
 
+_INSTALL_OK = an._INSTALL_OK_MARKER
+_IMPORT_OK = an._IMPORT_OK_MARKER
+
+
+def _factory_ws(tmp_path) -> str:
+    """A workspace whose discovery resolves to server.app.main:create_app."""
+    d = tmp_path / "server" / "app"
+    d.mkdir(parents=True)
+    (d / "main.py").write_text("def create_app():\n    return object()\n")
+    (tmp_path / "server" / "__init__.py").write_text("")
+    (d / "__init__.py").write_text("")
+    return str(tmp_path)
+
+
 class TestSandboxRunnerProvisioning:
     def _patch(self, monkeypatch, *, install_step, output):
         _CaptureExecutor.output = output
@@ -196,7 +210,7 @@ class TestSandboxRunnerProvisioning:
         self._patch(
             monkeypatch,
             install_step="uv pip install -r server/requirements.txt",
-            output="PASSED tests/acceptance/test_s1.py::test_add",
+            output=f"{_INSTALL_OK}\nPASSED tests/acceptance/test_s1.py::test_add",
         )
         runner = an._make_sandbox_runner(
             {"sandbox_config": {}, "allow_network": False}, "tests/acceptance")
@@ -204,6 +218,7 @@ class TestSandboxRunnerProvisioning:
 
         cmd = _CaptureExecutor.last["cmd"]
         assert cmd.startswith("uv pip install -r server/requirements.txt && ")
+        assert f"echo {_INSTALL_OK}" in cmd
         assert "python -m pytest tests/acceptance" in cmd
         assert _CaptureExecutor.last["allow_network"] is True
         assert len(outcomes) == 1 and outcomes[0].passed
@@ -223,23 +238,72 @@ class TestSandboxRunnerProvisioning:
         assert "uv pip install" not in cmd
         assert _CaptureExecutor.last["allow_network"] is False
 
-    def test_collection_banner_raises_collection_error(self, monkeypatch):
-        # B3: a pytest collection banner → the runner raises the typed signal
-        # instead of returning [] (which used to fan out to blocked-by-dep).
+    def test_import_preflight_probes_discovered_entrypoint(self, monkeypatch, tmp_path):
+        # B4/B2: the command includes an import preflight that replicates the
+        # conftest's app import EXACTLY, gating the (seeded) pytest run.
+        ws = _factory_ws(tmp_path)
         self._patch(
             monkeypatch, install_step="uv pip install -e .",
-            output="ERROR collecting tests/acceptance/test_s1.py\n"
-                   "ImportError: cannot import name create_app",
+            output=f"{_INSTALL_OK}\n{_IMPORT_OK}\n"
+                   "PASSED tests/acceptance/test_s1.py::test_add",
         )
+        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        outcomes = runner(["tests/acceptance/test_s1.py"], ws)
+        cmd = _CaptureExecutor.last["cmd"]
+        assert 'python -c "from server.app.main import create_app"' in cmd
+        # preflight sits before pytest so a bad import short-circuits the run.
+        assert cmd.index("from server.app.main") < cmd.index("python -m pytest")
+        assert len(outcomes) == 1 and outcomes[0].passed
+
+    def test_app_entrypoint_import_failure_raises_with_message(
+        self, monkeypatch, tmp_path,
+    ):
+        # B4: install succeeded (marker present) but the app import preflight
+        # did not (no import marker) → precise entrypoint error, not a vague
+        # blocked-by-dependency.
+        ws = _factory_ws(tmp_path)
+        self._patch(
+            monkeypatch, install_step="uv pip install -e .",
+            output=f"{_INSTALL_OK}\n"
+                   "Traceback (most recent call last):\n"
+                   "ModuleNotFoundError: No module named 'server.app.db'",
+        )
+        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        with pytest.raises(ar.AcceptanceCollectionError) as ei:
+            runner(["tests/acceptance/test_s1.py"], ws)
+        assert "server.app.main:create_app" in str(ei.value)
+
+    def test_install_failure_raises_collection_error(self, monkeypatch, tmp_path):
+        # B1: the install step failed and short-circuited before the preflight
+        # / pytest (no install marker) → a provisioning collection-error.
+        ws = _factory_ws(tmp_path)
+        self._patch(
+            monkeypatch, install_step="uv pip install -e .",
+            output="ERROR: Could not find a version that satisfies fastapi",
+        )
+        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        with pytest.raises(ar.AcceptanceCollectionError) as ei:
+            runner(["tests/acceptance/test_s1.py"], ws)
+        assert "install failed" in str(ei.value)
+
+    def test_collection_banner_after_clean_import_raises(self, monkeypatch):
+        # B3: install + app import both fine, but pytest still hit a collection
+        # banner (a generated test file's own import) → collection-error.
+        self._patch(
+            monkeypatch, install_step="uv pip install -e .",
+            output=f"{_INSTALL_OK}\nERROR collecting tests/acceptance/test_s1.py\n"
+                   "ImportError: cannot import name helper",
+        )
+        # workspace "/ws" → no discovery → import preflight skipped.
         runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
         with pytest.raises(ar.AcceptanceCollectionError):
             runner(["tests/acceptance/test_s1.py"], "/ws")
 
     def test_empty_output_raises_collection_error(self, monkeypatch):
-        # B3: a run that produced no pytest summary at all (e.g. the install
-        # step failed and short-circuited before pytest) is also a "suite did
-        # not run" case, not a per-test deferral.
-        self._patch(monkeypatch, install_step="uv pip install -e .", output="")
-        runner = an._make_sandbox_runner({"sandbox_config": {}}, "tests/acceptance")
+        # B3: a run that produced no pytest summary at all is a "suite did not
+        # run" case, not a per-test deferral.
+        self._patch(monkeypatch, install_step=None, output="")
+        runner = an._make_sandbox_runner(
+            {"sandbox_config": {}, "allow_network": False}, "tests/acceptance")
         with pytest.raises(ar.AcceptanceCollectionError):
             runner(["tests/acceptance/test_s1.py"], "/ws")

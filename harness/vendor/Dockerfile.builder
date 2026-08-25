@@ -5,9 +5,14 @@
 # container at runtime (the latter is impossible under --user $UID:$GID
 # mode, which is the default).
 #
-# Covers: Python 3.12 (uv-managed CPython) + pip + venv + uv, Java JDK 21
-# + Maven + Gradle, Node 20 LTS + npm + yarn + pnpm + tsc, SQLite,
-# Playwright + Chromium. Plus make, gcc, git, curl as the universal glue.
+# Covers: Python 3.12 (uv-managed CPython) + pip + venv + uv, Node 20 LTS
+# + npm + yarn + pnpm + tsc, SQLite, Playwright + Chromium. Plus make,
+# gcc, git, curl as the universal glue.
+#
+# Deliberately NO Java toolchain (no JDK / Maven / Gradle): the supported
+# stacks are Python back ends and React/TypeScript front ends only. That
+# also lets the base image drop from eclipse-temurin:21-jdk-jammy to a
+# plain ubuntu:22.04 — same jammy userland, minus the JDK layers.
 #
 # Python comes from `uv python install`, NOT Ubuntu's apt: jammy's
 # python3.11 package is frozen at 3.11.0rc1 — an unreleased RELEASE
@@ -56,7 +61,7 @@
 #     -t ghcr.io/<owner>/harness-builder:stable \
 #     --push -f harness/vendor/Dockerfile.builder harness/vendor/
 
-FROM eclipse-temurin:21-jdk-jammy
+FROM ubuntu:22.04
 
 # uv as a static binary (no Python needed to bootstrap it).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
@@ -77,7 +82,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list \
  && apt-get update && apt-get install -y --no-install-recommends \
-      maven gradle \
       nodejs \
       sqlite3 libsqlite3-dev \
       make gcc git \
@@ -108,8 +112,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && python3 --version && python3 -m pip --version && python3 -m pytest --version
 
 ENV PIP_ROOT_USER_ACTION=ignore \
-    JAVA_HOME=/opt/java/openjdk \
-    PATH=/opt/java/openjdk/bin:$PATH \
     PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
     PIP_CACHE_DIR=/cache/pip \
     UV_CACHE_DIR=/cache/uv \
@@ -119,7 +121,7 @@ WORKDIR /workspace
 
 # Non-root runtime user. Every build/test/repair command — including
 # LLM-authored Makefile recipes — runs as `app`, not root. The baked
-# toolchains (JDK/Node/uv/pytest) stay root-owned and world-readable, and
+# toolchains (Node/uv/pytest) stay root-owned and world-readable, and
 # the uv-managed interpreter's tree + /cache/* were made world-writable
 # above, so `uv pip install --system` still works from a non-root UID.
 # On non-root Linux hosts the sandbox additionally passes

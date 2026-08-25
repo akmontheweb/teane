@@ -117,9 +117,11 @@ def _apply_teane_diagnostics_env(
 
 # The harness's kitchen-sink builder image. One image with every toolchain
 # the supported stacks need (Python 3.12 uv-managed + pip + venv + uv + pytest +
-# pytest-cov + pytest-xdist, Java JDK 21 + Maven + Gradle, Node 20 LTS +
-# npm + yarn + pnpm + tsc + jest + ts-jest, SQLite, Playwright +
-# Chromium, plus make/gcc/git/curl). Built from
+# pytest-cov + pytest-xdist, Node 20 LTS + npm + yarn + pnpm + tsc + jest
+# + ts-jest, SQLite, Playwright + Chromium, plus make/gcc/git/curl).
+# No Java toolchain: the supported stacks are Python back ends and
+# React/TypeScript front ends only, so the image is based on plain
+# ubuntu:22.04 rather than a JDK base. Built from
 # ``harness/vendor/Dockerfile.builder``. Pinning here means the sandbox
 # never needs to swap images or apt-get inside the container at runtime —
 # the latter is impossible under ``--user $UID:$GID`` mode anyway.
@@ -138,7 +140,7 @@ def _apply_teane_diagnostics_env(
 # and only required for multi-host fleets.
 BUILDER_IMAGE = (
     "harness-builder"
-    "@sha256:b9911f9f0a2a52a5c8b016b2dea8cd5ae4dbb50d7e4cd316606e2d0b5f46ad10"
+    "@sha256:2a33e7a71a2ec57f3f3bc51a99bce16fac6b79f0d8d3e95c878a7020c3c6af60"
 )
 
 

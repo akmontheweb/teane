@@ -115,12 +115,27 @@ class TestExpansion:
 
 
 class TestShippedConfig:
-    def test_repo_config_loads_with_no_env_and_no_leftovers(self, monkeypatch):
-        # With NO TEANE_/HARNESS_ overrides exported, the shipped
-        # config's :-defaults must fully resolve.
+    def test_repo_config_requires_fs_root_with_no_env(self, monkeypatch):
+        # TEANE_MCP_FS_ROOT carries no ':-default' on purpose: filesystem
+        # MCP bypasses the build sandbox, so an unset var must fail loudly
+        # instead of silently resolving to a broad root (it used to default
+        # to '~' — the operator's whole home dir).
         for var in list(os.environ):
             if var.startswith(("TEANE_", "HARNESS_")):
                 monkeypatch.delenv(var)
+        with pytest.raises(ConfigError) as exc:
+            load_raw_config()
+        msg = str(exc.value)
+        assert "TEANE_MCP_FS_ROOT" in msg
+        assert "mcp.servers" in msg
+
+    def test_repo_config_loads_with_no_leftovers(self, monkeypatch):
+        # With only the required override exported, every remaining
+        # placeholder in the shipped config must resolve from its default.
+        for var in list(os.environ):
+            if var.startswith(("TEANE_", "HARNESS_")):
+                monkeypatch.delenv(var)
+        monkeypatch.setenv("TEANE_MCP_FS_ROOT", "/srv/work")
         cfg = load_raw_config()
 
         def _assert_no_placeholders(node):
@@ -173,12 +188,22 @@ class TestDoctorEnvPlaceholders:
     def test_empty_env_var_reported_as_unset(self, monkeypatch):
         # Mirrors the expander's shell ':-' semantics: empty counts as
         # unset, so the default-used row must fire, not "set in
-        # environment".
-        monkeypatch.setenv("TEANE_MCP_FS_ROOT", "")
+        # environment". Uses TEANE_VOLUME_ROOT because it still carries a
+        # ':-default' in the shipped config.
+        monkeypatch.setenv("TEANE_VOLUME_ROOT", "")
         rows = dict(_doctor_check_env_placeholders())
-        detail = rows["env override: TEANE_MCP_FS_ROOT"][1]
+        detail = rows["env override: TEANE_VOLUME_ROOT"][1]
         assert "default used" in detail
         assert "empty" in detail
+
+    def test_defaultless_var_reported_as_failing(self, monkeypatch):
+        # The other half: a placeholder with no ':-default' must surface as
+        # a doctor failure naming the var, not a silent pass.
+        monkeypatch.delenv("TEANE_MCP_FS_ROOT", raising=False)
+        rows = dict(_doctor_check_env_placeholders())
+        status, detail = rows["env override: TEANE_MCP_FS_ROOT"]
+        assert status == "fail"
+        assert "export TEANE_MCP_FS_ROOT" in detail
 
 
 class TestPreflightEnvReport:

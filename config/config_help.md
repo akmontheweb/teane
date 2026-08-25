@@ -190,7 +190,7 @@ Model Context Protocol client pool. When enabled=true, each entry in 'servers' s
 
 ### `mcp.servers[1].command`
 
-The last arg is the host directory the LLM can read/write via mcp__fs__* tools. Machine-local override: export TEANE_MCP_FS_ROOT (like the API-key env vars); the default after :- applies when unset. Default '~' grants access to the operator's home dir; the harness expands ${TEANE_*}/${HARNESS_*} placeholders and a leading ~ at load time. Narrow this to a specific workspace root (e.g. '~/projects/foo') to reduce the filesystem-MCP blast radius. NEVER leave as '/' or a system-wide root.
+The last arg is the host directory the LLM can read/write via mcp__fs__* tools. This value is REQUIRED from the environment: export TEANE_MCP_FS_ROOT (like the API-key env vars). The placeholder carries no ':-default' on purpose — filesystem MCP bypasses the build sandbox and grants the LLM raw host I/O, so an unset var must fail loudly rather than silently resolve to a broad fallback (it previously defaulted to '~', handing over the operator's entire home dir). load_raw_config raises ConfigError naming the var and its config location when it is unset or empty; `teane doctor` reports the same as a failing 'env override' row. Point it at a specific workspace root (e.g. '~/projects/foo') to keep the filesystem-MCP blast radius tight. NEVER set it to '/' or a system-wide root. The harness expands ${TEANE_*}/${HARNESS_*} placeholders and a leading ~ at load time.
 
 ## `lsp`
 

@@ -531,7 +531,7 @@
                     "npx",
                     "-y",
                     "@modelcontextprotocol/server-filesystem",
-                    "${TEANE_MCP_FS_ROOT:-~}"
+                    "${TEANE_MCP_FS_ROOT}"
                 ]
             }
         ]

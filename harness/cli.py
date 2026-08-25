@@ -2745,6 +2745,23 @@ _HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
 # that the per-trigger cap already bounds.
 _HITL_AUTO_RESUME_CAP = _HITL_AUTO_RESUME_CAP_PER_TRIGGER * 3
 
+# Triggers that a headless HITL must terminate on IMMEDIATELY rather than
+# auto-resume. A decomposition failure produced zero stories; the repair
+# HITL menu (resume-compiler / inject-hint / edit-files) has no action that
+# fixes it, and ``route_after_hitl`` sends a decomposition trigger's
+# "resume" straight back to ``decomposition_node`` — which re-runs the same
+# planning LLM against the same spec and re-fails identically. Auto-resuming
+# it therefore just burns the whole auto-resume cap (N full planning
+# dispatches, real money) before the cap-hit path finally terminates. These
+# triggers are only resolvable by an operator editing the spec and
+# re-running, so headless we terminate on the FIRST hit — same clean-exit
+# mechanism the cap-hit path uses (bypasses the [q] confirm that returns
+# False headless), just reached with zero wasted re-runs.
+_HEADLESS_TERMINAL_TRIGGERS = frozenset({
+    "decomposition_validation_failed",
+    "decomposition_missing",
+})
+
 # The five HITL gates the resolver knows about. Tuples of
 # (gate_name, args_attr, config_key) so the resolver, the CLI plumbing,
 # and the config-tree validation stay aligned. New gates added here
@@ -4337,6 +4354,68 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         # — proceed when possible). Skips the prompt entirely.
         auto_resumed_this_round = False
         if not _hitl_gate_enabled("repair") or _gatekeeper_auto_approves():
+            # A4 — non-resumable planning failures terminate on the FIRST
+            # headless hit instead of auto-resuming N times. Re-running
+            # decomposition against the same spec re-fails identically, so
+            # the resume loop only wastes planning-LLM dispatches before the
+            # cap trips. Mirror the cap-hit clean-exit EXACTLY (set
+            # hitl_abandon so route_after_hitl → END, and
+            # hitl_auto_resume_cap_hit so a later `teane resume` stays
+            # recoverable via the resume-rewind path) but reach it with zero
+            # wasted re-runs.
+            if trigger in _HEADLESS_TERMINAL_TRIGGERS:
+                _session_id = str(state.get("session_id") or "unknown")
+                logger.warning(
+                    "[HITL] '%s' in headless mode — terminating instead of "
+                    "auto-resuming. Re-running decomposition against the same "
+                    "spec would re-fail identically; only an operator editing "
+                    "docs/SPEC_REQUIREMENTS.md and re-running can resolve it.",
+                    trigger,
+                )
+                _banner = (
+                    "\n" + "=" * 78 + "\n"
+                    "TERMINATED — decomposition could not be validated "
+                    "(headless mode)\n"
+                    + "=" * 78 + "\n"
+                    f"Session:              {_session_id}\n"
+                    f"Trigger:              {trigger}\n"
+                    "\n"
+                    "The planner produced no usable story decomposition and "
+                    "no operator is\navailable to intervene. This is not "
+                    "auto-recoverable — re-running the\nsame planning step "
+                    "yields the same failure.\n"
+                    "\n"
+                    "Recovery options:\n"
+                    "  1. Fix docs/SPEC_REQUIREMENTS.md (ensure requirements "
+                    "are declared as\n     headings/labels the parser "
+                    "recognises), then rerun `teane build`.\n"
+                    "  2. Rerun with a TTY (no CI/HARNESS_AUTO_APPROVE, "
+                    "interactive stdin) so\n     the HITL menu can prompt.\n"
+                    + "=" * 78 + "\n"
+                )
+                try:
+                    print(_banner, file=sys.stderr, flush=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                node_state["hitl_abandon"] = True
+                node_state["hitl_auto_resume_cap_hit"] = True
+                node_state["hitl_terminated_reason"] = trigger
+                node_state["hitl_active"] = False
+                node_state["hitl_awaiting_input"] = False
+                state["node_state"] = node_state
+                try:
+                    from harness.observability import log_failure as _lf
+                    _lf(
+                        "hitl_gate_blocked",
+                        trigger=trigger,
+                        session_id=state.get("session_id", ""),
+                        loop_counter=loop_counter.get("total_repairs", 0),
+                        modified_files=len(modified_files),
+                        reason="headless_non_resumable_trigger",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return state
             # 2026-07-04 fix — budget_exhausted trigger MUST NOT auto-
             # resume. The auto-resume path resets HITL trip counters
             # but leaves ``budget_remaining_usd`` at 0, so the next

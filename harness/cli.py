@@ -10251,7 +10251,13 @@ def _doctor_check_external_tools(
                 "install Docker Engine: https://docs.docker.com/engine/install/",
             )
 
-    deployment_enabled = bool(config.get("deployment", {}).get("enabled", False))
+    # Default True to match the deploy node itself, which reads
+    # `deploy_cfg.get("enabled", True)` (deploy.py). Defaulting False here
+    # meant a config with no explicit `deployment` section — the shipped
+    # shape, which carries `deployment_defaults` instead — made doctor skip
+    # the compose and buildx rows while `teane deploy` would really run.
+    # Doctor then reported green on a host that deploy fails on.
+    deployment_enabled = bool(config.get("deployment", {}).get("enabled", True))
     compose_present = shutil.which("docker-compose") is not None or (
         docker_present and _has_docker_compose_subcommand()
     )

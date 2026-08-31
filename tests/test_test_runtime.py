@@ -201,7 +201,16 @@ def test_pipeline_infra_no_scenarios(tmp_path: Path) -> None:
     assert result.reason == "no_scenarios"
 
 
-def test_pipeline_infra_chromium_failed(tmp_path: Path) -> None:
+def test_pipeline_infra_chromium_failed(monkeypatch, tmp_path: Path) -> None:
+    # Point HOME at an empty dir (and clear the Windows equivalent) so the
+    # host's real playwright cache can't satisfy `_chromium_cache_present()`.
+    # Without this, `ensure_chromium_installed` short-circuits before ever
+    # calling the injected failing runner, the pipeline legitimately returns
+    # EXIT_OK, and the test fails on any machine that has run Playwright.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
     workspace = _make_workspace(tmp_path)
     overrides = PipelineOverrides(
         base_url="http://app",

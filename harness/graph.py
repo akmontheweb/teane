@@ -7449,8 +7449,8 @@ def _parse_openapi_between_sentinels(raw: str) -> Optional[dict[str, Any]]:
     """
     lines = (raw or "").splitlines()
     try:
-        b = next(i for i, l in enumerate(lines) if "OPENAPI_SCHEMA_BEGIN" in l)
-        e = next(i for i, l in enumerate(lines) if "OPENAPI_SCHEMA_END" in l)
+        b = next(i for i, ln in enumerate(lines) if "OPENAPI_SCHEMA_BEGIN" in ln)
+        e = next(i for i, ln in enumerate(lines) if "OPENAPI_SCHEMA_END" in ln)
     except StopIteration:
         return None
     for line in lines[b + 1:e]:
@@ -18037,7 +18037,6 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # already folded chunked output into ``response.content``, so
         # the cycle scans that directly.
         from harness.patcher import (
-            parse_patch_blocks,
             parse_read_blocks as _parse_read_blocks,
             strip_read_blocks as _strip_read_blocks,
         )
@@ -26274,7 +26273,6 @@ def build_graph() -> Any:
         no-human behavior. The end-of-run traceability gate remains the backstop
         for gaps introduced after this point.
         """
-        from langgraph.graph import END
         ns = state.get("node_state", {}) or {}
         if ns.get("reconcile_failed"):
             logger.warning(

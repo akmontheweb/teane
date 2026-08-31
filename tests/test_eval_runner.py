@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 
-import pytest
 
 import evals.run_eval as re_mod
 from evals.run_eval import _run_harness

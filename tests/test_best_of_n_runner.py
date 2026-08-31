@@ -155,8 +155,6 @@ class TestOrchestrationOnRealRepo:
         # smallest-diff selection.
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co"}
-        captured: dict[int, tuple[int, int]] = {}
-
         async def variant_runner(vid, wt, cfg):
             with open(os.path.join(wt, "app.py"), "w") as f:
                 f.write("x = 1\nextra = True\n")

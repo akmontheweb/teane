@@ -7,7 +7,6 @@ these tests pin the conservative boundaries as hard as the positive cases.
 """
 
 from harness.test_contradiction import (
-    Contradiction,
     find_contradictions,
     find_contradictions_across,
     machine_unsatisfiable_reason,
@@ -263,14 +262,9 @@ class TestClassifierGate:
         assert machine_unsatisfiable_reason(src, filename="t.py") is None
 
     def test_functional_raises_form(self):
-        # pytest.raises(Exc, callable, *args) functional form.
-        src = (
-            "def test_ok():\n"
-            "    obj = Foo(x=1)\n"
-            "def test_bad():\n"
-            "    pytest.raises(E, Foo, x=1)\n"  # note: kwargs form differs; positional below
-        )
-        # Positional-arg functional form is the detectable shape:
+        # pytest.raises(Exc, callable, *args) functional form. The kwargs
+        # shape -- pytest.raises(E, Foo, x=1) -- is deliberately NOT
+        # asserted here: only the positional-arg form below is detectable.
         src2 = (
             "def test_ok():\n"
             "    obj = Foo(1)\n"

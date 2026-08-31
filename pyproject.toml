@@ -101,6 +101,16 @@ harness = [
 line-length = 120
 target-version = "py311"
 
+[tool.ruff.lint]
+# Pin the rule set explicitly. Ruff's implicit default set widened in
+# 0.16, which silently expanded this gate from 14 findings to 2543 and
+# broke both the pre-commit hook and the CI `quality` job without a
+# single line of source changing. These four families are the documented
+# intent: unused imports, undefined names, and style errors that change
+# behaviour. Widening is a deliberate opt-in, not a side effect of an
+# upgrade — add a family here and clear its backlog in the same commit.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 # Collect tests only from the tests/ directory so source modules whose
 # filenames happen to start with `test_` (e.g. harness/test_generation.py,

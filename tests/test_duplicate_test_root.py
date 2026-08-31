@@ -14,7 +14,6 @@ import os
 
 from harness.patcher import (
     _canonical_test_suffix,
-    _extract_test_scoped_suffix,
     _detect_duplicate_test_root,
 )
 

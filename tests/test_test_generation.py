@@ -1132,7 +1132,7 @@ class TestTestsMarkerGate:
         )
         stub_sandbox(0, "1 passed in 0.01s")
 
-        result = await run_test_generation({
+        await run_test_generation({
             "workspace_path": str(tmp_path),
             "modified_files": ["calculator.py"],
             "messages": [],

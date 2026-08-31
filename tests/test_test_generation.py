@@ -929,8 +929,14 @@ class TestGraphWiring:
         # confirm the wiring via the graph's compiled structure.
         from harness.graph import build_graph
         try:
-            g = build_graph(checkpointer=None)
-        except Exception as exc:
+            # build_graph() takes no arguments. This previously passed a
+            # `checkpointer=None` kwarg that the signature never had, so the
+            # call raised TypeError and the blanket `except Exception` below
+            # swallowed it as "missing deps" — the wiring assertion had not
+            # run in any environment. Only a genuine import failure warrants
+            # a skip; anything else is a real break and must fail loudly.
+            g = build_graph()
+        except ImportError as exc:
             pytest.skip(f"build_graph requires extra deps in this env: {exc}")
         # LangGraph compiled graph exposes node names via .nodes
         node_names = set(g.nodes.keys()) if hasattr(g, "nodes") else set()

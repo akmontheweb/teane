@@ -277,9 +277,9 @@
         "ttl_days": 30
     },
     "logging": {
-        "level": "INFO",
+        "level": "DEBUG",
         "log_dir": "~/.harness/logs",
-        "console_level": "WARNING",
+        "console_level": "DEBUG",
         "json_stderr": false,
         "langsmith": false
     },

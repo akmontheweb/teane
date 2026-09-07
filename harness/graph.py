@@ -3295,6 +3295,7 @@ async def _continue_on_length(
     enabled: bool,
     role_label: str,
     max_cycles: int = _MAX_CONTINUATION_CYCLES,
+    json_output: bool = False,
 ) -> tuple[Any, float, list[str]]:
     """Run the finish_reason==length continuation loop for a node.
 
@@ -3330,6 +3331,12 @@ async def _continue_on_length(
     role_label:
         Used for the per-cycle info log line and the "still truncated"
         warning.
+    json_output:
+        True when the caller parses the combined result as a single JSON
+        document. Continuation is then refused outright, whatever
+        ``enabled`` says — see the shape gate below for why. Set this at the
+        call site; it is a property of how the output is consumed, which the
+        role-keyed config flag cannot express.
 
     Returns
     -------
@@ -3340,6 +3347,44 @@ async def _continue_on_length(
     """
     accumulated_chunks: list[str] = [initial_response.content or ""]
     if not enabled:
+        return initial_response, initial_budget, accumulated_chunks
+    # Shape gate. ``continue_on_length`` is keyed by ROLE NAME, which cannot
+    # express the thing that actually determines whether continuation is
+    # safe: whether the caller parses the result as one structured document.
+    # Continuing a JSON object means reassembling it from chunks the model
+    # emitted across separate turns, and the model is free to restart the
+    # object, re-open a code fence, or interject prose at any boundary — none
+    # of which survive concatenation. A TRUNCATED critique degrades
+    # gracefully (the caller's parse fallback re-prompts once); a CORRUPTED
+    # one does not, and costs a repair pass on top of the cycles.
+    #
+    # lumina 01a079dc: ``continue_on_length.doc_reviewer`` was true in
+    # config.json, overriding this module's own False default and its
+    # "JSON critique continuation is RISKY" comment. Five cycles fired, each
+    # hitting the 32,768 cap, input growing 22k → 186k because every cycle
+    # resends the whole transcript — 624,585 in / 196,608 out, 24.3 min — and
+    # the reassembled text still failed to parse. 30.1 min and 43% of the
+    # session's spend on one critique that produced nothing.
+    if json_output:
+        logger.warning(
+            "[%s] finish_reason=length but this call site parses its output "
+            "as JSON — refusing continuation. Reassembling a JSON document "
+            "from continuation chunks is not reliable, and a truncated "
+            "critique is recoverable where a corrupted one is not. Bound the "
+            "REQUEST instead (fewer/shorter items) so the response fits the "
+            "output cap. Set by call site, not by "
+            "llm_dispatch.continue_on_length.",
+            role_label,
+        )
+        try:
+            from harness.observability import emit_event as _emit_json_cont
+            _emit_json_cont(
+                "continuation_refused_json_output",
+                role=role_label,
+                finish_reason=getattr(initial_response, "finish_reason", ""),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return initial_response, initial_budget, accumulated_chunks
     # Skip continuation when the model returned tool_calls — tool-use
     # mode already multi-turns inside its own loop (e.g. patching's
@@ -23996,7 +24041,27 @@ drop a requirement the user would notice was missing.
 
 Each array may be empty if no issues are found in that category. \
 Follow-up questions should be precise and answerable by the human in one or two sentences. \
-Mark a question critical=true only if its answer would change the architecture or invalidate the spec."""
+Mark a question critical=true only if its answer would change the architecture or invalidate the spec.
+
+## Size limits — these are hard requirements, not suggestions
+
+Your ENTIRE response must fit in a single reply. Budget for it up front:
+
+- At most 10 items per array, except "dropped_requirements" which may carry \
+up to 15 (a silently dropped requirement is the most expensive defect here).
+- At most 6 entries in "followup_questions".
+- At most 240 characters per item. Name the specific spec statement and what \
+is wrong with it; do not restate the spec, quote long passages, or explain \
+your reasoning.
+- Rank each array most-severe first, and if a category has more issues than \
+its cap, EMIT ONLY THE MOST SEVERE ONES AND DROP THE REST. Ten precise, \
+well-ordered issues are worth more to the author than a hundred exhaustive \
+ones, and a critique that runs past the output cap is discarded entirely — \
+truncated JSON does not parse, so an over-long review delivers nothing at all.
+
+If a category genuinely overflows its cap, make the LAST item in that array \
+say so ("N further items omitted; the above are the most severe") rather \
+than continuing past the limit."""
 
 
 _SPEC_REVISE_INSTRUCTION_TEMPLATE = """The original specification draft is below, followed by an independent reviewer's critique JSON. \
@@ -24217,9 +24282,22 @@ async def review_and_revise_spec(
         enabled=_doc_continue_enabled,
         role_label="spec_review:critique",
         max_cycles=_resolve_max_continuation_cycles(llm_dispatch_config or {}),
+        # This call site json.loads() the combined text — see the shape gate
+        # in _continue_on_length. Belt and braces with the bounded critique
+        # prompt: the request should no longer reach the output cap at all.
+        json_output=True,
     )
     if len(_critique_chunks) > 1:
-        critique_response.content = "\n".join(
+        # Concatenate LOSSLESSLY. The continue prompt says "Stay inside the
+        # same JSON object", so the chunks are one continuous token stream:
+        # any separator inserted at a boundary that landed INSIDE a string
+        # literal becomes a raw control character and the document no longer
+        # parses. The previous "\n".join produced exactly lumina 01a079dc's
+        # "Invalid control character at: line 397 column 261". Whitespace
+        # between JSON tokens is insignificant, so "" is correct at every
+        # other boundary too — it is never worse and is sometimes the only
+        # thing that parses.
+        critique_response.content = "".join(
             c for c in _critique_chunks if c
         )
     result["new_budget_usd"] = new_budget

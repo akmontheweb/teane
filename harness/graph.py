@@ -11220,13 +11220,44 @@ def _build_repair_reflection_prompt(
             return f
         return "<no location>"
 
+    # Fix H — render each top diagnostic's ``semantic_context`` alongside its
+    # file:line. This is the SAME enrichment the repair prompt already gets
+    # (see the "Context (first occurrence)" block in
+    # ``_format_compiler_errors_for_repair``): the parser-extracted workspace
+    # call chain, the pytest assertion-rewrite lines that name the resolved
+    # values, the failure-frame locals, and the harness's runtime-object
+    # detail. Withholding it from the judge while handing it to repair was
+    # the core asymmetry behind lumina session 01a079dc: repair saw
+    # ``+ where 2 = len([<LogRecord: audit ...>, <LogRecord: httpx ...>])``
+    # and could name the contaminating logger, while the judge saw only
+    # ``[AssertionError] test_middleware.py:118 :: assert 2 == 1`` and had no
+    # choice but to return the "insufficient data" sentinel — five rounds
+    # running, which is exactly what tripped the HITL cap. The judge is the
+    # component whose verdict gates the loop; starving it starves the loop.
+    _CTX_PER_DIAG = 1200
+    _CTX_TOTAL = 3000
     if top_persisted_diagnostics:
         lines: list[str] = []
+        _ctx_budget = _CTX_TOTAL
         for d in top_persisted_diagnostics[:3]:
             code = str(d.get("error_code", "?"))
             msg = str(d.get("message", ""))
             loc = _fmt_loc(d)
             lines.append(f"  - [{code}] {loc} :: {msg[:180]}")
+            ctx = str(d.get("semantic_context", "") or "").strip()
+            if not ctx or _ctx_budget <= 0:
+                continue
+            allowance = min(_CTX_PER_DIAG, _ctx_budget)
+            truncated = len(ctx) > allowance
+            shown = ctx[:allowance]
+            _ctx_budget -= len(shown)
+            indented = "\n".join(
+                f"      {ln}" for ln in shown.splitlines()
+            )
+            lines.append("    context:")
+            lines.append(indented)
+            if truncated:
+                lines.append("      … (context truncated)")
         top_block = "\n".join(lines)
     else:
         top_block = "  (no persistent errors)"
@@ -11242,23 +11273,46 @@ def _build_repair_reflection_prompt(
     # tail unconditionally would double the judge's token cost; gating on a
     # bare top message keeps the extra cost to sessions that need it.
     def _top_message_is_bare(diags: list[dict[str, Any]]) -> bool:
+        # Fix H — scan the top 3, not just the first. The gate exists to ask
+        # "does the structured view alone let the judge localize?", and one
+        # richly-worded error at position 0 does not answer that for the two
+        # bare ones behind it. lumina 01a079dc happened to have a bare top
+        # error ("boom") so the tail was attached, but the ordering was luck:
+        # had the AssertionError sorted first, the judge would have lost the
+        # traceback entirely while still being unable to ground on the
+        # RuntimeError below it.
         if not diags:
             return False
-        top = diags[0]
-        code = str(top.get("error_code", "") or "").strip()
-        msg = str(top.get("message", "") or "").strip()
-        if not msg:
-            return True
-        if code and msg.lower() == code.lower():
-            return True
-        return len(msg) < 40
+        for top in diags[:3]:
+            code = str(top.get("error_code", "") or "").strip()
+            msg = str(top.get("message", "") or "").strip()
+            if not msg:
+                return True
+            if code and msg.lower() == code.lower():
+                return True
+            if len(msg) < 40:
+                return True
+        return False
     tail_block = ""
     if build_output_tail and _top_message_is_bare(top_persisted_diagnostics):
-        _tail_snippet = build_output_tail[-2500:]
+        # Fix H — slice the log the same way the repair prompt does instead
+        # of taking a blind last-2500-bytes cut. ``_slice_build_output_for_
+        # repair`` keeps a head window (where the root cause usually is),
+        # keeps a tail window (where the final state is), strips pip/
+        # deprecation noise, and lifts pytest's FAILURES/short-summary signal
+        # lines out of the dropped middle. The raw tail slice was actively
+        # misleading on lumina 01a079dc: the last 2.5KB began mid-traceback
+        # at "equest FAILED [ 98%]" and the ``test_main.py`` RuntimeError
+        # traceback body — the one thing the judge needed to localize the
+        # top error — fell entirely inside the discarded middle, leaving only
+        # the exception-group header. The judge said "insufficient data"
+        # because it genuinely had none.
+        _tail_snippet = _slice_build_output_for_repair(build_output_tail)
         tail_block = (
-            "\nBUILD OUTPUT TAIL (last ~2.5KB — the top persistent error's "
-            "message is a bare exception type, so the full traceback below is "
-            "your primary source of grounding for ``real_blocker``):\n"
+            "\nBUILD OUTPUT (head+tail slice, pytest signal lines lifted "
+            "from the middle — a top persistent error's message is a bare "
+            "exception type, so the traceback below is your primary source "
+            "of grounding for ``real_blocker``):\n"
             "---\n"
             f"{_tail_snippet}\n"
             "---\n\n"
@@ -11619,6 +11673,38 @@ def _build_repair_reflection_prompt(
         "even when it does not appear in the diagnostics; the grounding "
         "rule above does not apply to install-class fixes. Do NOT "
         "recommend editing the import site.\n"
+        "\nACTIONABILITY CONTRACT — what the next repair LLM can actually "
+        "do with your ``recommendation``:\n"
+        "  - The repair LLM's ENTIRE action space is emitting patch blocks "
+        "against workspace files (REPLACE_BLOCK / CREATE_FILE / "
+        "REWRITE_FILE / READ_FILE). It does not have a shell. It cannot "
+        "run a command, re-run the suite, change the pytest/build "
+        "invocation, add flags, set an environment variable, attach a "
+        "debugger, enable a log level, or inspect anything at runtime. Its "
+        "output goes straight to the patcher.\n"
+        "  - Therefore ``recommendation`` MUST name a concrete "
+        "workspace-relative file to edit and say what to change in it. A "
+        "recommendation the repair LLM cannot execute is worse than no "
+        "recommendation: it consumes the round and the same diagnostics "
+        "come back unchanged.\n"
+        "  - FORBIDDEN openings, and the shape they signal — never begin "
+        "``recommendation`` with any of these: \"Run …\", \"Re-run …\", "
+        "\"Execute …\", \"Invoke …\", \"Investigate …\", \"Inspect …\", "
+        "\"Examine …\", \"Look at …\", \"Check …\", \"Verify …\", "
+        "\"Confirm …\", \"Determine …\", \"Debug …\", \"Trace …\", "
+        "\"Reproduce …\", \"Enable logging …\", \"Add logging to …\". "
+        "Each of these asks for an OBSERVATION the repair LLM has no way "
+        "to make.\n"
+        "  - If you genuinely cannot localize a fix, say so in "
+        "``real_blocker`` via the insufficient-data sentinel and leave "
+        "``recommendation`` EMPTY. An empty recommendation is honest and "
+        "the harness handles it. A pseudo-actionable one (\"run pytest "
+        "with -vv to capture the traceback\") is not: it reads as guidance, "
+        "gets injected as authoritative direction, and cannot be followed.\n"
+        "  - Good: \"Edit server/app/middleware/audit.py:21 to await "
+        "call_next inside a try/finally so the duration is recorded on the "
+        "error path too.\" Bad: \"Run pytest with --log-cli-level=DEBUG to "
+        "identify where the RuntimeError originates.\"\n"
     )
     evidence = (
         "\n=== EVIDENCE (this round) ===\n"
@@ -13165,6 +13251,41 @@ def _patches_touched_judge_files(
     return False
 
 
+# Fix I — openings that mark a reflection ``recommendation`` as something
+# the repair LLM structurally cannot do. The repair role's whole action
+# space is emitting patch blocks; it has no shell, cannot re-run the suite,
+# cannot change the build/test invocation, and cannot observe anything at
+# runtime. A recommendation phrased as an investigation step therefore
+# cannot be followed, but it is injected downstream as authoritative
+# direction all the same — so the round is spent and the diagnostics come
+# back identical. lumina session 01a079dc returned "Run pytest with -vv and
+# --log-cli-level=DEBUG to capture the full exception traceback" for five
+# consecutive rounds and tripped the low-signal HITL cap on it.
+_UNACTIONABLE_RECOMMENDATION_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:first\s+|next\s+|then\s+)?"
+    r"(?:re-?run|run|execute|invoke|launch|"
+    r"investigate|inspect|examine|review|study|analy[sz]e|"
+    r"look\s+at|look\s+into|check|verify|confirm|determine|identify|"
+    r"debug|trace|diagnose|reproduce|observe|capture|measure|profile|"
+    r"print|log|enable\s+logging|add\s+logging|add\s+a?\s*breakpoint)\b",
+    re.IGNORECASE,
+)
+
+
+def _recommendation_is_unactionable(recommendation: str) -> bool:
+    """True when ``recommendation`` asks the repair LLM for an observation
+    rather than an edit.
+
+    Matched on the OPENING verb only, deliberately. The imperative that
+    starts the sentence is what the repair LLM acts on, and a mid-sentence
+    "check" is usually a qualifier on a real edit ("Edit foo.py:20 to check
+    for None before indexing") — matching those would reject good guidance.
+    An edit-shaped recommendation that merely mentions running tests
+    afterwards stays actionable.
+    """
+    return bool(_UNACTIONABLE_RECOMMENDATION_RE.match(recommendation or ""))
+
+
 def _parse_repair_reflection_verdict(
     raw: str,
 ) -> Optional[dict[str, str]]:
@@ -13239,6 +13360,34 @@ def _parse_repair_reflection_verdict(
             impl_file = ""
     else:
         impl_file = ""
+    # Fix I — drop a recommendation the repair LLM cannot act on. The
+    # prompt forbids these shapes; this is the enforcement, because a judge
+    # that ignores the instruction still gets its text injected as a
+    # "REQUIRED ACTION" system message and still burns the round. Blanking
+    # it degrades the verdict to "verdict + real_blocker", which every
+    # downstream consumer already handles (recommendation is optional and
+    # frequently empty on PROGRESS). We do NOT reject the whole verdict:
+    # the verdict/real_blocker halves may still be sound and are what the
+    # low-signal and fixation detectors read.
+    if recommendation and _recommendation_is_unactionable(recommendation):
+        logger.warning(
+            "[judgment:repair_reflection] Dropping unactionable "
+            "recommendation (%r) — it asks the repair LLM to run or "
+            "investigate something, and the repair role can only emit "
+            "patch blocks. Verdict and real_blocker are kept.",
+            recommendation[:200],
+        )
+        try:
+            from harness.observability import emit_event as _emit_unact
+            _emit_unact(
+                "reflection_recommendation_unactionable",
+                verdict=verdict,
+                recommendation=recommendation[:300],
+                real_blocker=real_blocker[:300],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        recommendation = ""
     result = {
         "verdict": verdict,
         "real_blocker": real_blocker,

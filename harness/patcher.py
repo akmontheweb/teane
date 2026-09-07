@@ -1584,6 +1584,54 @@ class TextPatcher(BasePatcher):
                 ),
             )
 
+        # Identity-patch guard: the LLM emitted a REPLACE_BLOCK whose
+        # ``replace`` is byte-identical to its ``search``. Every match tier
+        # below (exact, whitespace-, quote-, indent-tolerant) would find the
+        # region, write back the same bytes, and report success with
+        # ``lines_changed=0`` — so the round's rollup read "Applied 3/3
+        # patches" for a round that changed nothing, and the repair loop's
+        # ``consecutive_zero`` progress detector never fired. lumina session
+        # 01a079dc shipped four of these across rounds 5-8 (main.py twice,
+        # audit.py twice, dates.py, server/requirements.txt) while the
+        # failing-test count sat at 3, and the run escalated to HITL on the
+        # low-signal cap instead of on "you are emitting no-ops".
+        #
+        # Mirrors the REWRITE_FILE no-op contract above: report as an
+        # actionable FAILURE (not a silent success) so the block lands in
+        # the patch-failure surface the LLM reads next round, and set
+        # ``no_op=True`` so the loop's progress accounting can tell an
+        # identity patch apart from a genuine search miss.
+        if search and _is_identity_replacement(search, replace):
+            logger.info(
+                "[patcher:text] REPLACE_BLOCK identity no-op signaled as "
+                "failure: %s search and replace are identical. LLM will see "
+                "the 'your patch changed nothing' hint next round.",
+                filepath,
+            )
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.REPLACE_BLOCK,
+                error=(
+                    f"REPLACE_BLOCK no-op: on `{filepath}` your `search` and "
+                    "`replace` blocks are identical, so this patch changes "
+                    "nothing. Emitting it burned the round. This usually "
+                    "means one of two things:\n"
+                    "  1) This file is already correct — the bug is "
+                    "somewhere ELSE (a caller, an import site, a test "
+                    "expectation, a config/manifest). Re-read the judge's "
+                    "real_blocker and pick a different target.\n"
+                    "  2) You intended an edit but copied the original text "
+                    "into `replace` by mistake. Re-emit with the CHANGED "
+                    "text in `replace`.\n"
+                    "Do NOT re-emit this block unchanged — it will be "
+                    "rejected as a no-op again. Either change the target "
+                    "file, change the `replace` content, or READ_FILE first."
+                ),
+                lines_changed=0,
+                no_op=True,
+            )
+
         try:
             original = await _aread(full_path)
         except OSError as exc:
@@ -3225,6 +3273,34 @@ def _strip_line_number_prefixes(search: str) -> Optional[str]:
         for line in lines
     ]
     return "".join(stripped)
+
+
+def _is_identity_replacement(search: str, replace: str) -> bool:
+    """True when a REPLACE_BLOCK's ``replace`` cannot change the file.
+
+    Deliberately narrow. Only two shapes count as identity:
+
+      1. Byte-for-byte equality.
+      2. Equality after normalizing line endings (CRLF/CR -> LF) and
+         dropping a trailing-newline-only difference. An LLM re-emitting a
+         block it copied out of a file view routinely drifts on exactly
+         these two and on nothing else.
+
+    Everything else — including a replacement that differs only in trailing
+    whitespace or in leading indentation — is treated as a REAL edit and
+    allowed through. Those can be deliberate (a lint fix, a Makefile recipe
+    tab, a YAML indent repair), and misclassifying one as a no-op would
+    reject a patch the LLM needs to land. The failure this guard exists to
+    catch is the LLM pasting its ``search`` verbatim into ``replace``, which
+    is always exact.
+    """
+    if search == replace:
+        return True
+
+    def _canon(text: str) -> str:
+        return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+    return _canon(search) == _canon(replace)
 
 
 def _whitespace_tolerant_match(

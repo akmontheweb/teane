@@ -304,7 +304,12 @@ def test_parse_reflection_verdict_strips_leftover_file_placeholder():
             "insufficient data — investigate <file>'s data flow into "
             "the assertion"
         ),
-        "recommendation": "Investigate the new AssertionError.",
+        # Actionable filler: the placeholder guard is what this test is
+        # about, and an edit-shaped recommendation keeps it isolated from
+        # the separate actionability guard (see
+        # test_reflection_judge_grounding.py), which would blank an
+        # "Investigate …" recommendation before we could assert on it.
+        "recommendation": "Edit src/math_utils.py:42 to return a float.",
     })
     v = _parse_repair_reflection_verdict(raw)
     assert v is not None
@@ -313,8 +318,9 @@ def test_parse_reflection_verdict_strips_leftover_file_placeholder():
     assert v["real_blocker"] == (
         "insufficient data — no diagnostic locations available"
     )
-    # Recommendation is left alone — the guard only touches real_blocker.
-    assert v["recommendation"] == "Investigate the new AssertionError."
+    # An actionable recommendation is left alone — the placeholder guard
+    # only touches real_blocker.
+    assert v["recommendation"] == "Edit src/math_utils.py:42 to return a float."
 
 
 def test_parse_reflection_verdict_strips_no_location_marker():

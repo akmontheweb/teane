@@ -101,15 +101,59 @@ _PATCH_TARGET_MISS_RE = re.compile(r"does not have the attribute")
 # ``No module named`` (a missing module/dependency), which stays a code-gap.
 _BAD_SYMBOL_IMPORT_RE = re.compile(r"cannot import name ['\"]([^'\"]+)['\"]")
 
+# --- context-based fingerprints -------------------------------------------
+# The two below read ``semantic_context`` rather than ``message``. Both of
+# the shapes they catch collapse to a message that carries no signal at all
+# ("AssertionError: assert 2 == 1", or a bare exception string) — the
+# evidence lives entirely in the parser's enrichment: the assertion-rewrite
+# expansion and the failure-frame locals. lumina session 01a079dc hit both
+# and neither matched a fingerprint, so both defaulted to CODE_GAP and the
+# repair loop spent 8 rounds patching production code that was correct.
+
+# A ``caplog.records`` assertion that counted a THIRD-PARTY library's log
+# record. pytest's caplog handler sits on the root logger and captures every
+# propagating record, so ``httpx`` (which the FastAPI/Starlette TestClient
+# drives, at INFO) lands in ``caplog.records`` alongside the app's own. A
+# test that asserts on ``len(caplog.records)`` without filtering by logger
+# name therefore counts library noise. No production change can remove
+# another library's record from an unfiltered count — the test must filter.
+_CAPLOG_RECORDS_RE = re.compile(r"caplog\.records")
+_THIRD_PARTY_LOGRECORD_RE = re.compile(
+    r"<LogRecord:[^>]*?(?:site-packages|dist-packages)", re.IGNORECASE,
+)
+
+# An exception that escaped a Starlette/FastAPI ``TestClient`` request back
+# into the test. ``TestClient`` defaults to ``raise_server_exceptions=True``,
+# under which ServerErrorMiddleware runs the app's 500 handler, sends the
+# response, and then RE-RAISES — so a test asserting "unhandled error yields
+# a 500" sees the exception instead of the response, no matter how correct
+# the app's handler is. A real server returns the 500. The test needs
+# ``TestClient(app, raise_server_exceptions=False)``.
+#
+# Safe because ``_classify_test_frame`` runs only when the innermost frame is
+# already a test file: a production-origin exception has a production
+# innermost frame and never reaches here, so this can only fire on a test
+# that raised its own exception through a test client.
+_TESTCLIENT_RE = re.compile(
+    r"(?:starlette|fastapi)\.testclient\.TestClient", re.IGNORECASE,
+)
+
 
 def _classify_test_frame(
-    error_code: str, message: str
+    error_code: str, message: str, context: str = "",
 ) -> Optional[TriageResult]:
     """High-confidence test-authoring fingerprints for a failure whose
     innermost frame is already known to be a test file. Returns None when no
-    fingerprint matches (caller then defaults to CODE_GAP)."""
+    fingerprint matches (caller then defaults to CODE_GAP).
+
+    ``context`` is the diagnostic's ``semantic_context`` — the parser's
+    enrichment (failing source line, assertion-rewrite expansion, workspace
+    call chain, failure-frame locals). Two fingerprints below key off it
+    because their shapes carry no signal in ``message`` at all.
+    """
     code = (error_code or "").strip()
     msg = message or ""
+    ctx = context or ""
 
     # NameError: name 'patch' is not defined — the test references a symbol it
     # never imported (lumina 019ff418: test_contact_service.py:83 used
@@ -158,6 +202,43 @@ def _classify_test_frame(
                 f"does not export",
             )
 
+    # --- context-based fingerprints ---------------------------------------
+    # Everything below reads the parser's enrichment. Skip when the
+    # diagnostic carries none (non-pytest parsers, or a summary-only row).
+    if not ctx:
+        return None
+
+    # An unfiltered ``caplog.records`` assertion that counted a third-party
+    # library's log record (lumina 01a079dc: two of the three failures).
+    # Requires BOTH the caplog assertion AND a site-packages LogRecord in the
+    # rewrite expansion, so a legitimate caplog assertion over the app's own
+    # records is untouched.
+    if (
+        _CAPLOG_RECORDS_RE.search(ctx)
+        and _THIRD_PARTY_LOGRECORD_RE.search(ctx)
+    ):
+        return TriageResult(
+            FailureClass.TEST_BUG, "test-caplog-third-party-records", "high",
+            "test asserts on unfiltered caplog.records, which captured a "
+            "third-party library's log record (pytest's caplog handler sits "
+            "on the root logger) — filter by logger name",
+        )
+
+    # An exception that came back out of a TestClient request. Only reachable
+    # when the test's own frame raised it (see the module note on
+    # ``_TESTCLIENT_RE``); an AssertionError is a behaviour assertion and
+    # stays a code-gap.
+    if code and code != "AssertionError" and _TESTCLIENT_RE.search(ctx):
+        return TriageResult(
+            FailureClass.TEST_BUG, "test-client-reraises-server-exception",
+            "high",
+            f"{code} raised by the test propagated back through a "
+            "Starlette/FastAPI TestClient — the client defaults to "
+            "raise_server_exceptions=True, so the app's 500 handler runs and "
+            "the exception is re-raised anyway; the test needs "
+            "TestClient(app, raise_server_exceptions=False)",
+        )
+
     return None
 
 
@@ -194,7 +275,9 @@ def classify_diagnostic(
             f"innermost frame in source ({file or 'unknown'}) — code-gap"
         )
 
-    hit = _classify_test_frame(error_code, message)
+    hit = _classify_test_frame(
+        error_code, message, str(_field(diag, "semantic_context") or ""),
+    )
     if hit is not None:
         return hit
 

@@ -253,6 +253,13 @@ class TestFix3ProductionPointers:
         assert "EdgarClient" in rendered
         assert "backend/services/edgar.py" in rendered
         assert "Default to patching the production code" in rendered
+        # lumina 01a079dc — the banner's only exit used to be "decide the
+        # test is right". A repair LLM that correctly concludes the test is
+        # wrong must be pointed at UNSATISFIABLE_TEST rather than left to
+        # invent a production-side change that makes a wrong test pass.
+        assert "UNSATISFIABLE_TEST" in rendered
+        assert "auto-rejected" in rendered
+        assert "regression that ships" in rendered
 
     def test_format_returns_empty_when_no_test_failures(self, tmp_path):
         errors = [{"file": "backend/services/edgar.py", "line": 5,

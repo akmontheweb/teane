@@ -6853,6 +6853,8 @@ def _should_offer_unsatisfiable_escape(
     has_mandatable_target: bool,
     distraction_streak: int,
     distraction_threshold: int = 2,
+    low_signal_streak: int = 0,
+    triage_test_bug: bool = False,
 ) -> bool:
     """Decide whether the defective-test banner should offer the
     ``UNSATISFIABLE_TEST`` escape this round.
@@ -6877,12 +6879,122 @@ def _should_offer_unsatisfiable_escape(
     Keyed on the CONSECUTIVE-distraction counter the reflection loop already
     maintains; a plain repair-round count would fire on legitimately-hard
     prod work too.
+
+    Two further triggers, both from lumina 01a079dc:
+
+      * ``low_signal_streak`` — the distraction counter is DELIBERATELY held
+        at 0 while the judge returns the "insufficient data" sentinel (see
+        the ``consecutive_low_signal_rounds`` handling in repair_node), so a
+        judge that cannot localize anything pins ``distraction_streak`` at 0
+        forever and this gate can never trip on it. That run spent five
+        rounds at ``consecutive_low_signal_rounds`` 1→5 with a guarded-test
+        blocker and the escape was never offered. A low-signal streak on a
+        protected-test blocker is the same evidence as a distraction streak:
+        the loop is not converging and the prod targets are not the fix.
+
+      * ``triage_test_bug`` — ``harness.test_triage`` matched a
+        high-confidence test-AUTHORING fingerprint on a guarded test file.
+        That is a positive identification, not an inference from a streak,
+        so it fires immediately rather than waiting for the loop to burn
+        ``distraction_threshold`` rounds proving it.
     """
     if not has_guarded_blocker:
         return False
+    if triage_test_bug:
+        return True
     if not has_mandatable_target:
         return True
-    return distraction_streak >= distraction_threshold
+    if distraction_streak >= distraction_threshold:
+        return True
+    return low_signal_streak >= distraction_threshold
+
+
+def _guarded_test_lines_from_diagnostics(
+    compiler_errors: list[dict[str, Any]],
+    workspace_path: str,
+    carveout: frozenset[str],
+    *, limit: int = 5,
+) -> list[tuple[str, int]]:
+    """``(file, line)`` pairs from the failing set whose innermost frame is a
+    tamper-guarded test file.
+
+    The judge-driven path derives the same thing from
+    ``_verdict_named_file_lines(reflection_verdict, ...)``. That coupling is
+    what made the whole protected-test subsystem dark for the entire lumina
+    01a079dc run: a low-signal verdict names no files, so the enclosing
+    ``if`` never ran, so ``_guarded_display_parts`` was empty, so neither the
+    PROTECTED TEST LOCATION banner nor the UNSATISFIABLE_TEST escape was ever
+    offered — across five rounds in which the top failing diagnostic sat in a
+    guarded test file the whole time.
+
+    Which files are guarded is a fact about the FAILING SET, not about
+    whether the judge had a good round. Reading it from the diagnostics gives
+    the subsystem a floor that survives a starved judge.
+    """
+    out: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for d in compiler_errors or []:
+        if not isinstance(d, dict):
+            continue
+        raw = str(d.get("file", "") or "")
+        if not raw:
+            continue
+        norm = _normalize_ws_path(raw, workspace_path)
+        if not _is_test_artifact(norm) or norm in carveout:
+            continue
+        try:
+            ln = int(d.get("line", 0) or 0)
+        except (TypeError, ValueError):
+            ln = 0
+        key = (norm, ln)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _triage_flags_guarded_test_bug(
+    compiler_errors: list[dict[str, Any]],
+    workspace_path: str,
+    carveout: frozenset[str],
+) -> bool:
+    """True when ``harness.test_triage`` matches a test-AUTHORING fingerprint
+    on a diagnostic located in a tamper-guarded test file.
+
+    ADR-0005's classifier previously reached only two consumers: the
+    pre-repair gate in ``test_generation_node`` (which sees only the
+    freshly-generated test run — on lumina 01a079dc that was the jest command,
+    so the python failures were never triaged at all) and pure telemetry in
+    repair_node. Its verdict never influenced the repair loop.
+
+    Wiring it here gives it a routing consequence without inventing a new
+    state transition: a positively-identified test bug in a guarded file
+    unlocks the UNSATISFIABLE_TEST escape that already exists and already
+    routes to ``test_regeneration_node``. Fail-safe — any classifier fault
+    returns False and the streak-based triggers still apply.
+    """
+    try:
+        from harness.test_triage import FailureClass, classify_diagnostic
+    except Exception:  # noqa: BLE001
+        return False
+    for d in compiler_errors or []:
+        if not isinstance(d, dict):
+            continue
+        raw = str(d.get("file", "") or "")
+        if not raw:
+            continue
+        norm = _normalize_ws_path(raw, workspace_path)
+        if not _is_test_artifact(norm) or norm in carveout:
+            continue
+        try:
+            if classify_diagnostic(d).fclass is FailureClass.TEST_BUG:
+                return True
+        except Exception:  # noqa: BLE001 — classifier must never break repair
+            continue
+    return False
 
 
 # Declared-dead-end marker for the repair loop (lumina 019f7109). Offered
@@ -17341,6 +17453,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # offer can never validate a later round's declaration.
         _offered_unsat_marker = False
         _unsat_offer_files: set[str] = set()
+        # Whether the judge-driven path below reached a decision about a
+        # guarded-test blocker this round — either offering the escape or
+        # deliberately withholding it in favour of a prod target. The
+        # protected-test floor near the end of this node must not second-
+        # guess that decision; it exists only for the rounds where the judge
+        # path never ran at all.
+        _guarded_decision_made = False
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
@@ -17704,6 +17823,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 if f not in _guarded_line_files
             ]
             if _guarded_display_parts:
+                _guarded_decision_made = True
                 _guarded_display = ", ".join(_guarded_display_parts)
                 _has_mandatable_target = bool(
                     judge_named_files or _persistent_lines
@@ -17721,6 +17841,16 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     has_guarded_blocker=True,
                     has_mandatable_target=_has_mandatable_target,
                     distraction_streak=_distraction_streak,
+                    low_signal_streak=int(
+                        loop_counter.get(
+                            "consecutive_low_signal_rounds", 0,
+                        ) or 0
+                    ),
+                    triage_test_bug=_triage_flags_guarded_test_bug(
+                        state.get("compiler_errors", []) or [],
+                        _workspace_for_banner,
+                        _guard_carveout_for_banner,
+                    ),
                 )
                 if _has_mandatable_target and _offer_unsat:
                     logger.warning(
@@ -18013,6 +18143,127 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 pass
+
+        # Protected-test floor (lumina 01a079dc). Everything above is gated
+        # on a judge verdict that is DISTRACTION/REGRESSION, carries a
+        # real_blocker, is NOT low-signal, and grounds in the failing set. A
+        # judge stuck on the "insufficient data" sentinel satisfies none of
+        # that, so the entire protected-test subsystem — the PROTECTED TEST
+        # LOCATION banner and the UNSATISFIABLE_TEST escape — stays dark
+        # exactly when the loop is least able to help itself. That run spent
+        # five rounds with the top failing diagnostic inside a guarded test
+        # file and was never once told the file was guarded, let alone
+        # offered the escape; the repair LLM inferred the prohibition from
+        # the prod-pointer banner, correctly concluded the tests were wrong,
+        # and shipped a production regression because it had nowhere to say
+        # so.
+        #
+        # This block is a floor, not a replacement: it runs only when the
+        # judge-driven path did not already make the offer, and it derives
+        # the guarded set from the diagnostics rather than from the verdict.
+        if not _offered_unsat_marker and not _guarded_decision_made:
+            _ws_floor = str(state.get("workspace_path", "") or "")
+            _errs_floor = state.get("compiler_errors", []) or []
+            _carveout_floor = _syntax_broken_test_files(_errs_floor, _ws_floor)
+            _floor_lines = _guarded_test_lines_from_diagnostics(
+                _errs_floor, _ws_floor, _carveout_floor,
+            )
+            if _floor_lines:
+                _floor_triage = _triage_flags_guarded_test_bug(
+                    _errs_floor, _ws_floor, _carveout_floor,
+                )
+                _floor_offer = _should_offer_unsatisfiable_escape(
+                    has_guarded_blocker=True,
+                    # Deliberately True. With the judge path dark we have no
+                    # verdict to tell us whether a prod target exists, and
+                    # assuming none would make the escape fire on the FIRST
+                    # round of any all-test failing set — which is the common
+                    # shape of an ordinary code gap, since a plain
+                    # ``assert x == y`` failure has a test innermost frame
+                    # even when production is entirely at fault (the
+                    # ADR-0005 docstring's lumina 019ff418 case: a database
+                    # fault cascading into ``assert 500 == 404`` across many
+                    # tests). Claiming True forces the offer to earn itself
+                    # through one of the evidence-bearing triggers below: a
+                    # distraction streak, a low-signal streak, or a positive
+                    # test-authoring fingerprint.
+                    has_mandatable_target=True,
+                    distraction_streak=int(
+                        loop_counter.get(
+                            "consecutive_distraction_rounds", 0,
+                        ) or 0
+                    ),
+                    low_signal_streak=int(
+                        loop_counter.get(
+                            "consecutive_low_signal_rounds", 0,
+                        ) or 0
+                    ),
+                    triage_test_bug=_floor_triage,
+                )
+                if _floor_offer:
+                    _floor_display = ", ".join(
+                        f"{f}:{ln}" if ln else f
+                        for f, ln in _floor_lines
+                    )
+                    _offered_unsat_marker = True
+                    _unsat_offer_files = {f for f, _ in _floor_lines}
+                    logger.warning(
+                        "[repair_node] Protected-test floor: failing "
+                        "diagnostic(s) at %s live in tamper-guarded test "
+                        "file(s) and no judge-driven offer was made this "
+                        "round (triage_test_bug=%s). Offering the "
+                        "UNSATISFIABLE_TEST escape.",
+                        _floor_display, _floor_triage,
+                    )
+                    try:
+                        from harness.observability import emit_event as _emit_fl
+                        _emit_fl(
+                            "unsatisfiable_escape_floor_offered",
+                            files=sorted(_unsat_offer_files),
+                            triage_test_bug=_floor_triage,
+                            low_signal_streak=int(
+                                loop_counter.get(
+                                    "consecutive_low_signal_rounds", 0,
+                                ) or 0
+                            ),
+                            distraction_streak=int(
+                                loop_counter.get(
+                                    "consecutive_distraction_rounds", 0,
+                                ) or 0
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    messages.append(MessageDict(role="system", content=(
+                        "PROTECTED TEST LOCATION — the failing "
+                        f"diagnostic(s) at {_floor_display} live inside test "
+                        "file(s) the repair loop may NOT modify. Patches "
+                        "targeting them WILL be auto-rejected; do not emit "
+                        "any.\n"
+                        + (
+                            "The harness's test-triage classifier has "
+                            "positively identified a test-AUTHORING defect "
+                            "here — a mistake in the test's own code that no "
+                            "production change can satisfy.\n"
+                            if _floor_triage else ""
+                        )
+                        + "First re-examine whether ANY production-code "
+                        "change can make the assertion pass as written, and "
+                        "if so, patch the production code. If — and only if "
+                        "— no production-code change can EVER satisfy it "
+                        "(the test encodes an impossible or self-"
+                        "contradictory expectation, asserts on state it "
+                        "never set up, or counts artifacts it does not own), "
+                        "emit ZERO patch blocks and exactly one line of the "
+                        "form:\n"
+                        "UNSATISFIABLE_TEST: <workspace-relative test path> "
+                        "— <one sentence: why no production change can "
+                        "satisfy it>\n"
+                        "That declaration hands the test to regeneration. It "
+                        "is the ONLY sanctioned way to report a defective "
+                        "test — do not work around one by changing "
+                        "production behaviour the specification requires."
+                    )))
 
         # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
@@ -20333,6 +20584,17 @@ def _format_production_symbols_under_test(
         "code, not the test**, unless the test's expectation itself "
         "contradicts the requirements. Repair loops burn iterations "
         "when the LLM decides the test is wrong and it isn't.\n"
+        "\nIf you do conclude the test itself is defective: test files are "
+        "tamper-guarded and any patch you emit against one is auto-rejected, "
+        "so do not try. Say so instead — when the harness offers the "
+        "`UNSATISFIABLE_TEST:` declaration in a PROTECTED TEST LOCATION "
+        "directive, that line is how you report it, and it routes the file "
+        "to regeneration. What you must NOT do is treat the guard as a "
+        "reason to invent a production-side change that makes a wrong test "
+        "pass: bending production behaviour the specification requires, in "
+        "order to satisfy a test you believe is wrong, is a regression that "
+        "ships. A correct diagnosis with no patch beats a patch you do not "
+        "believe in.\n"
     )
     return header + "\n".join(sections) + "\n"
 

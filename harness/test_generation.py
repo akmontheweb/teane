@@ -695,6 +695,16 @@ _COMPONENT_TEST_DEVDEPS: dict[str, str] = {
     "@testing-library/jest-dom": "^6.4.2",
     "jest-environment-jsdom": "^29.7.0",
 }
+# Runner-agnostic half of the above, for packages already on vitest. Vitest
+# drives jsdom through the ``jsdom`` package directly (``environment:
+# 'jsdom'``) rather than through jest's environment adapter, and
+# @testing-library/jest-dom's matchers work unchanged under vitest despite
+# the name.
+_VITEST_COMPONENT_TEST_DEVDEPS: dict[str, str] = {
+    "@testing-library/react": "^14.2.0",
+    "@testing-library/jest-dom": "^6.4.2",
+    "jsdom": "^24.1.0",
+}
 # Plain-JS packages get no ts-jest preset, so jest falls back to
 # babel-jest — which without a preset can parse neither modern syntax in
 # .js tests nor JSX in .jsx tests. Scaffold the babel side too, or the
@@ -812,15 +822,36 @@ def _ensure_js_test_env(
         if not isinstance(pkg, dict):
             continue
 
-        needed = dict(_JS_TEST_DEVDEPS_BASE)
-        if is_ts:
-            needed.update(_TS_TEST_DEVDEPS)
-        else:
-            needed.update(_JS_BABEL_DEVDEPS)
+        # Never scaffold jest onto a package that already uses vitest. The
+        # old guard (``has_jest_config`` below) asked only "is jest set up?",
+        # so on a vitest project the answer was no and the harness installed
+        # a second, conflicting runner: on lumina 01a079dc it added four jest
+        # devDependencies, wrote jest.config.cjs and jest.setup.ts, and
+        # appended "jest" to tsconfig types, onto a workspace whose spec
+        # mandated Vitest in three places. The runner-agnostic pieces
+        # (@testing-library/*) are still worth adding — a generated component
+        # test needs them under either runner — but everything jest-specific
+        # is skipped, as is the config/setup/tsconfig scaffolding below.
+        from harness.cli import detect_node_test_runner
+        pkg_runner, _pkg_has_test_script = detect_node_test_runner(pkg, pkg_dir)
+        is_vitest_pkg = pkg_runner == "vitest"
+
+        needed: dict[str, str] = {}
+        if is_vitest_pkg:
+            # jsdom rather than jest-environment-jsdom: vitest takes the
+            # jsdom package directly via `environment: 'jsdom'`.
             if is_component:
-                needed.update(_JS_BABEL_REACT_DEVDEPS)
-        if is_component:
-            needed.update(_COMPONENT_TEST_DEVDEPS)
+                needed.update(_VITEST_COMPONENT_TEST_DEVDEPS)
+        else:
+            needed.update(_JS_TEST_DEVDEPS_BASE)
+            if is_ts:
+                needed.update(_TS_TEST_DEVDEPS)
+            else:
+                needed.update(_JS_BABEL_DEVDEPS)
+                if is_component:
+                    needed.update(_JS_BABEL_REACT_DEVDEPS)
+            if is_component:
+                needed.update(_COMPONENT_TEST_DEVDEPS)
         present = set()
         for section in ("dependencies", "devDependencies"):
             sec = pkg.get(section)
@@ -854,7 +885,14 @@ def _ensure_js_test_env(
             os.path.isfile(os.path.join(pkg_dir, name))
             for name in _JEST_CONFIG_NAMES
         )
-        if not has_jest_config:
+        if is_vitest_pkg:
+            logger.info(
+                "[test_generation_node] %s is a vitest package — skipping the "
+                "jest config/setup scaffold. The generated tests run under "
+                "the runner the package already declares.",
+                os.path.relpath(pkg_dir, ws) or ".",
+            )
+        if not has_jest_config and not is_vitest_pkg:
             setup_ext = "ts" if is_ts else "js"
             cfg_lines = ["module.exports = {"]
             if is_ts:
@@ -939,6 +977,16 @@ def _ensure_js_test_env(
                 )
 
         if is_ts:
+            # Runner globals for tsc. The deterministic contract tests use
+            # bare describe/it/expect with no import, so without the ambient
+            # declarations ``tsc --noEmit`` (and therefore ``npm run build``)
+            # fails with TS2582/TS2304 even though the tests run fine. The
+            # vitest spelling is ``vitest/globals``, which is what a project
+            # with ``test.globals: true`` in its vite config needs — lumina
+            # 01a079dc's build typechecked only incidentally, off the
+            # @types/jest that arrived with the mistaken jest scaffolding,
+            # and broke the moment that was removed.
+            types_entry = "vitest/globals" if is_vitest_pkg else "jest"
             ts_path = os.path.join(pkg_dir, "tsconfig.json")
             if os.path.isfile(ts_path):
                 try:
@@ -950,8 +998,13 @@ def _ensure_js_test_env(
                     opts = tscfg.get("compilerOptions")
                     if isinstance(opts, dict):
                         types = opts.get("types")
-                        if isinstance(types, list) and "jest" not in types:
-                            opts["types"] = list(types) + ["jest"]
+                        # Absent ``types`` means "every @types package in
+                        # scope", which already covers the runner globals —
+                        # writing the key would NARROW resolution and break
+                        # unrelated ambient types. Only extend an explicit
+                        # list, matching the pre-existing behaviour.
+                        if isinstance(types, list) and types_entry not in types:
+                            opts["types"] = list(types) + [types_entry]
                             try:
                                 with open(ts_path, "w", encoding="utf-8") as fh:
                                     fh.write(json.dumps(tscfg, indent=2) + "\n")
@@ -959,8 +1012,9 @@ def _ensure_js_test_env(
                                     os.path.relpath(ts_path, ws).replace(os.sep, "/")
                                 )
                                 logger.info(
-                                    "[test_generation_node] Appended 'jest' "
+                                    "[test_generation_node] Appended %r "
                                     "to %s compilerOptions.types.",
+                                    types_entry,
                                     os.path.relpath(ts_path, ws),
                                 )
                             except OSError as exc:
@@ -1156,8 +1210,132 @@ def _pick_primary_stack(tags: set[str]) -> Optional[str]:
     return None
 
 
-def _stack_test_command(primary: str) -> Optional[str]:
-    """Return the deterministic test runner command for a primary stack."""
+# JS/TS stacks whose runner is resolved from the workspace rather than from
+# the static _STACK_TEST_COMMANDS entry.
+_JS_STACKS = frozenset({"node", "javascript", "typescript"})
+
+
+def _js_package_roots_for_tests(
+    workspace_path: str, generated_tests: list[str],
+) -> list[str]:
+    """Absolute package roots (nearest ``package.json``) owning the freshly
+    generated JS/TS tests, workspace root first, then sorted.
+
+    Same resolution ``_ensure_js_test_env`` uses to decide where to scaffold.
+    Running the tests somewhere other than where the scaffolding landed is
+    exactly the lumina 01a079dc failure — see ``_js_test_command``.
+    """
+    ws = os.path.abspath(workspace_path)
+    roots: set[str] = set()
+    for rel in generated_tests:
+        if not rel.endswith(_JS_TEST_EXTS):
+            continue
+        pkg_dir = _nearest_package_root(os.path.join(ws, rel), ws)
+        if pkg_dir:
+            roots.add(os.path.abspath(pkg_dir))
+    ordered = sorted(roots)
+    if ws in roots:
+        ordered.remove(ws)
+        ordered.insert(0, ws)
+    return ordered
+
+
+def _js_test_command(
+    workspace_path: str, generated_tests: list[str],
+) -> Optional[str]:
+    """Compose the JS/TS test invocation for this workspace.
+
+    Two things the previous static ``npx --no-install jest --silent`` entry
+    got wrong on lumina session 01a079dc, both of which had to be fixed
+    together for a non-root JS layout to run at all:
+
+    1. **Runner.** jest was hardcoded for every JS/TS workspace. The project
+       was a Vitest project — spec, ``vite.config.ts`` test block and
+       ``scripts.test`` all said so, and every generated test opened with
+       ``import { describe, expect, it, vi } from 'vitest'``. Resolution now
+       goes through ``harness.cli.detect_node_test_runner``, the same
+       function the main build command uses, so the two cannot disagree.
+
+    2. **Working directory.** The command ran bare at the workspace root
+       while the scaffolding (devDependencies, runner config, setup file)
+       was written into ``client/`` beside the tests. lumina has no root
+       ``package.json``, so the run died in 0.61s with "Could not find a
+       config file based on provided values: path: /workspace" — zero tests
+       executed. The sandbox parsed no diagnostics, the node synthesised a
+       ``<test_runner>`` placeholder from the tail, and THAT is what routed
+       the session into the repair loop. Commands are now scoped with
+       ``cd <pkg_dir> &&`` whenever the owning package is not the workspace
+       root.
+
+    Multiple package roots are chained with ``&&`` (fail-fast, matching the
+    build command's own composition). Returns None when no JS package owns
+    any generated test, leaving the caller's "no runner for stack" path.
+    """
+    from harness.cli import detect_node_test_runner
+
+    roots = _js_package_roots_for_tests(workspace_path, generated_tests)
+    if not roots:
+        return None
+
+    ws = os.path.abspath(workspace_path)
+    parts: list[str] = []
+    for pkg_dir in roots:
+        pkg_path = os.path.join(pkg_dir, "package.json")
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as fh:
+                pkg_data = json.loads(fh.read()) or {}
+        except (OSError, ValueError):
+            pkg_data = {}
+        if not isinstance(pkg_data, dict):
+            pkg_data = {}
+        runner, has_test_script = detect_node_test_runner(pkg_data, pkg_dir)
+
+        if runner == "vitest":
+            # ``run`` (not watch) and no coverage: a coverage threshold in
+            # the project's own scripts.test would fail this verification
+            # run for a reason that has nothing to do with the tests we just
+            # generated. Invoke the runner directly rather than via npm.
+            cmd = "npx --no-install vitest run"
+        elif runner == "jest":
+            cmd = "npx --no-install jest --silent"
+        elif has_test_script:
+            # A runner we don't recognise, but the package says how to run
+            # its tests. Trust it over guessing.
+            cmd = "npm test"
+        else:
+            # Nothing configured — _ensure_js_test_env provisions jest below,
+            # so jest is the correct default here.
+            cmd = "npx --no-install jest --silent"
+
+        rel = os.path.relpath(pkg_dir, ws)
+        if rel not in (".", ""):
+            cmd = f"(cd {rel} && {cmd})"
+        parts.append(cmd)
+        logger.info(
+            "[test_generation_node] JS test runner for %s: %s (%s).",
+            rel if rel not in (".", "") else "<workspace root>",
+            runner,
+            "scripts.test present" if has_test_script else "no scripts.test",
+        )
+    return " && ".join(parts)
+
+
+def _stack_test_command(
+    primary: str,
+    workspace_path: str = "",
+    generated_tests: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Return the deterministic test runner command for a primary stack.
+
+    JS/TS resolve against the workspace (see ``_js_test_command``); every
+    other stack keeps its static entry. The workspace-less call form is
+    retained so existing callers and tests that only care about python/java
+    keep working.
+    """
+    if primary in _JS_STACKS and workspace_path:
+        resolved = _js_test_command(workspace_path, generated_tests or [])
+        if resolved:
+            return resolved
     return _STACK_TEST_COMMANDS.get(primary)
 
 
@@ -3000,7 +3178,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # --- Deterministic test run ---
-    test_cmd = _stack_test_command(primary)
+    test_cmd = _stack_test_command(primary, workspace_path, generated_tests)
     if test_cmd is None:
         logger.info(
             "[test_generation_node] No deterministic test command for stack=%s. "

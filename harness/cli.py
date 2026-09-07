@@ -2289,6 +2289,103 @@ def _extract_delegate_subdirs(scripts: dict) -> list[str]:
     return found
 
 
+# Config filenames that mark a package as vitest- or jest-configured even
+# when the runner itself is absent from dependencies (a workspace can carry
+# the config while relying on a hoisted or globally-installed binary).
+_VITEST_CONFIG_NAMES = (
+    "vitest.config.ts", "vitest.config.js", "vitest.config.mjs",
+    "vitest.config.cjs", "vitest.config.mts", "vitest.config.cts",
+)
+_VITE_CONFIG_NAMES = (
+    "vite.config.ts", "vite.config.js", "vite.config.mjs",
+    "vite.config.cjs", "vite.config.mts", "vite.config.cts",
+)
+_JEST_CONFIG_FILENAMES = (
+    "jest.config.js", "jest.config.cjs", "jest.config.mjs",
+    "jest.config.ts", "jest.config.json",
+)
+# A `test:` key inside a vite config's defineConfig object — Vitest's
+# documented way to configure itself without a separate vitest.config file.
+# Matched structurally rather than by parsing TS: a line whose only content
+# is ``test:`` followed by an object or a reference.
+_VITE_TEST_BLOCK_RE = re.compile(r"^\s*test\s*:\s*[{\w]", re.MULTILINE)
+
+
+def detect_node_test_runner(
+    pkg_data: dict, pkg_dir: str,
+) -> tuple[str, bool]:
+    """Which test runner a Node package is configured to use.
+
+    Returns ``(runner, has_test_script)`` where ``runner`` is one of
+    ``"vitest"``, ``"jest"`` or ``"none"``, and ``has_test_script`` says
+    whether ``package.json`` declares ``scripts.test``.
+
+    THE single source of truth for this question. It exists because the
+    harness previously answered it in two places that disagreed: this module
+    detected vitest correctly for the build command, while
+    ``harness.test_generation._STACK_TEST_COMMANDS`` hardcoded
+    ``npx --no-install jest --silent`` for every JS/TS workspace. On lumina
+    session 01a079dc that put jest — plus four jest devDependencies, a
+    ``jest.config.cjs``, a ``jest.setup.ts`` and a ``"jest"`` tsconfig type —
+    onto a project whose spec, ``vite.config.ts`` and ``scripts.test`` all
+    said Vitest, and every generated test began ``import { describe, expect,
+    it, vi } from 'vitest'``. Nine of twelve suites then failed to load.
+
+    Detection is deliberately broader than a dependency check: a package can
+    be vitest-configured through ``vitest.config.*`` or through a ``test``
+    block inside ``vite.config.*`` (Vitest's documented in-vite-config form,
+    which is what lumina used) without vitest appearing where a naive
+    ``"vitest" in devDependencies`` probe would look.
+
+    Vitest is checked before jest so that a workspace carrying both — common
+    when a previous harness run scaffolded jest onto a vitest project —
+    resolves to the one its tests are actually written against.
+    """
+    deps: dict = {}
+    for key in ("dependencies", "devDependencies"):
+        section = pkg_data.get(key) if isinstance(pkg_data, dict) else None
+        if isinstance(section, dict):
+            deps.update(section)
+    scripts = pkg_data.get("scripts") if isinstance(pkg_data, dict) else None
+    scripts = scripts if isinstance(scripts, dict) else {}
+    has_test_script = "test" in scripts
+    test_script = str(scripts.get("test", "") or "")
+
+    def _exists(names: tuple[str, ...]) -> bool:
+        return any(
+            os.path.isfile(os.path.join(pkg_dir or ".", n)) for n in names
+        )
+
+    if (
+        "vitest" in deps
+        or _exists(_VITEST_CONFIG_NAMES)
+        or "vitest" in test_script
+    ):
+        return "vitest", has_test_script
+
+    # A `test` block inside vite.config.* — read the file rather than infer.
+    for name in _VITE_CONFIG_NAMES:
+        path = os.path.join(pkg_dir or ".", name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                if _VITE_TEST_BLOCK_RE.search(fh.read()):
+                    return "vitest", has_test_script
+        except OSError:
+            continue
+
+    if (
+        "jest" in deps
+        or "jest" in pkg_data
+        or _exists(_JEST_CONFIG_FILENAMES)
+        or "jest" in test_script
+    ):
+        return "jest", has_test_script
+
+    return "none", has_test_script
+
+
 def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> str:
     """Build the Node command for a single ``package.json``.
 
@@ -2327,15 +2424,14 @@ def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> 
         with open(package_json_path, "r", encoding="utf-8", errors="replace") as f:
             data = _json.load(f) or {}
         scripts = data.get("scripts") or {}
-        if isinstance(scripts, dict) and "test" in scripts:
-            has_test_script = True
-        deps = {}
-        for key in ("dependencies", "devDependencies"):
-            section = data.get(key)
-            if isinstance(section, dict):
-                deps.update(section)
-        if "vitest" in deps:
-            has_vitest = True
+        # Shared with test_generation_node's runner selection — see
+        # ``detect_node_test_runner``. Broader than the old inline
+        # ``"vitest" in deps`` probe: it also recognises vitest.config.* and
+        # a ``test`` block inside vite.config.*, so a project configured
+        # either of those ways now gets ``npx vitest run`` here instead of
+        # the silent no-op tail.
+        _runner, has_test_script = detect_node_test_runner(data, pkg_dir)
+        has_vitest = _runner == "vitest"
         workspaces = data.get("workspaces")
         if isinstance(workspaces, (list, dict)) and workspaces:
             has_workspaces = True

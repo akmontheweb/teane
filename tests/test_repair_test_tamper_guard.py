@@ -85,6 +85,83 @@ class TestRejectTestPatchBlocks:
 
 
 # -----------------------------------------------------------------------
+# Harness-generated fixture carve-out (lumina 01a079dc)
+# -----------------------------------------------------------------------
+
+class TestGeneratedFixtureCarveOut:
+    """The acceptance node's own ``tests/acceptance/conftest.py`` is fixture
+    scaffolding with ZERO assertions, so nothing in it can be weakened to make
+    a test pass — but a defect in it (a missing per-test DB reset) is also
+    unfixable from production code. Lumina 01a079dc: the model diagnosed the
+    missing reset correctly, this guard refused the fix, and the next round
+    tried to smuggle ``if os.environ.get("PYTEST_CURRENT_TEST")`` reset logic
+    into production ``create_app()`` instead → zero-patch HITL."""
+
+    @staticmethod
+    def _ws(tmp_path, body: str = "", name: str = "tests/acceptance/conftest.py"):
+        import os
+        from harness import acceptance_gen as ag
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body or ag.render_acceptance_conftest(
+            {"module": "server.app.main", "symbol": "create_app",
+             "kind": "factory"}))
+        return str(tmp_path), os.path.relpath(str(p), str(tmp_path))
+
+    def test_generated_conftest_is_editable(self, tmp_path) -> None:
+        ws, rel = self._ws(tmp_path)
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block(rel, OperationType.REPLACE_BLOCK)], workspace_path=ws,
+        )
+        assert [b.file for b in kept] == [rel]
+        assert rejections == []
+
+    def test_real_test_module_still_protected(self, tmp_path) -> None:
+        ws, _ = self._ws(tmp_path)
+        (tmp_path / "tests/acceptance/test_story.py").write_text(
+            "def test_a(client):\n    assert client\n")
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block("tests/acceptance/test_story.py", OperationType.REPLACE_BLOCK)],
+            workspace_path=ws,
+        )
+        assert kept == []
+        assert "[test-protected]" in rejections[0].error
+
+    def test_hand_written_conftest_still_protected(self, tmp_path) -> None:
+        # No generated marker ⇒ a human wrote it ⇒ stays protected.
+        ws, rel = self._ws(tmp_path, body="import pytest\n", name="tests/conftest.py")
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block(rel, OperationType.REPLACE_BLOCK)], workspace_path=ws,
+        )
+        assert kept == []
+        assert "[test-protected]" in rejections[0].error
+
+    def test_marked_conftest_carrying_a_test_is_protected(self, tmp_path) -> None:
+        # Belt-and-braces: the marker alone must not unlock a file that has
+        # grown real assertions.
+        from harness import acceptance_gen as ag
+        ws, rel = self._ws(
+            tmp_path,
+            body=f'"""{ag.GENERATED_CONFTEST_MARKER}."""\n'
+                 "def test_sneak():\n    assert True\n",
+        )
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block(rel, OperationType.REPLACE_BLOCK)], workspace_path=ws,
+        )
+        assert kept == []
+        assert "[test-protected]" in rejections[0].error
+
+    def test_missing_file_is_protected(self, tmp_path) -> None:
+        # Cannot read it ⇒ cannot prove it is generated ⇒ refuse.
+        kept, rejections = _reject_test_patch_blocks(
+            [_Block("tests/acceptance/conftest.py", OperationType.REPLACE_BLOCK)],
+            workspace_path=str(tmp_path),
+        )
+        assert kept == []
+        assert rejections
+
+
+# -----------------------------------------------------------------------
 # Parse-error carve-out (lumina 019f7054)
 # -----------------------------------------------------------------------
 

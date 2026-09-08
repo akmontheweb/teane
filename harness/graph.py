@@ -3285,6 +3285,44 @@ def _resolve_read_file_rounds(state: "AgentState") -> int:
     return max(1, min(20, val))
 
 
+#: Fraction of substantial lines that must be verbatim repeats before a
+#: truncated response is treated as a degenerate loop rather than real work.
+#: Calibrated against every response in session 01a079dc: the one real repeat
+#: loop scored 0.976, while the highest-scoring legitimate output scored 0.462
+#: (REPLACE_BLOCK search/replace pairs repeat lines by construction). 0.7 sits
+#: in that gap — a false positive here would discard a real patch, so the
+#: threshold is deliberately biased toward letting borderline output continue.
+_DEGENERATE_REPEAT_RATIO = 0.7
+#: Minimum substantial lines before the ratio means anything.
+_DEGENERATE_MIN_LINES = 8
+
+
+def _repetition_ratio(text: str, *, min_line_len: int = 40) -> float:
+    """Fraction of substantial lines in ``text`` that are verbatim repeats.
+
+    A model that has fallen into a repeat loop emits the same few sentences
+    until it hits the output cap. Short lines are excluded because real output
+    legitimately repeats them (``}``, ``search:``, blank lines); a 40-char
+    threshold keeps the measure on prose and code the model actually composed.
+
+    Session 01a079dc, repair round 9: 163 verbatim copies of the same four
+    paragraphs filled 32,768 output tokens over 4m19s, and the harness then
+    paid for a continuation on top.
+    """
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if len(ln) >= min_line_len]
+    if len(lines) < _DEGENERATE_MIN_LINES:
+        return 0.0
+    from collections import Counter
+    counts = Counter(lines)
+    return sum(c - 1 for c in counts.values()) / len(lines)
+
+
+def _is_degenerate_repeat(text: str) -> bool:
+    """True when ``text`` looks like a stuck repeat loop, not real output."""
+    return _repetition_ratio(text) >= _DEGENERATE_REPEAT_RATIO
+
+
 async def _continue_on_length(
     *,
     initial_response: Any,
@@ -3396,6 +3434,45 @@ async def _continue_on_length(
     response = initial_response
     budget = initial_budget
     continuation_cycles = 0
+
+    def _refuse_degenerate(text: str, cycle: int) -> bool:
+        """Bail out when the truncated turn is a stuck repeat loop.
+
+        Continuing here is actively harmful: the whole degenerate turn is
+        re-sent as context (so input grows by the full 32k of repeats), and a
+        model already looping is the least likely to break out of it. Stopping
+        keeps whatever real content preceded the loop — the caller's parser
+        takes what it can from it.
+        """
+        ratio = _repetition_ratio(text)
+        if ratio < _DEGENERATE_REPEAT_RATIO:
+            return False
+        logger.warning(
+            "[%s] truncated output is %.0f%% verbatim repeated lines — the "
+            "model is looping, not producing. Refusing continuation (cycle "
+            "%d/%d) and keeping what landed; re-sending a degenerate turn "
+            "only grows the prompt and re-primes the loop.",
+            role_label, ratio * 100, cycle, max_cycles,
+        )
+        try:
+            from harness.observability import emit_event as _emit_degen
+            _emit_degen(
+                "continuation_refused_degenerate_repeat",
+                role=role_label,
+                repetition_ratio=round(ratio, 3),
+                cycle=cycle,
+                chars=len(text),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    if (
+        getattr(initial_response, "finish_reason", "stop") == "length"
+        and _refuse_degenerate(initial_response.content or "", 0)
+    ):
+        return initial_response, initial_budget, accumulated_chunks
+
     # ``getattr`` with a "stop" default keeps stub responses in tests
     # (which historically omit finish_reason) on the non-continuation
     # path — only real gateway responses with an explicit "length"
@@ -3418,6 +3495,13 @@ async def _continue_on_length(
         ))
         response, budget = await dispatch(messages, budget)
         accumulated_chunks.append(response.content or "")
+        # A cycle can itself fall into the loop — re-check before paying
+        # for the next one.
+        if (
+            getattr(response, "finish_reason", "stop") == "length"
+            and _refuse_degenerate(response.content or "", continuation_cycles)
+        ):
+            return response, budget, accumulated_chunks
     if (
         continuation_cycles >= max_cycles
         and getattr(response, "finish_reason", "stop") == "length"
@@ -6827,6 +6911,43 @@ def _normalize_ws_path(path: str, workspace_path: str) -> str:
     return p
 
 
+def _is_harness_generated_fixture(path: str, workspace_path: str) -> bool:
+    """True for a ``conftest.py`` the harness itself generated.
+
+    The acceptance node writes ``tests/acceptance/conftest.py`` (see
+    :func:`harness.acceptance_gen.render_acceptance_conftest`): pure fixture
+    scaffolding — a ``client`` fixture and its database isolation — carrying
+    ZERO assertions. Refusing repair edits to it is not reward-hacking defense,
+    because there is nothing in it that could be weakened to make a test pass;
+    it is a deadlock. Lumina session 01a079dc is the worked example: the model
+    correctly diagnosed a missing per-test DB reset in this exact file, the
+    guard refused the fix, and the next round tried to smuggle
+    ``if os.environ.get("PYTEST_CURRENT_TEST")`` reset logic into production
+    ``create_app()`` instead — then hit HITL with zero patches.
+
+    Deliberately narrow, so the carve-out can never reach a real test:
+      * basename must be ``conftest.py`` — never a ``test_*.py`` module;
+      * the file must carry the generated-header marker; and
+      * it must define no test functions of its own.
+    """
+    if os.path.basename(str(path or "")) != "conftest.py":
+        return False
+    try:
+        from harness.acceptance_gen import GENERATED_CONFTEST_MARKER
+    except Exception:  # noqa: BLE001 — carve-out is best-effort
+        return False
+    rel = _normalize_ws_path(path, workspace_path)
+    abs_path = rel if os.path.isabs(rel) else os.path.join(workspace_path, rel)
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    if GENERATED_CONFTEST_MARKER not in text:
+        return False
+    return not re.search(r"^\s*(async\s+)?def\s+test_", text, re.MULTILINE)
+
+
 def _reject_test_patch_blocks(
     blocks: list[Any],
     *,
@@ -6851,12 +6972,18 @@ def _reject_test_patch_blocks(
     (dir-based + co-located basenames) so both nodes agree on what "a test
     file" is.
 
-    Carve-out: ``allow_parse_broken`` (from
+    Carve-out 1: ``allow_parse_broken`` (from
     :func:`_syntax_broken_test_files`) lists test files whose CURRENT
     diagnostic is a parse error. A file that cannot parse cannot run any
     assertion, so there is nothing to weaken — and pytest collection
     failure on one test-infra file blocks the entire suite, turning a
     one-line repair into a guaranteed HITL when rejected here.
+
+    Carve-out 2: the harness's own generated acceptance ``conftest.py`` (see
+    :func:`_is_harness_generated_fixture`). It holds fixtures only — no
+    assertions exist in it to weaken — and a defect in it (a missing per-test
+    database reset, say) is unfixable from production code, so refusing the
+    edit guarantees a zero-patch HITL.
     """
     from harness.patcher import PatchResult
 
@@ -6869,6 +6996,14 @@ def _reject_test_patch_blocks(
             and _normalize_ws_path(file_path, workspace_path)
             in allow_parse_broken
         ):
+            kept.append(block)
+            continue
+        if workspace_path and _is_harness_generated_fixture(file_path, workspace_path):
+            logger.info(
+                "[repair_node:test-guard] Fixture carve-out: allowing edit to "
+                "harness-generated %s (fixtures only, no assertions).",
+                file_path,
+            )
             kept.append(block)
             continue
         if _is_test_artifact(file_path):
@@ -9340,6 +9475,34 @@ def _is_workspace_source_path(path: str, workspace_path: str) -> bool:
 _PERSISTENT_BLOCKER_FILE_LINE_CAP = 3000
 _PERSISTENT_BLOCKER_FILE_CHAR_CAP = 100000
 
+#: Cap on one diagnostic's rendered ``semantic_context``. pytest's assertion
+#: rewriting inlines the full repr of whatever was compared, so a single
+#: ``assert len(items) == 3`` against a 57-row response spent ~8 KB of prompt on
+#: one diagnostic (session 01a079dc) — crowding the actual file content out of
+#: the preflight section that shares the same budget.
+_DIAGNOSTIC_CONTEXT_CHAR_CAP = 4000
+
+
+def _truncate_middle(text: str, cap: int) -> str:
+    """Bound ``text`` to ``cap`` chars, elliding the MIDDLE.
+
+    Head-only truncation is wrong for a diagnostic context: the head carries the
+    failing source line but the tail carries the harness's runtime enrichment
+    (response bodies, locals), and it is usually the tail that names the real
+    cause. Keeping both ends preserves the two informative halves and drops the
+    long repr in between.
+    """
+    if cap <= 0 or len(text) <= cap:
+        return text
+    head = cap * 2 // 3
+    tail = cap - head
+    dropped = len(text) - head - tail
+    return (
+        f"{text[:head]}\n"
+        f"... [{dropped} chars elided from the middle of this diagnostic] ...\n"
+        f"{text[-tail:]}"
+    )
+
 
 def _render_file_with_line_numbers(
     path: str,
@@ -9449,8 +9612,29 @@ def _format_current_file_content(failures: list[Any]) -> str:
             + _SEARCH_BLOCK_COPY_RULES
         ),
     ]
+    # Bound the total, as ``_format_preflight_file_content`` does. One entry
+    # per file with a failed patch is normally a handful, but a round that
+    # misses across a dozen large files would otherwise render every full
+    # view unbounded and crowd out the diagnostics below it. Files whose
+    # views don't fit are NAMED, so the LLM knows to READ_FILE them rather
+    # than patching from memory.
+    accumulated = sum(len(s) for s in lines)
+    omitted: list[str] = []
     for file_ref, wider in seen.items():
-        lines.append(f"\n### `{file_ref}`\n```\n{wider}\n```")
+        block = f"\n### `{file_ref}`\n```\n{wider}\n```"
+        if omitted or accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
+            omitted.append(file_ref)
+            continue
+        lines.append(block)
+        accumulated += len(block)
+    if omitted:
+        listed = ", ".join(f"`{p}`" for p in omitted)
+        lines.append(
+            f"\n(omitted to keep this section under "
+            f"{_PREFLIGHT_SECTION_CHAR_CAP // 1000}k chars: {listed}. You have "
+            f"NOT been shown these — emit a READ_FILE block before writing any "
+            f"REPLACE_BLOCK against one of them.)"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -9507,19 +9691,27 @@ def _format_preflight_file_content(
         intro,
     ]
     accumulated = sum(len(s) for s in lines)
-    truncated_at: Optional[str] = None
+    omitted: list[str] = []
     for rel_path, content in seen.items():
         block = f"\n### `{rel_path}`\n```\n{content}\n```"
-        if accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
-            truncated_at = rel_path
-            break
+        # Keep going after the first over-cap file: a single large file must
+        # not suppress every smaller one behind it.
+        if omitted or accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
+            omitted.append(rel_path)
+            continue
         lines.append(block)
         accumulated += len(block)
-    if truncated_at is not None:
+    if omitted:
+        # NAME every omitted file. "starting at X" told the LLM one path and
+        # left the rest invisible, so it had no way to know which files it was
+        # reasoning about blind — and it wrote SEARCH blocks from memory
+        # instead of reading them (session 01a079dc, `server/app/main.py`).
+        listed = ", ".join(f"`{p}`" for p in omitted)
         lines.append(
-            f"\n(omitted further files starting at `{truncated_at}` to "
-            f"keep this section under {_PREFLIGHT_SECTION_CHAR_CAP // 1000}k "
-            f"chars — emit a READ_FILE block for any other file you need.)"
+            f"\n(omitted to keep this section under "
+            f"{_PREFLIGHT_SECTION_CHAR_CAP // 1000}k chars: {listed}. You have "
+            f"NOT been shown these — emit a READ_FILE block before writing any "
+            f"REPLACE_BLOCK against one of them.)"
         )
     return "\n".join(lines) + "\n"
 
@@ -16616,21 +16808,38 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             # the current investigation's reads (the files the judge kept
             # naming) fell past the cap — each round re-spent its
             # READ_FILE budget rediscovering them.
+            # Dedupe on the NORMALIZED path: an LLM that emits an
+            # absolute ``READ_FILE`` path records a second key for a file
+            # already in the dict (session 01a079dc recorded both
+            # ``server/tests/test_main.py`` and its absolute twin), and
+            # each duplicate burns one of the few injection slots.
+            _seen_norm: set[str] = {
+                _normalize_ws_path(_p, workspace_path)
+                for _p in _existing_preflight
+            }
             for _seen_path in reversed(list(files_seen_by_llm.keys())):
-                if _seen_path in _existing_preflight:
+                _norm = _normalize_ws_path(_seen_path, workspace_path)
+                if _norm in _seen_norm:
                     continue
-                _abs = os.path.join(workspace_path, _seen_path)
+                _abs = os.path.join(workspace_path, _norm)
                 # Skip files that no longer exist on disk — a deletion
                 # would render the injection as "(file not found)" and
                 # confuse the LLM. Best-effort.
                 if not os.path.isfile(_abs):
                     continue
-                _reread_candidates.append(_seen_path)
+                _seen_norm.add(_norm)
+                _reread_candidates.append(_norm)
                 if len(_reread_candidates) >= _REREAD_INJECTION_CAP:
                     break
-            # Restore chronological (oldest → newest) order for the
-            # prompt so the rendering stays stable across rounds.
-            _reread_candidates.reverse()
+            # Keep MOST-RECENT-FIRST all the way into the prompt. The
+            # selection above deliberately evicts the oldest reads, but
+            # ``_format_preflight_file_content`` truncates from the TAIL
+            # once its char cap is hit — so re-sorting back to
+            # chronological order handed the renderer the newest reads
+            # last and let it drop exactly the files the selection had
+            # just worked to keep. Session 01a079dc lost ``main.py`` (the
+            # file the judge had directed it to patch) that way and
+            # hallucinated two REPLACE_BLOCK searches against it.
             if _reread_candidates:
                 files_for_preflight = (
                     list(files_for_preflight) + _reread_candidates
@@ -21015,7 +21224,10 @@ def _format_diagnostics_for_repair(
             lines.append(f"  **Cascade hint:** {cascade}")
         context = (group["first"].get("semantic_context") or "").strip()
         if context:
-            lines.append(f"  Context (first occurrence):\n```\n{context}\n```")
+            lines.append(
+                "  Context (first occurrence):\n```\n"
+                f"{_truncate_middle(context, _DIAGNOSTIC_CONTEXT_CHAR_CAP)}\n```"
+            )
     if hidden:
         # Phase 2.1 — decision-point logging. Emit a structured event
         # naming exactly which groups got deferred from full context, so
@@ -24787,9 +24999,17 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         enabled=_code_continue_enabled,
         role_label="code_review:critique",
         max_cycles=_resolve_max_continuation_cycles(state),
+        # This call site json.loads() the combined text. cf5d7e9 gated the
+        # byte-identical spec_review:critique site and left this twin behind,
+        # while config.json sets continue_on_length.code_reviewer=true — so
+        # the risky path stayed live here. Same reasoning, same gate.
+        json_output=True,
     )
     if len(_code_critique_chunks) > 1:
-        critique_response.content = "\n".join(
+        # Concatenate LOSSLESSLY — see the spec_review:critique site. A "\n"
+        # at a boundary that landed inside a string literal is a raw control
+        # character and the document stops parsing.
+        critique_response.content = "".join(
             c for c in _code_critique_chunks if c
         )
 

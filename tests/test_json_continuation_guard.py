@@ -120,6 +120,102 @@ class TestJsonOutputRefusesContinuation:
         assert budget == 6.0
 
 
+class TestDegenerateRepeatRefusesContinuation:
+    """A truncated turn that is mostly verbatim repeats is a stuck model, not
+    work in progress — continuing it re-sends the whole degenerate turn as
+    context and re-primes the loop.
+
+    lumina 01a079dc, repair round 9: 163 copies of the same four paragraphs
+    filled 32,768 output tokens over 4m19s ($0.039), and the harness then paid
+    for a continuation on top of it.
+    """
+
+    # Four distinct paragraphs, repeated — the shape of the real failure.
+    LOOP = "\n".join([
+        "The problem is that the database contains records from previous runs.",
+        "Since I can't edit the test conftest, I must modify production code.",
+        "Let me look at the create_app function and the initialization code.",
+        "The fix should be in server/app/main.py where create_app is defined.",
+    ] * 40)
+
+    def test_degenerate_initial_turn_is_not_continued(self):
+        _, budget, chunks = _run(
+            initial_response=_Resp(self.LOOP),
+            initial_budget=9.0, messages=[], dispatch=_never_called,
+            continue_prompt="c", enabled=True, role_label="repair",
+        )
+        # Whatever landed is kept — the caller's parser takes what it can.
+        assert chunks == [self.LOOP]
+        assert budget == 9.0
+
+    def test_loop_that_starts_mid_continuation_stops_there(self):
+        calls = []
+
+        async def _dispatch(msgs, budget):
+            calls.append(1)
+            return _Resp(self.LOOP), budget - 1
+
+        _, budget, chunks = _run(
+            initial_response=_Resp("head"),
+            initial_budget=9.0, messages=[], dispatch=_dispatch,
+            continue_prompt="c", enabled=True, role_label="repair",
+            max_cycles=5,
+        )
+        assert len(calls) == 1        # bailed instead of burning 5 cycles
+        assert chunks == ["head", self.LOOP]
+        assert budget == 8.0
+
+    def test_real_patch_output_is_not_mistaken_for_a_loop(self):
+        # REPLACE_BLOCK search/replace pairs repeat lines by construction; the
+        # highest legitimate ratio measured in 01a079dc was 0.462.
+        from harness.graph import _is_degenerate_repeat, _repetition_ratio
+        patch = (
+            "<<<REPLACE_BLOCK>>>\nfile: server/app/main.py\nsearch:\n"
+            + "\n".join(f"    value_{i} = compute_something(argument_{i})"
+                        for i in range(12))
+            + "\nreplace:\n"
+            + "\n".join(f"    value_{i} = compute_something(argument_{i})"
+                        for i in range(12))
+            + "\n<<<END_REPLACE_BLOCK>>>\n"
+        )
+        assert _repetition_ratio(patch) < 0.7
+        assert not _is_degenerate_repeat(patch)
+
+    def test_short_output_never_trips_the_detector(self):
+        from harness.graph import _repetition_ratio
+        assert _repetition_ratio("same line repeated\n" * 3) == 0.0
+
+
+class TestJsonCritiqueRolesStayDisabledInConfig:
+    """Both JSON-critique reviewers must stay off in the shipped config.
+
+    ``continue_on_length.doc_reviewer: true`` in config.json is what overrode
+    the module default and produced lumina 01a079dc's 4 wasted cycles (131k
+    output tokens, 16 min, input growing 87k → 186k). ``code_reviewer`` sat at
+    ``true`` beside it with a byte-identical JSON critique call site. The
+    ``json_output`` shape gate now protects both at the call site, but config
+    drifting back to ``true`` restores the cost even when the gate saves the
+    parse — so pin it.
+    """
+
+    ROLES = ("doc_reviewer", "code_reviewer")
+
+    def _config(self):
+        from harness.cli import _strip_comments, load_raw_config
+        return _strip_comments(load_raw_config())
+
+    def test_shipped_config_disables_json_critique_continuation(self):
+        cfg = self._config().get("llm_dispatch", {}).get("continue_on_length", {})
+        for role in self.ROLES:
+            assert cfg.get(role) is False, f"{role} must stay False in config.json"
+
+    def test_config_agrees_with_module_defaults(self):
+        from harness.graph import _CONTINUE_ON_LENGTH_DEFAULTS
+        cfg = self._config().get("llm_dispatch", {}).get("continue_on_length", {})
+        for role in self.ROLES:
+            assert cfg.get(role) == _CONTINUE_ON_LENGTH_DEFAULTS[role]
+
+
 class TestLosslessReassembly:
     """The concrete corruption, reproduced. A cycle boundary that lands inside
     a string literal is the case that matters; every other boundary is

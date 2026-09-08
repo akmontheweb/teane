@@ -5429,6 +5429,81 @@ class TestClaudeCodeStyleEditPipeline:
         from harness.graph import _format_preflight_file_content
         assert _format_preflight_file_content([]) == ""
 
+    def test_preflight_truncation_names_every_omitted_file(self):
+        # "omitted further files starting at X" named ONE path and left the
+        # rest invisible, so the model had no way to know which files it was
+        # reasoning about blind — and wrote SEARCH blocks from memory instead
+        # (session 01a079dc, server/app/main.py).
+        from harness.graph import (
+            _format_preflight_file_content, _PREFLIGHT_SECTION_CHAR_CAP,
+        )
+        big = "x" * (_PREFLIGHT_SECTION_CHAR_CAP // 2)
+        rendered = _format_preflight_file_content(
+            [("a.py", big), ("b.py", big), ("c.py", big), ("d.py", "tiny")],
+        )
+        assert "### `a.py`" in rendered
+        for dropped in ("`c.py`", "`d.py`"):
+            assert dropped in rendered.split("(omitted to keep")[1]
+        assert "READ_FILE" in rendered
+
+    def test_preflight_one_huge_file_does_not_hide_the_rest(self):
+        # A single over-cap file used to `break`, suppressing every smaller
+        # file queued behind it.
+        from harness.graph import (
+            _format_preflight_file_content, _PREFLIGHT_SECTION_CHAR_CAP,
+        )
+        rendered = _format_preflight_file_content(
+            [("small.py", "s = 1"), ("huge.py", "x" * _PREFLIGHT_SECTION_CHAR_CAP)],
+        )
+        assert "### `small.py`" in rendered
+        assert "`huge.py`" in rendered.split("(omitted to keep")[1]
+
+    def test_failure_content_section_is_capped_and_names_omissions(self):
+        # Sibling of _format_preflight_file_content, and it had no total cap
+        # at all: a round that missed across many large files would render
+        # every full view and crowd out the diagnostics below it.
+        from harness.graph import (
+            _format_current_file_content, _PREFLIGHT_SECTION_CHAR_CAP,
+            _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        big = "x" * (_PREFLIGHT_SECTION_CHAR_CAP // 2)
+        failures = [
+            {"file": f"{n}.py",
+             "error": f"Search block not found.\n"
+                      f"{_PATCH_ERROR_WIDER_CONTEXT_MARKER}\n{big}"}
+            for n in ("a", "b", "c", "d")
+        ]
+        rendered = _format_current_file_content(failures)
+        assert len(rendered) < _PREFLIGHT_SECTION_CHAR_CAP * 2
+        assert "### `a.py`" in rendered
+        tail = rendered.split("(omitted to keep")[1]
+        assert "`c.py`" in tail and "`d.py`" in tail
+        assert "READ_FILE" in tail
+
+    def test_failure_content_section_unchanged_when_it_fits(self):
+        from harness.graph import (
+            _format_current_file_content, _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        rendered = _format_current_file_content(
+            [{"file": "a.py",
+              "error": f"miss\n{_PATCH_ERROR_WIDER_CONTEXT_MARKER}\n 1| x = 1"}],
+        )
+        assert "### `a.py`" in rendered
+        assert "(omitted to keep" not in rendered
+
+    def test_truncate_middle_keeps_both_ends(self):
+        from harness.graph import _truncate_middle
+        text = "HEAD" + ("filler " * 2000) + "TAIL"
+        out = _truncate_middle(text, 400)
+        assert out.startswith("HEAD")
+        assert out.endswith("TAIL")
+        assert "elided from the middle" in out
+        assert len(out) < len(text)
+
+    def test_truncate_middle_is_a_noop_under_cap(self):
+        from harness.graph import _truncate_middle
+        assert _truncate_middle("short", 400) == "short"
+
     def test_b1_collect_records_hashes_when_dict_provided(self, tmp_path):
         from harness.graph import _collect_workspace_file_content
         (tmp_path / "a.py").write_text("a\n")

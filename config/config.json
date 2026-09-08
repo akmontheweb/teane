@@ -249,8 +249,8 @@
             "planning": true,
             "patching": true,
             "repair": true,
-            "doc_reviewer": true,
-            "code_reviewer": true
+            "doc_reviewer": false,
+            "code_reviewer": false
         },
         "max_continuation_cycles": 5,
         "patching_read_file_cap": 20,

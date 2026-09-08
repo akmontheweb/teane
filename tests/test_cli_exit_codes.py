@@ -104,6 +104,34 @@ class TestResolverPrecedence:
             final_state={"node_state": {"hitl_suspend": True}},
         ) == EXIT_PARTIAL_SUCCESS
 
+    def test_suspend_message_names_a_real_branch(self, caplog):
+        from harness.cli import _log_hitl_suspend
+
+        class _G:
+            _patch_branch = "agent/patch-01a079dc"
+
+        with caplog.at_level("INFO"):
+            _log_hitl_suspend(_G(), ["a.py", "b.py"], "01a079dc")
+        assert "on branch 'agent/patch-01a079dc'" in caplog.text
+        assert "2 LLM-modified file(s)" in caplog.text
+
+    def test_suspend_message_does_not_invent_a_branch(self, caplog):
+        # A workspace that is not a git repo (or --git false) has no patch
+        # branch. The message used to say "on branch 'agent/patch-<unknown>'",
+        # pointing the operator at a git recovery path that does not exist —
+        # lumina 01a079dc left 76 files with no repo, no branch, no stash.
+        from harness.cli import _log_hitl_suspend
+
+        class _G:
+            _patch_branch = None
+
+        with caplog.at_level("INFO"):
+            _log_hitl_suspend(_G(), ["a.py"], "01a079dc")
+        assert "<unknown>" not in caplog.text
+        assert "on disk only" in caplog.text
+        # Resume genuinely does work from workspace state in both cases.
+        assert "teane resume --session-id 01a079dc" in caplog.text
+
     def test_nonzero_graph_exit_without_flags_is_partial(self):
         assert _resolve_cli_exit_code(
             graph_exit_code=1,

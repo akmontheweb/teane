@@ -219,6 +219,32 @@ class _NullGitGuardian:
     def restore_original_branch(self) -> bool: return False
 
 
+def _log_hitl_suspend(git_guardian: Any, modified_files: Any, session_id: str) -> None:
+    """Tell the operator where their suspended work actually is.
+
+    ``GitGuardian._patch_branch`` is None whenever no patch branch exists — a
+    workspace that is not a git repo, or ``--git false``. The message used to
+    fill that hole with the literal string ``agent/patch-<unknown>``, telling
+    the operator their work sat on a branch that had never been created and
+    pointing them at a git recovery path that does not exist for them (lumina
+    session 01a079dc: 76 modified files, no repo, no branch, no stash). The
+    files ARE on disk and ``teane resume`` DOES work in both cases — only the
+    branch claim was false, so say the true thing instead.
+    """
+    branch = getattr(git_guardian, "_patch_branch", None)
+    where = (
+        f"on branch '{branch}'" if branch
+        else "on disk only (no patch branch — the workspace is not a git "
+             "repo, or --git false)"
+    )
+    logger.info(
+        "[cli] HITL suspend: leaving %d LLM-modified file(s) %s. Resume with "
+        "`teane resume --session-id %s` to continue from the same workspace "
+        "state.",
+        len(modified_files), where, session_id,
+    )
+
+
 def _make_git_guardian(workspace_path: str) -> Any:
     """Return a real ``GitGuardian`` when ``--git true`` is in effect,
     otherwise a no-op :class:`_NullGitGuardian`. One place to swap so the
@@ -8282,13 +8308,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # can list it with `git stash list` and pop it manually if they
         # need the prior work); popping it here could merge-conflict with
         # the LLM's edits and surprise the operator.
-        agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
-        logger.info(
-            "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
-            "'%s'. Resume with `teane resume --session-id %s` to continue "
-            "from the same workspace state.",
-            len(modified_files), agent_branch, session_id,
-        )
+        _log_hitl_suspend(git_guardian, modified_files, session_id)
     elif hitl_abandon:
         # Abandon = user explicitly confirmed "throw it away." The HITL
         # handler already ran _attempt_git_rollback(workspace_path); the
@@ -9108,13 +9128,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     hitl_abandon = bool(node_state.get("hitl_abandon"))
 
     if hitl_suspend:
-        agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
-        logger.info(
-            "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
-            "'%s'. Resume with `teane resume --session-id %s` to continue "
-            "from the same workspace state.",
-            len(modified_files), agent_branch, args.session_id,
-        )
+        _log_hitl_suspend(git_guardian, modified_files, args.session_id)
     elif hitl_abandon:
         git_guardian.rollback(modified_files)
         git_guardian.pop_stash()

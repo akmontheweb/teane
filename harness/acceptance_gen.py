@@ -66,6 +66,11 @@ _DEFAULT_ALTITUDES = (ALTITUDE_INTEGRATION, ALTITUDE_E2E)
 # apps enforcing a loopback+port Host policy accept in-process requests.
 _ACCEPTANCE_BASE_URL = "http://127.0.0.1:8000"
 
+#: Marker written into the generated conftest's module docstring. The repair
+#: loop's test-tamper guard keys its fixture carve-out off this string, so it is
+#: part of the contract between the two — do not reword it in isolation.
+GENERATED_CONFTEST_MARKER = "AUTO-GENERATED acceptance conftest (ADR-0006)"
+
 # The exact placeholder the Phase-4 scaffold emitted — a scenario whose only
 # assertion is "the page has a non-empty title" is not a verification of
 # anything, so we reject it outright.
@@ -159,7 +164,32 @@ class AcceptanceGenResult:
 # Prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
+#: Substituted into :data:`_SYSTEM_PROMPT_TEMPLATE` when the conftest really does
+#: hand each test its own database.
+_DB_ISOLATED_RULE = """\
+- Each test gets a FRESH ISOLATED database, so state from other scenarios can \
+  never leak in. You may assert on collection totals and assert emptiness \
+  directly for an "empty state" criterion."""
+
+#: Substituted when DB isolation could NOT be arranged. The generator previously
+#: shipped the isolated wording unconditionally, which is what licensed
+#: ``assert len(items) == 3`` against a database shared by the whole suite —
+#: lumina session 01a079dc, where that assertion saw 57 rows and could never pass.
+_DB_SHARED_RULE = """\
+- CRITICAL — the database is SHARED by every test in the run and is NOT reset \
+  between tests. It WILL already hold rows written by other scenarios, and the \
+  rows you write persist for later ones. Therefore:
+  * NEVER assert on the size of a whole collection (`assert len(items) == 3`) \
+    and never compare a whole response list for equality. Such an assertion is \
+    a guaranteed false failure and will be rejected.
+  * Scope EVERY assertion to the rows YOU created: give each row a unique \
+    generated value, filter the response down to those rows, then assert on the \
+    filtered subset — including ordering, which you assert as the RELATIVE order \
+    of your own rows.
+  * An "empty state" criterion CANNOT be verified here. Assert the behaviour you \
+    can prove from your own rows instead, or classify the criterion "ui-only"."""
+
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are a senior test engineer writing ACCEPTANCE tests for one user story.
 
 For each acceptance criterion you MUST decide a classification and emit runnable \
@@ -183,8 +213,8 @@ Hard requirements — a scenario with any of these is useless and will be reject
 - integration bodies MUST be SELF-CONTAINED: arrange every prerequisite via the \
   API inside the test (e.g. POST a contact before you PATCH or DELETE it), and use \
   unique/generated field values so the test is robust to any shared state. NEVER \
-  assume pre-seeded rows exist. For an "empty state" criterion, the harness gives \
-  each test a fresh isolated database, so you may assert emptiness directly.
+  assume pre-seeded rows exist.
+{db_isolation_rule}
 - e2e bodies: use `page` and real selectors/roles + `await expect(...)`. Assume \
   the app is served at the configured base URL.
 - Do NOT mock internal modules (db, repositories, services). Exercise real \
@@ -210,6 +240,24 @@ Return STRICT JSON, no prose, no markdown fences, exactly:
 Emit one object per acceptance criterion, in order. `body` values are the INSIDE \
 of the test function only (the harness adds the signature and the @verifies marker).\
 """
+
+_DB_ISOLATION_SLOT = "{db_isolation_rule}"
+
+
+def build_system_prompt(*, db_isolated: bool) -> str:
+    """Render the scenario-generation system prompt for this workspace.
+
+    ``db_isolated`` must reflect what the conftest ACTUALLY provides (i.e.
+    whether :func:`discover_db_override` found an override). Telling the model it
+    has isolation when it does not produces tests that assert on collection
+    totals against a suite-wide shared database — tests no production code can
+    ever make pass, which is how a repair loop reaches HITL with zero patches.
+    """
+    # ``str.replace``, not ``str.format``: the prompt embeds a literal JSON
+    # schema full of braces.
+    return _SYSTEM_PROMPT_TEMPLATE.replace(
+        _DB_ISOLATION_SLOT, _DB_ISOLATED_RULE if db_isolated else _DB_SHARED_RULE,
+    )
 
 
 def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str:
@@ -257,12 +305,15 @@ async def generate_acceptance_scenarios(
     gateway: Any,
     budget_remaining_usd: float,
     config: Optional[dict[str, Any]] = None,
+    db_isolated: bool = False,
 ) -> AcceptanceGenResult:
     """Generate + validate dual-altitude scenarios for one story via the LLM.
 
     ``gateway`` is dependency-injected (the global one in production, a fake in
-    tests). Fail-soft: any dispatch/parse error returns an empty LLM result — the
-    caller decides whether to fall back. Never raises on model output.
+    tests). ``db_isolated`` must mirror what the rendered conftest provides — it
+    selects the shared-vs-isolated database contract the model writes against.
+    Fail-soft: any dispatch/parse error returns an empty LLM result — the caller
+    decides whether to fall back. Never raises on model output.
     """
     config = config or {}
     max_scenarios = int(config.get("max_scenarios_per_story", _DEFAULT_MAX_SCENARIOS_PER_STORY))
@@ -272,7 +323,7 @@ async def generate_acceptance_scenarios(
     from harness.trust import strip_code_fences
 
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt(db_isolated=db_isolated)},
         {"role": "user", "content": build_user_prompt(ctx, max_scenarios=max_scenarios)},
     ]
 
@@ -281,7 +332,12 @@ async def generate_acceptance_scenarios(
             messages=messages,
             role=NodeRole.PLANNING,
             budget_remaining_usd=budget_remaining_usd,
-            cache_family="acceptance:scenario_gen",
+            # The system prompt differs between the isolated and shared-DB
+            # contracts, so they must not share a cache prefix.
+            cache_family=(
+                "acceptance:scenario_gen:isolated" if db_isolated
+                else "acceptance:scenario_gen:shared"
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — model/transport failure must not raise
         logger.warning("[acceptance_gen] dispatch failed for %s: %s", ctx.story_key, exc)
@@ -680,20 +736,75 @@ def discover_app_factory(workspace_path: str, *, max_files: int = 300) -> Option
     return factory or singleton
 
 
-# pydantic-settings config classes declare an env prefix; a DB-path field under
-# that prefix is controllable via ``{PREFIX}{FIELD_UPPER}``. Discovering it lets
-# the conftest give each test an isolated database.
-_ENV_PREFIX_RE = re.compile(r"env_prefix\s*=\s*[\"']([A-Za-z0-9_]+)[\"']")
-_DB_FIELD_RE = re.compile(r"^\s*(db_path|database_path|db_file|sqlite_path)\s*[:=]", re.MULTILINE)
+# pydantic-settings config classes expose every field as an env var. A DB-path
+# field is therefore controllable via ``{PREFIX}{FIELD_UPPER}`` — where PREFIX is
+# the class's declared ``env_prefix`` or, far more commonly, nothing at all.
+# Discovering that var is what lets the conftest give each test its own database.
+#
+# ``env_prefix`` is OPTIONAL: pydantic-settings defaults to the empty prefix, so
+# a plain ``class Settings(BaseSettings): database_url: str = ...`` is driven by
+# ``DATABASE_URL``. Requiring an explicit prefix (as this did) silently disabled
+# isolation for the majority of real apps — lumina session 01a079dc burned nine
+# repair rounds and a HITL on one shared ``./birthday_manager.db`` because of it.
+_ENV_PREFIX_RE = re.compile(r"env_prefix\s*=\s*[\"']([A-Za-z0-9_]*)[\"']")
+# ``BaseSettings`` anchors the match to a real settings class, which is what
+# makes the empty-prefix default safe to assume.
+_BASE_SETTINGS_RE = re.compile(r"\bBaseSettings\b")
+# Path-valued DB fields (a bare filesystem path) and URL-valued ones (a
+# SQLAlchemy/DSN URL). The two need DIFFERENT override values, so they are
+# matched separately rather than lumped into one alternation.
+_DB_PATH_FIELD_RE = re.compile(
+    r"^\s*(db_path|database_path|db_file|db_filename|sqlite_path|sqlite_file)\s*[:=]",
+    re.MULTILINE,
+)
+_DB_URL_FIELD_RE = re.compile(
+    r"^\s*(database_url|database_uri|db_url|db_uri|db_dsn|database_dsn"
+    r"|sqlalchemy_database_uri|sqlalchemy_database_url)\s*[:=]",
+    re.MULTILINE,
+)
+
+#: ``kind`` values for :class:`DbOverride` — how the env var's value is shaped.
+DB_VALUE_PATH = "path"
+DB_VALUE_URL = "url"
 
 
-def discover_db_env_var(workspace_path: str, *, max_files: int = 300) -> Optional[str]:
-    """Best-effort discovery of the env var that overrides the app's DB path.
+@dataclass(frozen=True)
+class DbOverride:
+    """The env var that re-points an app's database, and its value shape.
 
-    Looks for a pydantic-settings class with an ``env_prefix`` and a DB-path
-    field (``db_path`` etc.), and returns ``{PREFIX}{FIELD_UPPER}`` (e.g.
-    ``LUMINA_DB_PATH``). None when nothing matches — the conftest then skips
-    isolation and relies on self-contained scenarios.
+    ``kind`` is :data:`DB_VALUE_PATH` when the app wants a bare filesystem path
+    (``LUMINA_DB_PATH=/tmp/x/acceptance.db``) or :data:`DB_VALUE_URL` when it
+    wants a SQLAlchemy-style URL (``DATABASE_URL=sqlite:////tmp/x/acceptance.db``).
+    Writing a bare path into a URL-shaped setting produces an app that cannot
+    build its engine, so the distinction is load-bearing.
+    """
+
+    env_var: str
+    kind: str = DB_VALUE_PATH
+
+
+def _override_kind_for_name(env_var: str) -> str:
+    """Infer the value shape from an env var NAME alone.
+
+    Used for the operator-supplied ``acceptance.db_path_env`` override, where
+    there is no source field to inspect.
+    """
+    tail = env_var.rsplit("_", 1)[-1].upper()
+    return DB_VALUE_URL if tail in ("URL", "URI", "DSN") else DB_VALUE_PATH
+
+
+def discover_db_override(
+    workspace_path: str, *, max_files: int = 300,
+) -> Optional[DbOverride]:
+    """Best-effort discovery of the env var that overrides the app's database.
+
+    Looks for a pydantic-settings class (``BaseSettings``) carrying a DB-path or
+    DB-URL field, and returns ``{PREFIX}{FIELD_UPPER}`` with the value shape the
+    field expects. ``env_prefix`` is honoured when declared and treated as empty
+    when it isn't — matching pydantic-settings' own default.
+
+    Returns None when nothing matches; the caller then renders a conftest with
+    no isolation AND must tell the scenario generator that the DB is shared.
     """
     _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
     scanned = 0
@@ -712,11 +823,24 @@ def discover_db_env_var(workspace_path: str, *, max_files: int = 300) -> Optiona
                     text = fh.read()
             except OSError:
                 continue
+            if not _BASE_SETTINGS_RE.search(text):
+                continue
             pm = _ENV_PREFIX_RE.search(text)
-            fm = _DB_FIELD_RE.search(text)
-            if pm and fm:
-                return f"{pm.group(1)}{fm.group(1).upper()}"
+            prefix = pm.group(1) if pm else ""
+            # Prefer an explicit path field: it needs no value rewriting.
+            fm = _DB_PATH_FIELD_RE.search(text)
+            if fm:
+                return DbOverride(f"{prefix}{fm.group(1).upper()}", DB_VALUE_PATH)
+            fm = _DB_URL_FIELD_RE.search(text)
+            if fm:
+                return DbOverride(f"{prefix}{fm.group(1).upper()}", DB_VALUE_URL)
     return None
+
+
+def discover_db_env_var(workspace_path: str, *, max_files: int = 300) -> Optional[str]:
+    """Name-only view of :func:`discover_db_override` (back-compat shim)."""
+    found = discover_db_override(workspace_path, max_files=max_files)
+    return found.env_var if found else None
 
 
 # Self-contained (stdlib-only) seed applier inlined into the generated conftest.
@@ -760,24 +884,58 @@ def _apply_seed(db_path):
 '''
 
 
+# Fresh-import helper inlined into the ISOLATED conftest. Re-pointing the DB env
+# var is not enough on its own: apps routinely bind the engine at import time
+# (``engine = create_engine(get_settings().database_url)``) and cache settings
+# behind ``functools.lru_cache``. Once the app package is in ``sys.modules`` the
+# env var is never re-read, so every test after the first would silently share
+# test #1's database — the same shared-state failure the isolation exists to
+# prevent. Dropping the app's modules before each build forces a genuine re-read.
+_FRESH_IMPORT_SRC = '''\
+def _purge_app_modules():
+    """Drop the app's already-imported modules so it re-reads the DB env var."""
+    import sys
+    for _name in [
+        _m for _m in list(sys.modules)
+        if _m == _APP_ROOT_PKG or _m.startswith(_APP_ROOT_PKG + ".")
+    ]:
+        sys.modules.pop(_name, None)
+
+
+def _build_app():
+    """Import the app fresh and build it against the current environment."""
+    import importlib
+    _purge_app_modules()
+    _obj = getattr(importlib.import_module(_APP_MODULE), _APP_SYMBOL)
+    return _obj() if _APP_IS_FACTORY else _obj
+'''
+
+
 def render_acceptance_conftest(
     discovery: dict[str, str],
     *,
     db_env_var: Optional[str] = None,
+    db_value_kind: str = DB_VALUE_PATH,
     seed: bool = False,
 ) -> str:
     """Render a pytest ``conftest.py`` providing the ``client`` fixture.
 
     Builds a FastAPI ``TestClient`` from the discovered app (factory or
     singleton). When ``db_env_var`` is known, each test gets a FRESH isolated
-    SQLite database (the env var is pointed at a per-test temp file before the app
-    is built, so the app migrates a clean DB) — this is what lets "empty state"
-    and mutation criteria verify deterministically, and it is also the only mode
-    that can apply a seed (a known DB path). When ``seed`` is set, a sibling
-    ``seed.json`` is inserted into the migrated schema after app startup. Without
-    isolation the fixture still yields a client and self-contained scenarios carry
-    verification. Any build/seed failure surfaces as a fixture error, which the run
-    engine defers — never a false acceptance failure.
+    SQLite database: the env var is pointed at a per-test temp file and the app's
+    modules are dropped from ``sys.modules`` before it is imported, so the app
+    genuinely migrates a clean DB even when it binds its engine at import time.
+    ``db_value_kind`` says whether the app wants a bare path (:data:`DB_VALUE_PATH`)
+    or a SQLAlchemy URL (:data:`DB_VALUE_URL`) in that var.
+
+    Isolation is what lets "empty state" and mutation criteria verify
+    deterministically, and it is also the only mode that can apply a seed (a known
+    DB path). When ``seed`` is set, a sibling ``seed.json`` is inserted into the
+    migrated schema after app startup. Without isolation the fixture still yields a
+    client, and the scenario generator MUST be told the DB is shared (see
+    :func:`build_system_prompt`) so it never asserts on collection totals. Any
+    build/seed failure surfaces as a fixture error, which the run engine defers —
+    never a false acceptance failure.
     """
     module = discovery["module"]
     symbol = discovery["symbol"]
@@ -785,22 +943,40 @@ def render_acceptance_conftest(
     build = f"{symbol}()" if kind == "factory" else symbol
     seed = seed and bool(db_env_var)  # seeding needs a known (isolated) DB path
 
-    header = (
-        '"""AUTO-GENERATED acceptance conftest (ADR-0006). Provides the in-process\n'
+    docstring = (
+        f'"""{GENERATED_CONFTEST_MARKER}. Provides the in-process\n'
         '`client` fixture the integration acceptance tests use."""\n\n'
-        "import os\n"
-        "import shutil\n"
-        "import tempfile\n"
-        "import pytest\n"
-        "from fastapi.testclient import TestClient\n\n"
-        f"from {module} import {symbol}\n\n"
+    )
+    # Import only what each mode actually uses — a conftest carrying unused
+    # ``shutil``/``tempfile`` imports is what made the missing isolation on lumina
+    # session 01a079dc look intentional for nine repair rounds.
+    imports = ""
+    if db_env_var:
+        imports += "import os\nimport shutil\nimport tempfile\n"
+    imports += "import pytest\nfrom fastapi.testclient import TestClient\n\n"
+    if db_env_var:
+        # NO module-level app import: it would bind the engine to the real
+        # database before the fixture ever re-points the env var.
+        imports += (
+            f"_APP_MODULE = {module!r}\n"
+            f"_APP_SYMBOL = {symbol!r}\n"
+            f"_APP_IS_FACTORY = {kind == 'factory'!r}\n"
+            f"_APP_ROOT_PKG = {module.split('.')[0]!r}\n"
+        )
+    else:
+        imports += f"from {module} import {symbol}\n"
+
+    header = (
+        docstring
+        + imports
+        + "\n"
         # A loopback base URL WITH a port so apps that harden the bind/Host (e.g.
         # a "loopback + port required" NFR) accept the in-process test requests.
-        f"_ACCEPTANCE_BASE_URL = {_ACCEPTANCE_BASE_URL!r}\n\n\n"
+        + f"_ACCEPTANCE_BASE_URL = {_ACCEPTANCE_BASE_URL!r}\n\n\n"
         # Drop caller-supplied Host/Origin so the loopback base_url always wins —
         # a generated test that sets its own Host must not defeat a loopback/CORS
         # policy. Deterministic; does not depend on the model omitting headers.
-        "class _Client(TestClient):\n"
+        + "class _Client(TestClient):\n"
         "    def request(self, method, url, **kwargs):\n"
         "        _h = kwargs.get('headers')\n"
         "        if _h:\n"
@@ -808,11 +984,18 @@ def render_acceptance_conftest(
         "                                 if k.lower() not in ('host', 'origin')}\n"
         "        return super().request(method, url, **kwargs)\n\n\n"
     )
+    if db_env_var:
+        header += _FRESH_IMPORT_SRC + "\n\n"
     if seed:
         header += _SEED_APPLIER_SRC + "\n\n"
 
     if db_env_var:
         seed_call = "            _apply_seed(_db)\n" if seed else ""
+        # URL-shaped settings need a DSN, not a bare path. ``sqlite:///`` + an
+        # absolute path yields the four-slash absolute form SQLAlchemy expects.
+        db_value = (
+            "'sqlite:///' + _db" if db_value_kind == DB_VALUE_URL else "_db"
+        )
         # A fresh temp DIRECTORY (not just a temp file): apps commonly harden the
         # DB's parent dir (chmod 0700) on startup, which fails against the shared
         # system temp root. A per-test dir gives them their own directory to lock.
@@ -824,9 +1007,9 @@ def render_acceptance_conftest(
             "    _dir = tempfile.mkdtemp(prefix='acc_')\n"
             "    _db = os.path.join(_dir, 'acceptance.db')\n"
             f"    _prev = os.environ.get({db_env_var!r})\n"
-            f"    os.environ[{db_env_var!r}] = _db\n"
+            f"    os.environ[{db_env_var!r}] = {db_value}\n"
             "    try:\n"
-            f"        app = {build}\n"
+            "        app = _build_app()\n"
             "        with _Client(app, base_url=_ACCEPTANCE_BASE_URL, raise_server_exceptions=False) as c:\n"
             f"{seed_call}"
             "            yield c\n"
@@ -1165,10 +1348,12 @@ __all__ = [
     "ALTITUDE_INTEGRATION", "ALTITUDE_E2E", "CLASS_BACKEND", "CLASS_UI",
     "StoryAcceptanceContext", "AcceptanceScenario", "AcceptanceGenResult",
     "generate_acceptance_scenarios", "fallback_acceptance_scenarios",
-    "validate_scenarios", "build_user_prompt",
+    "validate_scenarios", "build_user_prompt", "build_system_prompt",
     "render_integration_file", "render_e2e_spec", "integration_function_name",
     "discover_routes", "gather_story_acceptance_context",
     "discover_app_factory", "render_acceptance_conftest", "discover_db_env_var",
+    "discover_db_override", "DbOverride", "DB_VALUE_PATH", "DB_VALUE_URL",
+    "GENERATED_CONFTEST_MARKER",
     # Seed generator
     "SeedContext", "SeedGenResult", "generate_seed_data_llm", "validate_seed",
     "build_seed_prompt", "discover_table_schemas", "gather_seed_context",

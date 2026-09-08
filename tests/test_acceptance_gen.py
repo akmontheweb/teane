@@ -454,10 +454,45 @@ class TestAppDiscoveryAndConftest:
             "    db_path: str = './data/lumina.db'\n"
         )
         assert ag.discover_db_env_var(str(tmp_path)) == "LUMINA_DB_PATH"
+        assert ag.discover_db_override(str(tmp_path)).kind == ag.DB_VALUE_PATH
+
+    def test_discovers_url_field_without_env_prefix(self, tmp_path):
+        # pydantic-settings defaults to NO prefix, so `database_url` is driven
+        # by bare DATABASE_URL. Requiring an explicit env_prefix silently
+        # disabled isolation for this (very common) shape — lumina 01a079dc.
+        app_dir = tmp_path / "server" / "app"
+        app_dir.mkdir(parents=True)
+        (app_dir / "config.py").write_text(
+            "from pydantic_settings import BaseSettings, SettingsConfigDict\n"
+            "class Settings(BaseSettings):\n"
+            "    model_config = SettingsConfigDict(env_file='.env', extra='ignore')\n"
+            "    database_url: str = 'sqlite:///./birthday_manager.db'\n"
+        )
+        found = ag.discover_db_override(str(tmp_path))
+        assert found == ag.DbOverride("DATABASE_URL", ag.DB_VALUE_URL)
+
+    def test_path_field_preferred_over_url_field(self, tmp_path):
+        app_dir = tmp_path / "app"
+        app_dir.mkdir(parents=True)
+        (app_dir / "settings.py").write_text(
+            "from pydantic_settings import BaseSettings\n"
+            "class Settings(BaseSettings):\n"
+            "    database_url: str = 'sqlite:///./x.db'\n"
+            "    db_path: str = './x.db'\n"
+        )
+        # A bare path needs no value rewriting, so it wins when both exist.
+        assert ag.discover_db_override(str(app_dir.parent)).kind == ag.DB_VALUE_PATH
 
     def test_db_env_var_none_when_absent(self, tmp_path):
-        (tmp_path / "x.py").write_text("db_path = './x.db'\n")  # no env_prefix
+        # A bare module-level assignment is not a settings class.
+        (tmp_path / "x.py").write_text("db_path = './x.db'\n")
         assert ag.discover_db_env_var(str(tmp_path)) is None
+        assert ag.discover_db_override(str(tmp_path)) is None
+
+    def test_override_kind_inferred_from_name(self):
+        assert ag._override_kind_for_name("APP_DATABASE_URL") == ag.DB_VALUE_URL
+        assert ag._override_kind_for_name("APP_DB_DSN") == ag.DB_VALUE_URL
+        assert ag._override_kind_for_name("APP_DB_PATH") == ag.DB_VALUE_PATH
 
     def test_conftest_isolation_block_when_db_env_var(self):
         out = ag.render_acceptance_conftest(
@@ -466,15 +501,53 @@ class TestAppDiscoveryAndConftest:
         )
         assert "tempfile.mkdtemp" in out  # a fresh temp DIR (apps harden the parent)
         assert "os.environ['LUMINA_DB_PATH'] = _db" in out
-        assert "app = create_app()" in out
+        # Built through the deferred-import helper, NOT a module-level import:
+        # importing the app before the env var is re-pointed binds the engine
+        # to the real database.
+        assert "app = _build_app()" in out
+        assert "from server.app.main import create_app" not in out
+        assert "_purge_app_modules" in out
+        assert "_APP_ROOT_PKG = 'server'" in out
         # restores prior value + cleans the temp dir
         assert "shutil.rmtree(_dir" in out
         assert "_prev" in out
+
+    def test_conftest_url_valued_override_gets_a_dsn(self):
+        out = ag.render_acceptance_conftest(
+            {"module": "server.app.main", "symbol": "create_app", "kind": "factory"},
+            db_env_var="DATABASE_URL", db_value_kind=ag.DB_VALUE_URL,
+        )
+        # A bare path in a URL-shaped setting yields an app that can't build
+        # its engine at all.
+        assert "os.environ['DATABASE_URL'] = 'sqlite:///' + _db" in out
 
     def test_conftest_no_isolation_without_db_env_var(self):
         out = ag.render_acceptance_conftest(
             {"module": "m", "symbol": "create_app", "kind": "factory"})
         assert "tempfile.mkdtemp" not in out
+
+    def test_conftest_has_no_unused_imports(self):
+        # The unused os/shutil/tempfile in the non-isolated conftest made the
+        # missing isolation look deliberate for nine repair rounds.
+        import ast
+        for kwargs in ({}, {"db_env_var": "DATABASE_URL"}):
+            out = ag.render_acceptance_conftest(
+                {"module": "server.app.main", "symbol": "create_app",
+                 "kind": "factory"}, **kwargs)
+            tree = ast.parse(out)
+            imported = {
+                alias.asname or alias.name.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import) for alias in node.names
+            }
+            used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            assert not (imported - used), f"unused imports in {kwargs}: {imported - used}"
+
+    def test_generated_conftest_carries_the_guard_marker(self):
+        # The repair loop's test-guard carve-out keys off this exact string.
+        out = ag.render_acceptance_conftest(
+            {"module": "m", "symbol": "create_app", "kind": "factory"})
+        assert ag.GENERATED_CONFTEST_MARKER in out
 
     def test_conftest_with_seed_is_valid_and_applies(self):
         import ast
@@ -503,6 +576,29 @@ class TestPrompt:
         assert "POST /contacts" in p
         assert "STORY-001" in p
         assert "at most 10" in p
+
+    def test_system_prompt_promises_isolation_only_when_isolated(self):
+        iso = ag.build_system_prompt(db_isolated=True)
+        assert "FRESH ISOLATED database" in iso
+        assert "You may assert on collection totals" in iso
+        assert "SHARED by every test" not in iso
+
+    def test_system_prompt_forbids_collection_totals_when_shared(self):
+        # Shipping the isolated wording against a suite-wide shared DB is what
+        # produced `assert len(items) == 3` on a 57-row response — a test no
+        # production change could ever make pass (lumina 01a079dc).
+        shared = ag.build_system_prompt(db_isolated=False)
+        assert "SHARED by every test" in shared
+        assert "assert len(items) == 3" in shared  # named as the anti-pattern
+        assert "FRESH ISOLATED database" not in shared
+
+    def test_system_prompt_leaves_no_unsubstituted_slot(self):
+        for isolated in (True, False):
+            p = ag.build_system_prompt(db_isolated=isolated)
+            assert ag._DB_ISOLATION_SLOT not in p
+            # The literal JSON schema's braces must survive intact — this is
+            # why the slot is replaced, not `str.format`-ed.
+            assert '"scenarios": [' in p
 
 
 # ---------------------------------------------------------------------------

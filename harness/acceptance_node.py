@@ -94,8 +94,16 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
         from harness.graph import get_gateway  # lazy
         gateway = get_gateway()
 
+    # Resolve DB isolation ONCE, before generation. The scenario prompt and the
+    # rendered conftest must agree: a generator told it has a fresh database
+    # writes collection-total assertions, and if the conftest then hands it a
+    # suite-wide shared DB those tests can never pass no matter what the repair
+    # loop does to the production code (lumina session 01a079dc → zero-patch HITL).
+    db_override = _resolve_db_override(workspace, cfg)
+
     scenarios, budget = await _generate_batch_scenarios(
         workspace, story_keys, cfg, gateway=gateway, budget=budget,
+        db_isolated=db_override is not None,
     )
     # ui-only ACs (no integration scenario) are recorded as needs-browser deferrals.
     _persist_ui_only_deferrals(workspace, app_name, scenarios)
@@ -109,7 +117,10 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     seed_dict, budget = await _generate_seed(workspace, cfg, gateway=gateway, budget=budget)
 
     # --- 2. write conftest + integration files ---------------------------------
-    written = _write_integration_suite(workspace, integ_dir_rel, runnable, cfg, seed=seed_dict)
+    written = _write_integration_suite(
+        workspace, integ_dir_rel, runnable, cfg, seed=seed_dict,
+        db_override=db_override,
+    )
     if not written:
         return _passthrough(state, reason="could not write integration suite / no app client")
 
@@ -169,6 +180,36 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
 # ---------------------------------------------------------------------------
 
 
+def _resolve_db_override(
+    workspace: str, cfg: dict[str, Any],
+) -> Optional[ag.DbOverride]:
+    """Decide how (or whether) each acceptance test gets its own database.
+
+    Operator override (``acceptance.db_path_env``) wins; otherwise auto-discover
+    from the app's pydantic-settings class. Returns None when isolation cannot be
+    arranged — and says so at WARNING, because that silently degrades every
+    acceptance criterion that depends on a known-empty database.
+    """
+    forced = str(cfg.get("db_path_env", "") or "")
+    if forced:
+        return ag.DbOverride(forced, ag._override_kind_for_name(forced))
+    found = ag.discover_db_override(workspace)
+    if found is None:
+        logger.warning(
+            "[acceptance] no DB override env var discovered — acceptance tests "
+            "will SHARE one database across the whole suite. Scenarios will be "
+            "generated under the shared-DB contract (no collection-total "
+            "assertions). Set `acceptance.db_path_env` to the env var that "
+            "re-points this app's database to restore per-test isolation.",
+        )
+    else:
+        logger.info(
+            "[acceptance] per-test DB isolation via %s (%s-valued).",
+            found.env_var, found.kind,
+        )
+    return found
+
+
 async def _generate_batch_scenarios(
     workspace: str,
     story_keys: list[str],
@@ -176,6 +217,7 @@ async def _generate_batch_scenarios(
     *,
     gateway: Any,
     budget: float,
+    db_isolated: bool = False,
 ) -> tuple[list[ag.AcceptanceScenario], float]:
     """Generate scenarios for every story in the batch (LLM or fallback)."""
     all_scen: list[ag.AcceptanceScenario] = []
@@ -187,6 +229,7 @@ async def _generate_batch_scenarios(
         if use_llm:
             res = await ag.generate_acceptance_scenarios(
                 ctx, gateway=gateway, budget_remaining_usd=budget, config=cfg,
+                db_isolated=db_isolated,
             )
             budget = res.budget_remaining_usd
         else:
@@ -224,22 +267,27 @@ async def _generate_seed(
 def _write_integration_suite(
     workspace: str, integ_dir_rel: str, runnable: list[ag.AcceptanceScenario],
     cfg: dict[str, Any], *, seed: Optional[dict[str, Any]] = None,
+    db_override: Optional[ag.DbOverride] = None,
 ) -> list[str]:
     """Write one pytest module per story + a shared conftest. Return abs paths.
 
     Returns [] when no app client can be built (no ``client`` fixture ⇒ nothing
     can run ⇒ the caller safely passes through rather than emitting failures).
-    When ``seed`` carries rows AND the DB can be isolated, ``seed.json`` is written
-    and the conftest applies it to each test's fresh database.
+    ``db_override`` is the isolation decision made before generation (see
+    :func:`_resolve_db_override`) so the conftest matches the contract the
+    scenarios were written against; it is re-resolved here only when the caller
+    passed nothing. When ``seed`` carries rows AND the DB can be isolated,
+    ``seed.json`` is written and the conftest applies it to each fresh database.
     """
     discovery = ag.discover_app_factory(workspace)
     if discovery is None:
         logger.info("[acceptance] no FastAPI app discovered — cannot build client fixture.")
         return []
 
-    # DB isolation env var: operator override wins; else auto-discover (pydantic
-    # settings env_prefix + db-path field). None → conftest skips isolation.
-    db_env_var = str(cfg.get("db_path_env", "") or "") or ag.discover_db_env_var(workspace)
+    if db_override is None:
+        db_override = _resolve_db_override(workspace, cfg)
+    db_env_var = db_override.env_var if db_override else None
+    db_value_kind = db_override.kind if db_override else ag.DB_VALUE_PATH
     seed_rows = bool((seed or {}).get("tables"))
     apply_seed = seed_rows and bool(db_env_var)
 
@@ -247,7 +295,8 @@ def _write_integration_suite(
     try:
         os.makedirs(out_dir, exist_ok=True)
         conftest = ag.render_acceptance_conftest(
-            discovery, db_env_var=db_env_var, seed=apply_seed)
+            discovery, db_env_var=db_env_var, db_value_kind=db_value_kind,
+            seed=apply_seed)
         with open(os.path.join(out_dir, "conftest.py"), "w", encoding="utf-8") as fh:
             fh.write(conftest)
         if apply_seed:

@@ -27667,6 +27667,95 @@ async def _reset_stale_gate_counters_on_resume(
         )
 
 
+#: State channels that carry CONFIGURATION rather than work. On resume these
+#: must be refreshed from config.json; every other channel (messages,
+#: loop_counter, node_state, current_gate, …) must survive untouched.
+#: Kept in sync with the ``initial_state[...] = ...`` config assignments in
+#: :func:`run_graph`.
+_CONFIG_STATE_CHANNELS: tuple[str, ...] = (
+    "lintgate_config",
+    "diagnostics_config",
+    "post_mortem_config",
+    "deployment_config",
+    "deployment_defaults",
+    "test_generation_config",
+    "test_regeneration_config",
+    "acceptance_config",
+    "decomposition_config",
+    "speculative_config",
+    "change_requests_config",
+    "repo_memory_config",
+    "repo_index_config",
+    "llm_dispatch_config",
+    "compiler_config",
+    "sandbox_config",
+    "retrieval_tools_config",
+)
+
+
+async def _refresh_config_channels_on_resume(
+    compiled_graph: Any,
+    graph_config: dict[str, Any],
+    fresh_state: dict[str, Any],
+) -> None:
+    """Re-apply config.json's values to the checkpointed state on resume.
+
+    Resume deliberately invokes with ``None`` so LangGraph continues from the
+    checkpoint instead of resetting messages / loop_counter / node_state to
+    their zero values. The side effect is that the freshly-read ``*_config``
+    channels assembled into ``initial_state`` are discarded along with
+    everything else — so a resumed session runs on whatever config.json said
+    when the session FIRST started, and editing config.json has no effect on
+    resume at all.
+
+    lumina 01a079dc: ``llm_dispatch.continue_on_length.code_reviewer`` was set
+    to ``false`` between the original run and the resume, and the resumed run
+    still took the ``true`` branch from its checkpoint. (The call-site
+    ``json_output`` gate caught it, so the only cost was a misleading log —
+    but ``sandbox``, ``compiler``, ``acceptance`` and ``token_budget`` settings
+    are frozen by the same mechanism, where a stale value is not cosmetic.)
+
+    Only the channels in :data:`_CONFIG_STATE_CHANNELS` are written, and only
+    those the caller actually resolved, so no work channel can be clobbered.
+    Must run BEFORE :func:`_rewind_suspended_checkpoint` — that one uses
+    ``as_node=`` to queue an outgoing edge, and a later ``aupdate_state``
+    without ``as_node`` would clear it.
+    """
+    updates = {
+        k: fresh_state[k]
+        for k in _CONFIG_STATE_CHANNELS
+        if fresh_state.get(k) is not None
+    }
+    if not updates:
+        return
+    try:
+        state = await compiled_graph.aget_state(graph_config)
+    except Exception as exc:  # noqa: BLE001 — never block resume
+        logger.debug(
+            "[run_graph] Could not read state for config refresh: %s", exc,
+        )
+        return
+    checkpointed = (getattr(state, "values", None) or {}) if state else {}
+    changed = sorted(
+        k for k, v in updates.items() if checkpointed.get(k) != v
+    )
+    if not changed:
+        return
+    logger.info(
+        "[run_graph] Resume: refreshing %d config channel(s) from config.json "
+        "that differ from the checkpoint: %s. Work channels (messages, "
+        "loop_counter, node_state) are untouched.",
+        len(changed), changed,
+    )
+    try:
+        await compiled_graph.aupdate_state(graph_config, updates)
+    except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+        logger.warning(
+            "[run_graph] Failed to refresh config channels on resume: %s. "
+            "The run will use the checkpointed config.", exc,
+        )
+
+
 async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, Any]) -> None:
     """If the resumed checkpoint ended at END via hitl_suspend, rewind it.
 
@@ -28191,6 +28280,14 @@ async def run_graph(
     # without reaching out to config (which the graph module doesn't
     # touch directly today).
     if compiler_config is not None:
+        # The section itself, not just the three booleans derived below:
+        # ``compiler_node`` reads ``state["compiler_config"]`` for
+        # ``targeted_tests_first`` and ``advisory_exit_codes``, and nothing
+        # ever put it on the state — both read sites fall back to ``{}``, so
+        # the two documented settings were silently inert. (Today's values
+        # match the code defaults, so wiring it changes no behaviour; it makes
+        # config.json's `compiler` section take effect as documented.)
+        initial_state["compiler_config"] = compiler_config
         initial_state["run_route_check"] = bool(
             compiler_config.get("run_route_check", True)
         )
@@ -28294,6 +28391,14 @@ async def run_graph(
         # uses ``as_node=human_intervention_node``, so rewind must run
         # LAST for its queued edge to survive into the ainvoke call.
         await _reset_stale_gate_counters_on_resume(compiled_graph, config)
+        # Resume discards ``initial_state`` wholesale (invoke_input=None), so
+        # the freshly-read config channels it just assembled would be thrown
+        # away with it and the run would silently use first-run config. Write
+        # just those channels back. Ordering: after the counter reset, before
+        # the rewind — the rewind's ``as_node`` edge must be the last update.
+        await _refresh_config_channels_on_resume(
+            compiled_graph, config, initial_state,
+        )
         # Save & Quit ([s] in hitl_menu_loop) routes through route_after_hitl
         # to __end__, leaving the checkpoint at the terminal pseudo-node with
         # node_state.hitl_suspend=True. A naive ainvoke(None) on that

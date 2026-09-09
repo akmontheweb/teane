@@ -2372,6 +2372,82 @@ _PY_TEST_FUNC_RE = re.compile(r"^\s*(?:async\s+)?def\s+test", re.MULTILINE)
 # subset. ``.py::`` is unambiguous — the full-suite build command never carries
 # it. Used to suppress the silent-drop guard on such runs (see below).
 _PYTEST_NODEID_SELECTOR_RE = re.compile(r"\.py::")
+# pytest flags that consume the NEXT token as their value. Needed so a value
+# like ``no:cacheprovider`` (from ``-p no:cacheprovider``) is not mistaken for
+# a positional path argument when scoping the guard.
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-p", "-k", "-m", "-n", "-c", "-o", "-W", "-r", "--rootdir",
+    "--import-mode", "--deselect", "--ignore", "--maxfail", "--timeout",
+    "--junitxml", "--cov", "--cov-report",
+})
+
+
+def _pytest_path_scopes(build_command: str, workspace_path: str) -> list[str]:
+    """Workspace-relative paths a pytest invocation was explicitly scoped to.
+
+    Returns ``[]`` when the run is workspace-wide (no positional path
+    arguments, or one of them IS the workspace root), which is the only case
+    where "every test file on disk should have been collected" holds.
+
+    The acceptance node runs ``python -m pytest tests/acceptance ...`` — a
+    deliberate subset with no ``::`` selector, so the node-id escape above does
+    not apply. Without this the guard walked the whole workspace and reported
+    every ``server/tests/**`` file as silently dropped on a run that never
+    asked for them (lumina 01a079dc: three acceptance batches, 20/20 criteria
+    passing, each reported as a failed build).
+    """
+    cmd = build_command or ""
+    if not cmd or not workspace_path:
+        return []
+    # Isolate the pytest invocation from a compound shell command.
+    segments = re.split(r"&&|\|\||;|\|", cmd)
+    segment = next(
+        (s for s in reversed(segments) if "pytest" in s), "",
+    )
+    if not segment:
+        return []
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:  # unbalanced quotes — best-effort
+        tokens = segment.split()
+    # Everything before (and including) the pytest token is the interpreter
+    # invocation, not an argument.
+    for i, tok in enumerate(tokens):
+        if tok == "pytest" or tok.endswith("/pytest"):
+            tokens = tokens[i + 1:]
+            break
+    else:
+        return []
+
+    scopes: list[str] = []
+    skip_next = False
+    ws = os.path.normpath(os.path.abspath(workspace_path))
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            # ``--flag=value`` carries its value inline; ``--flag value`` does not.
+            if "=" not in tok and tok in _PYTEST_VALUE_FLAGS:
+                skip_next = True
+            continue
+        candidate = tok.split("::", 1)[0]
+        if not candidate:
+            continue
+        abs_candidate = os.path.normpath(
+            candidate if os.path.isabs(candidate)
+            else os.path.join(ws, candidate)
+        )
+        if not os.path.exists(abs_candidate):
+            continue
+        # A scope that IS the workspace root means "run everything".
+        if abs_candidate == ws:
+            return []
+        rel = os.path.normpath(os.path.relpath(abs_candidate, ws))
+        if rel.startswith(".."):     # outside the workspace — ignore
+            continue
+        scopes.append(rel)
+    return scopes
 
 
 def _detect_dropped_test_files(
@@ -2407,6 +2483,12 @@ def _detect_dropped_test_files(
     # targeted run carries no selectors, so the guard still covers it.
     if _PYTEST_NODEID_SELECTOR_RE.search(build_command or ""):
         return []
+    # Path-scoped run (``pytest tests/acceptance``): the same premise fails for
+    # every file OUTSIDE the requested paths, but still holds INSIDE them — a
+    # collision that drops a file within the scope is exactly what this guard
+    # exists to catch. So narrow the on-disk walk to the scope rather than
+    # bailing outright, keeping detection where it remains meaningful.
+    scopes = _pytest_path_scopes(build_command, workspace_path)
 
     collected = {
         os.path.normpath(m).lstrip("./")
@@ -2418,30 +2500,40 @@ def _detect_dropped_test_files(
         return []
 
     ws = os.path.normpath(os.path.abspath(workspace_path))
+    # Walk only the requested scopes when the run was path-scoped; the whole
+    # workspace otherwise. ``scopes`` entries may name a directory or a single
+    # file — os.walk over a file yields nothing, so handle files directly.
+    walk_roots = [os.path.join(ws, s) for s in scopes] if scopes else [ws]
     dropped: list[str] = []
-    for root, dirs, files in os.walk(ws):
-        dirs[:] = [
-            d for d in dirs
-            if d not in _DROP_GUARD_SKIP_DIRS and not d.startswith(".")
-        ]
-        for name in files:
-            if not name.endswith(".py"):
-                continue
-            if not (name.startswith("test_") or name.endswith("_test.py")):
-                continue
-            abs_path = os.path.join(root, name)
-            rel = os.path.normpath(os.path.relpath(abs_path, ws)).lstrip("./")
-            if rel in collected:
-                continue
-            # Only flag files that actually contain a test function — skip
-            # empty scaffolds and helper modules that merely match the name.
-            try:
-                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                    body = f.read(256 * 1024)
-            except OSError:
-                continue
-            if _PY_TEST_FUNC_RE.search(body):
-                dropped.append(rel)
+    candidates: list[str] = []
+    for walk_root in walk_roots:
+        if os.path.isfile(walk_root):
+            candidates.append(walk_root)
+            continue
+        for root, dirs, files in os.walk(walk_root):
+            dirs[:] = [
+                d for d in dirs
+                if d not in _DROP_GUARD_SKIP_DIRS and not d.startswith(".")
+            ]
+            candidates.extend(os.path.join(root, f) for f in files)
+    for abs_path in candidates:
+        name = os.path.basename(abs_path)
+        if not name.endswith(".py"):
+            continue
+        if not (name.startswith("test_") or name.endswith("_test.py")):
+            continue
+        rel = os.path.normpath(os.path.relpath(abs_path, ws)).lstrip("./")
+        if rel in collected:
+            continue
+        # Only flag files that actually contain a test function — skip
+        # empty scaffolds and helper modules that merely match the name.
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                body = f.read(256 * 1024)
+        except OSError:
+            continue
+        if _PY_TEST_FUNC_RE.search(body):
+            dropped.append(rel)
     return sorted(dropped)
 
 

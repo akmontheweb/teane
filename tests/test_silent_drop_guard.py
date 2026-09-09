@@ -138,3 +138,89 @@ def test_ignores_vendored_dirs(tmp_path):
     _write(os.path.join(ws, ".venv", "lib", "pkg", "test_vendor.py"))
     output = "tests/test_a.py::test_ok PASSED\n===== 1 passed =====\n"
     assert _detect_dropped_test_files(output, "python3 -m pytest -vv", ws) == []
+
+
+# ---------------------------------------------------------------------------
+# Path-scoped runs (lumina 01a079dc)
+# ---------------------------------------------------------------------------
+
+def test_path_scoped_run_does_not_flag_files_outside_the_scope(tmp_path):
+    # The acceptance node runs ``pytest tests/acceptance`` — a deliberate
+    # subset with NO ``::`` selector, so the node-id escape does not apply.
+    # The guard used to walk the whole workspace and report every
+    # ``server/tests/**`` file as silently dropped on a run that never asked
+    # for them: lumina 01a079dc reported three acceptance batches (20/20
+    # criteria passing) as failed builds.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "acceptance", "test_story_001.py"))
+    _write(os.path.join(ws, "server", "tests", "test_repository.py"))
+    _write(os.path.join(ws, "server", "tests", "test_service.py"))
+    output = (
+        "tests/acceptance/test_story_001.py::test_ok PASSED\n"
+        "===== 1 passed in 0.01s =====\n"
+    )
+    cmd = (
+        "python -m pytest tests/acceptance -rA --tb=short "
+        "-p no:cacheprovider -q"
+    )
+    assert _detect_dropped_test_files(output, cmd, ws) == []
+
+
+def test_path_scoped_run_still_catches_a_drop_inside_the_scope(tmp_path):
+    # Narrowing the walk must not disable the guard: a collision that drops a
+    # file WITHIN the requested scope is exactly what it exists to catch.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "acceptance", "test_story_001.py"))
+    _write(os.path.join(ws, "tests", "acceptance", "test_story_002.py"))
+    _write(os.path.join(ws, "server", "tests", "test_repository.py"))
+    output = (
+        "tests/acceptance/test_story_001.py::test_ok PASSED\n"
+        "===== 1 passed in 0.01s =====\n"
+    )
+    cmd = "python -m pytest tests/acceptance -rA -p no:cacheprovider -q"
+    assert _detect_dropped_test_files(output, cmd, ws) == [
+        os.path.join("tests", "acceptance", "test_story_002.py")
+    ]
+
+
+def test_value_flag_argument_is_not_mistaken_for_a_path(tmp_path):
+    # ``-p no:cacheprovider`` — the value must not be read as a positional
+    # path, and a command whose only "paths" are flag values is workspace-wide.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "test_a.py"))
+    _write(os.path.join(ws, "server", "tests", "test_b.py"))
+    output = "tests/test_a.py::test_ok PASSED\n===== 1 passed =====\n"
+    cmd = "python -m pytest -vv -p no:cacheprovider -k 'not slow'"
+    assert _detect_dropped_test_files(output, cmd, ws) == [
+        os.path.join("server", "tests", "test_b.py")
+    ]
+
+
+def test_explicit_workspace_root_scope_is_treated_as_full_suite(tmp_path):
+    # ``pytest .`` names the workspace root — that IS a full-suite run.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "test_a.py"))
+    _write(os.path.join(ws, "server", "tests", "test_b.py"))
+    output = "tests/test_a.py::test_ok PASSED\n===== 1 passed =====\n"
+    assert _detect_dropped_test_files(output, "python -m pytest . -vv", ws) == [
+        os.path.join("server", "tests", "test_b.py")
+    ]
+
+
+def test_single_file_scope_is_honoured(tmp_path):
+    # A scope may name one file rather than a directory.
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "test_a.py"))
+    _write(os.path.join(ws, "tests", "test_b.py"))
+    output = "tests/test_a.py::test_ok PASSED\n===== 1 passed =====\n"
+    cmd = "python -m pytest tests/test_a.py -vv"
+    assert _detect_dropped_test_files(output, cmd, ws) == []
+
+
+def test_scopes_ignore_nonexistent_paths(tmp_path):
+    from harness.sandbox import _pytest_path_scopes
+    ws = str(tmp_path)
+    _write(os.path.join(ws, "tests", "test_a.py"))
+    # ``nope/`` doesn't exist, so it cannot scope anything — fall back to
+    # workspace-wide rather than silently walking an empty scope.
+    assert _pytest_path_scopes("python -m pytest nope/ -vv", ws) == []

@@ -110,6 +110,17 @@ class StoryAcceptanceContext:
     architecture_excerpt: str = ""
     stack: dict[str, Any] = field(default_factory=dict)
     """Backend/frontend/db hints, e.g. ``{"backend": "fastapi", "db": "sqlite"}``."""
+    response_models: dict[str, list[str]] = field(default_factory=dict)
+    """Response-schema class name → its field names, read off the code.
+
+    The generator otherwise sees only ``METHOD /path`` and has to INVENT the
+    response body's keys from the criterion prose, while the unit-test
+    generator reads the real schema source. When the two guesses differ the
+    build cannot satisfy both (lumina 969f8e1c: acceptance asserted
+    ``body['items']``, ``server/tests/test_main.py`` asserted
+    ``"birthdays" in body``, and renaming the key to please one broke the
+    other until the run died).
+    """
 
     def ac_keys(self) -> set[str]:
         return {a.get("ac_key", "") for a in self.acceptance_criteria if a.get("ac_key")}
@@ -283,6 +294,24 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
         "",
         f"## Stack\n{stack_desc}",
     ]
+    if ctx.response_models:
+        # The response body's ACTUAL keys. Without this the model invents them
+        # from the criterion prose while the unit-test generator reads the real
+        # schema, and the two shapes cannot both be satisfied.
+        model_lines = "\n".join(
+            f"- {name}: {', '.join(fields)}"
+            for name, fields in sorted(ctx.response_models.items())
+        )
+        parts += [
+            "",
+            "## Response schemas (read from the code — these are the REAL keys)",
+            model_lines,
+            "",
+            "Assert against THESE field names. Do NOT invent a different "
+            "envelope key from the criterion's wording: the unit-test tier "
+            "asserts the same schema, so a body key you guess at will "
+            "contradict it and no production change can satisfy both.",
+        ]
     if ctx.data_model_excerpt.strip():
         parts += ["", "## Data model (excerpt)", ctx.data_model_excerpt.strip()]
     if ctx.architecture_excerpt.strip():
@@ -645,6 +674,92 @@ _ROUTE_DECORATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _ROUTER_PREFIX_RE = re.compile(r"APIRouter\([^)]*prefix\s*=\s*[\"']([^\"']+)[\"']")
+
+
+#: Class-name suffixes that mark a model as an HTTP RESPONSE shape, so
+#: ordinary request/DB models don't flood the prompt.
+_RESPONSE_NAME_RE = re.compile(r"(Response|Payload|Out|Result|Envelope)\w*$")
+
+
+def discover_response_models(
+    workspace_path: str, *, max_files: int = 200,
+) -> dict[str, list[str]]:
+    """Response-schema class names → their effective field names.
+
+    Parsed with :mod:`ast` rather than regex: a class body needs correct
+    bounds (a regex slice running to the next match swallows trailing module
+    code and invents fields out of ``try:`` statements) and pydantic response
+    models routinely inherit (``class UpcomingBirthdayResponse(BirthdayResponse)``
+    declares one field and inherits four). Bases declared in the same workspace
+    are resolved so the reported shape is what the endpoint actually emits.
+
+    Best-effort, in the spirit of :func:`discover_routes`: a hint for the
+    generator, never a contract. Unparseable files are skipped.
+
+    Exists so acceptance scenarios assert the keys the API ACTUALLY returns.
+    Without it the generator sees only ``METHOD /path`` and invents body keys
+    from the criterion prose, while the unit-test generator reads the real
+    schema source — and two independently-invented shapes cannot both be
+    satisfied (lumina 969f8e1c, ``items`` vs ``birthdays``).
+    """
+    import ast
+
+    declared: dict[str, list[str]] = {}
+    bases: dict[str, list[str]] = {}
+    scanned = 0
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            if scanned >= max_files:
+                break
+            scanned += 1
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if "BaseModel" not in text:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                fields = [
+                    stmt.target.id
+                    for stmt in node.body
+                    if isinstance(stmt, ast.AnnAssign)
+                    and isinstance(stmt.target, ast.Name)
+                    and not stmt.target.id.startswith("_")
+                    and stmt.target.id != "model_config"
+                ]
+                declared[node.name] = fields
+                bases[node.name] = [
+                    b.id for b in node.bases if isinstance(b, ast.Name)
+                ]
+
+    def _effective(cls: str, seen: frozenset[str] = frozenset()) -> list[str]:
+        """Own fields plus inherited ones, base-first, deduped."""
+        if cls in seen:               # defensive: cyclic bases
+            return []
+        out: list[str] = []
+        for base in bases.get(cls, []):
+            if base in declared:
+                out.extend(_effective(base, seen | {cls}))
+        out.extend(declared.get(cls, []))
+        return list(dict.fromkeys(out))
+
+    return {
+        cls: eff
+        for cls in declared
+        if _RESPONSE_NAME_RE.search(cls) and (eff := _effective(cls))
+    }
 
 
 def discover_routes(workspace_path: str, *, max_files: int = 200) -> list[dict[str, str]]:
@@ -1075,6 +1190,7 @@ def gather_story_acceptance_context(
         description=story.get("description", "") or "",
         acceptance_criteria=ac_rows,
         routes=discover_routes(workspace_path),
+        response_models=discover_response_models(workspace_path),
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
         architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),
         stack=dict(stack or {}),
@@ -1350,7 +1466,8 @@ __all__ = [
     "generate_acceptance_scenarios", "fallback_acceptance_scenarios",
     "validate_scenarios", "build_user_prompt", "build_system_prompt",
     "render_integration_file", "render_e2e_spec", "integration_function_name",
-    "discover_routes", "gather_story_acceptance_context",
+    "discover_routes", "discover_response_models",
+    "gather_story_acceptance_context",
     "discover_app_factory", "render_acceptance_conftest", "discover_db_env_var",
     "discover_db_override", "DbOverride", "DB_VALUE_PATH", "DB_VALUE_URL",
     "GENERATED_CONFTEST_MARKER",

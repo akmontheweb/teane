@@ -15031,6 +15031,58 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         result = await executor.run(build_cmd)
 
     exit_code: int = result.exit_code
+
+    # Reviewer-regression guard. code_review_node only runs on a GREEN build,
+    # so a failure on the very next compile is caused by ITS re-patch — the
+    # workspace was verified moments earlier. Put the pre-re-patch bytes back
+    # and re-run, rather than handing the repair loop a regression the
+    # reviewer introduced and letting it chase the symptom.
+    #
+    # lumina 01a079dc: a re-patch acting on 20 findings changed
+    # models/birthday.py's column from String to Date while every caller kept
+    # passing ISO strings. 20/20 acceptance criteria had just passed; the next
+    # build went red across the whole repository + service tier, and the repair
+    # loop burned its rounds re-emitting byte-identical content for that file
+    # until it hit a zero-patch HITL.
+    _review_snapshot = dict(
+        (state.get("node_state", {}) or {}).get(
+            "code_review_revert_snapshot", {}
+        ) or {}
+    )
+    if exit_code != 0 and _review_snapshot:
+        restored = _revert_code_review_repatch(_review_snapshot, workspace)
+        if restored:
+            logger.warning(
+                "[compiler_node:review-revert] The build was green before "
+                "code_review's re-patch and red after it, so the re-patch "
+                "regressed it. Restored %d file(s) to their pre-review bytes "
+                "and re-running: %s",
+                len(restored), ", ".join(sorted(restored)),
+            )
+            try:
+                from harness.observability import emit_event as _emit_rev
+                _emit_rev(
+                    "code_review_repatch_reverted",
+                    files=sorted(restored),
+                    exit_code=exit_code,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            result = await executor.run(build_cmd)
+            exit_code = result.exit_code
+            if exit_code == 0:
+                logger.info(
+                    "[compiler_node:review-revert] Build green again after "
+                    "the revert — the reviewer's changes were the cause."
+                )
+            else:
+                logger.warning(
+                    "[compiler_node:review-revert] Build still failing after "
+                    "the revert (exit %d) — the reviewer's re-patch was not "
+                    "the only cause; handing the remainder to repair.",
+                    exit_code,
+                )
+
     compiler_errors: list[Any] = [d.to_dict() for d in result.diagnostics]
     raw_log: str = result.raw_output
     # The unfiltered capture. On failure ``raw_output`` has been through
@@ -15397,6 +15449,12 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     node_state: dict[str, Any] = dict(state.get("node_state", {}) or {})
     node_state["current_node"] = "compiler"
     node_state["last_build_output"] = raw_log
+    # The reviewer-regression snapshot is valid for exactly ONE re-verify —
+    # the build immediately following the re-patch that produced it. Clearing
+    # it unconditionally (green or red, reverted or not) stops it being
+    # replayed against an unrelated failure many rounds later, which would
+    # silently undo real repair work.
+    node_state.pop("code_review_revert_snapshot", None)
     # Only set the short-circuit flag for symbols the LLM truly can't fix.
     # Repairable symbols carry their diagnostic into repair_node normally.
     if env_misconfig_symbol and not env_misconfig_is_repairable:
@@ -25280,6 +25338,15 @@ Generate the patches that address every finding below. Output only the blocks �
     token_tracker = gateway.aggregate_tokens(token_tracker, repatch_response.usage)
 
     allowed_paths = _build_patcher_allowlist(workspace)
+    # Snapshot every file the re-patch is about to touch, BEFORE touching it.
+    # code_review only runs on a GREEN build, so any failure on the re-verify
+    # that follows is caused by this re-patch — and the pre-patch bytes are a
+    # known-good state we can put back instead of spending repair rounds
+    # chasing a regression the reviewer introduced. See
+    # ``_revert_code_review_repatch`` in compiler_node for the restore side.
+    pre_patch_snapshot = _snapshot_patch_targets(
+        repatch_response.content, workspace,
+    )
     patch_results, new_modified_files = await process_llm_patch_output(
         repatch_response.content,
         workspace,
@@ -25354,6 +25421,13 @@ Generate the patches that address every finding below. Output only the blocks �
             "repatch_real_success": real_success_count,
             "repatch_no_ops": no_op_count,
             "repatch_total": len(patch_results),
+            # Known-good bytes for the re-verify that follows. compiler_node
+            # restores these if this re-patch turned the green build red, and
+            # clears the key either way so it can never be replayed against an
+            # unrelated later failure.
+            "code_review_revert_snapshot": (
+                pre_patch_snapshot if repatched else {}
+            ),
         },
     }
 
@@ -27754,6 +27828,68 @@ async def _refresh_config_channels_on_resume(
             "[run_graph] Failed to refresh config channels on resume: %s. "
             "The run will use the checkpointed config.", exc,
         )
+
+
+def _snapshot_patch_targets(
+    patch_payload: str, workspace_path: str,
+) -> dict[str, Optional[str]]:
+    """Current bytes of every file a patch payload targets.
+
+    ``None`` as a value means "did not exist" — restoring that entry deletes
+    the file the patch created. Returns ``{}`` on any parse/read problem;
+    the caller treats an empty snapshot as "cannot revert" and proceeds
+    normally, so this is never able to block progress.
+    """
+    snapshot: dict[str, Optional[str]] = {}
+    try:
+        from harness.patcher import parse_patch_blocks as _parse_blocks
+        blocks = _parse_blocks(patch_payload)
+    except Exception:  # noqa: BLE001 — best-effort
+        return {}
+    for blk in blocks:
+        rel = _normalize_ws_path(getattr(blk, "file", "") or "", workspace_path)
+        if not rel or rel in snapshot:
+            continue
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                snapshot[rel] = fh.read()
+        except FileNotFoundError:
+            snapshot[rel] = None
+        except OSError:
+            continue
+    return snapshot
+
+
+def _revert_code_review_repatch(
+    snapshot: dict[str, Optional[str]], workspace_path: str,
+) -> list[str]:
+    """Restore files to their pre-re-patch bytes. Returns what was restored.
+
+    Only called when a build that was GREEN before the reviewer's re-patch
+    came back RED, so the snapshot is a verified-good state by construction.
+    """
+    restored: list[str] = []
+    for rel, content in snapshot.items():
+        abs_path = os.path.join(workspace_path, rel)
+        try:
+            if content is None:
+                if os.path.isfile(abs_path):
+                    os.remove(abs_path)
+                    restored.append(rel)
+                continue
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                if fh.read() == content:
+                    continue          # reviewer left it alone
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            restored.append(rel)
+        except OSError as exc:  # noqa: PERF203 — per-file best effort
+            logger.warning(
+                "[compiler_node:review-revert] could not restore %s: %s",
+                rel, exc,
+            )
+    return restored
 
 
 async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, Any]) -> None:

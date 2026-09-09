@@ -3495,6 +3495,43 @@ async def _continue_on_length(
         ))
         response, budget = await dispatch(messages, budget)
         accumulated_chunks.append(response.content or "")
+        # A cycle that reproduces a chunk we already hold is the OTHER
+        # degenerate shape: not "the same paragraph N times inside one
+        # response" (which _repetition_ratio catches) but "the same whole
+        # response, cycle after cycle". Each such cycle re-sends the growing
+        # transcript for output the caller already has, so it is pure waste.
+        # Exact equality — no threshold, so no risk of discarding real work.
+        #
+        # lumina 01a079dc, code_review:repatch: five cycles returned a
+        # byte-identical 126 KB body (md5 18efe03316cb), input growing
+        # 107k → 140k → 173k at ~$0.029 each — 23 minutes for content the
+        # first cycle had already produced. _repetition_ratio scored it
+        # 0.000, because patch DSL repeats few whole LINES; the repetition
+        # is across responses, not within one.
+        latest = response.content or ""
+        if latest and latest in accumulated_chunks[:-1]:
+            logger.warning(
+                "[%s] continuation cycle %d/%d returned content identical to "
+                "an earlier chunk (%d chars) — the model is re-emitting, not "
+                "continuing. Stopping; further cycles would re-send a growing "
+                "transcript for output already in hand.",
+                role_label, continuation_cycles, max_cycles, len(latest),
+            )
+            try:
+                from harness.observability import emit_event as _emit_dup
+                _emit_dup(
+                    "continuation_refused_duplicate_chunk",
+                    role=role_label,
+                    cycle=continuation_cycles,
+                    chars=len(latest),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # Drop the duplicate so the caller's join doesn't emit the same
+            # blocks twice — a duplicated REPLACE_BLOCK is a guaranteed
+            # no-op rejection on the second copy.
+            accumulated_chunks.pop()
+            return response, budget, accumulated_chunks
         # A cycle can itself fall into the loop — re-check before paying
         # for the next one.
         if (

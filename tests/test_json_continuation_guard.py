@@ -107,8 +107,15 @@ class TestJsonOutputRefusesContinuation:
         assert chunks == ["head"]
 
     def test_cycles_are_capped(self):
+        # Each cycle must return DISTINCT content: an identical body every
+        # time is a re-emission loop, which the duplicate-chunk guard now
+        # stops early (see TestDuplicateChunkRefusesContinuation). This test
+        # is about the cycle CAP, so keep it on the genuine-progress path.
+        counter = {"n": 0}
+
         async def _always_truncated(msgs, budget):
-            return _Resp("x"), budget - 1
+            counter["n"] += 1
+            return _Resp(f"chunk-{counter['n']}"), budget - 1
 
         _, budget, chunks = _run(
             initial_response=_Resp("head"),
@@ -184,6 +191,82 @@ class TestDegenerateRepeatRefusesContinuation:
     def test_short_output_never_trips_the_detector(self):
         from harness.graph import _repetition_ratio
         assert _repetition_ratio("same line repeated\n" * 3) == 0.0
+
+
+class TestDuplicateChunkRefusesContinuation:
+    """A cycle that reproduces a chunk we already hold is re-emission, not
+    continuation.
+
+    lumina 01a079dc, ``code_review:repatch``: five cycles returned a
+    byte-identical 126 KB body (md5 18efe03316cb), input growing
+    107k → 140k → 173k at ~$0.029 each — 23 minutes producing 1787 patch
+    blocks of which 10 applied, the rest identity no-ops.
+    ``_repetition_ratio`` scored that body 0.000: patch DSL repeats few whole
+    LINES, so the within-response detector is blind to it. The repetition is
+    ACROSS responses, which exact equality catches with no threshold.
+    """
+
+    BODY = "<<<REPLACE_BLOCK>>>\nfile: a.py\nsearch:\nx = 1\nreplace:\nx = 2\n<<<END_REPLACE_BLOCK>>>"
+
+    def test_identical_cycle_stops_the_loop(self):
+        calls = []
+
+        async def _dispatch(msgs, budget):
+            calls.append(1)
+            return _Resp(self.BODY), budget - 1
+
+        _, budget, chunks = _run(
+            initial_response=_Resp(self.BODY),
+            initial_budget=9.0, messages=[], dispatch=_dispatch,
+            continue_prompt="c", enabled=True, role_label="code_review:repatch",
+            max_cycles=5,
+        )
+        assert len(calls) == 1          # stopped at the first repeat, not 5
+        assert chunks == [self.BODY]    # duplicate dropped, not concatenated
+        assert budget == 8.0
+
+    def test_duplicate_is_dropped_so_blocks_are_not_doubled(self):
+        # Re-emitting the same REPLACE_BLOCK twice guarantees a no-op
+        # rejection on the second copy, which is what produced the identity
+        # -patch flood in the incident.
+        async def _dispatch(msgs, budget):
+            return _Resp(self.BODY), budget - 1
+
+        _, _, chunks = _run(
+            initial_response=_Resp(self.BODY),
+            initial_budget=9.0, messages=[], dispatch=_dispatch,
+            continue_prompt="c", enabled=True, role_label="r",
+        )
+        assert "".join(chunks).count("<<<REPLACE_BLOCK>>>") == 1
+
+    def test_genuine_continuation_is_unaffected(self):
+        # Distinct chunks are the normal case and must still accumulate.
+        seen = []
+
+        async def _dispatch(msgs, budget):
+            seen.append(1)
+            return _Resp("tail", finish_reason="stop"), budget - 1
+
+        _, _, chunks = _run(
+            initial_response=_Resp("head"),
+            initial_budget=9.0, messages=[], dispatch=_dispatch,
+            continue_prompt="c", enabled=True, role_label="patching_node",
+        )
+        assert chunks == ["head", "tail"]
+        assert len(seen) == 1
+
+    def test_empty_cycle_does_not_trip_the_duplicate_check(self):
+        # "" is falsy and would otherwise match a prior empty chunk; the
+        # length cap / cycle cap owns that case, not this guard.
+        async def _dispatch(msgs, budget):
+            return _Resp("", finish_reason="stop"), budget - 1
+
+        _, _, chunks = _run(
+            initial_response=_Resp("head"),
+            initial_budget=9.0, messages=[], dispatch=_dispatch,
+            continue_prompt="c", enabled=True, role_label="r",
+        )
+        assert chunks == ["head", ""]
 
 
 class TestJsonCritiqueRolesStayDisabledInConfig:

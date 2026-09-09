@@ -15455,6 +15455,17 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # replayed against an unrelated failure many rounds later, which would
     # silently undo real repair work.
     node_state.pop("code_review_revert_snapshot", None)
+    # Same one-shot contract for the security autofix re-verify: this compile
+    # IS that verification, so clear the flag now. Leaving it set would send
+    # the router back here on every subsequent pass — an infinite
+    # compiler ⇄ security_scan loop.
+    _sec_ns_clear = node_state.get("security_scan")
+    if isinstance(_sec_ns_clear, dict) and _sec_ns_clear.get(
+        "autofix_needs_reverify"
+    ):
+        _sec_ns_clear = dict(_sec_ns_clear)
+        _sec_ns_clear.pop("autofix_needs_reverify", None)
+        node_state["security_scan"] = _sec_ns_clear
     # Only set the short-circuit flag for symbols the LLM truly can't fix.
     # Repairable symbols carry their diagnostic into repair_node normally.
     if env_misconfig_symbol and not env_misconfig_is_repairable:
@@ -26218,6 +26229,26 @@ def route_after_security_scan(state: AgentState) -> Literal[
 
     # If no compiler_errors populated, security scan passed
     if not compiler_errors:
+        # The deterministic autofix pass EDITED SOURCE on a workspace that was
+        # green when it entered this node — removing a secret-bearing line,
+        # bumping a pinned dependency, rewriting a subprocess call. Any of
+        # those can break the build, and no other path re-compiles them: the
+        # pre_exit_verify branch below needs an opt-in that is off by default,
+        # and it reads ``pending_mutations``, which nothing but code_review
+        # used to populate. Re-verify unconditionally, mirroring how
+        # ``repatched`` sends code_review's re-patch back to the compiler.
+        # compiler_node clears the flag, so one batch of autofixes buys
+        # exactly one re-verify and this cannot loop.
+        _sec_ns = (state.get("node_state", {}) or {}).get("security_scan", {})
+        if isinstance(_sec_ns, dict) and _sec_ns.get("autofix_needs_reverify"):
+            logger.info(
+                "[router] security autofix edited %d file(s) on a green "
+                "workspace (%s) — re-running the compiler to confirm the "
+                "fixes hold before any terminal route.",
+                len(_sec_ns.get("autofix_files") or []),
+                ", ".join(_sec_ns.get("autofix_files") or []) or "?",
+            )
+            return "compiler_node"
         # Audit #18 — defensive pre-exit verification. When the operator
         # opts in (compiler.pre_exit_verify=true) AND a post-green node has
         # mutated source since the last green compile AND we haven't

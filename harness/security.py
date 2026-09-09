@@ -2218,17 +2218,40 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     # If the autofix pass cleared every blocking finding, the gate passes
-    # for this round. Routing then sends the build back through compile +
-    # security_scan so we can confirm the fixes hold.
+    # for this round — but the fixes EDITED SOURCE on a workspace that was
+    # green when it reached this node, and nothing downstream re-compiles it.
+    # Removing a secret-bearing line, bumping a pinned dependency, or
+    # rewriting a subprocess call can all break the build, and until now that
+    # breakage could ship: the only re-verify path in
+    # ``route_after_security_scan`` is the ``pre_exit_verify`` branch, which
+    # needs BOTH an opt-in (``compiler.pre_exit_verify``, off by default) AND
+    # a non-empty ``pending_mutations`` — a list only ``code_review_node``
+    # ever wrote to. So the comment that used to sit here ("routing then
+    # sends the build back through compile") described behaviour that did not
+    # exist under any configuration.
+    #
+    # ``autofix_needs_reverify`` makes it true: the router sends this back to
+    # compiler_node, exactly as ``repatched`` does for code_review's
+    # re-patch. compiler_node clears the flag on the next pass, so one batch
+    # of autofixes buys exactly one re-verify and the path cannot loop. The
+    # files also go into ``pending_mutations`` so the opt-in pre-exit check
+    # sees them for the first time.
     if applied_fixes and not unhandled_diagnostics:
+        _autofix_files = sorted({r.file for r in applied_fixes if r.file})
+        _prior_pending = list(state.get("pending_mutations") or [])
         passed_state: dict[str, Any] = {
             "modified_files": autofix_modified_files,
             "loop_counter": loop_counter,
+            "pending_mutations": _prior_pending + [
+                f for f in _autofix_files if f not in _prior_pending
+            ],
             "node_state": {
                 "security_scan": {
                     "passed": True,
                     "autofix_applied": len(applied_fixes),
                     "autofix_kinds": sorted({r.fix_kind for r in applied_fixes}),
+                    "autofix_needs_reverify": True,
+                    "autofix_files": _autofix_files,
                     **summary,
                 },
             },

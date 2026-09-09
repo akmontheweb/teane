@@ -10979,6 +10979,105 @@ def _pytest_cmd_has_positional_args(build_cmd: str) -> bool:
     return False
 
 
+#: How many compile rounds of diagnostic shapes to keep for oscillation
+#: detection. Three is the minimum that can hold an A → B → A cycle.
+_DIAG_HISTORY_DEPTH = 4
+
+
+def _detect_contradictory_tests(
+    loop_counter: dict[str, Any], fingerprints: list[str],
+) -> bool:
+    """True when the loop is toggling between two diagnostic states.
+
+    An A → B → A cycle means the last patch un-did what the previous one
+    fixed: the two failures demand opposite things and no single edit can
+    satisfy both. That is a CONTRADICTION, not slow progress, and every
+    further repair round is guaranteed to swap the pair again.
+
+    lumina 969f8e1c: ``tests/acceptance/test_story_001_acceptance.py`` asserts
+    ``body['items']`` while ``server/tests/test_main.py`` asserts
+    ``"birthdays" in body``. Renaming the response key to satisfy one broke
+    the other, and repair cannot edit either file to resolve it. The existing
+    ``_nodeid_streak`` and ``recent_hypothesis_fingerprints`` trackers both
+    miss this: the failing nodeid CHANGES every round, which is exactly what
+    they read as progress.
+    """
+    current = tuple(sorted(fingerprints))
+    history = [tuple(h) for h in (loop_counter.get("_diag_fp_history") or [])]
+    history.append(current)
+    loop_counter["_diag_fp_history"] = [
+        list(h) for h in history[-_DIAG_HISTORY_DEPTH:]
+    ]
+    # Need A, B, A — and A must differ from B, or this is just a stall the
+    # zero-patch / no-progress guards already own.
+    if len(history) < 3 or not current:
+        return False
+    two_back, one_back = history[-3], history[-2]
+    return bool(current == two_back and current != one_back and one_back)
+
+
+def _record_suite_order_pollution(
+    loop_counter: dict[str, Any], rel_file: str,
+) -> None:
+    """Note that ``rel_file`` passes alone but fails in the suite.
+
+    The isolation hints attached to the diagnostics tell the reader to fix
+    OTHER test modules — install overrides inside a fixture, give each module
+    its own engine, drop a module-level singleton. Every one of those is an
+    edit to a test file, which ``_reject_test_patch_blocks`` refuses for the
+    repair node. Routing such a failure to repair therefore hands it a
+    highest-priority directive it is structurally forbidden to execute, and it
+    burns its budget on production code instead (lumina 969f8e1c: eight rounds
+    of cosmetic edits to ``_extract_record_id`` while the stated cause was
+    cross-module test state). Recording it here lets
+    :func:`route_after_compiler` send it to the node that CAN rewrite tests.
+    """
+    if not rel_file:
+        return
+    seen = list(loop_counter.get("suite_order_pollution_files") or [])
+    if rel_file not in seen:
+        seen.append(rel_file)
+        loop_counter["suite_order_pollution_files"] = seen
+
+
+#: Judge phrasings that mean "the fix is in a test file". The reflection judge
+#: routinely offers a test edit as its recommendation (lumina 969f8e1c:
+#: "…or update tests/acceptance/test_story_001_acceptance.py:162 to access
+#: body['birthdays']"), which repair cannot act on.
+_TEST_EDIT_RECOMMENDATION_RE = re.compile(
+    r"\b(?:update|edit|change|fix|modify|correct|rewrite|adjust)\b[^.]{0,80}?"
+    r"\b(?:tests?/|[\w/]*tests?/[\w/]*|test_\w+\.py|\w+\.test\.[jt]sx?|"
+    r"\w+_test\.py|conftest\.py)",
+    re.IGNORECASE,
+)
+
+
+def _verdict_demands_test_edit(verdict: Any) -> str:
+    """The test path a reflection verdict says must change, or ``""``.
+
+    Returns the first test-file reference found in the verdict's
+    ``recommendation`` / ``real_blocker`` when the surrounding phrasing asks
+    for that file to be CHANGED. A verdict that merely *cites* a test as the
+    place a failure surfaces (the normal case) does not match — only one that
+    proposes editing it.
+    """
+    if not isinstance(verdict, dict):
+        return ""
+    for key in ("recommendation", "real_blocker"):
+        text = str(verdict.get(key) or "")
+        if not text or not _TEST_EDIT_RECOMMENDATION_RE.search(text):
+            continue
+        # Pull the concrete path out of the matched phrasing.
+        path = re.search(
+            r"[\w./\\-]*(?:tests?/[\w./\\-]+|test_[\w.]+\.py|"
+            r"[\w.]+_test\.py|[\w.]+\.test\.[jt]sx?|conftest\.py)",
+            text,
+        )
+        if path:
+            return path.group(0).rstrip(".,;:")
+    return ""
+
+
 async def _maybe_pytest_isolation_rerun(
     executor: Any,
     diagnostics: list[dict[str, Any]],
@@ -11102,6 +11201,12 @@ async def _maybe_pytest_isolation_rerun(
     if not passed_alone:
         return
 
+    # Record the pollution for the ROUTER, not just the prompt. Every remedy
+    # this hint goes on to name is an edit to a TEST module, and repair_node
+    # is forbidden from editing tests — so routing this to repair guarantees
+    # wasted rounds. See ``_pollution_files`` / ``route_after_compiler``.
+    _record_suite_order_pollution(loop_counter, nodeid.split("::", 1)[0])
+
     hint = (
         "\n\n[HARNESS ISOLATION SIGNAL — HIGHEST PRIORITY]\n"
         f"Test `{nodeid}` PASSES when run alone (verified this round in "
@@ -11205,6 +11310,7 @@ async def _maybe_pytest_isolation_rerun_multi(
             )
         if not passed_alone:
             continue
+        _record_suite_order_pollution(loop_counter, rel_file)
         hint = (
             "\n\n[HARNESS ISOLATION SIGNAL — HIGHEST PRIORITY]\n"
             f"EVERY test in `{rel_file}` PASSES when the file runs alone "
@@ -15652,6 +15758,29 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # detect which groups survived between two compile rounds. Cleared
     # to [] on success. Warnings are excluded — they don't drive the
     # repair loop, so survival of a warning is irrelevant.
+    # Oscillation check: does this round's diagnostic shape match the one from
+    # TWO rounds ago, with a different shape in between? That is a pair of
+    # mutually exclusive expectations, not progress.
+    if exit_code != 0:
+        _fps_now = _fingerprint_diagnostics(compiler_errors)
+        if _detect_contradictory_tests(loop_counter, _fps_now):
+            node_state["contradictory_tests"] = True
+            logger.warning(
+                "[compiler_node] Diagnostics have returned to the shape from "
+                "two rounds ago with a different shape in between — the last "
+                "patch un-did the previous one. Two expectations are in "
+                "direct conflict and no single edit satisfies both; repair "
+                "cannot resolve this on its own.",
+            )
+            try:
+                from harness.observability import emit_event as _emit_contra
+                _emit_contra(
+                    "contradictory_tests_detected",
+                    fingerprints=_fps_now[:6],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     return_dict: dict[str, Any] = {
         "exit_code": exit_code,
         "compiler_errors": compiler_errors,
@@ -21770,6 +21899,65 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "[router] Stale unsatisfiable-test declaration for %s (no "
             "longer in the failing set) — continuing the loop.",
             _unsat_declared_file,
+        )
+
+    # Same ladder, two more cases where repair is STRUCTURALLY unable to act.
+    # Both were previously routed to repair_node, which then burned its budget
+    # on production code because that is the only thing it may edit.
+    #
+    # (a) Suite-order pollution. The isolation signal's own remedies —
+    #     "install/remove overrides inside a fixture", "each module needs its
+    #     own engine" — are all TEST edits, refused by the tamper guard.
+    # (b) Contradictory expectations. Two tests demand opposite things, so
+    #     every patch that satisfies one breaks the other; the diagnostics
+    #     oscillate A → B → A forever.
+    #
+    # lumina 969f8e1c hit (a) for eight rounds on ``_extract_record_id`` and
+    # (b) on ``items`` vs ``birthdays``, and spent its whole distraction
+    # budget on both before terminating.
+    _blocked_reason = ""
+    _blocked_file = ""
+    if state.get("node_state", {}).get("contradictory_tests"):
+        _blocked_reason = "contradictory test expectations"
+        # Regenerating either side resolves it; prefer a test file from the
+        # current failing set so the regeneration node has a concrete target.
+        for _d in state.get("compiler_errors", []) or []:
+            _f = str((_d or {}).get("file", "") or "") if isinstance(_d, dict) else ""
+            if _f and _is_test_artifact(_f):
+                _blocked_file = _f
+                break
+    elif (state.get("loop_counter", {}) or {}).get("suite_order_pollution_files"):
+        _blocked_reason = "suite-order pollution"
+        _blocked_file = str(
+            (state.get("loop_counter", {}) or {})
+            .get("suite_order_pollution_files")[0]
+        )
+    else:
+        _verdict_file = _verdict_demands_test_edit(
+            (state.get("loop_counter", {}) or {}).get("last_reflection_verdict")
+        )
+        if _verdict_file:
+            _blocked_reason = "the judge's own recommendation is a test edit"
+            _blocked_file = _verdict_file
+
+    if _blocked_reason and _blocked_file:
+        logger.warning(
+            "[router] %s — the only remedy names a TEST file (%s), which "
+            "repair_node is forbidden to edit. Routing to the test-author "
+            "ladder instead of burning repair rounds on production code.",
+            _blocked_reason.capitalize(), _blocked_file,
+        )
+        try:
+            from harness.observability import emit_event as _emit_blocked
+            _emit_blocked(
+                "repair_blocked_needs_test_edit",
+                reason=_blocked_reason,
+                file=_blocked_file,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return _transition(  # type: ignore[arg-type]
+            route_after_unsatisfiable(state, _blocked_file)
         )
 
     # Pytest exit=5 (no tests collected) is not a build failure.

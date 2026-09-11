@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 
 from harness.post_mortem import (
+    _build_post_mortem_prompt,
     already_recorded,
     deterministic_rule,
     format_rule_note,
@@ -455,3 +456,108 @@ async def test_finalize_disabled_records_nothing(tmp_path):
     note = await _post_mortem_finalize(
         state, 1, _cli_config(tmp_path, enabled=False), str(tmp_path / "ws"))
     assert note == ""
+
+
+# ---------------------------------------------------------------------------
+# Prompt grounding (lumina 20260911)
+#
+# Session lumina-testrun-20260911-1102 died at `decomposition_validation_failed`
+# — the planner returned prose instead of the JSON object. `compiler_errors`
+# was empty (nothing had compiled yet), so the post-mortem prompt carried only
+# the trigger name and the build command. The model read "decomposition" as
+# Python module layout and wrote a learned rule about import paths and test
+# collection structure, which then persisted into repo memory and would have
+# been injected into every subsequent run on the workspace.
+# ---------------------------------------------------------------------------
+class TestPromptCarriesTheDiagnostic:
+
+    def test_node_error_reaches_prompt_when_no_compiler_errors(self):
+        """The exact lumina shape: a pre-compile failure whose only signal
+        is ``node_state['error']``."""
+        prompt = _build_post_mortem_prompt(
+            {
+                "build_command": "pytest",
+                "node_state": {
+                    "error": "invalid_json: Expecting value: line 1 column 1 (char 0)",
+                    "decomposition_failed": True,
+                },
+            },
+            "decomposition_validation_failed",
+            None,
+        )
+        assert "Node failure reason:" in prompt
+        assert "invalid_json" in prompt
+        # And it lands before the build command, so the concrete cause is
+        # not buried under a 400-char shell one-liner.
+        assert prompt.index("Node failure reason:") < prompt.index("Build command:")
+
+    def test_node_error_is_length_capped(self):
+        prompt = _build_post_mortem_prompt(
+            {"node_state": {"error": "x" * 900}}, "some_trigger", None,
+        )
+        assert "x" * 300 in prompt
+        assert "x" * 301 not in prompt
+
+    def test_reflection_verdict_reaches_prompt(self):
+        prompt = _build_post_mortem_prompt(
+            {
+                "compiler_errors": [
+                    {"file": "t.py", "line": 36,
+                     "error_code": "AssertionError", "message": "assert 0 == 2"},
+                ],
+                "loop_counter": {
+                    "last_reflection_verdict": {
+                        "verdict": "DISTRACTION",
+                        "real_blocker": "upcoming returns empty after two POSTs",
+                        "recommendation": "Edit list_upcoming()",
+                    },
+                },
+            },
+            "zero_patch_loop:2",
+            None,
+        )
+        assert "Reflection verdict: DISTRACTION" in prompt
+        assert "upcoming returns empty after two POSTs" in prompt
+        assert "Edit list_upcoming()" in prompt
+
+    def test_verdict_without_blocker_is_omitted(self):
+        """An empty ``real_blocker`` carries no signal — don't pad the
+        prompt with a bare verdict label."""
+        prompt = _build_post_mortem_prompt(
+            {"loop_counter": {"last_reflection_verdict": {"verdict": "PROGRESS"}}},
+            "t", None,
+        )
+        assert "Reflection verdict" not in prompt
+
+    def test_malformed_verdict_does_not_raise(self):
+        """State is LLM-adjacent; a non-mapping verdict must not break the
+        fail-open contract."""
+        for bad in ("a string", ["a", "list"], 42):
+            prompt = _build_post_mortem_prompt(
+                {"loop_counter": {"last_reflection_verdict": bad}}, "t", None,
+            )
+            assert "Respond with the rule only." in prompt
+
+    def test_no_evidence_instructs_against_inventing_a_mechanism(self):
+        """With nothing captured, the prompt must say so — an unconstrained
+        'distill a rule' on a bare trigger is what produced the bogus
+        module-layout rule."""
+        prompt = _build_post_mortem_prompt({}, "budget_exhausted", None)
+        assert "No diagnostics, node error, or escalation summary" in prompt
+        assert "rather than inferring a mechanism" in prompt
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"compiler_errors": [{"file": "a.py", "line": 1, "message": "boom"}]},
+            {"node_state": {"error": "dispatch_failed: timeout"}},
+        ],
+    )
+    def test_no_evidence_note_absent_when_evidence_exists(self, state):
+        prompt = _build_post_mortem_prompt(state, "t", None)
+        assert "No diagnostics, node error, or escalation summary" not in prompt
+
+    def test_escalation_summary_alone_counts_as_evidence(self):
+        prompt = _build_post_mortem_prompt({}, "t", "verified: the DB path is unset")
+        assert "No diagnostics, node error, or escalation summary" not in prompt
+        assert "verified: the DB path is unset" in prompt

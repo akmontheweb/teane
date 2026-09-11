@@ -369,6 +369,20 @@ def _build_post_mortem_prompt(
         "happened.",
         f"Failure trigger: {trigger}",
     ]
+    node_state = state.get("node_state") or {}
+    # The failing node's own reason string. For any failure that never
+    # reaches the compiler — decomposition, spec validation, gateway
+    # dispatch — ``compiler_errors`` is empty and this is the ONLY
+    # concrete signal in state; without it the prompt carries nothing but
+    # the trigger name and the model is left to guess a mechanism.
+    # lumina 20260911 (session lumina-testrun-20260911-1102): a
+    # ``decomposition_validation_failed`` post-mortem saw only the trigger,
+    # read "decomposition" as Python module layout, and wrote a learned
+    # rule about import paths and test collection — nothing to do with the
+    # planner having returned prose instead of the JSON object.
+    node_error = str(node_state.get("error") or "").strip()
+    if node_error:
+        parts.append(f"Node failure reason: {node_error[:300]}")
     build_cmd = str(state.get("build_command") or "").strip()
     if build_cmd:
         parts.append(f"Build command: {build_cmd}")
@@ -380,7 +394,21 @@ def _build_post_mortem_prompt(
             for e in errs
         ]
         parts.append("Top diagnostics:\n" + "\n".join(lines))
-    node_state = state.get("node_state") or {}
+    # The reflection judge's read of the blocker. This is the richest
+    # interpreted signal available — strictly better grounding than the raw
+    # assertion text above, which says "assert 0 == 2" without saying why.
+    verdict = (state.get("loop_counter") or {}).get("last_reflection_verdict")
+    if isinstance(verdict, Mapping):
+        blocker = str(verdict.get("real_blocker") or "").strip()
+        if blocker:
+            vlines = [
+                f"Reflection verdict: {verdict.get('verdict') or 'unknown'}",
+                f"Judge's stated blocker: {blocker[:400]}",
+            ]
+            rec = str(verdict.get("recommendation") or "").strip()
+            if rec:
+                vlines.append(f"Judge's recommendation: {rec[:400]}")
+            parts.append("\n".join(vlines))
     rejections = node_state.get("allowlist_rejections") or []
     if rejections:
         parts.append(f"Allowlist rejections this session: {len(rejections)}")
@@ -391,6 +419,16 @@ def _build_post_mortem_prompt(
         parts.append(
             "Grounded escalation summary (already verified against the "
             f"workspace):\n{escalation_summary[:1500]}"
+        )
+    # Nothing concrete was captured. Say so explicitly: an unconstrained
+    # "distill a rule" instruction on a bare trigger name reliably produces
+    # a confident, invented mechanism (see the lumina note above).
+    if not errs and not node_error and not escalation_summary:
+        parts.append(
+            "No diagnostics, node error, or escalation summary were "
+            "captured for this failure. Base the rule ONLY on the trigger "
+            "name, and state plainly that the underlying cause was not "
+            "captured rather than inferring a mechanism."
         )
     parts.append("Respond with the rule only.")
     return "\n\n".join(parts)

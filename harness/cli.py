@@ -4494,6 +4494,45 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     "docs/SPEC_REQUIREMENTS.md and re-running can resolve it.",
                     trigger,
                 )
+                # Two very different causes land on this one trigger, and
+                # they need opposite advice. A serialisation miss (the model
+                # answered in prose, or returned nothing) says nothing about
+                # the spec and usually clears on a rerun — decomposition_node
+                # already burned its one retry before reaching here. Telling
+                # the operator to go edit SPEC_REQUIREMENTS.md in that case
+                # sends them to rewrite a file that was parsed correctly
+                # (lumina-testrun-20260911-1102: "17 parsed, 17 upserted",
+                # and a rerun on the same spec decomposed cleanly).
+                _err = str(node_state.get("error") or "")
+                _serialisation_miss = _err.startswith(
+                    ("invalid_json", "empty_response")
+                )
+                if _serialisation_miss:
+                    _cause = (
+                        "The planner never emitted a parseable JSON object — "
+                        "it answered in prose\nor returned nothing. The "
+                        "harness already retried once with a JSON-only\n"
+                        "nudge. This is a serialisation miss, not a spec "
+                        "defect: your spec was\nparsed and ingested fine, "
+                        "and a fresh run on the SAME spec commonly\n"
+                        "succeeds.\n"
+                    )
+                    _first_option = (
+                        "  1. Rerun `teane build` unchanged — a different "
+                        "roll usually serialises.\n     Do NOT edit "
+                        "docs/SPEC_REQUIREMENTS.md on account of this "
+                        "error.\n"
+                    )
+                else:
+                    _cause = (
+                        "The planner produced no usable story decomposition "
+                        "and no operator is\navailable to intervene.\n"
+                    )
+                    _first_option = (
+                        "  1. Fix docs/SPEC_REQUIREMENTS.md (ensure "
+                        "requirements are declared as\n     headings/labels "
+                        "the parser recognises), then rerun `teane build`.\n"
+                    )
                 _banner = (
                     "\n" + "=" * 78 + "\n"
                     "TERMINATED — decomposition could not be validated "
@@ -4501,17 +4540,13 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     + "=" * 78 + "\n"
                     f"Session:              {_session_id}\n"
                     f"Trigger:              {trigger}\n"
-                    "\n"
-                    "The planner produced no usable story decomposition and "
-                    "no operator is\navailable to intervene. This is not "
-                    "auto-recoverable — re-running the\nsame planning step "
-                    "yields the same failure.\n"
-                    "\n"
+                    + (f"Error:                {_err[:200]}\n" if _err else "")
+                    + "\n"
+                    + _cause
+                    + "\n"
                     "Recovery options:\n"
-                    "  1. Fix docs/SPEC_REQUIREMENTS.md (ensure requirements "
-                    "are declared as\n     headings/labels the parser "
-                    "recognises), then rerun `teane build`.\n"
-                    "  2. Rerun with a TTY (no CI/HARNESS_AUTO_APPROVE, "
+                    + _first_option
+                    + "  2. Rerun with a TTY (no CI/HARNESS_AUTO_APPROVE, "
                     "interactive stdin) so\n     the HITL menu can prompt.\n"
                     + "=" * 78 + "\n"
                 )

@@ -1516,9 +1516,13 @@ def test_decomposition_node_budget_exhausted(workspace: str):
 def test_decomposition_node_invalid_json(workspace: str):
     from harness.graph import set_gateway
     _write_spec(workspace)
-    set_gateway(_FakeGateway(["not actually json"]))
+    # Two bad rolls: the node retries once with a JSON-only nudge before
+    # giving up, so both attempts must be stubbed to reach the failure.
+    gw = _FakeGateway(["not actually json", "still not json"])
+    set_gateway(gw)
     out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
     assert out["node_state"]["error"].startswith("invalid_json")
+    assert len(gw.calls) == 2
     # DB should not have been populated for this app
     app = story_state.app_name_for_workspace(workspace)
     conn = story_state.open_story_db()
@@ -1772,10 +1776,12 @@ def test_decomposition_node_empty_response_is_named(workspace: str):
     instead of the opaque ``Expecting value: line 1 column 1``."""
     from harness.graph import set_gateway
     _write_spec(workspace)
-    set_gateway(_FakeGateway([""]))
+    gw = _FakeGateway(["", ""])  # both attempts empty
+    set_gateway(gw)
     out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
     assert out["node_state"]["decomposition_failed"] is True
     assert out["node_state"]["error"] == "empty_response"
+    assert len(gw.calls) == 2
     app = story_state.app_name_for_workspace(workspace)
     conn = story_state.open_story_db()
     try:
@@ -2537,3 +2543,141 @@ def test_validator_error_no_longer_hardcodes_waterfall_hint():
     assert "docs/SPEC_REQUIREMENTS.md" in msg
 
 
+
+
+# ---------------------------------------------------------------------------
+# Prose-instead-of-JSON retry (lumina-testrun-20260911-1102)
+#
+# decomposition_node is a SINGLE-DISPATCH node, so one bad serialisation roll
+# was a hard build failure at the very first node. deepseek-v4-pro in thinking
+# mode emitted 33,814 chars of planning prose into ``content`` — finish=stop,
+# tool_calls=0, every story and feature named correctly — and never produced
+# the JSON object. The run died in two minutes having spent $0.009; a rerun on
+# the same spec decomposed cleanly. regeneration_node already carries a
+# block-only retry for the same model's same habit (lumina 019fd587); this is
+# the decomposition-side twin.
+# ---------------------------------------------------------------------------
+
+_LUMINA_PROSE = (
+    "Content model knows Python + React, wants JSON only. Need decide exact "
+    "JSON.\n\nBut wait: The user asked to decompose the approved "
+    "specification. Output strict JSON. So we should output JSON object "
+    "only, no markdown/code fence. Need ensure all stories count and keys.\n"
+)
+
+
+class TestProseInsteadOfJsonRetries:
+
+    def test_prose_then_json_recovers(self, workspace: str):
+        """The exact lumina shape: deliberation prose first, object second."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([_LUMINA_PROSE, _valid_payload()])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        # The success path never sets ``decomposition_failed`` at all.
+        assert not out["node_state"].get("decomposition_failed")
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 2
+
+    def test_retry_carries_a_json_only_nudge(self, workspace: str):
+        """The second dispatch must actually tell the model what went
+        wrong — a bare re-ask is just a re-roll."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([_LUMINA_PROSE, _valid_payload()])
+        set_gateway(gw)
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        nudge = str(gw.calls[1]["messages"][-1].get("content", ""))
+        assert "ONLY the JSON object" in nudge
+        assert "no ``` code fences" in nudge
+        # The original prompt is retained, not replaced — the retry must not
+        # drop the spec it is meant to decompose.
+        assert len(gw.calls[1]["messages"]) > len(gw.calls[0]["messages"])
+
+    def test_empty_then_json_recovers(self, workspace: str):
+        """The other half of the same failure mode: reasoning consumed the
+        whole response and ``content`` came back empty."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway(["", _valid_payload()])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 2
+
+    def test_good_first_response_does_not_retry(self, workspace: str):
+        """The retry is a fallback, not a tax on every build."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([_valid_payload()])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 1
+
+    def test_retry_stops_at_two_attempts(self, workspace: str):
+        """Bounded: never a third dispatch, however bad the rolls."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([_LUMINA_PROSE, _LUMINA_PROSE, _valid_payload()])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["decomposition_failed"] is True
+        assert out["node_state"]["error"].startswith("invalid_json")
+        assert len(gw.calls) == 2
+
+    def test_last_error_is_reported_not_the_first(self, workspace: str):
+        """When the two attempts fail differently, the surviving error is
+        the one that actually ended the node."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway(["", _LUMINA_PROSE])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["error"].startswith("invalid_json")
+
+    def test_gateway_error_on_retry_is_reported_as_dispatch_failed(
+        self, workspace: str,
+    ):
+        """An upstream failure during the retry must not be mislabelled as
+        a parse problem."""
+        from harness.graph import set_gateway
+
+        class _FailSecond(_FakeGateway):
+            async def dispatch(self, **kw):
+                if len(self.calls) == 1:
+                    self.calls.append(kw)
+                    raise RuntimeError("upstream 503")
+                return await super().dispatch(**kw)
+
+        _write_spec(workspace)
+        set_gateway(_FailSecond([_LUMINA_PROSE]))
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["error"].startswith("dispatch_failed")
+
+    def test_no_stories_committed_when_both_attempts_fail(
+        self, workspace: str,
+    ):
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        set_gateway(_FakeGateway([_LUMINA_PROSE, _LUMINA_PROSE]))
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        app = story_state.app_name_for_workspace(workspace)
+        conn = story_state.open_story_db()
+        try:
+            assert story_state.list_stories(conn, app) == []
+        finally:
+            conn.close()

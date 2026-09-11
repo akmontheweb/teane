@@ -2310,35 +2310,83 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     system_msg = state.get("messages", [{}])[0] if state.get("messages") else {}
     call_messages = [system_msg, {"role": "user", "content": prompt}]
 
-    try:
-        response, budget = await gateway.dispatch(
-            messages=call_messages,
-            role=NodeRole.PLANNING,
-            budget_remaining_usd=budget,
-            cache_family="planning:story_decomposition",
+    # The planning model (deepseek-v4-pro in thinking mode) sometimes emits
+    # its entire deliberation into ``content`` and never produces the JSON
+    # object at all — finish=stop, tool_calls=0, ~9.7k output tokens of
+    # planning prose that names every story and feature correctly but never
+    # serialises them (lumina session lumina-testrun-20260911-1102). This is
+    # a SINGLE-DISPATCH node, so one bad roll was a hard build failure at the
+    # very first node: the run died in two minutes having spent $0.009, and a
+    # rerun against the same spec decomposed cleanly — the miss is a
+    # serialisation roll, not a spec defect, which makes the HITL banner's
+    # "re-running the same planning step yields the same failure" wrong.
+    # Give it one terse JSON-only nudge before giving up, mirroring the
+    # block-only retry regeneration_node already does for the same model's
+    # same habit (lumina 019fd587).
+    _retry_nudge = (
+        "You did not emit parseable JSON. Output ONLY the JSON object — "
+        "start with { and end with }, with no prose, no analysis, no "
+        "markdown headings, and no ``` code fences. Do not restate your "
+        "reasoning; emit the object described above."
+    )
+    data = None
+    parse_error = "empty_response"
+    for _attempt in range(2):
+        _msgs = (
+            call_messages if _attempt == 0
+            else call_messages + [{"role": "user", "content": _retry_nudge}]
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("[decomposition] gateway dispatch failed: %s", exc)
-        return {
-            "exit_code": 1,
-            "node_state": {
-                "current_node": "decomposition",
-                "decomposition_complete": False,
-                "decomposition_failed": True,
-                "error": f"dispatch_failed: {exc}",
-                "story_count": 0,
-            },
-            "budget_remaining_usd": budget,
-        }
+        try:
+            response, budget = await gateway.dispatch(
+                messages=_msgs,
+                role=NodeRole.PLANNING,
+                budget_remaining_usd=budget,
+                cache_family="planning:story_decomposition",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[decomposition] gateway dispatch failed: %s", exc)
+            return {
+                "exit_code": 1,
+                "node_state": {
+                    "current_node": "decomposition",
+                    "decomposition_complete": False,
+                    "decomposition_failed": True,
+                    "error": f"dispatch_failed: {exc}",
+                    "story_count": 0,
+                },
+                "budget_remaining_usd": budget,
+            }
 
-    raw = strip_json_fence(getattr(response, "content", "") or "")
-    if not raw.strip():
-        # An empty model response would otherwise surface as the opaque
-        # ``Expecting value: line 1 column 1 (char 0)`` from json.loads,
-        # hiding the real cause (the model returned nothing). Name it.
+        raw = strip_json_fence(getattr(response, "content", "") or "")
+        if not raw.strip():
+            # An empty model response would otherwise surface as the opaque
+            # ``Expecting value: line 1 column 1 (char 0)`` from json.loads,
+            # hiding the real cause (the model returned nothing). Name it.
+            parse_error = "empty_response"
+            logger.error(
+                "[decomposition] LLM returned an empty response — no JSON to "
+                "parse (attempt %d/2).", _attempt + 1,
+            )
+        else:
+            try:
+                data = json.loads(raw)
+                break
+            except json.JSONDecodeError as exc:
+                parse_error = f"invalid_json: {exc}"
+                logger.error(
+                    "[decomposition] LLM returned invalid JSON (attempt "
+                    "%d/2): %s", _attempt + 1, exc,
+                )
+        if _attempt == 0:
+            logger.warning(
+                "[decomposition] Retrying once with a JSON-only nudge — the "
+                "model answered in prose. A second roll usually serialises."
+            )
+
+    if data is None:
         logger.error(
-            "[decomposition] LLM returned an empty response — no JSON to "
-            "parse. Treating as a decomposition failure."
+            "[decomposition] No parseable JSON after 2 attempts (%s). "
+            "Treating as a decomposition failure.", parse_error,
         )
         return {
             "exit_code": 1,
@@ -2346,22 +2394,7 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 "current_node": "decomposition",
                 "decomposition_complete": False,
                 "decomposition_failed": True,
-                "error": "empty_response",
-                "story_count": 0,
-            },
-            "budget_remaining_usd": budget,
-        }
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("[decomposition] LLM returned invalid JSON: %s", exc)
-        return {
-            "exit_code": 1,
-            "node_state": {
-                "current_node": "decomposition",
-                "decomposition_complete": False,
-                "decomposition_failed": True,
-                "error": f"invalid_json: {exc}",
+                "error": parse_error,
                 "story_count": 0,
             },
             "budget_remaining_usd": budget,

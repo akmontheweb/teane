@@ -41,6 +41,7 @@ from harness.gateway import (
 )
 from harness.tool_schemas import (
     PATCH_TOOLS,
+    resolve_tool_choice_for_thinking,
     to_anthropic_tool_choice,
     to_anthropic_tools,
     to_openai_tool_choice,
@@ -1215,3 +1216,336 @@ def test_tool_choice_is_not_folded_into_the_cache_prefix_hash():
     msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
     assert hash_stable_prefix(msgs, n_stable=2, tools=PATCH_TOOLS) == \
         hash_stable_prefix(msgs, n_stable=2, tools=PATCH_TOOLS)
+
+
+# ---------------------------------------------------------------------------
+# thinking x forced tool_choice — a per-model wire quirk, not a per-provider
+# code path.
+#
+# deepseek-v4-pro 400s the whole request when a thinking-mode call also
+# carries a COMPELLING tool_choice: {"message": "Thinking mode does not
+# support this tool_choice"} — for a named tool AND for "required". Only
+# "auto"/omission is accepted. Verified live 2026-09-13.
+#
+# Since a default config routes every role at DeepSeek, an unguarded caller
+# combining a thinking role with a forced tool would hard-fail every
+# dispatch. The downgrade keeps the request alive and lets the caller's
+# fallback absorb the lost guarantee.
+# ---------------------------------------------------------------------------
+
+class TestThinkingDowngradesForcedToolChoice:
+
+    def test_named_tool_downgrades_under_thinking(self):
+        assert resolve_tool_choice_for_thinking(
+            "read_file", thinking=True, rejects_forced=True,
+        ) == "auto"
+
+    def test_required_downgrades_under_thinking(self):
+        assert resolve_tool_choice_for_thinking(
+            "required", thinking=True, rejects_forced=True,
+        ) == "auto"
+
+    def test_auto_is_already_safe(self):
+        assert resolve_tool_choice_for_thinking(
+            "auto", thinking=True, rejects_forced=True,
+        ) == "auto"
+
+    def test_none_stays_none(self):
+        """None means "omit" — it must not become an explicit "auto"."""
+        assert resolve_tool_choice_for_thinking(
+            None, thinking=True, rejects_forced=True,
+        ) is None
+
+    def test_no_downgrade_when_not_thinking(self):
+        """The whole point: forcing works fine on the same model with
+        thinking off."""
+        assert resolve_tool_choice_for_thinking(
+            "read_file", thinking=False, rejects_forced=True,
+        ) == "read_file"
+
+    def test_no_downgrade_for_models_without_the_quirk(self):
+        assert resolve_tool_choice_for_thinking(
+            "read_file", thinking=True, rejects_forced=False,
+        ) == "read_file"
+
+
+@pytest.mark.asyncio
+class TestThinkingDowngradeOnTheWire:
+
+    def _spec(self, **kw: Any) -> ModelSpec:
+        base = dict(
+            provider="deepseek", model_id="ds-test", context_window=1_000_000,
+            input_cost_per_1m=0.4, output_cost_per_1m=0.9,
+            api_base_url="https://api.deepseek.com/v1", api_key="x",
+            supports_thinking=True, supports_tools=True,
+            thinking_rejects_forced_tool_choice=True,
+        )
+        base.update(kw)
+        return ModelSpec(**base)  # type: ignore[arg-type]
+
+    async def _call(self, spec: ModelSpec, **kw: Any) -> dict[str, Any]:
+        from harness.gateway import DeepSeekProvider
+        provider = DeepSeekProvider(spec, api_key="x")
+        client = _RecordingClient({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        provider._client = client  # type: ignore[assignment]
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}],
+            tools=PATCH_TOOLS, **kw,
+        )
+        assert client.last_payload is not None
+        return client.last_payload
+
+    async def test_thinking_plus_forced_becomes_auto_on_the_wire(self):
+        """The exact 400 shape from the live probe must be unreachable."""
+        payload = await self._call(
+            self._spec(), thinking=True, tool_choice="read_file",
+        )
+        assert payload["thinking"] == {"type": "enabled"}
+        assert payload["tool_choice"] == "auto"
+
+    async def test_thinking_off_keeps_the_forced_choice(self):
+        payload = await self._call(
+            self._spec(), thinking=False, tool_choice="read_file",
+        )
+        assert payload["tool_choice"] == {
+            "type": "function", "function": {"name": "read_file"},
+        }
+
+    async def test_model_without_the_quirk_keeps_forcing_under_thinking(self):
+        payload = await self._call(
+            self._spec(thinking_rejects_forced_tool_choice=False),
+            thinking=True, tool_choice="read_file",
+        )
+        assert payload["tool_choice"] == {
+            "type": "function", "function": {"name": "read_file"},
+        }
+
+    async def test_downgrade_keyed_on_effective_thinking_not_the_flag(self):
+        """``thinking=True`` on a model that does not support thinking never
+        reaches the provider as thinking, so there is nothing to downgrade."""
+        payload = await self._call(
+            self._spec(supports_thinking=False),
+            thinking=True, tool_choice="read_file",
+        )
+        assert "thinking" not in payload or payload.get("thinking") != {"type": "enabled"}
+        assert payload["tool_choice"] == {
+            "type": "function", "function": {"name": "read_file"},
+        }
+
+
+def test_deepseek_thinking_models_declare_the_quirk_in_the_catalogue():
+    """The flag is data, not a code path — a new provider with the same
+    quirk is a catalogue edit. Guard the entries we verified live."""
+    import json
+    from pathlib import Path
+    catalogue = json.loads(
+        (Path(__file__).resolve().parents[1] / "harness" / "model_prices.json")
+        .read_text()
+    )
+    for key, spec in catalogue.items():
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("provider") == "deepseek" and spec.get("supports_thinking"):
+            assert spec.get("thinking_rejects_forced_tool_choice") is True, (
+                f"{key} supports thinking but does not declare the "
+                "forced-tool_choice restriction"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Learn-and-downgrade: the provider-agnostic correctness mechanism.
+#
+# Teane is model-agnostic — users route whatever they like, including models
+# released after this code was written. A hand-maintained capability
+# catalogue can never cover that, and every gap is a hard 400 on a paid
+# dispatch. The ModelSpec flags are an optimisation that skips the doomed
+# first call for models we already know about; this is what actually keeps
+# an unknown model working.
+# ---------------------------------------------------------------------------
+
+class _Rejects400:
+    """Stub provider that 400s exactly like a real backend refusing a
+    compelled tool_choice, then succeeds once downgraded."""
+
+    def __init__(self, spec: ModelSpec, body: str):
+        self.spec = spec
+        self.api_key = "x"
+        self._body = body
+        self.seen: list[Any] = []
+
+    async def chat_completion(self, *, tool_choice=None, **_kw: Any) -> LLMResponse:
+        self.seen.append(tool_choice)
+        if tool_choice not in (None, "auto"):
+            raise _FakeHttpError(400, self._body)
+        return LLMResponse(
+            content="ok",
+            usage=TokenUsage(input_tokens=1, output_tokens=1,
+                             model_name=self.spec.model_id, cost_usd=0.0),
+            model=self.spec.model_id,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeHttpError(Exception):
+    def __init__(self, status_code: int, text: str):
+        super().__init__(f"{status_code} error")
+        self.response = _FakeHttpResponse(status_code, text)
+
+
+def _stub_spec(key: str) -> ModelSpec:
+    return ModelSpec(
+        provider="stub", model_id=key, context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=True,
+        supports_thinking=True,
+    )
+
+
+def _gw_with(provider: Any, key: str) -> Gateway:
+    register_model(key, provider.spec)
+    gw = Gateway(GatewayConfig(
+        planning_primary=key, patching_primary=key, repair_primary=key,
+        use_structured_tools=True,
+    ))
+    gw._providers[key] = provider  # type: ignore[assignment]
+    return gw
+
+
+class TestDetector:
+    """Phrasing-agnostic on purpose — the next provider will word it
+    differently again."""
+
+    @pytest.mark.parametrize("body", [
+        '{"error":{"message":"Thinking mode does not support this tool_choice"}}',
+        '{"error":{"message":"tool_choice: type \\"tool\\" and \\"any\\" are not '
+        'supported for this model."}}',
+        '{"error":{"message":"Unsupported TOOL_CHOICE value"}}',
+    ])
+    def test_matches_real_and_hypothetical_phrasings(self, body: str):
+        from harness.gateway import _is_forced_tool_choice_rejection
+        assert _is_forced_tool_choice_rejection(_FakeHttpError(400, body))
+
+    def test_ignores_unrelated_400s(self):
+        from harness.gateway import _is_forced_tool_choice_rejection
+        assert not _is_forced_tool_choice_rejection(
+            _FakeHttpError(400, '{"error":{"message":"messages: too long"}}')
+        )
+
+    def test_ignores_non_4xx(self):
+        from harness.gateway import _is_forced_tool_choice_rejection
+        assert not _is_forced_tool_choice_rejection(
+            _FakeHttpError(500, '{"error":{"message":"tool_choice exploded"}}')
+        )
+
+    def test_ignores_errors_without_a_response(self):
+        from harness.gateway import _is_forced_tool_choice_rejection
+        assert not _is_forced_tool_choice_rejection(RuntimeError("boom"))
+
+
+@pytest.mark.asyncio
+class TestLearnAndDowngrade:
+
+    async def test_unknown_model_recovers_instead_of_failing(self):
+        """The whole point: a model nobody flagged still completes."""
+        key = "stub:unknown-rejector"
+        prov = _Rejects400(
+            _stub_spec(key),
+            '{"error":{"message":"Thinking mode does not support this tool_choice"}}',
+        )
+        gw = _gw_with(prov, key)
+        resp, _budget = await gw.dispatch(
+            messages=[{"role": "user", "content": "go"}],
+            role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+            tools=PATCH_TOOLS, tool_choice="read_file",
+        )
+        assert resp.content == "ok"
+        assert prov.seen == ["read_file", "auto"]
+
+    async def test_second_dispatch_skips_the_doomed_call(self):
+        key = "stub:learns-once"
+        prov = _Rejects400(
+            _stub_spec(key), '{"error":{"message":"bad tool_choice"}}',
+        )
+        gw = _gw_with(prov, key)
+        for _ in range(2):
+            await gw.dispatch(
+                messages=[{"role": "user", "content": "go"}],
+                role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+                tools=PATCH_TOOLS, tool_choice="read_file",
+            )
+        # First dispatch pays for the rejection; the second goes straight
+        # to auto. Three calls total, not four.
+        assert prov.seen == ["read_file", "auto", "auto"]
+
+    async def test_unrelated_400_still_propagates(self):
+        """Downgrading must not become a catch-all that hides real bugs."""
+        key = "stub:other-400"
+
+        class _AlwaysBad(_Rejects400):
+            async def chat_completion(self, *, tool_choice=None, **_kw: Any):
+                self.seen.append(tool_choice)
+                raise _FakeHttpError(
+                    400, '{"error":{"message":"messages: too long"}}',
+                )
+
+        prov = _AlwaysBad(_stub_spec(key), "")
+        gw = _gw_with(prov, key)
+        with pytest.raises(Exception) as excinfo:
+            await gw.dispatch(
+                messages=[{"role": "user", "content": "go"}],
+                role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+                tools=PATCH_TOOLS, tool_choice="read_file",
+            )
+        assert "400" in str(excinfo.value)
+        assert prov.seen == ["read_file"]  # no downgrade retry
+
+    async def test_auto_is_never_retried(self):
+        """An 'auto' call that 400s has nothing left to downgrade to."""
+        key = "stub:auto-fails"
+
+        class _AutoFails(_Rejects400):
+            async def chat_completion(self, *, tool_choice=None, **_kw: Any):
+                self.seen.append(tool_choice)
+                raise _FakeHttpError(
+                    400, '{"error":{"message":"bad tool_choice"}}',
+                )
+
+        prov = _AutoFails(_stub_spec(key), "")
+        gw = _gw_with(prov, key)
+        with pytest.raises(Exception):
+            await gw.dispatch(
+                messages=[{"role": "user", "content": "go"}],
+                role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+                tools=PATCH_TOOLS, tool_choice="auto",
+            )
+        assert prov.seen == ["auto"]
+
+    async def test_learning_is_keyed_on_thinking_mode(self):
+        """DeepSeek refuses only in thinking mode — a refusal there must
+        not permanently disable forcing for non-thinking roles on the
+        same model."""
+        key = "stub:thinking-only"
+        prov = _Rejects400(
+            _stub_spec(key),
+            '{"error":{"message":"Thinking mode does not support this tool_choice"}}',
+        )
+        gw = _gw_with(prov, key)
+        gw._forced_tool_choice_unsupported.add((key, True))
+        await gw.dispatch(
+            messages=[{"role": "user", "content": "go"}],
+            role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+            tools=PATCH_TOOLS, tool_choice="read_file", _thinking_override=False,
+        )
+        # thinking=False was never marked, so forcing was still attempted.
+        assert prov.seen[0] == "read_file"

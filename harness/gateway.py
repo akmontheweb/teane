@@ -165,6 +165,15 @@ class ModelSpec:
     # from ``supports_thinking`` so enabling the suppression for a model does
     # NOT change its thinking-ON (planning) behaviour.
     suppress_reasoning_when_off: bool = False
+    # Wire quirk: this model 400s when a thinking-mode request also carries
+    # a COMPELLING tool_choice (a named tool, or "required"). Only "auto" or
+    # omission is accepted alongside thinking. Verified on deepseek-v4-pro
+    # 2026-09-13: {"message": "Thinking mode does not support this
+    # tool_choice"}. When true the gateway downgrades a compelled choice to
+    # "auto" instead of letting the request hard-fail. Distinct from
+    # ``supports_tools`` — the tools array itself is fine in thinking mode,
+    # it is only the compulsion that is refused.
+    thinking_rejects_forced_tool_choice: bool = False
     supports_cache: bool = False
     # B6 capability flag — true for models that accept native function/tool
     # calling on their wire format. Anthropic 3.x+/4.x all support it;
@@ -251,6 +260,9 @@ def load_model_prices(prices_path: Optional[str] = None, override: bool = False)
                 api_key=spec_dict.get("api_key", ""),
                 supports_thinking=bool(spec_dict.get("supports_thinking", False)),
                 suppress_reasoning_when_off=bool(spec_dict.get("suppress_reasoning_when_off", False)),
+                thinking_rejects_forced_tool_choice=bool(
+                    spec_dict.get("thinking_rejects_forced_tool_choice", False)
+                ),
                 supports_cache=bool(spec_dict.get("supports_cache", False)),
                 supports_tools=bool(spec_dict.get("supports_tools", False)),
                 anthropic_version=spec_dict.get("anthropic_version", "2023-06-01"),
@@ -352,6 +364,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                     "api_key": baseline.api_key,
                     "supports_thinking": baseline.supports_thinking,
                     "suppress_reasoning_when_off": baseline.suppress_reasoning_when_off,
+                    "thinking_rejects_forced_tool_choice": baseline.thinking_rejects_forced_tool_choice,
                     "supports_cache": baseline.supports_cache,
                     "supports_tools": baseline.supports_tools,
                     "anthropic_version": baseline.anthropic_version,
@@ -372,6 +385,9 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 api_key=merged.get("api_key", ""),
                 supports_thinking=bool(merged.get("supports_thinking", False)),
                 suppress_reasoning_when_off=bool(merged.get("suppress_reasoning_when_off", False)),
+                thinking_rejects_forced_tool_choice=bool(
+                    merged.get("thinking_rejects_forced_tool_choice", False)
+                ),
                 supports_cache=bool(merged.get("supports_cache", False)),
                 supports_tools=bool(merged.get("supports_tools", False)),
                 anthropic_version=merged.get("anthropic_version", "2023-06-01"),
@@ -925,6 +941,7 @@ class DeepSeekProvider(BaseLLM):
             payload["thinking"] = {"type": "disabled"}
         if tools:
             from harness.tool_schemas import (
+                resolve_tool_choice_for_thinking,
                 to_openai_tool_choice,
                 to_openai_tools,
                 validate_tool_choice,
@@ -936,7 +953,11 @@ class DeepSeekProvider(BaseLLM):
             # caller degrades to the provider default instead of killing
             # a paid dispatch.
             _choice = to_openai_tool_choice(
-                validate_tool_choice(tool_choice, tools)
+                resolve_tool_choice_for_thinking(
+                    validate_tool_choice(tool_choice, tools),
+                    thinking=bool(thinking and self.spec.supports_thinking),
+                    rejects_forced=self.spec.thinking_rejects_forced_tool_choice,
+                )
             )
             if _choice is not None:
                 payload["tool_choice"] = _choice
@@ -1085,11 +1106,16 @@ class AnthropicProvider(BaseLLM):
                 }
             payload["tools"] = anthropic_tools
             from harness.tool_schemas import (
+                resolve_tool_choice_for_thinking,
                 to_anthropic_tool_choice,
                 validate_tool_choice,
             )
             _choice = to_anthropic_tool_choice(
-                validate_tool_choice(tool_choice, tools)
+                resolve_tool_choice_for_thinking(
+                    validate_tool_choice(tool_choice, tools),
+                    thinking=bool(thinking and self.spec.supports_thinking),
+                    rejects_forced=self.spec.thinking_rejects_forced_tool_choice,
+                )
             )
             if _choice is not None:
                 payload["tool_choice"] = _choice
@@ -1292,6 +1318,7 @@ class OpenAIProvider(BaseLLM):
         }
         if tools:
             from harness.tool_schemas import (
+                resolve_tool_choice_for_thinking,
                 to_openai_tool_choice,
                 to_openai_tools,
                 validate_tool_choice,
@@ -1303,7 +1330,11 @@ class OpenAIProvider(BaseLLM):
             # caller degrades to the provider default instead of killing
             # a paid dispatch.
             _choice = to_openai_tool_choice(
-                validate_tool_choice(tool_choice, tools)
+                resolve_tool_choice_for_thinking(
+                    validate_tool_choice(tool_choice, tools),
+                    thinking=bool(thinking and self.spec.supports_thinking),
+                    rejects_forced=self.spec.thinking_rejects_forced_tool_choice,
+                )
             )
             if _choice is not None:
                 payload["tool_choice"] = _choice
@@ -1464,6 +1495,7 @@ class OllamaProvider(BaseLLM):
         }
         if tools:
             from harness.tool_schemas import (
+                resolve_tool_choice_for_thinking,
                 to_openai_tool_choice,
                 to_openai_tools,
                 validate_tool_choice,
@@ -1475,7 +1507,11 @@ class OllamaProvider(BaseLLM):
             # caller degrades to the provider default instead of killing
             # a paid dispatch.
             _choice = to_openai_tool_choice(
-                validate_tool_choice(tool_choice, tools)
+                resolve_tool_choice_for_thinking(
+                    validate_tool_choice(tool_choice, tools),
+                    thinking=bool(thinking and self.spec.supports_thinking),
+                    rejects_forced=self.spec.thinking_rejects_forced_tool_choice,
+                )
             )
             if _choice is not None:
                 payload["tool_choice"] = _choice
@@ -2675,6 +2711,33 @@ def _prune_debug_dumps(debug_dir: str, cap: int) -> None:
         return
 
 
+def _is_forced_tool_choice_rejection(exc: BaseException) -> bool:
+    """True when a provider refused the request *because of* a compelled
+    ``tool_choice``, as opposed to any other 400.
+
+    Deliberately phrasing-agnostic: providers word this differently and
+    new ones will word it differently again.
+
+        DeepSeek   "Thinking mode does not support this tool_choice"
+        Anthropic  'tool_choice: type "tool" and "any" are not supported
+                    for this model.'
+
+    The common factor is a 4xx whose body names ``tool_choice``, which is
+    specific enough not to swallow unrelated 400s (a malformed message
+    array, an oversized request) and general enough to catch a provider
+    nobody here has tested. A false positive costs one redundant retry
+    with ``auto``; a false negative costs the whole dispatch.
+    """
+    resp = getattr(exc, "response", None)
+    if getattr(resp, "status_code", None) not in (400, 422):
+        return False
+    try:
+        body = (resp.text or "")[:4000].lower()
+    except Exception:  # noqa: BLE001 — a body we cannot read is not a match
+        return False
+    return "tool_choice" in body
+
+
 class Gateway:
     """
     Central orchestrator for model-agnostic LLM dispatching.
@@ -2692,6 +2755,17 @@ class Gateway:
         self.config = config
         # Provider cache: lazily instantiated per unique model_key
         self._providers: dict[str, BaseLLM] = {}
+        # Models observed this session to refuse a COMPELLED tool_choice,
+        # keyed by (model_key, thinking). Teane is model-agnostic — users
+        # route whatever they like, including models that did not exist
+        # when this code was written — so a hand-maintained capability
+        # catalogue can never be complete, and every gap would be a hard
+        # 400 on a paid dispatch. The catalogue flags on ModelSpec are an
+        # optimisation that skips the doomed first call for models we
+        # already know about; THIS set is the correctness mechanism, and
+        # it learns from any provider, known or not. In-memory only: a
+        # restart re-learns at a cost of one downgraded call.
+        self._forced_tool_choice_unsupported: set[tuple[str, bool]] = set()
         # 429/503 circuit breaker (P1.9). When too many rate-limit / server
         # failures pile up in a short window, fall the next call back to
         # local Ollama instead of burning retries with no chance of
@@ -3610,18 +3684,62 @@ class Gateway:
         import time as _time
         _dispatch_start = _time.monotonic()
 
+        # --- Compelled tool_choice: learn-and-downgrade ---
+        # If this (model, thinking) pair already refused a compelled choice
+        # this session, skip straight to "auto" rather than paying for the
+        # rejection again.
+        from harness.tool_schemas import TOOL_CHOICE_AUTO as _TC_AUTO
+        _tc_key = (model_key, bool(thinking))
+        _tc = effective_tool_choice
+        if (
+            _tc is not None and _tc != _TC_AUTO
+            and _tc_key in self._forced_tool_choice_unsupported
+        ):
+            logger.debug(
+                "[gateway] tool_choice=%r pre-downgraded to 'auto': %s "
+                "refused a compelled choice earlier this session.",
+                _tc, model_key,
+            )
+            _tc = _TC_AUTO
+
         async def _call() -> LLMResponse:
-            return await provider.chat_completion(
+            nonlocal _tc
+            _kw = dict(
                 messages=messages,
                 thinking=thinking,
                 tools=effective_tools,
-                tool_choice=effective_tool_choice,
                 # Per-role, config-controlled HTTP timeout (resolved fresh here
                 # so a fallback re-dispatch re-resolves for its own role rather
                 # than inheriting a stale value via llm_kwargs).
                 request_timeout=self._request_timeout_for(role),
                 **llm_kwargs,
             )
+            try:
+                return await provider.chat_completion(tool_choice=_tc, **_kw)
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it is OUR 400
+                if _tc is None or _tc == _TC_AUTO:
+                    raise
+                if not _is_forced_tool_choice_rejection(exc):
+                    raise
+                # Any provider may refuse to be compelled — some always,
+                # some only in thinking mode, some for reasons not yet
+                # documented anywhere. Rather than require a verified
+                # capability matrix (impossible on a platform where the
+                # user picks the model), learn it here and carry on with
+                # the tools still attached. The caller loses the guarantee,
+                # not the request — so the caller's fallback path must stay
+                # live whenever it passes a compelled tool_choice.
+                self._forced_tool_choice_unsupported.add(_tc_key)
+                logger.warning(
+                    "[gateway] %s refused tool_choice=%r (%s). Retrying once "
+                    "with 'auto' and remembering it for this session. The "
+                    "structural guarantee is GONE for this call — the "
+                    "caller's fallback path must handle a prose answer.",
+                    model_key, _tc,
+                    "thinking on" if thinking else "thinking off",
+                )
+                _tc = _TC_AUTO
+                return await provider.chat_completion(tool_choice=_tc, **_kw)
 
         # P1.9: instrument the retry path so a 429/503 burst that exhausts
         # retries gets recorded for the circuit breaker. Non-rate-limit

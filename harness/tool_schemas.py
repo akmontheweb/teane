@@ -443,6 +443,37 @@ def to_anthropic_tool_choice(choice: Optional[str]) -> Optional[dict[str, Any]]:
     return {"type": "tool", "name": choice}
 
 
+def resolve_tool_choice_for_thinking(
+    choice: Optional[str], *, thinking: bool, rejects_forced: bool,
+) -> Optional[str]:
+    """Downgrade a COMPELLING ``tool_choice`` to ``"auto"`` when the model
+    rejects forcing in thinking mode.
+
+    DeepSeek 400s the whole request with ``"Thinking mode does not support
+    this tool_choice"`` for BOTH a named tool and ``"required"`` — only
+    ``"auto"`` (or omission) is accepted alongside ``thinking:
+    {"type": "enabled"}``. Verified against deepseek-v4-pro 2026-09-13.
+
+    Since every routing role in a default config points at DeepSeek, a
+    caller that combines a thinking role with a forced tool would hard-fail
+    every dispatch. Downgrading (rather than raising) keeps the gateway's
+    fail-open posture: the tools array still goes out, the model still
+    overwhelmingly calls the tool, and the caller's own fallback handles
+    the residue. Losing the guarantee beats losing the request.
+    """
+    if choice is None or not thinking or not rejects_forced:
+        return choice
+    if choice == TOOL_CHOICE_AUTO:
+        return choice
+    logger.warning(
+        "[tool_schemas] tool_choice=%r downgraded to 'auto': this model "
+        "rejects a compelled tool_choice in thinking mode. Structure is "
+        "no longer guaranteed — keep the caller's fallback path live.",
+        choice,
+    )
+    return TOOL_CHOICE_AUTO
+
+
 def validate_tool_choice(
     choice: Optional[str], tools: Optional[list[dict[str, Any]]],
 ) -> Optional[str]:

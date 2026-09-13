@@ -42,6 +42,9 @@ from harness.gateway import (
 from harness.tool_schemas import (
     PATCH_TOOLS,
     resolve_tool_choice_for_thinking,
+    strip_strict,
+    to_strict_schema,
+    with_strict,
     to_anthropic_tool_choice,
     to_anthropic_tools,
     to_openai_tool_choice,
@@ -1549,3 +1552,172 @@ class TestLearnAndDowngrade:
         )
         # thinking=False was never marked, so forcing was still attempted.
         assert prov.seen[0] == "read_file"
+
+
+# ---------------------------------------------------------------------------
+# strict mode — schema-valid arguments, independent of tool_choice
+#
+# ``strict`` constrains the ARGUMENTS a call carries; ``tool_choice``
+# constrains WHETHER one happens. Independence matters on a platform: a
+# model that refuses compulsion may still honour strict. Verified live on
+# deepseek-v4-pro 2026-09-13 — accepted with thinking both ON and OFF,
+# where a compelled tool_choice is refused with thinking ON.
+# ---------------------------------------------------------------------------
+
+class TestStrictSchemaHardening:
+
+    def test_object_is_closed_and_fully_required(self):
+        out = to_strict_schema({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+        })
+        assert out["additionalProperties"] is False
+        assert sorted(out["required"]) == ["a", "b"]
+
+    def test_nested_objects_are_closed_recursively(self):
+        out = to_strict_schema({
+            "type": "object",
+            "properties": {
+                "rows": {"type": "array", "items": {
+                    "type": "object", "properties": {"c": {"type": "string"}},
+                }},
+            },
+        })
+        item = out["properties"]["rows"]["items"]
+        assert item["additionalProperties"] is False
+        assert item["required"] == ["c"]
+
+    def test_input_is_not_mutated(self):
+        original = {"type": "object", "properties": {"a": {"type": "string"}}}
+        snapshot = json.loads(json.dumps(original))
+        to_strict_schema(original)
+        assert original == snapshot
+
+    def test_non_object_nodes_pass_through(self):
+        assert to_strict_schema({"type": "string"}) == {"type": "string"}
+        assert to_strict_schema("scalar") == "scalar"
+        assert to_strict_schema(7) == 7
+
+    def test_existing_required_is_widened_not_trusted(self):
+        """A caller's partial ``required`` would fail strict validation —
+        promoting every property is the point."""
+        out = to_strict_schema({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a"],
+        })
+        assert sorted(out["required"]) == ["a", "b"]
+
+
+class TestWithStrictAndStrip:
+
+    def test_with_strict_marks_and_hardens(self):
+        out = with_strict(PATCH_TOOLS)
+        assert all(t["strict"] is True for t in out)
+        assert all(
+            t["input_schema"].get("additionalProperties") is False
+            for t in out if "properties" in t["input_schema"]
+        )
+
+    def test_with_strict_disabled_is_a_clean_passthrough(self):
+        assert all("strict" not in t for t in with_strict(PATCH_TOOLS, enabled=False))
+
+    def test_with_strict_does_not_mutate_the_global_patch_tools(self):
+        before = json.dumps(PATCH_TOOLS, sort_keys=True)
+        with_strict(PATCH_TOOLS)
+        assert json.dumps(PATCH_TOOLS, sort_keys=True) == before
+
+    def test_strip_strict_keeps_the_closed_schema(self):
+        """Only the flag that triggers refusal is dropped — a closed schema
+        is valid ordinary JSON Schema and costs nothing."""
+        stripped = strip_strict(with_strict(PATCH_TOOLS))
+        assert all("strict" not in t for t in stripped)
+        assert all(
+            t["input_schema"].get("additionalProperties") is False
+            for t in stripped if "properties" in t["input_schema"]
+        )
+
+    def test_strip_strict_handles_none_and_empty(self):
+        assert strip_strict(None) is None
+        assert strip_strict([]) == []
+
+
+class TestStrictWireplacement:
+
+    def test_openai_nests_strict_inside_function(self):
+        fn = to_openai_tools(with_strict(PATCH_TOOLS))[0]["function"]
+        assert fn["strict"] is True
+
+    def test_anthropic_keeps_strict_top_level(self):
+        tool = to_anthropic_tools(with_strict(PATCH_TOOLS))[0]
+        assert tool["strict"] is True
+        assert "strict" not in tool["input_schema"]
+
+    def test_absent_strict_is_not_emitted(self):
+        fn = to_openai_tools(PATCH_TOOLS)[0]["function"]
+        assert "strict" not in fn
+
+
+class TestStrictDetector:
+
+    @pytest.mark.parametrize("body", [
+        '{"error":{"message":"strict mode is not supported"}}',
+        '{"error":{"message":"schema must set additionalProperties:false"}}',
+    ])
+    def test_matches_strict_refusals(self, body: str):
+        from harness.gateway import _is_strict_tool_rejection
+        assert _is_strict_tool_rejection(_FakeHttpError(400, body))
+
+    def test_ignores_unrelated_400s(self):
+        from harness.gateway import _is_strict_tool_rejection
+        assert not _is_strict_tool_rejection(
+            _FakeHttpError(400, '{"error":{"message":"messages: too long"}}')
+        )
+
+
+@pytest.mark.asyncio
+class TestStrictLearnAndDowngrade:
+
+    async def test_rejecting_model_recovers_without_strict(self):
+        key = "stub:no-strict"
+
+        class _NoStrict:
+            spec = _stub_spec(key)
+            api_key = "x"
+
+            def __init__(self) -> None:
+                self.seen: list[bool] = []
+
+            async def chat_completion(self, *, tools=None, **_kw: Any) -> LLMResponse:
+                had = bool(tools and any(t.get("strict") for t in tools))
+                self.seen.append(had)
+                if had:
+                    raise _FakeHttpError(
+                        400, '{"error":{"message":"strict mode not supported"}}',
+                    )
+                return LLMResponse(
+                    content="ok",
+                    usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                     model_name=key, cost_usd=0.0),
+                    model=key,
+                )
+
+            async def close(self) -> None:
+                return None
+
+        prov = _NoStrict()
+        gw = _gw_with(prov, key)
+        resp, _b = await gw.dispatch(
+            messages=[{"role": "user", "content": "go"}],
+            role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+            tools=with_strict(PATCH_TOOLS),
+        )
+        assert resp.content == "ok"
+        assert prov.seen == [True, False]
+        # Learned — a second dispatch never sends strict again.
+        await gw.dispatch(
+            messages=[{"role": "user", "content": "go"}],
+            role=NodeRole.PATCHING, budget_remaining_usd=1.0,
+            tools=with_strict(PATCH_TOOLS),
+        )
+        assert prov.seen == [True, False, False]

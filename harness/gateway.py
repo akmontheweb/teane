@@ -2711,6 +2711,26 @@ def _prune_debug_dumps(debug_dir: str, cap: int) -> None:
         return
 
 
+def _is_strict_tool_rejection(exc: BaseException) -> bool:
+    """True when a provider refused the request because a tool was marked
+    ``strict``.
+
+    Same reasoning as :func:`_is_forced_tool_choice_rejection`: strict
+    support is uneven and undocumented across the backends a user may
+    route to, so the recovery cannot depend on knowing in advance which
+    models have it. Matches a 4xx whose body names strict mode or the
+    closed-schema requirement it implies.
+    """
+    resp = getattr(exc, "response", None)
+    if getattr(resp, "status_code", None) not in (400, 422):
+        return False
+    try:
+        body = (resp.text or "")[:4000].lower()
+    except Exception:  # noqa: BLE001 — a body we cannot read is not a match
+        return False
+    return "strict" in body or "additionalproperties" in body
+
+
 def _is_forced_tool_choice_rejection(exc: BaseException) -> bool:
     """True when a provider refused the request *because of* a compelled
     ``tool_choice``, as opposed to any other 400.
@@ -2766,6 +2786,9 @@ class Gateway:
         # it learns from any provider, known or not. In-memory only: a
         # restart re-learns at a cost of one downgraded call.
         self._forced_tool_choice_unsupported: set[tuple[str, bool]] = set()
+        # Same mechanism for strict-mode tools, keyed by model_key alone —
+        # strict support is a property of the model, not of thinking mode.
+        self._strict_tools_unsupported: set[str] = set()
         # 429/503 circuit breaker (P1.9). When too many rate-limit / server
         # failures pile up in a short window, fall the next call back to
         # local Ollama instead of burning retries with no chance of
@@ -3702,12 +3725,17 @@ class Gateway:
             )
             _tc = _TC_AUTO
 
+        # Strict tools: same learn-and-downgrade contract.
+        from harness.tool_schemas import strip_strict as _strip_strict
+        _tools = effective_tools
+        if _tools and model_key in self._strict_tools_unsupported:
+            _tools = _strip_strict(_tools)
+
         async def _call() -> LLMResponse:
-            nonlocal _tc
+            nonlocal _tc, _tools
             _kw = dict(
                 messages=messages,
                 thinking=thinking,
-                tools=effective_tools,
                 # Per-role, config-controlled HTTP timeout (resolved fresh here
                 # so a fallback re-dispatch re-resolves for its own role rather
                 # than inheriting a stale value via llm_kwargs).
@@ -3715,8 +3743,29 @@ class Gateway:
                 **llm_kwargs,
             )
             try:
-                return await provider.chat_completion(tool_choice=_tc, **_kw)
-            except Exception as exc:  # noqa: BLE001 — re-raised unless it is OUR 400
+                return await provider.chat_completion(
+                    tools=_tools, tool_choice=_tc, **_kw,
+                )
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it is OURS
+                # Strict first: a strict rejection names the tool schema and
+                # would otherwise be misread as a tool_choice problem, since
+                # some bodies mention both.
+                if (
+                    _tools and any(t.get("strict") for t in _tools)
+                    and _is_strict_tool_rejection(exc)
+                ):
+                    self._strict_tools_unsupported.add(model_key)
+                    logger.warning(
+                        "[gateway] %s rejected strict-mode tools. Retrying "
+                        "once without strict and remembering it for this "
+                        "session. Tool arguments are no longer schema-"
+                        "guaranteed — validate them on receipt.",
+                        model_key,
+                    )
+                    _tools = _strip_strict(_tools)
+                    return await provider.chat_completion(
+                        tools=_tools, tool_choice=_tc, **_kw,
+                    )
                 if _tc is None or _tc == _TC_AUTO:
                     raise
                 if not _is_forced_tool_choice_rejection(exc):
@@ -3739,7 +3788,9 @@ class Gateway:
                     "thinking on" if thinking else "thinking off",
                 )
                 _tc = _TC_AUTO
-                return await provider.chat_completion(tool_choice=_tc, **_kw)
+                return await provider.chat_completion(
+                    tools=_tools, tool_choice=_tc, **_kw,
+                )
 
         # P1.9: instrument the retry path so a 429/503 burst that exhausts
         # retries gets recorded for the circuit breaker. Non-rate-limit

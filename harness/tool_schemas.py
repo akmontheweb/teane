@@ -360,9 +360,10 @@ def to_anthropic_tools(tools: list[dict[str, Any]] = PATCH_TOOLS) -> list[dict[s
     """Return ``tools`` in Anthropic's Messages-API ``tools=[...]`` shape.
 
     Anthropic accepts the raw ``{name, description, input_schema}`` dicts
-    directly, so this is mostly a copy. Kept as a function so future
-    Anthropic-specific tweaks (e.g. caching control on tool blocks) have
-    one place to land.
+    directly, so this is mostly a copy. ``strict`` (when a caller has set
+    it via :func:`with_strict`) is already a top-level field on the tool,
+    which is exactly where Anthropic wants it — alongside ``name`` /
+    ``description`` / ``input_schema``, NOT on ``tool_choice``.
     """
     return [dict(t) for t in tools]
 
@@ -378,15 +379,91 @@ def to_openai_tools(tools: list[dict[str, Any]] = PATCH_TOOLS) -> list[dict[str,
     """
     out: list[dict[str, Any]] = []
     for t in tools:
-        out.append({
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["input_schema"],
-            },
-        })
+        fn: dict[str, Any] = {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        }
+        # OpenAI nests ``strict`` INSIDE the function object, where
+        # Anthropic keeps it top-level on the tool. Same flag, different
+        # depth — the only reason this adapter has to know about it.
+        if t.get("strict"):
+            fn["strict"] = True
+        out.append({"type": "function", "function": fn})
     return out
+
+
+# ---------------------------------------------------------------------------
+# strict mode — schema-valid tool input, independent of tool_choice
+# ---------------------------------------------------------------------------
+#
+# ``strict`` constrains the ARGUMENTS a tool call carries; ``tool_choice``
+# constrains WHETHER one happens. They are independent, which matters on a
+# platform: a model that refuses to be compelled may still honour strict,
+# so strict is the more portable of the two guarantees.
+#
+# Both providers require the schema to be closed — ``additionalProperties:
+# false`` throughout, and ``required`` present on every object. A strict
+# tool whose schema is not closed is rejected, so ``with_strict`` hardens
+# the schema rather than trusting the caller to have done it.
+
+def to_strict_schema(schema: Any) -> Any:
+    """Return ``schema`` closed for strict mode, recursively.
+
+    Sets ``additionalProperties: false`` on every object node and makes
+    ``required`` list every declared property. Promoting optional fields
+    to required is deliberate and is what strict mode demands: the model
+    must emit the key, though an empty array / empty string / null-union
+    still expresses "nothing here". Callers who need a genuinely absent
+    key should model it as a nullable type rather than an optional one.
+
+    Input is never mutated — nested dicts and lists are rebuilt.
+    """
+    if isinstance(schema, list):
+        return [to_strict_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {k: to_strict_schema(v) for k, v in schema.items()}
+    if out.get("type") == "object" or "properties" in out:
+        props = out.get("properties")
+        if isinstance(props, dict):
+            out["additionalProperties"] = False
+            out["required"] = list(props.keys())
+    return out
+
+
+def with_strict(
+    tools: list[dict[str, Any]] = PATCH_TOOLS, *, enabled: bool = True,
+) -> list[dict[str, Any]]:
+    """Return ``tools`` marked strict, with every schema closed to match.
+
+    ``enabled=False`` returns the tools unchanged (and strips any strict
+    marker), so a caller can flip the guarantee from config without
+    branching at the call site.
+    """
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        copy = dict(t)
+        if enabled:
+            copy["strict"] = True
+            if "input_schema" in copy:
+                copy["input_schema"] = to_strict_schema(copy["input_schema"])
+        else:
+            copy.pop("strict", None)
+        out.append(copy)
+    return out
+
+
+def strip_strict(tools: Optional[list[dict[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+    """Return ``tools`` with every ``strict`` marker removed.
+
+    The recovery path for a provider that rejects strict mode. The closed
+    schema is left in place — it is valid ordinary JSON Schema and costs
+    nothing; only the flag that triggers the refusal is dropped.
+    """
+    if not tools:
+        return tools
+    return [{k: v for k, v in t.items() if k != "strict"} for t in tools]
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +21,11 @@ from harness import decomposition, story_state
 @dataclass
 class _FakeResponse:
     content: str
+    # B6 structured tool-use. When the model calls the tool, real providers
+    # return EMPTY content and put the payload here — the double must be
+    # able to express that, or the tool path can't be tested.
+    tool_calls: list = field(default_factory=list)
+    reasoning_content: str = ""
 
 
 class _FakeGateway:
@@ -53,13 +58,31 @@ class _FakeGateway:
             "messages": list(messages),
             "role": role,
             "budget_in": budget_remaining_usd,
+            "tools": _kw.get("tools"),
+            "tool_choice": _kw.get("tool_choice"),
+            "thinking_override": _kw.get("_thinking_override"),
         })
         if self._raise is not None:
             raise self._raise
         if not self._responses:
             raise AssertionError("fake gateway out of responses")
-        content = self._responses.pop(0)
-        return _FakeResponse(content=content), self._budget
+        item = self._responses.pop(0)
+        if isinstance(item, dict):
+            # {"tool": {...}} → a structured submit_decomposition call.
+            if "tool" in item:
+                return (
+                    _FakeResponse(
+                        content="",
+                        tool_calls=[{
+                            "name": "submit_decomposition",
+                            "input": item["tool"],
+                            "id": "call_1",
+                        }],
+                    ),
+                    self._budget,
+                )
+            return _FakeResponse(**item), self._budget
+        return _FakeResponse(content=item), self._budget
 
 
 @pytest.fixture
@@ -1518,11 +1541,12 @@ def test_decomposition_node_invalid_json(workspace: str):
     _write_spec(workspace)
     # Two bad rolls: the node retries once with a JSON-only nudge before
     # giving up, so both attempts must be stubbed to reach the failure.
-    gw = _FakeGateway(["not actually json", "still not json"])
+    # Three dispatches now: attempt 1, the phase-2 serialise pass, attempt 2.
+    gw = _FakeGateway(["not actually json", "still prose", "still not json"])
     set_gateway(gw)
     out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
     assert out["node_state"]["error"].startswith("invalid_json")
-    assert len(gw.calls) == 2
+    assert len(gw.calls) == 3
     # DB should not have been populated for this app
     app = story_state.app_name_for_workspace(workspace)
     conn = story_state.open_story_db()
@@ -1776,7 +1800,9 @@ def test_decomposition_node_empty_response_is_named(workspace: str):
     instead of the opaque ``Expecting value: line 1 column 1``."""
     from harness.graph import set_gateway
     _write_spec(workspace)
-    gw = _FakeGateway(["", ""])  # both attempts empty
+    # Empty content and empty reasoning → nothing to serialise, so phase 2
+    # is skipped entirely and only the two attempts run.
+    gw = _FakeGateway(["", ""])
     set_gateway(gw)
     out = asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
     assert out["node_state"]["decomposition_failed"] is True
@@ -2569,10 +2595,12 @@ _LUMINA_PROSE = (
 class TestProseInsteadOfJsonRetries:
 
     def test_prose_then_json_recovers(self, workspace: str):
-        """The exact lumina shape: deliberation prose first, object second."""
+        """Prose first, then the serialise pass returns text JSON."""
         from harness.graph import set_gateway
         _write_spec(workspace)
-        gw = _FakeGateway([_LUMINA_PROSE, _valid_payload()])
+        # Phase 2 dispatches but answers in text rather than a tool call;
+        # the nudge attempt then lands the object.
+        gw = _FakeGateway([_LUMINA_PROSE, "still prose", _valid_payload()])
         set_gateway(gw)
         out = asyncio.run(
             decomposition.decomposition_node(_build_state(workspace))
@@ -2580,22 +2608,23 @@ class TestProseInsteadOfJsonRetries:
         # The success path never sets ``decomposition_failed`` at all.
         assert not out["node_state"].get("decomposition_failed")
         assert out["node_state"]["story_count"] == 2
-        assert len(gw.calls) == 2
+        assert len(gw.calls) == 3
 
     def test_retry_carries_a_json_only_nudge(self, workspace: str):
         """The second dispatch must actually tell the model what went
         wrong — a bare re-ask is just a re-roll."""
         from harness.graph import set_gateway
         _write_spec(workspace)
-        gw = _FakeGateway([_LUMINA_PROSE, _valid_payload()])
+        gw = _FakeGateway([_LUMINA_PROSE, "still prose", _valid_payload()])
         set_gateway(gw)
         asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
-        nudge = str(gw.calls[1]["messages"][-1].get("content", ""))
+        # calls[1] is the phase-2 serialise pass; calls[2] carries the nudge.
+        nudge = str(gw.calls[2]["messages"][-1].get("content", ""))
         assert "ONLY the JSON object" in nudge
         assert "no ``` code fences" in nudge
         # The original prompt is retained, not replaced — the retry must not
         # drop the spec it is meant to decompose.
-        assert len(gw.calls[1]["messages"]) > len(gw.calls[0]["messages"])
+        assert len(gw.calls[2]["messages"]) > len(gw.calls[0]["messages"])
 
     def test_empty_then_json_recovers(self, workspace: str):
         """The other half of the same failure mode: reasoning consumed the
@@ -2626,14 +2655,18 @@ class TestProseInsteadOfJsonRetries:
         """Bounded: never a third dispatch, however bad the rolls."""
         from harness.graph import set_gateway
         _write_spec(workspace)
-        gw = _FakeGateway([_LUMINA_PROSE, _LUMINA_PROSE, _valid_payload()])
+        gw = _FakeGateway([
+            _LUMINA_PROSE, _LUMINA_PROSE, _LUMINA_PROSE, _valid_payload(),
+        ])
         set_gateway(gw)
         out = asyncio.run(
             decomposition.decomposition_node(_build_state(workspace))
         )
         assert out["node_state"]["decomposition_failed"] is True
         assert out["node_state"]["error"].startswith("invalid_json")
-        assert len(gw.calls) == 2
+        # Two planning attempts plus one serialise pass — never a third
+        # planning attempt, and never a serialise pass off the retry.
+        assert len(gw.calls) == 3
 
     def test_last_error_is_reported_not_the_first(self, workspace: str):
         """When the two attempts fail differently, the surviving error is
@@ -2681,3 +2714,180 @@ class TestProseInsteadOfJsonRetries:
             assert story_state.list_stories(conn, app) == []
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# B3 — think, then serialise.
+#
+# The lumina failure was not bad planning. deepseek-v4-pro named every story,
+# feature, dependency and scope file correctly across 33,814 chars of prose,
+# then never serialised any of it. Re-planning throws that work away; phase 2
+# keeps the plan and redoes only the step that failed.
+#
+# Phase 1  thinking ON, strict tools, tool_choice=auto.
+#          strict survives thinking mode where a compelled tool_choice is a
+#          400 (deepseek-v4-pro, verified live 2026-09-13).
+# Phase 2  thinking OFF, tool FORCED, fed the prose from phase 1.
+# Phase 3  the pre-existing JSON-only nudge, unchanged.
+# ---------------------------------------------------------------------------
+
+class TestThinkThenSerialize:
+
+    def test_tool_call_is_read_before_content(self, workspace: str):
+        """When the tool fires, real providers return EMPTY content — a node
+        that parses content first would see nothing and declare failure."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([{"tool": json.loads(_valid_payload())}])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 1  # no retry, no serialise pass
+
+    def test_phase_one_attaches_strict_tools_with_auto(self, workspace: str):
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([{"tool": json.loads(_valid_payload())}])
+        set_gateway(gw)
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        call = gw.calls[0]
+        tools = call["tools"]
+        assert [t["name"] for t in tools] == ["submit_decomposition"]
+        assert tools[0]["strict"] is True
+        assert tools[0]["input_schema"]["additionalProperties"] is False
+        # Forcing here would 400 on a thinking-mode planning role.
+        assert call["tool_choice"] == "auto"
+
+    def test_prose_is_serialized_rather_than_replanned(self, workspace: str):
+        """The headline path: phase 1 answers in prose, phase 2 turns that
+        same prose into the payload, and no third dispatch is needed."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            _LUMINA_PROSE,
+            {"tool": json.loads(_valid_payload())},
+        ])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 2
+
+    def test_serialize_pass_carries_the_prose_and_forces_the_tool(
+        self, workspace: str,
+    ):
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            _LUMINA_PROSE,
+            {"tool": json.loads(_valid_payload())},
+        ])
+        set_gateway(gw)
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        serialize = gw.calls[1]
+        body = str(serialize["messages"][-1].get("content", ""))
+        # The model's own words are handed back to it verbatim.
+        assert _LUMINA_PROSE.strip()[:60] in body
+        # And it is told not to re-plan.
+        assert "do NOT re-plan" in body or "do not re-plan" in body.lower()
+        assert serialize["tool_choice"] == "submit_decomposition"
+
+    def test_serialize_pass_runs_with_thinking_off(self, workspace: str):
+        """Forcing a tool is a 400 in thinking mode on the model this was
+        built for, and the reasoning already happened in phase 1."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            _LUMINA_PROSE,
+            {"tool": json.loads(_valid_payload())},
+        ])
+        set_gateway(gw)
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        assert gw.calls[1]["thinking_override"] is False
+
+    def test_reasoning_content_is_used_when_content_is_empty(
+        self, workspace: str,
+    ):
+        """The other shape of the same failure: the whole answer went to the
+        reasoning channel. That is still a plan worth serialising."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            {"content": "", "reasoning_content": _LUMINA_PROSE},
+            {"tool": json.loads(_valid_payload())},
+        ])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+        assert len(gw.calls) == 2
+
+    def test_no_serialize_pass_when_there_is_nothing_to_serialize(
+        self, workspace: str,
+    ):
+        """An empty response carries no plan — spending a dispatch on it
+        would be pure waste."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway(["", ""])
+        set_gateway(gw)
+        asyncio.run(decomposition.decomposition_node(_build_state(workspace)))
+        assert len(gw.calls) == 2
+
+    def test_serialize_failure_falls_through_to_the_nudge(
+        self, workspace: str,
+    ):
+        """Phase 2 is an optimisation, not a dependency — if it throws, the
+        pre-existing phase 3 still runs."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+
+        class _FailSerialize(_FakeGateway):
+            async def dispatch(self, **kw):
+                if len(self.calls) == 1:
+                    self.calls.append(kw)
+                    raise RuntimeError("serialise upstream 503")
+                return await super().dispatch(**kw)
+
+        gw = _FailSerialize([_LUMINA_PROSE, _valid_payload()])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+
+    def test_wrong_tool_name_is_ignored(self, workspace: str):
+        """A call to some other tool is not our payload."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            {"content": "", "tool_calls": [
+                {"name": "read_file", "input": {"path": "x"}, "id": "1"},
+            ]},
+            _valid_payload(),
+        ])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2
+
+    def test_non_dict_tool_input_is_ignored(self, workspace: str):
+        """Tool input arrives from a model; it is not trusted to be a dict."""
+        from harness.graph import set_gateway
+        _write_spec(workspace)
+        gw = _FakeGateway([
+            {"content": "", "tool_calls": [
+                {"name": "submit_decomposition", "input": "not a dict", "id": "1"},
+            ]},
+            _valid_payload(),
+        ])
+        set_gateway(gw)
+        out = asyncio.run(
+            decomposition.decomposition_node(_build_state(workspace))
+        )
+        assert out["node_state"]["story_count"] == 2

@@ -467,6 +467,132 @@ def strip_strict(tools: Optional[list[dict[str, Any]]]) -> Optional[list[dict[st
 
 
 # ---------------------------------------------------------------------------
+# Story decomposition
+# ---------------------------------------------------------------------------
+#
+# One tool covers all five JSON-emitting dispatch sites in
+# ``decomposition_node``: the main plan, the agile-patch augment, and the
+# three targeted repairs (cycle, unknown requirement key, too many
+# features) — every repair prompt asks for "the COMPLETE corrected payload
+# … exactly the same shape as before", so they share this schema.
+#
+# The schema encodes the STRUCTURAL half of the contract that
+# ``_build_decomposition_prompt`` previously carried in prose. The
+# SEMANTIC half stays in the prompt and the validator, because JSON Schema
+# cannot express it: that ``feature`` must match a declared
+# ``feature_key``, that ``requirement_keys`` must come from the workspace's
+# own spec registry, that ``depends_on`` must be acyclic, or that a
+# ``scope_files`` entry must share a domain word with the story. Do not
+# delete that guidance from the prompt on the strength of this schema.
+
+DECOMPOSITION_TOOL: list[dict[str, Any]] = [{
+    "name": "submit_decomposition",
+    "description": (
+        "Submit the finished decomposition of the specification into "
+        "features and vertical-slice stories. Call this exactly once, "
+        "with the complete plan."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "features": {
+                "type": "array",
+                "description": "The features this spec decomposes into.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "feature_key": {
+                            "type": "string",
+                            "description": (
+                                "Short kebab-case identifier, unique across "
+                                "features (e.g. 'auth', 'billing')."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Human-readable name, 3-6 words.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "One or two sentences of scope.",
+                        },
+                    },
+                },
+            },
+            "stories": {
+                "type": "array",
+                "description": (
+                    "Vertical-slice stories. May be empty in augment mode "
+                    "when the spec introduced nothing new."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "story_key": {
+                            "type": "string",
+                            "description": "e.g. 'STORY-001'.",
+                        },
+                        "feature": {
+                            "type": "string",
+                            "description": (
+                                "Must equal one of the declared "
+                                "feature_key values."
+                            ),
+                        },
+                        "title": {"type": "string"},
+                        "description": {
+                            "type": "string",
+                            "description": "1-2 sentence summary of intent.",
+                        },
+                        "requirement_keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "At least one identifier drawn from this "
+                                "workspace's spec (FR-/NFR-/US-/EPIC-/"
+                                "FEAT-/STORY-)."
+                            ),
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "1-4 concrete, observable criteria. Name the "
+                                "observable outcome, not just the action."
+                            ),
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "story_key values this story hard-depends "
+                                "on. Must be acyclic. Empty is normal."
+                            ),
+                        },
+                        "scope_files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Production file hints. EMPTY IS THE RIGHT "
+                                "DEFAULT — a wrong hint costs more than no "
+                                "hint. Never test files alone."
+                            ),
+                        },
+                    },
+                },
+            },
+            "summary": {
+                "type": "string",
+                "description": "One line describing the decomposition shape.",
+            },
+        },
+    },
+}]
+
+DECOMPOSITION_TOOL_NAME = "submit_decomposition"
+
+
+# ---------------------------------------------------------------------------
 # tool_choice — offering a tool vs. compelling one
 # ---------------------------------------------------------------------------
 #

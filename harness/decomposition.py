@@ -2122,6 +2122,75 @@ def _build_unknown_req_repair_prompt(
     )
 
 
+def _payload_from_tool_calls(response: Any) -> Optional[dict[str, Any]]:
+    """Return the decomposition payload from a structured tool call, or None.
+
+    When the model calls the tool, ``content`` comes back EMPTY (verified on
+    deepseek-v4-pro: 5/5 rolls, content=0 chars, reasoning populated). So the
+    tool call must be read FIRST — a caller that parses ``content`` first
+    sees nothing and concludes the model failed.
+    """
+    from harness.tool_schemas import DECOMPOSITION_TOOL_NAME
+    for call in getattr(response, "tool_calls", None) or []:
+        if call.get("name") != DECOMPOSITION_TOOL_NAME:
+            continue
+        payload = call.get("input")
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+async def _serialize_prose_via_tool(
+    gateway: Any,
+    system_msg: dict[str, Any],
+    prose: str,
+    budget: float,
+) -> tuple[Optional[dict[str, Any]], float]:
+    """Second phase: turn a prose decomposition into the structured payload.
+
+    The lumina failure was NOT bad planning — the model named every story,
+    feature, dependency and scope file correctly, in 33,814 chars of prose,
+    and then never serialised any of it. Re-planning throws that work away;
+    this call keeps it and does only the step that failed.
+
+    Runs with thinking OFF deliberately. deepseek-v4-pro 400s a compelled
+    ``tool_choice`` in thinking mode but accepts it with thinking off
+    (verified 2026-09-13), and this call needs no reasoning — the thinking
+    already happened upstream. On a model that refuses compulsion outright
+    the gateway downgrades to ``auto`` and this becomes best-effort, which
+    is why the caller still has a text path behind it.
+    """
+    # Deferred, like decomposition_node's own NodeRole import — these
+    # modules import back into the graph package.
+    from harness.gateway import NodeRole
+    from harness.tool_schemas import (
+        DECOMPOSITION_TOOL,
+        DECOMPOSITION_TOOL_NAME,
+        with_strict,
+    )
+    prompt = (
+        "Below is a decomposition you have already worked out, written as "
+        "prose. It is correct — do NOT re-plan it, do NOT rename anything, "
+        "and do NOT add or drop features, stories, dependencies or scope "
+        "files. Your only job is to serialise exactly what is already "
+        "there by calling the tool once.\n\n"
+        "If the prose leaves a required field genuinely unstated, use the "
+        "most conservative value consistent with it (an empty array rather "
+        "than an invented entry).\n\n"
+        f"{prose[:60000]}"
+    )
+    response, budget = await gateway.dispatch(
+        messages=[system_msg, {"role": "user", "content": prompt}],
+        role=NodeRole.PLANNING,
+        budget_remaining_usd=budget,
+        cache_family="planning:decomposition_serialize",
+        tools=with_strict(DECOMPOSITION_TOOL),
+        tool_choice=DECOMPOSITION_TOOL_NAME,
+        _thinking_override=False,
+    )
+    return _payload_from_tool_calls(response), budget
+
+
 async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     """Decompose the approved spec into stories, persist them, regenerate views.
 
@@ -2329,6 +2398,17 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
         "markdown headings, and no ``` code fences. Do not restate your "
         "reasoning; emit the object described above."
     )
+    # Phase 1 attaches the schema as a strict tool. Strict survives thinking
+    # mode where a compelled tool_choice does not (deepseek-v4-pro, verified
+    # 2026-09-13), so the structural contract holds on the reasoning call and
+    # only the compulsion is deferred to phase 2. ``auto`` rather than a
+    # forced choice for the same reason — forcing here is a 400.
+    from harness.tool_schemas import (
+        TOOL_CHOICE_AUTO,
+        DECOMPOSITION_TOOL,
+        with_strict,
+    )
+    _tools = with_strict(DECOMPOSITION_TOOL)
     data = None
     parse_error = "empty_response"
     for _attempt in range(2):
@@ -2342,6 +2422,8 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 role=NodeRole.PLANNING,
                 budget_remaining_usd=budget,
                 cache_family="planning:story_decomposition",
+                tools=_tools,
+                tool_choice=TOOL_CHOICE_AUTO,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[decomposition] gateway dispatch failed: %s", exc)
@@ -2356,6 +2438,17 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 },
                 "budget_remaining_usd": budget,
             }
+
+        # Structured call first — when the tool fires, ``content`` is empty.
+        _tool_payload = _payload_from_tool_calls(response)
+        if _tool_payload is not None:
+            logger.info(
+                "[decomposition] payload arrived as a structured tool call "
+                "(attempt %d).", _attempt + 1,
+            )
+            data = _tool_payload
+            raw = json.dumps(data)
+            break
 
         raw = strip_json_fence(getattr(response, "content", "") or "")
         if not raw.strip():
@@ -2378,6 +2471,39 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                     "%d/2): %s", _attempt + 1, exc,
                 )
         if _attempt == 0:
+            # Phase 2 — the model planned in prose but never serialised.
+            # Keep the plan, redo only the step that failed. Cheaper and
+            # far more faithful than asking it to think the whole thing
+            # through again.
+            _prose = (getattr(response, "content", "") or "").strip()
+            if not _prose:
+                _prose = (
+                    getattr(response, "reasoning_content", "") or ""
+                ).strip()
+            if _prose:
+                logger.warning(
+                    "[decomposition] No JSON and no tool call, but %d chars "
+                    "of prose. Asking the model to serialise what it already "
+                    "decided rather than re-plan it.", len(_prose),
+                )
+                try:
+                    _serialized, budget = await _serialize_prose_via_tool(
+                        gateway, system_msg, _prose, budget,
+                    )
+                except Exception as exc:  # noqa: BLE001 — fall through to the nudge
+                    logger.warning(
+                        "[decomposition] Serialise pass failed (%s); falling "
+                        "back to the JSON-only nudge.", exc,
+                    )
+                    _serialized = None
+                if _serialized is not None:
+                    logger.info(
+                        "[decomposition] Serialise pass recovered the payload "
+                        "from prose — the planning work was not wasted."
+                    )
+                    data = _serialized
+                    raw = json.dumps(data)
+                    break
             logger.warning(
                 "[decomposition] Retrying once with a JSON-only nudge — the "
                 "model answered in prose. A second roll usually serialises."

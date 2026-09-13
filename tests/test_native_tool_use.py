@@ -41,9 +41,12 @@ from harness.gateway import (
 )
 from harness.tool_schemas import (
     PATCH_TOOLS,
+    to_anthropic_tool_choice,
     to_anthropic_tools,
+    to_openai_tool_choice,
     to_openai_tools,
     tool_calls_to_patch_blocks,
+    validate_tool_choice,
 )
 
 
@@ -972,3 +975,243 @@ async def test_relative_paths_pass_through_unchanged(tmp_path):
     )
     assert results[0].success, results[0].error
     assert "server/app/db.py" in modified
+
+
+# ---------------------------------------------------------------------------
+# tool_choice — offering a tool vs. compelling one
+#
+# Attaching ``tools`` only OFFERS them; every backend here may answer in prose
+# and ignore the array. That is the failure that kills single-dispatch
+# structured nodes (lumina-testrun-20260911-1102: the planner narrated its
+# whole decomposition in ``content`` and never emitted the object).
+# ``tool_choice`` is what turns the offer into a requirement.
+# ---------------------------------------------------------------------------
+
+class TestToolChoiceTranslation:
+    """Canonical vocabulary → provider wire format."""
+
+    def test_openai_auto_and_required_are_bare_strings(self):
+        assert to_openai_tool_choice("auto") == "auto"
+        assert to_openai_tool_choice("required") == "required"
+
+    def test_openai_named_tool_is_nested_function_object(self):
+        assert to_openai_tool_choice("read_file") == {
+            "type": "function", "function": {"name": "read_file"},
+        }
+
+    def test_anthropic_uses_objects_and_spells_required_as_any(self):
+        assert to_anthropic_tool_choice("auto") == {"type": "auto"}
+        assert to_anthropic_tool_choice("required") == {"type": "any"}
+        assert to_anthropic_tool_choice("read_file") == {
+            "type": "tool", "name": "read_file",
+        }
+
+    def test_none_translates_to_none_on_both(self):
+        """None means "omit the field", not "send auto" — the provider
+        default must stay reachable."""
+        assert to_openai_tool_choice(None) is None
+        assert to_anthropic_tool_choice(None) is None
+
+
+class TestToolChoiceCoherenceGuard:
+    """``validate_tool_choice`` drops guaranteed-400 requests without
+    raising — a malformed choice must degrade, never abort a paid
+    dispatch."""
+
+    def test_naming_a_supplied_tool_passes(self):
+        assert validate_tool_choice("read_file", PATCH_TOOLS) == "read_file"
+
+    def test_naming_an_absent_tool_is_dropped(self):
+        assert validate_tool_choice("no_such_tool", PATCH_TOOLS) is None
+
+    def test_choice_without_tools_is_dropped(self):
+        assert validate_tool_choice("read_file", None) is None
+        assert validate_tool_choice("required", []) is None
+
+    def test_sentinels_pass_without_name_matching(self):
+        assert validate_tool_choice("auto", PATCH_TOOLS) == "auto"
+        assert validate_tool_choice("required", PATCH_TOOLS) == "required"
+
+    def test_none_stays_none(self):
+        assert validate_tool_choice(None, PATCH_TOOLS) is None
+
+
+@pytest.mark.asyncio
+class TestToolChoiceOnTheWire:
+
+    async def test_openai_payload_carries_forced_tool(self):
+        provider, client = _make_openai_provider({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}],
+            tools=PATCH_TOOLS,
+            tool_choice="read_file",
+        )
+        assert client.last_payload["tool_choice"] == {
+            "type": "function", "function": {"name": "read_file"},
+        }
+
+    async def test_anthropic_payload_carries_forced_tool(self):
+        provider, client = _make_anthropic_provider({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+            "stop_reason": "end_turn",
+        })
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}],
+            tools=PATCH_TOOLS,
+            tool_choice="read_file",
+        )
+        assert client.last_payload["tool_choice"] == {
+            "type": "tool", "name": "read_file",
+        }
+
+    async def test_omitted_when_not_requested(self):
+        """Existing callers pass no tool_choice; their payloads must be
+        byte-identical to before."""
+        provider, client = _make_openai_provider({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}], tools=PATCH_TOOLS,
+        )
+        assert "tool_choice" not in client.last_payload
+
+    async def test_never_sent_without_tools(self):
+        """A bare tool_choice 400s OpenAI-compat backends outright."""
+        provider, client = _make_openai_provider({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}], tool_choice="read_file",
+        )
+        assert "tool_choice" not in client.last_payload
+        assert "tools" not in client.last_payload
+
+    async def test_incoherent_choice_degrades_rather_than_raising(self):
+        provider, client = _make_openai_provider({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        await provider.chat_completion(
+            messages=[{"role": "user", "content": "go"}],
+            tools=PATCH_TOOLS,
+            tool_choice="not_a_real_tool",
+        )
+        assert "tool_choice" not in client.last_payload
+        assert client.last_payload["tools"]  # tools still attached
+
+
+@pytest.mark.asyncio
+async def test_gateway_drops_tool_choice_with_the_suppressed_tools_array():
+    """When the B6 gate suppresses ``tools``, ``tool_choice`` must die with
+    it — a bare tool_choice is a guaranteed 400."""
+    register_model("stub:no-tools-tc", ModelSpec(
+        provider="stub", model_id="no-tools-tc", context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=False,
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:no-tools-tc",
+        patching_primary="stub:no-tools-tc",
+        repair_primary="stub:no-tools-tc",
+        use_structured_tools=True,
+    )
+    gw = Gateway(cfg)
+    seen: list[tuple[Any, Any]] = []
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="no-tools-tc", context_window=64_000,
+            input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+            api_base_url="", api_key="x", supports_tools=False,
+        )
+        api_key = "x"
+
+        async def chat_completion(
+            self, *, tools=None, tool_choice=None, **_kwargs: Any,
+        ) -> LLMResponse:
+            seen.append((tools, tool_choice))
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                 model_name="stub:no-tools-tc", cost_usd=0.0),
+                model="stub:no-tools-tc",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:no-tools-tc"] = _Stub()  # type: ignore[assignment]
+    await gw.dispatch(
+        messages=[{"role": "user", "content": "go"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+        tools=PATCH_TOOLS,
+        tool_choice="read_file",
+    )
+    assert seen == [(None, None)]
+
+
+@pytest.mark.asyncio
+async def test_gateway_forwards_tool_choice_when_tools_survive():
+    register_model("stub:tools-tc", ModelSpec(
+        provider="stub", model_id="tools-tc", context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=True,
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:tools-tc",
+        patching_primary="stub:tools-tc",
+        repair_primary="stub:tools-tc",
+        use_structured_tools=True,
+    )
+    gw = Gateway(cfg)
+    seen: list[tuple[Any, Any]] = []
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="tools-tc", context_window=64_000,
+            input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+            api_base_url="", api_key="x", supports_tools=True,
+        )
+        api_key = "x"
+
+        async def chat_completion(
+            self, *, tools=None, tool_choice=None, **_kwargs: Any,
+        ) -> LLMResponse:
+            seen.append((tools, tool_choice))
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                 model_name="stub:tools-tc", cost_usd=0.0),
+                model="stub:tools-tc",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:tools-tc"] = _Stub()  # type: ignore[assignment]
+    await gw.dispatch(
+        messages=[{"role": "user", "content": "go"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+        tools=PATCH_TOOLS,
+        tool_choice="read_file",
+    )
+    assert seen[0][1] == "read_file"
+
+
+def test_tool_choice_is_not_folded_into_the_cache_prefix_hash():
+    """``tool_choice`` is a request-level parameter, NOT part of
+    Anthropic's cacheable prefix. Folding it into the drift hash would
+    report a cache miss that never happens."""
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+    assert hash_stable_prefix(msgs, n_stable=2, tools=PATCH_TOOLS) == \
+        hash_stable_prefix(msgs, n_stable=2, tools=PATCH_TOOLS)

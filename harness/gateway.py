@@ -471,6 +471,7 @@ class BaseLLM(ABC):
         max_tokens: int = 4096,
         thinking: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send a chat completion request and return a standardized response.
@@ -895,6 +896,7 @@ class DeepSeekProvider(BaseLLM):
         max_tokens: int = 4096,
         thinking: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
@@ -922,8 +924,22 @@ class DeepSeekProvider(BaseLLM):
             # "enabled"} shape the backend already accepts.
             payload["thinking"] = {"type": "disabled"}
         if tools:
-            from harness.tool_schemas import to_openai_tools
+            from harness.tool_schemas import (
+                to_openai_tool_choice,
+                to_openai_tools,
+                validate_tool_choice,
+            )
             payload["tools"] = to_openai_tools(tools)
+            # Only meaningful alongside a non-empty tools array — these
+            # backends 400 on a bare tool_choice. validate_tool_choice
+            # drops an incoherent value rather than raising, so a bad
+            # caller degrades to the provider default instead of killing
+            # a paid dispatch.
+            _choice = to_openai_tool_choice(
+                validate_tool_choice(tool_choice, tools)
+            )
+            if _choice is not None:
+                payload["tool_choice"] = _choice
 
         logger.debug("[deepseek] Sending completion request. model=%s tokens_est=%d", self.spec.model_id, len(messages))
 
@@ -1003,6 +1019,7 @@ class AnthropicProvider(BaseLLM):
         max_tokens: int = 4096,
         thinking: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
@@ -1067,6 +1084,15 @@ class AnthropicProvider(BaseLLM):
                     "cache_control": {"type": "ephemeral"},
                 }
             payload["tools"] = anthropic_tools
+            from harness.tool_schemas import (
+                to_anthropic_tool_choice,
+                validate_tool_choice,
+            )
+            _choice = to_anthropic_tool_choice(
+                validate_tool_choice(tool_choice, tools)
+            )
+            if _choice is not None:
+                payload["tool_choice"] = _choice
 
         # Prompt caching. When the model declares ``supports_cache`` and the
         # gateway has not disabled it via ``prompt_cache_enabled=False``,
@@ -1235,6 +1261,7 @@ class OpenAIProvider(BaseLLM):
         max_tokens: int = 4096,
         thinking: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
@@ -1264,8 +1291,22 @@ class OpenAIProvider(BaseLLM):
             "stream": False,
         }
         if tools:
-            from harness.tool_schemas import to_openai_tools
+            from harness.tool_schemas import (
+                to_openai_tool_choice,
+                to_openai_tools,
+                validate_tool_choice,
+            )
             payload["tools"] = to_openai_tools(tools)
+            # Only meaningful alongside a non-empty tools array — these
+            # backends 400 on a bare tool_choice. validate_tool_choice
+            # drops an incoherent value rather than raising, so a bad
+            # caller degrades to the provider default instead of killing
+            # a paid dispatch.
+            _choice = to_openai_tool_choice(
+                validate_tool_choice(tool_choice, tools)
+            )
+            if _choice is not None:
+                payload["tool_choice"] = _choice
 
         logger.debug("[openai] Sending completion request. model=%s", self.spec.model_id)
 
@@ -1404,6 +1445,7 @@ class OllamaProvider(BaseLLM):
         max_tokens: int = 4096,
         thinking: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
@@ -1421,8 +1463,22 @@ class OllamaProvider(BaseLLM):
             "stream": False,
         }
         if tools:
-            from harness.tool_schemas import to_openai_tools
+            from harness.tool_schemas import (
+                to_openai_tool_choice,
+                to_openai_tools,
+                validate_tool_choice,
+            )
             payload["tools"] = to_openai_tools(tools)
+            # Only meaningful alongside a non-empty tools array — these
+            # backends 400 on a bare tool_choice. validate_tool_choice
+            # drops an incoherent value rather than raising, so a bad
+            # caller degrades to the provider default instead of killing
+            # a paid dispatch.
+            _choice = to_openai_tool_choice(
+                validate_tool_choice(tool_choice, tools)
+            )
+            if _choice is not None:
+                payload["tool_choice"] = _choice
 
         logger.debug("[ollama] Sending completion request. model=%s", self.spec.model_id)
 
@@ -3137,6 +3193,7 @@ class Gateway:
         force_local: bool = False,
         model_override: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         cache_family: Optional[str] = None,
         _thinking_override: Optional[bool] = None,
         **llm_kwargs: Any,
@@ -3337,6 +3394,15 @@ class Gateway:
                 "[gateway] tools= passed but suppressed (use_structured_tools=%s, "
                 "model=%s supports_tools=%s).",
                 self.config.use_structured_tools, model_key, spec.supports_tools,
+            )
+        # tool_choice is meaningless — and a 400 on OpenAI-compat backends —
+        # without the tools array it names, so it dies with the suppression
+        # above rather than leaking onto a tool-less request.
+        effective_tool_choice = tool_choice if effective_tools else None
+        if tool_choice and not effective_tools:
+            logger.debug(
+                "[gateway] tool_choice=%r dropped with the suppressed tools "
+                "array.", tool_choice,
             )
 
         # --- Redact secrets from messages before transmission ---
@@ -3549,6 +3615,7 @@ class Gateway:
                 messages=messages,
                 thinking=thinking,
                 tools=effective_tools,
+                tool_choice=effective_tool_choice,
                 # Per-role, config-controlled HTTP timeout (resolved fresh here
                 # so a fallback re-dispatch re-resolves for its own role rather
                 # than inheriting a stale value via llm_kwargs).

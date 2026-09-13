@@ -28,9 +28,12 @@ keeps running. See ``config.patcher.use_structured_tools`` in
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Optional
 
 from harness.patcher import OperationType, PatchBlock, Placement
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +387,90 @@ def to_openai_tools(tools: list[dict[str, Any]] = PATCH_TOOLS) -> list[dict[str,
             },
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# tool_choice — offering a tool vs. compelling one
+# ---------------------------------------------------------------------------
+#
+# Attaching ``tools`` only OFFERS them: every backend here is free to answer
+# in prose and ignore the array entirely. That is exactly the failure that
+# kills single-dispatch structured nodes — the planner narrates its plan in
+# ``content`` and never calls the tool (lumina-testrun-20260911-1102).
+# ``tool_choice`` is the knob that turns an offer into a requirement.
+#
+# Callers use a provider-agnostic vocabulary and the adapters below translate:
+#
+#   None          omit the field — provider default (usually "auto")
+#   "auto"        model decides whether to call a tool
+#   "required"    model MUST call one of the supplied tools (any of them)
+#   "<tool name>" model MUST call that specific tool
+#
+# NEVER send tool_choice without a non-empty ``tools`` array — OpenAI-compat
+# backends 400 the request outright.
+
+TOOL_CHOICE_AUTO = "auto"
+TOOL_CHOICE_REQUIRED = "required"
+
+
+def to_openai_tool_choice(choice: Optional[str]) -> Any:
+    """Translate a canonical ``tool_choice`` into the OpenAI-compat shape.
+
+    Used by OpenAI, DeepSeek, Google (OpenAI-compat endpoint), Moonshot and
+    Ollama. ``"auto"``/``"required"`` are bare strings on the wire; a
+    specific tool is the nested ``{"type": "function", ...}`` object.
+    """
+    if choice is None:
+        return None
+    if choice in (TOOL_CHOICE_AUTO, TOOL_CHOICE_REQUIRED):
+        return choice
+    return {"type": "function", "function": {"name": choice}}
+
+
+def to_anthropic_tool_choice(choice: Optional[str]) -> Optional[dict[str, Any]]:
+    """Translate a canonical ``tool_choice`` into Anthropic's Messages-API
+    shape.
+
+    Anthropic spells "any of them" as ``{"type": "any"}`` rather than
+    ``"required"``, and always uses an object rather than a bare string.
+    """
+    if choice is None:
+        return None
+    if choice == TOOL_CHOICE_AUTO:
+        return {"type": "auto"}
+    if choice == TOOL_CHOICE_REQUIRED:
+        return {"type": "any"}
+    return {"type": "tool", "name": choice}
+
+
+def validate_tool_choice(
+    choice: Optional[str], tools: Optional[list[dict[str, Any]]],
+) -> Optional[str]:
+    """Return ``choice`` when it is coherent against ``tools``, else None.
+
+    Guards the two ways a caller can produce a guaranteed-400 request:
+    naming a tool that was never supplied, and asking for a choice with no
+    tools at all. Returning None (rather than raising) keeps the gateway's
+    fail-open contract — a malformed choice degrades to the provider
+    default instead of aborting a paid dispatch.
+    """
+    if choice is None:
+        return None
+    if not tools:
+        logger.warning(
+            "[tool_schemas] tool_choice=%r ignored: no tools supplied.", choice,
+        )
+        return None
+    if choice in (TOOL_CHOICE_AUTO, TOOL_CHOICE_REQUIRED):
+        return choice
+    names = {str(t.get("name")) for t in tools if isinstance(t, dict)}
+    if choice not in names:
+        logger.warning(
+            "[tool_schemas] tool_choice=%r ignored: not among supplied "
+            "tools %s.", choice, sorted(names),
+        )
+        return None
+    return choice
 
 
 # ---------------------------------------------------------------------------

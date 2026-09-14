@@ -25397,7 +25397,7 @@ async def review_and_revise_spec(
         critique_response, new_budget = await gateway.dispatch(
             messages=critique_messages,
             role=NodeRole.DOC_REVIEWER,
-            cache_family='doc_reviewer:review_and_revise_spec',
+            cache_family=f"doc_reviewer:review_and_revise_spec:{gate}",
             budget_remaining_usd=budget_remaining_usd,
         )
     except Exception as exc:
@@ -25408,7 +25408,7 @@ async def review_and_revise_spec(
         return await gateway.dispatch(
             messages=list(msgs),
             role=NodeRole.DOC_REVIEWER,
-            cache_family='doc_reviewer:critique_dispatch',
+            cache_family=f"doc_reviewer:critique_dispatch:{gate}",
             budget_remaining_usd=budget_remaining,
         )
 
@@ -25468,7 +25468,7 @@ async def review_and_revise_spec(
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.DOC_REVIEWER,
-                cache_family='doc_reviewer:spec_repair_dispatch',
+                cache_family=f"doc_reviewer:spec_repair_dispatch:{gate}",
                 budget_remaining_usd=bud,
             )
         _schema_hint = (
@@ -25545,7 +25545,7 @@ async def review_and_revise_spec(
         revised_response, new_budget = await gateway.dispatch(
             messages=revise_messages,
             role=NodeRole.PLANNING,
-            cache_family='planning:spec_repair_dispatch',
+            cache_family=f"planning:spec_repair_dispatch:{gate}",
             budget_remaining_usd=new_budget,
         )
 
@@ -25553,7 +25553,7 @@ async def review_and_revise_spec(
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.PLANNING,
-                cache_family='planning:revise_dispatch',
+                cache_family=f"planning:revise_dispatch:{gate}",
                 budget_remaining_usd=budget_remaining,
             )
 

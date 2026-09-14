@@ -187,6 +187,13 @@ Check each story and each pair of stories for:
 - right-sizing: a story too LARGE (bundles several behaviours — should be split; \
   name the seams) or trivially SMALL (should be merged).
 - overlap: two stories covering the SAME behaviour (should be merged/disambiguated).
+  EXCEPTION — an acceptance criterion prefixed ``[NFR:<policy>]`` is a
+  non-functional policy deliberately attached to every story it constrains
+  (ADR-0004). Seeing the SAME ``[NFR:...]`` criterion in several stories is
+  correct and expected; it is single-ownership fan-out, not duplication.
+  NEVER report overlap on the basis of shared ``[NFR:...]`` criteria, and
+  never suggest merging stories because they share one. Judge overlap on
+  the UNTAGGED criteria only.
 - ac_quality: an acceptance criterion that is NOT atomic (bundles behaviours with \
   "and"/"or"), NOT testable (an implementation detail, or no observable outcome), \
   or ambiguous ("works well", "handles errors", "fast").
@@ -206,6 +213,10 @@ Be specific and strict, but do not invent problems — a clean, well-formed stor
 produces no finding. Prefer high/medium severity only for issues that would cause \
 real downstream churn.
 """
+
+# Matches either the embedded-AC tag ``[NFR:NFR-002]`` or a bare policy
+# key like ``NFR-002`` in a reviewer's prose, since the model paraphrases.
+_NFR_TAG_RE = re.compile(r"\[NFR:[^\]]+\]|\bNFR[-_ ]?\d+\b", re.IGNORECASE)
 
 _VALID_DIMENSIONS = frozenset({
     "right_sizing", "overlap", "ac_quality", "dependency", "balance",
@@ -290,6 +301,25 @@ async def review_decomposition_quality(
         action = str(item.get("suggested_action") or "").strip().lower()
         if action not in _VALID_ACTIONS:
             action = "resize"
+        # Belt-and-braces behind the prompt's NFR exception. ADR-0004
+        # deliberately fans one non-functional policy out across every
+        # story it constrains, tagging each copy ``[NFR:<policy>]``. A
+        # reviewer that has not internalised that reads the repeated
+        # criteria as duplication and recommends merging stories that
+        # ADR-0004 requires to stay separate — two harness features
+        # contradicting each other, with the operator left to arbitrate.
+        # lumina-fresh-20260911-1107 produced four of these
+        # (overlap/high -> merge, STORY-001..005, all citing the shared
+        # NFR-002 security criteria).
+        if dim == "overlap" and _NFR_TAG_RE.search(
+            str(item.get("problem") or "")
+        ):
+            logger.info(
+                "[decomposition_review] Dropping overlap finding on %s — "
+                "cites shared [NFR:...] criteria, which ADR-0004 fans out "
+                "across stories on purpose.", sk,
+            )
+            continue
         findings.append(_finding(
             sk, dim, sev, str(item.get("problem") or "").strip(), action,
             source="llm"))

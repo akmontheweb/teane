@@ -179,3 +179,95 @@ class TestDoc:
 
     def test_renders_clean(self):
         assert "well-formed" in dr.render_review_doc([], 5)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0004 fan-out vs. the overlap dimension.
+#
+# The embedder attaches one non-functional policy to every story it
+# constrains, tagging each copy ``[NFR:<policy>]``. A reviewer that has not
+# internalised that reads the repeated criteria as duplication and
+# recommends merging stories ADR-0004 requires to stay separate — two
+# harness features contradicting each other with the operator left to
+# arbitrate.
+#
+# lumina-fresh-20260911-1107 produced four of these in one pass:
+#   STORY-001 [overlap/high]: STORY-001 and STORY-002 both contain
+#   identical NFR-002 security ACs for POST /api/birthdays -> merge
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestNfrFanoutIsNotOverlap:
+
+    async def test_the_lumina_overlap_finding_is_dropped(self):
+        stories = [_story("STORY-001"), _story("STORY-002")]
+        payload = json.dumps([{
+            "story_key": "STORY-001", "dimension": "overlap",
+            "severity": "high",
+            "problem": (
+                "STORY-001 and STORY-002 both contain identical NFR-002 "
+                "security ACs for POST /api/birthdays, duplicating the same "
+                "behavior across stories."
+            ),
+            "suggested_action": "merge",
+        }])
+        findings, _ = await dr.review_decomposition_quality(
+            _FakeGateway(payload), stories, 1.0,
+        )
+        assert findings == []
+
+    async def test_bracket_tag_form_is_dropped(self):
+        stories = [_story("STORY-001")]
+        payload = json.dumps([{
+            "story_key": "STORY-001", "dimension": "overlap",
+            "severity": "high",
+            "problem": "Shared [NFR:NFR-002] criterion appears in 5 stories.",
+            "suggested_action": "merge",
+        }])
+        findings, _ = await dr.review_decomposition_quality(
+            _FakeGateway(payload), stories, 1.0,
+        )
+        assert findings == []
+
+    async def test_genuine_overlap_still_reported(self):
+        """The filter is narrow — an overlap finding that does not rest on
+        NFR fan-out must survive, or the dimension becomes useless."""
+        stories = [_story("STORY-001"), _story("STORY-002")]
+        payload = json.dumps([{
+            "story_key": "STORY-001", "dimension": "overlap",
+            "severity": "high",
+            "problem": "Both stories implement the same delete endpoint.",
+            "suggested_action": "merge",
+        }])
+        findings, _ = await dr.review_decomposition_quality(
+            _FakeGateway(payload), stories, 1.0,
+        )
+        assert len(findings) == 1
+        assert findings[0]["dimension"] == "overlap"
+
+    async def test_other_dimensions_are_untouched_by_the_filter(self):
+        """An ac_quality finding ABOUT an NFR criterion is legitimate — the
+        criterion came from a real NFR story and may genuinely be vague.
+        Only the overlap dimension is filtered."""
+        stories = [_story("STORY-001")]
+        payload = json.dumps([{
+            "story_key": "STORY-001", "dimension": "ac_quality",
+            "severity": "high",
+            "problem": "NFR-002 criterion 'is secure' has no observable outcome.",
+            "suggested_action": "rewrite_ac",
+        }])
+        findings, _ = await dr.review_decomposition_quality(
+            _FakeGateway(payload), stories, 1.0,
+        )
+        assert len(findings) == 1
+        assert findings[0]["dimension"] == "ac_quality"
+
+
+def test_rubric_states_the_nfr_exception():
+    """The deterministic filter is a safety net; the rubric is the fix.
+
+    Without this line the reviewer has no way to tell deliberate ADR-0004
+    fan-out from planner sloppiness.
+    """
+    assert "[NFR:<policy>]" in dr._QUALITY_RUBRIC
+    assert "NEVER report overlap" in dr._QUALITY_RUBRIC

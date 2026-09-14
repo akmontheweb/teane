@@ -251,6 +251,68 @@ _READ_FILE_PATTERN = re.compile(
 )
 
 
+# Second dialect. The bracket leniency above covers a model fumbling the
+# harness's OWN grammar; this covers a model reaching for a DIFFERENT one.
+# Models trained on XML-style function calling fall back to that syntax
+# under pressure, emitting
+#
+#     <invoke name="read_file">
+#     <parameter name="file">server/app/api/birthdays.py</parameter>
+#     </invoke>
+#
+# which is a perfectly clear request that the DSL parser sees as prose.
+# lumina-run5-20260914-2120 lost FOUR repair rounds to it (calls 0047,
+# 0049, 0052, 0054 — one spending $0.010 to produce 29 output tokens), and
+# two such rounds trip the zero-patch gate straight to HITL. Teane is
+# model-agnostic, so this is not one provider's quirk: any model with XML
+# tool syntax in its training will reach for it.
+#
+# Worse than the wasted rounds: a round landing zero patches because its
+# read request was ignored is indistinguishable, to every downstream
+# counter, from a model that refuses to act. On the same run it drove the
+# UNSATISFIABLE_TEST offer floor to conclude a test was unsatisfiable when
+# the model had only been asking to look at a file.
+#
+# Normalising to the canonical DSL is preferred over teaching every
+# consumer a second grammar: one rewrite here and parse_read_blocks, the
+# strippers and the round accounting all keep working unchanged.
+_XML_READ_INVOKE_RE = re.compile(
+    r"<invoke\s+name=[\"']read_file[\"']\s*>(?P<body>.*?)</invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_XML_READ_PARAM_RE = re.compile(
+    r"<parameter\s+name=[\"'](?P<key>file|path|file_path|range)[\"']\s*>"
+    r"(?P<val>.*?)</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def normalize_xml_read_requests(llm_output: str) -> str:
+    """Rewrite XML-style ``read_file`` invocations into the READ_FILE DSL.
+
+    Returns ``llm_output`` unchanged when no such invocation is present, so
+    the common path costs one substring check."""
+    if not llm_output or "<invoke" not in llm_output:
+        return llm_output
+
+    def _replace(m: "re.Match[str]") -> str:
+        params = {
+            pm.group("key").lower(): pm.group("val").strip()
+            for pm in _XML_READ_PARAM_RE.finditer(m.group("body"))
+        }
+        path = params.get("file") or params.get("path") or params.get("file_path")
+        if not path:
+            return m.group(0)  # unusable — leave it visible to the caller
+        out = ["<<<READ_FILE>>>", "file: " + path]
+        rng = params.get("range")
+        if rng:
+            out.append("range: " + rng)
+        out.append("<<<END_READ_FILE>>>")
+        return "\n".join(out)
+
+    return _XML_READ_INVOKE_RE.sub(_replace, llm_output)
+
+
 def parse_read_blocks(llm_output: str) -> list[tuple[str, Optional[tuple[int, int]]]]:
     """Extract READ_FILE blocks from ``llm_output``.
 
@@ -260,6 +322,7 @@ def parse_read_blocks(llm_output: str) -> list[tuple[str, Optional[tuple[int, in
     to whole-file output.
     """
     out: list[tuple[str, Optional[tuple[int, int]]]] = []
+    llm_output = normalize_xml_read_requests(llm_output)
     for match in _READ_FILE_PATTERN.finditer(llm_output):
         file_ref = match.group("file").strip()
         if not file_ref:
@@ -295,7 +358,9 @@ def strip_read_blocks(llm_output: str) -> str:
     blocks to feed into ``parse_patch_blocks`` (they're not patches), nor do
     we want them to leak into commit messages or transcripts.
     """
-    return _READ_FILE_PATTERN.sub("", llm_output)
+    # Normalise first so an XML-dialect request is stripped too — left
+    # behind, it would be parsed as patch prose on the next pass.
+    return _READ_FILE_PATTERN.sub("", normalize_xml_read_requests(llm_output))
 
 
 # PROMOTE_DEFERRED is the LLM's escape hatch against the cascade-ranking

@@ -319,3 +319,110 @@ class TestReadFileResolutionCycle:
         # Nothing fired: no bonus, no ultimatum, no dispatch.
         assert dispatch.calls == 0
         assert out_text == read_req
+
+
+# ---------------------------------------------------------------------------
+# Second dialect: XML-style tool invocations (lumina-run5-20260914-2120).
+#
+# The bracket leniency in _READ_FILE_PATTERN covers a model fumbling the
+# harness's OWN grammar. This covers a model reaching for a DIFFERENT one:
+# models trained on XML function calling fall back to that syntax under
+# pressure and emit
+#
+#     <invoke name="read_file">
+#     <parameter name="file">server/app/api/birthdays.py</parameter>
+#     </invoke>
+#
+# which is a perfectly clear request the DSL parser sees as prose. Run 5 lost
+# FOUR repair rounds to it (calls 0047, 0049, 0052, 0054 — one spending
+# $0.010 to produce 29 output tokens) and terminated on zero_patch_loop 3/3.
+#
+# The compounding harm: a round landing zero patches because its read request
+# was ignored is indistinguishable, to every downstream counter, from a model
+# that refuses to act. On the same run it drove the UNSATISFIABLE_TEST offer
+# floor to declare a test unsatisfiable when the model had only been asking
+# to look at a file.
+# ---------------------------------------------------------------------------
+
+class TestXmlDialectReadRequests:
+
+    def _xml(self, path="server/app/api/birthdays.py", extra=""):
+        return (
+            '<invoke name="read_file">\n'
+            f'<parameter name="file">{path}</parameter>\n'
+            f'{extra}'
+            '</invoke>'
+        )
+
+    def test_the_exact_run5_payload_parses(self):
+        from harness.patcher import parse_read_blocks
+        assert parse_read_blocks(self._xml()) == [
+            ("server/app/api/birthdays.py", None),
+        ]
+
+    def test_range_is_carried_through(self):
+        from harness.patcher import parse_read_blocks
+        out = parse_read_blocks(self._xml(
+            extra='<parameter name="range">10-40</parameter>\n'))
+        assert out == [("server/app/api/birthdays.py", (10, 40))]
+
+    def test_path_and_file_path_aliases(self):
+        from harness.patcher import parse_read_blocks
+        for key in ("path", "file_path"):
+            raw = (
+                '<invoke name="read_file">\n'
+                f'<parameter name="{key}">a/b.py</parameter>\n'
+                '</invoke>'
+            )
+            assert parse_read_blocks(raw) == [("a/b.py", None)]
+
+    def test_single_quoted_attributes(self):
+        from harness.patcher import parse_read_blocks
+        raw = (
+            "<invoke name='read_file'>\n"
+            "<parameter name='file'>a/b.py</parameter>\n"
+            "</invoke>"
+        )
+        assert parse_read_blocks(raw) == [("a/b.py", None)]
+
+    def test_multiple_requests_in_one_response(self):
+        from harness.patcher import parse_read_blocks
+        out = parse_read_blocks(self._xml("a.py") + "\n" + self._xml("b.py"))
+        assert out == [("a.py", None), ("b.py", None)]
+
+    def test_surrounding_prose_is_preserved_on_strip(self):
+        from harness.patcher import strip_read_blocks
+        raw = "before\n" + self._xml() + "\nafter"
+        out = strip_read_blocks(raw)
+        assert "before" in out and "after" in out
+        assert "<invoke" not in out
+        assert "birthdays.py" not in out
+
+    def test_canonical_dsl_still_works(self):
+        """The new dialect must not disturb the existing one."""
+        from harness.patcher import parse_read_blocks
+        raw = "<<<READ_FILE>>>\nfile: a/b.py\n<<<END_READ_FILE>>>"
+        assert parse_read_blocks(raw) == [("a/b.py", None)]
+
+    def test_other_xml_tools_are_left_alone(self):
+        """Only read_file is normalised — an unrelated invocation must not
+        be silently swallowed, or a real bug becomes invisible."""
+        from harness.patcher import parse_read_blocks, strip_read_blocks
+        raw = (
+            '<invoke name="run_tests">\n'
+            '<parameter name="file">a/b.py</parameter>\n'
+            '</invoke>'
+        )
+        assert parse_read_blocks(raw) == []
+        assert "<invoke" in strip_read_blocks(raw)
+
+    def test_invocation_without_a_path_is_left_visible(self):
+        """An unusable request should reach the caller rather than vanish."""
+        from harness.patcher import strip_read_blocks
+        raw = '<invoke name="read_file">\n<parameter name="mode">x</parameter>\n</invoke>'
+        assert "<invoke" in strip_read_blocks(raw)
+
+    def test_plain_text_is_untouched(self):
+        from harness.patcher import normalize_xml_read_requests
+        raw = "no tool syntax here at all"
+        assert normalize_xml_read_requests(raw) is raw

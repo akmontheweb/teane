@@ -29,6 +29,7 @@ from harness.cli import (
     _extract_delegate_subdirs,
 )
 from harness.graph import (
+    _detect_state_reverts,
     _build_repair_reflection_prompt,
     _diagnostics_look_like_install_failure,
     _missing_module_matches_workspace_source,
@@ -831,3 +832,152 @@ def test_elided_middle_requires_matching_marker_counts():
 def test_elided_middle_ignored_when_no_marker():
     from harness.patcher import _elided_match_replace
     assert _elided_match_replace("a\nb\n", "a\nb\n", "a\nc\n") is None
+
+
+# ---------------------------------------------------------------------------
+# Revert / oscillation detection (lumina-run3-20260914-1330).
+#
+# Over six repair rounds the judge alternated between `default=1` and
+# `default=lambda: 1` on one SQLAlchemy column, and the model applied every
+# reversal:
+#
+#     0028  1 -> lambda: 1      0035  lambda: 1 -> 1
+#     0031  lambda: 1 -> 1      0037  1 -> lambda: 1
+#     0033  1 -> lambda: 1      0039  lambda: 1 -> 1
+#
+# Seven edits, net effect zero, twelve consecutive DISTRACTION verdicts, and
+# the run died on the auto-resume cap. Both spellings are equivalent —
+# SQLAlchemy applies `default=` at flush time either way — so neither could
+# satisfy an assertion on a freshly constructed instance.
+#
+# Every existing counter read this as progress, because each patch applied
+# cleanly. This is the only signal that sees the cycle.
+# ---------------------------------------------------------------------------
+
+
+def _write(ws, rel, text):
+    import os
+    p = os.path.join(ws, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+class TestRevertDetection:
+
+    def test_a_b_a_cycle_is_flagged(self, tmp_path):
+        ws, rel, lc = str(tmp_path), "app/models/birthday.py", {}
+        _write(ws, rel, "default=1")
+        assert _detect_state_reverts(ws, [rel], lc) == []      # A, first sight
+        _write(ws, rel, "default=lambda: 1")
+        assert _detect_state_reverts(ws, [rel], lc) == []      # B, new state
+        _write(ws, rel, "default=1")
+        assert _detect_state_reverts(ws, [rel], lc) == [rel]   # A again
+
+    def test_forward_progress_is_never_flagged(self, tmp_path):
+        """Three genuinely different states in a row are convergence, not a
+        cycle — the detector must stay silent."""
+        ws, rel, lc = str(tmp_path), "app/m.py", {}
+        for text in ("v1", "v2", "v3", "v4"):
+            _write(ws, rel, text)
+            assert _detect_state_reverts(ws, [rel], lc) == []
+
+    def test_unchanged_content_is_not_a_revert(self, tmp_path):
+        """Writing the same bytes again is a no-op, which the patcher
+        already reports. Double-counting it here would fire on every
+        idempotent re-emission."""
+        ws, rel, lc = str(tmp_path), "app/m.py", {}
+        _write(ws, rel, "same")
+        _detect_state_reverts(ws, [rel], lc)
+        assert _detect_state_reverts(ws, [rel], lc) == []
+
+    def test_the_lumina_six_round_oscillation(self, tmp_path):
+        """Replay the real sequence and count how early it is caught."""
+        ws, rel, lc = str(tmp_path), "server/app/models/birthday.py", {}
+        seq = ["default=1", "default=lambda: 1", "default=1",
+               "default=lambda: 1", "default=1", "default=lambda: 1",
+               "default=1"]
+        first_catch = None
+        for i, text in enumerate(seq):
+            _write(ws, rel, text)
+            if _detect_state_reverts(ws, [rel], lc) and first_catch is None:
+                first_catch = i
+        # Caught on the third write — the first return to a prior state —
+        # not after seven.
+        assert first_catch == 2
+
+    def test_per_file_isolation(self, tmp_path):
+        ws, lc = str(tmp_path), {}
+        _write(ws, "a.py", "x")
+        _write(ws, "b.py", "y")
+        _detect_state_reverts(ws, ["a.py", "b.py"], lc)
+        _write(ws, "a.py", "z")
+        _write(ws, "b.py", "y2")
+        _detect_state_reverts(ws, ["a.py", "b.py"], lc)
+        _write(ws, "a.py", "x")          # a reverts, b does not
+        _write(ws, "b.py", "y3")
+        assert _detect_state_reverts(ws, ["a.py", "b.py"], lc) == ["a.py"]
+
+    def test_history_is_bounded(self, tmp_path):
+        ws, rel, lc = str(tmp_path), "app/m.py", {}
+        for i in range(40):
+            _write(ws, rel, f"v{i}")
+            _detect_state_reverts(ws, [rel], lc, keep=5)
+        assert len(lc["file_state_history"][rel]) <= 5
+
+    def test_missing_file_is_skipped(self, tmp_path):
+        assert _detect_state_reverts(str(tmp_path), ["gone.py"], {}) == []
+
+    def test_empty_input_is_safe(self, tmp_path):
+        assert _detect_state_reverts(str(tmp_path), [], {}) == []
+        assert _detect_state_reverts(str(tmp_path), ["", None], {}) == []
+
+
+class TestRevertBlockRendering:
+
+    def _kwargs(self):
+        return {
+            "prior_diagnostics_count": 3,
+            "current_diagnostics_count": 3,
+            "resolved_fingerprints": [],
+            "persisted_fingerprints": ["a", "b", "c"],
+            "new_fingerprints": [],
+            "top_persisted_diagnostics": [
+                {"error_code": "AssertionError",
+                 "file": "server/tests/test_birthday_model.py",
+                 "line": 37, "message": "assert None == 1"},
+            ],
+        }
+
+    def test_absent_by_default(self):
+        from harness.graph import _build_repair_reflection_prompt
+        assert "YOUR GUIDANCE IS CYCLING" not in \
+            _build_repair_reflection_prompt(**self._kwargs())
+
+    def test_single_revert_is_noise(self):
+        from harness.graph import _build_repair_reflection_prompt
+        assert "YOUR GUIDANCE IS CYCLING" not in _build_repair_reflection_prompt(
+            **self._kwargs(), file_revert_streak=1,
+            file_revert_files=["server/app/models/birthday.py"],
+        )
+
+    def test_renders_at_two_and_forbids_the_alternatives(self):
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            **self._kwargs(), file_revert_streak=2,
+            file_revert_files=["server/app/models/birthday.py"],
+        )
+        assert "YOUR GUIDANCE IS CYCLING" in prompt
+        assert "birthday.py" in prompt
+        # It must tell the judge BOTH alternatives are wrong — telling the
+        # model to try harder is what produced the loop.
+        assert "are therefore wrong" in prompt
+        assert "Do NOT recommend either of them again" in prompt
+        # And offer the way out.
+        assert "cannot localise it" in prompt
+
+    def test_no_files_means_no_block(self):
+        from harness.graph import _build_repair_reflection_prompt
+        assert "YOUR GUIDANCE IS CYCLING" not in _build_repair_reflection_prompt(
+            **self._kwargs(), file_revert_streak=5, file_revert_files=[],
+        )

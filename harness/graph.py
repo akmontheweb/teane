@@ -7310,6 +7310,83 @@ _UNSAT_TEST_DECL_RE = re.compile(
 )
 
 
+def _detect_state_reverts(
+    workspace_path: str,
+    modified_files: Iterable[str],
+    loop_counter: dict[str, Any],
+    *,
+    keep: int = 12,
+) -> list[str]:
+    """Return the files whose content has returned to a state seen earlier
+    this session — i.e. this round UNDID an earlier round.
+
+    Every existing progress signal reads an A->B->A cycle as progress,
+    because each individual patch applies cleanly:
+
+      * identity-no-op detection compares ``search`` to ``replace`` WITHIN
+        one patch; these are genuine changes
+      * ``consecutive_zero_patch_rounds`` and ``no_progress_repairs`` key on
+        patches SUCCEEDING, and they all succeed
+      * ``recent_hypothesis_fingerprints`` tracks which FILES were touched,
+        not what content changed — same file every round, identical
+        fingerprint, no signal
+      * ``judge_target_noop_streak`` is reset by any real patch landing
+
+    lumina-run3-20260914-1330 is the worked example. Over six repair rounds
+    the judge alternated between ``default=1`` and ``default=lambda: 1`` on
+    one SQLAlchemy column, and the model applied every reversal:
+
+        0028  1 -> lambda: 1      0035  lambda: 1 -> 1
+        0031  lambda: 1 -> 1      0037  1 -> lambda: 1
+        0033  1 -> lambda: 1      0039  lambda: 1 -> 1
+
+    Seven edits, net effect zero, twelve consecutive DISTRACTION verdicts,
+    and the run died on the auto-resume cap. Both spellings are in fact
+    equivalent — SQLAlchemy applies ``default=`` at flush time either way,
+    so neither could satisfy an assertion on a freshly constructed
+    instance. The judge was oscillating between two spellings of the same
+    wrong answer.
+
+    Hashing on-disk content (rather than the patch text) catches the cycle
+    however the edit was expressed — a REPLACE_BLOCK, a REWRITE_FILE, or a
+    different search anchor all land on the same digest.
+
+    A digest matching the IMMEDIATELY preceding state is a no-op, which the
+    patcher already reports; only a match against an EARLIER state counts
+    as a revert. History is bounded to ``keep`` entries per file.
+    """
+    import hashlib
+
+    hist_raw = loop_counter.setdefault("file_state_history", {})
+    if not isinstance(hist_raw, dict):
+        hist_raw = {}
+        loop_counter["file_state_history"] = hist_raw
+    reverted: list[str] = []
+    # Filter BEFORE sorting: ``modified_files`` comes from the patcher and
+    # a stray None would raise on the comparison, taking down a repair round
+    # over bookkeeping.
+    for rel in sorted({f for f in (modified_files or []) if isinstance(f, str) and f}):
+        path = rel if os.path.isabs(rel) else os.path.join(workspace_path, rel)
+        try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+        except OSError:
+            continue
+        seen = hist_raw.setdefault(rel, [])
+        if not isinstance(seen, list):
+            seen = []
+            hist_raw[rel] = seen
+        # seen[-1] is the state BEFORE this round's write only if the file
+        # was recorded last round; an exact match there means nothing
+        # changed, which the no-op path already surfaces.
+        if digest in seen[:-1]:
+            reverted.append(rel)
+        seen.append(digest)
+        if len(seen) > keep:
+            del seen[:-keep]
+    return reverted
+
+
 def _apply_unsat_offer_floor(
     declined: dict[str, int],
     offer_files: set[str],
@@ -11807,6 +11884,8 @@ def _build_repair_reflection_prompt(
     judge_ignored_streak: int = 0,
     judge_target_noop_streak: int = 0,
     judge_target_noop_files: Optional[list[str]] = None,
+    file_revert_streak: int = 0,
+    file_revert_files: Optional[list[str]] = None,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
     workspace_path: str = "",
 ) -> str:
@@ -12131,6 +12210,26 @@ def _build_repair_reflection_prompt(
     # was a test posting future-dated births its own validator rejects, so
     # every round spent on that file was wasted and the build died on the
     # HITL cap.
+    # An oscillation is evidence against the JUDGE, like a no-op on its
+    # target — the model is following guidance that keeps reversing, so
+    # telling it to try harder cannot help.
+    revert_block = ""
+    if file_revert_streak >= 2 and file_revert_files:
+        revert_block = (
+            "\nYOUR GUIDANCE IS CYCLING — read carefully:\n"
+            f"The last {file_revert_streak} round(s) returned "
+            f"{sorted(file_revert_files)} to a state it had ALREADY been in "
+            "earlier this session. The repair LLM is not ignoring you; it is "
+            "following you around a loop — you named one value, then the "
+            "other, then the first again.\n"
+            "Both alternatives you have been alternating between are "
+            "therefore wrong, or the defect is not in that file at all. Do "
+            "NOT recommend either of them again. Name a DIFFERENT mechanism "
+            "(a caller, the object's construction path, the test's own "
+            "setup), or state plainly in ``real_blocker`` that you cannot "
+            "localise it from the evidence available.\n"
+        )
+
     noop_on_target_block = ""
     if judge_target_noop_streak >= 2 and judge_target_noop_files:
         noop_on_target_block = (
@@ -12391,6 +12490,7 @@ def _build_repair_reflection_prompt(
         f"{tail_block}"
         f"{source_evidence_block}"
         f"{prior_verdict_block}"
+        f"{revert_block}"
         f"{noop_on_target_block}"
         f"{disagreement_block}"
         f"{path_wiring_hint_block}"
@@ -16532,6 +16632,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         loop_counter.get("judge_target_noop_files") or []
                     ) if isinstance(f, str) and f
                 ],
+                file_revert_streak=int(
+                    loop_counter.get("file_revert_streak", 0) or 0
+                ),
+                file_revert_files=[
+                    f for f in (
+                        loop_counter.get("file_revert_files") or []
+                    ) if isinstance(f, str) and f
+                ],
                 prior_reflection_verdict=_prior_reflection,
                 workspace_path=state.get("workspace_path") or "",
             )
@@ -19486,6 +19594,37 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # requires a fresh READ_FILE.
         if modified_files:
             _mark_files_modified(loop_counter, modified_files)
+            # Revert detection. An A->B->A cycle reads as progress to every
+            # other counter because each patch applies cleanly; this is the
+            # only signal that notices the round undid an earlier one.
+            _reverted = _detect_state_reverts(
+                workspace, modified_files, loop_counter,
+            )
+            if _reverted:
+                loop_counter["file_revert_streak"] = int(
+                    loop_counter.get("file_revert_streak", 0) or 0
+                ) + 1
+                loop_counter["file_revert_files"] = _reverted
+                logger.warning(
+                    "[repair_node] REVERT detected: %s returned to a state "
+                    "already seen this session (streak=%d). The loop is "
+                    "oscillating, not converging — the next reflection "
+                    "prompt will tell the judge its guidance is cycling.",
+                    _reverted, loop_counter["file_revert_streak"],
+                )
+                try:
+                    from harness.observability import emit_event as _emit_rev
+                    _emit_rev(
+                        "repair_state_revert",
+                        files=_reverted,
+                        streak=int(loop_counter["file_revert_streak"]),
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+            else:
+                loop_counter["file_revert_streak"] = 0
+                loop_counter["file_revert_files"] = []
         # Merge test-tamper rejections AND anti-drift screen rejections so
         # the LLM sees both in the next round's status message alongside the
         # patcher's own results. Order: tamper first (the strongest steer —

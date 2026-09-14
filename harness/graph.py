@@ -2801,6 +2801,21 @@ async def _maybe_judgment_llm(
         response, new_budget = await gw.dispatch(
             messages=messages,
             role=_role,
+            # Keep judgment prompts in their OWN cache family even when
+            # ``escalate_to_reasoning`` borrows the REPAIR role for its
+            # thinking setting. Without this the family defaults to
+            # ``role.value``, so a ~1.6k judgment prompt lands between two
+            # ~54k repair prompts in the ``repair`` bucket and the drift
+            # detector — which keys on (session_id, cache_family) — reports
+            # "auto-cache will miss this call" on a perfectly healthy
+            # sequence. lumina-verify-20260914-1151: 3 escalated calls, 3
+            # false role=repair drift warnings, while the real repair
+            # dispatches kept hitting cached=45184 throughout.
+            #
+            # The noise is not the main cost. Drift within a family is
+            # supposed to be load-bearing signal for a genuine cache leak,
+            # and false positives here drown that channel.
+            cache_family=f"judgment:{purpose}",
             budget_remaining_usd=budget_remaining_usd,
         )
         content = (response.content or "").strip()

@@ -2777,6 +2777,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             response, new_budget = await gateway.dispatch(
                 messages=list(messages),
                 role=NodeRole.PATCHING,
+                cache_family='patching:test_authoring',
                 budget_remaining_usd=budget,
             )
         except RuntimeError as exc:
@@ -3114,6 +3115,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             response, new_budget = await gateway.dispatch(
                 messages=list(messages),
                 role=NodeRole.PATCHING,
+                cache_family='patching:test_contradiction_reprompt',
                 budget_remaining_usd=budget,
             )
         except RuntimeError as exc:

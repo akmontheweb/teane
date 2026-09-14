@@ -30,7 +30,7 @@ class _StubGateway:
         self._critique = critique_json
         self._revised = revised_md
 
-    async def dispatch(self, messages, role, budget_remaining_usd):
+    async def dispatch(self, messages, role, budget_remaining_usd, **_kw):
         self.calls.append((role, messages))
         content = self._critique if role == NodeRole.DOC_REVIEWER else self._revised
         return _Resp(content), budget_remaining_usd - 0.01

@@ -519,6 +519,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         try:
             response, budget = await gateway.dispatch(
                 messages=_msgs, role=NodeRole.PATCHING,
+                cache_family='patching:test_regeneration',
                 budget_remaining_usd=budget,
             )
         except Exception as exc:  # noqa: BLE001 — a gateway error must not crash the graph

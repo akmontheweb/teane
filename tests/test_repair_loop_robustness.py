@@ -882,6 +882,40 @@ class TestRevertDetection:
             _write(ws, rel, text)
             assert _detect_state_reverts(ws, [rel], lc) == []
 
+    def test_repeated_observation_of_a_stable_file_is_never_a_revert(
+        self, tmp_path,
+    ):
+        """``modified_files`` is CUMULATIVE across the session, so every
+        repair round re-hashes every file ever touched. Recording each
+        sighting made a stable file's history grow [A, A, A...] and it then
+        matched its own earlier copy.
+
+        lumina-run4-20260914-1608 flagged 17 files per round on this —
+        .gitignore and Makefile among them — which would have drowned the
+        real signal and told the judge it was cycling when it was not.
+        Recording transitions rather than observations is the fix.
+        """
+        ws, rel, lc = str(tmp_path), "app/m.py", {}
+        _write(ws, rel, "stable")
+        for _ in range(8):
+            assert _detect_state_reverts(ws, [rel], lc) == []
+        # One state recorded, not eight.
+        assert lc["file_state_history"][rel] == lc["file_state_history"][rel][:1]
+
+    def test_a_revert_still_fires_after_many_stable_observations(
+        self, tmp_path,
+    ):
+        """Suppressing repeats must not suppress the real signal."""
+        ws, rel, lc = str(tmp_path), "app/m.py", {}
+        _write(ws, rel, "A")
+        for _ in range(5):
+            _detect_state_reverts(ws, [rel], lc)
+        _write(ws, rel, "B")
+        for _ in range(5):
+            _detect_state_reverts(ws, [rel], lc)
+        _write(ws, rel, "A")
+        assert _detect_state_reverts(ws, [rel], lc) == [rel]
+
     def test_unchanged_content_is_not_a_revert(self, tmp_path):
         """Writing the same bytes again is a no-op, which the patcher
         already reports. Double-counting it here would fire on every

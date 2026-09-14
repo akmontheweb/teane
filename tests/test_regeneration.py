@@ -400,7 +400,7 @@ class _QueueGateway:
         self._contents = list(contents)
         self.calls = []
 
-    async def dispatch(self, messages=None, role=None, budget_remaining_usd=1.0):
+    async def dispatch(self, messages=None, role=None, budget_remaining_usd=1.0, **_kw):
         self.calls.append(messages)
         c = self._contents.pop(0) if self._contents else ""
         return _QueueResp(c), budget_remaining_usd

@@ -2538,6 +2538,7 @@ async def _maybe_discovery_saturation_check(
         response, new_budget = await gw.dispatch(
             messages=check_messages,
             role=NodeRole.REPAIR,
+            cache_family='repair:maybe_discovery_saturation_check',
             budget_remaining_usd=budget,
         )
         raw = (response.content or "").strip()
@@ -2698,6 +2699,7 @@ async def _maybe_discovery_followup_focus(
         response, new_budget = await gw.dispatch(
             messages=check_messages,
             role=NodeRole.REPAIR,
+            cache_family='repair:maybe_discovery_followup_focus',
             budget_remaining_usd=budget,
         )
         raw = (response.content or "").strip()
@@ -3821,6 +3823,7 @@ async def _patching_tool_loop(
     response, budget = await gateway.dispatch(
         messages=list(messages),
         role=NodeRole.PATCHING,
+        cache_family='patching:patching_tool_loop',
         budget_remaining_usd=budget,
         **dispatch_kwargs,
     )
@@ -3934,6 +3937,7 @@ async def _patching_tool_loop(
             response, budget = await gateway.dispatch(
                 messages=list(messages),
                 role=NodeRole.PATCHING,
+                cache_family='patching:patching_tool_loop',
                 budget_remaining_usd=budget,
                 **dispatch_kwargs,
             )
@@ -3970,6 +3974,7 @@ async def _patching_tool_loop(
             response, budget = await gateway.dispatch(
                 messages=list(messages),
                 role=NodeRole.PATCHING,
+                cache_family='patching:patching_tool_loop',
                 budget_remaining_usd=budget,
                 **dispatch_kwargs,
             )
@@ -4305,6 +4310,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
         response, new_budget = await gateway.dispatch(
             messages=list(messages),
             role=NodeRole.PLANNING,
+            cache_family='planning:planning_node',
             budget_remaining_usd=budget,
         )
 
@@ -4318,6 +4324,7 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.PLANNING,
+                cache_family='planning:planning_dispatch',
                 budget_remaining_usd=budget_remaining,
             )
 
@@ -7376,10 +7383,21 @@ def _detect_state_reverts(
         if not isinstance(seen, list):
             seen = []
             hist_raw[rel] = seen
-        # seen[-1] is the state BEFORE this round's write only if the file
-        # was recorded last round; an exact match there means nothing
-        # changed, which the no-op path already surfaces.
-        if digest in seen[:-1]:
+        # Record TRANSITIONS, not observations. ``modified_files`` is
+        # cumulative across the session (graph.py: ``modified_files =
+        # list(existing_modified)``), so every round re-hashes every file
+        # ever touched. Appending on each sighting made an untouched file's
+        # history grow [A, A, A...], and a membership test against anything
+        # but the final element then matched its own earlier copy — a false
+        # revert on every stable file. lumina-run4 flagged 17 files per
+        # round, .gitignore and Makefile among them, which is how this
+        # surfaced.
+        #
+        # Skipping the append when nothing changed keeps history to genuine
+        # state changes, so a repeat can only mean the content came BACK.
+        if seen and digest == seen[-1]:
+            continue
+        if digest in seen:
             reverted.append(rel)
         seen.append(digest)
         if len(seen) > keep:
@@ -16685,6 +16703,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         return await _gw.dispatch(
                             messages=list(msgs),
                             role=_NodeRole.JUDGMENT,
+                            cache_family='judgment:reflection_repair_dispatch',
                             budget_remaining_usd=bud,
                         )
                     _reflection_schema = (
@@ -23089,6 +23108,7 @@ async def reverse_engineer_architecture_node(state: AgentState) -> dict[str, Any
                 MessageDict(role="user", content=user_prompt),
             ],
             role=NodeRole.PLANNING,
+            cache_family='planning:reverse_engineer_architecture_node',
             budget_remaining_usd=current_budget,
         )
     except Exception as exc:
@@ -23869,6 +23889,7 @@ async def reverse_spec_node(state: AgentState) -> dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
         role=NodeRole.PLANNING,
+        cache_family='planning:reverse_spec_node',
         budget_remaining_usd=budget,
     )
 
@@ -24014,6 +24035,7 @@ async def story_reopen_node(state: AgentState) -> dict[str, Any]:
                 {"role": "user", "content": prompt},
             ],
             role=NodeRole.PLANNING,
+            cache_family='planning:story_reopen_node',
             budget_remaining_usd=budget,
         )
     except Exception as exc:  # noqa: BLE001
@@ -24338,6 +24360,7 @@ async def requirements_discovery_node(state: AgentState) -> dict[str, Any]:
     try:
         response, budget = await gateway.dispatch(
             messages=list(messages), role=NodeRole.PLANNING,
+            cache_family='planning:requirements_discovery_node',
             budget_remaining_usd=current_budget,
         )
 
@@ -24355,6 +24378,7 @@ async def requirements_discovery_node(state: AgentState) -> dict[str, Any]:
                 return await gateway.dispatch(
                     messages=list(msgs),
                     role=NodeRole.PLANNING,
+                    cache_family='planning:reqs_repair_dispatch',
                     budget_remaining_usd=bud,
                 )
             _discovery_schema = (
@@ -24504,6 +24528,7 @@ async def architecture_discovery_node(state: AgentState) -> dict[str, Any]:
     try:
         response, budget = await gateway.dispatch(
             messages=list(messages), role=NodeRole.PLANNING,
+            cache_family='planning:architecture_discovery_node',
             budget_remaining_usd=current_budget,
         )
 
@@ -24518,6 +24543,7 @@ async def architecture_discovery_node(state: AgentState) -> dict[str, Any]:
                 return await gateway.dispatch(
                     messages=list(msgs),
                     role=NodeRole.PLANNING,
+                    cache_family='planning:arch_repair_dispatch',
                     budget_remaining_usd=bud,
                 )
             _arch_schema = (
@@ -24748,6 +24774,7 @@ JSON. No markdown, no explanation, no code blocks.""" + telemetry_block + resolv
     try:
         response, budget = await gateway.dispatch(
             messages=list(messages), role=NodeRole.PLANNING,
+            cache_family='planning:deployment_discovery_node',
             budget_remaining_usd=current_budget,
         )
 
@@ -24762,6 +24789,7 @@ JSON. No markdown, no explanation, no code blocks.""" + telemetry_block + resolv
                 return await gateway.dispatch(
                     messages=list(msgs),
                     role=NodeRole.PLANNING,
+                    cache_family='planning:deploy_repair_dispatch',
                     budget_remaining_usd=bud,
                 )
             _deploy_schema = (
@@ -25214,6 +25242,7 @@ async def review_and_revise_spec(
         critique_response, new_budget = await gateway.dispatch(
             messages=critique_messages,
             role=NodeRole.DOC_REVIEWER,
+            cache_family='doc_reviewer:review_and_revise_spec',
             budget_remaining_usd=budget_remaining_usd,
         )
     except Exception as exc:
@@ -25224,6 +25253,7 @@ async def review_and_revise_spec(
         return await gateway.dispatch(
             messages=list(msgs),
             role=NodeRole.DOC_REVIEWER,
+            cache_family='doc_reviewer:critique_dispatch',
             budget_remaining_usd=budget_remaining,
         )
 
@@ -25283,6 +25313,7 @@ async def review_and_revise_spec(
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.DOC_REVIEWER,
+                cache_family='doc_reviewer:spec_repair_dispatch',
                 budget_remaining_usd=bud,
             )
         _schema_hint = (
@@ -25359,6 +25390,7 @@ async def review_and_revise_spec(
         revised_response, new_budget = await gateway.dispatch(
             messages=revise_messages,
             role=NodeRole.PLANNING,
+            cache_family='planning:spec_repair_dispatch',
             budget_remaining_usd=new_budget,
         )
 
@@ -25366,6 +25398,7 @@ async def review_and_revise_spec(
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.PLANNING,
+                cache_family='planning:revise_dispatch',
                 budget_remaining_usd=budget_remaining,
             )
 
@@ -25713,6 +25746,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         critique_response, new_budget = await gateway.dispatch(
             messages=critique_messages,
             role=NodeRole.CODE_REVIEWER,
+            cache_family='code_reviewer:code_review_node',
             budget_remaining_usd=budget,
         )
     except Exception as exc:
@@ -25729,6 +25763,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         return await gateway.dispatch(
             messages=list(msgs),
             role=NodeRole.CODE_REVIEWER,
+            cache_family='code_reviewer:code_critique_dispatch',
             budget_remaining_usd=budget_remaining,
         )
 
@@ -25797,6 +25832,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
             return await gateway.dispatch(
                 messages=list(msgs),
                 role=NodeRole.CODE_REVIEWER,
+                cache_family='code_reviewer:code_repair_dispatch',
                 budget_remaining_usd=bud,
             )
         _findings_schema = (
@@ -26144,6 +26180,7 @@ first heading. Fences are reserved for code blocks INSIDE the document."""
             else:
                 response, budget = await gateway.dispatch(
                     messages=messages, role=NodeRole.PLANNING,
+                    cache_family='planning:generate_deployment_spec_node',
                     budget_remaining_usd=current_budget,
                 )
                 content = response.content.strip()

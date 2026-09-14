@@ -5899,6 +5899,7 @@ async def _llm_classify_ambiguous_nfrs(
         response, budget_usd = await gateway.dispatch(
             messages=[{"role": "user", "content": prompt}],
             role=NodeRole.DOC_REVIEWER,
+            cache_family='doc_reviewer:llm_classify_ambiguous_nfrs',
             budget_remaining_usd=budget_usd,
         )
     except Exception as exc:  # noqa: BLE001 — never break refinement on this

@@ -577,6 +577,7 @@ Design the optimal container architecture. Return ONLY a valid JSON object match
         response, budget = await gateway.dispatch(
             messages=messages,
             role=NodeRole.PLANNING,
+            cache_family='planning:synthesize_architecture',
             budget_remaining_usd=_synth_budget,
         )
 

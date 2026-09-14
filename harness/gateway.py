@@ -2431,6 +2431,23 @@ class GatewayConfig:
     # repair LLM isn't touching the real blocker N rounds in a row,
     # the router escalates to HITL. Clamped to [1, 10] at config load.
     max_consecutive_distraction_rounds: int = 3
+    # How many times the repair loop will OFFER the UNSATISFIABLE_TEST
+    # escape on the same guarded test file before taking it itself.
+    #
+    # The escape is model-declared: the harness prints the offer and the
+    # model must emit an ``UNSATISFIABLE_TEST: <path>`` line for anything
+    # to happen. On lumina-fresh-20260911-1107 the harness offered it 15
+    # times and was correct every time — the test posts future-dated births
+    # that the model's own validator rejects, so no production change can
+    # make it pass — and the model declined all 15 while patching
+    # main.py, deps.py and config.py in turn. The detector holding the
+    # correct diagnosis could only suggest; the reflection judge, wrong 13
+    # times, could compel via the MUST-MODIFY promotion. This floor gives
+    # the correct subsystem a way to act.
+    #
+    # Matches ``max_consecutive_distraction_rounds`` by default: the same
+    # number of wasted rounds that trips the distraction breaker.
+    max_unsat_offers_before_forcing: int = 3
     # Bug B (2026-07-04) — low-signal-verdict circuit breaker. Ticked
     # whenever the reflection judge falls back to the "insufficient
     # data — no diagnostic locations available" sentinel, regardless of
@@ -4787,6 +4804,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_consecutive_low_signal_rounds=_clamp_low_signal_rounds(
             node_throttle.get("max_consecutive_low_signal_rounds", 5)
+        ),
+        max_unsat_offers_before_forcing=_clamp_distraction_rounds(
+            node_throttle.get("max_unsat_offers_before_forcing", 3)
         ),
         total_hard_cap_multiplier=_clamp_hard_cap_multiplier(
             node_throttle.get("total_hard_cap_multiplier", 4)

@@ -28,6 +28,7 @@ can't modify tests", and shipped a production regression instead.
 from __future__ import annotations
 
 from harness.graph import (
+    _apply_unsat_offer_floor,
     _guarded_test_lines_from_diagnostics,
     _should_offer_unsatisfiable_escape,
     _triage_flags_guarded_test_bug,
@@ -238,3 +239,149 @@ class TestLuminaRound8EndToEnd:
                 errs, WS, carveout,
             ),
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# The declined-offer floor.
+#
+# The escape is MODEL-DECLARED: the harness prints the offer and the model
+# must emit an ``UNSATISFIABLE_TEST: <path>`` line for anything to happen. A
+# model that never writes the line declines it forever.
+#
+# lumina-fresh-20260911-1107 is the case. The harness offered the escape 15
+# times and was correct every time — ``server/tests/test_birthdays_api.py:36``
+# builds dates of birth with ``today.replace(day=today.day + 1)``, which keeps
+# the current year, so both POSTs are future-dated and the app's own
+# ``validate_date_not_future`` rejects them with 422. The test never asserts
+# the POST status, so it GETs an empty list and fails ``len == 2``. No
+# production change can satisfy it. The model declined all 15 offers and
+# worked through main.py, deps.py and config.py while the build died on the
+# HITL auto-resume cap.
+#
+# The subsystem holding the correct diagnosis could only suggest; the
+# reflection judge — wrong 13 rounds running — could compel via the
+# MUST-MODIFY promotion. This floor gives the correct one a way to act.
+# ---------------------------------------------------------------------------
+
+_LUMINA_TEST = "server/tests/test_birthdays_api.py"
+
+
+class TestDeclinedOfferFloor:
+
+    def test_below_the_floor_only_counts(self):
+        declined: dict[str, int] = {}
+        for _ in range(2):
+            assert _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=3,
+            ) is None
+        assert declined[_LUMINA_TEST] == 2
+
+    def test_floor_forces_the_declaration(self):
+        declined: dict[str, int] = {}
+        out = None
+        for _ in range(3):
+            out = _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=3,
+            )
+        assert out is not None
+        path, reason = out
+        assert path == _LUMINA_TEST
+        # The reason must say who declared it — a post-mortem reading this
+        # should not mistake it for the model's own words.
+        assert "harness-declared" in reason
+        assert "3 declined" in reason
+
+    def test_counter_clears_after_forcing(self):
+        """So a later, genuinely different blocker starts from zero rather
+        than tripping on the first offer."""
+        declined: dict[str, int] = {}
+        for _ in range(3):
+            _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=3,
+            )
+        assert _LUMINA_TEST not in declined
+
+    def test_a_real_patch_resets_the_counter(self):
+        """Production moving means the loop is working. The floor is for a
+        loop that is stuck, not for a model taking a few rounds."""
+        declined: dict[str, int] = {}
+        for _ in range(2):
+            _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=3,
+            )
+        assert _apply_unsat_offer_floor(
+            declined, {_LUMINA_TEST},
+            any_real_patch=True, already_declared=False, floor=3,
+        ) is None
+        assert declined == {}
+        # And the next decline starts from one, not three.
+        _apply_unsat_offer_floor(
+            declined, {_LUMINA_TEST},
+            any_real_patch=False, already_declared=False, floor=3,
+        )
+        assert declined[_LUMINA_TEST] == 1
+
+    def test_model_declaration_suppresses_forcing(self):
+        """When the model speaks for itself there is nothing to force, and
+        the round must not also count as a decline."""
+        declined: dict[str, int] = {}
+        assert _apply_unsat_offer_floor(
+            declined, {_LUMINA_TEST},
+            any_real_patch=False, already_declared=True, floor=3,
+        ) is None
+        assert declined == {}
+
+    def test_floor_of_zero_disables_the_mechanism(self):
+        declined: dict[str, int] = {}
+        for _ in range(10):
+            assert _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=0,
+            ) is None
+
+    def test_empty_offer_set_is_a_no_op(self):
+        declined: dict[str, int] = {}
+        assert _apply_unsat_offer_floor(
+            declined, set(), any_real_patch=False,
+            already_declared=False, floor=3,
+        ) is None
+        assert declined == {}
+
+    def test_the_worst_offender_is_chosen(self):
+        """Offers can name several files; force the one that has been
+        declined most, not an arbitrary member of the set."""
+        declined = {"tests/a.py": 2, "tests/b.py": 0}
+        out = _apply_unsat_offer_floor(
+            declined, {"tests/a.py", "tests/b.py"},
+            any_real_patch=False, already_declared=False, floor=3,
+        )
+        assert out is not None and out[0] == "tests/a.py"
+
+    def test_counts_are_per_file(self):
+        """Two files each declined twice must not sum to a trip at floor 3."""
+        declined: dict[str, int] = {}
+        for _ in range(2):
+            assert _apply_unsat_offer_floor(
+                declined, {"tests/a.py", "tests/b.py"},
+                any_real_patch=False, already_declared=False, floor=3,
+            ) is None
+        assert declined == {"tests/a.py": 2, "tests/b.py": 2}
+
+    def test_the_fifteen_decline_lumina_sequence_trips_at_three(self):
+        """End-to-end shape of the real session: the offer repeats on the
+        same file with no production patch ever landing. The build should
+        stop losing rounds at 3, not 15."""
+        declined: dict[str, int] = {}
+        forced_at = None
+        for round_no in range(1, 16):
+            out = _apply_unsat_offer_floor(
+                declined, {_LUMINA_TEST},
+                any_real_patch=False, already_declared=False, floor=3,
+            )
+            if out is not None and forced_at is None:
+                forced_at = round_no
+        assert forced_at == 3

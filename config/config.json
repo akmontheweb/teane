@@ -43,7 +43,7 @@
         "gates": {
             "force_local_below_usd": 0.05,
             "refuse_if_est_cost_fraction_over": 0.8,
-            "low_budget_skip_usd": 0.10,
+            "low_budget_skip_usd": 0.1,
             "min_call_budget_usd": 0.01
         }
     },
@@ -55,6 +55,7 @@
         "max_patch_repair_iterations": 5,
         "max_consecutive_distraction_rounds": 3,
         "max_consecutive_low_signal_rounds": 5,
+        "max_unsat_offers_before_forcing": 3,
         "total_hard_cap_multiplier": 4,
         "max_end_of_session_regression_cycles": 3,
         "end_of_session_repair_diagnostic_cap": 30,
@@ -385,7 +386,10 @@
         "enabled": true,
         "scenario_source": "llm",
         "seed_source": "fallback",
-        "altitudes": ["integration", "e2e"],
+        "altitudes": [
+            "integration",
+            "e2e"
+        ],
         "max_scenarios_per_story": 24,
         "max_seed_rows_per_table": 20,
         "integration_dir": "tests/acceptance",

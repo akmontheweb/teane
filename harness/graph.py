@@ -7226,6 +7226,70 @@ _UNSAT_TEST_DECL_RE = re.compile(
 )
 
 
+def _apply_unsat_offer_floor(
+    declined: dict[str, int],
+    offer_files: set[str],
+    *,
+    any_real_patch: bool,
+    already_declared: bool,
+    floor: int,
+) -> Optional[tuple[str, str]]:
+    """Count declined ``UNSATISFIABLE_TEST`` offers and, at the floor, take
+    the escape on the model's behalf.
+
+    The escape is MODEL-DECLARED: the harness prints the offer and the model
+    must emit an ``UNSATISFIABLE_TEST: <path>`` line for anything to happen.
+    A model that simply never writes the line declines it forever. On
+    lumina-fresh-20260911-1107 the harness offered it 15 times and was
+    correct every time — ``test_birthdays_api.py:36`` posts future-dated
+    births that the app's own ``validate_date_not_future`` rejects, so NO
+    production change could satisfy it — while the model worked through
+    main.py, deps.py and config.py and the build died on the HITL
+    auto-resume cap.
+
+    This invents no new state transition. It returns exactly what the
+    model's own declaration would have produced, so the caller routes
+    through the existing path to ``test_regeneration_node``.
+
+    ``declined`` is mutated in place (it lives in ``loop_counter``).
+
+    Only rounds that landed NO real patch count toward the floor, and a
+    round that DID land one clears the counters: production moving means
+    the loop is working, not stuck. ``floor <= 0`` disables the mechanism.
+    """
+    if any_real_patch:
+        for path in offer_files:
+            declined.pop(path, None)
+        return None
+    if already_declared:
+        # The model spoke for itself this round; nothing to force.
+        return None
+    if not offer_files:
+        return None
+    for path in sorted(offer_files):
+        declined[path] = int(declined.get(path, 0) or 0) + 1
+    if floor <= 0:
+        return None
+    worst = max(offer_files, key=lambda f: int(declined.get(f, 0) or 0))
+    count = int(declined.get(worst, 0) or 0)
+    if count < floor:
+        return None
+    logger.warning(
+        "[repair_node] UNSATISFIABLE_TEST offer declined %d time(s) on %s "
+        "with zero real patches. Taking the escape on the model's behalf "
+        "and routing to test regeneration — further production rounds "
+        "cannot satisfy this assertion.",
+        count, worst,
+    )
+    declined.pop(worst, None)
+    return (
+        worst,
+        f"harness-declared after {count} declined UNSATISFIABLE_TEST "
+        "offer(s) with no production patch landing — the repair loop "
+        "cannot satisfy this test by changing production code",
+    )
+
+
 def _parse_unsatisfiable_test_declaration(
     text: str,
 ) -> Optional[tuple[str, str]]:
@@ -19192,14 +19256,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             _unsat_decl_raw = _parse_unsatisfiable_test_declaration(
                 patch_payload,
             )
+            # Hoisted: the declined-offer floor below needs this whether or
+            # not the model declared anything.
+            _any_real_patch = any(
+                getattr(r, "success", False)
+                and not getattr(r, "no_op", False)
+                for r in patch_results
+            )
             if _unsat_decl_raw is not None:
                 _unsat_path_norm = _normalize_ws_path(
                     _unsat_decl_raw[0], workspace,
-                )
-                _any_real_patch = any(
-                    getattr(r, "success", False)
-                    and not getattr(r, "no_op", False)
-                    for r in patch_results
                 )
                 if _unsat_path_norm in _unsat_offer_files and not _any_real_patch:
                     _unsat_declared = (_unsat_path_norm, _unsat_decl_raw[1])
@@ -19224,6 +19290,50 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                         file=_unsat_decl_raw[0],
                         reason=_unsat_decl_raw[1],
                         honoured=_unsat_declared is not None,
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+            # --- Declined-offer floor (lumina-fresh-20260911-1107) ---
+            # The escape is model-declared, so a model that simply never
+            # writes the line can decline it forever. On that session the
+            # harness offered it 15 times and was right every time — the
+            # test posts future-dated births its own validator rejects, so
+            # NO production change could make it pass — while the model
+            # patched main.py, deps.py and config.py in turn and the loop
+            # ran until the HITL auto-resume cap killed the build.
+            #
+            # Track declines per offered file and, at the floor, take the
+            # escape ourselves. This invents no new state transition: it
+            # sets exactly the flag the model's own declaration would have
+            # set, and routes through the same path to
+            # ``test_regeneration_node``.
+            #
+            # Only rounds that landed NO real patch count. A round that
+            # changed production code is progress, and progress resets the
+            # counter — the floor is for a loop that is genuinely stuck,
+            # not for a model taking a few rounds to find the fix.
+            _gw_floor = get_gateway()
+            _forced_unsat = _apply_unsat_offer_floor(
+                loop_counter.setdefault("unsat_offers_declined_per_file", {}),
+                _unsat_offer_files,
+                any_real_patch=_any_real_patch,
+                already_declared=_unsat_declared is not None,
+                floor=(
+                    int(getattr(
+                        _gw_floor.config,
+                        "max_unsat_offers_before_forcing", 3,
+                    ))
+                    if _gw_floor is not None else 3
+                ),
+            )
+            if _forced_unsat is not None:
+                _unsat_declared = _forced_unsat
+                try:
+                    from harness.observability import emit_event as _emit_uf
+                    _emit_uf(
+                        "unsatisfiable_test_forced",
+                        file=_forced_unsat[0],
                         total_repairs=loop_counter.get("total_repairs", 0),
                     )
                 except Exception:  # noqa: BLE001 — telemetry must not block

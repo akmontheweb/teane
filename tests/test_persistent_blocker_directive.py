@@ -613,19 +613,27 @@ class TestGuardAwareSeeder:
         assert guarded == []
 
     def test_non_assertion_round_also_filters_guarded_tests(self, tmp_path):
-        # An ImportError anchored in a healthy test file: the guard would
-        # veto repair edits to it in ANY round type, so the filter must
-        # apply outside test-assertion mode too.
+        # An AssertionError anchored in a healthy test file: the guard vetoes
+        # repair edits to it in ANY round type, so the filter must apply
+        # outside test-assertion mode too.
+        #
+        # (This case used an ImportError until 2026-09-14. Carve-out 3 in
+        # ``_syntax_broken_test_files`` now makes a collection-phase
+        # ImportError on a test module EDITABLE — a module that cannot be
+        # imported has no live assertions to weaken — so that input is no
+        # longer guarded and no longer filtered. See the companion test
+        # below. AssertionError keeps the original intent: a file whose
+        # assertions ARE live stays protected.)
         from harness.graph import _effective_judge_named_files
         verdict = {
-            "real_blocker": "ImportError at tests/test_api.py:2",
-            "recommendation": "Export the symbol from the api module.",
+            "real_blocker": "AssertionError at tests/test_api.py:2",
+            "recommendation": "Fix the production code under test.",
         }
         errs = [{
             "file": "tests/test_api.py",
             "line": 2,
-            "error_code": "ImportError",
-            "message": "cannot import name 'create_app'",
+            "error_code": "AssertionError",
+            "message": "assert 0 == 2",
         }]
         files, promoted, guarded = _effective_judge_named_files(
             verdict, errs, errs, str(tmp_path),
@@ -633,6 +641,31 @@ class TestGuardAwareSeeder:
         assert files == []
         assert promoted is None
         assert guarded == ["tests/test_api.py"]
+
+    def test_unimportable_test_file_is_not_filtered(self, tmp_path):
+        """Carve-out 3's consequence for the seeder: once the repair loop
+        CAN fix a file, naming it is useful rather than pointless.
+
+        lumina-verify-20260914-1151 generated a test module using
+        ``@pytest.fixture`` with no ``import pytest``. Filtering it out of
+        the judge's named files would steer repair away from the only edit
+        that resolves the build.
+        """
+        from harness.graph import _effective_judge_named_files
+        verdict = {
+            "real_blocker": "ImportError at tests/test_api.py:2",
+            "recommendation": "Add the missing import.",
+        }
+        errs = [{
+            "file": "tests/test_api.py",
+            "line": 2,
+            "error_code": "ImportError",
+            "message": "cannot import name 'create_app'",
+        }]
+        files, _promoted, _guarded = _effective_judge_named_files(
+            verdict, errs, errs, str(tmp_path),
+        )
+        assert files == ["tests/test_api.py"]
 
     def test_mixed_files_keep_production_drop_guarded_test(self, tmp_path):
         # Judge names a production file in the recommendation AND the

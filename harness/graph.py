@@ -6797,6 +6797,15 @@ _COLLECTION_ERROR_CODES = frozenset({
     "ImportError", "ModuleNotFoundError", "CollectError", "CollectionError",
     "ConftestImportFailure", "ImportPathMismatchError", "UsageError",
 })
+# Codes that make a test module UNIMPORTABLE. Distinct from
+# ``_PARSE_ERROR_CODES`` (the file does not parse) and from
+# ``_COLLECTION_ERROR_CODES`` (the run had a collection failure somewhere):
+# these name a specific file that parsed fine but blew up during import.
+# A missing ``import pytest`` under a ``@pytest.fixture`` decorator is the
+# canonical case — lumina-verify-20260914-1151 generated exactly that.
+_IMPORT_FATAL_TEST_CODES = frozenset({
+    "NameError", "ImportError", "ModuleNotFoundError",
+})
 _COLLECTION_ERROR_MARKERS = (
     "error collecting",
     "import file mismatch",
@@ -6884,12 +6893,36 @@ def _has_collection_error(compiler_errors: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _diagnostic_is_collection_scoped(d: dict[str, Any]) -> bool:
+    """True when THIS diagnostic reports a collection/import failure of the
+    file it names — as opposed to :func:`_has_collection_error`, which asks
+    whether the RUN had a collection failure anywhere.
+
+    The distinction is the whole safety argument. Run-level collection
+    failure plus an ``AssertionError`` on some other file must not open that
+    other file; its assertions ran and are live. A diagnostic that itself
+    says "ERROR collecting ..." names a file nothing was evaluated in.
+    """
+    msg = str(d.get("message") or "").lower()
+    if not msg:
+        return False
+    # ``conftest`` is deliberately excluded from the marker list here: it
+    # appears in plenty of ordinary tracebacks and is already handled, far
+    # more precisely, by the infra-scoped carve-out.
+    return any(
+        marker in msg for marker in (
+            "error collecting", "errors during collection",
+            "import file mismatch", "importpathmismatcherror",
+        )
+    )
+
+
 def _syntax_broken_test_files(
     compiler_errors: list[dict[str, Any]], workspace_path: str,
 ) -> frozenset[str]:
     """Test paths the repair loop may edit despite the tamper guard.
 
-    Two carve-outs, both feeding :func:`_reject_test_patch_blocks`:
+    Three carve-outs, all feeding :func:`_reject_test_patch_blocks`:
 
     1. **Parse errors** (per-file). Any test-artifact path whose CURRENT
        diagnostic is a ``SyntaxError`` / ``IndentationError`` / ``TabError``.
@@ -6910,25 +6943,61 @@ def _syntax_broken_test_files(
        green. Assertions live in test-case files, which stay protected, so
        this cannot reward-hack a red test green.
 
+    3. **Unimportable test modules** (per-file). A test-artifact path whose
+       own diagnostic is a ``NameError`` / ``ImportError`` /
+       ``ModuleNotFoundError`` DURING a collection-phase failure. The
+       safety argument is carve-out 1's, verbatim: a module that cannot be
+       imported has no assertions being evaluated, so making it importable
+       cannot weaken one. Gated on ``_has_collection_error`` so a NameError
+       raised inside a RUNNING test body — where the assertions are live
+       and must stay protected — never opens the file.
+
+       lumina-verify-20260914-1151: test_errors.py used ``@pytest.fixture``
+       without importing pytest. Carve-out 1 missed it (a NameError, not a
+       SyntaxError) and carve-out 2 missed it (a test-CASE file, not
+       infra), so the repair LLM emitted the correct one-line import fix
+       and the guard refused it — ``Refused 1 repair edit(s) to test
+       file(s): server/tests/test_errors.py`` — with no production change
+       able to make ``pytest`` defined in that module.
+
     Paths are returned in normalized workspace-relative form (see
     :func:`_normalize_ws_path`).
     """
     out: set[str] = set()
+    # Carve-out 3 is gated on the run having failed at collection at all, so
+    # a NameError raised INSIDE a running test body (a real assertion-phase
+    # failure, where the file's assertions are live and must stay protected)
+    # can never open the file.
+    collection_phase = _has_collection_error(compiler_errors)
     for d in compiler_errors or []:
         if not isinstance(d, dict):
             continue
         code = str(d.get("error_code") or d.get("code") or "")
-        if code not in _PARSE_ERROR_CODES:
-            continue
         raw = str(d.get("file") or "")
         if not raw:
             continue
         norm = _normalize_ws_path(raw, workspace_path)
-        if _is_test_artifact(norm):
+        if not _is_test_artifact(norm):
+            continue
+        if code in _PARSE_ERROR_CODES:
+            out.add(norm)
+        elif collection_phase and code in _IMPORT_FATAL_TEST_CODES:
+            out.add(norm)
+        elif _diagnostic_is_collection_scoped(d):
+            # Phase beats error code. A diagnostic whose OWN message says
+            # the file failed to collect means nothing in it was
+            # evaluated — whatever the exception was called. This catches
+            # the import-time failures the code allowlist above cannot
+            # enumerate (a decorator evaluating to AttributeError, a
+            # module-level TypeError, a plugin that blew up on import).
+            #
+            # Assertion-phase codes can never reach here: a test that
+            # RAN to produce an AssertionError was collected, so its
+            # diagnostic carries no collection marker.
             out.add(norm)
 
     # Collection carve-out: open all workspace test-infra files.
-    if _has_collection_error(compiler_errors):
+    if collection_phase:
         out |= _workspace_test_infra_files(workspace_path)
 
     return frozenset(out)

@@ -7317,6 +7317,86 @@ _UNSAT_TEST_DECL_RE = re.compile(
 )
 
 
+_EVIDENCE_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import\b|import\s+([A-Za-z_][\w.]*))",
+    re.MULTILINE,
+)
+
+
+def _workspace_imports_of(
+    workspace_path: str, rel_files: Iterable[str], *, cap: int = 8,
+) -> list[str]:
+    """Workspace-local modules imported BY ``rel_files``.
+
+    The downstream half of the evidence widening. When the failing
+    assertion lives in a test, the modules that test imports are the code
+    whose behaviour it is asserting on — including the wiring that shapes
+    the result, which no diagnostic ever names.
+
+    lumina-run4-20260914-1608: ``test_birthdays_api.py`` asserted on an
+    error body, ``api/birthdays.py`` raised the right error, and
+    ``main.py`` overwrote its message in a bare-except middleware. The
+    test imports ``server.app.main`` on line 15 — the defect was one line
+    of the test's own import list away, and the judge was forbidden from
+    naming it because no diagnostic mentioned it.
+
+    Third-party imports are skipped: only modules that resolve to a file
+    inside the workspace are returned.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for rel in rel_files:
+        path = rel if os.path.isabs(rel) else os.path.join(workspace_path, rel)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                src = fh.read(40000)
+        except OSError:
+            continue
+        for m in _EVIDENCE_IMPORT_RE.finditer(src):
+            dotted = m.group(1) or m.group(2) or ""
+            if not dotted or dotted.startswith("."):
+                continue
+            candidate = os.path.join(*dotted.split(".")) + ".py"
+            if not os.path.exists(os.path.join(workspace_path, candidate)):
+                continue  # third-party or stdlib — not ours to name
+            if candidate in seen or candidate in set(rel_files):
+                continue
+            seen.add(candidate)
+            out.append(candidate)
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def _related_files_evidence(
+    workspace_path: str, diag_files: Iterable[str], *, cap: int = 6,
+) -> tuple[list[str], list[str]]:
+    """``(imports, importers)`` for the diagnostic files.
+
+    The judge's grounding rule — "the file:line locations shown are the
+    ONLY files you may name" — is correct and must stay: it is what stops
+    invented paths. But it makes a defect that lives one hop from the
+    diagnostics structurally unnameable, and the harness already computes
+    the graph that closes that gap; it was just never shown to the judge.
+
+    Widening the EVIDENCE is the fix, not loosening the permission. There
+    is precedent: the install-class carve-out already tells the judge it
+    may name a manifest that appears in no diagnostic.
+    """
+    imports = _workspace_imports_of(workspace_path, diag_files, cap=cap)
+    importers: list[str] = []
+    try:
+        from harness.impact import DependencyGraph
+        graph = DependencyGraph(workspace_path)
+        importers = [
+            f for f in graph.immediate_callers_of(list(diag_files), top_k=cap)
+            if f not in set(diag_files)
+        ]
+    except Exception:  # noqa: BLE001 — evidence is best-effort, never fatal
+        importers = []
+    return imports, importers
+
+
 def _detect_state_reverts(
     workspace_path: str,
     modified_files: Iterable[str],
@@ -11904,6 +11984,8 @@ def _build_repair_reflection_prompt(
     judge_target_noop_files: Optional[list[str]] = None,
     file_revert_streak: int = 0,
     file_revert_files: Optional[list[str]] = None,
+    related_imports: Optional[list[str]] = None,
+    related_importers: Optional[list[str]] = None,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
     workspace_path: str = "",
 ) -> str:
@@ -12228,6 +12310,42 @@ def _build_repair_reflection_prompt(
     # was a test posting future-dated births its own validator rejects, so
     # every round spent on that file was wasted and the build died on the
     # HITL cap.
+    # Widened evidence. A defect one hop from the diagnostics — a wrapper,
+    # a middleware, a registration site — is named by no diagnostic, so the
+    # grounding rule above makes it unnameable. The harness already computes
+    # this graph for the repair prompt; the judge was simply never shown it.
+    #
+    # lumina-run4-20260914-1608: the assertion was in
+    # test_birthdays_api.py, api/birthdays.py raised the right error, and
+    # main.py overwrote its message in a bare-except middleware. main.py is
+    # line 15 of the test's own import list and appeared in no diagnostic.
+    related_block = ""
+    _ri = [f for f in (related_imports or []) if isinstance(f, str) and f]
+    _rr = [f for f in (related_importers or []) if isinstance(f, str) and f]
+    if _ri or _rr:
+        _lines = []
+        if _ri:
+            _lines.append(
+                "  Workspace modules the failing file(s) IMPORT — the code "
+                "under test and the wiring that shapes its output:\n    "
+                + "\n    ".join(_ri)
+            )
+        if _rr:
+            _lines.append(
+                "  Workspace files that IMPORT the failing file(s) — "
+                "callers whose expectations it must satisfy:\n    "
+                + "\n    ".join(_rr)
+            )
+        related_block = (
+            "\nRELATED FILES (grounded — you MAY name these):\n"
+            + "\n".join(_lines) + "\n"
+            "These are resolved from the workspace, not guesses. When every "
+            "file named in the diagnostics looks correct on inspection, the "
+            "defect is usually in one of these: a value produced correctly "
+            "and then overwritten downstream, or a contract a caller "
+            "depends on.\n"
+        )
+
     # An oscillation is evidence against the JUDGE, like a no-op on its
     # target — the model is following guidance that keeps reversing, so
     # telling it to try harder cannot help.
@@ -12247,6 +12365,14 @@ def _build_repair_reflection_prompt(
             "setup), or state plainly in ``real_blocker`` that you cannot "
             "localise it from the evidence available.\n"
         )
+        if _ri or _rr:
+            revert_block += (
+                "  START with the RELATED FILES above. A value can be "
+                "produced correctly and then overwritten downstream — that "
+                "is invisible at the assertion's own file:line, and it is "
+                "the usual reason a correct-looking file keeps being "
+                "named.\n"
+            )
 
     noop_on_target_block = ""
     if judge_target_noop_streak >= 2 and judge_target_noop_files:
@@ -12267,6 +12393,13 @@ def _build_repair_reflection_prompt(
             "satisfied by ANY production change, say so plainly in "
             "``real_blocker`` rather than naming a production file again.\n"
         )
+        if _ri or _rr:
+            noop_on_target_block += (
+                "  The RELATED FILES section above lists what that file "
+                "imports and what imports it. If the repair LLM reports it "
+                "is already correct, the defect is most likely in one of "
+                "those, not in the file itself.\n"
+            )
 
     disagreement_block = ""
     if (
@@ -12448,8 +12581,10 @@ def _build_repair_reflection_prompt(
         "of this prompt failed:\n"
         "  - Your answer must be grounded ONLY in the diagnostic data in "
         "the EVIDENCE section below. The file:line locations shown there "
-        "are the ONLY files you may name. Do NOT invent file paths, "
-        "symbol names, or call-site guesses that are not present there.\n"
+        "are the ONLY files you may name, TOGETHER WITH any file listed "
+        "in the RELATED FILES section when one is present. Do NOT invent "
+        "file paths, symbol names, or call-site guesses that appear in "
+        "neither.\n"
         "  - EXCEPTION for install / unresolved-import / test-plugin "
         "errors (TS2307, MISSING_DEP, MODULENOTFOUND, IMPORTERROR, "
         "UV_VERSION_CONSTRAINT and any diagnostic whose message includes "
@@ -12508,6 +12643,7 @@ def _build_repair_reflection_prompt(
         f"{tail_block}"
         f"{source_evidence_block}"
         f"{prior_verdict_block}"
+        f"{related_block}"
         f"{revert_block}"
         f"{noop_on_target_block}"
         f"{disagreement_block}"
@@ -16627,6 +16763,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             _prior_reflection = loop_counter.get("last_reflection_verdict")
             if not isinstance(_prior_reflection, dict):
                 _prior_reflection = None
+            # Widened evidence: what the failing files import, and what
+            # imports them. Best-effort — an empty result just renders no
+            # RELATED FILES section.
+            _diag_files_for_ev = [
+                _f for _f in (
+                    str(_d.get("file", "") or "")
+                    for _d in (top_persisted_diagnostics or [])
+                    if isinstance(_d, dict)
+                ) if _f
+            ][:4]
+            try:
+                _related_imports, _related_importers = _related_files_evidence(
+                    str(state.get("workspace_path", "") or ""),
+                    _diag_files_for_ev,
+                )
+            except Exception:  # noqa: BLE001 — never block the judge
+                _related_imports, _related_importers = [], []
             reflection_prompt = _build_repair_reflection_prompt(
                 prior_diagnostics_count=len(prior_fps_set),
                 current_diagnostics_count=len(current_fps_set),
@@ -16658,6 +16811,8 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         loop_counter.get("file_revert_files") or []
                     ) if isinstance(f, str) and f
                 ],
+                related_imports=_related_imports,
+                related_importers=_related_importers,
                 prior_reflection_verdict=_prior_reflection,
                 workspace_path=state.get("workspace_path") or "",
             )

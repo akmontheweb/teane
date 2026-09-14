@@ -30,6 +30,7 @@ from harness.cli import (
 )
 from harness.graph import (
     _detect_state_reverts,
+    _workspace_imports_of,
     _build_repair_reflection_prompt,
     _diagnostics_look_like_install_failure,
     _missing_module_matches_workspace_source,
@@ -1015,3 +1016,52 @@ class TestRevertBlockRendering:
         assert "YOUR GUIDANCE IS CYCLING" not in _build_repair_reflection_prompt(
             **self._kwargs(), file_revert_streak=5, file_revert_files=[],
         )
+
+
+class TestWorkspaceImportResolution:
+    """`_workspace_imports_of` is the downstream half of the widened
+    evidence: the modules a failing file imports, which is where the wiring
+    that shapes its output lives."""
+
+    def _mk(self, tmp_path):
+        import os
+        for rel, body in [
+            ("server/app/main.py", "x = 1\n"),
+            ("server/app/db.py", "y = 2\n"),
+            ("server/tests/test_api.py",
+             "import pytest\n"
+             "from fastapi.testclient import TestClient\n"
+             "from server.app.main import create_app\n"
+             "from server.app.db import get_db\n"),
+        ]:
+            p = os.path.join(str(tmp_path), rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write(body)
+        return str(tmp_path)
+
+    def test_resolves_workspace_modules(self, tmp_path):
+        ws = self._mk(tmp_path)
+        out = _workspace_imports_of(ws, ["server/tests/test_api.py"])
+        assert "server/app/main.py" in out
+        assert "server/app/db.py" in out
+
+    def test_third_party_imports_are_skipped(self, tmp_path):
+        """Naming pytest or fastapi as the blocker would be worse than
+        naming nothing."""
+        ws = self._mk(tmp_path)
+        out = _workspace_imports_of(ws, ["server/tests/test_api.py"])
+        assert not any("pytest" in f or "fastapi" in f for f in out)
+
+    def test_capped(self, tmp_path):
+        ws = self._mk(tmp_path)
+        assert len(_workspace_imports_of(
+            ws, ["server/tests/test_api.py"], cap=1)) == 1
+
+    def test_missing_file_is_safe(self, tmp_path):
+        assert _workspace_imports_of(str(tmp_path), ["nope.py"]) == []
+
+    def test_relative_imports_are_skipped(self, tmp_path):
+        import os
+        p = os.path.join(str(tmp_path), "m.py")
+        open(p, "w").write("from . import sibling\nfrom .pkg import thing\n")
+        assert _workspace_imports_of(str(tmp_path), ["m.py"]) == []

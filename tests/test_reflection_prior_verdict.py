@@ -340,3 +340,87 @@ class TestNoopOnJudgeTargetBlock:
             judge_target_noop_files=[],
         )
         assert _NOOP_HEADER not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Widened evidence — RELATED FILES (lumina-run4-20260914-1608).
+#
+# The grounding rule ("the file:line locations shown are the ONLY files you
+# may name") is what stops invented paths, and it must stay. But it also made
+# a defect one hop from the diagnostics structurally unnameable.
+#
+# Run 4 ended on a single failing test: the assertion lived in
+# test_birthdays_api.py, api/birthdays.py raised the right error
+# ("invalid_stored_data"), and main.py overwrote its message with a hardcoded
+# "unexpected error" in a bare-except middleware. main.py is line 15 of the
+# test's own import list and appeared in no diagnostic, so the judge could
+# not name it without breaking its own rule.
+#
+# The fix widens the EVIDENCE rather than loosening the permission.
+# ---------------------------------------------------------------------------
+
+_RELATED = "RELATED FILES (grounded"
+
+
+class TestRelatedFilesEvidence:
+
+    def test_absent_when_nothing_related(self) -> None:
+        assert _RELATED not in _build_repair_reflection_prompt(**_base_kwargs())
+
+    def test_imports_are_rendered(self) -> None:
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            related_imports=["server/app/main.py"],
+        )
+        assert _RELATED in prompt
+        assert "server/app/main.py" in prompt
+
+    def test_importers_are_rendered(self) -> None:
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            related_importers=["server/app/main.py"],
+        )
+        assert _RELATED in prompt
+        assert "IMPORT the failing file(s)" in prompt
+
+    def test_grounding_rule_admits_the_section(self) -> None:
+        """The permission and the evidence must move together — rendering
+        the files while still telling the judge it may only name
+        diagnostics would be worse than not rendering them."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(), related_imports=["server/app/main.py"],
+        )
+        assert "TOGETHER WITH any file listed in the RELATED FILES" in prompt
+
+    def test_names_the_overwritten_downstream_shape(self) -> None:
+        """The hint has to describe the actual failure mode, or it is just
+        a list of files."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(), related_imports=["server/app/main.py"],
+        )
+        assert "overwritten downstream" in prompt
+
+    def test_stall_signals_redirect_to_the_section(self) -> None:
+        """A stall signal that only says "you are wrong" leaves the judge
+        nowhere to go. With related files present it must point there."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            related_imports=["server/app/main.py"],
+            file_revert_streak=2,
+            file_revert_files=["server/app/models/birthday.py"],
+        )
+        assert "START with the RELATED FILES above" in prompt
+
+    def test_noop_signal_also_redirects(self) -> None:
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            related_imports=["server/app/main.py"],
+            judge_target_noop_streak=2,
+            judge_target_noop_files=["server/app/services/birthdays_service.py"],
+        )
+        assert "most likely in one of those" in prompt
+
+    def test_non_string_entries_are_ignored(self) -> None:
+        assert _RELATED not in _build_repair_reflection_prompt(
+            **_base_kwargs(), related_imports=[None, "", 7],
+        )

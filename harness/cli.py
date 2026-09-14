@@ -1048,6 +1048,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # quality_enforce. Phase-2 auto-remediation keys land with that phase.
     "decomposition": frozenset({
         "quality_review", "quality_enforce", "max_stories_per_review",
+        # Phase-2 bounded AC remediation (ADR-0007).
+        "quality_remediate",
     }),
     "traceability": frozenset({
         "enforce", "enforce_reqs", "enforce_acs",
@@ -1478,6 +1480,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     # ADR-0007 decomposition-quality review.
     "decomposition.quality_review": (bool,),
     "decomposition.quality_enforce": (bool,),
+    "decomposition.quality_remediate": (bool,),
     "decomposition.max_stories_per_review": (int,),
     # End-of-run traceability gate. See installation_doc_node.
     "traceability.enforce": (bool,),

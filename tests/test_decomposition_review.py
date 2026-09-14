@@ -271,3 +271,304 @@ def test_rubric_states_the_nfr_exception():
     """
     assert "[NFR:<policy>]" in dr._QUALITY_RUBRIC
     assert "NEVER report overlap" in dr._QUALITY_RUBRIC
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — bounded AC remediation (ADR-0007).
+#
+# `quality_enforce` is binary: discard every finding, or fail the build with
+# exit_code=1 and a "revise the spec by hand" message.
+# lumina-fresh-20260911-1107 produced 13 ac_quality/high findings on an
+# ordinary spec, so enforcing would have bricked the run at decomposition —
+# strictly worse than ignoring them. They were ignored, and the vague
+# criteria they named went on to feed test generation.
+#
+# The safety contract is the point of these tests: rewriting AC text must
+# not disturb anything that currently works.
+# ---------------------------------------------------------------------------
+
+def _finding_rewrite(story_key: str, sev: str = "high") -> dict:
+    return dr._finding(
+        story_key, "ac_quality", sev,
+        "AC 'Dashboard handles no upcoming birthdays' is not testable.",
+        "rewrite_ac", source="llm",
+    )
+
+
+class TestRemediableSelection:
+    """Only high-severity AC rewrites qualify. Structural recommendations
+    would reshape the decomposition and invalidate story keys downstream
+    nodes have already committed to."""
+
+    def test_high_ac_quality_rewrite_qualifies(self):
+        assert dr._remediable_findings([_finding_rewrite("STORY-001")])
+
+    def test_medium_does_not_qualify(self):
+        assert not dr._remediable_findings(
+            [_finding_rewrite("STORY-001", sev="medium")]
+        )
+
+    @pytest.mark.parametrize("dim,action", [
+        ("right_sizing", "split"),
+        ("overlap", "merge"),
+        ("dependency", "add_dependency"),
+        ("balance", "resize"),
+    ])
+    def test_structural_dimensions_are_never_auto_applied(self, dim, action):
+        f = dr._finding("STORY-001", dim, "high", "x", action, source="llm")
+        assert not dr._remediable_findings([f])
+
+
+class TestNfrCriteriaAreNeverRewritten:
+    """ADR-0004 owns `[NFR:...]` text and fans identical copies across every
+    story a policy constrains. Rewriting one copy desynchronises the rest
+    and breaks the single-ownership the tag exists to express."""
+
+    def test_tagged_criterion_is_excluded(self):
+        assert not dr._ac_is_remediable(
+            "[NFR:NFR-002] Input is validated before persistence"
+        )
+
+    def test_untagged_criterion_is_included(self):
+        assert dr._ac_is_remediable("POST /api/birthdays returns 201")
+
+    def test_tag_must_be_a_prefix_not_a_mention(self):
+        """A criterion that merely mentions NFR-002 in passing is ordinary
+        text and stays remediable."""
+        assert dr._ac_is_remediable("Latency meets the NFR-002 budget")
+
+
+@pytest.mark.asyncio
+class TestRemediationWritePath:
+
+    def _db(self, tmp_path):
+        """A real story DB with one story and two ACs, one NFR-tagged."""
+        from harness import story_state
+        ws = str(tmp_path)
+        app = story_state.app_name_for_workspace(ws)
+        conn = story_state.open_story_db(workspace_path=ws)
+        story_state.ensure_feature(conn, app, "core", name="Core",
+                                   description="d")
+        keys = story_state.create_stories(conn, app, [{
+            "title": "View upcoming birthdays", "feature": "core",
+            "acceptance_criteria": [
+                "Dashboard handles no upcoming birthdays",
+                "[NFR:NFR-002] Input is validated before persistence",
+            ],
+            "depends_on": [], "scope_files": [],
+        }])
+        return ws, app, conn, keys[0]
+
+    async def test_rewrites_text_and_preserves_row_id(self, tmp_path):
+        """The whole safety argument: `test_verifies_ac` edges point at
+        `acceptance_criteria.id`, so the row id MUST survive the rewrite."""
+        from harness import story_state
+        ws, app, conn, skey = self._db(tmp_path)
+        story = next(
+            s for s in story_state.list_stories(conn, app)
+            if s["story_key"] == skey
+        )
+        before = story_state.list_acceptance_criteria(conn, app, int(story["id"]))
+        target = next(a for a in before if not a["text"].startswith("[NFR:"))
+        payload = json.dumps([{
+            "ac_key": target["ac_key"],
+            "text": "GET /api/birthdays/upcoming returns 200 with an empty list",
+        }])
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway(payload), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 1
+        after = story_state.list_acceptance_criteria(conn, app, int(story["id"]))
+        rewritten = next(a for a in after if a["ac_key"] == target["ac_key"])
+        assert rewritten["text"].startswith("GET /api/birthdays/upcoming")
+        assert rewritten["id"] == target["id"]          # edges survive
+        assert rewritten["ordinal"] == target["ordinal"]
+        assert len(after) == len(before)                # coverage unchanged
+        conn.close()
+
+    async def test_nfr_criterion_is_left_alone(self, tmp_path):
+        from harness import story_state
+        ws, app, conn, skey = self._db(tmp_path)
+        story = next(
+            s for s in story_state.list_stories(conn, app)
+            if s["story_key"] == skey
+        )
+        nfr = next(
+            a for a in story_state.list_acceptance_criteria(
+                conn, app, int(story["id"]))
+            if a["text"].startswith("[NFR:")
+        )
+        # Even if the model tries, the key was never offered to it and the
+        # write path re-checks.
+        payload = json.dumps([{"ac_key": nfr["ac_key"], "text": "rewritten"}])
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway(payload), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        after = next(
+            a for a in story_state.list_acceptance_criteria(
+                conn, app, int(story["id"]))
+            if a["ac_key"] == nfr["ac_key"]
+        )
+        assert after["text"].startswith("[NFR:NFR-002]")
+        conn.close()
+
+    async def test_a_rewrite_may_not_forge_an_nfr_tag(self, tmp_path):
+        """A model that prefixes `[NFR:...]` onto a plain criterion would
+        forge ADR-0004 ownership the embedder never granted."""
+        from harness import story_state
+        ws, app, conn, skey = self._db(tmp_path)
+        story = next(
+            s for s in story_state.list_stories(conn, app)
+            if s["story_key"] == skey
+        )
+        target = next(
+            a for a in story_state.list_acceptance_criteria(
+                conn, app, int(story["id"]))
+            if not a["text"].startswith("[NFR:")
+        )
+        payload = json.dumps([{
+            "ac_key": target["ac_key"], "text": "[NFR:NFR-009] forged",
+        }])
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway(payload), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 0
+        conn.close()
+
+    async def test_no_findings_means_no_dispatch(self, tmp_path):
+        ws, app, conn, skey = self._db(tmp_path)
+        gw = _FakeGateway("[]")
+        n, budget = await dr.remediate_acceptance_criteria(
+            gw, conn, app, [{"story_key": skey}], [], 1.0,
+        )
+        assert (n, budget) == (0, 1.0)
+        conn.close()
+
+    async def test_non_json_response_leaves_criteria_untouched(self, tmp_path):
+        from harness import story_state
+        ws, app, conn, skey = self._db(tmp_path)
+        story = next(
+            s for s in story_state.list_stories(conn, app)
+            if s["story_key"] == skey
+        )
+        before = story_state.list_acceptance_criteria(conn, app, int(story["id"]))
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway("I think these look fine actually"), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 0
+        after = story_state.list_acceptance_criteria(conn, app, int(story["id"]))
+        assert [a["text"] for a in after] == [a["text"] for a in before]
+        conn.close()
+
+    async def test_dispatch_failure_is_fail_open(self, tmp_path):
+        ws, app, conn, skey = self._db(tmp_path)
+        gw = _FakeGateway("", raise_exc=RuntimeError("upstream 503"))
+        n, budget = await dr.remediate_acceptance_criteria(
+            gw, conn, app, [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 0 and budget == 1.0
+        conn.close()
+
+    async def test_unchanged_text_is_not_counted_as_a_rewrite(self, tmp_path):
+        """The prompt tells the model to return the original when it cannot
+        improve a criterion. That is a no-op, not a fix."""
+        from harness import story_state
+        ws, app, conn, skey = self._db(tmp_path)
+        story = next(
+            s for s in story_state.list_stories(conn, app)
+            if s["story_key"] == skey
+        )
+        target = next(
+            a for a in story_state.list_acceptance_criteria(
+                conn, app, int(story["id"]))
+            if not a["text"].startswith("[NFR:")
+        )
+        payload = json.dumps([
+            {"ac_key": target["ac_key"], "text": target["text"]},
+        ])
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway(payload), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 0
+        conn.close()
+
+    async def test_unknown_ac_key_is_ignored(self, tmp_path):
+        ws, app, conn, skey = self._db(tmp_path)
+        payload = json.dumps([{"ac_key": "STORY-999.AC-1", "text": "x"}])
+        n, _ = await dr.remediate_acceptance_criteria(
+            _FakeGateway(payload), conn, app,
+            [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+        )
+        assert n == 0
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_remediation_preserves_a_real_verification_edge(tmp_path):
+    """The load-bearing safety claim, tested end to end rather than inferred.
+
+    `test_verifies_ac` rows point at `acceptance_criteria.id`. If a rewrite
+    deleted and recreated the row, the edge would cascade away and
+    `teane audit` — which gates CI — would start reporting untested ACs
+    that are in fact tested. Assert the edge itself survives, not just the
+    row id.
+    """
+    from harness import story_state
+    ws = str(tmp_path)
+    app = story_state.app_name_for_workspace(ws)
+    conn = story_state.open_story_db(workspace_path=ws)
+    story_state.ensure_feature(conn, app, "core", name="Core", description="d")
+    skey = story_state.create_stories(conn, app, [{
+        "title": "View upcoming birthdays", "feature": "core",
+        "acceptance_criteria": ["Dashboard handles no upcoming birthdays"],
+        "depends_on": [], "scope_files": [],
+    }])[0]
+    story = next(
+        s for s in story_state.list_stories(conn, app) if s["story_key"] == skey
+    )
+    ac = story_state.list_acceptance_criteria(conn, app, int(story["id"]))[0]
+
+    # A test verifies this criterion, exactly as test_generation would record.
+    assert story_state.link_test_to_ac(
+        conn, app, "server/tests/test_dashboard.py", int(ac["id"]),
+        test_function_name="test_empty_dashboard",
+    )
+    edges_before = conn.execute(
+        "SELECT COUNT(*) FROM test_verifies_ac WHERE ac_id = ?", (int(ac["id"]),)
+    ).fetchone()[0]
+    assert edges_before == 1
+
+    payload = json.dumps([{
+        "ac_key": ac["ac_key"],
+        "text": "GET /api/birthdays/upcoming returns 200 with an empty list",
+    }])
+    n, _ = await dr.remediate_acceptance_criteria(
+        _FakeGateway(payload), conn, app,
+        [{"story_key": skey}], [_finding_rewrite(skey)], 1.0,
+    )
+    assert n == 1
+
+    after = story_state.list_acceptance_criteria(conn, app, int(story["id"]))[0]
+    assert after["text"].startswith("GET /api/birthdays/upcoming")
+    # The edge still resolves, still points at the same criterion, and the
+    # criterion it names is the REWRITTEN one.
+    edges_after = conn.execute(
+        "SELECT test_path, test_function_name FROM test_verifies_ac "
+        "WHERE ac_id = ?", (int(after["id"]),)
+    ).fetchall()
+    assert len(edges_after) == 1
+    assert edges_after[0][0] == "server/tests/test_dashboard.py"
+    assert edges_after[0][1] == "test_empty_dashboard"
+    # And nothing was orphaned anywhere in the table.
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM test_verifies_ac t "
+        "LEFT JOIN acceptance_criteria a ON a.id = t.ac_id "
+        "WHERE a.id IS NULL"
+    ).fetchone()[0]
+    assert orphans == 0
+    conn.close()

@@ -327,6 +327,234 @@ async def review_decomposition_quality(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — bounded AC remediation (ADR-0007)
+# ---------------------------------------------------------------------------
+#
+# ``quality_enforce`` is binary: findings are either discarded entirely or
+# they kill the build with exit_code=1 and a "revise the spec by hand"
+# message. lumina-fresh-20260911-1107 produced 14 high-severity findings on
+# an ordinary spec, so enforcing would have bricked the run at
+# decomposition — strictly worse than ignoring them. The findings were
+# discarded instead, and the vague ACs they named went on to feed test
+# generation and acceptance-scenario generation.
+#
+# This is the middle path: one bounded LLM pass that rewrites ONLY the
+# acceptance-criterion text the reviewer flagged, in place.
+#
+# Safety contract — every clause here exists to avoid breaking something
+# that currently works:
+#
+#   * AC identity is (story_id, ac_key) and ``create_acceptance_criteria``
+#     UPSERTs on it, preserving the row id. Rewriting text through that
+#     path leaves every ``test_verifies_ac`` edge intact, so the
+#     traceability audit (`teane audit`, which gates CI) sees no change.
+#   * The AC COUNT per story never changes, and ordinals are preserved.
+#     Adding or dropping an AC would silently change coverage denominators.
+#   * ``[NFR:...]``-tagged criteria are never touched. ADR-0004 owns that
+#     text and fans identical copies across stories; rewriting one copy
+#     would break single-ownership and desynchronise the rest.
+#   * Only ``ac_quality`` findings with ``suggested_action == "rewrite_ac"``
+#     qualify. split / merge / resize / add_dependency are structural and
+#     are NOT auto-applied — those stay advisory.
+#   * Fail-open at every step. A malformed response, a budget refusal, a DB
+#     error, an unknown ac_key, an empty rewrite — all leave the original
+#     text exactly as it was.
+
+_REMEDIATION_PROMPT = """\
+You are tightening acceptance criteria that a quality review flagged as \
+not testable or ambiguous.
+
+For each item below, rewrite ONLY the criterion text so it names a \
+concrete, observable outcome — a status code, a rendered string, a stored \
+value, a specific error. Keep the original intent exactly; do not broaden \
+it, do not narrow it, and do not split one criterion into several.
+
+Rules:
+- Return the SAME number of items you were given, with the same ac_key values.
+- One sentence per criterion. No markdown, no numbering, no commentary.
+- If a criterion is already fine, or you cannot improve it without \
+inventing a requirement that is not implied, return its ORIGINAL text \
+unchanged.
+- Never invent a threshold, timeout, or numeric limit that the criterion \
+does not already imply. "Fast" becomes an observable outcome, not "under \
+200ms" unless 200ms was already stated.
+
+Return ONLY a JSON array (no prose, no code fence):
+[{"ac_key": "<unchanged>", "text": "<rewritten criterion>"}]
+"""
+
+
+def _remediable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The subset this pass will act on: high-severity AC-quality findings
+    whose recommended action is a rewrite.
+
+    Structural recommendations (split / merge / resize / add_dependency)
+    are deliberately excluded — acting on those would reshape the
+    decomposition, which is the operator's call and would invalidate the
+    story keys downstream nodes have already committed to.
+    """
+    return [
+        f for f in findings
+        if f.get("dimension") == "ac_quality"
+        and f.get("severity") == "high"
+        and f.get("suggested_action") == "rewrite_ac"
+    ]
+
+
+def _ac_is_remediable(text: str) -> bool:
+    """``[NFR:...]``-tagged criteria are owned by the ADR-0004 embedder,
+    which fans identical copies across every story a policy constrains.
+    Rewriting one copy desynchronises the rest and breaks the
+    single-ownership the tag exists to express."""
+    return not _NFR_TAG_RE.match(text.strip())
+
+
+async def remediate_acceptance_criteria(
+    gateway: Any,
+    conn: Any,
+    workspace: str,
+    stories: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+    budget: float,
+) -> tuple[int, float]:
+    """Rewrite flagged acceptance criteria in place. Returns (count, budget).
+
+    Fail-open: returns ``(0, budget)`` unchanged on any problem.
+    """
+    from harness import story_state
+
+    targets = _remediable_findings(findings)
+    if not targets:
+        return 0, budget
+    flagged_keys = {f.get("story_key") for f in targets}
+
+    # Build the work list from the DB, not from the finding text — the
+    # finding says WHICH story is weak, the DB says what its criteria
+    # actually are and which row each one is.
+    items: list[dict[str, Any]] = []
+    try:
+        db_stories = story_state.list_stories(conn, workspace)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[decomposition_review] remediation skipped — story read "
+            "failed: %s", exc,
+        )
+        return 0, budget
+    story_by_key = {s.get("story_key"): s for s in db_stories}
+    for skey in sorted(k for k in flagged_keys if k):
+        story = story_by_key.get(skey)
+        if not story:
+            continue
+        try:
+            acs = story_state.list_acceptance_criteria(
+                conn, workspace, int(story["id"]),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        for ac in acs:
+            text = str(ac.get("text") or "")
+            if not text or not _ac_is_remediable(text):
+                continue
+            items.append({
+                "ac_key": ac.get("ac_key"),
+                "text": text,
+                "story_id": int(story["id"]),
+                "ordinal": ac.get("ordinal"),
+                "story_key": skey,
+                "title": story.get("title") or "",
+            })
+    if not items:
+        return 0, budget
+
+    payload = json.dumps(
+        [
+            {"ac_key": i["ac_key"], "story": i["title"], "text": i["text"]}
+            for i in items
+        ],
+        indent=1,
+    )
+    from harness.decomposition import strip_json_fence
+    from harness.gateway import NodeRole
+    try:
+        response, budget = await gateway.dispatch(
+            messages=[
+                {"role": "system", "content": _REMEDIATION_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            role=NodeRole.DECOMPOSITION_REVIEWER,
+            budget_remaining_usd=budget,
+            cache_family="decomposition_reviewer:ac_remediation",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[decomposition_review] remediation dispatch failed: %s; "
+            "criteria left unchanged.", exc,
+        )
+        return 0, budget
+
+    raw = strip_json_fence(str(getattr(response, "content", "") or ""))
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[decomposition_review] remediation response was not JSON; "
+            "criteria left unchanged.",
+        )
+        return 0, budget
+    if not isinstance(data, list):
+        return 0, budget
+
+    by_key = {i["ac_key"]: i for i in items}
+    rewritten = 0
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("ac_key") or "").strip()
+        new_text = str(entry.get("text") or "").strip()
+        item = by_key.get(key)
+        if item is None or not new_text:
+            continue
+        if new_text == item["text"]:
+            continue  # model judged it already fine
+        if not _ac_is_remediable(new_text):
+            # Never let a rewrite introduce an NFR tag — that would forge
+            # ADR-0004 ownership onto a criterion the embedder did not
+            # place.
+            continue
+        try:
+            # Same ac_key, same ordinal → UPSERT preserves the row id, so
+            # every test_verifies_ac edge pointing at it survives.
+            story_state.create_acceptance_criteria(
+                conn, workspace, item["story_id"],
+                [{
+                    "ac_key": key,
+                    "text": new_text,
+                    "ordinal": item["ordinal"],
+                }],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[decomposition_review] remediation write failed for %s: "
+                "%s; leaving original.", key, exc,
+            )
+            continue
+        logger.info(
+            "[decomposition_review] AC %s rewritten:\n    was: %s\n    now: %s",
+            key, item["text"], new_text,
+        )
+        rewritten += 1
+
+    if rewritten:
+        logger.warning(
+            "[decomposition_review] Remediated %d acceptance criterion(s) "
+            "in place across %d flagged story(ies). Row ids and ordinals "
+            "preserved — traceability edges are intact.",
+            rewritten, len(flagged_keys),
+        )
+    return rewritten, budget
+
+
+# ---------------------------------------------------------------------------
 # Report + node
 # ---------------------------------------------------------------------------
 
@@ -373,6 +601,13 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
         return out
 
     enforce = bool(cfg.get("quality_enforce", False))
+    # Phase-2 auto-remediation (ADR-0007). Independent of ``quality_enforce``
+    # — that flag is binary (discard everything, or fail the build), and on
+    # an ordinary spec the reviewer emits enough high-severity findings that
+    # enforcing is unusable. Remediation is the middle path and is safe to
+    # leave on: it rewrites flagged criterion TEXT in place, preserving row
+    # ids, ordinals and AC counts, so traceability is untouched.
+    remediate = bool(cfg.get("quality_remediate", True))
     max_stories = int(cfg.get("max_stories_per_review", 60))
     workspace_path = state.get("workspace_path") or os.getcwd()
 
@@ -405,6 +640,36 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
     out["budget_remaining_usd"] = budget
     node_state["decomposition_quality_findings"] = findings
 
+    # Phase 2 — bounded AC remediation. Runs BEFORE the enforce gate so a
+    # finding the harness just fixed cannot also fail the build; ``high``
+    # is recomputed from ``remaining`` below for exactly that reason.
+    remediated = 0
+    if remediate and gateway is not None:
+        try:
+            conn = story_state.open_story_db(workspace_path=workspace_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[decomposition_review] remediation skipped — DB "
+                "unavailable: %s", exc,
+            )
+        else:
+            try:
+                remediated, budget = await remediate_acceptance_criteria(
+                    gateway, conn, app, stories, findings, budget,
+                )
+                out["budget_remaining_usd"] = budget
+            except Exception as exc:  # noqa: BLE001 — never break the build
+                logger.warning(
+                    "[decomposition_review] remediation raised (%s); "
+                    "criteria left unchanged.", exc,
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    node_state["decomposition_acs_remediated"] = remediated
+
     try:
         doc_path = os.path.join(workspace_path, "docs", "DECOMPOSITION_REVIEW.md")
         os.makedirs(os.path.dirname(doc_path), exist_ok=True)
@@ -429,7 +694,23 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
                     "findings.", len(stories))
         return out
 
-    high = [f for f in findings if f["severity"] == "high"]
+    # A finding whose criterion the harness just rewrote is no longer a
+    # reason to stop the build. Without this, remediation and enforcement
+    # would contradict each other: the harness fixes the AC and then fails
+    # the run for the AC it fixed.
+    if remediated:
+        _fixed_stories = {f.get("story_key") for f in _remediable_findings(findings)}
+        remaining = [
+            f for f in findings
+            if not (
+                f.get("dimension") == "ac_quality"
+                and f.get("suggested_action") == "rewrite_ac"
+                and f.get("story_key") in _fixed_stories
+            )
+        ]
+    else:
+        remaining = findings
+    high = [f for f in remaining if f["severity"] == "high"]
     logger.warning("[decomposition_review] %d quality finding(s) across %d stories "
                    "(%d high, enforce=%s):", len(findings), len(stories),
                    len(high), enforce)

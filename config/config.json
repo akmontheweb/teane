@@ -399,6 +399,7 @@
     "decomposition": {
         "quality_review": true,
         "quality_enforce": false,
+        "quality_remediate": true,
         "max_stories_per_review": 60
     },
     "traceability": {

@@ -859,6 +859,60 @@ def _embed_constraint_nfrs(
     return new_keys, new_cleaned
 
 
+# Shortest token that may act as a prefix. Three is the floor because the
+# shortest real stem we need is ``nav`` (from ``NavBar.tsx``, matching a
+# story whose ACs say "navigation"), and two-character tokens are already
+# discarded by both tokenizers.
+#
+# Three is safe here only because ``_SCOPE_GENERIC_TOKENS`` has already
+# removed the short structural words that would collide — ``api``, ``web``,
+# ``app``, ``src``, ``lib`` and 80-odd others never reach this function. If
+# that filter is ever narrowed, revisit this constant: ``api`` prefixing
+# ``apiary`` is exactly the kind of false match it currently prevents.
+_MIN_PREFIX_MATCH_LEN = 3
+
+
+def _domain_tokens_match(path_tokens: set[str], ctx: set[str]) -> bool:
+    """True when a scope-file path shares a domain word with the story.
+
+    Exact intersection first — that is the common case and is free.
+
+    Failing that, prefix matching in either direction. The tokenizers on
+    both sides already split camelCase symmetrically, so what is left is
+    pure morphology: the same word in a different form. Real drops from
+    lumina-fresh-20260911-1107, both of them files that genuinely belonged
+    to the story they were stripped from:
+
+        ConfirmDialog.tsx  ->  {confirm, dialog}
+        …dropped from the DELETE-CONFIRMATION story, whose ACs say
+        "confirmation". ``confirm`` is a prefix of ``confirmation``.
+
+        NavBar.tsx         ->  {nav, bar}
+        …dropped from a story whose ACs say "navigation". ``nav`` is a
+        prefix of ``navigation``.
+
+    The SHORTER token must clear ``_MIN_PREFIX_MATCH_LEN``, so a stem like
+    ``nav`` still matches while shorter noise cannot sneak back in.
+
+    Deliberately NOT a stemmer. A real stemmer (Porter, snowball) would
+    also collapse unrelated pairs and would put a dependency behind a
+    guard whose whole purpose is to be conservative. Prefix matching
+    catches the observed failures and nothing else.
+    """
+    if path_tokens & ctx:
+        return True
+    for p_tok in path_tokens:
+        for c_tok in ctx:
+            shorter, longer = (
+                (p_tok, c_tok) if len(p_tok) <= len(c_tok) else (c_tok, p_tok)
+            )
+            if len(shorter) < _MIN_PREFIX_MATCH_LEN:
+                continue
+            if longer.startswith(shorter):
+                return True
+    return False
+
+
 def _drop_cross_domain_scope_files(
     story_key: str,
     scope: list[str],
@@ -909,7 +963,7 @@ def _drop_cross_domain_scope_files(
     kept: list[str] = []
     for entry in scope:
         path_tokens = _scope_path_tokens(entry)
-        if not path_tokens or (path_tokens & ctx):
+        if not path_tokens or _domain_tokens_match(path_tokens, ctx):
             kept.append(entry)
             continue
         logger.warning(

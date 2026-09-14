@@ -456,6 +456,60 @@ class TestCrossDomainScopeGuard:
         ]
         assert any("forecast.py" in r.getMessage() for r in warned)
 
+    def test_morphological_variant_is_kept(self, caplog):
+        """lumina-fresh-20260911-1107: ConfirmDialog.tsx was dropped from
+        the DELETE-CONFIRMATION story because the path tokenizes to
+        ``confirm`` while the ACs say ``confirmation``. Same word, and the
+        file genuinely belongs to the story the guard stripped it from."""
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-005",
+            "title": "Delete a birthday record",
+            "acceptance_criteria": [
+                "Clicking delete opens a confirmation modal",
+                "Confirming permanently removes the record",
+            ],
+            "scope_files": ["client/src/components/ConfirmDialog.tsx"],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == [
+            "client/src/components/ConfirmDialog.tsx",
+        ]
+        assert not [
+            r for r in caplog.records if "cross-domain drop" in r.getMessage()
+        ]
+
+    def test_nav_matches_navigation(self, caplog):
+        """The other live drop from the same session: NavBar.tsx -> ``nav``
+        against ACs saying ``navigation``. Three characters is the floor,
+        and this is the case that sets it."""
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-003",
+            "title": "Directory listing",
+            "acceptance_criteria": [
+                "Top navigation links to the directory",
+            ],
+            "scope_files": ["client/src/components/NavBar.tsx"],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == ["client/src/components/NavBar.tsx"]
+
+    def test_prefix_matching_does_not_rescue_unrelated_files(self, caplog):
+        """The finsearch B2 guard must still bite — prefix matching widens
+        the keep set, it does not disable it."""
+        payload = _payload_with_one_feature([{
+            "story_key": "STORY-001",
+            "title": "Source Traceability",
+            "acceptance_criteria": [
+                "Chart footnotes cite the source filing",
+            ],
+            "scope_files": ["server/services/forecast.py"],
+        }])
+        caplog.set_level("WARNING", logger="harness.decomposition")
+        _, stories = decomposition._validate_stories_payload(payload)
+        assert stories[0]["scope_files"] == []
+
     def test_nfr_story_scope_is_exempt(self, caplog):
         # lumina 019fa046: STORY-NFR-004 (input sanitization) legitimately
         # scopes domain-named modules whose paths share no token with the

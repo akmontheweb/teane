@@ -11721,6 +11721,8 @@ def _build_repair_reflection_prompt(
     build_output_tail: str = "",
     judge_disagreement_history: Optional[list[dict[str, Any]]] = None,
     judge_ignored_streak: int = 0,
+    judge_target_noop_streak: int = 0,
+    judge_target_noop_files: Optional[list[str]] = None,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
     workspace_path: str = "",
 ) -> str:
@@ -12033,6 +12035,38 @@ def _build_repair_reflection_prompt(
     # indefinitely against a plausible upstream fix (finsearch STORY-038
     # loop: 3 rounds of edgar_client.py patches while judge named the test
     # file, ended in HITL).
+    # A no-op ON the judge's own target is the strongest evidence the
+    # harness can collect AGAINST the judge's hypothesis. The repair LLM
+    # went to the named file and reported that nothing there needs to
+    # change — an identity REPLACE_BLOCK is an assertion, not a shrug.
+    # Every other signal in this prompt assumes the judge is right and asks
+    # the LLM to comply harder; this is the one that pushes back.
+    #
+    # lumina-fresh-20260911-1107: the judge named birthday_service.py for
+    # 13 rounds. list_upcoming() was correct throughout. The real defect
+    # was a test posting future-dated births its own validator rejects, so
+    # every round spent on that file was wasted and the build died on the
+    # HITL cap.
+    noop_on_target_block = ""
+    if judge_target_noop_streak >= 2 and judge_target_noop_files:
+        noop_on_target_block = (
+            "\nYOUR NAMED FILE WAS EXAMINED AND FOUND UNCHANGED — read "
+            "carefully:\n"
+            f"For {judge_target_noop_streak} round(s) the repair LLM DID go "
+            f"to the file(s) you named ({sorted(judge_target_noop_files)}) "
+            "and emitted a patch whose content was identical to what is "
+            "already on disk. It is not avoiding your target; it is "
+            "telling you that target is already correct.\n"
+            "Treat this as evidence against your current hypothesis. "
+            "Before naming the same file again, consider: is the defect "
+            "actually in a CALLER, in the WIRING that constructs this "
+            "module, or in the TEST'S OWN SETUP (fixture data that the "
+            "production code legitimately rejects, an assertion that "
+            "encodes the wrong contract)? If the failing test cannot be "
+            "satisfied by ANY production change, say so plainly in "
+            "``real_blocker`` rather than naming a production file again.\n"
+        )
+
     disagreement_block = ""
     if (
         judge_ignored_streak >= 2
@@ -12273,6 +12307,7 @@ def _build_repair_reflection_prompt(
         f"{tail_block}"
         f"{source_evidence_block}"
         f"{prior_verdict_block}"
+        f"{noop_on_target_block}"
         f"{disagreement_block}"
         f"{path_wiring_hint_block}"
         f"{install_hint_block}"
@@ -13791,10 +13826,22 @@ def _patches_touched_judge_files(
             if not success or no_op:
                 continue
         else:
-            # Attempt-mode: count both successes (non-no-op) and failures.
-            # Skip only no-ops since those neither succeeded nor were tried.
-            if no_op:
-                continue
+            # Attempt-mode counts no-ops too. A no-op on a judge-named file
+            # is not absence of effort — it is the model looking at the
+            # judge's target and reporting that nothing there needs to
+            # change. An identity REPLACE_BLOCK returns
+            # ``success=False, no_op=True`` (patcher.py ~1644), so the old
+            # ``if no_op: continue`` scored that as IGNORING the judge and
+            # escalated the banner to push harder at the same file.
+            #
+            # lumina-fresh-20260911-1107: forced onto
+            # ``birthday_service.py`` by Fix G, the model emitted
+            # search == replace four rounds running because
+            # ``list_upcoming()`` was in fact correct — the real defect was
+            # a test posting future-dated births. Every one of those
+            # rounds incremented judge_ignored_streak. The model was right
+            # and was penalised for saying so.
+            pass
         f = str(getattr(r, "file", "") or "")
         if not f:
             continue
@@ -16393,6 +16440,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 ),
                 judge_disagreement_history=_judge_disagreement_history,
                 judge_ignored_streak=_judge_ignored_streak,
+                judge_target_noop_streak=int(
+                    loop_counter.get("judge_target_noop_streak", 0) or 0
+                ),
+                judge_target_noop_files=[
+                    f for f in (
+                        loop_counter.get("judge_target_noop_files") or []
+                    ) if isinstance(f, str) and f
+                ],
                 prior_reflection_verdict=_prior_reflection,
                 workspace_path=state.get("workspace_path") or "",
             )
@@ -19619,6 +19674,44 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                         patch_results, _judge_named_now, include_attempts=True,
                     )
                 )
+                # Inverse signal: did the LLM land a deliberate NO-OP on a
+                # file the judge named? That is the model asserting the
+                # judge's target is already correct, and it is the only
+                # evidence the harness gathers AGAINST the judge. Tracked
+                # separately from the ignored-streak so the reflection
+                # prompt can push back instead of escalating compliance.
+                _noop_on_judge_target = sorted({
+                    str(getattr(r, "file", "") or "")
+                    for r in patch_results
+                    if getattr(r, "no_op", False)
+                    and str(getattr(r, "file", "") or "")
+                    and _patches_touched_judge_files(
+                        [r], _judge_named_now, include_attempts=True,
+                    )
+                })
+                _any_real_this_round = any(
+                    getattr(r, "success", False)
+                    and not getattr(r, "no_op", False)
+                    for r in patch_results
+                )
+                if _noop_on_judge_target and not _any_real_this_round:
+                    loop_counter["judge_target_noop_streak"] = int(
+                        loop_counter.get("judge_target_noop_streak", 0) or 0
+                    ) + 1
+                    loop_counter["judge_target_noop_files"] = (
+                        _noop_on_judge_target
+                    )
+                    logger.warning(
+                        "[repair_node] No-op on the judge's own target %s "
+                        "(streak=%d). The repair LLM says that file is "
+                        "already correct — next reflection prompt will ask "
+                        "the judge to reconsider rather than re-name it.",
+                        _noop_on_judge_target,
+                        loop_counter["judge_target_noop_streak"],
+                    )
+                elif _any_real_this_round:
+                    loop_counter["judge_target_noop_streak"] = 0
+                    loop_counter["judge_target_noop_files"] = []
                 if not _attempted_judge_files:
                     loop_counter["judge_ignored_last_round"] = True
                     loop_counter["judge_named_files_last_round"] = _judge_named_now

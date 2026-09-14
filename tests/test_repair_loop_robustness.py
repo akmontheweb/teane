@@ -580,12 +580,38 @@ def test_patches_touched_judge_files_include_attempts_counts_failures():
     ) is True
 
 
-def test_patches_touched_judge_files_no_ops_excluded_in_attempt_mode():
-    """no-op results are neither successes nor failed attempts; they
-    must not count as touched even in include_attempts mode."""
+def test_patches_touched_judge_files_counts_no_ops_in_attempt_mode():
+    """A no-op on a judge-named file IS engagement with the target.
+
+    Reversed 2026-09-14. The previous contract ("neither successes nor
+    failed attempts") conflated "no change resulted" with "no attempt
+    made", and the difference matters: an identity REPLACE_BLOCK returns
+    ``success=False, no_op=True`` and means the model looked at the
+    judge's file and found nothing to change.
+
+    lumina-fresh-20260911-1107: forced onto ``birthday_service.py`` by the
+    Fix G MUST-MODIFY promotion, the model emitted search == replace four
+    rounds running because ``list_upcoming()`` was in fact correct — the
+    real defect was a test posting future-dated births that the app's own
+    validator rejects. Each of those rounds incremented
+    ``judge_ignored_streak`` and escalated the banner to push harder at
+    the same correct file. The model was right and was penalised for it.
+    """
+    for success in (True, False):
+        results = [
+            _StubResult("client/src/App.tsx", success=success, no_op=True),
+        ]
+        assert _patches_touched_judge_files(
+            results, ["src/App.tsx"], include_attempts=True,
+        ) is True
+
+
+def test_patches_touched_judge_files_still_excludes_no_ops_by_default():
+    """Default mode is progress accounting, not engagement accounting —
+    a no-op changed nothing and must not read as a landed patch."""
     results = [_StubResult("client/src/App.tsx", success=True, no_op=True)]
     assert _patches_touched_judge_files(
-        results, ["src/App.tsx"], include_attempts=True,
+        results, ["src/App.tsx"],
     ) is False
 
 

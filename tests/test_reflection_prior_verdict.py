@@ -262,3 +262,81 @@ class TestPromptCacheLayout:
         # Stable instruction blocks come first; volatile counts live inside
         # the trailing EVIDENCE section.
         assert intro < grounding < evidence < counts
+
+
+# ---------------------------------------------------------------------------
+# No-op on the judge's own target — the one signal that pushes BACK.
+#
+# Every other block in this prompt assumes the judge is right and asks the
+# repair LLM to comply harder. This one is the inverse: the LLM went to the
+# judge's named file and emitted content identical to what is on disk. An
+# identity REPLACE_BLOCK is an assertion, not a shrug.
+#
+# lumina-fresh-20260911-1107: the judge named birthday_service.py for 13
+# rounds. list_upcoming() was correct the whole time — the real defect was
+# server/tests/test_birthdays_api.py:36 posting future-dated births that
+# validate_date_not_future rejects with 422, so no production change could
+# satisfy the assertion. Forced onto that file by the Fix G MUST-MODIFY
+# promotion, the model emitted search == replace four rounds running and was
+# scored as ignoring the judge each time.
+# ---------------------------------------------------------------------------
+
+_NOOP_HEADER = "YOUR NAMED FILE WAS EXAMINED AND FOUND UNCHANGED"
+
+
+class TestNoopOnJudgeTargetBlock:
+
+    def test_absent_by_default(self) -> None:
+        assert _NOOP_HEADER not in _build_repair_reflection_prompt(
+            **_base_kwargs()
+        )
+
+    def test_absent_on_a_single_noop(self) -> None:
+        """One no-op is noise — a search miss, a stale view, a bad round.
+        Two on the same target is a claim."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            judge_target_noop_streak=1,
+            judge_target_noop_files=["server/app/services/birthday_service.py"],
+        )
+        assert _NOOP_HEADER not in prompt
+
+    def test_renders_at_two(self) -> None:
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            judge_target_noop_streak=2,
+            judge_target_noop_files=["server/app/services/birthday_service.py"],
+        )
+        assert _NOOP_HEADER in prompt
+        assert "birthday_service.py" in prompt
+
+    def test_names_the_alternatives_the_judge_should_consider(self) -> None:
+        """The block has to be actionable, not just contradictory — it
+        points at callers, wiring, and the test's own setup, which are the
+        three places the defect actually was across both lumina runs."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            judge_target_noop_streak=3,
+            judge_target_noop_files=["server/app/services/birthday_service.py"],
+        )
+        assert "CALLER" in prompt
+        assert "WIRING" in prompt
+        assert "TEST'S OWN SETUP" in prompt
+
+    def test_invites_declaring_the_test_unsatisfiable(self) -> None:
+        """The escape exists; the judge has to be told it may name it."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            judge_target_noop_streak=3,
+            judge_target_noop_files=["server/app/services/birthday_service.py"],
+        )
+        assert "cannot be satisfied by ANY production change" in prompt
+
+    def test_no_files_means_no_block(self) -> None:
+        """A streak with no filenames would render an empty accusation."""
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            judge_target_noop_streak=5,
+            judge_target_noop_files=[],
+        )
+        assert _NOOP_HEADER not in prompt

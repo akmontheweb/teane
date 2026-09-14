@@ -368,10 +368,52 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # Defensive: the router gates entry, but never trust that alone.
     if not rel:
-        logger.warning("[test_regeneration_node] No unsatisfiable_test in state; no-op.")
-        return {"loop_counter": loop_counter,
-                "node_state": {"current_node": "test_regeneration"}}
+        # A no-op here used to be silent and free, which made it unbounded.
+        # The router's per-test cap is keyed on ``test_regen_attempts[rel]``
+        # and only THIS node increments it — so a no-op (no ``rel``, nothing
+        # to count) left the cap permanently unreachable. The router then
+        # re-derived the same decision from the same diagnostics and sent us
+        # straight back: router -> regeneration(no-op) -> compiler, forever.
+        #
+        # lumina-verify-20260914-1151 ran 813 such cycles in ~68 minutes.
+        # Nothing stopped it: budget is the usual backstop for a stuck graph
+        # and the loop makes no LLM calls, so spend sat flat at $0.24 while
+        # the sandbox rebuilt 827 times.
+        #
+        # Count the no-ops on their own axis and surface a flag the router
+        # honours. This bounds ANY future path that reaches this node
+        # without seeding state — the specific caller that did so has been
+        # fixed, but the guard must not depend on that staying true.
+        noops = int(loop_counter.get("test_regen_noop_rounds", 0) or 0) + 1
+        loop_counter["test_regen_noop_rounds"] = noops
+        cap = int(cfg.get("max_noop_rounds", 3))
+        stuck = noops >= cap
+        logger.warning(
+            "[test_regeneration_node] No unsatisfiable_test in state; no-op "
+            "(%d/%d). The router sent us here without naming a test — %s",
+            noops, cap,
+            "escalating to HITL." if stuck else
+            "returning to the compiler.",
+        )
+        if stuck:
+            try:
+                from harness.observability import emit_event as _emit_stuck
+                _emit_stuck(
+                    "test_regen_noop_loop",
+                    rounds=noops,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+        return {
+            "loop_counter": loop_counter,
+            "node_state": {
+                "current_node": "test_regeneration",
+                "test_regen_stuck": stuck,
+            },
+        }
 
+    # A productive round clears the no-op streak.
+    loop_counter["test_regen_noop_rounds"] = 0
     _bump_attempt(loop_counter, rel)
 
     def _give_up(status: str, detail: str) -> dict[str, Any]:

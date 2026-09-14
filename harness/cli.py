@@ -1034,6 +1034,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
         "require_code_linkage", "coverage_nonregression",
+        # Cap on consecutive no-op entries (routed in with no test named)
+        # before the router escalates instead of looping.
+        "max_noop_rounds",
     }),
     # ADR-0006 — build-time acceptance-criterion verification. Phase 0 ships the
     # dual-altitude (integration + e2e) LLM scenario/seed generators; the graph
@@ -1464,6 +1467,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     # ADR-0001 test-author regeneration for unsatisfiable tests.
     "test_regeneration.enabled": (bool,),
     "test_regeneration.max_attempts_per_test": (int,),
+    "test_regeneration.max_noop_rounds": (int,),
     "test_regeneration.tier_b_auto": (bool,),
     "test_regeneration.require_code_linkage": (bool,),
     "test_regeneration.coverage_nonregression": (bool,),

@@ -21948,6 +21948,17 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
     if not cfg.get("enabled", False):
         return "human_intervention_node"
 
+    # The regeneration node reported it was sent here with no test named,
+    # repeatedly. Routing back would re-run the identical no-op — the loop
+    # that cost lumina-verify-20260914-1151 813 cycles. Hand it to a human
+    # with the diagnostics already gathered.
+    if state.get("node_state", {}).get("test_regen_stuck"):
+        logger.warning(
+            "[router] test_regeneration_node no-opped repeatedly (routed in "
+            "without a named test) — routing to HITL instead of looping.",
+        )
+        return "human_intervention_node"
+
     workspace = str(state.get("workspace_path", "") or "")
     attempts = (
         (state.get("loop_counter", {}) or {})
@@ -22228,9 +22239,24 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             )
         except Exception:  # noqa: BLE001
             pass
-        return _transition(  # type: ignore[arg-type]
-            route_after_unsatisfiable(state, _blocked_file)
-        )
+        _blocked_dest = route_after_unsatisfiable(state, _blocked_file)
+        if _blocked_dest == "test_regeneration_node":
+            # test_regeneration_node reads node_state["unsatisfiable_test"],
+            # which only repair_node sets — and only when the MODEL declared
+            # the dead end. This path reaches the same node from a router
+            # decision, so without seeding the key the node no-ops on
+            # arrival. It then never increments test_regen_attempts, the
+            # router's cap stays unreachable, and the graph ping-pongs
+            # router -> regeneration(no-op) -> compiler forever.
+            #
+            # lumina-verify-20260914-1151 ran 813 such cycles in ~68
+            # minutes. Budget is the usual backstop for a stuck graph and it
+            # never fired, because the loop makes no LLM calls at all —
+            # spend sat flat at $0.24 while the sandbox rebuilt 827 times.
+            _ns_blocked = state.setdefault("node_state", {})
+            _ns_blocked["unsatisfiable_test"] = _blocked_file
+            _ns_blocked["unsatisfiable_test_reason"] = _blocked_reason
+        return _transition(_blocked_dest)  # type: ignore[arg-type]
 
     # Pytest exit=5 (no tests collected) is not a build failure.
     #   * Source files exist → route to test_generation_node, which will

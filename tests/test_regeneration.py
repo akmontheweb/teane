@@ -468,3 +468,97 @@ class TestEmptyContentRetry:
             await regeneration_node(state)
         # A good first response must NOT trigger a second dispatch.
         assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# The 813-cycle loop (lumina-verify-20260914-1151).
+#
+# `d872f33` added a router path that sends a repair blocked on a test edit to
+# test_regeneration_node. It routes on `_blocked_file` but never seeds
+# `node_state["unsatisfiable_test"]`, which only repair_node writes and only
+# when the MODEL declared the dead end. The node therefore no-opped on
+# arrival, and because the router's per-test cap is keyed on
+# `test_regen_attempts[rel]` — incremented by this node and nowhere else — a
+# no-op left the cap permanently unreachable:
+#
+#   [router] Test test_errors.py declared unsatisfiable; tier_b_auto enabled
+#   [test_regeneration_node] No unsatisfiable_test in state; no-op.
+#   [compiler_node] Running build command in sandbox...
+#
+# 813 cycles, ~5s each, ~68 minutes. Nothing stopped it: budget is the usual
+# backstop for a stuck graph and this loop makes no LLM calls at all, so
+# spend sat flat at $0.24 while the sandbox rebuilt 827 times.
+# ---------------------------------------------------------------------------
+
+class TestNoopRoundsAreBounded:
+
+    def _state(self, loop_counter=None, cfg=None):
+        return {
+            "node_state": {},                     # nothing named — the bug
+            "workspace_path": "/tmp/nonexistent",
+            "loop_counter": loop_counter or {},
+            "test_regeneration_config": cfg or {"enabled": True},
+        }
+
+    @pytest.mark.asyncio
+    async def test_noop_increments_its_own_counter(self):
+        out = await regeneration_node(self._state())
+        assert out["loop_counter"]["test_regen_noop_rounds"] == 1
+        assert out["node_state"]["test_regen_stuck"] is False
+
+    @pytest.mark.asyncio
+    async def test_stuck_flag_raised_at_the_cap(self):
+        lc = {"test_regen_noop_rounds": 2}
+        out = await regeneration_node(self._state(loop_counter=lc))
+        assert out["loop_counter"]["test_regen_noop_rounds"] == 3
+        assert out["node_state"]["test_regen_stuck"] is True
+
+    @pytest.mark.asyncio
+    async def test_cap_is_configurable(self):
+        out = await regeneration_node(self._state(
+            cfg={"enabled": True, "max_noop_rounds": 1},
+        ))
+        assert out["node_state"]["test_regen_stuck"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_lumina_sequence_stops_at_three_not_eight_hundred(self):
+        """Replay the shape of the real loop and assert it terminates."""
+        lc: dict = {}
+        stuck_at = None
+        for cycle in range(1, 20):
+            out = await regeneration_node(self._state(loop_counter=lc))
+            lc = out["loop_counter"]
+            if out["node_state"]["test_regen_stuck"] and stuck_at is None:
+                stuck_at = cycle
+        assert stuck_at == 3
+
+
+class TestRouterHonoursTheStuckFlag:
+
+    def test_stuck_flag_routes_to_hitl(self):
+        from harness.graph import route_after_unsatisfiable
+        state = {
+            "node_state": {"test_regen_stuck": True},
+            "loop_counter": {},
+            "workspace_path": "/tmp/nonexistent",
+            "test_regeneration_config": {"enabled": True, "tier_b_auto": True},
+        }
+        assert route_after_unsatisfiable(
+            state, "tests/test_errors.py",
+        ) == "human_intervention_node"
+
+    def test_without_the_flag_the_ladder_is_unchanged(self, tmp_path):
+        """The guard must not short-circuit a healthy regeneration route."""
+        from harness.graph import route_after_unsatisfiable
+        rel = "tests/test_errors.py"
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_errors.py").write_text(
+            "def test_x():\n    assert True\n"
+        )
+        state = {
+            "node_state": {},
+            "loop_counter": {},
+            "workspace_path": str(tmp_path),
+            "test_regeneration_config": {"enabled": True, "tier_b_auto": True},
+        }
+        assert route_after_unsatisfiable(state, rel) == "test_regeneration_node"

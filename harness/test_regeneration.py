@@ -610,6 +610,39 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     applied = sum(1 for r in patch_results if getattr(r, "success", False))
+    if applied == 0:
+        # The attempt was consumed at dispatch time, but nothing was
+        # written — the escape accomplished nothing and, with
+        # ``max_attempts_per_test`` at 1, there is no second chance.
+        # lumina-run7-20260915-1410: the offer floor correctly took the
+        # escape on the model's behalf, regeneration ran, applied 0
+        # blocks, and the loop carried on with the identical failure.
+        #
+        # Refund the attempt ONCE per file so a failed dispatch is not
+        # counted as a fix attempt — the same distinction the zero-emit
+        # re-prompt draws in test_generation_node. Bounded: the reprieve
+        # is granted at most once, so a model that never emits still
+        # converges to HITL.
+        _reprieved = loop_counter.setdefault("test_regen_zero_block", {})
+        if isinstance(_reprieved, dict) and not _reprieved.get(rel):
+            _reprieved[rel] = 1
+            _att = dict(loop_counter.get(_REGEN_ATTEMPTS_KEY, {}) or {})
+            if int(_att.get(rel, 0)) > 0:
+                _att[rel] = int(_att[rel]) - 1
+                loop_counter[_REGEN_ATTEMPTS_KEY] = _att
+            logger.warning(
+                "[test_regeneration_node] %s regenerated with ZERO blocks "
+                "applied — nothing was written. Refunding the attempt once "
+                "so a failed dispatch does not spend the file's only "
+                "chance; a second zero-block round will not be refunded.",
+                rel,
+            )
+        else:
+            logger.warning(
+                "[test_regeneration_node] %s regenerated with ZERO blocks "
+                "applied again — no further reprieve; the attempt cap now "
+                "routes this to HITL.", rel,
+            )
     logger.warning(
         "[test_regeneration_node] Regenerated %s (attempt %d): %d block(s) "
         "applied, %d/%d public symbol(s) covered. Routing to compiler to "

@@ -562,3 +562,53 @@ class TestRouterHonoursTheStuckFlag:
             "test_regeneration_config": {"enabled": True, "tier_b_auto": True},
         }
         assert route_after_unsatisfiable(state, rel) == "test_regeneration_node"
+
+
+class TestZeroBlockRegenerationIsRefundedOnce:
+    """The attempt is consumed at dispatch time, before anything is
+    written. With `max_attempts_per_test` at 1, a regeneration that emits
+    nothing spends the file's only chance and the escape accomplishes
+    nothing.
+
+    lumina-run7-20260915-1410: the offer floor correctly took the escape on
+    the model's behalf, regeneration ran, applied 0 blocks, and the loop
+    carried on with the identical failure — with no second chance.
+    """
+
+    def _apply(self, lc, rel, applied):
+        """Mirror of the refund rule at the end of regeneration_node."""
+        if applied:
+            return lc
+        reprieved = lc.setdefault("test_regen_zero_block", {})
+        if not reprieved.get(rel):
+            reprieved[rel] = 1
+            att = dict(lc.get("test_regen_attempts", {}) or {})
+            if int(att.get(rel, 0)) > 0:
+                att[rel] = int(att[rel]) - 1
+                lc["test_regen_attempts"] = att
+        return lc
+
+    def test_first_zero_block_round_is_refunded(self):
+        lc = {"test_regen_attempts": {"t.py": 1}}
+        self._apply(lc, "t.py", applied=0)
+        assert lc["test_regen_attempts"]["t.py"] == 0
+
+    def test_second_zero_block_round_is_not(self):
+        """Bounded: a model that never emits still converges to HITL."""
+        lc = {"test_regen_attempts": {"t.py": 1}}
+        self._apply(lc, "t.py", applied=0)
+        lc["test_regen_attempts"]["t.py"] = 1
+        self._apply(lc, "t.py", applied=0)
+        assert lc["test_regen_attempts"]["t.py"] == 1
+
+    def test_a_productive_round_is_never_refunded(self):
+        lc = {"test_regen_attempts": {"t.py": 1}}
+        self._apply(lc, "t.py", applied=2)
+        assert lc["test_regen_attempts"]["t.py"] == 1
+        assert "t.py" not in lc.get("test_regen_zero_block", {})
+
+    def test_the_reprieve_is_per_file(self):
+        lc = {"test_regen_attempts": {"a.py": 1, "b.py": 1}}
+        self._apply(lc, "a.py", applied=0)
+        self._apply(lc, "b.py", applied=0)
+        assert lc["test_regen_attempts"] == {"a.py": 0, "b.py": 0}

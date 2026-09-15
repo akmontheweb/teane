@@ -179,7 +179,51 @@ Rejected alternative: walking imports transitively. Broader, exhausts the
 cap with breadth nobody asked for, and would still not prioritise the file
 that matters.
 
-### Proposed change 1 — scope the system prompt by round type
+### Change 2 — SHIPPED as `af47985`
+
+Judge-named paths go to the front of `files_for_preflight`, capped at 3,
+existence-checked and deduped against the diagnostics.
+
+### Change 1 — HELD, deliberately (2026-09-15)
+
+Two flaws surfaced while designing it, both of which argue against building
+it on present evidence.
+
+**Dropping the design system from repair is unsafe.** Repair touches
+frontend files — run 4 generated and repaired `Dashboard.tsx`. Removing the
+styling contract from repair prompts would let frontend rounds emit
+off-system components. The existing tag-based filter
+(`_detect_workspace_stack`) is already correct: it loads the web design
+system because the workspace genuinely has a React frontend. The waste is
+that it ships on a *backend round*, which is a per-round property.
+
+**Making the filter per-round destroys what it optimises.** A
+diagnostic-aware filter changes `messages[0]` whenever the diagnostic mix
+flips backend↔frontend, and `messages[0]` IS the ~46k cached prefix. That
+trades ~12k chars of context for repeated cache re-creation — the same
+thrash two commits this session were spent eliminating.
+
+The one cut that is both safe and role-stable is the test-authoring policy
+(`## Test Strategy`, coverage targets, coverage gate — 10,821 chars
+measured). Repair is architecturally forbidden to edit tests, so that
+guidance is dead weight in a repair prompt regardless of the round.
+
+| Section | Chars | Usable by repair? |
+|---|---|---|
+| Test Strategy + Coverage | 10,821 | No — repair cannot edit tests |
+| Design system | 12,753 | Sometimes — frontend rounds need it |
+| Patch syntax + rules | 15,251 | Essential |
+
+**Decision: hold entirely until a run says more.** The justification for
+trimming — that 67k tokens of largely irrelevant context degrades a
+165-token answer — is the one claim in this audit that is measured in
+volume but unproven in effect. Change 2 may have removed the actual
+starvation, in which case the context budget was never the problem.
+
+Revisit if a future run shows the model asking for files it was already
+given, or repair quality degrading as the spec grows.
+
+### Superseded sketch — scope the system prompt by round type
 
 `messages[0]` is assembled once in `cli.py` (requirements doc plus
 `SPEC_ARCHITECTURE.md`, appended at 8156) and shared by every role. It is

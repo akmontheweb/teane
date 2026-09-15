@@ -1123,3 +1123,44 @@ class TestJudgeNamedPathExtraction:
         assert _RE_WS_SOURCE_PATH.findall("at a/b/c.py:66 the call fails") == [
             "a/b/c.py",
         ]
+
+
+class TestRevertStreakSurvivesNoopRounds:
+    """A no-op round must HOLD the oscillation signal, not clear it.
+
+    lumina-run6-20260914-1230: config.py reverted on three consecutive
+    rounds (streak 1, 2, 3), then a no-op round on the judge's own target
+    reset it to zero — so the reflection prompt built next never carried
+    the cycling block, despite the loop still oscillating. "No revert this
+    round" is not the same as "the oscillation stopped": a no-op has
+    nothing to revert, and is itself evidence of being stuck.
+    """
+
+    class _R:
+        def __init__(self, success=True, no_op=False, file="a.py"):
+            self.success, self.no_op, self.file = success, no_op, file
+
+    def _reset_branch(self, patch_results, streak_before):
+        """Mirror of the reset rule in repair_node's revert block."""
+        lc = {"file_revert_streak": streak_before, "file_revert_files": ["a.py"]}
+        forward = any(r.success and not r.no_op for r in patch_results)
+        if forward:
+            lc["file_revert_streak"] = 0
+            lc["file_revert_files"] = []
+        return lc
+
+    def test_a_noop_round_holds_the_streak(self):
+        lc = self._reset_branch([self._R(success=False, no_op=True)], 3)
+        assert lc["file_revert_streak"] == 3
+
+    def test_a_round_with_no_patches_at_all_holds_the_streak(self):
+        assert self._reset_branch([], 3)["file_revert_streak"] == 3
+
+    def test_genuine_forward_progress_clears_it(self):
+        lc = self._reset_branch([self._R(success=True, no_op=False)], 3)
+        assert lc["file_revert_streak"] == 0
+        assert lc["file_revert_files"] == []
+
+    def test_an_idempotency_noop_alongside_nothing_else_holds(self):
+        lc = self._reset_branch([self._R(success=True, no_op=True)], 2)
+        assert lc["file_revert_streak"] == 2

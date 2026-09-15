@@ -19915,8 +19915,26 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 except Exception:  # noqa: BLE001 — telemetry must not block
                     pass
             else:
-                loop_counter["file_revert_streak"] = 0
-                loop_counter["file_revert_files"] = []
+                # Reset ONLY on genuine forward progress. "No revert this
+                # round" is not the same as "the oscillation stopped": a
+                # no-op round has nothing to revert, and clearing the
+                # counter there erases the evidence.
+                #
+                # lumina-run6-20260914-1230 showed exactly that. config.py
+                # reverted on three consecutive rounds (streak 1, 2, 3),
+                # then a no-op round on the judge's own target reset it to
+                # zero — so the reflection prompt built next never carried
+                # the cycling block, despite the loop still oscillating.
+                # A no-op is itself evidence of being stuck; it must HOLD
+                # the signal, not clear it.
+                _forward_progress = any(
+                    getattr(r, "success", False)
+                    and not getattr(r, "no_op", False)
+                    for r in patch_results
+                )
+                if _forward_progress:
+                    loop_counter["file_revert_streak"] = 0
+                    loop_counter["file_revert_files"] = []
         # Merge test-tamper rejections AND anti-drift screen rejections so
         # the LLM sees both in the next round's status message alongside the
         # patcher's own results. Order: tamper first (the strongest steer —

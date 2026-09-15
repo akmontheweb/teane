@@ -20267,7 +20267,22 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                         _noop_on_judge_target,
                         loop_counter["judge_target_noop_streak"],
                     )
-                elif _any_real_this_round:
+                elif _any_real_this_round and not loop_counter.get(
+                    "file_revert_streak",
+                ):
+                    # Mirrors the revert-streak rule: reset only on genuine
+                    # forward progress. A round whose "real patch" was
+                    # itself a REVERT is not progress — it is the
+                    # oscillation — and clearing the no-op signal there
+                    # loses the second half of the picture.
+                    #
+                    # lumina-run6-20260914-1230 showed both counters
+                    # erasing each other: a no-op round cleared the revert
+                    # streak, and a revert round cleared the no-op streak,
+                    # so neither ever reached the 2 it needs to render
+                    # while the loop visibly cycled on config.py and
+                    # birthdays.py. Two guards for the same underlying
+                    # condition must not cancel out.
                     loop_counter["judge_target_noop_streak"] = 0
                     loop_counter["judge_target_noop_files"] = []
                 if not _attempted_judge_files:

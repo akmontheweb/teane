@@ -67,7 +67,17 @@ def _gather_stories(conn: Any, workspace: str) -> list[dict[str, Any]]:
 
 
 def _finding(story_key: str, dimension: str, severity: str, problem: str,
-             suggested_action: str, *, source: str) -> dict[str, Any]:
+             suggested_action: str, *, source: str,
+             remediable: bool = True) -> dict[str, Any]:
+    """``remediable=False`` marks a finding the Phase-2 pass must not act
+    on even though its ``suggested_action`` says otherwise.
+
+    ``_VALID_ACTIONS`` has no "create" member, so the zero-AC check has to
+    report ``rewrite_ac`` while its actual remedy is to WRITE criteria that
+    do not exist. Remediation then selects it and finds nothing to rewrite,
+    dispatching an LLM call that can only no-op. The outcome is correct but
+    accidental; this makes the exclusion explicit.
+    """
     return {
         "story_key": story_key,
         "dimension": dimension,
@@ -75,6 +85,7 @@ def _finding(story_key: str, dimension: str, severity: str, problem: str,
         "problem": problem,
         "suggested_action": suggested_action,
         "source": source,
+        "remediable": remediable,
     }
 
 
@@ -144,7 +155,7 @@ def deterministic_findings(stories: list[dict[str, Any]]) -> list[dict[str, Any]
             findings.append(_finding(
                 s["story_key"], "ac_quality", "high",
                 "story has no acceptance criteria — nothing to test or verify",
-                "rewrite_ac", source="deterministic"))
+                "rewrite_ac", source="deterministic", remediable=False))
         elif any(not str(a).strip() for a in acs):
             findings.append(_finding(
                 s["story_key"], "ac_quality", "medium",
@@ -398,6 +409,7 @@ def _remediable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]
         if f.get("dimension") == "ac_quality"
         and f.get("severity") == "high"
         and f.get("suggested_action") == "rewrite_ac"
+        and f.get("remediable", True)
     ]
 
 

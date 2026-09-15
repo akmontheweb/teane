@@ -572,3 +572,42 @@ async def test_remediation_preserves_a_real_verification_edge(tmp_path):
     ).fetchone()[0]
     assert orphans == 0
     conn.close()
+
+
+class TestZeroAcFindingIsNotRemediable:
+    """`_VALID_ACTIONS` has no "create" member, so the zero-AC check must
+    report `rewrite_ac` while its actual remedy is to WRITE criteria that
+    do not exist. Remediation then selected it, found nothing to rewrite,
+    and dispatched an LLM call that could only no-op — correct outcome,
+    accidental mechanism. Now excluded explicitly.
+    """
+
+    def test_zero_ac_finding_is_flagged_non_remediable(self):
+        findings = dr.deterministic_findings([{
+            "story_key": "STORY-NFR-001", "title": "Latency budget",
+            "description": "", "feature_key": "nfr",
+            "depends_on": [], "scope_files": [], "acceptance_criteria": [],
+        }])
+        zero = [f for f in findings if "no acceptance criteria" in f["problem"]]
+        assert zero and zero[0]["remediable"] is False
+
+    def test_it_is_not_selected_for_remediation(self):
+        f = dr._finding(
+            "STORY-NFR-001", "ac_quality", "high",
+            "story has no acceptance criteria — nothing to test or verify",
+            "rewrite_ac", source="deterministic", remediable=False,
+        )
+        assert dr._remediable_findings([f]) == []
+
+    def test_an_ordinary_rewrite_finding_is_still_selected(self):
+        f = dr._finding(
+            "STORY-001", "ac_quality", "high", "not testable",
+            "rewrite_ac", source="llm",
+        )
+        assert dr._remediable_findings([f]) == [f]
+
+    def test_findings_default_to_remediable(self):
+        """Only the zero-AC case opts out; nothing else should regress."""
+        f = dr._finding("S", "ac_quality", "high", "x", "rewrite_ac",
+                        source="llm")
+        assert f["remediable"] is True

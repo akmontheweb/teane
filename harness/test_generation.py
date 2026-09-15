@@ -2802,8 +2802,43 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         )
         messages.append({"role": "assistant", "content": response.content})
 
-        if len(patch_results) > 0:
+        _applied = sum(
+            1 for r in patch_results if getattr(r, "success", False)
+        )
+        _rejected = len(patch_results) - _applied
+        if _rejected:
+            # Previously invisible. The round summary reported only
+            # re-prompt counts, so a round whose every operation was
+            # REJECTED read identically to a clean one — on
+            # lumina-fresh-20260911-1107 eight rejected operations
+            # (a CREATE_FILE over an existing path plus three
+            # byte-identical REWRITE_FILEs) were logged by the patcher
+            # and then omitted from this node's own accounting.
+            logger.warning(
+                "[test_generation_node] %d patch operation(s) applied, "
+                "%d rejected: %s",
+                _applied, _rejected,
+                ", ".join(sorted({
+                    f"{getattr(r, 'file', '?')} "
+                    f"({getattr(r, 'operation', '?')})"
+                    for r in patch_results
+                    if not getattr(r, "success", False)
+                }))[:400],
+            )
+        if _applied > 0:
             break
+        if patch_results:
+            # Results arrived but NONE landed, so no test file exists —
+            # functionally identical to emitting nothing. Falling through
+            # to the zero-emit re-prompt gives the model the patcher's
+            # rejection feedback and another attempt, instead of
+            # proceeding to the build with no tests written.
+            logger.warning(
+                "[test_generation_node] All %d emitted operation(s) were "
+                "rejected — treating as a zero-emit round so the model "
+                "gets the rejection feedback and another attempt.",
+                len(patch_results),
+            )
 
         zero_emit_this_call += 1
         logger.warning(

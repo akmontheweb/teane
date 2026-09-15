@@ -1721,3 +1721,100 @@ class TestStrictLearnAndDowngrade:
             tools=with_strict(PATCH_TOOLS),
         )
         assert prov.seen == [True, False, False]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic requires messages[0] to be a USER turn.
+#
+# Hoisting the system messages out of an OpenAI-shaped array can expose a
+# leading assistant turn that was only ever interior. The repair loop builds
+# prompts shaped
+#
+#   [system, system, system, system, assistant, system, user, user]
+#
+# for its cross-round workspace context — perfectly legal on an OpenAI-compat
+# endpoint. 5 of 16 repair dispatches measured on lumina-run5-20260914-2120
+# would have come out assistant-first after hoisting, so an operator routing
+# `repair` at an Anthropic model would see ~a third of repair rounds rejected.
+# Same family as the tool_choice and tool-dialect bugs: a provider-specific
+# requirement breaking a deliberately model-agnostic path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestAnthropicLeadingTurnNormalisation:
+
+    async def _payload(self, messages):
+        provider, client = _make_anthropic_provider({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+            "stop_reason": "end_turn",
+        })
+        await provider.chat_completion(messages=messages)
+        return client.last_payload
+
+    async def test_the_repair_loop_shape_starts_with_user(self):
+        """The exact shape the repair loop builds."""
+        payload = await self._payload([
+            {"role": "system", "content": "spec"},
+            {"role": "system", "content": "banner"},
+            {"role": "assistant", "content": "prior round context"},
+            {"role": "system", "content": "directive"},
+            {"role": "user", "content": "fix it"},
+        ])
+        assert payload["messages"][0]["role"] == "user"
+
+    async def test_the_folded_turn_is_preserved_not_dropped(self):
+        """It carries cross-round workspace context; losing it silently
+        would degrade the prompt in a way nothing downstream detects."""
+        payload = await self._payload([
+            {"role": "system", "content": "spec"},
+            {"role": "assistant", "content": "MARKER-cross-round-context"},
+            {"role": "user", "content": "fix it"},
+        ])
+        system = payload["system"]
+        blob = system if isinstance(system, str) else json.dumps(system)
+        assert "MARKER-cross-round-context" in blob
+
+    async def test_several_leading_non_user_turns_are_all_folded(self):
+        payload = await self._payload([
+            {"role": "assistant", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "go"},
+        ])
+        assert [m["role"] for m in payload["messages"]] == ["user"]
+
+    async def test_a_normal_conversation_is_untouched(self):
+        """The guard must not reorder a well-formed exchange."""
+        payload = await self._payload([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+        ])
+        assert [m["role"] for m in payload["messages"]] == [
+            "user", "assistant", "user",
+        ]
+
+    async def test_interior_assistant_turns_are_not_folded(self):
+        """Only a LEADING non-user turn is a problem; an interior one is
+        exactly how a multi-turn conversation is supposed to look."""
+        payload = await self._payload([
+            {"role": "assistant", "content": "lead"},
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "interior"},
+            {"role": "user", "content": "two"},
+        ])
+        roles = [m["role"] for m in payload["messages"]]
+        assert roles == ["user", "assistant", "user"]
+
+    async def test_empty_leading_turn_does_not_pollute_the_system_prompt(self):
+        payload = await self._payload([
+            {"role": "assistant", "content": "   "},
+            {"role": "user", "content": "go"},
+        ])
+        assert payload["messages"][0]["role"] == "user"
+        blob = payload.get("system")
+        blob = blob if isinstance(blob, str) else json.dumps(blob or "")
+        assert "Prior assistant turn" not in blob

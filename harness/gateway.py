@@ -1078,6 +1078,43 @@ class AnthropicProvider(BaseLLM):
                 anthropic_msg: dict[str, Any] = {"role": role, "content": msg.get("content", "")}
                 anthropic_messages.append(anthropic_msg)
 
+        # Anthropic requires messages[0] to be a USER turn. Hoisting the
+        # system messages out (above) can expose a leading assistant turn
+        # that was only ever interior in the OpenAI-shaped array the graph
+        # builds — where an assistant turn after several system messages is
+        # perfectly legal.
+        #
+        # This is not hypothetical. The repair loop builds prompts shaped
+        # [system, system, system, system, assistant, system, user, user]
+        # for its cross-round context, and 5 of 16 repair dispatches
+        # measured on lumina-run5-20260914-2120 would have come out
+        # assistant-first here. An operator who routes `repair` at an
+        # Anthropic model would see roughly a third of repair rounds
+        # rejected — a provider-specific requirement breaking a
+        # deliberately model-agnostic path, the same family as the
+        # tool_choice and tool-dialect bugs.
+        #
+        # Fold the leading assistant turn into the system prompt rather
+        # than dropping it: it carries the harness's cross-round workspace
+        # context, and losing it silently would degrade the repair prompt
+        # in a way nothing downstream could detect.
+        _folded_lead = 0
+        while anthropic_messages and anthropic_messages[0].get("role") != "user":
+            lead = anthropic_messages.pop(0)
+            lead_text = lead.get("content", "")
+            if isinstance(lead_text, str) and lead_text.strip():
+                system_content.append(
+                    "[Prior assistant turn, moved here because Anthropic "
+                    "requires the first message to be a user turn]\n"
+                    + lead_text
+                )
+            _folded_lead += 1
+        if _folded_lead:
+            logger.debug(
+                "[anthropic] Folded %d leading non-user turn(s) into the "
+                "system prompt so messages[0] is a user turn.", _folded_lead,
+            )
+
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": anthropic_messages,

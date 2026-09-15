@@ -516,3 +516,41 @@ def test_unsatisfiable_test_wins_over_zero_patch_loop():
         max_repair=3,
     )
     assert out == "unsatisfiable_test:tests/test_db.py"
+
+
+def test_asserted_correct_round_suppresses_zero_patch_loop():
+    """A deliberate no-op is the model acting, not the model refusing.
+
+    lumina-run7-20260915-1345 died here. The model re-emitted a byte-
+    identical ``BodySizeLimitMiddleware`` five rounds running (repair calls
+    0072/0075/0078/0081/0084, all md5 8cea442d8d68) because the production
+    file WAS correct and the defect was in the test. Each round scored
+    ``real_success_count == 0``, ``zero_patch_loop`` counted to its 3/3 cap,
+    and the build terminated with the real defect untouched.
+
+    Mirrors the ``unparsed_tool_round`` carve-out directly above it: a round
+    the harness could not hear is not a model that would not act.
+    """
+    out = _infer_hitl_trigger(
+        _state(loop_counter={
+            "consecutive_zero_patch_rounds": 3,
+            "asserted_correct_round": True,
+            "asserted_correct_files": ["server/app/middleware/body_size_limit.py"],
+        }),
+        max_repair=10,
+    )
+    assert out != "zero_patch_loop:3", (
+        "an asserted-correct round must not escalate as a zero-patch refusal"
+    )
+
+
+def test_zero_patch_loop_still_fires_without_an_assertion():
+    """The carve-out must not blanket-disable the tripwire."""
+    out = _infer_hitl_trigger(
+        _state(loop_counter={
+            "consecutive_zero_patch_rounds": 3,
+            "asserted_correct_round": False,
+        }),
+        max_repair=10,
+    )
+    assert out == "zero_patch_loop:3"

@@ -7457,6 +7457,24 @@ def _prove_oscillation_contradiction(
     return None
 
 
+def _content_digest(workspace_path: str, rel: str) -> str:
+    """Return a short sha256 of ``rel``'s on-disk content, or "" if unreadable.
+
+    Shared by the revert detector and the asserted-correct detector so both
+    reason about file state the same way: hashing the bytes on disk rather
+    than the patch text, so the same content reached by a REPLACE_BLOCK, a
+    REWRITE_FILE, or a different search anchor lands on one digest.
+    """
+    import hashlib
+
+    path = rel if os.path.isabs(rel) else os.path.join(workspace_path, rel)
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
 def _detect_state_reverts(
     workspace_path: str,
     modified_files: Iterable[str],
@@ -7576,6 +7594,7 @@ def _apply_unsat_offer_floor(
     any_real_patch: bool,
     already_declared: bool,
     floor: int,
+    asserted_correct: bool = False,
 ) -> Optional[tuple[str, str]]:
     """Count declined ``UNSATISFIABLE_TEST`` offers and, at the floor, take
     the escape on the model's behalf.
@@ -7599,6 +7618,11 @@ def _apply_unsat_offer_floor(
     Only rounds that landed NO real patch count toward the floor, and a
     round that DID land one clears the counters: production moving means
     the loop is working, not stuck. ``floor <= 0`` disables the mechanism.
+
+    ``asserted_correct`` marks a round in which the model re-emitted a
+    production file byte-for-byte after being told the patch changed
+    nothing (see Layer 5 in ``repair_node``). That is the same claim as the
+    escape itself, made without the keyword, so it counts double.
     """
     if any_real_patch:
         for path in offer_files:
@@ -7609,8 +7633,17 @@ def _apply_unsat_offer_floor(
         return None
     if not offer_files:
         return None
+    # A silent decline and an asserted-correct round are not equal evidence.
+    # Saying nothing is ambiguous; re-emitting a production file byte-for-
+    # byte after being told the patch changed nothing is the model making
+    # the UNSATISFIABLE_TEST claim in everything but name -- "production is
+    # already right" and "no production change can satisfy this test" are
+    # the same proposition. Weighting it double lets an affirmative claim
+    # reach the floor in half the rounds without changing the floor's
+    # meaning or firing on a model that is merely quiet.
+    _weight = 2 if asserted_correct else 1
     for path in sorted(offer_files):
-        declined[path] = int(declined.get(path, 0) or 0) + 1
+        declined[path] = int(declined.get(path, 0) or 0) + _weight
     if floor <= 0:
         return None
     worst = max(offer_files, key=lambda f: int(declined.get(f, 0) or 0))
@@ -19906,6 +19939,80 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     )
                 except Exception:  # noqa: BLE001 — telemetry must not block
                     pass
+            # --- Layer 5: asserted-correct detection ------------------------
+            # A no-op patch is ambiguous ONCE: the model may have re-emitted a
+            # file's current content because its mental model was stale, which
+            # is reason (1) in the patcher's own rejection text. It is not
+            # ambiguous TWICE. That rejection tells the model in so many words
+            # not to emit the same content again; a model that emits it anyway,
+            # byte-for-byte, against a file that has not changed in between is
+            # not failing to act. It is asserting -- in the only vocabulary
+            # this harness accepts -- that the file is already correct.
+            #
+            # lumina-run7-20260915-1345 is the worked example. The model
+            # re-emitted an identical BodySizeLimitMiddleware five times (repair
+            # calls 0072/0075/0078/0081/0084, every response md5 8cea442d8d68)
+            # while the actual defect was in the TEST, which posts raw bytes to
+            # an endpoint that parses JSON. Each of those rounds scored
+            # real_success_count == 0 and drove zero_patch_loop to its 3/3 cap,
+            # killing the build on exactly the conflation Layer 4 exists to
+            # prevent: a round the harness could not hear is not a model that
+            # would not act. 18 no-op rejections landed that way across the run,
+            # 7 on this one file.
+            #
+            # So the repeat is FLAGGED rather than counted as silence, and the
+            # named files become evidence for the UNSATISFIABLE_TEST ladder --
+            # which is where a "production code is already right" claim belongs.
+            _asserted: list[str] = []
+            _noop_rejects = [
+                r for r in patch_results
+                if getattr(r, "no_op", False) and not getattr(r, "success", False)
+            ]
+            if _noop_rejects:
+                _assert_hist = loop_counter.setdefault("noop_assert_history", {})
+                if not isinstance(_assert_hist, dict):
+                    _assert_hist = {}
+                    loop_counter["noop_assert_history"] = _assert_hist
+                for _r in _noop_rejects:
+                    _rel = str(getattr(_r, "file", "") or "")
+                    if not _rel:
+                        continue
+                    # Key on the file's CURRENT content. If the file changed
+                    # between the two no-ops, the second one is a fresh stale
+                    # mental model against different bytes, not a repeat of the
+                    # same claim -- so the assertion resets rather than accrues.
+                    _digest = _content_digest(workspace, _rel)
+                    if not _digest:
+                        continue
+                    if _assert_hist.get(_rel) == _digest:
+                        _asserted.append(_rel)
+                    else:
+                        _assert_hist[_rel] = _digest
+            if _asserted:
+                _asserted = sorted(set(_asserted))
+                loop_counter["asserted_correct_round"] = True
+                loop_counter["asserted_correct_files"] = _asserted
+                logger.warning(
+                    "[repair_node] ASSERTED-CORRECT round: the model re-emitted "
+                    "byte-identical content for %s after being told the patch "
+                    "changed nothing. Reading this as a claim that the file is "
+                    "already correct -- NOT as a zero-patch refusal -- and "
+                    "passing it to the unsatisfiable-test ladder as evidence "
+                    "the defect is elsewhere.",
+                    _asserted,
+                )
+                try:
+                    from harness.observability import emit_event as _emit_ac
+                    _emit_ac(
+                        "asserted_correct_round",
+                        files=_asserted,
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+            else:
+                loop_counter["asserted_correct_round"] = False
+
             # --- Declined-offer floor (lumina-fresh-20260911-1107) ---
             # The escape is model-declared, so a model that simply never
             # writes the line can decline it forever. On that session the
@@ -19938,6 +20045,9 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 set() if _unparsed_this_round else _unsat_offer_files,
                 any_real_patch=_any_real_patch,
                 already_declared=_unsat_declared is not None,
+                asserted_correct=bool(
+                    loop_counter.get("asserted_correct_round")
+                ),
                 floor=(
                     int(getattr(
                         _gw_floor.config,
@@ -20943,6 +21053,20 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
                 "not translate. The model has been told the expected "
                 "grammar — giving it the round.",
                 loop_counter.get("unparsed_tool_dialects") or [],
+            )
+        elif bool(loop_counter.get("asserted_correct_round")):
+            # Same principle as the unparsed carve-out above, one step
+            # further along: the model DID act, deliberately and twice, and
+            # what it expressed was "this file is already correct". Counting
+            # that as a refusal is what ended lumina-run7 with the real
+            # defect sitting untouched in a test file. The ladder handles
+            # the claim; HITL has nothing to add.
+            logger.info(
+                "[router] zero_patch_loop suppressed: last round re-asserted "
+                "byte-identical content for %s. The model is claiming the "
+                "production file is correct, not declining to act — routing "
+                "on that claim instead of escalating.",
+                loop_counter.get("asserted_correct_files") or [],
             )
         else:
             return f"zero_patch_loop:{consecutive_zero}"

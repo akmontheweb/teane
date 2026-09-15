@@ -385,3 +385,63 @@ class TestDeclinedOfferFloor:
             if out is not None and forced_at is None:
                 forced_at = round_no
         assert forced_at == 3
+
+
+class TestAssertedCorrectWeighting:
+    """An asserted-correct round is the escape claim without the keyword.
+
+    lumina-run7-20260915-1345: the model re-emitted a byte-identical
+    ``BodySizeLimitMiddleware`` five times (repair calls 0072/0075/0078/
+    0081/0084, every response md5 8cea442d8d68) while the real defect sat in
+    ``test_body_size_limit.py``, which posts raw bytes to an endpoint that
+    parses JSON. Every one of those rounds scored zero real patches, drove
+    ``zero_patch_loop`` to its 3/3 cap, and killed the build.
+
+    "This production file is already correct" and "no production change can
+    satisfy this test" are the same proposition, so the round counts double
+    toward the floor rather than reading as a silent decline.
+    """
+
+    def test_asserted_round_reaches_floor_in_half_the_rounds(self) -> None:
+        declined: dict[str, int] = {}
+        offers = {"server/tests/test_body_size_limit.py"}
+        kw = dict(any_real_patch=False, already_declared=False, floor=4)
+
+        first = _apply_unsat_offer_floor(
+            declined, offers, asserted_correct=True, **kw
+        )
+        assert first is None, "one asserted round must not reach a floor of 4"
+
+        second = _apply_unsat_offer_floor(
+            declined, offers, asserted_correct=True, **kw
+        )
+        assert second is not None, "two asserted rounds must reach floor 4"
+        assert second[0] == "server/tests/test_body_size_limit.py"
+
+    def test_silent_declines_are_unchanged(self) -> None:
+        """The default path must keep its old arithmetic exactly."""
+        declined: dict[str, int] = {}
+        offers = {"server/tests/test_birthdays_api.py"}
+        kw = dict(any_real_patch=False, already_declared=False, floor=3)
+
+        assert _apply_unsat_offer_floor(declined, offers, **kw) is None
+        assert _apply_unsat_offer_floor(declined, offers, **kw) is None
+        forced = _apply_unsat_offer_floor(declined, offers, **kw)
+        assert forced is not None, "third silent decline must reach floor 3"
+
+    def test_a_real_patch_still_clears_an_asserted_counter(self) -> None:
+        """Production moving outranks the claim that production is done."""
+        declined: dict[str, int] = {}
+        offers = {"server/tests/test_body_size_limit.py"}
+
+        _apply_unsat_offer_floor(
+            declined, offers, any_real_patch=False,
+            already_declared=False, floor=4, asserted_correct=True,
+        )
+        assert declined, "the asserted round should have counted"
+
+        _apply_unsat_offer_floor(
+            declined, offers, any_real_patch=True,
+            already_declared=False, floor=4, asserted_correct=True,
+        )
+        assert not declined, "a real patch must reset the counter"

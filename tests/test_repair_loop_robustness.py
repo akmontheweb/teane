@@ -32,6 +32,7 @@ from harness.cli import (
 )
 from harness.graph import (
     _RE_WS_SOURCE_PATH,
+    _prove_oscillation_contradiction,
     _detect_state_reverts,
     _workspace_imports_of,
     _build_repair_reflection_prompt,
@@ -1223,3 +1224,132 @@ class TestPerFileRevertCounts:
         _detect_state_reverts(ws, ["x.py", "y.py"], lc)
         assert "x.py" in lc["file_revert_counts"]
         assert "y.py" not in lc["file_revert_counts"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-artifact contradiction (lumina-run6-20260914-1230).
+#
+# harness.test_contradiction proves contradictions WITHIN one test file from
+# its AST. It cannot see the contradiction that actually killed run 6, which
+# is cross-artifact and only visible over time: server/tests/test_config.py:29
+# requires MANAGEMENT_KEY to raise when unset, while the harness's own
+# PROD_IMPORT_SMOKE check requires the module to import without it. No value
+# of that setting satisfies both. config.py reverted seven times and every
+# signal said "you are cycling" without anyone able to say WHY.
+# ---------------------------------------------------------------------------
+
+class TestProveOscillationContradiction:
+
+    def _lc(self, states, diags):
+        return {"file_state_history": {"config.py": states},
+                "file_state_diags": diags}
+
+    def test_the_run6_shape_is_proved(self):
+        out = _prove_oscillation_contradiction(
+            self._lc(["A", "B", "A"], {
+                "A": ["PROD_IMPORT_SMOKE::MANAGEMENT_KEY required at import"],
+                "B": ["AssertionError::test_config expects RuntimeError"],
+            }),
+            ["config.py"],
+        )
+        assert out is not None
+        assert out["file"] == "config.py"
+        assert out["only_a"] and out["only_b"]
+
+    def test_a_strict_subset_is_not_a_contradiction(self):
+        """One state's failures being a subset of the other's means that
+        state is simply BETTER — recommending a change there is valid, so
+        calling it a contradiction would wrongly forbid the right fix."""
+        assert _prove_oscillation_contradiction(
+            self._lc(["A", "B", "A"], {"A": ["X::1", "Y::2"], "B": ["X::1"]}),
+            ["config.py"],
+        ) is None
+
+    def test_identical_diagnostics_are_not_a_contradiction(self):
+        """Both states failing identically is a no-op cycle, not a conflict
+        of requirements."""
+        assert _prove_oscillation_contradiction(
+            self._lc(["A", "B", "A"], {"A": ["X::1"], "B": ["X::1"]}),
+            ["config.py"],
+        ) is None
+
+    def test_missing_diagnostics_yield_no_proof(self):
+        """Unrecorded state means the cycle stays merely reported — never
+        claim a proof from absent evidence."""
+        assert _prove_oscillation_contradiction(
+            self._lc(["A", "B", "A"], {"A": ["X::1"]}), ["config.py"],
+        ) is None
+
+    def test_a_single_state_cannot_contradict_itself(self):
+        assert _prove_oscillation_contradiction(
+            self._lc(["A"], {"A": ["X::1"]}), ["config.py"],
+        ) is None
+
+    def test_malformed_counters_are_safe(self):
+        for lc in ({}, {"file_state_history": "nope"},
+                   {"file_state_diags": None, "file_state_history": {}}):
+            assert _prove_oscillation_contradiction(lc, ["config.py"]) is None
+
+
+class TestContradictionBlockRendering:
+
+    def _kwargs(self):
+        return {
+            "prior_diagnostics_count": 2, "current_diagnostics_count": 2,
+            "resolved_fingerprints": [], "persisted_fingerprints": ["a"],
+            "new_fingerprints": [],
+            "top_persisted_diagnostics": [
+                {"error_code": "RuntimeError", "file": "server/app/config.py",
+                 "line": 42, "message": "MANAGEMENT_KEY required"},
+            ],
+        }
+
+    def _con(self):
+        return {
+            "file": "server/app/config.py",
+            "only_a": ["PROD_IMPORT_SMOKE::MANAGEMENT_KEY required at import"],
+            "only_b": ["AssertionError::test_config expects RuntimeError"],
+        }
+
+    def test_names_both_requirement_sets(self):
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            **self._kwargs(), oscillation_contradiction=self._con(),
+        )
+        assert "PROVED CONTRADICTION" in prompt
+        assert "PROD_IMPORT_SMOKE" in prompt
+        assert "test_config expects RuntimeError" in prompt
+
+    def test_invites_naming_a_wrong_test(self):
+        """The exit this unlocks: saying a test expectation is incorrect.
+        Without it the judge has no legal move left."""
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            **self._kwargs(), oscillation_contradiction=self._con(),
+        )
+        assert "which of the two requirements is wrong" in prompt
+        assert "valid and expected answer" in prompt
+
+    def test_supersedes_the_generic_cycling_notice(self):
+        """Both would be true; showing both dilutes the specific one."""
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            **self._kwargs(), oscillation_contradiction=self._con(),
+            file_revert_streak=4, file_revert_files=["server/app/config.py"],
+        )
+        assert "PROVED CONTRADICTION" in prompt
+        assert "YOUR GUIDANCE IS CYCLING" not in prompt
+
+    def test_cycling_notice_still_renders_without_a_proof(self):
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            **self._kwargs(), file_revert_streak=2,
+            file_revert_files=["server/app/config.py"],
+        )
+        assert "YOUR GUIDANCE IS CYCLING" in prompt
+
+    def test_absent_by_default(self):
+        from harness.graph import _build_repair_reflection_prompt
+        assert "PROVED CONTRADICTION" not in _build_repair_reflection_prompt(
+            **self._kwargs()
+        )

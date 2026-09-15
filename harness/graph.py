@@ -7397,12 +7397,73 @@ def _related_files_evidence(
     return imports, importers
 
 
+def _prove_oscillation_contradiction(
+    loop_counter: dict[str, Any],
+    reverted_files: Iterable[str],
+) -> Optional[dict[str, Any]]:
+    """Name the two mutually exclusive requirement sets behind a revert
+    cycle, or None when they cannot be separated.
+
+    ``harness.test_contradiction`` proves contradictions WITHIN one test
+    file from its AST — the same call asserted to both raise and succeed.
+    It cannot see the contradiction that actually kills builds, which is
+    CROSS-ARTIFACT and only visible over time.
+
+    lumina-run6-20260914-1230 is the worked example. ``server/app/config.py``
+    reverted seven times because ``server/tests/test_config.py:29`` requires
+    MANAGEMENT_KEY to raise when unset, while the harness's own
+    PROD_IMPORT_SMOKE check requires the module to import without it. No
+    value of that setting satisfies both. The repair loop flipped between
+    them until the auto-resume cap killed the run, and every signal said
+    "you are cycling" without anyone able to say WHY.
+
+    The proof is behavioural rather than syntactic: state A of the file
+    leaves diagnostic set DA, state B leaves DB, the file keeps returning
+    to states it has already occupied, and DA != DB with both non-empty.
+    Each state therefore satisfies something the other breaks — so the
+    conflict is between the REQUIREMENTS, and one of them has to change.
+
+    Returns ``{"file", "only_a", "only_b"}`` naming the diagnostics unique
+    to each state, or None when the sets are equal, empty, or unrecorded
+    (in which case the cycle is unexplained and stays merely reported).
+    """
+    diag_by_state = loop_counter.get("file_state_diags") or {}
+    history = loop_counter.get("file_state_history") or {}
+    if not isinstance(diag_by_state, dict) or not isinstance(history, dict):
+        return None
+    for rel in sorted(set(reverted_files or [])):
+        states = history.get(rel)
+        if not isinstance(states, list) or len(states) < 2:
+            continue
+        # The two most recent DISTINCT states this file has occupied.
+        distinct: list[str] = []
+        for digest in reversed(states):
+            if digest not in distinct:
+                distinct.append(digest)
+            if len(distinct) == 2:
+                break
+        if len(distinct) < 2:
+            continue
+        da = set(diag_by_state.get(distinct[0]) or [])
+        db = set(diag_by_state.get(distinct[1]) or [])
+        if not da or not db or da == db:
+            continue
+        only_a, only_b = sorted(da - db), sorted(db - da)
+        if not only_a or not only_b:
+            # One state's failures are a strict subset of the other's —
+            # that is one state being better, not a contradiction.
+            continue
+        return {"file": rel, "only_a": only_a, "only_b": only_b}
+    return None
+
+
 def _detect_state_reverts(
     workspace_path: str,
     modified_files: Iterable[str],
     loop_counter: dict[str, Any],
     *,
     keep: int = 12,
+    round_diagnostics: Optional[list[str]] = None,
 ) -> list[str]:
     """Return the files whose content has returned to a state seen earlier
     this session — i.e. this round UNDID an earlier round.
@@ -7477,6 +7538,20 @@ def _detect_state_reverts(
         # state changes, so a repeat can only mean the content came BACK.
         if seen and digest == seen[-1]:
             continue
+        # Attach THIS round's diagnostics to the state we are leaving.
+        # Timing: detection runs right after patches apply, before the next
+        # compile — so ``round_diagnostics`` describes the PREVIOUS state,
+        # not the one just written. Recording it against the previous
+        # digest is what makes a contradiction provable later: if state A
+        # leaves diagnostics DA and state B leaves DB, and the file keeps
+        # flipping between them, then neither state satisfies both sets.
+        diag_by_state = loop_counter.setdefault("file_state_diags", {})
+        if not isinstance(diag_by_state, dict):
+            diag_by_state = {}
+            loop_counter["file_state_diags"] = diag_by_state
+        if seen and round_diagnostics is not None:
+            diag_by_state[seen[-1]] = list(round_diagnostics)
+
         counts = loop_counter.setdefault("file_revert_counts", {})
         if not isinstance(counts, dict):
             counts = {}
@@ -12004,6 +12079,7 @@ def _build_repair_reflection_prompt(
     file_revert_files: Optional[list[str]] = None,
     related_imports: Optional[list[str]] = None,
     related_importers: Optional[list[str]] = None,
+    oscillation_contradiction: Optional[dict[str, Any]] = None,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
     workspace_path: str = "",
 ) -> str:
@@ -12367,13 +12443,40 @@ def _build_repair_reflection_prompt(
     # An oscillation is evidence against the JUDGE, like a no-op on its
     # target — the model is following guidance that keeps reversing, so
     # telling it to try harder cannot help.
+    # A proved contradiction supersedes the generic cycling notice: it says
+    # not just THAT the loop is looping but WHY, and that no production
+    # change can end it. "Stop cycling" leaves the judge nowhere to go;
+    # "these two requirements are mutually exclusive" is actionable.
+    contradiction_block = ""
+    _con = oscillation_contradiction if isinstance(
+        oscillation_contradiction, dict
+    ) else None
+    if _con and _con.get("only_a") and _con.get("only_b"):
+        contradiction_block = (
+            "\nPROVED CONTRADICTION — no production change can resolve "
+            "this:\n"
+            f"  {_con.get('file')} has been flipped between two states. One "
+            "state leaves these failures:\n    "
+            + "\n    ".join(str(x) for x in _con["only_a"][:5]) + "\n"
+            "  The other leaves these instead:\n    "
+            + "\n    ".join(str(x) for x in _con["only_b"][:5]) + "\n"
+            "  Each state satisfies something the other breaks, so no value "
+            "of this file passes both. The conflict is between the "
+            "REQUIREMENTS, not in the code.\n"
+            "  Do NOT name this file again. Say plainly in ``real_blocker`` "
+            "which of the two requirements is wrong and must change — "
+            "naming a test whose expectation is incorrect is a valid and "
+            "expected answer here.\n"
+        )
+
     revert_block = ""
     # Keyed on a PER-FILE count. A global streak is diluted by progress
     # elsewhere: lumina-run6-20260914-1230 saw config.py revert SEVEN times
     # while the global streak never exceeded 3, because other files kept
     # advancing and clearing it. One file cycling is a complete signal on
     # its own, regardless of what the rest of the round achieved.
-    if file_revert_streak >= 2 and file_revert_files:
+    if (not contradiction_block
+            and file_revert_streak >= 2 and file_revert_files):
         revert_block = (
             "\nYOUR GUIDANCE IS CYCLING — read carefully:\n"
             f"The last {file_revert_streak} round(s) returned "
@@ -12666,6 +12769,7 @@ def _build_repair_reflection_prompt(
         f"{tail_block}"
         f"{source_evidence_block}"
         f"{prior_verdict_block}"
+        f"{contradiction_block}"
         f"{related_block}"
         f"{revert_block}"
         f"{noop_on_target_block}"
@@ -16845,6 +16949,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 }),
                 related_imports=_related_imports,
                 related_importers=_related_importers,
+                oscillation_contradiction=loop_counter.get(
+                    "oscillation_contradiction",
+                ),
                 prior_reflection_verdict=_prior_reflection,
                 workspace_path=state.get("workspace_path") or "",
             )
@@ -19914,6 +20021,9 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # only signal that notices the round undid an earlier one.
             _reverted = _detect_state_reverts(
                 workspace, modified_files, loop_counter,
+                round_diagnostics=_fingerprint_diagnostics(
+                    state.get("compiler_errors", []) or []
+                ),
             )
             if _reverted:
                 loop_counter["file_revert_streak"] = int(
@@ -19927,6 +20037,31 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     "prompt will tell the judge its guidance is cycling.",
                     _reverted, loop_counter["file_revert_streak"],
                 )
+                _contradiction = _prove_oscillation_contradiction(
+                    loop_counter, _reverted,
+                )
+                if _contradiction:
+                    loop_counter["oscillation_contradiction"] = _contradiction
+                    logger.warning(
+                        "[repair_node] CONTRADICTION proved on %s: one state "
+                        "leaves %s, the other leaves %s. Neither satisfies "
+                        "both, so no value of this file can pass — the "
+                        "conflict is between the REQUIREMENTS and one of "
+                        "them must change.",
+                        _contradiction["file"],
+                        _contradiction["only_a"], _contradiction["only_b"],
+                    )
+                    try:
+                        from harness.observability import emit_event as _emit_con
+                        _emit_con(
+                            "oscillation_contradiction_proved",
+                            file=_contradiction["file"],
+                            only_a=_contradiction["only_a"],
+                            only_b=_contradiction["only_b"],
+                            total_repairs=loop_counter.get("total_repairs", 0),
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry must not block
+                        pass
                 try:
                     from harness.observability import emit_event as _emit_rev
                     _emit_rev(

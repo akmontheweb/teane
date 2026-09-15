@@ -10565,6 +10565,15 @@ _PY_IMPORT_RE = re.compile(
 )
 
 
+# Workspace-relative source paths as they appear in judge prose —
+# "the implementation in server/app/services/birthday_service.py sorts by".
+# Deliberately narrow: a real extension and at least one directory
+# separator, so a bare module name or a sentence fragment cannot match.
+_RE_WS_SOURCE_PATH = re.compile(
+    r"\b((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java))\b"
+)
+
+
 def _first_party_imports_for(
     workspace_path: str, test_rel_path: str, *, max_depth: int = 2,
 ) -> list[str]:
@@ -17502,8 +17511,60 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     import_prefetch.append(_imp_rel)
                     if len(import_prefetch) >= 6:
                         break
+            # The judge's named blocker goes to the FRONT of the prefetch.
+            #
+            # The import prefetch above is one hop from the failing test and
+            # capped at 6, filled in iteration order. That is how
+            # lumina-run5-20260914-2120 starved: the judge named
+            # ``server/app/api/birthdays.py`` every round, the model asked to
+            # read it twice, and it was never inlined — the file is TWO hops
+            # out (test imports ``server.app.main``; main.py registers the
+            # router from api/birthdays.py), so the one-hop walk never
+            # reached it while alphabetically-earlier imports consumed the
+            # cap. The prompt mentioned that path 13 times and carried its
+            # source zero times.
+            #
+            # Ordering rather than widening is deliberate. Walking imports
+            # transitively would exhaust the same cap with breadth nobody
+            # asked for; the judge's pick is a signal already computed every
+            # round and already demonstrated relevant. Extending the cap is
+            # also wrong — the prompt is over-fed as it is (median 67k
+            # tokens in, 165 out).
+            _judge_named_prefetch: list[str] = []
+            try:
+                _jv = (state.get("loop_counter", {}) or {}).get(
+                    "last_reflection_verdict",
+                )
+                if isinstance(_jv, dict):
+                    _jtext = " ".join(
+                        str(_jv.get(k) or "")
+                        for k in ("real_blocker", "recommendation")
+                    )
+                    for _cand in _RE_WS_SOURCE_PATH.findall(_jtext):
+                        _cn = _normalize_ws_path(_cand, workspace_path)
+                        if not _is_workspace_source_path(_cn, workspace_path):
+                            continue
+                        if _cn in diag_files or _cn in _judge_named_prefetch:
+                            continue
+                        if not os.path.exists(
+                            os.path.join(workspace_path, _cn)
+                        ):
+                            continue
+                        _judge_named_prefetch.append(_cn)
+                        if len(_judge_named_prefetch) >= 3:
+                            break
+            except Exception:  # noqa: BLE001 — prefetch is best-effort
+                _judge_named_prefetch = []
+            if _judge_named_prefetch:
+                logger.info(
+                    "[repair_node] Prefetching the judge's named file(s) %s "
+                    "ahead of the import walk — they are the blocker this "
+                    "round and may be more than one hop from the test.",
+                    _judge_named_prefetch,
+                )
             files_for_preflight = (
-                list(diag_files) + cr_extra + import_prefetch
+                list(diag_files) + _judge_named_prefetch
+                + cr_extra + import_prefetch
             )
             # 2026-07-04 fix — re-inject files the LLM previously
             # ``READ_FILE``'d whose content was cleansed out of message

@@ -20,6 +20,8 @@ session 7c30bce2:
 
 from __future__ import annotations
 
+import pytest
+
 import asyncio
 import json
 from pathlib import Path
@@ -29,6 +31,7 @@ from harness.cli import (
     _extract_delegate_subdirs,
 )
 from harness.graph import (
+    _RE_WS_SOURCE_PATH,
     _detect_state_reverts,
     _workspace_imports_of,
     _build_repair_reflection_prompt,
@@ -1065,3 +1068,58 @@ class TestWorkspaceImportResolution:
         p = os.path.join(str(tmp_path), "m.py")
         open(p, "w").write("from . import sibling\nfrom .pkg import thing\n")
         assert _workspace_imports_of(str(tmp_path), ["m.py"]) == []
+
+
+# ---------------------------------------------------------------------------
+# The judge's named blocker is prefetched (lumina-run5-20260914-2120).
+#
+# The import prefetch is one hop from the failing test and capped at 6,
+# filled in iteration order. The judge named server/app/api/birthdays.py
+# every round and the model asked to read it twice, but it was never
+# inlined: the file is TWO hops out (the test imports server.app.main;
+# main.py registers the router from api/birthdays.py), so the one-hop walk
+# never reached it while earlier imports consumed the cap. The prompt
+# mentioned that path 13 times and carried its source zero times.
+# ---------------------------------------------------------------------------
+
+class TestJudgeNamedPathExtraction:
+    """Ordering the prefetch depends on pulling paths out of judge prose.
+    Over-matching would inline noise and crowd out the real blocker."""
+
+    def test_extracts_paths_from_a_real_blocker_sentence(self):
+        text = (
+            "The endpoint at server/app/api/birthdays.py:66 raises the right "
+            "error but server/app/main.py overwrites the message"
+        )
+        assert _RE_WS_SOURCE_PATH.findall(text) == [
+            "server/app/api/birthdays.py", "server/app/main.py",
+        ]
+
+    @pytest.mark.parametrize("text", [
+        "the service layer sorts by first_name rather than last_name",
+        "the birthdays module is fine",
+        "check the config",
+        "version is None instead of 1",
+    ])
+    def test_prose_without_paths_yields_nothing(self, text):
+        assert _RE_WS_SOURCE_PATH.findall(text) == []
+
+    def test_a_bare_filename_is_not_a_path(self):
+        """Needs a directory separator — 'main.py' alone is ambiguous and
+        would resolve to the wrong file in a multi-package workspace."""
+        assert _RE_WS_SOURCE_PATH.findall("the bug is in main.py") == []
+
+    @pytest.mark.parametrize("ext", ["py", "ts", "tsx", "js", "go", "rs", "java"])
+    def test_common_source_extensions(self, ext):
+        assert _RE_WS_SOURCE_PATH.findall(f"see src/thing.{ext} for it") == [
+            f"src/thing.{ext}",
+        ]
+
+    def test_non_source_extensions_are_ignored(self):
+        """A .md or .lock path in a verdict is not code to inline."""
+        assert _RE_WS_SOURCE_PATH.findall("see docs/notes.md and yarn.lock") == []
+
+    def test_line_suffix_does_not_leak_into_the_path(self):
+        assert _RE_WS_SOURCE_PATH.findall("at a/b/c.py:66 the call fails") == [
+            "a/b/c.py",
+        ]

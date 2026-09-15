@@ -377,7 +377,7 @@
     },
     "test_regeneration": {
         "enabled": true,
-        "max_attempts_per_test": 1,
+        "max_attempts_per_test": 2,
         "tier_b_auto": true,
         "require_code_linkage": true,
         "coverage_nonregression": true

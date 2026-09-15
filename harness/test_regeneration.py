@@ -612,8 +612,9 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     applied = sum(1 for r in patch_results if getattr(r, "success", False))
     if applied == 0:
         # The attempt was consumed at dispatch time, but nothing was
-        # written — the escape accomplished nothing and, with
-        # ``max_attempts_per_test`` at 1, there is no second chance.
+        # written — the escape accomplished nothing, yet the file is one
+        # attempt poorer against ``max_attempts_per_test`` whatever that
+        # cap is set to.
         # lumina-run7-20260915-1410: the offer floor correctly took the
         # escape on the model's behalf, regeneration ran, applied 0
         # blocks, and the loop carried on with the identical failure.

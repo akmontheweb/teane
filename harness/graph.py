@@ -19735,9 +19735,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # counter — the floor is for a loop that is genuinely stuck,
             # not for a model taking a few rounds to find the fix.
             _gw_floor = get_gateway()
+            # An unparsed round did not DECLINE the escape — the model was
+            # asking for something in a dialect the harness does not speak.
+            # Counting it as a refusal is how run 5 concluded a test was
+            # unsatisfiable when the model wanted to read a file.
+            _unparsed_this_round = bool(
+                loop_counter.get("unparsed_tool_round")
+            )
             _forced_unsat = _apply_unsat_offer_floor(
                 loop_counter.setdefault("unsat_offers_declined_per_file", {}),
-                _unsat_offer_files,
+                set() if _unparsed_this_round else _unsat_offer_files,
                 any_real_patch=_any_real_patch,
                 already_declared=_unsat_declared is not None,
                 floor=(
@@ -19759,6 +19766,56 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     )
                 except Exception:  # noqa: BLE001 — telemetry must not block
                     pass
+        # --- Layer 4: unparsed-round detection -------------------------
+        # A round that lands nothing because the harness did not UNDERSTAND
+        # it must never be mistaken for a model that refuses to act. Every
+        # progress counter downstream — zero_patch_loop, the
+        # UNSATISFIABLE_TEST offer floor, no_progress_repairs — reads "zero
+        # patches" as refusal, and on lumina-run5-20260914-2120 that
+        # mistake made the floor declare a test unsatisfiable when the
+        # model had only been asking to read a file in the wrong dialect.
+        #
+        # Enumerating dialects (Layer 2) shrinks how often this happens;
+        # it cannot make it never happen, because the next model ships a
+        # syntax nobody has catalogued. So the round is FLAGGED and the
+        # model is TOLD, which is what makes an unknown dialect survivable
+        # rather than fatal.
+        _unparsed_calls: list[dict[str, Any]] = []
+        if not patch_results:
+            try:
+                from harness.tool_dialects import unmapped_invocations
+                _unparsed_calls = unmapped_invocations(patch_payload or "")
+            except Exception:  # noqa: BLE001 — detection must never break repair
+                _unparsed_calls = []
+        if _unparsed_calls:
+            _dialects = sorted({
+                str(c.get("dialect") or "?") for c in _unparsed_calls
+            })
+            _names = sorted({str(c.get("name") or "?") for c in _unparsed_calls})
+            loop_counter["unparsed_tool_round"] = True
+            loop_counter["unparsed_tool_dialects"] = _dialects
+            logger.warning(
+                "[repair_node] UNPARSED round: the response contained %d "
+                "tool invocation(s) in dialect(s) %s naming %s, which this "
+                "harness does not speak. The round landed nothing because "
+                "it was not understood — NOT because the model refused. "
+                "Telling it the expected grammar instead of counting this "
+                "as a zero-patch round.",
+                len(_unparsed_calls), _dialects, _names,
+            )
+            try:
+                from harness.observability import emit_event as _emit_unp
+                _emit_unp(
+                    "unparsed_tool_dialect",
+                    dialects=_dialects, names=_names,
+                    count=len(_unparsed_calls),
+                    total_repairs=loop_counter.get("total_repairs", 0),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+        else:
+            loop_counter["unparsed_tool_round"] = False
+
         # Post-patch bookkeeping for the repeat-search detector.
         _update_search_history_post_patch(
             _blocks_kept, patch_results, loop_counter,
@@ -19932,6 +19989,31 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 no_op_count=no_op_count,
             )
         )
+        # Layer 4 feedback. Detecting an unparsed round only stops the
+        # harness drawing the WRONG conclusion; telling the model is what
+        # makes the next round land. Without this the model repeats the
+        # same unrecognised syntax — run 5 did exactly that four times.
+        if _unparsed_calls:
+            _unp_names = sorted({
+                str(c.get("name") or "?") for c in _unparsed_calls
+            })
+            status_msg += (
+                "\n\n[System]: YOUR TOOL SYNTAX WAS NOT UNDERSTOOD — this "
+                "round did nothing.\n"
+                f"You emitted {len(_unparsed_calls)} invocation(s) "
+                f"({', '.join(_unp_names)}) in "
+                f"{', '.join(sorted({str(c.get('dialect') or '?') for c in _unparsed_calls}))} "
+                "syntax. This harness does not use function-call syntax. It "
+                "uses a plain-text block DSL, and nothing else is parsed.\n"
+                "To READ a file, emit exactly:\n"
+                "<<<READ_FILE>>>\n"
+                "file: path/to/file.py\n"
+                "<<<END_READ_FILE>>>\n"
+                "To EDIT, use <<<REPLACE_BLOCK>>> / <<<CREATE_FILE>>> / "
+                "<<<REWRITE_FILE>>> as described above. Do not wrap these "
+                "in XML, JSON, or markdown fences — emit the markers "
+                "literally at the start of a line."
+            )
         # Repair keeps the allowlist_rejections that were already computed
         # above (line ~15465) — the shared helper recomputes them for its
         # own status_msg composition, but the caller-side list drives the
@@ -20598,7 +20680,20 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if consecutive_all_rejected >= 2:
         return f"all_allowlist_rejected:{consecutive_all_rejected}"
     if consecutive_zero >= 2:
-        return f"zero_patch_loop:{consecutive_zero}"
+        # An unparsed round produced no patches because its request was not
+        # understood, not because the model would not act. Escalating to
+        # HITL on it hides a harness-side parse gap behind an operator
+        # prompt; the corrective feedback gets a round to work first.
+        if bool(loop_counter.get("unparsed_tool_round")):
+            logger.info(
+                "[router] zero_patch_loop suppressed: last round carried "
+                "tool invocations in dialect(s) %s that the harness could "
+                "not translate. The model has been told the expected "
+                "grammar — giving it the round.",
+                loop_counter.get("unparsed_tool_dialects") or [],
+            )
+        else:
+            return f"zero_patch_loop:{consecutive_zero}"
     # Consecutive-DISTRACTION circuit breaker. The route gate compares
     # loop_counter["consecutive_distraction_rounds"] against
     # ``gw.config.max_consecutive_distraction_rounds`` — we reuse the

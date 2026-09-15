@@ -288,29 +288,43 @@ _XML_READ_PARAM_RE = re.compile(
 
 
 def normalize_xml_read_requests(llm_output: str) -> str:
-    """Rewrite XML-style ``read_file`` invocations into the READ_FILE DSL.
+    """Rewrite a read-file request written in ANY known text dialect into
+    the canonical READ_FILE DSL.
 
-    Returns ``llm_output`` unchanged when no such invocation is present, so
-    the common path costs one substring check."""
-    if not llm_output or "<invoke" not in llm_output:
+    Kept under its original name because five call sites import it, but the
+    scope widened on 2026-09-15 from Anthropic XML alone to the full table
+    in :mod:`harness.tool_dialects` — Hermes/Qwen, Mistral, Llama, DeepSeek
+    special tokens, Nemotron, and a permissive JSON tier for dialects
+    nobody has catalogued yet.
+
+    Returns ``llm_output`` unchanged when nothing matches, so the common
+    path costs one substring check per marker.
+    """
+    if not llm_output:
         return llm_output
+    # Cheap pre-filter. The literal dialect markers, PLUS the JSON core that
+    # the uncatalogued tier matches on — without that last pair the fast
+    # path short-circuits before the generic tier and defeats the very case
+    # it exists for (a dialect nobody has enumerated yet).
+    markers = ("<invoke", "<tool_call", "[TOOL_CALLS]", "<|python_tag|>",
+               "<function=", "tool▁call▁begin")
+    generic = '"name"' in llm_output and (
+        '"arguments"' in llm_output or '"parameters"' in llm_output
+        or '"args"' in llm_output or '"input"' in llm_output
+    )
+    if not generic and not any(marker in llm_output for marker in markers):
+        return llm_output
+    from harness.tool_dialects import extract_tool_invocations, to_read_file_dsl
 
-    def _replace(m: "re.Match[str]") -> str:
-        params = {
-            pm.group("key").lower(): pm.group("val").strip()
-            for pm in _XML_READ_PARAM_RE.finditer(m.group("body"))
-        }
-        path = params.get("file") or params.get("path") or params.get("file_path")
-        if not path:
-            return m.group(0)  # unusable — leave it visible to the caller
-        out = ["<<<READ_FILE>>>", "file: " + path]
-        rng = params.get("range")
-        if rng:
-            out.append("range: " + rng)
-        out.append("<<<END_READ_FILE>>>")
-        return "\n".join(out)
-
-    return _XML_READ_INVOKE_RE.sub(_replace, llm_output)
+    out = llm_output
+    for inv in extract_tool_invocations(llm_output):
+        block = to_read_file_dsl(inv)
+        if not block:
+            continue
+        span = inv.get("raw")
+        if isinstance(span, str) and span and span in out:
+            out = out.replace(span, block, 1)
+    return out
 
 
 def parse_read_blocks(llm_output: str) -> list[tuple[str, Optional[tuple[int, int]]]]:

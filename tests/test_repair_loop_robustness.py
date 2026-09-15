@@ -1164,3 +1164,62 @@ class TestRevertStreakSurvivesNoopRounds:
     def test_an_idempotency_noop_alongside_nothing_else_holds(self):
         lc = self._reset_branch([self._R(success=True, no_op=True)], 2)
         assert lc["file_revert_streak"] == 2
+
+
+class TestPerFileRevertCounts:
+    """A GLOBAL streak is diluted by progress elsewhere.
+
+    lumina-run6-20260914-1230: server/app/config.py reverted SEVEN times
+    while the global streak never exceeded 3, because other files kept
+    advancing and clearing it. One file cycling is a complete signal on its
+    own, regardless of what the rest of the round achieved.
+    """
+
+    def _w(self, ws, rel, text):
+        import os
+        p = os.path.join(ws, rel)
+        os.makedirs(os.path.dirname(p) or ws, exist_ok=True)
+        open(p, "w").write(text)
+
+    def test_one_file_cycling_accumulates_while_another_advances(self, tmp_path):
+        ws, lc = str(tmp_path), {}
+        self._w(ws, "cycler.py", "A")
+        self._w(ws, "mover.py", "v0")
+        _detect_state_reverts(ws, ["cycler.py", "mover.py"], lc)
+        for i in range(3):
+            self._w(ws, "cycler.py", "B")
+            self._w(ws, "mover.py", f"v{i}a")
+            _detect_state_reverts(ws, ["cycler.py", "mover.py"], lc)
+            self._w(ws, "cycler.py", "A")
+            self._w(ws, "mover.py", f"v{i}b")
+            _detect_state_reverts(ws, ["cycler.py", "mover.py"], lc)
+        counts = lc["file_revert_counts"]
+        assert counts.get("cycler.py", 0) >= 2
+        assert "mover.py" not in counts
+
+    def test_a_genuinely_new_state_clears_that_file(self, tmp_path):
+        ws, lc = str(tmp_path), {}
+        self._w(ws, "a.py", "A")
+        _detect_state_reverts(ws, ["a.py"], lc)
+        self._w(ws, "a.py", "B")
+        _detect_state_reverts(ws, ["a.py"], lc)
+        self._w(ws, "a.py", "A")
+        _detect_state_reverts(ws, ["a.py"], lc)
+        assert lc["file_revert_counts"].get("a.py", 0) >= 1
+        self._w(ws, "a.py", "C")          # never seen before
+        _detect_state_reverts(ws, ["a.py"], lc)
+        assert "a.py" not in lc["file_revert_counts"]
+
+    def test_counts_are_independent_per_file(self, tmp_path):
+        ws, lc = str(tmp_path), {}
+        for rel in ("x.py", "y.py"):
+            self._w(ws, rel, "A")
+        _detect_state_reverts(ws, ["x.py", "y.py"], lc)
+        self._w(ws, "x.py", "B")
+        self._w(ws, "y.py", "B")
+        _detect_state_reverts(ws, ["x.py", "y.py"], lc)
+        self._w(ws, "x.py", "A")
+        self._w(ws, "y.py", "C")
+        _detect_state_reverts(ws, ["x.py", "y.py"], lc)
+        assert "x.py" in lc["file_revert_counts"]
+        assert "y.py" not in lc["file_revert_counts"]

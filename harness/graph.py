@@ -7477,8 +7477,17 @@ def _detect_state_reverts(
         # state changes, so a repeat can only mean the content came BACK.
         if seen and digest == seen[-1]:
             continue
+        counts = loop_counter.setdefault("file_revert_counts", {})
+        if not isinstance(counts, dict):
+            counts = {}
+            loop_counter["file_revert_counts"] = counts
         if digest in seen:
             reverted.append(rel)
+            counts[rel] = int(counts.get(rel, 0) or 0) + 1
+        else:
+            # A genuinely NEW state for this file is forward progress FOR
+            # THIS FILE, whatever the rest of the round did.
+            counts.pop(rel, None)
         seen.append(digest)
         if len(seen) > keep:
             del seen[:-keep]
@@ -12359,6 +12368,11 @@ def _build_repair_reflection_prompt(
     # target — the model is following guidance that keeps reversing, so
     # telling it to try harder cannot help.
     revert_block = ""
+    # Keyed on a PER-FILE count. A global streak is diluted by progress
+    # elsewhere: lumina-run6-20260914-1230 saw config.py revert SEVEN times
+    # while the global streak never exceeded 3, because other files kept
+    # advancing and clearing it. One file cycling is a complete signal on
+    # its own, regardless of what the rest of the round achieved.
     if file_revert_streak >= 2 and file_revert_files:
         revert_block = (
             "\nYOUR GUIDANCE IS CYCLING — read carefully:\n"
@@ -16812,14 +16826,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         loop_counter.get("judge_target_noop_files") or []
                     ) if isinstance(f, str) and f
                 ],
-                file_revert_streak=int(
-                    loop_counter.get("file_revert_streak", 0) or 0
+                file_revert_streak=max(
+                    [int(loop_counter.get("file_revert_streak", 0) or 0)]
+                    + [
+                        int(v or 0) for v in (
+                            loop_counter.get("file_revert_counts") or {}
+                        ).values()
+                    ]
                 ),
-                file_revert_files=[
+                file_revert_files=sorted({
                     f for f in (
                         loop_counter.get("file_revert_files") or []
                     ) if isinstance(f, str) and f
-                ],
+                } | {
+                    f for f, n in (
+                        loop_counter.get("file_revert_counts") or {}
+                    ).items() if isinstance(f, str) and int(n or 0) >= 2
+                }),
                 related_imports=_related_imports,
                 related_importers=_related_importers,
                 prior_reflection_verdict=_prior_reflection,

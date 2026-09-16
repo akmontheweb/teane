@@ -8796,6 +8796,70 @@ def _format_rewrite_file_noop_directive(rw_noops: dict[str, int]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_last_word_corrections(loop_counter: dict[str, Any]) -> str:
+    """Restate the round's BLOCKING corrections so they are the last thing
+    the model reads before it is told to emit patches.
+
+    The repair prompt already carries every correction it needs. The problem
+    is where they sit. On lumina-run7-20260915-1345 the REWRITE_FILE
+    fixation trap fired correctly, named the right file, carried the right
+    count, and gave the right diagnosis -- "the bug is NOT in this file's
+    current state... the failing tests are actually caught by a DIFFERENT
+    file" -- which was exactly true. It landed 92.8% of the way through a
+    239,342-character prompt, and was then followed by ~9,800 characters of
+    diagnostics, a 6,326-character bare list of 83 workspace filenames, and
+    a generic format reminder ending "Generate your fix patches NOW."
+
+    The model re-emitted the same byte-identical file five times in a row
+    (repair calls 0072/0075/0078/0081/0084, every response md5
+    8cea442d8d68). Its own previous answer sat in the context immediately
+    before that wall of text, and the closing instruction was a demand for
+    blocks. The correction was present on every one of those calls and
+    never had the last word.
+
+    So this restates only the ACTIVE blocking directives, compactly, at the
+    end. It is deliberately not a copy of the full trap: the reasoning stays
+    where it is, and what moves to the end is the prohibition plus the two
+    sanctioned ways out. Returns "" when nothing is blocking, which is the
+    common case -- this must not become unconditional prompt bloat.
+    """
+    if not isinstance(loop_counter, dict):
+        return ""
+    stuck: dict[str, int] = {}
+    _rw = loop_counter.get("rewrite_file_no_ops_per_file")
+    if isinstance(_rw, dict):
+        stuck = {
+            str(f): int(n) for f, n in _rw.items()
+            if isinstance(n, int) and n >= 2
+        }
+    # Layer 5 may have flagged files this round that the per-file counter
+    # has not yet crossed the threshold on; both mean the same thing here.
+    _asserted = loop_counter.get("asserted_correct_files")
+    if isinstance(_asserted, list):
+        for f in _asserted:
+            if isinstance(f, str) and f:
+                stuck.setdefault(f, 2)
+    if not stuck:
+        return ""
+    names = ", ".join(f"`{f}`" for f in sorted(stuck))
+    return (
+        "\n\n[BEFORE YOU ANSWER — this round's blocking correction]\n"
+        f"You have already emitted byte-identical content for {names} and "
+        "it was rejected as a no-op each time. Emitting it again will be "
+        "rejected again and changes nothing. That file's current content is "
+        "not the bug.\n"
+        "Do exactly one of these instead:\n"
+        "  1) Patch a DIFFERENT file — the caller, the import site, the "
+        "fixture, or the test helper named in the failing diagnostic.\n"
+        "  2) READ_FILE the failing test's assertion, if you have not "
+        "already, and patch what it actually exercises.\n"
+        "  3) If no production change can EVER satisfy the failing test, "
+        "emit zero patch blocks and exactly one UNSATISFIABLE_TEST line as "
+        "described above.\n"
+        "Re-emitting the same content is not one of the options."
+    )
+
+
 def _format_stuck_rewrite_mandate(
     stuck_paths: list[str], workspace: str,
 ) -> str:
@@ -19507,6 +19571,13 @@ need to see and have not been shown; everything else, patch directly.
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your fix patches NOW. Only the blocks above. No other text."""
+        # Give the round's blocking correction the last word. The repair
+        # prompt already carries it, ~93% of the way through a ~240k-char
+        # message and buried under diagnostics, an 83-file inventory and
+        # this boilerplate; on lumina-run7-20260915-1345 that was enough to
+        # make the model re-emit the same byte-identical file five rounds
+        # running. Empty string when nothing is blocking.
+        _REPAIR_FORMAT_REMINDER += _format_last_word_corrections(loop_counter)
         messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
         # Ground the fix in neighbouring code (Wave-1 grounding). Query on the
         # diagnostic head (file:line + error text) so retrieval surfaces code

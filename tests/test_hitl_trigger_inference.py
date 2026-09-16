@@ -554,3 +554,36 @@ def test_zero_patch_loop_still_fires_without_an_assertion():
         max_repair=10,
     )
     assert out == "zero_patch_loop:3"
+
+
+def test_truncated_round_suppresses_zero_patch_loop():
+    """Running out of output budget is not the same as declining to act.
+
+    lumina-run7-20260915-1345, repair calls 0047 and 0064: each returned
+    ~140,000 characters of deliberation and hit the 32k output cap
+    mid-sentence without ever completing a patch block. Call 0064 had
+    diagnosed the bug correctly in its first paragraph. Both rounds scored
+    zero patches and counted toward zero_patch_loop exactly like a refusal,
+    which is the wrong remedy: an operator cannot act on a token cap.
+    """
+    out = _infer_hitl_trigger(
+        _state(loop_counter={
+            "consecutive_zero_patch_rounds": 3,
+            "truncated_round": True,
+        }),
+        max_repair=10,
+    )
+    assert out != "zero_patch_loop:3", (
+        "a truncated round must not escalate as a zero-patch refusal"
+    )
+
+
+def test_truncation_and_assertion_are_independent_carve_outs():
+    """Neither flag may depend on the other being set."""
+    for flags in (
+        {"truncated_round": True, "asserted_correct_round": False},
+        {"truncated_round": False, "asserted_correct_round": True},
+    ):
+        lc = {"consecutive_zero_patch_rounds": 2, **flags}
+        assert _infer_hitl_trigger(_state(loop_counter=lc), max_repair=10) \
+            != "zero_patch_loop:2", f"carve-out failed for {flags}"

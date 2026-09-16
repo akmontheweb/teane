@@ -20013,6 +20013,53 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             else:
                 loop_counter["asserted_correct_round"] = False
 
+            # --- Layer 6: truncated-round detection -------------------
+            # finish_reason == "length" means the model ran out of output
+            # budget, not that it declined to act. Those are opposite
+            # failures and only one of them is the model's fault.
+            #
+            # lumina-run7-20260915-1345, repair calls 0047 and 0064: each
+            # returned ~140,000 characters of deliberation ("Wait --
+            # actually... Hmm, let me think about this differently...")
+            # and hit the 32k cap mid-sentence without ever reaching a
+            # patch block. Call 0064 had in fact diagnosed the bug
+            # correctly in its FIRST paragraph -- "the only way to make
+            # this pass without modifying the test is to make the API
+            # route use a fixed date. But that breaks production
+            # behavior" -- and then spent the rest of the budget
+            # second-guessing it. Both rounds scored zero patches and
+            # counted toward zero_patch_loop exactly like a refusal.
+            #
+            # continue_on_length.repair is already true, so continuation
+            # ran and produced more prose; the cap is not the remedy and
+            # neither is HITL. Flag the round, keep the tripwire honest,
+            # and let the deliberation cap (separate fix) do the work.
+            _truncated_round = (
+                str(getattr(response, "finish_reason", "") or "") == "length"
+                and not patch_results
+            )
+            if _truncated_round:
+                loop_counter["truncated_round"] = True
+                logger.warning(
+                    "[repair_node] TRUNCATED round: the response hit the "
+                    "output token cap (finish_reason=length, %d chars) "
+                    "without completing a patch block. The round landed "
+                    "nothing because the budget ran out — NOT because the "
+                    "model refused. Not counting it as a zero-patch round.",
+                    len(str(getattr(response, "content", "") or "")),
+                )
+                try:
+                    from harness.observability import emit_event as _emit_tr
+                    _emit_tr(
+                        "truncated_repair_round",
+                        chars=len(str(getattr(response, "content", "") or "")),
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+            else:
+                loop_counter["truncated_round"] = False
+
             # --- Declined-offer floor (lumina-fresh-20260911-1107) ---
             # The escape is model-declared, so a model that simply never
             # writes the line can decline it forever. On that session the
@@ -20037,9 +20084,12 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             # asking for something in a dialect the harness does not speak.
             # Counting it as a refusal is how run 5 concluded a test was
             # unsatisfiable when the model wanted to read a file.
+            # A truncated round joins the unparsed round here for the same
+            # reason: neither is the model passing on the escape. One was
+            # not understood, the other never finished being written.
             _unparsed_this_round = bool(
                 loop_counter.get("unparsed_tool_round")
-            )
+            ) or bool(loop_counter.get("truncated_round"))
             _forced_unsat = _apply_unsat_offer_floor(
                 loop_counter.setdefault("unsat_offers_declined_per_file", {}),
                 set() if _unparsed_this_round else _unsat_offer_files,
@@ -21053,6 +21103,15 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
                 "not translate. The model has been told the expected "
                 "grammar — giving it the round.",
                 loop_counter.get("unparsed_tool_dialects") or [],
+            )
+        elif bool(loop_counter.get("truncated_round")):
+            # The model ran out of output budget mid-thought. That is a
+            # dispatch-shaped failure, not a refusal, and an operator has
+            # nothing to act on — see Layer 6 in repair_node.
+            logger.info(
+                "[router] zero_patch_loop suppressed: last round hit the "
+                "output token cap without completing a patch block. The "
+                "budget ran out — the model did not decline."
             )
         elif bool(loop_counter.get("asserted_correct_round")):
             # Same principle as the unparsed carve-out above, one step

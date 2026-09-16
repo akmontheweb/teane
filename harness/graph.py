@@ -3167,6 +3167,13 @@ _PATCHING_READ_FILE_CAP = 10
 # ``llm_dispatch.max_continuation_cycles`` in config.json (clamped to
 # [1, 10] at read time — see :func:`_resolve_max_continuation_cycles`).
 _MAX_CONTINUATION_CYCLES = 5
+# How much of a truncated, block-free response to keep. The head is
+# where the diagnosis lives when there is one; the tail is where a
+# model talks itself out of it. See _cap_runaway_deliberation.
+_DELIBERATION_HEAD_CHARS = 4000
+# Sentinel that makes _cap_runaway_deliberation idempotent — a
+# capped response is still truncated, block-free and over budget.
+_DELIBERATION_CAP_MARKER = "[harness: deliberation capped]"
 
 # Per-role default for ``continue_on_length`` when the operator's
 # config.json omits the section or the role entry. Patching's default
@@ -3198,6 +3205,26 @@ def _resolve_continue_on_length(
     default = _CONTINUE_ON_LENGTH_DEFAULTS.get(role, False)
     val = role_map.get(role, default)
     return bool(val) if val is not None else default
+
+
+def _resolve_deliberation_head_chars(state_or_cfg: Any) -> int:
+    """Resolve how much of a runaway deliberation to keep.
+
+    Same contract as :func:`_resolve_max_continuation_cycles`: accepts an
+    ``AgentState`` or the ``llm_dispatch_config`` dict directly. Clamps to
+    ``[500, 40000]`` and falls back to
+    :data:`_DELIBERATION_HEAD_CHARS` on a missing or malformed value.
+    """
+    if isinstance(state_or_cfg, dict) and "llm_dispatch_config" in state_or_cfg:
+        cfg = state_or_cfg.get("llm_dispatch_config", {}) or {}
+    else:
+        cfg = state_or_cfg or {}
+    raw = cfg.get("deliberation_head_chars", _DELIBERATION_HEAD_CHARS)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _DELIBERATION_HEAD_CHARS
+    return max(500, min(40000, val))
 
 
 def _resolve_max_continuation_cycles(
@@ -8794,6 +8821,80 @@ def _format_rewrite_file_noop_directive(rw_noops: dict[str, int]) -> str:
     for f in stuck:
         lines.append(f"- `{f}` ({rw_noops[f]})")
     return "\n".join(lines) + "\n"
+
+
+def _cap_runaway_deliberation(
+    response: Any, *, head_chars: int, node_label: str,
+) -> bool:
+    """Truncate a response that spent its whole output budget on prose.
+
+    Returns True when the content was capped.
+
+    A repair response that hit ``finish_reason == "length"`` and carries no
+    parseable patch block and no READ_FILE block is deliberation that never
+    arrived anywhere. It cannot be applied, and left intact it is actively
+    harmful: it enters the conversation history and inflates every
+    subsequent call.
+
+    lumina-run7-20260915-1345 measured both halves of that cost. Repair call
+    0064 returned 140,425 characters, spent the full 32,768-token cap at
+    $0.0288 (a normal repair round on that run cost ~$0.006), and the very
+    next call's input ballooned from a ~63k-token baseline to 94,714 tokens
+    at $0.0206. Call 0047 did the same thing with 141,172 characters.
+
+    The head is kept rather than the whole thing discarded, because the head
+    is where the signal was. Call 0064's FIRST paragraph reached the correct
+    conclusion -- "the only way to make this pass without modifying the test
+    is to make the API route use a fixed date. But that breaks production
+    behavior" -- which is precisely the UNSATISFIABLE_TEST case. What
+    followed was 140,000 characters of the model talking itself out of it
+    ("Wait -- actually...", "Hmm, let me think about this differently...").
+    Keeping the head preserves that reasoning for the next round; dropping
+    the tail stops it compounding.
+    """
+    if str(getattr(response, "finish_reason", "") or "") != "length":
+        return False
+    content = str(getattr(response, "content", "") or "")
+    if len(content) <= head_chars:
+        return False
+    # Idempotent: a capped response still reads as truncated, block-free and
+    # over budget, so without this a second pass would truncate the notice
+    # below and append another copy of it.
+    if _DELIBERATION_CAP_MARKER in content:
+        return False
+    try:
+        from harness.patcher import parse_patch_blocks, parse_read_blocks
+        if parse_patch_blocks(content) or parse_read_blocks(content):
+            # Something actionable survived; the normal paths own it.
+            return False
+    except Exception:  # noqa: BLE001 — capping must never break a round
+        return False
+    response.content = (
+        content[:head_chars]
+        + f"\n\n{_DELIBERATION_CAP_MARKER} Your response hit the output "
+        "token cap after "
+        f"{len(content):,} characters without completing a single patch or "
+        "READ_FILE block, so it was truncated here. Nothing above could be "
+        "applied. Do not re-derive it: commit to ONE concrete edit and emit "
+        "the block, or emit the UNSATISFIABLE_TEST line if no production "
+        "change can satisfy the failing test."
+    )
+    logger.warning(
+        "[%s] Capped runaway deliberation: %d chars of prose hit the output "
+        "cap with no patch or READ_FILE block. Keeping the first %d chars "
+        "(the diagnosis, where there is one) and dropping the rest so it "
+        "does not inflate every later call.",
+        node_label, len(content), head_chars,
+    )
+    try:
+        from harness.observability import emit_event as _emit_cap
+        _emit_cap(
+            "runaway_deliberation_capped",
+            chars=len(content), kept=head_chars, node=node_label,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    return True
 
 
 def _format_last_word_corrections(loop_counter: dict[str, Any]) -> str:
@@ -19697,6 +19798,17 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # dataclass — see harness/gateway.py:LLMResponse.
         if len(_repair_chunks) > 1:
             response.content = "\n".join(c for c in _repair_chunks if c)
+
+        # Cap a response that spent its entire output budget deliberating
+        # without ever reaching a block. Runs AFTER the continuation splice
+        # so it judges the full accumulated text, and BEFORE the READ_FILE
+        # cycle so a capped response still flows through the normal paths
+        # (the cap is a no-op when anything parseable survived).
+        _cap_runaway_deliberation(
+            response,
+            head_chars=_resolve_deliberation_head_chars(state),
+            node_label="repair_node",
+        )
 
         # READ_FILE machinery (B3) — resolve loop, never-seen-file bonus
         # round, forced-patch retry. Shared with patching_node; see

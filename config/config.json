@@ -254,6 +254,7 @@
             "code_reviewer": false
         },
         "max_continuation_cycles": 5,
+    "deliberation_head_chars": 4000,
         "patching_read_file_cap": 20,
         "patching_emission_rounds": 10,
         "read_file_rounds": 6,

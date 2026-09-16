@@ -1131,6 +1131,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Cap on continuation cycles per dispatch. Clamped to [1, 10]
         # in graph._resolve_max_continuation_cycles; default 5.
         "max_continuation_cycles",
+        # How much of a truncated, block-free response to keep before the
+        # rest is dropped. Clamped to [500, 40000] in
+        # graph._resolve_deliberation_head_chars; default 4000.
+        "deliberation_head_chars",
         # Cap on read_file tool-use rounds inside one patching turn.
         # Clamped to [1, 30] in graph._resolve_patching_read_file_cap;
         # default 10.
@@ -1465,6 +1469,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "test_generation.pre_repair_triage": (bool,),
     "test_generation.triage_gate_max_regens": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.
+    "llm_dispatch.deliberation_head_chars": (int,),
     "test_regeneration.enabled": (bool,),
     "test_regeneration.max_attempts_per_test": (int,),
     "test_regeneration.max_noop_rounds": (int,),

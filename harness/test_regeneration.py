@@ -250,6 +250,14 @@ def _norm(path: str, workspace: str) -> str:
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
+# Breadth bounds for the regenerated suite. Deliberately modest: the node
+# rewrites ONE file to get a build unstuck, not to reach coverage targets.
+# See the size-budget block in the prompt builder for the run that motivated
+# these.
+_REGEN_MAX_TESTS = 12
+_REGEN_MAX_LINES = 400
+
+
 _REGEN_SYSTEM = (
     "You are the TEST AUTHOR rewriting ONE defective unit-test file. The repair "
     "loop proved it unsatisfiable — no production change can make it pass as "
@@ -320,10 +328,33 @@ def build_regeneration_messages(
             f"{spec_tiebreaker[:4000]}\n"
         )
     parts.append(
-        "Rewrite the ONE test file as a comprehensive unit suite for the module "
-        "above, anchored on its contract. Emit only the canonical "
+        # "Comprehensive" with no stopping condition is what produced
+        # lumina-run8-20260916-2043: three regenerations of
+        # server/tests/test_employee.py, each running the full 32,768-token
+        # output budget from a ~2,100-token prompt and truncating
+        # mid-identifier. One ended in generated filler
+        # (`sundarpichaiantepenultimate="value"`), another mid-expression on
+        # `r"Alice\n" * 10**5`. None closed its block, so all three applied
+        # zero blocks and the file exhausted its attempts having written
+        # nothing. The model was not malfunctioning — it was following an
+        # instruction with no bound, against a budget it could not see.
+        #
+        # So the breadth is bounded explicitly and the model is told to stop.
+        "Rewrite the ONE test file as a focused unit suite for the module "
+        "above, anchored on its contract.\n"
+        "SIZE BUDGET — this is a hard requirement, not a guideline:\n"
+        f"  * At most {_REGEN_MAX_TESTS} test functions. Choose the highest-"
+        "value cases: the contract's happy path, its documented error "
+        "conditions, and the boundaries named in the failing output above.\n"
+        "  * Do NOT enumerate exhaustive permutations, generated names, or "
+        "synthetic stress inputs. One representative case per behaviour.\n"
+        f"  * Keep the whole file under {_REGEN_MAX_LINES} lines.\n"
+        "  * You have a finite output budget. A complete short suite is "
+        "correct; a long one truncated mid-file is worthless and will be "
+        "discarded — it cannot even be parsed.\n"
+        "Emit only the canonical "
         "<<<REWRITE_FILE>>> / file: / content: / <<<END_REWRITE_FILE>>> block "
-        "described in the rules — no ``` fences, no prose."
+        "described in the rules — no ``` fences, no prose. Close the block."
     )
     return [
         {"role": "system", "content": _REGEN_SYSTEM},
@@ -526,6 +557,57 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             return _give_up("gateway_error", str(exc))
         token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
         content = response.content or ""
+
+        # A response that hit the output cap is not a candidate for anything
+        # downstream. Two distinct hazards, both seen on
+        # lumina-run8-20260916-2043 where all three regenerations of
+        # server/tests/test_employee.py ran the full 32,768-token budget:
+        #
+        #   1. It cannot be parsed — the block never closes — so it reaches
+        #      the "0 blocks applied" path having burned an attempt.
+        #   2. Worse, ``salvage_canonical_rewrite`` below exists to rescue a
+        #      body emitted in a non-canonical dialect. A TRUNCATED body is
+        #      not non-canonical, it is INCOMPLETE, and salvaging one would
+        #      re-wrap half a file and write it over a real test. That is
+        #      precisely the shape of the NameError this run ended on: a test
+        #      file missing its own imports.
+        #
+        # So truncation short-circuits before salvage, and the retry nudge
+        # tells the model the cause rather than repeating the same request.
+        if str(getattr(response, "finish_reason", "") or "") == "length":
+            logger.warning(
+                "[test_regeneration_node] %s regeneration hit the output "
+                "token cap (%d chars, no closing block) — discarding it "
+                "unparsed rather than salvaging a half-written file.",
+                rel, len(content),
+            )
+            try:
+                from harness.observability import emit_event as _emit_rt
+                _emit_rt(
+                    "test_regen_truncated",
+                    file=rel, chars=len(content), attempt=_attempt,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+            if _attempt == 0:
+                # Re-ask with the size budget made urgent, not the generic
+                # block-only nudge: the model did emit a block, it just
+                # never finished one.
+                _retry_nudge = (
+                    "Your previous response was cut off by the output token "
+                    "limit before the block closed, so nothing could be "
+                    "applied. Emit a SHORTER suite — far fewer test "
+                    "functions, no exhaustive permutations, no generated or "
+                    "synthetic inputs. A small complete file is correct; a "
+                    "large truncated one is worthless. Close the "
+                    "<<<END_REWRITE_FILE>>> marker."
+                )
+                continue
+            return _give_up(
+                "truncated",
+                f"regeneration hit the output token cap twice ({len(content)} "
+                "chars) without closing a block",
+            )
 
         # --- Pre-apply gate: only the declared test path may be touched ---
         targets = {_norm(t, workspace) for t in patch_target_paths(content)}

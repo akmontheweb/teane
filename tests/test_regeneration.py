@@ -612,3 +612,125 @@ class TestZeroBlockRegenerationIsRefundedOnce:
         self._apply(lc, "a.py", applied=0)
         self._apply(lc, "b.py", applied=0)
         assert lc["test_regen_attempts"] == {"a.py": 0, "b.py": 0}
+
+
+# --- regeneration must not spend a build on output it cannot finish ---
+
+class _TruncResp:
+    """A response that hit the output token cap mid-write."""
+
+    def __init__(self, content, finish_reason="length"):
+        self.content = content
+        self.finish_reason = finish_reason
+        self.usage = {}
+
+
+class _SeqGateway:
+    """Returns a scripted sequence of responses, recording the prompts."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def dispatch(self, **kw):
+        self.calls.append(kw.get("messages") or [])
+        resp = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+        return resp, kw.get("budget_remaining_usd", 1.0)
+
+    def aggregate_tokens(self, tt, usage):
+        return tt
+
+
+class TestRegenerationPromptIsBounded:
+    """"Comprehensive" with no stopping condition is what produced run 8.
+
+    lumina-run8-20260916-2043 regenerated server/tests/test_employee.py three
+    times. Each call ran the full 32,768-token output budget from a ~2,100
+    token prompt and truncated mid-identifier -- one ending in generated
+    filler (`sundarpichaiantepenultimate="value"`), another mid-expression on
+    `r"Alice\\n" * 10**5`. None closed its block, so all three applied zero
+    blocks and the file exhausted its attempts having written nothing.
+    """
+
+    def _prompt(self):
+        msgs = build_regeneration_messages(
+            test_rel_path="tests/t.py", test_source="x",
+            code_module_path="app/m.py", code_module_source="def f(): ...",
+            module_symbols=["f"], unsat_reason="r", failing_output="o",
+        )
+        return " ".join(m["content"] for m in msgs)
+
+    def test_states_a_hard_test_count_budget(self):
+        assert "SIZE BUDGET" in self._prompt()
+
+    def test_does_not_ask_for_a_comprehensive_suite(self):
+        """The unbounded word is the bug — it must not survive."""
+        assert "comprehensive unit suite" not in self._prompt()
+
+    def test_forbids_exhaustive_permutations(self):
+        p = self._prompt()
+        assert "Do NOT enumerate exhaustive permutations" in p
+
+    def test_explains_that_a_truncated_file_is_worthless(self):
+        """The model cannot see its own budget; it has to be told."""
+        p = self._prompt()
+        assert "finite output budget" in p
+        assert "truncated" in p
+
+
+@pytest.mark.asyncio
+class TestTruncatedRegenerationIsDiscarded:
+    async def test_truncated_response_is_never_salvaged(self, tmp_path, monkeypatch):
+        """Salvage re-wraps a non-canonical body. A truncated body is not
+        non-canonical, it is INCOMPLETE — salvaging one writes half a file
+        over a real test, which is the NameError shape run 8 ended on.
+        """
+        ws = str(tmp_path)
+        rel = "tests/test_employee.py"
+        target = tmp_path / "tests"
+        target.mkdir(parents=True, exist_ok=True)
+        original = "import pytest\n\n\ndef test_ok():\n    assert True\n"
+        (target / "test_employee.py").write_text(original)
+
+        # A body that would salvage cleanly if it were merely non-canonical.
+        truncated = (
+            "<<<REWRITE_FILE>>>\nfile: tests/test_employee.py\ncontent:\n"
+            "class TestEmployee:\n    def test_a(self):\n        emp = Employee(\n"
+            "            first_name"
+        )
+        gw = _SeqGateway(_TruncResp(truncated), _TruncResp(truncated))
+        monkeypatch.setattr("harness.graph.get_gateway", lambda: gw)
+
+        st = _state(ws, rel)
+        st["test_regeneration_config"]["max_attempts_per_test"] = 2
+        out = await regeneration_node(st)
+
+        assert (target / "test_employee.py").read_text() == original, (
+            "a truncated regeneration must never overwrite the real test file"
+        )
+        detail = (out.get("node_state", {})
+                  .get("test_regeneration", {}) or {})
+        assert detail.get("status") == "truncated"
+
+    async def test_retry_nudge_names_the_real_cause(self, tmp_path, monkeypatch):
+        """The generic block-only nudge is wrong here: the model DID emit a
+        block, it just never finished one. Re-asking the same way repeats it.
+        """
+        ws = str(tmp_path)
+        rel = "tests/test_employee.py"
+        target = tmp_path / "tests"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "test_employee.py").write_text("import pytest\n")
+
+        gw = _SeqGateway(_TruncResp("<<<REWRITE_FILE>>>\nfile: tests/test_employee.py\ncontent:\nx"),
+                         _TruncResp("<<<REWRITE_FILE>>>\nfile: tests/test_employee.py\ncontent:\ny"))
+        monkeypatch.setattr("harness.graph.get_gateway", lambda: gw)
+
+        st = _state(ws, rel)
+        st["test_regeneration_config"]["max_attempts_per_test"] = 2
+        await regeneration_node(st)
+
+        assert len(gw.calls) >= 2, "truncation on attempt 0 must retry once"
+        second = " ".join(m.get("content", "") for m in gw.calls[1])
+        assert "cut off by the output token limit" in second
+        assert "SHORTER" in second

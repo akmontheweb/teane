@@ -244,7 +244,7 @@
             "doc_reviewer": 32768,
             "code_reviewer": 32768,
             "decomposition": 32768,
-            "decomposition_reviewer": 8192
+            "decomposition_reviewer": 32768
         },
         "continue_on_length": {
             "planning": true,
@@ -254,7 +254,7 @@
             "code_reviewer": false
         },
         "max_continuation_cycles": 5,
-    "deliberation_head_chars": 4000,
+        "deliberation_head_chars": 4000,
         "patching_read_file_cap": 20,
         "patching_emission_rounds": 10,
         "read_file_rounds": 6,

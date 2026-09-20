@@ -421,11 +421,156 @@ def _slice_span(
 _PY_IMPORT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"NameError:\s*name\s*'(?P<sym>\w+)'\s*is\s*not\s*defined"),
     re.compile(r"name\s*'(?P<sym>\w+)'\s*is\s*not\s*defined"),
+    # STATIC_UNDEFINED_NAME, emitted by harness.static_preflight before the
+    # sandbox runs. Without this row the preflight finds the defect in 0.02s
+    # and still hands it to the repair loop, which throws away most of the
+    # win — the point of finding it early is to fix it without an LLM.
+    re.compile(r"`(?P<sym>\w+)`\s+is used here but never imported"),
 ]
 _TS_IMPORT_PATTERN = re.compile(r"Cannot find name\s*'(?P<sym>\w+)'")
 _JAVA_IMPORT_PATTERN = re.compile(
     r"cannot find symbol[\s\S]*?symbol:\s*(?:class|method|variable)\s+(?P<sym>\w+)"
 )
+
+
+# Symbols that are importable but have NO definition anywhere in the
+# workspace, because they live in the stdlib or an installed package.
+#
+# R2 resolves a missing symbol by grep-walking the workspace for its
+# definition and requiring EXACTLY ONE match. That rule is correct for
+# first-party code and structurally blind to everything else: `pytest` has
+# zero workspace definitions, so the count is 0, so R2 returns None — every
+# time, by construction.
+#
+# lumina-run8-20260916-2043 is the cost of that gap. `_detect_missing_symbol`
+# correctly extracted ('python', 'pytest') from the diagnostic and R2 then
+# declined to act, so a one-line import went to the repair loop and the run
+# died on it. The detector was already right; only the resolution source was
+# incomplete.
+#
+# Closed allowlist, deliberately. A name absent from this table behaves
+# exactly as it does today — this adds capability without adding a failure
+# mode. Entries map symbol -> import statement, so `Path` can become
+# ``from pathlib import Path`` rather than a wrong ``import Path``.
+_PY_STDLIB_IMPORTS: dict[str, str] = {
+    name: f"import {name}" for name in (
+        "asyncio", "base64", "collections", "contextlib", "copy", "csv",
+        "dataclasses", "datetime", "decimal", "enum", "functools", "glob",
+        "hashlib", "io", "itertools", "json", "logging", "math", "os",
+        "pathlib", "pickle", "random", "re", "shutil", "socket", "sqlite3",
+        "string", "subprocess", "sys", "tempfile", "textwrap", "threading",
+        "time", "traceback", "types", "typing", "unittest", "uuid", "warnings",
+    )
+}
+_PY_STDLIB_IMPORTS.update({
+    "Path": "from pathlib import Path",
+    "dataclass": "from dataclasses import dataclass",
+    "field": "from dataclasses import field",
+    "defaultdict": "from collections import defaultdict",
+    "OrderedDict": "from collections import OrderedDict",
+    "Counter": "from collections import Counter",
+    "namedtuple": "from collections import namedtuple",
+    "Decimal": "from decimal import Decimal",
+    "Enum": "from enum import Enum",
+    "date": "from datetime import date",
+    "datetime_cls": "from datetime import datetime",
+    "timedelta": "from datetime import timedelta",
+    "timezone": "from datetime import timezone",
+    "UUID": "from uuid import UUID",
+    "wraps": "from functools import wraps",
+    "lru_cache": "from functools import lru_cache",
+    "suppress": "from contextlib import suppress",
+    "Any": "from typing import Any",
+    "Optional": "from typing import Optional",
+    "mock": "from unittest import mock",
+})
+
+# Third-party names. Unlike stdlib these need an installed-check before the
+# import is emitted: writing ``import httpx`` into a project that does not
+# depend on httpx trades a NameError for a ModuleNotFoundError, which is not
+# a fix. See _module_is_importable.
+_PY_THIRD_PARTY_IMPORTS: dict[str, str] = {
+    "pytest": "import pytest",
+    "httpx": "import httpx",
+    "requests": "import requests",
+    "numpy": "import numpy",
+    "pandas": "import pandas",
+    "yaml": "import yaml",
+    "responses": "import responses",
+    "freeze_time": "from freezegun import freeze_time",
+    "FastAPI": "from fastapi import FastAPI",
+    "TestClient": "from fastapi.testclient import TestClient",
+    "BaseModel": "from pydantic import BaseModel",
+    "Field": "from pydantic import Field",
+    "MagicMock": "from unittest.mock import MagicMock",
+    "AsyncMock": "from unittest.mock import AsyncMock",
+    "patch": "from unittest.mock import patch",
+}
+
+
+# Test-support packages the sandbox install step always provides, whatever
+# the project's own manifests say. Kept in sync with
+# _compose_prod_smoke_install_step / the build command's fixed preamble.
+_SANDBOX_GUARANTEED = frozenset({
+    "pytest", "hypothesis", "httpx", "freezegun", "responses",
+})
+
+
+def _module_available_to_workspace(module: str, workspace_path: str) -> bool:
+    """True when ``module`` will resolve where the workspace's tests RUN.
+
+    The environment that matters is the sandbox, not this process. Checking
+    the harness venv alone gets this wrong in both directions: freezegun is
+    installed by the sandbox preamble but absent here, and a package present
+    here may be missing from the target project entirely.
+
+    So: guaranteed sandbox packages, then the workspace's own declared
+    dependencies, and only then this runtime as a last resort. Fails closed —
+    an unknown package returns False and the diagnostic goes to the LLM,
+    because emitting an import for a dependency that does not exist trades a
+    NameError for a ModuleNotFoundError, which is not a fix.
+    """
+    top = module.split(".")[0]
+    if top in _SANDBOX_GUARANTEED:
+        return True
+    for manifest in (
+        "requirements.txt", "requirements-dev.txt", "pyproject.toml",
+        os.path.join("server", "requirements.txt"),
+        os.path.join("server", "requirements-dev.txt"),
+        os.path.join("server", "pyproject.toml"),
+    ):
+        path = os.path.join(workspace_path, manifest)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if re.search(rf"(?mi)^\s*[\"']?{re.escape(top)}\b", text):
+            return True
+    import importlib.util
+    try:
+        return importlib.util.find_spec(top) is not None
+    except (ImportError, ValueError, ModuleNotFoundError):
+        return False
+
+
+def _known_import_statement(
+    symbol: str, workspace_path: str,
+) -> Optional[str]:
+    """Import statement for a symbol with no workspace definition, or None.
+
+    Stdlib entries are returned unconditionally — the stdlib is present by
+    definition. Third-party entries are gated on the package being available
+    where the tests actually run.
+    """
+    stmt = _PY_STDLIB_IMPORTS.get(symbol)
+    if stmt:
+        return stmt
+    stmt = _PY_THIRD_PARTY_IMPORTS.get(symbol)
+    if not stmt:
+        return None
+    module = stmt.split()[1]
+    return stmt if _module_available_to_workspace(module, workspace_path) else None
 
 
 def _try_missing_import(
@@ -457,11 +602,28 @@ def _try_missing_import(
     file_abs = os.path.join(workspace_path, rel_file)
 
     candidates = _find_definitions(workspace_path, language, symbol, file_abs)
-    if len(candidates) != 1:
-        return None
-
-    def_path = candidates[0]
-    import_stmt = _build_import_statement(language, symbol, def_path, file_abs, workspace_path)
+    import_stmt: Optional[str]
+    if len(candidates) == 1:
+        import_stmt = _build_import_statement(
+            language, symbol, candidates[0], file_abs, workspace_path,
+        )
+    elif not candidates and language == "python":
+        # Zero workspace definitions used to mean "give up". For a stdlib or
+        # installed-package symbol that is not ambiguity — it is the only
+        # possible answer, and the workspace was simply the wrong place to
+        # look. Consult the closed allowlist instead.
+        #
+        # The ambiguous case (len > 1) is untouched: two candidate
+        # definitions still go to the LLM, which has the context to choose.
+        import_stmt = _known_import_statement(symbol, workspace_path)
+        if import_stmt:
+            logger.info(
+                "[autofix:R2] `%s` has no workspace definition but is a "
+                "known import — emitting `%s` for %s without an LLM call.",
+                symbol, import_stmt, rel_file,
+            )
+    else:
+        import_stmt = None
     if not import_stmt:
         return None
 

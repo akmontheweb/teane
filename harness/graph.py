@@ -15683,6 +15683,60 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # their own, with a [PROD_IMPORT_SMOKE] error_code tag the repair
     # node + cascade hints recognise.
     gw_for_cfg = get_gateway()
+    # --- Static preflight (fix D) ---------------------------------------
+    # Name-resolution defects need no container to find. Running this before
+    # the sandbox turns a Docker build + test run + reflection round + N
+    # regenerations into a 0.02s check that names the file and line.
+    #
+    # lumina-run8-20260916-2043 spent the whole run discovering one missing
+    # import this way. Measured against that workspace: 1 diagnostic, exact
+    # line, 0.02s.
+    #
+    # Findings are returned as this round's diagnostics and the sandbox is
+    # skipped -- there is no point compiling code that cannot execute its
+    # first line, and the repair loop reads these exactly like any other
+    # compiler_errors entry. The checker is false-negative-biased and never
+    # raises, so an empty result simply falls through to the normal build.
+    try:
+        from harness.static_preflight import run_static_preflight
+        _preflight_diags = run_static_preflight(workspace)
+    except Exception:  # noqa: BLE001 — preflight must never block a build
+        _preflight_diags = []
+    if _preflight_diags:
+        logger.warning(
+            "[compiler_node] Static preflight found %d defect(s) that cannot "
+            "survive execution; using them as this round's diagnostics and "
+            "skipping the sandbox build.",
+            len(_preflight_diags),
+        )
+        try:
+            from harness.observability import emit_event as _emit_sp
+            _emit_sp(
+                "static_preflight_short_circuit",
+                count=len(_preflight_diags),
+                files=sorted({d["file"] for d in _preflight_diags})[:10],
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        return {
+            "exit_code": 1,
+            "compiler_errors": _preflight_diags,
+            "node_state": {
+                "current_node": "compiler",
+                "static_preflight": {
+                    "count": len(_preflight_diags),
+                    "skipped_sandbox": True,
+                },
+            },
+            "loop_counter": loop_counter,
+            # Same contract as the prod-smoke and link-check short-circuits
+            # below: a round that returns diagnostics must rotate the
+            # fingerprints, or the "[persisted from previous round]" marker
+            # and every staleness check downstream read this round as though
+            # it never happened.
+            **_rotate_diag_fingerprints_delta(state, _preflight_diags),
+        }
+
     smoke_enabled = True
     if gw_for_cfg is not None:
         # The flag lives under config.compiler.run_prod_import_smoke_check

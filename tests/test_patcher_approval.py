@@ -197,7 +197,7 @@ def test_apply_without_approval_flag_is_byte_identical_to_pre_phase_5(tmp_path, 
     monkeypatch.setattr(_hitl_mod, "get_channel", lambda: stub)
     block = PatchBlock(
         operation=OperationType.CREATE_FILE, file="baseline.py",
-        content="OK\n",
+        content="OK = 1\n",  # valid Python: the gate now rejects a bare undefined name
     )
     results, modified = _run(apply_patch_blocks(
         [block], str(tmp_path),  # require_approval omitted
@@ -217,7 +217,7 @@ def test_apply_gate_channel_error_falls_through_to_approve(tmp_path, monkeypatch
     monkeypatch.setattr(_hitl_mod, "get_channel", lambda: _BrokenChannel("reject"))
     block = PatchBlock(
         operation=OperationType.CREATE_FILE, file="fallback.py",
-        content="OK\n",
+        content="OK = 1\n",  # valid Python: the gate now rejects a bare undefined name
     )
     results, modified = _run(apply_patch_blocks(
         [block], str(tmp_path), require_approval=True,

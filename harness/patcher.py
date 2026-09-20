@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -59,6 +60,94 @@ logger = logging.getLogger(__name__)
 _VALIDATED_SUFFIXES = (".py", ".json")
 
 
+# Names that look undefined to a static checker but are injected at runtime.
+# A file using any of these opts out of the undefined-name gate entirely —
+# a false positive here ROLLS BACK A GOOD PATCH, which is strictly worse
+# than missing a bad one.
+_DYNAMIC_NAME_MARKERS = (
+    "globals()", "locals()", "exec(", "eval(",
+    "import *",          # star-import: the names genuinely are not visible
+    "# noqa: F821", "# type: ignore",
+)
+
+
+def _undefined_names(content: str) -> Optional[str]:
+    """Return a message naming undefined references in ``content``, else None.
+
+    ``ast.parse`` accepts a file that references a name it never imports, so
+    the existing syntax gate lets that through and the failure only surfaces
+    when the test actually runs.
+
+    lumina-run8-20260916-2043 is the worked example, and the cost of
+    discovering it dynamically was the whole run. ``server/tests/test_employee.py``
+    was generated complete and well-formed -- 44 lines, docstring, closing
+    assertion -- using ``pytest.raises`` at line 32 while importing only
+    ``Employee``. That one missing import cost a Docker build, a reflection
+    round, three 32,768-token regenerations (~$0.088), three
+    persistent_build_failure auto-resumes, and finally the run. Ruff reports
+    it in milliseconds, before the file is ever written.
+
+    Deliberately conservative, because a false positive rolls back a patch
+    the model got RIGHT:
+
+      * anything with dynamic name injection or a star-import is skipped
+        wholesale (see :data:`_DYNAMIC_NAME_MARKERS`)
+      * ruff runs ``--isolated`` so a workspace config cannot widen the rule
+      * only F821 is selected -- not unused imports, not style
+      * any failure to run ruff at all returns None rather than blocking
+
+    The caller's rollback contract does the rest of the work: a patch is only
+    reverted when the file was CLEAN before and is BROKEN after, so a
+    pre-existing undefined name never blocks an edit.
+    """
+    if any(marker in content for marker in _DYNAMIC_NAME_MARKERS):
+        return None
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False, encoding="utf-8",
+        ) as fh:
+            fh.write(content)
+            tmp = fh.name
+    except OSError:
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "ruff", "check",
+             "--isolated", "--select", "F821",
+             "--output-format", "concise", tmp],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Ruff absent or unrunnable in this runtime. Skip rather than block
+        # patches on our own missing tooling -- same contract as the
+        # ``packaging`` import below.
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if proc.returncode == 0 or not proc.stdout.strip():
+        return None
+    names: list[str] = []
+    for line in proc.stdout.splitlines():
+        m = re.search(r"Undefined name `([^`]+)`", line)
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    if not names:
+        return None
+    joined = ", ".join(f"`{n}`" for n in names[:5])
+    more = f" (+{len(names) - 5} more)" if len(names) > 5 else ""
+    return (
+        f"Undefined name(s): {joined}{more}. The file parses, but these "
+        "names are never imported, defined, or passed in as a fixture "
+        "parameter — running it raises NameError on the first use. Add the "
+        "missing import(s) or define the name."
+    )
+
+
 def _validate_syntax(filepath: str, content: str) -> Optional[str]:
     """Return an error-message string when ``content`` doesn't parse for
     the language implied by ``filepath``, otherwise None.
@@ -73,7 +162,6 @@ def _validate_syntax(filepath: str, content: str) -> Optional[str]:
     if filepath.endswith(".py"):
         try:
             ast.parse(content)
-            return None
         except SyntaxError as e:
             loc = f"line {e.lineno}" if e.lineno else "unknown line"
             return f"SyntaxError at {loc}: {e.msg}"
@@ -81,6 +169,11 @@ def _validate_syntax(filepath: str, content: str) -> Optional[str]:
             # Empty ``\x00`` bytes and similar make ast.parse raise ValueError
             # rather than SyntaxError. Treat them the same for rollback.
             return f"ValueError during Python parse: {e}"
+        # Parsing is necessary but not sufficient: a file that references a
+        # name it never imports parses cleanly and raises NameError the
+        # moment it runs. See _undefined_names for the run that motivated
+        # extending the gate this one step.
+        return _undefined_names(content)
     if filepath.endswith(".json"):
         try:
             json.loads(content)

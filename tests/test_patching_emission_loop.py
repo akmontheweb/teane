@@ -410,7 +410,7 @@ class TestEmissionContinuation:
         _install_gateway(monkeypatch)
         responses = [
             _Response(
-                "<<<CREATE_FILE>>>\nfile: server/a.py\ncontent:\nx\n"
+                "<<<CREATE_FILE>>>\nfile: server/a.py\ncontent:\nx = 1\n"
                 "<<<END_CREATE_FILE>>>",
                 finish_reason="stop",
             ),

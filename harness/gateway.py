@@ -112,6 +112,47 @@ class TokenUsage:
         }
 
 
+def truncation_nudge(kind: str = "output") -> str:
+    """Retry text for a response that was cut off by the output cap.
+
+    The failure mode this exists to prevent is naming the WRONG cause. When
+    a truncated JSON payload fails to parse, the obvious message is "your
+    JSON was invalid" — and a model told that will re-emit the same
+    oversized payload and truncate again in exactly the same place.
+    decomposition.py did this: ``parse_error = f"invalid_json: {exc}"`` on
+    a response that was never invalid, only unfinished.
+
+    ``kind`` selects the shape being asked for so the instruction can name
+    something concrete to cut.
+    """
+    what = {
+        "json": (
+            "Emit a SMALLER payload: fewer items, shorter descriptions, no "
+            "optional fields you were padding with. A compact document that "
+            "parses is correct; a thorough one that stops mid-string is not "
+            "usable at all."
+        ),
+        "patch": (
+            "Emit FEWER blocks — one file at a time if necessary — and close "
+            "every block you open. A single complete block is worth more "
+            "than five that end mid-file."
+        ),
+        "tests": (
+            "Emit a SHORTER suite: far fewer test functions, no exhaustive "
+            "permutations, no generated or synthetic inputs. A small "
+            "complete file is correct; a large truncated one is discarded."
+        ),
+    }.get(kind, (
+        "Emit a SHORTER response and finish it. Partial output cannot be "
+        "used at all."
+    ))
+    return (
+        "Your previous response was cut off by the output token limit "
+        "before it finished — it was not rejected, and nothing about its "
+        f"content was wrong so far as it went. {what}"
+    )
+
+
 @dataclass
 class LLMResponse:
     """Standardized response from any LLM provider."""
@@ -130,6 +171,18 @@ class LLMResponse:
     # only the schema exists; provider wiring is gated behind
     # ``GatewayConfig.use_structured_tools`` and added in a follow-up.
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def truncated(self) -> bool:
+        """True when the provider stopped because the output cap was hit.
+
+        Distinct from every other failure: the model did not decline, error,
+        or misunderstand — it ran out of room mid-write. Callers that parse
+        structured output (JSON, the patch DSL) must treat this differently
+        from a parse error, because the remedy is "emit less", not "emit it
+        correctly". See :func:`truncation_nudge`.
+        """
+        return str(self.finish_reason or "") == "length"
     # Reasoning-model chain-of-thought. Populated when the provider
     # surfaces internal reasoning tokens separately from final ``content``
     # (OpenAI-compat: ``message.reasoning_content`` or ``message.thinking``;
@@ -4205,6 +4258,42 @@ class Gateway:
             )
         except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
             logger.debug("[gateway] LLM-call dump skipped: %s", exc)
+
+        # Truncation is the one failure that looks like success to a
+        # caller that only reads ``content``. Ten of the eleven dispatch
+        # sites in this codebase never check ``finish_reason``, and nine of
+        # those parse JSON — where a cut-off response is not an error but
+        # silent corruption. lumina-run8-20260916-2043 burned three
+        # 32,768-token regenerations this way, and decomposition can fail
+        # validation for the same reason while reporting "invalid_json".
+        #
+        # Changing control flow in every caller risks the paths that work.
+        # Making the event impossible to MISS costs nothing: one warning at
+        # the choke point, naming the role and family so a run trace shows
+        # exactly which call was cut off.
+        if response.truncated:
+            logger.warning(
+                "[gateway] TRUNCATED response: role=%s family=%s model=%s "
+                "hit the output cap (%d chars, %s tokens). The model did "
+                "not finish writing — if this call parses structured "
+                "output, the remedy is to ask for LESS, not to ask again. "
+                "See gateway.truncation_nudge().",
+                getattr(role, "value", role), cache_family or "-",
+                getattr(response, "model", "?"),
+                len(response.content or ""),
+                (response.usage or {}).get("output_tokens", "?")
+                if isinstance(response.usage, dict) else "?",
+            )
+            try:
+                from harness.observability import emit_event as _emit_trunc
+                _emit_trunc(
+                    "llm_response_truncated",
+                    role=str(getattr(role, "value", role)),
+                    family=cache_family or "",
+                    chars=len(response.content or ""),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
 
         return response, new_budget
 

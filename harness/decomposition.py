@@ -2519,11 +2519,37 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
                 data = json.loads(raw)
                 break
             except json.JSONDecodeError as exc:
-                parse_error = f"invalid_json: {exc}"
-                logger.error(
-                    "[decomposition] LLM returned invalid JSON (attempt "
-                    "%d/2): %s", _attempt + 1, exc,
-                )
+                # Distinguish "malformed" from "unfinished". A truncated
+                # payload is not invalid JSON in any sense the model can act
+                # on — it was writing correct JSON and ran out of room. Told
+                # "your JSON was invalid" it re-emits the same oversized
+                # document and stops in the same place, which is how
+                # decomposition_validation_failed reproduces.
+                #
+                # decomposition is absent from BOTH config.json's
+                # continue_on_length map and _CONTINUE_ON_LENGTH_DEFAULTS,
+                # so it resolves to False: there is no continuation to
+                # rescue it, which makes naming the cause the only remedy.
+                if getattr(response, "truncated", False):
+                    parse_error = (
+                        f"truncated_json: cut off at {len(raw)} chars "
+                        f"({exc})"
+                    )
+                    logger.error(
+                        "[decomposition] LLM response was TRUNCATED at the "
+                        "output cap (%d chars), so its JSON never closed "
+                        "(attempt %d/2). Asking for a smaller payload "
+                        "rather than a better-formed one.",
+                        len(raw), _attempt + 1,
+                    )
+                    from harness.gateway import truncation_nudge
+                    _retry_nudge = truncation_nudge("json")
+                else:
+                    parse_error = f"invalid_json: {exc}"
+                    logger.error(
+                        "[decomposition] LLM returned invalid JSON (attempt "
+                        "%d/2): %s", _attempt + 1, exc,
+                    )
         if _attempt == 0:
             # Phase 2 — the model planned in prose but never serialised.
             # Keep the plan, redo only the step that failed. Cheaper and

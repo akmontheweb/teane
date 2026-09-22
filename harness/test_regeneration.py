@@ -254,6 +254,16 @@ def _norm(path: str, workspace: str) -> str:
 # rewrites ONE file to get a build unstuck, not to reach coverage targets.
 # See the size-budget block in the prompt builder for the run that motivated
 # these.
+#: loop_counter key: md5 of the last body this node emitted per test file.
+#: Feeds the anti-repetition note — see the prompt-assembly site.
+_REGEN_EMISSION_KEY = "test_regen_last_emission"
+
+
+def _content_md5(text: str) -> str:
+    import hashlib
+    return hashlib.md5(text.encode("utf-8", "replace")).hexdigest()
+
+
 _REGEN_MAX_TESTS = 12
 _REGEN_MAX_LINES = 400
 
@@ -309,6 +319,8 @@ def build_regeneration_messages(
     unsat_reason: str,
     failing_output: str,
     spec_tiebreaker: str = "",
+    judge_diagnosis: str = "",
+    prior_attempt_note: str = "",
 ) -> list[dict[str, str]]:
     """Assemble the regeneration prompt, code-contract first. Pure/testable."""
     symbols = ", ".join(module_symbols) if module_symbols else "(none detected)"
@@ -322,6 +334,17 @@ def build_regeneration_messages(
         f"### Why the repair loop declared it unsatisfiable\n{unsat_reason}\n",
         f"### Failing test output\n{failing_output[:3000]}\n",
     ]
+    if judge_diagnosis.strip():
+        parts.append(
+            "### The repair judge's diagnosis of this file\n"
+            "(the analysis that routed the file here — it may name the exact "
+            "defect; verify it against the code contract above)\n"
+            f"{judge_diagnosis[:2000]}\n"
+        )
+    if prior_attempt_note.strip():
+        parts.append(
+            f"### Your previous attempt on this file\n{prior_attempt_note}\n"
+        )
     if spec_tiebreaker.strip():
         parts.append(
             "### Specification (TIEBREAKER ONLY — do not cite in the test)\n"
@@ -373,17 +396,72 @@ def _bump_attempt(loop_counter: dict[str, Any], rel: str) -> None:
 
 
 def _failing_output(state: dict[str, Any], rel: str, workspace: str) -> str:
-    """Best-effort pytest tail for the declared test, from compiler_errors."""
+    """Best-effort pytest tail for the declared test, from compiler_errors.
+
+    Each failure is rendered with its IDENTITY, not just its message. The
+    message alone is frequently a bare ``AssertionError: assert (2, 29) ==
+    (2, 28)`` which does not say WHICH test produced it — and a file under
+    regeneration routinely holds several tests over the same symbol, so the
+    author cannot tell which assertion to correct
+    (lumina-run10-20260922-2316: three byte-identical regenerations of
+    test_birthday_service.py, whose two leap-day tests assert opposite
+    outcomes; the harness knew the nodeid — it had just re-run that exact
+    selector — and sent only the message).
+    """
     lines: list[str] = []
     for d in state.get("compiler_errors", []) or []:
         if not isinstance(d, dict):
             continue
-        df = _norm(str(d.get("file", "") or ""), workspace)
+        # ``_norm("")`` returns "." — truthy — so the file-less branch below
+        # was unreachable and a bare failure carrying no path was silently
+        # dropped. Normalise only a path that exists.
+        raw_file = str(d.get("file", "") or "")
+        df = _norm(raw_file, workspace) if raw_file else ""
         if not df or df == _norm(rel, workspace) or df.endswith(rel) or "<" in df:
             msg = str(d.get("message", "") or "")
-            if msg:
-                lines.append(msg)
+            if not msg:
+                continue
+            nodeid = str(d.get("pytest_nodeid", "") or "")
+            line_no = int(d.get("line", 0) or 0)
+            where = nodeid or (f"{df}:{line_no}" if df and line_no else df)
+            head = f"FAILED {where}" if where else "FAILED"
+            if nodeid and line_no:
+                head += f"  (at {df or rel}:{line_no})"
+            lines.append(f"{head}\n{msg}")
+            ctx = str(d.get("semantic_context", "") or "").strip()
+            if ctx and ctx not in msg:
+                lines.append(f"  context: {ctx[:400]}")
     return "\n".join(lines)
+
+
+def _judge_diagnosis(state: dict[str, Any], rel: str) -> str:
+    """The repair judge's verdict on ``rel``, when it named that file.
+
+    The judge routinely works out the exact defect — lumina-run10:
+    "Edit server/tests/test_birthday_service.py:43 to call
+    _effective_month_day with the required reference_year argument" — and
+    that verdict is what makes the router divert here in the first place.
+    It then reached this node as the routing LABEL ("the judge's own
+    recommendation is a test edit") while the diagnosis itself was dropped,
+    leaving the author to re-derive from a bare assertion line. It could
+    not, and re-emitted the same file three times.
+
+    Only a verdict that names this file is used: ``last_reflection_verdict``
+    is deliberately not expired (the judge's own anti-repetition check needs
+    the stale value), so it may describe an earlier round.
+    """
+    verdict = (state.get("loop_counter", {}) or {}).get(
+        "last_reflection_verdict"
+    )
+    if not isinstance(verdict, dict):
+        return ""
+    stem = os.path.basename(rel)
+    parts: list[str] = []
+    for key in ("real_blocker", "recommendation"):
+        text = str(verdict.get(key) or "").strip()
+        if text and stem in text:
+            parts.append(f"{key.replace('_', ' ')}: {text}")
+    return "\n".join(parts)
 
 
 async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -505,6 +583,45 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             spec_tiebreaker = m["content"]
             break
 
+    # Anti-repetition. repair_node has had a fixation trap since 04a9968 —
+    # a byte-identical re-emission is the model CLAIMING the file is already
+    # right, and it must be told so rather than silently spending a round.
+    # The test author had no equivalent: lumina-run10-20260922-2316 returned
+    # the same 7,385-char file on all three calls (md5 25ecc121 each time),
+    # because the only thing that changed between prompts was the
+    # "defective test file" section — now showing the model's OWN previous
+    # output, unlabelled. Naming it is what makes the repetition visible.
+    prior_attempt_note = ""
+    _emissions = loop_counter.get(_REGEN_EMISSION_KEY) or {}
+    _prior_md5 = str(_emissions.get(rel, "") or "") if isinstance(
+        _emissions, dict) else ""
+    if _prior_md5 and _prior_md5 == _content_md5(old_source):
+        prior_attempt_note = (
+            "The 'Defective test file' shown above is the EXACT file you "
+            "emitted on your previous attempt — byte for byte. It was "
+            "applied, the suite was re-run, and it STILL FAILS with the "
+            "output above.\n"
+            "Re-emitting it unchanged writes nothing and spends this file's "
+            "remaining attempt. Do not repeat it.\n"
+            "Work out which specific assertion is wrong and correct it "
+            "against the code contract. If two of your tests assert "
+            "opposite outcomes for the same call, at most one can match the "
+            "contract — fix the other (system rule 5). An assertion that is "
+            "correct per the contract but fails against today's production "
+            "code is fine to keep (system rule 6), but it must be the "
+            "assertion the contract actually implies."
+        )
+        logger.warning(
+            "[test_regeneration_node] %s: the file on disk is byte-identical "
+            "to this node's previous emission — telling the author so "
+            "instead of re-asking the same question.", rel,
+        )
+        try:
+            from harness.observability import emit_event as _emit_rep
+            _emit_rep("test_regen_repeat_emission", file=rel)
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+
     messages = build_regeneration_messages(
         test_rel_path=rel,
         test_source=old_source,
@@ -514,6 +631,8 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         unsat_reason=reason,
         failing_output=_failing_output(state, rel, workspace),
         spec_tiebreaker=spec_tiebreaker,
+        judge_diagnosis=_judge_diagnosis(state, rel),
+        prior_attempt_note=prior_attempt_note,
     )
 
     budget = float(state.get("budget_remaining_usd", 2.00))
@@ -690,6 +809,13 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             "symbol(s); not exercised: %s.",
             rel, len(covered), len(module_symbols), ", ".join(uncovered),
         )
+
+    # Remember what was emitted, keyed by file, so the next attempt can be
+    # told when it produced the same bytes again. Recorded from the file as
+    # WRITTEN (post-gates), which is what the next prompt will display.
+    _emitted = dict(loop_counter.get(_REGEN_EMISSION_KEY, {}) or {})
+    _emitted[rel] = _content_md5(written)
+    loop_counter[_REGEN_EMISSION_KEY] = _emitted
 
     applied = sum(1 for r in patch_results if getattr(r, "success", False))
     if applied == 0:

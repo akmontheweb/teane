@@ -22,6 +22,7 @@ from harness.test_regeneration import (
     salvage_canonical_rewrite,
     build_regeneration_messages,
 )
+from harness.test_regeneration import _failing_output, _judge_diagnosis
 from harness.patcher import _BLOCK_PATTERNS, OperationType
 
 _REWRITE_RE = _BLOCK_PATTERNS[OperationType.REWRITE_FILE]
@@ -734,3 +735,224 @@ class TestTruncatedRegenerationIsDiscarded:
         second = " ".join(m.get("content", "") for m in gw.calls[1])
         assert "cut off by the output token limit" in second
         assert "SHORTER" in second
+
+
+# ---------------------------------------------------------------------------
+# lumina-run10-20260922-2316: three regenerations of
+# server/tests/test_birthday_service.py returned the SAME 7,385-char file
+# (md5 25ecc121 all three times), so two of them applied zero blocks and the
+# attempt cap dropped the run to HITL.
+#
+# The test was genuinely defective —
+#   _effective_month_day(date(1988, 2, 29)) == (2, 28)
+# passes no reference year, so the function falls back to the birth year
+# 1988, a leap year, and correctly returns (2, 29). But the author was given
+# strictly less evidence than repair had:
+#   * "Why unsatisfiable" held the router's LABEL ("the judge's own
+#     recommendation is a test edit"), while the judge's actual diagnosis —
+#     naming the missing reference_year argument — was dropped;
+#   * "Failing test output" was a bare `AssertionError: assert (2, 29) ==
+#     (2, 28)` with no nodeid, in a file whose two leap-day tests assert
+#     opposite outcomes;
+#   * nothing said the file shown was its own previous output.
+# A deterministic model given the same question returns the same answer.
+# ---------------------------------------------------------------------------
+
+_RUN10_VERDICT = {
+    "verdict": "DISTRACTION",
+    "real_blocker": (
+        "server/tests/test_birthday_service.py asserts (2, 28) for a call "
+        "that omits reference_year."
+    ),
+    "recommendation": (
+        "Edit server/tests/test_birthday_service.py:43 to call "
+        "_effective_month_day with the required reference_year argument."
+    ),
+}
+
+
+class TestFailingOutputCarriesTestIdentity:
+    def test_nodeid_and_line_accompany_the_message(self):
+        state = {"compiler_errors": [{
+            "file": "server/tests/test_birthday_service.py",
+            "line": 43,
+            "message": "AssertionError: assert (2, 29) == (2, 28)",
+            "pytest_nodeid": (
+                "server/tests/test_birthday_service.py::"
+                "TestEffectiveMonthDay::test_feb_29_maps_to_feb_28"
+            ),
+        }]}
+        out = _failing_output(
+            state, "server/tests/test_birthday_service.py", "/ws")
+        assert "test_feb_29_maps_to_feb_28" in out, (
+            "the author cannot fix an assertion it cannot identify"
+        )
+        assert ":43" in out
+        assert "assert (2, 29) == (2, 28)" in out
+
+    def test_semantic_context_is_included_once(self):
+        state = {"compiler_errors": [{
+            "file": "tests/t.py", "line": 7, "message": "boom",
+            "semantic_context": "while calling Widget.go()",
+        }]}
+        out = _failing_output(state, "tests/t.py", "/ws")
+        assert "while calling Widget.go()" in out
+        assert out.count("boom") == 1
+
+    def test_message_only_diagnostics_still_render(self):
+        state = {"compiler_errors": [{"file": "", "message": "bare failure"}]}
+        assert "bare failure" in _failing_output(state, "tests/t.py", "/ws")
+
+    def test_junk_entries_are_skipped(self):
+        state = {"compiler_errors": [None, "nope", {"file": "tests/t.py"}]}
+        assert _failing_output(state, "tests/t.py", "/ws") == ""
+
+
+class TestJudgeDiagnosisReachesTheAuthor:
+    def test_verdict_naming_the_file_is_passed_through(self):
+        state = {"loop_counter": {"last_reflection_verdict": _RUN10_VERDICT}}
+        out = _judge_diagnosis(state, "server/tests/test_birthday_service.py")
+        assert "reference_year" in out, (
+            "the diagnosis that justified the diversion must reach the only "
+            "component allowed to act on it"
+        )
+        assert "real blocker" in out and "recommendation" in out
+
+    def test_verdict_about_another_file_is_not_borrowed(self):
+        # last_reflection_verdict is deliberately never expired (the judge's
+        # anti-repetition check needs the stale value), so it may describe an
+        # earlier round on an unrelated file.
+        state = {"loop_counter": {"last_reflection_verdict": _RUN10_VERDICT}}
+        assert _judge_diagnosis(state, "server/tests/test_main.py") == ""
+
+    def test_junk_input_is_ignored(self):
+        for junk in (None, "", {"verdict": "PROGRESS"}):
+            state = {"loop_counter": {"last_reflection_verdict": junk}}
+            assert _judge_diagnosis(state, "tests/t.py") == ""
+
+    def test_prompt_renders_both_new_sections(self):
+        msgs = build_regeneration_messages(
+            test_rel_path="tests/t.py", test_source="x",
+            code_module_path="app/m.py", code_module_source="def f(): ...",
+            module_symbols=["f"], unsat_reason="label",
+            failing_output="FAILED tests/t.py::test_a\nboom",
+            judge_diagnosis="recommendation: pass reference_year",
+            prior_attempt_note="You emitted this exact file last time.",
+        )
+        joined = " ".join(m["content"] for m in msgs)
+        assert "pass reference_year" in joined
+        assert "You emitted this exact file last time." in joined
+
+    def test_sections_omitted_when_empty(self):
+        msgs = build_regeneration_messages(
+            test_rel_path="tests/t.py", test_source="x",
+            code_module_path="app/m.py", code_module_source="def f(): ...",
+            module_symbols=["f"], unsat_reason="r", failing_output="o",
+        )
+        joined = " ".join(m["content"] for m in msgs)
+        assert "judge's diagnosis" not in joined
+        assert "Your previous attempt" not in joined
+
+
+class TestRepeatedEmissionIsNamed:
+    """repair_node has had a fixation trap since 04a9968; the test author
+    had none. A byte-identical re-emission is the model claiming the file is
+    already right — it must be told, not asked the same question again."""
+
+    _GOOD = (
+        "# @tests: app/m.py\n"
+        "class TestWidget:\n"
+        "    def test_go(self):\n"
+        "        assert Widget().go() == 1\n"
+        "    def test_type(self):\n"
+        "        assert isinstance(Widget(), Widget)\n"
+    )
+
+    def _block(self):
+        return (f"<<<REWRITE_FILE>>>\nfile: tests/t.py\ncontent:\n"
+                f"{self._GOOD}<<<END_REWRITE_FILE>>>")
+
+    @pytest.mark.asyncio
+    async def test_second_round_is_told_the_file_is_its_own_output(
+        self, monkeypatch,
+    ):
+        import harness.graph as g
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            fake = _QueueGateway(contents=[self._block()])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            first = await regeneration_node(state)
+
+            # Round 2: same file on disk (NOT re-seeded), carrying round
+            # 1's loop_counter.
+            state2 = _state(ws, rel)
+            state2["loop_counter"] = first["loop_counter"]
+            fake2 = _QueueGateway(contents=[self._block()])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake2)
+            await regeneration_node(state2)
+
+        prompt1 = " ".join(m.get("content", "") for m in fake.calls[0])
+        prompt2 = " ".join(m.get("content", "") for m in fake2.calls[0])
+        assert "previous attempt" not in prompt1.lower(), (
+            "nothing to repeat yet on the first attempt"
+        )
+        assert "EXACT file you emitted on your previous attempt" in prompt2
+        assert "spends this file's remaining attempt" in prompt2
+
+    @pytest.mark.asyncio
+    async def test_a_changed_file_gets_no_repetition_note(self, monkeypatch):
+        import harness.graph as g
+        changed = self._block().replace("== 1", "== 2")
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            fake = _QueueGateway(contents=[self._block()])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            first = await regeneration_node(state)
+
+            # Someone (repair, the operator) changed the file since.
+            with open(os.path.join(ws, rel), "w") as fh:
+                fh.write("# @tests: app/m.py\n" + ORIGINAL)
+            state2 = _regen_setup(ws, rel)
+            state2["loop_counter"] = first["loop_counter"]
+            fake2 = _QueueGateway(contents=[changed])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake2)
+            await regeneration_node(state2)
+
+        prompt2 = " ".join(m.get("content", "") for m in fake2.calls[0])
+        assert "previous attempt" not in prompt2.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_run10_evidence_all_reaches_the_prompt(self, monkeypatch):
+        """End to end: the diagnosis, the failing test's identity and the
+        repetition notice are all in the second call's prompt."""
+        import harness.graph as g
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            state["compiler_errors"] = [{
+                "file": rel, "line": 43,
+                "message": "AssertionError: assert (2, 29) == (2, 28)",
+                "pytest_nodeid": f"{rel}::TestX::test_feb_29_maps_to_feb_28",
+            }]
+            state["loop_counter"] = {"last_reflection_verdict": {
+                "recommendation": (
+                    "Edit tests/t.py:43 to pass the reference_year argument."
+                ),
+            }}
+            fake = _QueueGateway(contents=[self._block()])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            first = await regeneration_node(state)
+
+            state2 = _state(ws, rel)
+            state2["compiler_errors"] = state["compiler_errors"]
+            state2["loop_counter"] = first["loop_counter"]
+            fake2 = _QueueGateway(contents=[self._block()])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake2)
+            await regeneration_node(state2)
+
+        prompt2 = " ".join(m.get("content", "") for m in fake2.calls[0])
+        assert "test_feb_29_maps_to_feb_28" in prompt2
+        assert "reference_year" in prompt2
+        assert "EXACT file you emitted" in prompt2

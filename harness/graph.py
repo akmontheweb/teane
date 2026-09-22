@@ -11630,10 +11630,62 @@ def _detect_contradictory_tests(
     return bool(current == two_back and current != one_back and one_back)
 
 
+def _update_contradiction_latch(
+    loop_counter: dict[str, Any],
+    node_state: dict[str, Any],
+    fingerprints: list[str],
+) -> bool:
+    """Set, hold or retire ``node_state["contradictory_tests"]`` for this round.
+
+    Returns True only on the round a pair is first detected.
+
+    The latch is a claim about ONE pair of diagnostic shapes, so it records
+    that pair and lives exactly as long as the loop is still inside it. A
+    round whose shape is A or B keeps it — regeneration that fails and lands
+    back on A is still the same conflict, and re-detecting it would cost two
+    more repair rounds. A round whose shape is anything else (the conflict
+    broke, or the build went green: pass ``[]``) retires it.
+
+    It used to be set once and never cleared (lumina-run9-20260921-1758
+    audit): a latch from round 3 would outrank every other router branch
+    for the rest of the run and attach itself to whatever unrelated test
+    happened to be failing by round 9.
+    """
+    pair = loop_counter.get("contradiction_pair") or []
+    if fingerprints and _detect_contradictory_tests(loop_counter, fingerprints):
+        history = loop_counter["_diag_fp_history"]
+        new_pair = [list(history[-1]), list(history[-2])]
+        loop_counter["contradiction_pair"] = new_pair
+        node_state["contradictory_tests"] = True
+        # The same A/B cycling on is the latch holding, not a new finding.
+        return sorted(new_pair) != sorted(list(p) for p in pair)
+    if sorted(fingerprints) not in [list(p) for p in pair]:
+        loop_counter.pop("contradiction_pair", None)
+        node_state.pop("contradictory_tests", None)
+    return False
+
+
+def _contradiction_flipping_fingerprints(loop_counter: dict[str, Any]) -> set[str]:
+    """Fingerprints present in exactly one side of the latched A/B pair.
+
+    Those are the two expectations in conflict: each round satisfies one and
+    breaks the other. Diagnostics common to both shapes are bystanders.
+    """
+    pair = loop_counter.get("contradiction_pair") or []
+    if len(pair) != 2:
+        return set()
+    return set(pair[0]) ^ set(pair[1])
+
+
 def _record_suite_order_pollution(
     loop_counter: dict[str, Any], rel_file: str,
 ) -> None:
-    """Note that ``rel_file`` passes alone but fails in the suite.
+    """Note that ``rel_file`` passes alone but fails in the suite THIS round.
+
+    compiler_node clears the list at the start of every compile, so it only
+    ever names files the current build is failing. It used to accumulate
+    across the run while the router read ``[0]`` — the first file ever
+    flagged, long after it was fixed (lumina-run9-20260921-1758 audit).
 
     The isolation hints attached to the diagnostics tell the reader to fix
     OTHER test modules — install overrides inside a fixture, give each module
@@ -15353,6 +15405,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     loop_counter = state.get("loop_counter", {})
     loop_counter = dict(loop_counter)
     loop_counter["compiler"] = loop_counter.get("compiler", 0) + 1
+    # Suite-order pollution is a per-build observation: this compile's
+    # isolation re-run repopulates it. See _record_suite_order_pollution.
+    loop_counter.pop("suite_order_pollution_files", None)
     # A compile marks the end of a diagnostics-gate cycle — reset the
     # per-cycle bound so the next patch round gets fresh gate rounds.
     loop_counter["diagnostics_rounds_since_compile"] = 0
@@ -16588,26 +16643,27 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # repair loop, so survival of a warning is irrelevant.
     # Oscillation check: does this round's diagnostic shape match the one from
     # TWO rounds ago, with a different shape in between? That is a pair of
-    # mutually exclusive expectations, not progress.
-    if exit_code != 0:
-        _fps_now = _fingerprint_diagnostics(compiler_errors)
-        if _detect_contradictory_tests(loop_counter, _fps_now):
-            node_state["contradictory_tests"] = True
-            logger.warning(
-                "[compiler_node] Diagnostics have returned to the shape from "
-                "two rounds ago with a different shape in between — the last "
-                "patch un-did the previous one. Two expectations are in "
-                "direct conflict and no single edit satisfies both; repair "
-                "cannot resolve this on its own.",
+    # mutually exclusive expectations, not progress. The latch holds while the
+    # loop stays inside that pair; a green build or any other shape retires it.
+    _fps_now = (
+        _fingerprint_diagnostics(compiler_errors) if exit_code != 0 else []
+    )
+    if _update_contradiction_latch(loop_counter, node_state, _fps_now):
+        logger.warning(
+            "[compiler_node] Diagnostics have returned to the shape from "
+            "two rounds ago with a different shape in between — the last "
+            "patch un-did the previous one. Two expectations are in "
+            "direct conflict and no single edit satisfies both; repair "
+            "cannot resolve this on its own.",
+        )
+        try:
+            from harness.observability import emit_event as _emit_contra
+            _emit_contra(
+                "contradictory_tests_detected",
+                fingerprints=_fps_now[:6],
             )
-            try:
-                from harness.observability import emit_event as _emit_contra
-                _emit_contra(
-                    "contradictory_tests_detected",
-                    fingerprints=_fps_now[:6],
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:  # noqa: BLE001
+            pass
 
     return_dict: dict[str, Any] = {
         "exit_code": exit_code,
@@ -22099,12 +22155,16 @@ def _fingerprint_diagnostics(
     for err in errors:
         if str(err.get("severity", "error")).lower() == "warning":
             continue
-        code = str(err.get("error_code", "UNKNOWN"))
-        msg = _normalize_diagnostic_message(
-            str(err.get("message", "No message"))
-        )
-        out.add(f"{code}::{msg}")
+        out.add(_diagnostic_fingerprint(err))
     return sorted(out)
+
+
+def _diagnostic_fingerprint(err: Any) -> str:
+    """One diagnostic's ``"<code>::<normalised_message>"`` fingerprint — the
+    unit :func:`_fingerprint_diagnostics` collects."""
+    code = str(err.get("error_code", "UNKNOWN"))
+    msg = _normalize_diagnostic_message(str(err.get("message", "No message")))
+    return f"{code}::{msg}"
 
 
 def _rotate_diag_fingerprints_delta(
@@ -23107,6 +23167,32 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
     return "human_intervention_node"
 
 
+def _file_in_failing_set(state: AgentState, path: str) -> bool:
+    """True when some current ``compiler_errors`` entry is in ``path``.
+
+    The grounding check for any router decision that acts on a file named
+    by derived state (a declaration, a verdict): such state is a claim about
+    the round it was made in, and only the current failing set says whether
+    it still holds. Paths are compared workspace-normalised, tolerating a
+    prefix on either side (``tests/x.py`` vs ``server/tests/x.py``).
+    """
+    ws = str(state.get("workspace_path", "") or "")
+    target = _normalize_ws_path(path, ws)
+    if not target:
+        return False
+    for d in state.get("compiler_errors", []) or []:
+        if not isinstance(d, dict):
+            continue
+        f = _normalize_ws_path(str(d.get("file", "") or ""), ws)
+        if f and (
+            f == target
+            or f.endswith(os.sep + target)
+            or target.endswith(os.sep + f)
+        ):
+            return True
+    return False
+
+
 def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_intervention_node", "security_scan_node", "test_generation_node", "test_regeneration_node"]:
     """
     Conditional edge router executed after compiler_node completes.
@@ -23251,23 +23337,7 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         state.get("node_state", {}).get("unsatisfiable_test", "") or ""
     )
     if _unsat_declared_file:
-        _ws_for_unsat = str(state.get("workspace_path", "") or "")
-        _unsat_norm = _normalize_ws_path(_unsat_declared_file, _ws_for_unsat)
-        _still_failing = False
-        for _d in state.get("compiler_errors", []) or []:
-            if not isinstance(_d, dict):
-                continue
-            _df = _normalize_ws_path(
-                str(_d.get("file", "") or ""), _ws_for_unsat,
-            )
-            if _df and (
-                _df == _unsat_norm
-                or _df.endswith(os.sep + _unsat_norm)
-                or _unsat_norm.endswith(os.sep + _df)
-            ):
-                _still_failing = True
-                break
-        if _still_failing:
+        if _file_in_failing_set(state, _unsat_declared_file):
             # ADR-0001: climb the autonomy ladder before halting for a human.
             # Repair still cannot edit the test — but the test-AUTHOR phase
             # can regenerate it from spec when the defect is provable.
@@ -23293,30 +23363,53 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # lumina 969f8e1c hit (a) for eight rounds on ``_extract_record_id`` and
     # (b) on ``items`` vs ``birthdays``, and spent its whole distraction
     # budget on both before terminating.
+    #
+    # Each case must name a test file the CURRENT build is failing. Derived
+    # state outlives the round that produced it, and routing on it without
+    # that check re-executes a directive that was already carried out
+    # (lumina-run9-20260921-1758: two zero-block regenerations of a test
+    # that had left the failing set, driven by a judge verdict from an
+    # earlier round). A case with no grounded target falls through to the
+    # next one instead of shadowing it.
     _blocked_reason = ""
     _blocked_file = ""
+    _lc_blocked = state.get("loop_counter", {}) or {}
     if state.get("node_state", {}).get("contradictory_tests"):
-        _blocked_reason = "contradictory test expectations"
-        # Regenerating either side resolves it; prefer a test file from the
-        # current failing set so the regeneration node has a concrete target.
+        # Regenerating either side resolves it. Target a test whose failure
+        # is one of the two flipping expectations — not merely the first
+        # failing test, which may be unrelated to the conflict.
+        _flipping = _contradiction_flipping_fingerprints(_lc_blocked)
         for _d in state.get("compiler_errors", []) or []:
-            _f = str((_d or {}).get("file", "") or "") if isinstance(_d, dict) else ""
-            if _f and _is_test_artifact(_f):
+            if not isinstance(_d, dict):
+                continue
+            _f = str(_d.get("file", "") or "")
+            if (_f and _is_test_artifact(_f)
+                    and _diagnostic_fingerprint(_d) in _flipping):
+                _blocked_reason = "contradictory test expectations"
                 _blocked_file = _f
                 break
-    elif (state.get("loop_counter", {}) or {}).get("suite_order_pollution_files"):
+    if not _blocked_file and _lc_blocked.get("suite_order_pollution_files"):
+        # Rebuilt by every compile from this round's isolation re-run, so
+        # every entry is already a currently-failing file.
         _blocked_reason = "suite-order pollution"
-        _blocked_file = str(
-            (state.get("loop_counter", {}) or {})
-            .get("suite_order_pollution_files")[0]
-        )
-    else:
+        _blocked_file = str(_lc_blocked["suite_order_pollution_files"][0])
+    if not _blocked_file:
+        # last_reflection_verdict is deliberately NOT expired: the judge's
+        # anti-repetition check needs the stale value. Ground it here, at
+        # the one consumer that treats it as a routing authority.
         _verdict_file = _verdict_demands_test_edit(
-            (state.get("loop_counter", {}) or {}).get("last_reflection_verdict")
+            _lc_blocked.get("last_reflection_verdict")
         )
-        if _verdict_file:
+        if _verdict_file and _file_in_failing_set(state, _verdict_file):
             _blocked_reason = "the judge's own recommendation is a test edit"
             _blocked_file = _verdict_file
+        elif _verdict_file:
+            logger.info(
+                "[router] Judge's test-edit recommendation names %s, which "
+                "is no longer in the failing set — the recommendation is "
+                "stale; not diverting.",
+                _verdict_file,
+            )
 
     if _blocked_reason and _blocked_file:
         logger.warning(

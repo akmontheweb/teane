@@ -16,14 +16,26 @@ and its whole distraction budget under the second.
 
 A third case has the same shape: two tests demanding opposite things, where
 the diagnostics oscillate A → B → A and every patch swaps the pair.
+
+All three are derived state that outlives the round it describes, so each
+diversion must name a test the CURRENT build is failing
+(lumina-run9-20260921-1758: a judge verdict already carried out drove two
+zero-block regenerations of a test that had left the failing set).
 """
 
 from __future__ import annotations
 
+import pytest
+
 from harness.graph import (
+    _contradiction_flipping_fingerprints,
     _detect_contradictory_tests,
+    _diagnostic_fingerprint,
     _record_suite_order_pollution,
+    _update_contradiction_latch,
     _verdict_demands_test_edit,
+    compiler_node,
+    route_after_compiler,
 )
 
 
@@ -157,6 +169,8 @@ class TestRouterDivertsAwayFromRepair:
         (tmp_path / "server" / "tests" / "test_main.py").write_text(
             "def test_a():\n    assert 1\n", encoding="utf-8")
         state = self._state(tmp_path, node_state={"contradictory_tests": True})
+        fp = _diagnostic_fingerprint(state["compiler_errors"][0])
+        state["loop_counter"]["contradiction_pair"] = [[fp], ["other::shape"]]
         assert route_after_compiler(state) != "repair_node"
 
     def test_judge_recommending_a_test_edit_does_not_reach_repair(self, tmp_path):
@@ -173,7 +187,11 @@ class TestRouterDivertsAwayFromRepair:
                     "tests/acceptance/test_story.py to access body['x']."
                 ),
             },
-        })
+        }, compiler_errors=[
+            {"file": "tests/acceptance/test_story.py", "line": 3,
+             "severity": "error", "error_code": "AssertionError",
+             "message": "KeyError: 'x'"},
+        ])
         assert route_after_compiler(state) != "repair_node"
 
     def test_an_ordinary_failure_still_goes_to_repair(self, tmp_path):
@@ -181,3 +199,189 @@ class TestRouterDivertsAwayFromRepair:
         from harness.graph import route_after_compiler
         state = self._state(tmp_path)
         assert route_after_compiler(state) == "repair_node"
+
+
+class TestContradictionLatch:
+    """The latch is a claim about one A/B pair and lives exactly as long as
+    the loop stays inside that pair."""
+
+    A = ["AssertionError::items not in body"]
+    B = ["AssertionError::birthdays not in body"]
+
+    def _latched(self):
+        lc: dict = {}
+        ns: dict = {}
+        assert _update_contradiction_latch(lc, ns, self.A) is False
+        assert _update_contradiction_latch(lc, ns, self.B) is False
+        assert _update_contradiction_latch(lc, ns, self.A) is True
+        return lc, ns
+
+    def test_detection_records_the_pair(self):
+        lc, ns = self._latched()
+        assert ns["contradictory_tests"] is True
+        assert sorted(lc["contradiction_pair"]) == sorted([self.A, self.B])
+
+    def test_holds_while_the_loop_stays_inside_the_pair(self):
+        # Regeneration that fails lands back on A: still the same conflict,
+        # and re-detecting it would cost two more repair rounds.
+        lc, ns = self._latched()
+        for shape in (self.A, self.B, self.A):
+            assert _update_contradiction_latch(lc, ns, shape) is False
+            assert ns["contradictory_tests"] is True
+
+    def test_a_new_shape_retires_it(self):
+        lc, ns = self._latched()
+        _update_contradiction_latch(lc, ns, ["TypeError::something else"])
+        assert "contradictory_tests" not in ns
+        assert "contradiction_pair" not in lc
+
+    def test_a_green_build_retires_it(self):
+        lc, ns = self._latched()
+        _update_contradiction_latch(lc, ns, [])
+        assert "contradictory_tests" not in ns
+        assert "contradiction_pair" not in lc
+
+    def test_a_flag_with_no_pair_is_retired(self):
+        # A checkpoint from before the pair was recorded: nothing grounds it.
+        ns = {"contradictory_tests": True}
+        _update_contradiction_latch({}, ns, ["x::y"])
+        assert "contradictory_tests" not in ns
+
+    def test_flipping_fingerprints_exclude_bystanders(self):
+        lc = {"contradiction_pair": [["a", "shared"], ["b", "shared"]]}
+        assert _contradiction_flipping_fingerprints(lc) == {"a", "b"}
+        assert _contradiction_flipping_fingerprints({}) == set()
+
+
+class TestDivertsOnlyOnCurrentEvidence:
+    """Each diversion must name a test the current build is failing."""
+
+    _state = staticmethod(TestRouterDivertsAwayFromRepair._state)
+
+    @staticmethod
+    def _diag(path, message="assert 500 == 200"):
+        return {"file": path, "line": 1, "severity": "error",
+                "error_code": "AssertionError", "message": message}
+
+    def test_run9_stale_verdict_does_not_divert(self, tmp_path):
+        # lumina-run9-20260921-1758: the judge said to edit
+        # test_birthday_repository.py; regeneration fixed it; the only
+        # failure left was test_main.py. The router re-read the verdict and
+        # regenerated the fixed file again, twice, with zero blocks.
+        state = self._state(tmp_path, loop_counter={
+            "total_repairs": 3,
+            "last_reflection_verdict": {
+                "verdict": "DISTRACTION",
+                "recommendation": (
+                    "Edit server/tests/test_birthday_repository.py line 118 "
+                    "to remove the 'updated_at' keyword argument, and edit "
+                    "server/app/main.py to fix the pagination logic."
+                ),
+            },
+        }, compiler_errors=[self._diag(
+            "server/tests/test_main.py", "assert 0 == 3")])
+        assert route_after_compiler(state) == "repair_node"
+
+    def test_contradiction_targets_a_flipping_test(self, tmp_path):
+        (tmp_path / "tests" / "acceptance").mkdir(parents=True)
+        (tmp_path / "tests" / "acceptance" / "test_story.py").write_text(
+            "def test_a():\n    assert 1\n", encoding="utf-8")
+        bystander = self._diag("server/tests/test_other.py", "bystander")
+        flipping = self._diag("tests/acceptance/test_story.py",
+                              "items not in body")
+        state = self._state(
+            tmp_path,
+            compiler_errors=[bystander, flipping],
+            node_state={"contradictory_tests": True},
+            loop_counter={"total_repairs": 1, "contradiction_pair": [
+                [_diagnostic_fingerprint(bystander),
+                 _diagnostic_fingerprint(flipping)],
+                [_diagnostic_fingerprint(bystander), "AssertionError::birthdays"],
+            ]},
+        )
+        route_after_compiler(state)
+        assert state["node_state"]["unsatisfiable_test"] == (
+            "tests/acceptance/test_story.py"
+        )
+
+    def test_contradiction_with_no_flipping_test_does_not_shadow(self, tmp_path):
+        # The conflict is between production-side diagnostics; no test is
+        # one of the flipping expectations. It must neither regenerate an
+        # unrelated test nor block the branches after it.
+        state = self._state(
+            tmp_path,
+            node_state={"contradictory_tests": True},
+            loop_counter={"total_repairs": 1,
+                          "contradiction_pair": [["x::a"], ["x::b"]]},
+        )
+        assert route_after_compiler(state) == "repair_node"
+
+
+class _StubBuildResult:
+    def __init__(self, exit_code: int, raw_output: str = "") -> None:
+        self.exit_code = exit_code
+        self.raw_output = raw_output
+        self.diagnostics = []
+        self.timed_out = False
+        self.log_truncated = False
+        self.elapsed_seconds = 0.1
+        self.backend_name = "stub"
+
+
+class _StubSandboxExecutor:
+    canned: _StubBuildResult = _StubBuildResult(0, "")
+
+    def __init__(self, **kwargs):
+        pass
+
+    async def run(self, build_command: str):
+        return _StubSandboxExecutor.canned
+
+
+@pytest.fixture
+def stub_sandbox(monkeypatch):
+    import harness.sandbox as sandbox_mod
+    monkeypatch.setattr(sandbox_mod, "SandboxExecutor", _StubSandboxExecutor)
+
+    def _set(exit_code: int, raw_output: str = "") -> None:
+        _StubSandboxExecutor.canned = _StubBuildResult(exit_code, raw_output)
+
+    return _set
+
+
+class TestCompilerNodeRebuildsRoundState:
+    @staticmethod
+    def _state(tmp_path, loop_counter, node_state=None):
+        return {
+            "workspace_path": str(tmp_path),
+            "build_command": "false",
+            "allow_network": False,
+            "sandbox_config": {},
+            "loop_counter": loop_counter,
+            "node_state": node_state or {},
+            "messages": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_pollution_from_an_earlier_round_is_dropped(
+        self, stub_sandbox, tmp_path,
+    ):
+        stub_sandbox(1, "some compile error\n")
+        result = await compiler_node(self._state(tmp_path, {
+            "suite_order_pollution_files": ["server/tests/test_fixed_long_ago.py"],
+        }))
+        assert result["exit_code"] == 1
+        assert not result["loop_counter"].get("suite_order_pollution_files")
+
+    @pytest.mark.asyncio
+    async def test_green_build_retires_the_contradiction_latch(
+        self, stub_sandbox, tmp_path,
+    ):
+        stub_sandbox(0, "")
+        result = await compiler_node(self._state(
+            tmp_path,
+            {"contradiction_pair": [["x::a"], ["x::b"]]},
+            {"contradictory_tests": True},
+        ))
+        assert "contradictory_tests" not in result["node_state"]
+        assert "contradiction_pair" not in result["loop_counter"]

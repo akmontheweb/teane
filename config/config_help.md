@@ -156,7 +156,7 @@ Cost-metrics aggregation for the `teane metrics` subcommand. burn_rate_window_mi
 
 ## `debug`
 
-Observability flags for post-mortem analysis. dump_llm_calls=true writes every LLM dispatch (across all roles: planning, patching, repair, doc/code review, test generation, discovery, etc.) as a single .txt file in ~/.harness/debug containing the exact input messages and the response. dump_max_files caps directory size; oldest files (by mtime) are pruned on each write. The deprecated dump_repair_prompts key is honoured as an alias for dump_llm_calls.
+Observability flags for post-mortem analysis. dump_llm_calls=true writes every LLM dispatch (across all roles: planning, patching, repair, doc/code review, test generation, discovery, etc.) as a single .txt file in ~/.harness/debug containing the exact input messages and the response. dump_max_files caps directory size; oldest files (by mtime) are pruned on each write. The deprecated dump_repair_prompts key is honoured as an alias for dump_llm_calls. measure_spec_usage=true emits one `spec_region_usage` event per dispatch reporting whether the response reproduced anything unique to the spec region anchored in messages[0] — a requirement id, or a distinctive shingle from a requirement body, in both cases absent from the rest of the prompt (ADR-0008 action item 2; see `harness/spec_usage.py` and summarise a run with `scripts/spec_usage_report.py`). Observation only: it never alters a prompt, a response, or routing, and a measurement failure can never break a dispatch. Off by default — it costs a shingle pass over each response, and the events are only meaningful while you are deciding what spec context a role actually needs.
 
 ## `compiler`
 

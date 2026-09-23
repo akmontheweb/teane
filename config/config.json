@@ -419,7 +419,8 @@
     },
     "debug": {
         "dump_llm_calls": true,
-        "dump_max_files": 5000
+        "dump_max_files": 5000,
+        "measure_spec_usage": false
     },
     "compiler": {
         "run_prod_import_smoke_check": true,

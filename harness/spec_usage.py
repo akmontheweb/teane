@@ -100,23 +100,32 @@ class SpecIndex:
 def split_spec_region(system_content: str) -> str:
     """Return the spec region of an anchored system prompt, or ``""``.
 
-    The anchor is ``spec_override + "\\n\\n---\\n\\n" + system_prompt``. A
-    ``---`` also occurs inside spec markdown, so the split is verified: the
-    tail must start with the harness prompt's own opening words. Partition on
-    the LAST separator whose tail qualifies, so a spec containing horizontal
-    rules cannot truncate the region.
+    The anchor is ``spec_override + "\\n\\n---\\n\\n" + system_prompt``, but the
+    seam is not reliably that separator: a spec document whose own last line
+    is a ``---`` rule produces a DOUBLED separator
+    (``\\n\\n---\\n\\n\\n---\\n\\n``), and spec markdown contains horizontal rules
+    throughout. So the harness prompt is located by its opening words and
+    everything above them is the region, with any trailing rule/whitespace
+    trimmed.
+
+    An earlier version split on the separator and required the tail to start
+    with the opener. That held in lumina-run12-20260923-0914 and silently
+    failed in run 13, where the architecture document ended with a rule: the
+    tail then began ``---\\n\\nYou are an expert…``, no candidate qualified,
+    and the function reported "no spec region" for every repair call —
+    disabling both the measurement and the slice without a word. Anchoring on
+    content that is actually invariant, rather than on punctuation, is the
+    point.
     """
-    if not system_content or _SYSTEM_PROMPT_OPENER not in system_content:
+    if not system_content:
         return ""
-    parts = system_content.split(_SPEC_SEPARATOR)
-    if len(parts) < 2:
+    idx = system_content.rfind(_SYSTEM_PROMPT_OPENER)
+    if idx <= 0:
         return ""
-    for i in range(len(parts) - 1, 0, -1):
-        tail = _SPEC_SEPARATOR.join(parts[i:])
-        if tail.lstrip().startswith(_SYSTEM_PROMPT_OPENER):
-            head = _SPEC_SEPARATOR.join(parts[:i])
-            return head if head.strip() else ""
-    return ""
+    head = system_content[:idx]
+    # Trim the seam: trailing blank lines and any run of `---` rules.
+    head = re.sub(r"(?:\s*\n-{3,}[ \t]*)+\s*$", "", head)
+    return head if head.strip() else ""
 
 
 def _shingles(text: str) -> set[str]:

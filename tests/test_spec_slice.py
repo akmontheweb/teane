@@ -234,3 +234,48 @@ class TestGatewayWiring:
         gw = create_gateway_from_config(
             {"planning": {"scoped_spec_context": True}})
         assert gw.config.scoped_spec_context is True
+
+
+class TestTheRun13Regressions:
+    """Two bugs run 13 (lumina-run13-20260923-2235) exposed in this feature,
+    both of which failed SILENTLY — the run completed and said nothing."""
+
+    def test_a_spec_ending_in_a_rule_still_splits(self):
+        # The seam is spec + "\n\n---\n\n" + prompt, but a spec whose own
+        # last line is a `---` rule doubles it. Run 13's architecture
+        # document did exactly that: region detection returned "" for every
+        # repair call, disabling both the measurement and the slice without
+        # a word.
+        from harness.spec_usage import split_spec_region
+        doubled = SPEC.rstrip() + "\n\n---\n" + "\n\n---\n\n" + SYSTEM_TAIL
+        region = split_spec_region(doubled)
+        assert region, "a trailing horizontal rule must not hide the region"
+        assert "STORY-001" in region
+        assert "You are an expert" not in region
+
+    def test_several_trailing_rules_are_trimmed(self):
+        from harness.spec_usage import split_spec_region
+        region = split_spec_region(
+            SPEC.rstrip() + "\n\n---\n\n---\n\n---\n\n" + SYSTEM_TAIL)
+        assert region.rstrip().endswith("day left.")
+
+    def test_narrowing_never_reaches_the_list_the_node_returns(self, monkeypatch):
+        # repair_node returns its ``messages`` into state. Narrowing that
+        # list made one repair round truncate the anchor permanently, for
+        # every later call of every role — including patching, the role the
+        # measurement showed using the requirement bodies. The dispatch copy
+        # is narrowed; the caller's list is not.
+        monkeypatch.setattr(
+            spec_slice, "scoped_slice", lambda ws, keys, **kw: "### S\nbody\n")
+        state_messages = _msgs()
+        dispatched, tel = apply_to_messages(
+            state_messages,
+            {"workspace_path": "/ws", "current_story_id": "STORY-001"},
+            consumer="repair_node",
+        )
+        assert tel is not None, "precondition: the slice must have applied"
+        assert "Display upcoming birthdays" not in dispatched[0]["content"]
+        assert "Display upcoming birthdays" in state_messages[0]["content"], (
+            "the node's own list must still carry the full region"
+        )
+        assert len(state_messages) == 3 and len(dispatched) == 4

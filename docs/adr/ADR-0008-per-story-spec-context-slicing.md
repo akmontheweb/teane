@@ -1,6 +1,6 @@
-# ADR-0008: Per-Story Spec Context Instead of the Whole-Spec Anchor
+# ADR-0008: Scoped Spec Context Instead of the Whole-Spec Anchor
 
-**Status:** Proposed — nothing implemented. Drafted 2026-09-23 after the lumina run 9→11 sequence.
+**Status:** Proposed — implementation not started. Drafted 2026-09-23 after the lumina run 9→11 sequence. **Amended the same day** by the action-item-2 measurement (`b4bd3bd`, run `lumina-run12-20260923-0914`), which confirmed the premise for `repair` and refuted the single-story slice scope for `patching`; the Tier-2 unit is now the **batch's** stories. Action item 2 is complete; nothing else is.
 **Date:** 2026-09-23
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0004]] (NFR embedding — the per-story NFR policy block is the precedent mechanism this ADR generalises), [[ADR-0003]] (hybrid test generation — consumes ACs, not spec prose), [[ADR-0006]] (in-build acceptance verification — the acceptance generator is already excerpt-based)
@@ -72,9 +72,56 @@ Measured on `lumina-run11-20260923-0040`: `system_prompt_built` reports
 | EPIC / FEAT / STORY blocks | ~24 KB | one story at a time |
 | `## Enabler Stories — Non-Functional Requirements` | ~6.6 KB | cited stories only |
 
-The question this ADR answers: **should the loop nodes receive a per-story
-slice of the specification assembled from the requirements DB, instead of the
-whole document anchored in `messages[0]`?**
+### Measured, not assumed (action item 2, `lumina-run12-20260923-0914`)
+
+Everything above was established by reading code, which is why action item 2
+was to measure it before changing anything. `harness/spec_usage.py` (`b4bd3bd`)
+observes each dispatch and reports whether the response reproduced content
+unique to the spec region — a requirement id, or a distinctive shingle from a
+requirement body, in both cases absent from the rest of the prompt. Run 12:
+
+| role | dispatches carrying the region | used |
+|---|---|---|
+| `repair` | 24 | **0** |
+| `patching` | 13 | 2 |
+| `planning` | 1 | 0 |
+| **total** | **38** | **2 (5%)** |
+
+Nine of the 13 requirement blocks were never used by any call.
+
+**The premise holds for `repair`** — the run's heaviest caller (30 dispatches)
+carried 72,866 chars of spec on every call with no detectable use. The
+instrument is not blind: it scored two calls positive in the same run.
+
+**It does not hold for `patching`, and the ADR's slice scope was wrong.** The
+two positive calls were test-authoring:
+
+```
+patching:test_authoring               echoed STORY-001, STORY-002, STORY-004 (14 shingles)
+patching:test_contradiction_reprompt  echoed STORY-NFR-002                   (2 shingles)
+```
+
+One call drew on **three stories at once**, because patching works a *batch*,
+not a story. A single-story slice would have withheld two thirds of what that
+call demonstrably used. The `STORY-NFR-002` echo confirms the same for
+constraint-NFR policies.
+
+A third finding came free: only **38 of the run's 63 dispatches carry the spec
+region at all**. All 15 `judgment` calls and both `decomposition_reviewer`
+calls build their own system messages and never receive the anchor — verified
+against the debug dumps, where a repair prompt contains `# Software
+Requirements Specification` and a judgment prompt does not. Two fifths of the
+run already operates without it.
+
+Limits of this evidence, stated plainly: one run, one trajectory, and echo
+detection is an undercount — a model can be steered by a requirement without
+reproducing its words. The reading that survives those limits is the
+comparative one: 0/24 for `repair` against 2/13 for `patching`, same anchor,
+same run.
+
+The question this ADR answers: **should the loop nodes receive a slice of the
+specification assembled from the requirements DB, instead of the whole document
+anchored in `messages[0]`?**
 
 A second question arrived with the same mechanism and is answered here because
 it shares it: **should capability NFR stories be abolished in favour of an NFR
@@ -90,14 +137,24 @@ the architecture summary. These are genuinely needed everywhere, change rarely,
 and are the ideal cache prefix. Sectioning uses the existing heading walk in
 `req_ids.parse_spec_requirements` (`req_ids.py:342`) — no new parser.
 
-**Tier 2 — per-story, injected, not anchored.** `_build_story_preamble`
-assembles the working slice from the DB:
+**Tier 2 — scoped to the work in hand, injected, not anchored.**
+`_build_story_preamble` assembles the working slice from the DB:
 
-- the story's own `requirements.body`;
-- its parent feature and epic bodies, reached through the existing
+- the `requirements.body` of **every story in scope for the call**;
+- their parent feature and epic bodies, reached through the existing
   `**Parent feature:** FEAT-001` markers (`story_state.py:1361`);
-- its acceptance criteria rows;
-- the NFR policies its ACs cite — already implemented.
+- their acceptance criteria rows;
+- the NFR policies those ACs cite — already implemented.
+
+**Scope is the batch, not the story, wherever the caller works a batch.**
+Run 12 measured a single `patching:test_authoring` call using STORY-001,
+STORY-002 and STORY-004 together; a story-scoped slice would have withheld two
+of the three. `batch_stories` (`story_state.py:255`) already records the
+membership, so the scope is a lookup, not a heuristic. A story-scoped caller
+(regeneration, which owns one file) takes the narrower slice. **Any node whose
+scope cannot be resolved keeps the full region** — an unresolved scope is a
+bug, and the failure must be a large prompt, never a silently missing
+requirement.
 
 The slice is injected as a **later message**. The cached prefix is never
 mutated, which is the invariant `graph.py:1721` depends on.
@@ -204,11 +261,15 @@ every node.
 
 The core trade is **relevance vs. the risk of withholding**. Option A can never
 withhold and can never focus; Option C focuses and must prove it withholds
-nothing that mattered. The mitigation is that the loop nodes' real inputs are
-already structured — ACs, diagnostics, source code — and the spec functions as
-background. ADR-0004's policy block is the existence proof: one requirement
-class has been delivered by selective injection since `2ed24df`, and no node
-has been shown to need the rest.
+nothing that mattered. That proof is now partly in hand and it cuts both ways.
+`repair` used nothing across 24 dispatches, so focusing costs it nothing.
+`patching` used three stories' criteria in a single call, so for that role the
+slice must be provably a superset of what it was using — which is why scope
+follows `batch_stories` and an unresolved scope falls back to the full region.
+
+The drafted version of this paragraph claimed "no node has been shown to need
+the rest." Measurement refuted that within a day of writing it, which is the
+argument for action item 2 existing at all.
 
 Caching deserves care rather than caution. The anchor exists to be cached, and
 run-10 logs already show `cache_prefix_drift` events, so slices must be appended
@@ -230,8 +291,9 @@ architectural work visible.
 ## Consequences
 
 **Easier:**
-- A loop-node prompt shows the story being worked, its parents, its ACs and its
-  NFR policies — traceable to rows, not to a 41 KB document.
+- A loop-node prompt shows the stories in scope for the call, their parents,
+  their ACs and their NFR policies — traceable to rows, not to a 41 KB
+  document.
 - `requirements.body` / `source_line` acquire their first reader, and
   `test_defects._write_source_spec`'s stub (`test_defects.py:311–330`, still
   emitting *"Phase 4 will inline the spec excerpt here"*) gets the lookup it
@@ -241,6 +303,10 @@ architectural work visible.
 **Harder:**
 - Slice assembly must handle a story with no requirement row, an unparented
   story, and a spec edited mid-run — each is a silent under-injection if wrong.
+- Scope is per-caller, not global: a batch caller and a file caller take
+  different slices from the same machinery, and a new caller that forgets to
+  declare its scope must land on the full-region fallback rather than an empty
+  one.
 - Two context paths exist (whole-spec planners, sliced loop) and must not drift.
 - Debugging shifts: "what did the model see?" stops being one anchored blob and
   becomes a per-story assembly, so the slice should be logged.
@@ -258,18 +324,27 @@ architectural work visible.
 
 1. [ ] Land this ADR as **Proposed** and settle the Tier-1 boundary: inferred
    from heading position, or spec-authored.
-2. [ ] Instrument before changing anything: log, per call, which nodes read
-   `messages[0]`'s spec region, over one lumina run. Option C's premise is that
-   the loop nodes do not need it; that premise should be measured, not
-   grepped.
+2. [x] Instrument before changing anything: log, per call, which nodes use
+   `messages[0]`'s spec region, over one lumina run. (`b4bd3bd`;
+   `harness/spec_usage.py`, `scripts/spec_usage_report.py`, run
+   `lumina-run12-20260923-0914`.) Result: `repair` 0/24, `patching` 2/13,
+   9 of 13 requirement blocks never used, and 25 of 63 dispatches never
+   carried the region at all. Premise confirmed for `repair`; slice scope
+   corrected from story to batch. Re-run the report after any change to the
+   anchor — it is the A/B's instrument as well as its motivation.
 3. [ ] Implement the Tier-2 slice in `_build_story_preamble` behind a config
-   flag (default off), reusing `req_ids.parse_spec_requirements` and the
-   `story_satisfies_req` join.
+   flag (default off), reusing `req_ids.parse_spec_requirements`, the
+   `story_satisfies_req` join and `batch_stories` for scope. Roll out by role:
+   `repair` first, where the measurement says nothing is at risk; `patching`
+   only once the slice is shown to contain what run 12 saw it use.
 4. [ ] Switch `test_regeneration`'s `spec_tiebreaker` to the Tier-2 slice.
 5. [ ] Trim `spec_override` to the Tier-1 preamble under the same flag; record
    `system_prompt_built` chars and per-call input tokens before and after.
 6. [ ] A/B on a lumina rebuild: compare acceptance-scenario accuracy and
-   repair-round count against the run-11 baseline.
+   repair-round count against the run-11 baseline, and re-run
+   `scripts/spec_usage_report.py` on the sliced run. The pass condition is
+   not "the prompt shrank" — it is that every requirement the baseline used
+   is present in the slice the sliced run carried.
 7. [ ] Independently of the above: add a decomposition-quality check
    ([[ADR-0007]]) for capability-NFR ACs that carry no measurable threshold.
 8. [ ] Verify each `[NFR:<policy-id>]` policy once per run rather than once per

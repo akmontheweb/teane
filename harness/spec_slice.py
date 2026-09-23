@@ -184,6 +184,7 @@ def apply_to_messages(
     state: dict[str, Any],
     *,
     consumer: str,
+    position: str = "before_last",
 ) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
     """Return ``(messages, telemetry)`` with the spec region narrowed.
 
@@ -192,6 +193,20 @@ def apply_to_messages(
     story; the story extract is appended as a LATER message, which is the
     invariant ``graph.py:1721`` ("never mutated — it maximizes prefix
     caching") depends on.
+
+    ``position`` decides where the extract goes. The default,
+    ``"before_last"``, keeps whatever the caller put last in that position —
+    for repair that is ``_REPAIR_FORMAT_REMINDER``, which restates the patch
+    DSL and carries the round's blocking correction, and whose whole design
+    is to have the last word (see the comment at its append site; burying it
+    once cost lumina-run7 five byte-identical rounds).
+
+    lumina-run14-20260923-2352 appended the extract at the very end instead,
+    displacing that reminder behind 6,876 chars of specification. Ten repair
+    rounds came back as ``UNPARSED`` — the model answering in
+    ``anthropic_xml`` ``edit_file`` tool calls rather than the harness DSL —
+    and the run ended on persistent_build_failure. A slice that changes what
+    the model is told to DO is not a context optimisation.
 
     The input list is not mutated. Returns the original list unchanged, and
     ``None`` telemetry, whenever anything is missing: no anchored region, no
@@ -226,7 +241,11 @@ def apply_to_messages(
     preamble = tier1_preamble(region)
     msgs[0] = dict(msgs[0])
     msgs[0]["content"] = preamble + system_content[len(region):]
-    msgs.append({"role": "user", "content": extract})
+    entry = {"role": "user", "content": extract}
+    if position == "before_last" and len(msgs) >= 2:
+        msgs.insert(len(msgs) - 1, entry)
+    else:
+        msgs.append(entry)
 
     telemetry = {
         "consumer": consumer,

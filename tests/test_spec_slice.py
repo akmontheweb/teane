@@ -148,8 +148,8 @@ class TestApplyToMessages:
         # The requirement bodies are gone from the cached prefix...
         assert "Display upcoming birthdays" not in head
         # ...and the extract rides as a LATER message, per graph.py:1721.
-        assert out[-1]["role"] == "user"
-        assert "the story body" in out[-1]["content"]
+        assert out[-2]["role"] == "user"
+        assert "the story body" in out[-2]["content"]
         assert tel["stories"] == ["STORY-001"] and tel["saved_chars"] > 0
 
     def test_the_input_list_is_not_mutated(self, monkeypatch):
@@ -279,3 +279,38 @@ class TestTheRun13Regressions:
             "the node's own list must still carry the full region"
         )
         assert len(state_messages) == 3 and len(dispatched) == 4
+
+
+class TestExtractPlacement:
+    """run14: the extract was appended at the very end, displacing
+    _REPAIR_FORMAT_REMINDER — the message whose entire purpose is to have the
+    last word (patch DSL + the round's blocking correction). Ten repair
+    rounds came back UNPARSED, the model answering in anthropic_xml
+    `edit_file` tool calls, and the run died on persistent_build_failure."""
+
+    def _applied(self, monkeypatch, **kw):
+        monkeypatch.setattr(
+            spec_slice, "scoped_slice", lambda ws, keys, **k: "### S\nbody\n")
+        msgs = _msgs() + [{"role": "user", "content": "Generate patches NOW."}]
+        out, _ = apply_to_messages(
+            msgs, {"workspace_path": "/ws", "current_story_id": "STORY-001"},
+            consumer="repair_node", **kw)
+        return out
+
+    def test_the_callers_last_message_keeps_the_last_word(self, monkeypatch):
+        out = self._applied(monkeypatch)
+        assert out[-1]["content"] == "Generate patches NOW."
+        assert "body" in out[-2]["content"]
+
+    def test_end_placement_is_still_available(self, monkeypatch):
+        out = self._applied(monkeypatch, position="end")
+        assert "body" in out[-1]["content"]
+
+    def test_a_single_message_prompt_degrades_to_append(self, monkeypatch):
+        monkeypatch.setattr(
+            spec_slice, "scoped_slice", lambda ws, keys, **k: "### S\nbody\n")
+        out, tel = apply_to_messages(
+            [{"role": "system", "content": _anchored()}],
+            {"workspace_path": "/ws", "current_story_id": "STORY-001"},
+            consumer="repair_node")
+        assert tel is not None and "body" in out[-1]["content"]

@@ -701,11 +701,22 @@ def discover_response_models(
     from the criterion prose, while the unit-test generator reads the real
     schema source — and two independently-invented shapes cannot both be
     satisfied (lumina 969f8e1c, ``items`` vs ``birthdays``).
+
+    A model a ROUTE declares (``response_model=BirthdayPage``) is included
+    whatever it is called: the name heuristic is a fallback for apps that
+    declare nothing, not the test of what an endpoint returns. The filter
+    alone dropped the envelope on lumina-run11-20260923-0040 —
+    ``GET /api/birthdays`` declares ``response_model=BirthdayPage``, which
+    matches no suffix in the pattern — so the generator was handed only the
+    ITEM shape (``BirthdayResponse``), wrote ``body[0]['first_name']``
+    against a ``{"birthdays": [...], "total": ...}`` envelope, and all 10
+    acceptance criteria failed and were blamed on production code.
     """
     import ast
 
     declared: dict[str, list[str]] = {}
     bases: dict[str, list[str]] = {}
+    route_declared: set[str] = set()
     scanned = 0
     _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
     for root, dirs, files in os.walk(workspace_path):
@@ -722,12 +733,16 @@ def discover_response_models(
                     text = fh.read()
             except OSError:
                 continue
-            if "BaseModel" not in text:
+            # Router modules declare response models without ever naming
+            # BaseModel, so they must be parsed too — that declaration is
+            # the authoritative statement of what the endpoint returns.
+            if "BaseModel" not in text and "response_model" not in text:
                 continue
             try:
                 tree = ast.parse(text)
             except SyntaxError:
                 continue
+            route_declared |= _route_declared_models(tree)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ClassDef):
                     continue
@@ -758,8 +773,37 @@ def discover_response_models(
     return {
         cls: eff
         for cls in declared
-        if _RESPONSE_NAME_RE.search(cls) and (eff := _effective(cls))
+        if (cls in route_declared or _RESPONSE_NAME_RE.search(cls))
+        and (eff := _effective(cls))
     }
+
+
+def _route_declared_models(tree: Any) -> set[str]:
+    """Class names any route decorator names via ``response_model=``.
+
+    Handles the plain name (``response_model=BirthdayPage``), a dotted
+    reference (``schemas.BirthdayPage``) and a container
+    (``response_model=list[BirthdayResponse]``). ``response_model=dict``
+    contributes nothing, which is correct — it declares no shape.
+    """
+    import ast
+
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            for kw in dec.keywords:
+                if kw.arg != "response_model":
+                    continue
+                for sub in ast.walk(kw.value):
+                    if isinstance(sub, ast.Name):
+                        found.add(sub.id)
+                    elif isinstance(sub, ast.Attribute):
+                        found.add(sub.attr)
+    return found
 
 
 def discover_routes(workspace_path: str, *, max_files: int = 200) -> list[dict[str, str]]:

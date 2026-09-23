@@ -9,6 +9,14 @@ lumina 969f8e1c: ``tests/acceptance/test_story_001_acceptance.py`` asserted
 ``body['items']``; ``server/tests/test_main.py`` asserted ``"birthdays" in
 body``. Renaming the response key to satisfy one broke the other, the
 diagnostics oscillated, and the run died on its distraction budget.
+
+Discovery then had to stop filtering by class NAME. lumina-run11-20260923-0040
+returned to the same failure with the anchor in place: ``GET /api/birthdays``
+declares ``response_model=BirthdayPage`` and that name matches no suffix in
+``_RESPONSE_NAME_RE``, so the envelope was dropped, the generator saw only the
+ITEM shape and asserted ``body[0]['first_name']`` against
+``{"birthdays": [...], "total": ...}``. All 10 acceptance criteria failed and
+were reported as production defects.
 """
 
 from __future__ import annotations
@@ -129,3 +137,87 @@ class TestPromptCarriesTheContract:
     def test_section_absent_when_nothing_discovered(self):
         p = build_user_prompt(self._ctx(), max_scenarios=5)
         assert "Response schemas" not in p
+
+
+class TestRouteDeclaredModelsAreAlwaysIncluded:
+    """What a route DECLARES beats what a class is called. The name pattern
+    is the fallback for apps that declare nothing, not the test."""
+
+    def test_the_run11_envelope_is_discovered(self, tmp_path):
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class BirthdayResponse(BaseModel):\n"
+            "    id: int\n"
+            "    first_name: str\n"
+            "class BirthdayPage(BaseModel):\n"
+            "    birthdays: list[BirthdayResponse]\n"
+            "    total: int\n"
+            "    limit: int\n"
+            "    offset: int\n"
+        ))
+        _write(tmp_path, "app/api/birthdays.py", (
+            "from fastapi import APIRouter\n"
+            "from app.schemas import BirthdayPage, BirthdayResponse\n"
+            "router = APIRouter()\n"
+            "@router.get('', response_model=BirthdayPage)\n"
+            "def list_birthdays():\n"
+            "    ...\n"
+        ))
+        got = discover_response_models(str(tmp_path))
+        assert got["BirthdayPage"] == ["birthdays", "total", "limit", "offset"], (
+            "the envelope the endpoint declares must reach the generator"
+        )
+        assert got["BirthdayResponse"] == ["id", "first_name"]
+
+    def test_a_dotted_declaration_is_resolved(self, tmp_path):
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class Page(BaseModel):\n    rows: list[str]\n"
+        ))
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "from app import schemas\n"
+            "router = APIRouter()\n"
+            "@router.get('/x', response_model=schemas.Page)\n"
+            "def x():\n    ...\n"
+        ))
+        assert discover_response_models(str(tmp_path))["Page"] == ["rows"]
+
+    def test_a_container_declaration_is_unwrapped(self, tmp_path):
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class Row(BaseModel):\n    name: str\n"
+        ))
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "from app.schemas import Row\n"
+            "router = APIRouter()\n"
+            "@router.get('/x', response_model=list[Row])\n"
+            "def x():\n    ...\n"
+        ))
+        assert discover_response_models(str(tmp_path))["Row"] == ["name"]
+
+    def test_response_model_dict_declares_no_shape(self, tmp_path):
+        # `response_model=dict` is a real pattern in the wild and names no
+        # model; it must not invent one.
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class Internal(BaseModel):\n    x: int\n"
+        ))
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/x', response_model=dict)\n"
+            "def x():\n    ...\n"
+        ))
+        assert discover_response_models(str(tmp_path)) == {}
+
+    def test_undeclared_request_models_are_still_excluded(self, tmp_path):
+        # The name filter still earns its keep: nothing declares these.
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class BirthdayCreate(BaseModel):\n    first_name: str\n"
+            "class ThingResponse(BaseModel):\n    id: int\n"
+        ))
+        got = discover_response_models(str(tmp_path))
+        assert "ThingResponse" in got and "BirthdayCreate" not in got

@@ -23114,6 +23114,20 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
         )
         return "human_intervention_node"
 
+    # The node refused this exact file as one it cannot author (no `# @tests:`
+    # linkage — an acceptance suite, owned by acceptance_node). That answer is
+    # a property of the file, not of the round, so further attempts would
+    # re-derive it. Keyed by path so an unrelated file is unaffected.
+    if str(
+        state.get("node_state", {}).get("test_regen_unsupported", "") or ""
+    ) == declared_file:
+        logger.warning(
+            "[router] %s is not a unit test the regeneration node can author "
+            "— routing to HITL instead of spending its remaining attempts.",
+            declared_file,
+        )
+        return "human_intervention_node"
+
     workspace = str(state.get("workspace_path", "") or "")
     attempts = (
         (state.get("loop_counter", {}) or {})

@@ -303,7 +303,10 @@ async def test_node_rejects_stray_file(monkeypatch):
     with tempfile.TemporaryDirectory() as ws:
         rel = "tests/t.py"
         os.makedirs(os.path.join(ws, "tests"))
-        open(os.path.join(ws, rel), "w").write(ORIGINAL)
+        # The marker matters: a file without one is refused before dispatch
+        # (see TestAcceptanceSuiteIsRefusedBeforeDispatch), and this test is
+        # about the stray-target gate that runs after it.
+        open(os.path.join(ws, rel), "w").write("# @tests: app/m.py\n" + ORIGINAL)
         import harness.graph as g
         monkeypatch.setattr(g, "get_gateway",
                             lambda: _FakeGateway("file: server/app.py\ncontent: x"))
@@ -690,7 +693,10 @@ class TestTruncatedRegenerationIsDiscarded:
         rel = "tests/test_employee.py"
         target = tmp_path / "tests"
         target.mkdir(parents=True, exist_ok=True)
-        original = "import pytest\n\n\ndef test_ok():\n    assert True\n"
+        original = (
+            "# @tests: app/employee.py\n"
+            "import pytest\n\n\ndef test_ok():\n    assert True\n"
+        )
         (target / "test_employee.py").write_text(original)
 
         # A body that would salvage cleanly if it were merely non-canonical.
@@ -721,7 +727,8 @@ class TestTruncatedRegenerationIsDiscarded:
         rel = "tests/test_employee.py"
         target = tmp_path / "tests"
         target.mkdir(parents=True, exist_ok=True)
-        (target / "test_employee.py").write_text("import pytest\n")
+        (target / "test_employee.py").write_text(
+            "# @tests: app/employee.py\nimport pytest\n")
 
         gw = _SeqGateway(_TruncResp("<<<REWRITE_FILE>>>\nfile: tests/test_employee.py\ncontent:\nx"),
                          _TruncResp("<<<REWRITE_FILE>>>\nfile: tests/test_employee.py\ncontent:\ny"))
@@ -956,3 +963,123 @@ class TestRepeatedEmissionIsNamed:
         assert "test_feb_29_maps_to_feb_28" in prompt2
         assert "reference_year" in prompt2
         assert "EXACT file you emitted" in prompt2
+
+
+class TestAcceptanceSuiteIsRefusedBeforeDispatch:
+    """This node authors UNIT tests mapped 1:1 to a code module. An
+    acceptance suite links to criteria via `# @verifies:` and is rewritten
+    wholesale by acceptance_node from its scenarios — it has no @tests
+    marker, so require_code_linkage rejects whatever comes back.
+
+    lumina-run11-20260923-0040 sent it tests/acceptance/test_story_001_
+    acceptance.py. The prompt went out as "Regenerate the unit tests for
+    module: (unknown — no @tests marker)" with an empty code-under-test
+    section; both responses correctly kept @verifies, both were rolled back
+    as no_code_linkage, and the run reached HITL having spent two dispatches
+    to learn what the marker said up front.
+    """
+
+    _ACCEPTANCE = (
+        '"""Acceptance tests for STORY-001. AUTO-GENERATED."""\n'
+        "import pytest\n\n"
+        "# @verifies: STORY-001.AC-1\n"
+        "def test_upcoming_sorted(client):\n"
+        "    assert client.get('/api/birthdays').json()[0]\n"
+    )
+
+    def _state_with(self, ws, rel):
+        os.makedirs(os.path.join(ws, os.path.dirname(rel)), exist_ok=True)
+        with open(os.path.join(ws, rel), "w") as fh:
+            fh.write(self._ACCEPTANCE)
+        return _state(ws, rel)
+
+    @pytest.mark.asyncio
+    async def test_no_llm_call_is_spent(self, monkeypatch):
+        import harness.graph as g
+        rel = "tests/acceptance/test_story_001_acceptance.py"
+        with tempfile.TemporaryDirectory() as ws:
+            fake = _QueueGateway(contents=["whatever"])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            out = await regeneration_node(self._state_with(ws, rel))
+        assert fake.calls == [], (
+            "the marker says up front that the gate will reject this"
+        )
+        detail = out["node_state"]["test_regeneration"]
+        assert detail["status"] == "unsupported_test_kind"
+
+    @pytest.mark.asyncio
+    async def test_the_file_is_left_untouched(self, monkeypatch):
+        import harness.graph as g
+        rel = "tests/acceptance/test_story_001_acceptance.py"
+        with tempfile.TemporaryDirectory() as ws:
+            state = self._state_with(ws, rel)
+            monkeypatch.setattr(
+                g, "get_gateway", lambda: _QueueGateway(contents=[""]))
+            await regeneration_node(state)
+            with open(os.path.join(ws, rel)) as fh:
+                assert fh.read() == self._ACCEPTANCE
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_terminal_for_that_file(self, monkeypatch):
+        """Re-asking cannot change the answer, so the ladder escalates now
+        instead of bouncing through the compiler for each attempt left."""
+        from harness.graph import route_after_unsatisfiable
+        import harness.graph as g
+        rel = "tests/acceptance/test_story_001_acceptance.py"
+        with tempfile.TemporaryDirectory() as ws:
+            state = self._state_with(ws, rel)
+            state["test_regeneration_config"]["max_attempts_per_test"] = 3
+            monkeypatch.setattr(
+                g, "get_gateway", lambda: _QueueGateway(contents=[""]))
+            out = await regeneration_node(state)
+
+            nxt = dict(state)
+            nxt["node_state"] = out["node_state"]
+            nxt["loop_counter"] = out["loop_counter"]
+            assert route_after_unsatisfiable(nxt, rel) == (
+                "human_intervention_node")
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_file_is_unaffected(self, monkeypatch):
+        from harness.graph import route_after_unsatisfiable
+        import harness.graph as g
+        rel = "tests/acceptance/test_story_001_acceptance.py"
+        with tempfile.TemporaryDirectory() as ws:
+            state = self._state_with(ws, rel)
+            state["test_regeneration_config"]["max_attempts_per_test"] = 3
+            monkeypatch.setattr(
+                g, "get_gateway", lambda: _QueueGateway(contents=[""]))
+            out = await regeneration_node(state)
+
+            other = "tests/t.py"
+            _regen_setup(ws, other)
+            nxt = dict(state)
+            nxt["node_state"] = out["node_state"]
+            nxt["loop_counter"] = {}
+            assert route_after_unsatisfiable(nxt, other) == (
+                "test_regeneration_node")
+
+    @pytest.mark.asyncio
+    async def test_a_unit_test_with_linkage_still_runs(self, monkeypatch):
+        """Regression guard: the normal path must be untouched."""
+        import harness.graph as g
+        with tempfile.TemporaryDirectory() as ws:
+            rel = "tests/t.py"
+            state = _regen_setup(ws, rel)
+            fake = _QueueGateway(contents=[""])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            await regeneration_node(state)
+        assert len(fake.calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_linkage_gate_off_means_no_refusal(self, monkeypatch):
+        # Nothing will reject the result, so there is nothing to refuse.
+        import harness.graph as g
+        rel = "tests/acceptance/test_story_001_acceptance.py"
+        with tempfile.TemporaryDirectory() as ws:
+            state = self._state_with(ws, rel)
+            state["test_regeneration_config"]["require_code_linkage"] = False
+            fake = _QueueGateway(contents=[""])
+            monkeypatch.setattr(g, "get_gateway", lambda: fake)
+            await regeneration_node(state)
+        assert len(fake.calls) >= 1

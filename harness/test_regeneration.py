@@ -575,6 +575,43 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             )
     module_symbols = public_symbols(code_module_source)
 
+    # This node's contract is a UNIT test mapped 1:1 to a code module. A file
+    # with no `# @tests:` marker cannot satisfy it: the system prompt forbids
+    # @verifies/STORY/AC references while ``require_code_linkage`` demands
+    # @tests, so whatever comes back is rolled back by the post-apply gate.
+    # Refuse before spending the call.
+    #
+    # lumina-run11-20260923-0040 routed tests/acceptance/test_story_001_
+    # acceptance.py here — an AUTO-GENERATED acceptance suite that
+    # acceptance_node rewrites wholesale from its scenarios and that links to
+    # criteria via `# @verifies: STORY-001.AC-1`. The prompt went out reading
+    # "Regenerate the unit tests for module: (unknown — no @tests marker)"
+    # with an empty code-under-test section. Both attempts came back
+    # correctly carrying @verifies, both were rejected as no_code_linkage,
+    # and the run reached HITL having spent two dispatches to learn what the
+    # marker said up front. The flag makes the refusal terminal for this
+    # file: re-asking cannot change the answer, so the ladder escalates now
+    # rather than bouncing through the compiler for the remaining attempts.
+    if cfg.get("require_code_linkage", True) and not marker_paths:
+        logger.warning(
+            "[test_regeneration_node] %s has no `# @tests:` marker and no "
+            "1:1 code module — it is not a unit test this node can author "
+            "(an acceptance suite is owned by acceptance_node). Refusing "
+            "before dispatch.", rel,
+        )
+        try:
+            from harness.observability import emit_event as _emit_unsup
+            _emit_unsup("test_regen_unsupported_kind", file=rel)
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        out = _give_up(
+            "unsupported_test_kind",
+            f"{rel} has no `# @tests:` code linkage; this node authors unit "
+            "tests mapped 1:1 to a module",
+        )
+        out["node_state"]["test_regen_unsupported"] = rel
+        return out
+
     # SRS is a TIEBREAKER only (anchored system prompt for spec-driven builds).
     spec_tiebreaker = ""
     for m in state.get("messages", []) or []:

@@ -19796,6 +19796,32 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         await _inject_repo_index_grounding(
             state, messages, query=(error_summary or "")[:2000], consumer="repair_node",
         )
+        # ADR-0008 item 3, repair first. run12 measured repair using the
+        # anchored spec region on 0 of 24 dispatches while patching used it
+        # on 2 of 13, so repair is where narrowing costs nothing measurable.
+        # messages[0] keeps the cross-cutting preamble (prefix stays stable
+        # for the whole run); the story's own requirement rows are appended
+        # as a later message. An unresolved scope keeps the full region —
+        # a missing requirement must never be the silent outcome.
+        if bool(getattr(gateway.config, "scoped_spec_context", False)):
+            from harness import spec_slice as _spec_slice
+            messages, _slice_tel = _spec_slice.apply_to_messages(
+                messages, state, consumer="repair_node",
+            )
+            if _slice_tel:
+                logger.info(
+                    "[repair_node] Scoped spec context: %s → %d chars "
+                    "(was %d), %d chars of preamble kept.",
+                    ",".join(_slice_tel["stories"]),
+                    _slice_tel["extract_chars"], _slice_tel["region_chars"],
+                    _slice_tel["preamble_chars"],
+                )
+                try:
+                    from harness.observability import emit_event as _emit_slice
+                    _emit_slice("spec_context_scoped", **_slice_tel)
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+
         _r_stubbed, _r_reclaimed = _dedupe_repeated_preambles(messages)
         if _r_stubbed:
             logger.info(

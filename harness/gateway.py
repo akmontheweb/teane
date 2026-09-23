@@ -2649,6 +2649,12 @@ class GatewayConfig:
     # anchored spec region. Wired from debug.measure_spec_usage. Observation
     # only — it never alters a prompt, a response, or routing.
     measure_spec_usage: bool = False
+    # ADR-0008 item 3: narrow the anchored spec region to the stories in
+    # scope for the call. Wired from planning.scoped_spec_context. Applied to
+    # repair_node only for now — run12 measured repair using the region on 0
+    # of 24 dispatches and patching on 2 of 13, so patching waits until its
+    # slice is shown to contain what it was measured using.
+    scoped_spec_context: bool = False
     # B5: when true, the patcher rejects REPLACE_BLOCK / DELETE_BLOCK /
     # INSERT_AT_BLOCK against any file the LLM has not yet been shown this
     # turn (via pre-flight injection, READ_FILE resolution, or the patcher's
@@ -5119,6 +5125,10 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         dump_max_files=_resolve_dump_max_files(config_dict),
         measure_spec_usage=bool(
             (config_dict.get("debug") or {}).get("measure_spec_usage", False)
+        ),
+        scoped_spec_context=bool(
+            (config_dict.get("planning") or {}).get(
+                "scoped_spec_context", False)
         ),
         enforce_read_before_edit=bool(
             (config_dict.get("patcher", {}) or {}).get(

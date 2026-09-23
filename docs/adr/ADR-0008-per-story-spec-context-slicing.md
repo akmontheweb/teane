@@ -332,11 +332,18 @@ architectural work visible.
    carried the region at all. Premise confirmed for `repair`; slice scope
    corrected from story to batch. Re-run the report after any change to the
    anchor — it is the A/B's instrument as well as its motivation.
-3. [ ] Implement the Tier-2 slice in `_build_story_preamble` behind a config
-   flag (default off), reusing `req_ids.parse_spec_requirements`, the
-   `story_satisfies_req` join and `batch_stories` for scope. Roll out by role:
-   `repair` first, where the measurement says nothing is at risk; `patching`
-   only once the slice is shown to contain what run 12 saw it use.
+3. [~] Implement the Tier-2 slice behind a config flag (default off),
+   reusing the `requirements` rows and `batch_stories` for scope. Roll out by
+   role: `repair` first, where the measurement says nothing is at risk;
+   `patching` only once the slice is shown to contain what run 12 saw it use.
+   **repair done** (`harness/spec_slice.py`, `planning.scoped_spec_context`):
+   against the real lumina plan a repair prompt goes from 74,314 to 14,448
+   chars — a 7,496-char cross-cutting preamble kept in the cached prefix
+   plus a 6,876-char extract appended as a later message. It landed in
+   `repair_node` rather than `_build_story_preamble`: the preamble serves the
+   patching/test phases, and repair assembles its own message list. `patching`
+   is NOT done and is the harder half — it is the role the measurement showed
+   using the region.
 4. [ ] Switch `test_regeneration`'s `spec_tiebreaker` to the Tier-2 slice.
 5. [ ] Trim `spec_override` to the Tier-1 preamble under the same flag; record
    `system_prompt_built` chars and per-call input tokens before and after.

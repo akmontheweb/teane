@@ -1068,6 +1068,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # of scheduling separate NFR stories. Read in decomposition_node.
     "planning": frozenset({
         "embed_constraint_nfrs",
+        # ADR-0008 item 3: replace the anchored whole-spec region with the
+        # stories in scope for the call. repair_node only for now.
+        "scoped_spec_context",
     }),
     "fanout": frozenset({
         "max_concurrency",
@@ -1366,6 +1369,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "change_requests_dir": (str,),
     "debug.dump_llm_calls": (bool,),
     "debug.measure_spec_usage": (bool,),
+    "planning.scoped_spec_context": (bool,),
     "debug.dump_max_files": (int,),
     "debug.dump_repair_prompts": (bool,),  # deprecated alias for dump_llm_calls
     "patcher.enforce_read_before_edit": (bool,),

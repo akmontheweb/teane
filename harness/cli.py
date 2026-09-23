@@ -1179,6 +1179,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # deprecated alias for dump_llm_calls — accepted with a warning.
     "debug": frozenset({
         "dump_llm_calls", "dump_max_files", "dump_repair_prompts",
+        # measure_spec_usage emits one spec_region_usage event per dispatch
+        # saying whether the response reproduced anything unique to the
+        # anchored spec region (ADR-0008 action item 2). Observation only.
+        "measure_spec_usage",
     }),
     # Patcher behaviour knobs. enforce_read_before_edit gates the B5
     # read-before-edit invariant — when true the patcher rejects edits to
@@ -1361,6 +1365,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "product_spec_dir": (str,),
     "change_requests_dir": (str,),
     "debug.dump_llm_calls": (bool,),
+    "debug.measure_spec_usage": (bool,),
     "debug.dump_max_files": (int,),
     "debug.dump_repair_prompts": (bool,),  # deprecated alias for dump_llm_calls
     "patcher.enforce_read_before_edit": (bool,),

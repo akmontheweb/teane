@@ -2644,6 +2644,11 @@ class GatewayConfig:
     # Wired from debug.dump_max_files in config.json. 5000 keeps roughly
     # the last 250 runs at ~20 dispatches/run, fitting easily in <100 MB.
     dump_max_files: int = 5000
+    # ADR-0008 action item 2: emit one spec_region_usage event per dispatch
+    # reporting whether the response reproduced anything unique to the
+    # anchored spec region. Wired from debug.measure_spec_usage. Observation
+    # only — it never alters a prompt, a response, or routing.
+    measure_spec_usage: bool = False
     # B5: when true, the patcher rejects REPLACE_BLOCK / DELETE_BLOCK /
     # INSERT_AT_BLOCK against any file the LLM has not yet been shown this
     # turn (via pre-flight injection, READ_FILE resolution, or the patcher's
@@ -4259,6 +4264,21 @@ class Gateway:
         except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
             logger.debug("[gateway] LLM-call dump skipped: %s", exc)
 
+        # ADR-0008 action item 2: does this call USE the spec region it was
+        # handed? Measurement only — no prompt or response is altered — and
+        # gated by debug.measure_spec_usage (default false). The ADR's premise
+        # is that the loop nodes carry the requirement bodies without reading
+        # them; that was established by reading code, so it is measured on a
+        # real run before anything is trimmed. See harness/spec_usage.py.
+        if bool(getattr(self.config, "measure_spec_usage", False)):
+            from harness import spec_usage
+            spec_usage.maybe_emit(
+                messages=messages,
+                response_text=getattr(response, "content", "") or "",
+                role=role,
+                cache_family=cache_family,
+            )
+
         # Truncation is the one failure that looks like success to a
         # caller that only reads ``content``. Ten of the eleven dispatch
         # sites in this codebase never check ``finish_reason``, and nine of
@@ -5097,6 +5117,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         },
         dump_llm_calls=_resolve_dump_llm_calls(config_dict),
         dump_max_files=_resolve_dump_max_files(config_dict),
+        measure_spec_usage=bool(
+            (config_dict.get("debug") or {}).get("measure_spec_usage", False)
+        ),
         enforce_read_before_edit=bool(
             (config_dict.get("patcher", {}) or {}).get(
                 "enforce_read_before_edit", True,

@@ -302,6 +302,39 @@ class _TestFnScanner(ast.NodeVisitor):
     def _is_raises_functional(node: ast.Call) -> bool:
         return _is_raises_call(node) and len(node.args) >= 2
 
+    def state_dependent_sigs(self) -> set[str]:
+        """Signatures whose outcome demonstrably depends on PRIOR STATE.
+
+        A test that calls the same signature once bare and once inside
+        ``pytest.raises`` is not contradicting itself — it is specifying a
+        sequence, and the second outcome differs because the first call
+        changed the world:
+
+            def test_rejects_duplicate(self, conn):
+                birthday_repository.create(conn, make_employee())      # ok
+                with pytest.raises(DuplicateBirthdayError):
+                    birthday_repository.create(conn, make_employee())  # raises
+
+        That is the correct specification of a uniqueness constraint. The
+        scanner records the signature as BOTH ``success`` and ``raise`` for
+        that one function, and that dual classification is proof the call is
+        state-dependent — so the signature cannot prove a contradiction
+        against ANY other test either. Its outcome is not a function of its
+        arguments, which is the assumption the whole prover rests on.
+
+        lumina-run12-20260923-0914: this pair was declared "PROVABLY
+        unsatisfiable" against ``test_assigns_generated_id``. The escape
+        ladder took its top rung, regenerated the file twice — each time
+        correctly reproducing the same pair, because the pair is right —
+        exhausted the per-file cap, and the run ended on the distraction
+        loop with repair chasing a defect that did not exist.
+        """
+        return {
+            sig
+            for kinds in self.by_fn.values()
+            for sig in (kinds["raise"] & kinds["success"])
+        }
+
 
 def _scan(source: str) -> Optional[_TestFnScanner]:
     """Parse ``source`` and return the populated scanner (per-test-function
@@ -333,6 +366,7 @@ def find_contradictions(
         return []
     by_fn = scanner.by_fn
     ambient = scanner.ambient_fns
+    state_dependent = scanner.state_dependent_sigs()
 
     # Aggregate per-signature the set of tests that expect raise vs success.
     raise_tests: dict[str, list[str]] = {}
@@ -345,6 +379,9 @@ def find_contradictions(
 
     out: list[Contradiction] = []
     for sig in sorted(set(raise_tests) & set(success_tests)):
+        if sig in state_dependent:
+            # Sequence, not contradiction — see state_dependent_sigs.
+            continue
         rt = sorted(raise_tests[sig])
         st = sorted(success_tests[sig])
         # Require the opposite classifications to come from *different* test
@@ -395,10 +432,15 @@ def find_contradictions_across(
     # (file, test_fn) locations that reconfigure ambient state — excluded from
     # contradiction pairing for the same reason as the single-file detector.
     ambient_loc: set[tuple[str, str]] = set()
+    # A call shown to be state-dependent in ANY file is state-dependent
+    # everywhere: its outcome is not a function of its arguments, so it
+    # cannot prove a same-input contradiction in another file either.
+    state_dependent: set[str] = set()
     for fname in sorted(files):
         scanner = _scan(files[fname])
         if scanner is None:
             continue
+        state_dependent |= scanner.state_dependent_sigs()
         for fn, kinds in scanner.by_fn.items():
             for sig in kinds["raise"]:
                 raise_loc.setdefault(sig, []).append((fname, fn))
@@ -409,6 +451,9 @@ def find_contradictions_across(
 
     out: list[Contradiction] = []
     for sig in sorted(set(raise_loc) & set(success_loc)):
+        if sig in state_dependent:
+            # Sequence, not contradiction — see state_dependent_sigs.
+            continue
         rl = sorted(raise_loc[sig])
         sl = sorted(success_loc[sig])
         # Distinct (file, fn) locations only — the same call both raising and

@@ -372,3 +372,102 @@ class TestCrossFileDetection:
             "        Foo(1)\n"
         )
         assert find_contradictions_across({"one.py": one}) == []
+
+
+class TestStateDependentCallsAreNotContradictions:
+    """lumina-run12-20260923-0914. A call the same test makes twice — once
+    bare, once inside pytest.raises — is specifying a SEQUENCE: the second
+    outcome differs because the first call changed the world. The prover
+    assumes an outcome is a function of the arguments, and that assumption
+    does not hold for such a call, so it cannot prove a contradiction
+    against any other test either.
+
+    Run 12 declared exactly this pair "PROVABLY unsatisfiable", took the top
+    rung of the escape ladder, regenerated the file twice — each time
+    correctly reproducing the pair, because the pair is right — exhausted
+    the per-file cap and ended on the distraction loop, with repair chasing
+    a defect that did not exist.
+    """
+
+    LUMINA = (
+        "class TestCreate:\n"
+        "    def test_assigns_generated_id(self, conn):\n"
+        "        created = birthday_repository.create(conn, make_employee())\n"
+        "        assert created.id > 0\n"
+        "    def test_rejects_duplicate(self, conn):\n"
+        "        birthday_repository.create(conn, make_employee())\n"
+        "        with pytest.raises(DuplicateBirthdayError):\n"
+        "            birthday_repository.create(conn, make_employee())\n"
+    )
+
+    def test_the_run12_pair_is_not_a_contradiction(self):
+        assert find_contradictions(self.LUMINA) == [], (
+            "a uniqueness constraint is a sequence, not a contradiction"
+        )
+
+    def test_nor_across_files(self):
+        from harness.test_contradiction import find_contradictions_across
+        # The duplicate-rejecting test and the success-expecting test split
+        # across two files: still a sequence, still not a contradiction.
+        raises_side = (
+            "def test_rejects_duplicate(conn):\n"
+            "    repo.create(conn, emp())\n"
+            "    with pytest.raises(Dup):\n"
+            "        repo.create(conn, emp())\n"
+        )
+        success_side = (
+            "def test_assigns_id(conn):\n"
+            "    created = repo.create(conn, emp())\n"
+            "    assert created.id > 0\n"
+        )
+        assert find_contradictions_across(
+            {"a.py": raises_side, "b.py": success_side}) == []
+
+    def test_a_genuine_contradiction_is_still_proven(self):
+        # The guard must not blunt the detector: no test here calls the
+        # signature twice, so nothing is state-dependent.
+        src = (
+            "def test_a():\n"
+            "    obj = ContactUpdate(first_name=None)\n"
+            "def test_b():\n"
+            "    with pytest.raises(ValidationError):\n"
+            "        ContactUpdate(first_name=None)\n"
+        )
+        found = find_contradictions(src)
+        assert len(found) == 1
+        assert found[0].expect_raise_test == "test_b"
+        assert found[0].expect_success_test == "test_a"
+
+    def test_a_genuine_contradiction_is_still_proven_across_files(self):
+        from harness.test_contradiction import find_contradictions_across
+        found = find_contradictions_across({
+            "schemas.py": (
+                "def test_rejects_blank():\n"
+                "    with pytest.raises(ValidationError):\n"
+                "        ContactUpdate(first_name='   ')\n"
+            ),
+            "service.py": (
+                "def test_builds_payload():\n"
+                "    payload = ContactUpdate(first_name='   ')\n"
+            ),
+        })
+        assert len(found) == 1
+
+    def test_only_the_state_dependent_signature_is_spared(self):
+        # One sequence-using call and one genuinely contradicted call in the
+        # same file: the first is spared, the second still reported.
+        src = (
+            "def test_dup(conn):\n"
+            "    repo.create(conn, emp())\n"
+            "    with pytest.raises(Dup):\n"
+            "        repo.create(conn, emp())\n"
+            "def test_ok(conn):\n"
+            "    created = repo.create(conn, emp())\n"
+            "def test_blank_raises():\n"
+            "    with pytest.raises(E):\n"
+            "        Update(name='')\n"
+            "def test_blank_ok():\n"
+            "    obj = Update(name='')\n"
+        )
+        found = find_contradictions(src)
+        assert [f.call for f in found] == ["Update(name='')"]

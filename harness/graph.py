@@ -20139,6 +20139,60 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # stuck-file-without-fresh-view, and byte-identical repeat search
         # blocks. See ``_pre_patch_screen`` for the full rationale.
         _blocks_parsed = parse_patch_blocks(patch_payload)
+        # Foreign-dialect rescue. When nothing parsed as the harness DSL, the
+        # model may still have expressed a patch precisely — in another
+        # dialect's envelope. `edit_file(file_path, old_string, new_string)`
+        # IS teane's own tool schema; only the wrapper is foreign, and
+        # tool_dialects already recognises it. Translating it through
+        # tool_call_to_patch_block — the same translator the native tool-use
+        # path uses — makes such a round land its patch instead of being
+        # reported and discarded.
+        #
+        # lumina-run14-20260923-2352 lost TEN rounds this way, deepseek-v4-pro
+        # answering in anthropic_xml under the length pressure of a displaced
+        # format reminder. The dialect detector named the tool and its
+        # arguments every time; nothing consumed them.
+        #
+        # Everything downstream is unchanged: these blocks go through the
+        # tamper guard, the anti-drift screen, the allowlist and
+        # read-before-edit exactly as parsed ones do, because they ARE parsed
+        # ones by the time the pipeline sees them.
+        _rescued_dialects: list[str] = []
+        if not _blocks_parsed and patch_payload:
+            try:
+                from harness.tool_dialects import (
+                    invocations_to_patch_blocks as _inv_to_blocks,
+                    unmapped_invocations as _unmapped_inv,
+                )
+                _foreign = _unmapped_inv(patch_payload)
+                _rescued, _unrescued = _inv_to_blocks(_foreign)
+                if _rescued:
+                    _blocks_parsed = _rescued
+                    _rescued_dialects = sorted({
+                        str(c.get("dialect") or "?") for c in _foreign
+                    })
+                    logger.warning(
+                        "[repair_node] Rescued %d patch block(s) from "
+                        "foreign tool dialect(s) %s naming %s — the round "
+                        "expressed a patch, just not in this harness's "
+                        "grammar. Applying it and telling the model the "
+                        "expected form.",
+                        len(_rescued), _rescued_dialects,
+                        sorted({str(c.get("name") or "?") for c in _foreign
+                                if c not in _unrescued}),
+                    )
+                    try:
+                        from harness.observability import emit_event as _emit_rsc
+                        _emit_rsc(
+                            "foreign_dialect_rescued",
+                            dialects=_rescued_dialects,
+                            blocks=len(_rescued),
+                            untranslated=len(_unrescued),
+                        )
+                    except Exception:  # noqa: BLE001 — telemetry must not block
+                        pass
+            except Exception as exc:  # noqa: BLE001 — rescue must never break repair
+                logger.debug("[repair_node] dialect rescue skipped: %s", exc)
         # Parse-miss diagnostic (mirrors the patching_node site). See
         # rationale there — silent parser drop with zero LLM-visible
         # feedback is the exact loop that killed finsearch 156032347

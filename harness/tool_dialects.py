@@ -298,3 +298,51 @@ def unmapped_invocations(text: str) -> list[dict[str, Any]]:
         inv for inv in extract_tool_invocations(text)
         if to_read_file_dsl(inv) is None
     ]
+
+
+def invocations_to_patch_blocks(
+    invocations: list[dict[str, Any]],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Translate recognised foreign-dialect invocations into ``PatchBlock``s.
+
+    Returns ``(blocks, untranslated)``. A model that writes
+    ``edit_file(file_path=..., old_string=..., new_string=...)`` in
+    Anthropic's XML has expressed a REPLACE_BLOCK precisely — the name and
+    arguments are teane's own tool schema (``harness/tool_schemas.py``), only
+    the envelope is foreign. Recognising that and then discarding it wastes a
+    round the model did its part in: lumina-run14-20260923-2352 lost ten of
+    them this way.
+
+    Reuses ``tool_call_to_patch_block``, the same translator the native
+    tool-use path uses, so a call means exactly what it would have meant had
+    the provider delivered it natively. ``read_file`` and unknown names come
+    back in ``untranslated`` for the caller to handle or report — a read is
+    a host round-trip, not a patch.
+    """
+    from harness.tool_schemas import tool_call_to_patch_block
+
+    blocks: list[Any] = []
+    untranslated: list[dict[str, Any]] = []
+    for inv in invocations or []:
+        if not isinstance(inv, dict):
+            continue
+        name = str(inv.get("name") or "")
+        args = inv.get("args")
+        if name == "read_file" or not isinstance(args, dict):
+            untranslated.append(inv)
+            continue
+        try:
+            block = tool_call_to_patch_block({"name": name, "input": args})
+        except Exception as exc:  # noqa: BLE001 — translation is best-effort
+            logger.debug("[tool_dialects] translation failed for %s: %s", name, exc)
+            block = None
+        if block is None:
+            untranslated.append(inv)
+            continue
+        if not str(getattr(block, "file", "") or "").strip():
+            # A patch with no path cannot be applied and must not be counted
+            # as understood.
+            untranslated.append(inv)
+            continue
+        blocks.append(block)
+    return blocks, untranslated

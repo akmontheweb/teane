@@ -844,6 +844,121 @@ def discover_routes(workspace_path: str, *, max_files: int = 200) -> list[dict[s
     return routes
 
 
+def discover_route_response_literals(
+    workspace_path: str, *, max_files: int = 200,
+) -> dict[str, list[str]]:
+    """Endpoint → the keys of the dict literal its handler actually returns.
+
+    The companion to :func:`discover_response_models`, for the endpoints that
+    one cannot see. A route declaring ``response_model=dict`` (or nothing)
+    declares no shape, so there is no class to read — but the handler
+    frequently spells the envelope out:
+
+        @router.get("/upcoming", response_model=dict)
+        def get_upcoming(...) -> dict:
+            return {"birthdays": [u.model_dump() for u in upcoming]}
+
+    lumina-run15-20260924-1423: with no shape for that endpoint the scenario
+    generator guessed a bare list and wrote
+    ``[item['first_name'] for item in data]``, which iterates a dict's KEYS.
+    Eight of ten acceptance criteria failed on it, while the sibling endpoint
+    — which declares ``response_model=BirthdayPage`` — passed, because
+    ``ba2f949`` had given the generator its real keys.
+
+    Only routes with no usable declared model are inspected: a declared model
+    is the authority, and a handler that returns a model instance has no dict
+    literal to read anyway. Keys are the literal's top-level string keys, in
+    source order. Best-effort, like every discovery helper here.
+    """
+    import ast
+
+    out: dict[str, list[str]] = {}
+    scanned = 0
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py") or scanned >= max_files:
+                continue
+            scanned += 1
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if "response_model" not in text and "@router" not in text \
+                    and "@app" not in text:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            pm = _ROUTER_PREFIX_RE.search(text)
+            prefix = pm.group(1) if pm else ""
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                route = _route_of(node, prefix)
+                if route is None:
+                    continue
+                method, full_path, declares_shape = route
+                if declares_shape:
+                    continue  # the declared model is the authority
+                keys = _returned_dict_keys(node)
+                if keys:
+                    out[f"{method} {full_path} (returned body)"] = keys
+    return out
+
+
+def _route_of(
+    node: Any, prefix: str,
+) -> "Optional[tuple[str, str, bool]]":
+    """``(METHOD, path, declares_a_shape)`` for a route handler, else None."""
+    import ast
+
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
+            continue
+        method = dec.func.attr.upper()
+        if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+            continue
+        sub = ""
+        if dec.args and isinstance(dec.args[0], ast.Constant) \
+                and isinstance(dec.args[0].value, str):
+            sub = dec.args[0].value
+        declares = False
+        for kw in dec.keywords:
+            if kw.arg != "response_model":
+                continue
+            # ``response_model=dict`` / ``=None`` name no shape; anything
+            # else does (a class, a dotted ref, a container of one).
+            names = {
+                n.id for n in ast.walk(kw.value) if isinstance(n, ast.Name)
+            } | {
+                a.attr for a in ast.walk(kw.value) if isinstance(a, ast.Attribute)
+            }
+            declares = bool(names - {"dict", "Dict", "Any", "None", "list",
+                                     "List"})
+        return method, (prefix + sub) or "/", declares
+    return None
+
+
+def _returned_dict_keys(node: Any) -> list[str]:
+    """Top-level string keys of the dict literals a function returns."""
+    import ast
+
+    keys: list[str] = []
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Return) or not isinstance(sub.value, ast.Dict):
+            continue
+        for k in sub.value.keys:
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                if k.value not in keys:
+                    keys.append(k.value)
+    return keys
+
+
 def _read_excerpt(workspace_path: str, rel: str, *, max_chars: int) -> str:
     path = os.path.join(workspace_path, rel)
     if not os.path.isfile(path):
@@ -1234,7 +1349,12 @@ def gather_story_acceptance_context(
         description=story.get("description", "") or "",
         acceptance_criteria=ac_rows,
         routes=discover_routes(workspace_path),
-        response_models=discover_response_models(workspace_path),
+        response_models={
+            # Declared models first; literals fill only the endpoints that
+            # declare no shape, so a declared model is never overridden.
+            **discover_route_response_literals(workspace_path),
+            **discover_response_models(workspace_path),
+        },
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
         architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),
         stack=dict(stack or {}),

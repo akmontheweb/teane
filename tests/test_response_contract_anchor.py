@@ -25,6 +25,7 @@ from harness.acceptance_gen import (
     StoryAcceptanceContext,
     build_user_prompt,
     discover_response_models,
+    discover_route_response_literals,
 )
 
 
@@ -221,3 +222,106 @@ class TestRouteDeclaredModelsAreAlwaysIncluded:
         ))
         got = discover_response_models(str(tmp_path))
         assert "ThingResponse" in got and "BirthdayCreate" not in got
+
+
+class TestEndpointsThatDeclareNoShape:
+    """``response_model=dict`` declares nothing, so there is no class to read
+    — but the handler usually spells the envelope out in its return.
+
+    lumina-run15-20260924-1423: `GET /api/birthdays/upcoming` declares
+    ``dict`` and returns ``{"birthdays": [...]}``. With no shape for it the
+    generator guessed a bare list and wrote
+    ``[item['first_name'] for item in data]``, which iterates a dict's KEYS.
+    Eight of ten acceptance criteria failed on it — while the sibling
+    endpoint, which declares ``response_model=BirthdayPage``, passed.
+    """
+
+    ROUTER = (
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/api/birthdays')\n"
+        "@router.get('/upcoming', response_model=dict)\n"
+        "def get_upcoming():\n"
+        "    return {'birthdays': [u.model_dump() for u in upcoming]}\n"
+    )
+
+    def test_the_run15_envelope_is_discovered(self, tmp_path):
+        _write(tmp_path, "app/api.py", self.ROUTER)
+        got = discover_route_response_literals(str(tmp_path))
+        assert got == {"GET /api/birthdays/upcoming (returned body)": ["birthdays"]}
+
+    def test_an_async_handler_counts(self, tmp_path):
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/x')\n"
+            "async def x():\n"
+            "    return {'items': [], 'total': 0}\n"
+        ))
+        got = discover_route_response_literals(str(tmp_path))
+        assert got["GET /x (returned body)"] == ["items", "total"]
+
+    def test_a_declared_model_is_left_to_the_schema_reader(self, tmp_path):
+        # The declared model is the authority; reading the handler too could
+        # contradict it.
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/x', response_model=BirthdayPage)\n"
+            "def x():\n"
+            "    return {'whatever': 1}\n"
+        ))
+        assert discover_route_response_literals(str(tmp_path)) == {}
+
+    def test_a_handler_returning_a_model_instance_yields_nothing(self, tmp_path):
+        _write(tmp_path, "app/api.py", (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/x')\n"
+            "def x():\n"
+            "    return BirthdayPage(birthdays=[], total=0)\n"
+        ))
+        assert discover_route_response_literals(str(tmp_path)) == {}
+
+    def test_non_route_functions_are_ignored(self, tmp_path):
+        _write(tmp_path, "app/util.py", (
+            "def helper():\n"
+            "    return {'not': 'a response'}\n"
+        ))
+        assert discover_route_response_literals(str(tmp_path)) == {}
+
+    def test_tests_and_broken_files_are_skipped(self, tmp_path):
+        _write(tmp_path, "tests/api.py", self.ROUTER)
+        _write(tmp_path, "app/broken.py", "@router.get('/x')\ndef (:\n")
+        assert discover_route_response_literals(str(tmp_path)) == {}
+
+    def test_both_sources_reach_the_context(self, tmp_path):
+        # The merge must not let a literal shadow a declared model, nor drop
+        # the endpoints only a literal describes.
+        _write(tmp_path, "app/schemas.py", (
+            "from pydantic import BaseModel\n"
+            "class BirthdayPage(BaseModel):\n"
+            "    birthdays: list\n    total: int\n"
+        ))
+        _write(tmp_path, "app/api.py", self.ROUTER + (
+            "@router.get('', response_model=BirthdayPage)\n"
+            "def listing():\n"
+            "    return page\n"
+        ))
+        merged = {
+            **discover_route_response_literals(str(tmp_path)),
+            **discover_response_models(str(tmp_path)),
+        }
+        assert merged["BirthdayPage"] == ["birthdays", "total"]
+        assert merged["GET /api/birthdays/upcoming (returned body)"] == ["birthdays"]
+
+    def test_the_prompt_shows_the_endpoint_shape(self, tmp_path):
+        ctx = StoryAcceptanceContext(
+            story_key="STORY-001", title="t", description="d",
+            acceptance_criteria=[{"ac_key": "AC-1", "text": "shows names"}],
+            routes=[{"method": "GET", "path": "/api/birthdays/upcoming"}],
+            response_models={
+                "GET /api/birthdays/upcoming (returned body)": ["birthdays"]},
+            data_model_excerpt="", architecture_excerpt="", stack={},
+        )
+        prompt = build_user_prompt(ctx, max_scenarios=5)
+        assert "GET /api/birthdays/upcoming (returned body): birthdays" in prompt

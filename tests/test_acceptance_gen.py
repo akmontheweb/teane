@@ -570,6 +570,17 @@ class TestAppDiscoveryAndConftest:
 
 
 class TestPrompt:
+    def test_status_assertions_must_carry_the_response_body(self):
+        """lumina-run17-20260924-2351, generalised. The deterministic
+        contract tier lost two HITL trips to `assert 500 == 422` with no
+        message; this tier had no rule against writing the same thing — the
+        one workspace file that carried `, resp.text` did so by the model's
+        own habit, not by contract."""
+        from harness.acceptance_gen import build_system_prompt
+        prompt = build_system_prompt(db_isolated=True)
+        assert "resp.status_code == 200, resp.text" in prompt
+        assert "hides the body" in prompt
+
     def test_user_prompt_includes_ac_text_and_routes(self):
         p = ag.build_user_prompt(_ctx(), max_scenarios=10)
         assert "Reject a future date of birth returns 422" in p

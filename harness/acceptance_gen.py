@@ -221,6 +221,12 @@ Hard requirements — a scenario with any of these is useless and will be reject
 - integration bodies: use the injected `client` fixture (an in-process test \
   client). Assert real status codes AND response/persisted content. Do NOT import \
   the app, spin a server, or use a live URL — the harness provides `client`.
+- EVERY status-code assertion MUST carry the response body as its message: \
+  `assert resp.status_code == 200, resp.text`. Without it a failure reads \
+  `assert 500 == 200` and nothing more — pytest prints `resp` as \
+  `<Response [500 Internal Server Error]>`, whose repr hides the body — so the \
+  server's own explanation never reaches the repair loop and it fixes the \
+  wrong thing for several rounds.
 - integration bodies MUST be SELF-CONTAINED: arrange every prerequisite via the \
   API inside the test (e.g. POST a contact before you PATCH or DELETE it), and use \
   unique/generated field values so the test is robust to any shared state. NEVER \

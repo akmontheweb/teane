@@ -278,6 +278,44 @@ class TestRenderApi:
         # GET has nothing deterministic → no test
         assert "test_get_" not in body
 
+    def test_every_status_assertion_carries_the_response_body(self):
+        """lumina-run17-20260924-2351: two HITL trips because a failure read
+        `assert 500 == 422` and nothing else.
+
+        The app had already answered
+        `{"detail": "Unable to open database file at DATABASE_PATH=..."}`, but
+        an exception handler turned the real error into a 500 body and
+        `--showlocals` prints only `resp = <Response [500 ...]>`, whose repr
+        omits it. The judge guessed across four files and hedged its verdict
+        with an "or"; repair took the cheaper branch and the loop stalled.
+        """
+        model_required = {"ContactCreate": True, "ContactUpdate": False}
+        routes = parse_fastapi_routes(
+            _ROUTES, rel_path="app/api.py", model_required=model_required,
+        )
+        body = render_api_contract_test(
+            routes, app_module="app.main", app_var="app", source_rel="app/api.py",
+        )
+        asserts = [ln.strip() for ln in body.splitlines()
+                   if "resp.status_code" in ln]
+        assert asserts, "precondition: the renderer emitted status assertions"
+        for line in asserts:
+            assert line.endswith(", resp.text"), (
+                f"a status assertion with no message hides the server's own "
+                f"explanation from the repair loop: {line!r}"
+            )
+
+    def test_the_emitted_assertions_are_valid_python(self):
+        import ast
+        model_required = {"ContactCreate": True, "ContactUpdate": False}
+        routes = parse_fastapi_routes(
+            _ROUTES, rel_path="app/api.py", model_required=model_required,
+        )
+        body = render_api_contract_test(
+            routes, app_module="app.main", app_var="app", source_rel="app/api.py",
+        )
+        ast.parse(body)  # raises if the message was spliced in wrongly
+
     def test_none_when_no_testable_routes(self):
         src = (
             "from fastapi import APIRouter\n"

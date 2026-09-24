@@ -815,7 +815,23 @@ def render_api_contract_test(
     source_rel: str,
 ) -> Optional[str]:
     """Render the API-contract test file, or None if no route yields a
-    deterministic assertion."""
+    deterministic assertion.
+
+    Every status assertion carries ``resp.text`` as its message. Without it
+    a failure reads ``assert 500 == 422`` and nothing more: pytest's
+    ``--showlocals`` prints ``resp = <Response [500 Internal Server Error]>``,
+    whose repr omits the body, so the server's own explanation never reaches
+    the repair loop.
+
+    lumina-run17-20260924-2351 cost two HITL trips to that gap. The app
+    answered ``{"detail": "Unable to open database file at DATABASE_PATH=..."}``
+    — an exception handler had already turned the real error into a 500 body
+    — while the diagnostics carried only the number. The judge, with nothing
+    else to go on, guessed across row_factory, DATABASE_PATH, config defaults
+    and the data directory, and hedged its verdict with an "or" that sent
+    repair after the cheaper of two alternatives. The acceptance emitter has
+    always written ``, resp.text``; this tier had not.
+    """
     body: list[str] = []
     for r in routes:
         # 1. Empty-body → 422 (only when the body model has a required field;
@@ -825,7 +841,7 @@ def render_api_contract_test(
             body.append(
                 f"def test_{r.method}_{_path_slug(r.path)}_empty_body_422():\n"
                 f'    resp = client.{r.method}("{url}", json={{}})\n'
-                f"    assert resp.status_code == 422\n\n"
+                f"    assert resp.status_code == 422, resp.text\n\n"
             )
         # 2. Non-numeric value in an int path param → 422.
         slug = _path_slug(r.path)
@@ -841,7 +857,7 @@ def render_api_contract_test(
             body.append(
                 f"def test_{r.method}_{slug}_{suffix}_422():\n"
                 f"    resp = {call}\n"
-                f"    assert resp.status_code == 422\n\n"
+                f"    assert resp.status_code == 422, resp.text\n\n"
             )
     if not body:
         return None

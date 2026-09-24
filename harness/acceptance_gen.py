@@ -108,6 +108,19 @@ class StoryAcceptanceContext:
     """Best-effort discovered HTTP routes: ``{"method": "POST", "path": "/contacts"}``."""
     data_model_excerpt: str = ""
     architecture_excerpt: str = ""
+    cross_cutting_rules: str = ""
+    """The requirements document's cross-cutting head — product decisions,
+    assumptions, data model, time/date semantics, API conventions, error
+    shapes, test conventions. Everything above the first requirement heading.
+
+    Without it the generator writes scenarios that cannot pass, because the
+    rule governing them is invisible. lumina-run17-20260924-2351: the
+    leap-day criterion was verified through ``GET /api/birthdays/upcoming``,
+    which returns a 30-DAY window (spec: "Only birthdays with days_left from
+    0 through 30 inclusive are shown"). A birthday five months out is
+    correctly absent, ``next(...)`` raised StopIteration, and the run ended
+    with repair chasing a defect that did not exist. The same blindness
+    produced run 15's seeded name the validator rejects."""
     stack: dict[str, Any] = field(default_factory=dict)
     """Backend/frontend/db hints, e.g. ``{"backend": "fastapi", "db": "sqlite"}``."""
     response_models: dict[str, list[str]] = field(default_factory=dict)
@@ -232,6 +245,7 @@ Hard requirements — a scenario with any of these is useless and will be reject
   unique/generated field values so the test is robust to any shared state. NEVER \
   assume pre-seeded rows exist.
 {db_isolation_rule}
+{clock_rule}
 - e2e bodies: use `page` and real selectors/roles + `await expect(...)`. Assume \
   the app is served at the configured base URL.
 - Do NOT mock internal modules (db, repositories, services). Exercise real \
@@ -260,8 +274,24 @@ of the test function only (the harness adds the signature and the @verifies mark
 
 _DB_ISOLATION_SLOT = "{db_isolation_rule}"
 
+#: Filled when the app exposes an injectable clock the conftest can pin.
+_CLOCK_SLOT = "{clock_rule}"
+_CLOCK_AVAILABLE_RULE = """\
+- The `client` fixture exposes `client.freeze_today(datetime.date(Y, M, D))`. \
+  Call it BEFORE arranging data for ANY criterion whose outcome depends on \
+  today's date — a rolling window, an age, an expiry, a leap-day rule. \
+  Without it such a scenario passes only on the right calendar day: a record \
+  outside a documented window is correctly absent, and asserting it is \
+  present is simply wrong."""
+_CLOCK_ABSENT_RULE = """\
+- The app exposes no injectable clock, so today's date cannot be pinned. For \
+  a criterion that depends on the date, arrange data RELATIVE to today \
+  (e.g. a birthday N days out, computed from `datetime.date.today()`) and \
+  keep it inside any window the rules above document. Never hard-code a \
+  month or a fixed date."""
 
-def build_system_prompt(*, db_isolated: bool) -> str:
+
+def build_system_prompt(*, db_isolated: bool, clock_available: bool = False) -> str:
     """Render the scenario-generation system prompt for this workspace.
 
     ``db_isolated`` must reflect what the conftest ACTUALLY provides (i.e.
@@ -274,6 +304,9 @@ def build_system_prompt(*, db_isolated: bool) -> str:
     # schema full of braces.
     return _SYSTEM_PROMPT_TEMPLATE.replace(
         _DB_ISOLATION_SLOT, _DB_ISOLATED_RULE if db_isolated else _DB_SHARED_RULE,
+    ).replace(
+        _CLOCK_SLOT,
+        _CLOCK_AVAILABLE_RULE if clock_available else _CLOCK_ABSENT_RULE,
     )
 
 
@@ -318,6 +351,17 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
             "asserts the same schema, so a body key you guess at will "
             "contradict it and no production change can satisfy both.",
         ]
+    if ctx.cross_cutting_rules.strip():
+        parts += [
+            "",
+            "## Rules that govern EVERY endpoint (from the specification)",
+            "A scenario that ignores one of these cannot pass, however well "
+            "it matches the criterion's wording: filters, windows, "
+            "pagination, rate limits, validation rules and error shapes are "
+            "part of the contract. Check the data you arrange against these "
+            "before asserting it is visible.",
+            ctx.cross_cutting_rules.strip(),
+        ]
     if ctx.data_model_excerpt.strip():
         parts += ["", "## Data model (excerpt)", ctx.data_model_excerpt.strip()]
     if ctx.architecture_excerpt.strip():
@@ -341,6 +385,7 @@ async def generate_acceptance_scenarios(
     budget_remaining_usd: float,
     config: Optional[dict[str, Any]] = None,
     db_isolated: bool = False,
+    clock_available: bool = False,
 ) -> AcceptanceGenResult:
     """Generate + validate dual-altitude scenarios for one story via the LLM.
 
@@ -358,7 +403,8 @@ async def generate_acceptance_scenarios(
     from harness.trust import strip_code_fences
 
     messages = [
-        {"role": "system", "content": build_system_prompt(db_isolated=db_isolated)},
+        {"role": "system", "content": build_system_prompt(
+            db_isolated=db_isolated, clock_available=clock_available)},
         {"role": "user", "content": build_user_prompt(ctx, max_scenarios=max_scenarios)},
     ]
 
@@ -965,6 +1011,47 @@ def _returned_dict_keys(node: Any) -> list[str]:
     return keys
 
 
+#: Budget for the cross-cutting rules block. Larger than the per-file
+#: excerpt budget because this is the CONTRACT the scenarios must satisfy,
+#: not background: for lumina it is ~7.5 KB covering product decisions,
+#: assumptions, data model, time/date semantics, API conventions, success
+#: and error response shapes, frontend routing, deployment and test
+#: conventions. Cutting it to the 6 KB excerpt budget dropped the error
+#: shapes, which is exactly the kind of rule a scenario gets wrong.
+_CROSS_CUTTING_MAX_CHARS = 12000
+
+
+def _cross_cutting_rules(
+    workspace_path: str, *, max_chars: int = _CROSS_CUTTING_MAX_CHARS,
+) -> str:
+    """The requirements document's cross-cutting head, or ``""``.
+
+    Reuses ``spec_slice.tier1_preamble`` (ADR-0008) — everything above the
+    first EPIC/FEAT/STORY heading — so the acceptance generator and the
+    repair loop reason from the same rules instead of each seeing half.
+    """
+    path = os.path.join(workspace_path, "docs", "SPEC_REQUIREMENTS.md")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    try:
+        from harness.spec_slice import tier1_preamble
+        head = tier1_preamble(text)
+    except Exception:  # noqa: BLE001 — discovery is best-effort
+        return ""
+    if len(head) <= max_chars:
+        return head
+    # Trim at a section boundary. A mid-section cut is worse than a shorter
+    # block: it silently drops the tail of a rule the generator is being
+    # told to obey, and the error-shape conventions sit at the end.
+    cut = head.rfind("\n## ", 0, max_chars)
+    return head[:cut] if cut > 0 else head[:max_chars]
+
+
 def _read_excerpt(workspace_path: str, rel: str, *, max_chars: int) -> str:
     path = os.path.join(workspace_path, rel)
     if not os.path.isfile(path):
@@ -1191,12 +1278,185 @@ def _build_app():
 '''
 
 
+#: Method names a clock-like object exposes, mapped to what they return.
+#: Matched case-insensitively against the discovered class's zero-arg
+#: methods; the return annotation wins when present.
+_CLOCK_DATE_HINTS = ("today", "date")
+_CLOCK_DATETIME_HINTS = ("now", "utcnow", "timestamp")
+
+
+def discover_clock_override(
+    workspace_path: str, *, max_files: int = 200,
+) -> Optional[dict[str, Any]]:
+    """The app's injectable clock, so date-dependent criteria can be pinned.
+
+    Returns ``{"module", "symbol", "date_methods", "datetime_methods"}`` for a
+    FastAPI dependency provider whose name mentions a clock, or None.
+
+    Exists because a criterion about dates is otherwise unverifiable except by
+    accident of the calendar. lumina-run17-20260924-2351 generated a leap-day
+    scenario that posted a 29 February birthday and asserted it appeared in
+    ``/api/birthdays/upcoming`` — an endpoint with a 30-day window. In late
+    September the record is correctly absent, ``next(...)`` raised
+    StopIteration, and the harness spent its remaining rounds on a defect that
+    did not exist. With the clock pinned to February the same criterion is
+    provable, and the assertion means what it says.
+    """
+    import ast
+
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    scanned = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py") or scanned >= max_files:
+                continue
+            scanned += 1
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if "clock" not in text.lower():
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if "clock" not in node.name.lower() or node.args.args:
+                    continue
+                cls = _clock_class_of(node)
+                if not cls:
+                    continue
+                methods = _clock_methods(workspace_path, cls)
+                if not methods[0] and not methods[1]:
+                    continue
+                module = os.path.relpath(
+                    path, workspace_path).replace(os.sep, ".")[:-3]
+                return {
+                    "module": module, "symbol": node.name,
+                    "date_methods": methods[0],
+                    "datetime_methods": methods[1],
+                }
+    return None
+
+
+def _clock_class_of(node: Any) -> str:
+    """Name of the class a provider returns (annotation or returned call)."""
+    import ast
+
+    if isinstance(node.returns, ast.Name):
+        return node.returns.id
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call) \
+                and isinstance(sub.value.func, ast.Name):
+            return sub.value.func.id
+    return ""
+
+
+def _clock_methods(
+    workspace_path: str, class_name: str, *, max_files: int = 200,
+) -> "tuple[list[str], list[str]]":
+    """``(date_methods, datetime_methods)`` of ``class_name``, by annotation
+    then by name. A method taking arguments is skipped: the frozen stub
+    replaces zero-arg accessors only."""
+    import ast
+
+    _skip = {"node_modules", ".venv", ".git", "__pycache__"}
+    scanned = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py") or scanned >= max_files:
+                continue
+            scanned += 1
+            try:
+                with open(os.path.join(root, name), "r",
+                          encoding="utf-8", errors="replace") as fh:
+                    tree = ast.parse(fh.read())
+            except (OSError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef) or node.name != class_name:
+                    continue
+                dates: list[str] = []
+                stamps: list[str] = []
+                for item in node.body:
+                    if not isinstance(item, (ast.FunctionDef,
+                                             ast.AsyncFunctionDef)):
+                        continue
+                    args = [a.arg for a in item.args.args
+                            if a.arg not in ("self", "cls")]
+                    if args or item.name.startswith("_"):
+                        continue
+                    ann = getattr(item.returns, "id", "") or getattr(
+                        item.returns, "attr", "")
+                    low = item.name.lower()
+                    if ann == "datetime" or (
+                            not ann and any(h in low
+                                            for h in _CLOCK_DATETIME_HINTS)):
+                        stamps.append(item.name)
+                    elif ann == "date" or any(h in low
+                                              for h in _CLOCK_DATE_HINTS):
+                        dates.append(item.name)
+                return dates, stamps
+    return [], []
+
+
+def _render_frozen_clock(clock: Optional[dict[str, Any]]) -> tuple[str, str]:
+    """``(module_level_src, client_method_src)`` for the clock freeze, or
+    ``("", "")`` when the app exposes no injectable clock.
+
+    The freeze hangs off the CLIENT (``client.freeze_today(d)``) rather than a
+    separate fixture because the app object lives inside the ``client``
+    fixture's scope — a sibling fixture could not reach its
+    ``dependency_overrides``.
+    """
+    if not clock:
+        return "", ""
+    date_methods = list(clock.get("date_methods") or [])
+    stamp_methods = list(clock.get("datetime_methods") or [])
+    if not date_methods and not stamp_methods:
+        return "", ""
+    body = ["class _FrozenClock:",
+            "    def __init__(self, d):",
+            "        self._d = d"]
+    for m in date_methods:
+        body.append(f"    def {m}(self):")
+        body.append("        return self._d")
+    for m in stamp_methods:
+        body.append(f"    def {m}(self):")
+        body.append("        return _dt.datetime.combine(")
+        body.append("            self._d, _dt.time(12, 0), tzinfo=_dt.timezone.utc)")
+    module_src = (
+        "import datetime as _dt\n"
+        f"from {clock['module']} import {clock['symbol']} as _CLOCK_DEP\n\n\n"
+        + "\n".join(body) + "\n\n\n"
+    )
+    method_src = (
+        "\n    def freeze_today(self, d):\n"
+        '        """Pin the app\'s clock to date ``d`` for the rest of this test.\n\n'
+        "        Use this for any criterion whose outcome depends on today's\n"
+        "        date — a rolling window, an age, an expiry. Without it such a\n"
+        "        criterion only passes on the right calendar day.\n"
+        '        """\n'
+        "        self.app.dependency_overrides[_CLOCK_DEP] = (\n"
+        "            lambda: _FrozenClock(d))\n"
+    )
+    return module_src, method_src
+
+
 def render_acceptance_conftest(
     discovery: dict[str, str],
     *,
     db_env_var: Optional[str] = None,
     db_value_kind: str = DB_VALUE_PATH,
     seed: bool = False,
+    clock: Optional[dict[str, Any]] = None,
 ) -> str:
     """Render a pytest ``conftest.py`` providing the ``client`` fixture.
 
@@ -1246,9 +1506,11 @@ def render_acceptance_conftest(
     else:
         imports += f"from {module} import {symbol}\n"
 
+    clock_module_src, clock_method_src = _render_frozen_clock(clock)
     header = (
         docstring
         + imports
+        + clock_module_src
         + "\n"
         # A loopback base URL WITH a port so apps that harden the bind/Host (e.g.
         # a "loopback + port required" NFR) accept the in-process test requests.
@@ -1262,7 +1524,9 @@ def render_acceptance_conftest(
         "        if _h:\n"
         "            kwargs['headers'] = {k: v for k, v in dict(_h).items()\n"
         "                                 if k.lower() not in ('host', 'origin')}\n"
-        "        return super().request(method, url, **kwargs)\n\n\n"
+        "        return super().request(method, url, **kwargs)\n"
+        + clock_method_src
+        + "\n\n"
     )
     if db_env_var:
         header += _FRESH_IMPORT_SRC + "\n\n"
@@ -1361,6 +1625,7 @@ def gather_story_acceptance_context(
             **discover_route_response_literals(workspace_path),
             **discover_response_models(workspace_path),
         },
+        cross_cutting_rules=_cross_cutting_rules(workspace_path),
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
         architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),
         stack=dict(stack or {}),

@@ -100,10 +100,24 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     # suite-wide shared DB those tests can never pass no matter what the repair
     # loop does to the production code (lumina session 01a079dc → zero-patch HITL).
     db_override = _resolve_db_override(workspace, cfg)
+    # An injectable clock makes date-dependent criteria provable instead of
+    # calendar-dependent (lumina-run17-20260924-2351: a leap-day scenario
+    # asserted a February birthday was visible through a 30-day window, in
+    # September). Resolved BEFORE generation so the prompt and the rendered
+    # conftest agree about whether freeze_today exists — the same contract
+    # the db_isolated flag has.
+    clock_override = ag.discover_clock_override(workspace)
+    if clock_override:
+        logger.info(
+            "[acceptance] clock freeze available via %s.%s — scenarios may "
+            "pin today's date.",
+            clock_override["module"], clock_override["symbol"],
+        )
 
     scenarios, budget = await _generate_batch_scenarios(
         workspace, story_keys, cfg, gateway=gateway, budget=budget,
         db_isolated=db_override is not None,
+        clock_available=clock_override is not None,
     )
     # ui-only ACs (no integration scenario) are recorded as needs-browser deferrals.
     _persist_ui_only_deferrals(workspace, app_name, scenarios)
@@ -119,7 +133,7 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     # --- 2. write conftest + integration files ---------------------------------
     written = _write_integration_suite(
         workspace, integ_dir_rel, runnable, cfg, seed=seed_dict,
-        db_override=db_override,
+        db_override=db_override, clock_override=clock_override,
     )
     if not written:
         return _passthrough(state, reason="could not write integration suite / no app client")
@@ -218,6 +232,7 @@ async def _generate_batch_scenarios(
     gateway: Any,
     budget: float,
     db_isolated: bool = False,
+    clock_available: bool = False,
 ) -> tuple[list[ag.AcceptanceScenario], float]:
     """Generate scenarios for every story in the batch (LLM or fallback)."""
     all_scen: list[ag.AcceptanceScenario] = []
@@ -229,7 +244,7 @@ async def _generate_batch_scenarios(
         if use_llm:
             res = await ag.generate_acceptance_scenarios(
                 ctx, gateway=gateway, budget_remaining_usd=budget, config=cfg,
-                db_isolated=db_isolated,
+                db_isolated=db_isolated, clock_available=clock_available,
             )
             budget = res.budget_remaining_usd
         else:
@@ -268,6 +283,7 @@ def _write_integration_suite(
     workspace: str, integ_dir_rel: str, runnable: list[ag.AcceptanceScenario],
     cfg: dict[str, Any], *, seed: Optional[dict[str, Any]] = None,
     db_override: Optional[ag.DbOverride] = None,
+    clock_override: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     """Write one pytest module per story + a shared conftest. Return abs paths.
 
@@ -296,7 +312,7 @@ def _write_integration_suite(
         os.makedirs(out_dir, exist_ok=True)
         conftest = ag.render_acceptance_conftest(
             discovery, db_env_var=db_env_var, db_value_kind=db_value_kind,
-            seed=apply_seed)
+            seed=apply_seed, clock=clock_override)
         with open(os.path.join(out_dir, "conftest.py"), "w", encoding="utf-8") as fh:
             fh.write(conftest)
         if apply_seed:

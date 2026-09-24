@@ -325,3 +325,124 @@ class TestEndpointsThatDeclareNoShape:
         )
         prompt = build_user_prompt(ctx, max_scenarios=5)
         assert "GET /api/birthdays/upcoming (returned body): birthdays" in prompt
+
+
+class TestCrossCuttingRulesReachTheGenerator:
+    """lumina-run17-20260924-2351. The generator verified a leap-day criterion
+    through `GET /api/birthdays/upcoming`, an endpoint with a 30-DAY window.
+    A February birthday is correctly absent in September, `next(...)` raised
+    StopIteration, and repair spent the run chasing a defect that did not
+    exist. The rule — "Only birthdays with days_left from 0 through 30
+    inclusive are shown" — is IN the spec and was not in the prompt.
+    """
+
+    SPEC = (
+        "# Software Requirements Specification\n\n"
+        "## API conventions\n\n"
+        "Collections come back wrapped in an envelope.\n\n"
+        "## Time and date semantics\n\n"
+        "- `days_left` runs from 0 through 30 inclusive.\n\n"
+        "#### Story: STORY-001 - Dashboard\n\n"
+        "**Acceptance Criteria:**\n\n- Alice is listed first.\n"
+    )
+
+    def test_the_head_is_read_and_the_stories_are_not(self, tmp_path):
+        from harness.acceptance_gen import _cross_cutting_rules
+        _write(tmp_path, "docs/SPEC_REQUIREMENTS.md", self.SPEC)
+        rules = _cross_cutting_rules(str(tmp_path))
+        assert "days_left` runs from 0 through 30" in rules
+        assert "Collections come back wrapped" in rules
+        assert "STORY-001" not in rules, "story bodies belong to the story slice"
+
+    def test_a_missing_spec_is_not_fatal(self, tmp_path):
+        from harness.acceptance_gen import _cross_cutting_rules
+        assert _cross_cutting_rules(str(tmp_path)) == ""
+
+    def test_trimming_stops_at_a_section_boundary(self, tmp_path):
+        # A mid-section cut silently drops the tail of a rule the generator
+        # is being told to obey.
+        from harness.acceptance_gen import _cross_cutting_rules
+        _write(tmp_path, "docs/SPEC_REQUIREMENTS.md", self.SPEC)
+        rules = _cross_cutting_rules(str(tmp_path), max_chars=80)
+        assert rules.endswith("\n") or rules.strip()
+        assert "## Time and date semantics" not in rules or "0 through 30" in rules
+
+    def test_the_prompt_presents_them_as_binding(self, tmp_path):
+        ctx = StoryAcceptanceContext(
+            story_key="STORY-001", title="t", description="d",
+            acceptance_criteria=[{"ac_key": "AC-1", "text": "leap day"}],
+            routes=[], response_models={},
+            cross_cutting_rules="- `days_left` runs from 0 through 30 inclusive.",
+            data_model_excerpt="", architecture_excerpt="", stack={},
+        )
+        prompt = build_user_prompt(ctx, max_scenarios=5)
+        assert "0 through 30 inclusive" in prompt
+        assert "cannot pass" in prompt
+
+
+class TestClockFreeze:
+    """A criterion about dates is otherwise unverifiable except by accident of
+    the calendar."""
+
+    def _ws(self, tmp_path):
+        _write(tmp_path, "app/services/clock.py", (
+            "from datetime import date, datetime, timezone\n"
+            "class Clock:\n"
+            "    @staticmethod\n"
+            "    def today_utc() -> date:\n"
+            "        return datetime.now(timezone.utc).date()\n"
+            "    @staticmethod\n"
+            "    def now_utc() -> datetime:\n"
+            "        return datetime.now(timezone.utc)\n"
+        ))
+        _write(tmp_path, "app/deps.py", (
+            "from app.services.clock import Clock\n"
+            "def get_clock() -> Clock:\n"
+            "    return Clock()\n"
+        ))
+        return str(tmp_path)
+
+    def test_discovers_the_dependency_and_its_accessors(self, tmp_path):
+        from harness.acceptance_gen import discover_clock_override
+        got = discover_clock_override(self._ws(tmp_path))
+        assert got["symbol"] == "get_clock" and got["module"] == "app.deps"
+        assert got["date_methods"] == ["today_utc"]
+        assert got["datetime_methods"] == ["now_utc"]
+
+    def test_no_clock_is_not_an_error(self, tmp_path):
+        from harness.acceptance_gen import discover_clock_override
+        _write(tmp_path, "app/main.py", "app = 1\n")
+        assert discover_clock_override(str(tmp_path)) is None
+
+    def test_the_conftest_exposes_freeze_today(self, tmp_path):
+        import ast
+        from harness.acceptance_gen import (
+            discover_clock_override, render_acceptance_conftest)
+        src = render_acceptance_conftest(
+            {"module": "app.main", "symbol": "create_app", "kind": "factory"},
+            clock=discover_clock_override(self._ws(tmp_path)))
+        ast.parse(src)
+        assert "def freeze_today(self, d):" in src
+        assert "from app.deps import get_clock as _CLOCK_DEP" in src
+        assert "dependency_overrides[_CLOCK_DEP]" in src
+        # every discovered accessor is overridden, or the app reads real time
+        assert "def today_utc(self):" in src and "def now_utc(self):" in src
+
+    def test_no_clock_renders_no_freeze(self, tmp_path):
+        import ast
+        from harness.acceptance_gen import render_acceptance_conftest
+        src = render_acceptance_conftest(
+            {"module": "app.main", "symbol": "app", "kind": "singleton"},
+            clock=None)
+        ast.parse(src)
+        assert "freeze_today" not in src and "_CLOCK_DEP" not in src
+
+    def test_the_prompt_matches_what_the_conftest_provides(self):
+        from harness.acceptance_gen import build_system_prompt
+        with_clock = build_system_prompt(db_isolated=True, clock_available=True)
+        without = build_system_prompt(db_isolated=True, clock_available=False)
+        assert "client.freeze_today(" in with_clock
+        assert "freeze_today" not in without
+        assert "no injectable clock" in without
+        # The slot must never leak into a prompt either way.
+        assert "{clock_rule}" not in with_clock and "{clock_rule}" not in without

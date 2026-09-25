@@ -1325,16 +1325,13 @@ def discover_clock_override(
             except SyntaxError:
                 continue
             for node in tree.body:
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if "clock" not in node.name.lower() or node.args.args:
-                    continue
-                cls = _clock_class_of(node)
-                if not cls:
+                name, cls = _clock_provider_of(node)
+                if not name or not cls:
                     continue
                 methods = _clock_methods(workspace_path, cls)
                 if not methods[0] and not methods[1]:
                     continue
+                node = type("_N", (), {"name": name})()
                 module = os.path.relpath(
                     path, workspace_path).replace(os.sep, ".")[:-3]
                 return {
@@ -1345,17 +1342,52 @@ def discover_clock_override(
     return None
 
 
-def _clock_class_of(node: Any) -> str:
-    """Name of the class a provider returns (annotation or returned call)."""
+def _clock_provider_of(node: Any) -> "tuple[str, str]":
+    """``(symbol, clock_class)`` for a module-level clock provider, else ("","").
+
+    Three shapes, because an app may write any of them — and may CHANGE which
+    one mid-run. lumina-run18-20260925-0748 refactored
+    ``def get_clock() -> Clock`` into ``get_clock: _ClockProvider = ...`` so the
+    dependency key would survive the conftest's module purging; discovery saw
+    only the ``def`` form, lost the clock, and the conftest it then re-rendered
+    withdrew ``freeze_today`` from under tests already written against it.
+
+      * ``def get_clock() -> Clock``            — a plain provider function
+      * ``get_clock: _ClockProvider = <expr>``  — a callable instance, whose
+        ``__call__`` return type names the clock
+      * ``get_clock = _ClockProvider()``        — the same, unannotated
+    """
     import ast
 
-    if isinstance(node.returns, ast.Name):
-        return node.returns.id
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call) \
-                and isinstance(sub.value.func, ast.Name):
-            return sub.value.func.id
-    return ""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if "clock" not in node.name.lower() or node.args.args:
+            return "", ""
+        if isinstance(node.returns, ast.Name):
+            return node.name, node.returns.id
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call) \
+                    and isinstance(sub.value.func, ast.Name):
+                return node.name, sub.value.func.id
+        return "", ""
+
+    target = ""
+    ann = ""
+    value = None
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        target = node.target.id
+        ann = getattr(node.annotation, "id", "") or ""
+        value = node.value
+    elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+            and isinstance(node.targets[0], ast.Name):
+        target = node.targets[0].id
+        value = node.value
+    if not target or "clock" not in target.lower():
+        return "", ""
+    cls = ann
+    if not cls and isinstance(value, ast.Call) \
+            and isinstance(value.func, ast.Name):
+        cls = value.func.id
+    return (target, cls) if cls else ("", "")
 
 
 def _clock_methods(
@@ -1383,6 +1415,16 @@ def _clock_methods(
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ClassDef) or node.name != class_name:
                     continue
+                # A callable PROVIDER is not the clock: follow __call__'s
+                # return annotation to the class that actually has the
+                # accessors (lumina-run18's _ClockProvider -> Clock).
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                            and item.name == "__call__":
+                        returned = getattr(item.returns, "id", "")
+                        if returned and returned != class_name:
+                            return _clock_methods(
+                                workspace_path, returned, max_files=max_files)
                 dates: list[str] = []
                 stamps: list[str] = []
                 for item in node.body:

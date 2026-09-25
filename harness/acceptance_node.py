@@ -107,7 +107,16 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     # conftest agree about whether freeze_today exists — the same contract
     # the db_isolated flag has.
     clock_override = ag.discover_clock_override(workspace)
+    # NEVER withdraw a capability the already-written tests depend on. The
+    # conftest is re-rendered on every acceptance pass while the per-story
+    # test files persist, so a discovery that fails once would delete
+    # `freeze_today` from under tests generated in an earlier batch — which
+    # is how lumina-run18-20260925-0748 ended: repair was asked to add a
+    # method back to a generated file it would lose again on the next pass.
+    if clock_override is None:
+        clock_override = _remembered_clock(state, workspace, integ_dir_rel)
     if clock_override:
+        _remember_clock(state, clock_override)
         logger.info(
             "[acceptance] clock freeze available via %s.%s — scenarios may "
             "pin today's date.",
@@ -192,6 +201,64 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
+
+
+def _remember_clock(state: dict, clock: dict[str, Any]) -> None:
+    """Keep this run's clock discovery so a later pass cannot lose it."""
+    try:
+        ns = state.setdefault("node_state", {})
+        ns["acceptance_clock_override"] = dict(clock)
+    except Exception:  # noqa: BLE001 — memory of a discovery is best-effort
+        pass
+
+
+def _remembered_clock(
+    state: dict, workspace: str, integ_dir_rel: str,
+) -> Optional[dict[str, Any]]:
+    """The run's earlier clock discovery, when tests still depend on it.
+
+    Reused ONLY when both halves still hold: some generated test calls
+    ``freeze_today``, and the remembered module still declares the symbol.
+    Rendering an import for a symbol the app has deleted would turn every
+    acceptance test into a collection error — a worse failure than the one
+    this guards against.
+    """
+    prev = (state.get("node_state") or {}).get("acceptance_clock_override")
+    if not isinstance(prev, dict) or not prev.get("module"):
+        return None
+    out_dir = os.path.join(workspace, integ_dir_rel)
+    try:
+        used = any(
+            "freeze_today" in open(os.path.join(out_dir, f), encoding="utf-8",
+                                   errors="replace").read()
+            for f in os.listdir(out_dir)
+            if f.startswith("test_") and f.endswith(".py")
+        )
+    except OSError:
+        return None
+    if not used:
+        return None
+    mod_path = os.path.join(
+        workspace, *str(prev["module"]).split(".")) + ".py"
+    try:
+        with open(mod_path, "r", encoding="utf-8", errors="replace") as fh:
+            if str(prev.get("symbol", "")) not in fh.read():
+                logger.warning(
+                    "[acceptance] remembered clock %s is gone from %s — not "
+                    "reusing it; tests calling freeze_today will fail "
+                    "honestly rather than on an import error.",
+                    prev.get("symbol"), prev["module"],
+                )
+                return None
+    except OSError:
+        return None
+    logger.info(
+        "[acceptance] clock discovery found nothing this pass; reusing this "
+        "run's earlier %s.%s so the conftest does not withdraw freeze_today "
+        "from tests already written against it.",
+        prev["module"], prev.get("symbol"),
+    )
+    return prev
 
 
 def _resolve_db_override(

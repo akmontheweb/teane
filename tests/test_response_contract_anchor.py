@@ -446,3 +446,100 @@ class TestClockFreeze:
         assert "no injectable clock" in without
         # The slot must never leak into a prompt either way.
         assert "{clock_rule}" not in with_clock and "{clock_rule}" not in without
+
+
+class TestTheRun18Regressions:
+    """lumina-run18-20260925-0748 lost its clock mid-run and the conftest
+    withdrew `freeze_today` from tests already written against it."""
+
+    def test_a_callable_provider_is_discovered(self, tmp_path):
+        # Repair refactored `def get_clock() -> Clock` into a callable
+        # instance so the dependency key would survive the conftest's module
+        # purging — a correct change that discovery must not lose.
+        from harness.acceptance_gen import discover_clock_override
+        _write(tmp_path, "app/services/clock.py", (
+            "from datetime import date, datetime\n"
+            "class Clock:\n"
+            "    @staticmethod\n"
+            "    def today_utc() -> date: ...\n"
+            "    @staticmethod\n"
+            "    def now_utc() -> datetime: ...\n"
+        ))
+        _write(tmp_path, "app/deps.py", (
+            "import sys\n"
+            "from app.services.clock import Clock\n"
+            "class _ClockProvider:\n"
+            "    def __call__(self) -> Clock:\n"
+            "        return Clock()\n"
+            "get_clock: _ClockProvider = _ClockProvider()\n"
+        ))
+        got = discover_clock_override(str(tmp_path))
+        assert got is not None, "a callable provider is still a clock seam"
+        assert got["symbol"] == "get_clock"
+        assert got["date_methods"] == ["today_utc"], (
+            "the provider is not the clock — __call__'s return type is"
+        )
+
+    def test_an_unannotated_assignment_is_discovered(self, tmp_path):
+        from harness.acceptance_gen import discover_clock_override
+        _write(tmp_path, "app/clock.py", (
+            "from datetime import date\n"
+            "class Clock:\n"
+            "    @staticmethod\n"
+            "    def today() -> date: ...\n"
+            "class Provider:\n"
+            "    def __call__(self) -> Clock: ...\n"
+        ))
+        _write(tmp_path, "app/deps.py",
+               "from app.clock import Provider\nget_clock = Provider()\n")
+        got = discover_clock_override(str(tmp_path))
+        assert got and got["date_methods"] == ["today"]
+
+    def test_a_non_clock_assignment_is_ignored(self, tmp_path):
+        from harness.acceptance_gen import discover_clock_override
+        _write(tmp_path, "app/deps.py",
+               "class Thing:\n    def __call__(self): ...\nget_thing = Thing()\n")
+        assert discover_clock_override(str(tmp_path)) is None
+
+
+class TestTheConftestNeverWithdrawsAFixture:
+    """The conftest is re-rendered every acceptance pass; the per-story test
+    files persist. A pass that loses the clock must not delete `freeze_today`
+    from under tests that already call it."""
+
+    def _dirs(self, tmp_path, *, test_uses_freeze: bool, symbol_present: bool):
+        from harness import acceptance_node as an
+        ws = tmp_path
+        (ws / "tests" / "acceptance").mkdir(parents=True)
+        body = ("def test_x(client):\n    client.freeze_today(1)\n"
+                if test_uses_freeze else "def test_x(client):\n    pass\n")
+        (ws / "tests" / "acceptance" / "test_story_001_acceptance.py").write_text(body)
+        (ws / "app").mkdir()
+        (ws / "app" / "deps.py").write_text(
+            "get_clock = 1\n" if symbol_present else "nothing = 1\n")
+        state = {"node_state": {"acceptance_clock_override": {
+            "module": "app.deps", "symbol": "get_clock",
+            "date_methods": ["today_utc"], "datetime_methods": []}}}
+        return an, state, str(ws)
+
+    def test_reused_when_tests_still_call_it(self, tmp_path):
+        an, state, ws = self._dirs(tmp_path, test_uses_freeze=True,
+                                   symbol_present=True)
+        got = an._remembered_clock(state, ws, "tests/acceptance")
+        assert got and got["symbol"] == "get_clock"
+
+    def test_not_reused_when_no_test_needs_it(self, tmp_path):
+        an, state, ws = self._dirs(tmp_path, test_uses_freeze=False,
+                                   symbol_present=True)
+        assert an._remembered_clock(state, ws, "tests/acceptance") is None
+
+    def test_not_reused_when_the_symbol_is_gone(self, tmp_path):
+        # Rendering an import for a deleted symbol turns every acceptance
+        # test into a collection error — worse than the failure it guards.
+        an, state, ws = self._dirs(tmp_path, test_uses_freeze=True,
+                                   symbol_present=False)
+        assert an._remembered_clock(state, ws, "tests/acceptance") is None
+
+    def test_nothing_remembered_is_not_an_error(self, tmp_path):
+        from harness import acceptance_node as an
+        assert an._remembered_clock({}, str(tmp_path), "tests/acceptance") is None

@@ -23267,6 +23267,25 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
     return "human_intervention_node"
 
 
+def _test_regen_exhausted(state: AgentState, path: str) -> bool:
+    """True when ``path`` has spent its per-file regeneration attempts.
+
+    The router's escape branches ask the test-author ladder to take a file
+    the repair node may not edit. Once the cap is reached the ladder can only
+    answer HITL, so a caller that keeps diverting produces trips rather than
+    work (lumina-run19-20260925-1313).
+    """
+    cfg = state.get("test_regeneration_config", {}) or {}
+    if not cfg.get("enabled", False):
+        return False
+    attempts = int(
+        ((state.get("loop_counter", {}) or {})
+         .get("test_regen_attempts", {}) or {})
+        .get(path, 0) or 0
+    )
+    return attempts >= int(cfg.get("max_attempts_per_test", 1))
+
+
 def _file_in_failing_set(state: AgentState, path: str) -> bool:
     """True when some current ``compiler_errors`` entry is in ``path``.
 
@@ -23510,6 +23529,40 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
                 "stale; not diverting.",
                 _verdict_file,
             )
+
+    # An exhausted ladder is not a routing option. Once the per-file
+    # regeneration cap is spent, route_after_unsatisfiable can only answer
+    # HITL — and in headless mode HITL auto-resumes, the compiler reproduces
+    # the same diagnostic, and this branch re-derives the same diversion.
+    # lumina-run19-20260925-1313 spent its last four HITL trips in 35 seconds
+    # that way: compiler -> router -> HITL -> resume -> compiler, with NO
+    # repair round, no patch and no LLM call in between. The test it was
+    # diverting for was correct — `route_paths` held only FastAPI's built-in
+    # docs routes, so the app genuinely had no router — and repair, the one
+    # component that could have fixed the production side, was never reached.
+    #
+    # So when the ladder is spent, stop diverting and let the normal flow
+    # run. Repair still cannot edit the test, but it CAN fix the production
+    # defect the test is reporting, and its own tripwires (zero_patch_loop,
+    # the distraction loop) bound it if it cannot.
+    if _blocked_file and _test_regen_exhausted(state, _blocked_file):
+        logger.warning(
+            "[router] %s names %s, whose regeneration attempts are spent — "
+            "not diverting again. The test-author ladder has nothing left to "
+            "offer, so the round goes to repair, which can still fix the "
+            "production side of the failure.",
+            _blocked_reason.capitalize() or "A blocked remedy", _blocked_file,
+        )
+        try:
+            from harness.observability import emit_event as _emit_spent
+            _emit_spent(
+                "test_ladder_exhausted_no_divert",
+                reason=_blocked_reason, file=_blocked_file,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        _blocked_reason = ""
+        _blocked_file = ""
 
     if _blocked_reason and _blocked_file:
         logger.warning(

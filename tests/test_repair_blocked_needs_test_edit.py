@@ -385,3 +385,84 @@ class TestCompilerNodeRebuildsRoundState:
         ))
         assert "contradictory_tests" not in result["node_state"]
         assert "contradiction_pair" not in result["loop_counter"]
+
+
+class TestAnExhaustedLadderStopsDiverting:
+    """lumina-run19-20260925-1313 spent its last four HITL trips in 35
+    seconds on compiler -> router -> HITL -> resume -> compiler, with no
+    repair round, no patch and no LLM call in between.
+
+    The router kept diverting `server/tests/test_main.py` to the test-author
+    ladder on the judge's recommendation; the ladder answered "already
+    regenerated 2/2 and still unsatisfiable -> HITL" every time. The test was
+    CORRECT — `route_paths` held only FastAPI's built-in docs routes, so the
+    app genuinely had no router — and repair, the one component that could
+    have fixed the production side, was never reached.
+    """
+
+    @staticmethod
+    def _state(tmp_path, attempts, **over):
+        (tmp_path / "server" / "tests").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "server" / "tests" / "test_main.py").write_text(
+            "def test_a():\n    assert 1\n", encoding="utf-8")
+        base = {
+            "exit_code": 1,
+            "budget_remaining_usd": 5.0,
+            "workspace_path": str(tmp_path),
+            "loop_counter": {
+                "total_repairs": 1,
+                "test_regen_attempts": {"server/tests/test_main.py": attempts},
+                "last_reflection_verdict": {
+                    "verdict": "DISTRACTION",
+                    "recommendation": (
+                        "Edit server/tests/test_main.py line 12 to extract "
+                        "paths from route objects using getattr(...)."
+                    ),
+                },
+            },
+            "compiler_errors": [
+                {"file": "server/tests/test_main.py", "line": 87,
+                 "severity": "error", "error_code": "AssertionError",
+                 "message": "assert '/api/birthdays' in ['/openapi.json']"},
+            ],
+            "node_state": {},
+            "test_regeneration_config": {"enabled": True, "tier_b_auto": True,
+                                         "max_attempts_per_test": 2},
+        }
+        base.update(over)
+        return base
+
+    def test_spent_attempts_go_to_repair_not_hitl(self, tmp_path):
+        from harness.graph import route_after_compiler
+        state = self._state(tmp_path, attempts=2)
+        assert route_after_compiler(state) == "repair_node", (
+            "repair cannot edit the test, but it CAN fix the production "
+            "defect the test is reporting"
+        )
+
+    def test_attempts_remaining_still_divert(self, tmp_path):
+        # Regression guard: the ladder must still be used while it has
+        # something to offer.
+        from harness.graph import route_after_compiler
+        state = self._state(tmp_path, attempts=0)
+        assert route_after_compiler(state) != "repair_node"
+
+    def test_the_helper_reads_the_configured_cap(self, tmp_path):
+        from harness.graph import _test_regen_exhausted
+        s = self._state(tmp_path, attempts=1)
+        assert _test_regen_exhausted(s, "server/tests/test_main.py") is False
+        s["test_regeneration_config"]["max_attempts_per_test"] = 1
+        assert _test_regen_exhausted(s, "server/tests/test_main.py") is True
+
+    def test_regeneration_disabled_is_not_exhaustion(self, tmp_path):
+        # With the feature off there is no ladder to spend; the other
+        # branches keep their existing behaviour.
+        from harness.graph import _test_regen_exhausted
+        s = self._state(tmp_path, attempts=9)
+        s["test_regeneration_config"]["enabled"] = False
+        assert _test_regen_exhausted(s, "server/tests/test_main.py") is False
+
+    def test_an_unrelated_file_is_unaffected(self, tmp_path):
+        from harness.graph import _test_regen_exhausted
+        s = self._state(tmp_path, attempts=2)
+        assert _test_regen_exhausted(s, "server/tests/test_other.py") is False

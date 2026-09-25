@@ -142,6 +142,16 @@ def run_static_preflight(
         if not rels:
             return []
         diags = _undefined_name_diagnostics(workspace, rels)
+        # A constraint the spec states and the model omits is statically
+        # visible too, and costs a whole run when it is not surfaced: the
+        # property-test generator reads the bare annotation, asserts that any
+        # string is valid, and deadlocks against the validation tests
+        # (lumina-run20-20260925-1342). See harness/spec_constraints.
+        try:
+            from harness.spec_constraints import constraint_diagnostics
+            diags = diags + constraint_diagnostics(workspace)
+        except Exception as exc:  # noqa: BLE001 — a checker must never block
+            logger.debug("[static-preflight] constraint check skipped: %s", exc)
     except Exception as exc:  # noqa: BLE001 — a checker must never block a build
         logger.warning(
             "[static-preflight] check failed (%s); continuing without it.",
@@ -154,10 +164,14 @@ def run_static_preflight(
             len(rels),
         )
         return []
+    _undef = [d for d in diags
+              if d.get("error_code") != "SPEC_CONSTRAINT_NOT_DECLARED"]
+    _constraints = len(diags) - len(_undef)
     logger.warning(
-        "[static-preflight] %d undefined-name defect(s) across %d file(s), "
-        "found without running the build: %s",
-        len(diags), len({d["file"] for d in diags}),
+        "[static-preflight] %d undefined-name defect(s) and %d undeclared "
+        "spec constraint(s) across %d file(s), found without running the "
+        "build: %s",
+        len(_undef), _constraints, len({d["file"] for d in diags}),
         ", ".join(sorted({d["file"] for d in diags})[:5]),
     )
     return diags[:limit]

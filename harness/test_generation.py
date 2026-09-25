@@ -2114,6 +2114,20 @@ def _build_format_reminder(agile: bool = True) -> str:
 _PROMPT_FORMAT_REMINDER = _build_format_reminder()
 
 
+def _cross_cutting_rules_for_tests(workspace_path: str) -> str:
+    """The spec's cross-cutting head, or ``""``. Never raises.
+
+    Same source as the acceptance generator uses, so the two tiers derive
+    their expectations from one text rather than each inventing its own.
+    """
+    try:
+        from harness.acceptance_gen import _cross_cutting_rules
+        return _cross_cutting_rules(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — a prompt aid must never block
+        logger.debug("[test_generation] cross-cutting rules skipped: %s", exc)
+        return ""
+
+
 def _build_test_gen_prompt(
     workspace_path: str,
     modified_source_files: list[str],
@@ -2134,6 +2148,36 @@ def _build_test_gen_prompt(
         "Each test file should follow the conventions in the test-generation guide "
         "already loaded in the system prompt.",
         "",
+    ]
+    # The specification's cross-cutting rules, adjacent and binding. They are
+    # technically already present — the whole spec sits in messages[0] — but
+    # buried in ~100k characters, and a rule nobody reads is a rule nobody
+    # applies. Making them explicit is what turned the acceptance tier around
+    # (dc9ade1: 31/33 criteria passing in lumina-run18-20260925-0748).
+    #
+    # lumina-run21-20260925-2226 is the unit-tier version of the same gap.
+    # ASM-007 states "Directory records are sorted by last_name ascending,
+    # then first_name ascending, then id ascending"; the generated
+    # test_returns_records_in_directory_order asserted
+    # ["Carol", "Bob", "Alice"] — the Jones pair backwards — while a sibling
+    # test in the SAME FILE required first_name ASC. No ORDER BY satisfies
+    # both, so the judge flipped _DIRECTORY_ORDER every round until three
+    # distraction-loop trips ended the run. The production code was correct
+    # throughout; the wrong artefact was the test.
+    _rules = _cross_cutting_rules_for_tests(workspace_path)
+    if _rules:
+        lines += [
+            "## Rules the specification fixes (binding on your expectations)",
+            "An expected value you COMPUTE — a sort order, a page of results, "
+            "a window, a rejection — must follow these. A test whose expected "
+            "value contradicts one of them cannot pass without breaking "
+            "another test that follows it, and the repair loop cannot resolve "
+            "that: production can satisfy one or the other, never both.",
+            "",
+            _rules,
+            "",
+        ]
+    lines += [
         "## Source files to test",
         "",
     ]

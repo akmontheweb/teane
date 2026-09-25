@@ -2213,3 +2213,93 @@ class TestPackageNestedTestPreflight:
             primary_stack="typescript",  # full-stack primary is the frontend
         )
         assert "server/tests/test_database.py" in found
+
+
+class TestCrossCuttingRulesBindTheUnitTier:
+    """lumina-run21-20260925-2226: two generated unit tests in the SAME file
+    demanded opposite orderings of list_all —
+
+        test_returns_records_in_directory_order -> ["Carol", "Bob", "Alice"]
+        test_respects_limit_and_offset          -> User1, User2 (first_name ASC)
+
+    — so no ORDER BY satisfied both and the judge flipped _DIRECTORY_ORDER
+    every round until three distraction-loop trips ended the run. The spec
+    settles it (ASM-007: last_name ASC, then first_name ASC, then id ASC):
+    the first test had the Jones pair backwards and production was correct
+    throughout.
+
+    The rule was in the prompt only as part of the ~100k-char anchored spec.
+    dc9ade1 made it explicit for the acceptance tier; this does the same for
+    the unit tier, so both derive expectations from one text.
+    """
+
+    SPEC = (
+        "# Software Requirements Specification\n\n"
+        "## Assumptions\n\n"
+        "| ASM-007 | Directory records are sorted by `last_name` ascending, "
+        "then `first_name` ascending, then `id` ascending. |\n\n"
+        "## Data model\n\n"
+        "| `first_name` | TEXT | NOT NULL, length 1-100 |\n\n"
+        "#### Story: STORY-001 - Dashboard\n\n"
+        "- Alice is listed first.\n"
+    )
+
+    def _ws(self, tmp_path, spec=None):
+        (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+        if spec is not None:
+            (tmp_path / "docs" / "SPEC_REQUIREMENTS.md").write_text(spec)
+        (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "app" / "repo.py").write_text("def list_all():\n    ...\n")
+        return str(tmp_path)
+
+    def test_the_rule_reaches_the_prompt(self, tmp_path):
+        from harness.test_generation import _build_test_gen_prompt
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, self.SPEC), ["app/repo.py"], "python")
+        assert "ASM-007" in prompt
+        assert "first_name` ascending" in prompt
+
+    def test_it_is_presented_as_binding_on_expectations(self, tmp_path):
+        # A rule the model may treat as background is a rule it may
+        # contradict; the failure mode is a computed expected value, so the
+        # framing has to name that.
+        from harness.test_generation import _build_test_gen_prompt
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, self.SPEC), ["app/repo.py"], "python")
+        assert "binding on your expectations" in prompt
+        assert "sort order" in prompt
+
+    def test_story_bodies_are_not_dragged_in(self, tmp_path):
+        # Only the cross-cutting head: a story's own prose belongs to the
+        # story slice, and repeating it here would re-inflate the prompt.
+        from harness.test_generation import _build_test_gen_prompt
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, self.SPEC), ["app/repo.py"], "python")
+        assert "STORY-001" not in prompt
+
+    def test_the_source_files_still_dominate(self, tmp_path):
+        from harness.test_generation import _build_test_gen_prompt
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, self.SPEC), ["app/repo.py"], "python")
+        assert "## Source files to test" in prompt
+        assert "app/repo.py" in prompt
+        assert prompt.index("## Source files to test") > prompt.index("ASM-007")
+
+    def test_no_spec_is_not_an_error(self, tmp_path):
+        from harness.test_generation import _build_test_gen_prompt
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, None), ["app/repo.py"], "python")
+        assert "## Source files to test" in prompt
+        assert "binding on your expectations" not in prompt
+
+    def test_a_broken_reader_never_blocks_generation(self, tmp_path, monkeypatch):
+        from harness import acceptance_gen
+        from harness.test_generation import _build_test_gen_prompt
+
+        def _boom(*a, **k):
+            raise RuntimeError("reader exploded")
+
+        monkeypatch.setattr(acceptance_gen, "_cross_cutting_rules", _boom)
+        prompt = _build_test_gen_prompt(
+            self._ws(tmp_path, self.SPEC), ["app/repo.py"], "python")
+        assert "## Source files to test" in prompt

@@ -11860,8 +11860,14 @@ async def _maybe_pytest_isolation_rerun(
             "[compiler_node:isolation] Re-ran %s alone: %s. "
             "Suite exit was non-zero on this same test.",
             nodeid,
-            "PASSED (shared-state pollution signal)"
-            if passed_alone else "FAILED (real bug in the test's own code)",
+            # Failing alone rules out shared-state pollution. It says
+            # NOTHING about whose bug it is: a test that correctly detects a
+            # missing router fails alone too (lumina-run19-20260925-1313,
+            # where route_paths held only FastAPI's built-in docs routes and
+            # the log had called the correct test the bug).
+            "PASSED (shared-state pollution signal)" if passed_alone
+            else ("FAILED alone too — not shared-state pollution; the defect "
+                  "may be in the test OR in the code it exercises"),
         )
 
     if not passed_alone:

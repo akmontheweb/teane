@@ -485,3 +485,98 @@ class TestPropertyTier:
         )
         assert written == ["app/tests/contract/test_w_property.py"]
         assert markers["app/tests/contract/test_w_property.py"] == ["app/w.py"]
+
+
+class TestGeneratedPropertyFilesDoNotOutliveTheirModel:
+    """A derived artefact must not outlive the shape it was derived from.
+
+    lumina-run20-20260925-1342: BirthdayCreate gained validators, so
+    _property_testable skips it — but the file written before that stayed on
+    disk asserting `st.text(max_size=200)` roundtrips for any string. The
+    judge flipped between adding and removing validators for twelve verdicts
+    and the run died. The emitter knew the model was no longer testable;
+    nothing retired its output.
+    """
+
+    import os as _os
+
+    def _ws(self, tmp_path, model_src):
+        import os
+        os.makedirs(os.path.join(str(tmp_path), "app"), exist_ok=True)
+        with open(os.path.join(str(tmp_path), "app", "schemas.py"), "w") as fh:
+            fh.write(model_src)
+        return str(tmp_path)
+
+    PLAIN = (
+        "from pydantic import BaseModel\n"
+        "class Thing(BaseModel):\n"
+        "    name: str\n"
+        "    n: int\n"
+    )
+    CONSTRAINED = (
+        "from pydantic import BaseModel, Field\n"
+        "class Thing(BaseModel):\n"
+        "    name: str = Field(..., min_length=1, max_length=100)\n"
+        "    n: int\n"
+    )
+    VALIDATED = (
+        "from pydantic import BaseModel, field_validator\n"
+        "class Thing(BaseModel):\n"
+        "    name: str\n"
+        "    n: int\n"
+        "    @field_validator('name')\n"
+        "    def v(cls, x):\n        return x\n"
+    )
+
+    def _emit(self, ws):
+        from harness.contract_tests import emit_property_tests
+        return emit_property_tests(ws, ["app/schemas.py"], "python")
+
+    def test_a_model_that_stops_qualifying_retires_its_file(self, tmp_path):
+        import os
+        ws = self._ws(tmp_path, self.PLAIN)
+        written, _ = self._emit(ws)
+        out = os.path.join(ws, written[0])
+        assert os.path.exists(out)
+
+        self._ws(tmp_path, self.VALIDATED)
+        self._emit(ws)
+        assert not os.path.exists(out), (
+            "the stale file keeps asserting a contract the model no longer has"
+        )
+
+    def test_changed_constraints_refresh_the_strategies(self, tmp_path):
+        import os
+        ws = self._ws(tmp_path, self.PLAIN)
+        written, _ = self._emit(ws)
+        out = os.path.join(ws, written[0])
+        assert "max_size=200" in open(out).read()
+
+        # a7fa18d adds min_length/max_length upstream; the strategies must
+        # follow, or the file keeps generating out-of-range input.
+        self._ws(tmp_path, self.CONSTRAINED)
+        self._emit(ws)
+        body = open(out).read()
+        assert "min_size=1" in body and "max_size=100" in body
+
+    def test_an_unchanged_model_rewrites_nothing(self, tmp_path):
+        import os
+        ws = self._ws(tmp_path, self.PLAIN)
+        written, _ = self._emit(ws)
+        out = os.path.join(ws, written[0])
+        before = os.path.getmtime(out)
+        second, _ = self._emit(ws)
+        assert second == [] and os.path.getmtime(out) == before
+
+    def test_a_file_the_harness_did_not_write_is_never_touched(self, tmp_path):
+        import os
+        ws = self._ws(tmp_path, self.PLAIN)
+        written, _ = self._emit(ws)
+        out = os.path.join(ws, written[0])
+        with open(out, "w") as fh:
+            fh.write("# hand-written by the operator\ndef test_mine():\n    pass\n")
+
+        self._ws(tmp_path, self.VALIDATED)
+        self._emit(ws)
+        assert os.path.exists(out), "never delete a file we did not generate"
+        assert "hand-written" in open(out).read()

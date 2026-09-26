@@ -31,6 +31,7 @@ the filesystem and mirrors ``test_generation._emit_nfr_stubs``' shape.
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -61,6 +62,9 @@ _PYDANTIC_BASES = frozenset({"BaseModel"})
 # Field(...) keyword constraints we can turn into a deterministic assertion.
 _LEN_CONSTRAINTS = ("max_length", "min_length")
 _NUM_CONSTRAINTS = ("ge", "le", "gt", "lt")
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -1035,6 +1039,11 @@ _PROP_HEADER = (
 )
 
 
+#: Signature of a property file this emitter wrote. Used before replacing
+#: or deleting one: a file the harness did not write is never touched.
+_PROPERTY_MARKER = "Property-based contract tests for"
+
+
 def render_property_test(
     models: list["ModelSpec"], *, source_rel: str,
 ) -> Optional[str]:
@@ -1088,6 +1097,8 @@ def emit_property_tests(
         return [], {}
     source_roots = _source_roots_for(workspace_path)
     written: list[str] = []
+    retired: list[str] = []
+    refreshed: list[str] = []
     markers: dict[str, list[str]] = {}
     for rel in source_files:
         if not rel.endswith(".py") or _looks_like_test(rel):
@@ -1099,19 +1110,62 @@ def emit_property_tests(
         if not models:
             continue
         body = render_property_test(models, source_rel=rel)
-        if not body:
-            continue
         out_rel = _property_test_rel_path(rel, source_roots)
         out_abs = os.path.join(workspace_path, out_rel)
-        if os.path.exists(out_abs):
-            markers[out_rel] = [rel]
+        existing = _read_text(out_abs) if os.path.exists(out_abs) else None
+        ours = existing is not None and _PROPERTY_MARKER in existing[:400]
+
+        # A derived artefact must not outlive the shape it was derived from.
+        # This file asserts a model's structural contract; once the model
+        # changes, the old assertions are a claim about a model that no
+        # longer exists — and the repair loop cannot resolve a test that
+        # contradicts the code it is generated from.
+        #
+        # lumina-run20-20260925-1342: BirthdayCreate gained validators, so
+        # _property_testable now SKIPS it — but the file written before that
+        # stayed on disk asserting `st.text(max_size=200)` roundtrips for
+        # any string. The judge flipped between adding and removing
+        # validators for twelve verdicts and the run died. The emitter knew
+        # the model was no longer testable; nothing retired its output.
+        if not body:
+            if ours:
+                try:
+                    os.remove(out_abs)
+                    retired.append(out_rel)
+                except OSError:
+                    pass
             continue
+        if existing is not None:
+            if not ours:
+                # Someone else owns this path; never clobber it.
+                markers[out_rel] = [rel]
+                continue
+            if existing == body:
+                markers[out_rel] = [rel]
+                continue
+            # Refresh: the model's constraints changed, so the strategies
+            # must too. a7fa18d adding min_length/max_length is exactly
+            # this case — the stale file kept generating out-of-range input.
+            refreshed.append(out_rel)
         try:
             os.makedirs(os.path.dirname(out_abs), exist_ok=True)
             with open(out_abs, "w", encoding="utf-8") as fh:
                 fh.write(body)
         except OSError:
             continue
-        written.append(out_rel)
+        if out_rel not in refreshed:
+            written.append(out_rel)
         markers[out_rel] = [rel]
+    if retired:
+        logger.info(
+            "[contract-tests] retired %d stale property test file(s) whose "
+            "models are no longer property-testable: %s",
+            len(retired), ", ".join(retired),
+        )
+    if refreshed:
+        logger.info(
+            "[contract-tests] refreshed %d property test file(s) after a "
+            "model's constraints changed: %s",
+            len(refreshed), ", ".join(refreshed),
+        )
     return written, markers

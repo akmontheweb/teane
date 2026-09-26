@@ -152,6 +152,15 @@ def run_static_preflight(
             diags = diags + constraint_diagnostics(workspace)
         except Exception as exc:  # noqa: BLE001 — a checker must never block
             logger.debug("[static-preflight] constraint check skipped: %s", exc)
+        # Generated tests that make correct production code look wrong: a
+        # client bound at import in an env-configured app, a local date
+        # compared against a UTC application. Both cost the repair loop
+        # rounds on files that are fine. See harness/test_hygiene.
+        try:
+            from harness.test_hygiene import run_test_hygiene_checks
+            diags = diags + run_test_hygiene_checks(workspace)
+        except Exception as exc:  # noqa: BLE001 — a checker must never block
+            logger.debug("[static-preflight] hygiene checks skipped: %s", exc)
     except Exception as exc:  # noqa: BLE001 — a checker must never block a build
         logger.warning(
             "[static-preflight] check failed (%s); continuing without it.",
@@ -164,14 +173,17 @@ def run_static_preflight(
             len(rels),
         )
         return []
-    _undef = [d for d in diags
-              if d.get("error_code") != "SPEC_CONSTRAINT_NOT_DECLARED"]
-    _constraints = len(diags) - len(_undef)
+    # Count by code, not by "everything that is not X" — a new check added
+    # later would otherwise be reported as an undefined name.
+    _by_code: dict[str, int] = {}
+    for d in diags:
+        _code = str(d.get("error_code") or "UNKNOWN")
+        _by_code[_code] = _by_code.get(_code, 0) + 1
     logger.warning(
-        "[static-preflight] %d undefined-name defect(s) and %d undeclared "
-        "spec constraint(s) across %d file(s), found without running the "
-        "build: %s",
-        len(_undef), _constraints, len({d["file"] for d in diags}),
+        "[static-preflight] %d defect(s) across %d file(s), found without "
+        "running the build — %s: %s",
+        len(diags), len({d["file"] for d in diags}),
+        ", ".join(f"{n} {code}" for code, n in sorted(_by_code.items())),
         ", ".join(sorted({d["file"] for d in diags})[:5]),
     )
     return diags[:limit]

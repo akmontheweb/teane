@@ -12316,6 +12316,43 @@ def _reflection_test_source_evidence(
     return "".join(parts)
 
 
+def _summarize_round_patches(patch_results: list[Any]) -> list[dict[str, Any]]:
+    """What a repair round actually changed, as fact rather than inference.
+
+    The reflection judge is asked whether "the round's patches addressed
+    lower-priority items" — a question about the patches — while its prompt
+    carried only fingerprint deltas. With nothing to check against, it
+    infers what the round did from which diagnostics moved, and when they
+    move for another reason it invents a cause.
+
+    lumina-run22-20260926-2330: three consecutive verdicts asserted "the
+    previous round's patch changed the POST /api/birthdays response from 201
+    to 200". No patch in any dump of that run emits a 200, and the route
+    reads status.HTTP_201_CREATED throughout. The claim entered through one
+    verdict and was then fed back to the judge verbatim by the
+    anti-repetition block, where it read as prior knowledge — a fabrication
+    with nothing able to falsify it becomes self-reinforcing.
+    """
+    out: list[dict[str, Any]] = []
+    for r in patch_results or []:
+        file = str(getattr(r, "file", "") or "")
+        if not file:
+            continue
+        op = getattr(r, "operation", "")
+        op = getattr(op, "value", None) or str(op)
+        ok = bool(getattr(r, "success", False))
+        no_op = bool(getattr(r, "no_op", False))
+        if ok and no_op:
+            outcome = "no-op (content already identical)"
+        elif ok:
+            outcome = "applied"
+        else:
+            err = str(getattr(r, "error", "") or "").strip().replace("\n", " ")
+            outcome = f"REJECTED: {err[:120]}" if err else "REJECTED"
+        out.append({"file": file, "op": op, "outcome": outcome})
+    return out[:12]
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -12337,6 +12374,7 @@ def _build_repair_reflection_prompt(
     related_importers: Optional[list[str]] = None,
     oscillation_contradiction: Optional[dict[str, Any]] = None,
     prior_reflection_verdict: Optional[dict[str, str]] = None,
+    prior_round_patches: Optional[list[dict[str, Any]]] = None,
     workspace_path: str = "",
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
@@ -12850,6 +12888,32 @@ def _build_repair_reflection_prompt(
     # wrong and return a different real_blocker rooted elsewhere. Empty
     # when this is the first reflection round (no prior verdict) or when
     # the prior verdict lacks a real_blocker (PROGRESS or empty).
+    # What the round actually changed. Placed before the anti-repetition
+    # block on purpose: the judge should read the facts before it reads its
+    # own previous narrative.
+    patches_block = ""
+    if prior_round_patches:
+        _lines = "\n".join(
+            f"  {p.get('file', '?')}  {p.get('op', '?')}  {p.get('outcome', '?')}"
+            for p in prior_round_patches
+        )
+        patches_block = (
+            "\nPATCHES THE PREVIOUS ROUND APPLIED (the complete list):\n"
+            f"{_lines}\n"
+            "Any claim you make about what the previous round CHANGED must "
+            "match this list. A file that is not listed was not touched, and "
+            "a REJECTED entry changed nothing. Do not attribute a behaviour "
+            "change to a patch that is not here — say the behaviour is wrong "
+            "and name the file to edit instead.\n"
+        )
+    elif prior_round_patches is not None:
+        patches_block = (
+            "\nPATCHES THE PREVIOUS ROUND APPLIED: none — the round landed "
+            "no patch at all. Nothing it did can explain a change in "
+            "behaviour; any difference in the diagnostics comes from "
+            "elsewhere (a flaky test, shared state, or an earlier round).\n"
+        )
+
     prior_verdict_block = ""
     if isinstance(prior_reflection_verdict, dict):
         _pv = prior_reflection_verdict.get("verdict") or ""
@@ -13024,6 +13088,7 @@ def _build_repair_reflection_prompt(
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
         f"{tail_block}"
         f"{source_evidence_block}"
+        f"{patches_block}"
         f"{prior_verdict_block}"
         f"{contradiction_block}"
         f"{related_block}"
@@ -17267,6 +17332,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "oscillation_contradiction",
                 ),
                 prior_reflection_verdict=_prior_reflection,
+                prior_round_patches=loop_counter.get("last_round_patches"),
                 workspace_path=state.get("workspace_path") or "",
             )
             # Fix C — escalate the reflection judge to the reasoning
@@ -20272,6 +20338,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             allowed_paths=allowed_paths,
             files_seen_by_llm=files_seen_by_llm,
             enforce_read_before_edit=enforce_read,
+        )
+        # Record what this round actually changed, for the NEXT
+        # round's reflection judge. See _summarize_round_patches: the
+        # judge is asked whether "the round's patches addressed
+        # lower-priority items" and until now had no patches to
+        # answer from, so it inferred them from which diagnostics
+        # moved — and invented a cause when they moved for another
+        # reason (lumina-run22-20260926-2330).
+        loop_counter["last_round_patches"] = _summarize_round_patches(
+            patch_results,
         )
         # UNSATISFIABLE_TEST declaration (lumina 019f7109). Honoured only
         # when (a) this round's banner explicitly offered the escape (the

@@ -31,6 +31,7 @@ tests. It stays a known gap rather than a noisy check.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -128,6 +129,73 @@ def _undefined_name_diagnostics(
     return diags
 
 
+def _module_level_assert_diagnostics(
+    workspace: str, rels: list[str],
+) -> list[dict[str, Any]]:
+    """A bare ``assert`` at module scope in production code.
+
+    It runs at IMPORT, so it can only see the state the module has reached
+    by that line — and ``python -O`` strips it entirely, so it is not a
+    runtime guarantee either. In generated code it appears when a model
+    tries to satisfy a test by asserting the same thing in production.
+
+    lumina-run22-20260926-2330 lost most of its run to one:
+
+        router = APIRouter(prefix="/api/birthdays", tags=["birthdays"])
+
+        # Ensure routes are registered as APIRoute instances
+        assert len(router.routes) > 0, "Birthday router has no routes"
+
+    placed immediately after the router is created and before any
+    ``@router.get`` decorator runs — false by construction, every time. The
+    module could not import, so main.py could not import it, the app had no
+    routes, and test_main, the acceptance suite and PROD_IMPORT_SMOKE all
+    failed at once. The oscillation prover then read the add/remove cycle as
+    a conflict between REQUIREMENTS and told the judge "Do NOT name this
+    file again" — steering it away from the one file that was broken.
+
+    Only module scope is reported: an assert inside a function is an
+    ordinary runtime check and none of the above applies.
+    """
+    out: list[dict[str, Any]] = []
+    for rel in rels:
+        base = os.path.basename(rel)
+        if (os.sep + "tests" + os.sep) in (os.sep + rel) or \
+                base.startswith("test_") or base.endswith("_test.py") or \
+                base == "conftest.py":
+            continue
+        try:
+            with open(os.path.join(workspace, rel), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError):
+            continue
+        for node in tree.body:  # module scope only
+            if not isinstance(node, ast.Assert):
+                continue
+            out.append({
+                "file": rel,
+                "line": getattr(node, "lineno", 0),
+                "column": 0,
+                "severity": "error",
+                "error_code": "MODULE_LEVEL_ASSERT_IN_PRODUCTION",
+                "message": (
+                    "This module asserts at import time. The assertion can "
+                    "only see the state the module has reached by this "
+                    "line — anything defined below it, including decorated "
+                    "routes and registrations, does not exist yet — and "
+                    "`python -O` removes the check entirely, so it is not a "
+                    "runtime guarantee either. If it fails, the module "
+                    "cannot be imported at all and every consumer fails "
+                    "with it, which reads as a missing feature rather than "
+                    "a bad line. Delete it: a test asserts behaviour; "
+                    "production code implements it."
+                ),
+                "semantic_context": "Module-scope assert in production code.",
+            })
+    return out
+
+
 def run_static_preflight(
     workspace: str, *, limit: int = 25,
 ) -> list[dict[str, Any]]:
@@ -156,6 +224,7 @@ def run_static_preflight(
         # client bound at import in an env-configured app, a local date
         # compared against a UTC application. Both cost the repair loop
         # rounds on files that are fine. See harness/test_hygiene.
+        diags = diags + _module_level_assert_diagnostics(workspace, rels)
         try:
             from harness.test_hygiene import run_test_hygiene_checks
             diags = diags + run_test_hygiene_checks(workspace)

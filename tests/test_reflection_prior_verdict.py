@@ -424,3 +424,110 @@ class TestRelatedFilesEvidence:
         assert _RELATED not in _build_repair_reflection_prompt(
             **_base_kwargs(), related_imports=[None, "", 7],
         )
+
+
+class TestTheJudgeSeesWhatTheRoundActuallyChanged:
+    """The judge is asked whether "the round's patches addressed
+    lower-priority items" — a question about the patches — while its prompt
+    carried only fingerprint deltas. With nothing to check against, it
+    infers what the round did from which diagnostics moved.
+
+    lumina-run22-20260926-2330: three consecutive verdicts asserted "the
+    previous round's patch changed the POST /api/birthdays response from 201
+    to 200". No patch in any dump of that run emits a 200, and the route
+    reads status.HTTP_201_CREATED throughout. The claim entered through one
+    verdict and was then handed back to the judge verbatim by the
+    anti-repetition block, where it read as prior knowledge.
+    """
+
+    def test_applied_patches_are_listed(self):
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            prior_round_patches=[
+                {"file": "server/app/db.py", "op": "REPLACE_BLOCK",
+                 "outcome": "applied"},
+            ],
+        )
+        assert "PATCHES THE PREVIOUS ROUND APPLIED" in prompt
+        assert "server/app/db.py" in prompt
+        assert "REPLACE_BLOCK" in prompt
+
+    def test_a_rejected_patch_is_marked_as_changing_nothing(self):
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            prior_round_patches=[
+                {"file": "server/app/api.py", "op": "REPLACE_BLOCK",
+                 "outcome": "REJECTED: search text not found"},
+            ],
+        )
+        assert "REJECTED" in prompt
+        assert "changed nothing" in prompt
+
+    def test_the_claim_is_bound_to_the_list(self):
+        # Without this instruction the list is just more context; the point
+        # is that it can FALSIFY a narrative.
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            prior_round_patches=[
+                {"file": "a.py", "op": "REPLACE_BLOCK", "outcome": "applied"}],
+        )
+        assert "must match this list" in prompt
+        assert "was not touched" in prompt
+
+    def test_an_empty_round_says_so_explicitly(self):
+        # A round that landed nothing cannot explain any behaviour change —
+        # the judge should not be left to infer that from silence.
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(), prior_round_patches=[])
+        assert "none — the round landed" in prompt
+
+    def test_absent_data_renders_no_block(self):
+        # First reflection of a run: nothing recorded yet, and an empty
+        # section would read as "no patches", which is a different claim.
+        prompt = _build_repair_reflection_prompt(**_base_kwargs())
+        assert "PATCHES THE PREVIOUS ROUND APPLIED" not in prompt
+
+    def test_the_facts_precede_the_previous_narrative(self):
+        prompt = _build_repair_reflection_prompt(
+            **_base_kwargs(),
+            prior_round_patches=[
+                {"file": "a.py", "op": "REPLACE_BLOCK", "outcome": "applied"}],
+            prior_reflection_verdict={
+                "verdict": "DISTRACTION",
+                "real_blocker": "the endpoint returns 200 instead of 201",
+                "recommendation": "Edit a.py",
+            },
+        )
+        assert (prompt.index("PATCHES THE PREVIOUS ROUND APPLIED")
+                < prompt.index("YOUR PREVIOUS-ROUND VERDICT")), (
+            "the judge should read the facts before its own last narrative"
+        )
+
+
+class TestRoundPatchSummary:
+    def test_outcomes_are_distinguished(self):
+        from harness.graph import _summarize_round_patches
+
+        class _R:
+            def __init__(self, file, op, success, no_op=False, error=""):
+                self.file, self.operation = file, op
+                self.success, self.no_op, self.error = success, no_op, error
+
+        got = _summarize_round_patches([
+            _R("a.py", "REPLACE_BLOCK", True),
+            _R("b.py", "REPLACE_BLOCK", True, no_op=True),
+            _R("c.py", "CREATE_FILE", False, error="file already exists"),
+        ])
+        assert got[0]["outcome"] == "applied"
+        assert "no-op" in got[1]["outcome"]
+        assert got[2]["outcome"].startswith("REJECTED") and "exists" in got[2]["outcome"]
+
+    def test_it_is_bounded_and_tolerates_junk(self):
+        from harness.graph import _summarize_round_patches
+        assert _summarize_round_patches([]) == []
+        assert _summarize_round_patches(None) == []
+
+        class _NoFile:
+            file, operation, success, no_op, error = "", "X", True, False, ""
+
+        assert _summarize_round_patches([_NoFile()]) == []

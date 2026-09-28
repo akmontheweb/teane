@@ -174,3 +174,62 @@ class TestNeverFatal:
 
         monkeypatch.setattr(test_hygiene, "run_test_hygiene_checks", _boom)
         run_static_preflight(_ws(tmp_path))  # must not raise
+
+
+class TestModuleLevelAssertInProduction:
+    """lumina-run22-20260926-2330 lost most of its run to one line:
+
+        router = APIRouter(prefix="/api/birthdays", tags=["birthdays"])
+        assert len(router.routes) > 0, "Birthday router has no routes"
+
+    placed before any @router.get decorator ran — false by construction. The
+    module could not import, main.py could not import it, the app had no
+    routes, and test_main, the acceptance suite and PROD_IMPORT_SMOKE failed
+    together. The oscillation prover then read the add/remove cycle as a
+    REQUIREMENTS conflict and told the judge "Do NOT name this file again".
+    """
+
+    ROUTER_ASSERT = (
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/x')\n"
+        "assert len(router.routes) > 0, 'router has no routes'\n"
+        "@router.get('/y')\n"
+        "def y():\n    return {}\n"
+    )
+
+    def _codes(self, tmp_path, files):
+        from harness.static_preflight import run_static_preflight
+        for rel, body in files.items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+        return [d["error_code"] for d in run_static_preflight(str(tmp_path))]
+
+    def test_the_run22_line_is_caught(self, tmp_path):
+        codes = self._codes(tmp_path, {"app/api.py": self.ROUTER_ASSERT})
+        assert "MODULE_LEVEL_ASSERT_IN_PRODUCTION" in codes
+
+    def test_an_assert_inside_a_function_is_fine(self, tmp_path):
+        # An ordinary runtime check: it sees real arguments and does not
+        # decide whether the module can be imported.
+        codes = self._codes(tmp_path, {
+            "app/svc.py": "def f(x):\n    assert x > 0\n    return x\n"})
+        assert "MODULE_LEVEL_ASSERT_IN_PRODUCTION" not in codes
+
+    def test_asserts_in_tests_are_the_point_of_tests(self, tmp_path):
+        codes = self._codes(tmp_path, {
+            "tests/test_x.py": "assert True\n",
+            "app/conftest.py": "assert True\n",
+            "app/test_helper.py": "assert True\n",
+        })
+        assert "MODULE_LEVEL_ASSERT_IN_PRODUCTION" not in codes
+
+    def test_the_message_explains_the_import_time_trap(self, tmp_path):
+        from harness.static_preflight import run_static_preflight
+        (tmp_path / "app").mkdir(parents=True)
+        (tmp_path / "app" / "api.py").write_text(self.ROUTER_ASSERT)
+        d = [x for x in run_static_preflight(str(tmp_path))
+             if x["error_code"] == "MODULE_LEVEL_ASSERT_IN_PRODUCTION"][0]
+        assert "import time" in d["message"]
+        assert "does not exist yet" in d["message"]
+        assert "-O" in d["message"]

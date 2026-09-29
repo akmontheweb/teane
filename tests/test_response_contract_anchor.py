@@ -623,3 +623,84 @@ class TestTheFreezeSurvivesModulePurging:
         _, src = self._clock_ns(tmp_path)
         assert "could not install its clock override" in src
         assert "no longer exists" in src
+
+
+class TestCriteriaReachConsumersAsWritten:
+    """A criterion is its Given/When/Then, not its title.
+
+    The DB stores "Upcoming birthdays are shown sorted by next occurrence".
+    The specification states the clock to assume (2026-01-15), the rows to
+    seed (Alice 1990-01-16, Bob 1985-02-10, Carol 1992-03-20), the expected
+    values (days_left 1 and 26), the ordering (Alice before Bob) and the
+    exclusion (Carol absent). Every consumer received the first and none
+    received the second, so each invented its own data and expectations —
+    the envelope guesses, the out-of-window dates and the impossible
+    orderings of lumina runs 11-22.
+    """
+
+    SPEC = (
+        "# Software Requirements Specification\n\n"
+        "## API conventions\n\nEnvelope everything.\n\n"
+        "#### Story: STORY-001 - Display upcoming birthdays\n\n"
+        "**Parent feature:** FEAT-001\n\n"
+        "**As a** employee\n**I want** a dashboard\n**So that** I know\n\n"
+        "**Acceptance Criteria:**\n\n"
+        "**Scenario: Upcoming birthdays are shown sorted by next occurrence**\n"
+        "- Given the application clock is set to 2026-01-15T00:00:00Z\n"
+        "- And Alice has date_of_birth 1990-01-16\n"
+        "- Then Alice appears with days_left 1\n"
+    )
+
+    def _seeded(self, tmp_path):
+        from harness import story_state as sst
+        ws = tmp_path / "app"
+        ws.mkdir(parents=True, exist_ok=True)
+        app = sst.app_name_for_workspace(str(ws))
+        conn = sst.open_story_db(workspace_path=str(ws))
+        sst.create_requirements(conn, app, [
+            {"req_key": "STORY-001", "kind": "safe_story", "title": "Display",
+             "body": self.SPEC.split("**Parent feature:**", 1)[1]},
+        ])
+        conn.commit()
+        conn.close()
+        return str(ws)
+
+    def test_the_given_when_then_is_extracted(self, tmp_path):
+        from harness.acceptance_gen import _story_criteria_text
+        got = _story_criteria_text(self._seeded(tmp_path), "STORY-001")
+        assert "2026-01-15" in got and "days_left 1" in got
+        # the As a / I want preamble is not a criterion
+        assert "I want a dashboard" not in got
+
+    def test_an_unknown_story_is_not_an_error(self, tmp_path):
+        from harness.acceptance_gen import _story_criteria_text
+        assert _story_criteria_text(self._seeded(tmp_path), "STORY-404") == ""
+
+    def test_the_acceptance_prompt_carries_the_data_and_the_keys(self):
+        from harness.acceptance_gen import StoryAcceptanceContext, build_user_prompt
+        ctx = StoryAcceptanceContext(
+            story_key="STORY-001", title="t", description="d",
+            acceptance_criteria=[{"ac_key": "STORY-001.AC-1",
+                                  "text": "shown sorted"}],
+            criteria_as_specified=(
+                "**Scenario: sorted**\n- Given the clock is 2026-01-15\n"
+                "- Then Alice appears with days_left 1\n"),
+            routes=[], response_models={}, data_model_excerpt="",
+            architecture_excerpt="", stack={},
+        )
+        prompt = build_user_prompt(ctx, max_scenarios=5)
+        assert "2026-01-15" in prompt and "days_left 1" in prompt
+        assert "STORY-001.AC-1" in prompt, "the keys are still needed for verifies"
+        assert "rather than inventing your own" in prompt
+
+    def test_titles_alone_still_render_when_the_spec_is_absent(self):
+        from harness.acceptance_gen import StoryAcceptanceContext, build_user_prompt
+        ctx = StoryAcceptanceContext(
+            story_key="STORY-001", title="t", description="d",
+            acceptance_criteria=[{"ac_key": "AC-1", "text": "shown sorted"}],
+            routes=[], response_models={}, data_model_excerpt="",
+            architecture_excerpt="", stack={},
+        )
+        prompt = build_user_prompt(ctx, max_scenarios=5)
+        assert "AC-1: shown sorted" in prompt
+        assert "rather than inventing your own" not in prompt

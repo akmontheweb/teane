@@ -108,6 +108,23 @@ class StoryAcceptanceContext:
     """Best-effort discovered HTTP routes: ``{"method": "POST", "path": "/contacts"}``."""
     data_model_excerpt: str = ""
     architecture_excerpt: str = ""
+    criteria_as_specified: str = ""
+    """The story's criteria AS WRITTEN in the specification — the full
+    Given/When/Then, not the one-line titles the DB stores.
+
+    ``acceptance_criteria`` above carries titles: "Upcoming birthdays are
+    shown sorted by next occurrence". The specification carries the actual
+    criterion: "Given the application clock is set to 2026-01-15T00:00:00Z
+    / And Alice has date_of_birth 1990-01-16 / Then Alice appears with
+    next_birthday_date 2026-01-16 and days_left 1 / And Alice appears
+    before Bob / And Carol does not appear".
+
+    Every concrete fact a scenario needs — the date to pin, the rows to
+    seed, the expected values, the ordering, the exclusion — is in the
+    second and absent from the first. Without it the generator invents its
+    own data and its own expectations, which is where the envelope guesses,
+    the out-of-window dates and the impossible orderings came from across
+    lumina runs 11-22."""
     cross_cutting_rules: str = ""
     """The requirements document's cross-cutting head — product decisions,
     assumptions, data model, time/date semantics, API conventions, error
@@ -316,6 +333,16 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
         f"- {a.get('ac_key')}: {a.get('text', '').strip()}"
         for a in ctx.acceptance_criteria
     ) or "- (no acceptance criteria found)"
+    if ctx.criteria_as_specified.strip():
+        ac_lines = (
+            "The criteria AS WRITTEN in the specification. Use the data they "
+            "give — the stated clock, the stated rows, the stated expected "
+            "values and ordering — rather than inventing your own. Where a "
+            "criterion names a date, pin the clock to it; where it names "
+            "records, seed exactly those.\n\n"
+            + ctx.criteria_as_specified.strip()
+            + "\n\nCriterion keys, for the `verifies` field:\n" + ac_lines
+        )
     route_lines = "\n".join(
         f"- {r.get('method', '?')} {r.get('path', '?')}" for r in ctx.routes
     ) or "- (no routes discovered — infer from the architecture excerpt)"
@@ -1021,6 +1048,40 @@ def _returned_dict_keys(node: Any) -> list[str]:
 _CROSS_CUTTING_MAX_CHARS = 12000
 
 
+def _story_criteria_text(
+    workspace_path: str, story_key: str, *, max_chars: int = 6000,
+) -> str:
+    """The story's acceptance-criteria prose from the requirements row.
+
+    ``requirements.body`` holds the verbatim spec block that ingest already
+    stored — the Given/When/Then with its concrete dates and values. Only
+    the criteria section is returned; the "As a / I want" preamble adds
+    nothing a scenario writer can act on.
+    """
+    try:
+        from harness import story_state as sst
+        app = sst.app_name_for_workspace(workspace_path)
+        conn = sst.open_story_db(workspace_path=workspace_path)
+        try:
+            req = sst.get_requirement_by_key(conn, app, story_key)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — context assembly is best-effort
+        logger.debug("[acceptance_gen] criteria text unavailable: %s", exc)
+        return ""
+    body = str((req or {}).get("body") or "")
+    if not body.strip():
+        return ""
+    lowered = body.lower()
+    marker = lowered.find("acceptance criteria")
+    if marker != -1:
+        body = body[marker:]
+        nl = body.find("\n")
+        if nl != -1:
+            body = body[nl + 1:]
+    return body.strip()[:max_chars]
+
+
 def _cross_cutting_rules(
     workspace_path: str, *, max_chars: int = _CROSS_CUTTING_MAX_CHARS,
 ) -> str:
@@ -1695,6 +1756,7 @@ def gather_story_acceptance_context(
         title=story.get("title", story_key),
         description=story.get("description", "") or "",
         acceptance_criteria=ac_rows,
+        criteria_as_specified=_story_criteria_text(workspace_path, story_key),
         routes=discover_routes(workspace_path),
         response_models={
             # Declared models first; literals fill only the endpoints that

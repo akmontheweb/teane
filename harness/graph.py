@@ -24814,6 +24814,26 @@ def _build_nfr_policy_block(ac_texts: list[str], workspace: str) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _story_criteria_as_specified(state: AgentState, story_key: str) -> str:
+    """The story's criteria prose from the requirements row, or ``""``.
+
+    Same text the acceptance generator now receives, so the tier that
+    IMPLEMENTS a criterion and the tier that VERIFIES it read the same
+    words — including the concrete dates and expected values that neither
+    could see when both were handed titles.
+    """
+    if not story_key:
+        return ""
+    try:
+        from harness.acceptance_gen import _story_criteria_text
+        return _story_criteria_text(
+            str(state.get("workspace_path", "") or ""), story_key,
+        )
+    except Exception as exc:  # noqa: BLE001 — prompt aid, never fatal
+        logger.debug("[story-preamble] criteria text unavailable: %s", exc)
+        return ""
+
+
 def _build_story_preamble(state: AgentState, phase: str) -> str:
     """Return the per-story scoping preamble for ``phase`` (one of
     ``"patching"``, ``"tests"``). Empty string when no story is active.
@@ -24943,7 +24963,22 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
             "acceptance criteria below; do not attempt to deliver the "
             "whole specification in a single pass."
         )
-        ac_section = f"### Acceptance criteria\n{ac_block}\n\n"
+        # Titles alone are not a criterion. The DB stores "Upcoming
+        # birthdays are shown sorted by next occurrence"; the specification
+        # states the clock to assume, the rows, the expected days_left, the
+        # ordering and the exclusion. Those facts were ~150 KB away in the
+        # anchored spec while the implementer read the title here, and an
+        # implementer that cannot see the expected values has to guess them.
+        _spec_acs = _story_criteria_as_specified(state, story_key)
+        if _spec_acs:
+            ac_section = (
+                "### Acceptance criteria (as written in the specification)\n"
+                f"{_spec_acs}\n\n"
+                "### Criterion keys\n"
+                f"{ac_block}\n\n"
+            )
+        else:
+            ac_section = f"### Acceptance criteria\n{ac_block}\n\n"
     else:
         intro = (
             _incremental

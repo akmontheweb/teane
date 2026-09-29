@@ -1474,9 +1474,40 @@ def _render_frozen_clock(clock: Optional[dict[str, Any]]) -> tuple[str, str]:
         body.append(f"    def {m}(self):")
         body.append("        return _dt.datetime.combine(")
         body.append("            self._d, _dt.time(12, 0), tzinfo=_dt.timezone.utc)")
+    # NOTE the dependency is NOT imported here. The client fixture purges
+    # every app module and re-imports the application for database
+    # isolation, so a symbol bound at conftest-import time is a DIFFERENT
+    # object from the one the rebuilt app depends on — and
+    # dependency_overrides is keyed by function identity, so the override
+    # silently matches nothing.
+    #
+    # That is what made lumina runs 17, 21 and 22 report "the endpoint
+    # returns an empty birthdays list instead of the seeded birthdays":
+    # freeze_today appeared to succeed, the app kept the real clock, and
+    # records seeded around the frozen date fell outside the live 30-day
+    # window. Run 18's model even diagnosed it from the production side,
+    # refactoring get_clock into a sys.modules-pinned instance "so its
+    # identity survives module purging by test fixtures" — a workaround for
+    # a harness defect that the application should never have had to carry.
     module_src = (
         "import datetime as _dt\n"
-        f"from {clock['module']} import {clock['symbol']} as _CLOCK_DEP\n\n\n"
+        "import importlib as _importlib\n\n"
+        f"_CLOCK_MODULE = {clock['module']!r}\n"
+        f"_CLOCK_SYMBOL = {clock['symbol']!r}\n\n\n"
+        "def _clock_dependency():\n"
+        '    """The clock dependency object the CURRENT app is using.\n\n'
+        "    Resolved on every call: the client fixture re-imports the app,\n"
+        "    so the identity that dependency_overrides must key on changes\n"
+        "    with it.\n"
+        '    """\n'
+        "    _mod = _importlib.import_module(_CLOCK_MODULE)\n"
+        "    try:\n"
+        "        return getattr(_mod, _CLOCK_SYMBOL)\n"
+        "    except AttributeError:  # pragma: no cover - app moved the seam\n"
+        "        raise AssertionError(\n"
+        "            f'{_CLOCK_MODULE}.{_CLOCK_SYMBOL} no longer exists, so '\n"
+        "            'the clock cannot be pinned. Fix the test or the app '\n"
+        "            'rather than letting the freeze do nothing.') from None\n\n\n"
         + "\n".join(body) + "\n\n\n"
     )
     method_src = (
@@ -1486,8 +1517,12 @@ def _render_frozen_clock(clock: Optional[dict[str, Any]]) -> tuple[str, str]:
         "        date — a rolling window, an age, an expiry. Without it such a\n"
         "        criterion only passes on the right calendar day.\n"
         '        """\n'
-        "        self.app.dependency_overrides[_CLOCK_DEP] = (\n"
-        "            lambda: _FrozenClock(d))\n"
+        "        _dep = _clock_dependency()\n"
+        "        self.app.dependency_overrides[_dep] = lambda: _FrozenClock(d)\n"
+        "        # A freeze that matches nothing is worse than no freeze: the\n"
+        "        # test reads as pinned while the app keeps real time.\n"
+        "        assert _dep in self.app.dependency_overrides, (\n"
+        "            'freeze_today could not install its clock override')\n"
     )
     return module_src, method_src
 

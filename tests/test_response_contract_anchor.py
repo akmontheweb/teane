@@ -423,8 +423,12 @@ class TestClockFreeze:
             clock=discover_clock_override(self._ws(tmp_path)))
         ast.parse(src)
         assert "def freeze_today(self, d):" in src
-        assert "from app.deps import get_clock as _CLOCK_DEP" in src
-        assert "dependency_overrides[_CLOCK_DEP]" in src
+        # The dependency is resolved at CALL time, not bound at import: the
+        # client fixture re-imports the app, and dependency_overrides keys on
+        # identity. See TestTheFreezeSurvivesModulePurging.
+        assert "_CLOCK_MODULE = 'app.deps'" in src
+        assert "_CLOCK_SYMBOL = 'get_clock'" in src
+        assert "dependency_overrides[_dep]" in src
         # every discovered accessor is overridden, or the app reads real time
         assert "def today_utc(self):" in src and "def now_utc(self):" in src
 
@@ -543,3 +547,79 @@ class TestTheConftestNeverWithdrawsAFixture:
     def test_nothing_remembered_is_not_an_error(self, tmp_path):
         from harness import acceptance_node as an
         assert an._remembered_clock({}, str(tmp_path), "tests/acceptance") is None
+
+
+class TestTheFreezeSurvivesModulePurging:
+    """The client fixture purges every app module and re-imports the
+    application for database isolation. FastAPI keys dependency_overrides by
+    function IDENTITY, so a symbol bound at conftest-import time is a
+    different object from the one the rebuilt app depends on and the
+    override silently matches nothing.
+
+    lumina runs 17, 21 and 22 all reported "the endpoint returns an empty
+    birthdays list instead of the seeded birthdays": freeze_today appeared
+    to succeed, the app kept the real clock, and records seeded around the
+    frozen date fell outside the live 30-day window. Run 18's model
+    diagnosed it from the production side, pinning get_clock in sys.modules
+    "so its identity survives module purging by test fixtures" — a
+    workaround for a harness defect the application should not have to
+    carry.
+    """
+
+    APP = (
+        "from datetime import date, datetime, timezone\n"
+        "class Clock:\n"
+        "    @staticmethod\n"
+        "    def today_utc() -> date: ...\n"
+        "    @staticmethod\n"
+        "    def now_utc() -> datetime: ...\n"
+        "def get_clock() -> Clock:\n"
+        "    return Clock()\n"
+    )
+
+    def _clock_ns(self, tmp_path):
+        """Exec the rendered clock plumbing alone (no FastAPI needed)."""
+        from harness.acceptance_gen import (
+            discover_clock_override, render_acceptance_conftest)
+        _write(tmp_path, "app/__init__.py", "")
+        _write(tmp_path, "app/deps.py", self.APP)
+        src = render_acceptance_conftest(
+            {"module": "app.main", "symbol": "create_app", "kind": "factory"},
+            db_env_var="DATABASE_PATH",
+            clock=discover_clock_override(str(tmp_path)))
+        start = src.index("import importlib as _importlib")
+        end = src.index("_ACCEPTANCE_BASE_URL")
+        ns: dict = {}
+        exec(src[start:end], ns)
+        return ns, src
+
+    def test_resolution_follows_the_reimported_app(self, tmp_path, monkeypatch):
+        import importlib
+        import sys
+        ns, _ = self._clock_ns(tmp_path)
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        first = importlib.import_module("app.deps").get_clock
+        for m in [m for m in list(sys.modules)
+                  if m == "app" or m.startswith("app.")]:
+            sys.modules.pop(m, None)
+        second = importlib.import_module("app.deps").get_clock
+
+        assert first is not second, "precondition: the purge rebinds the symbol"
+        assert ns["_clock_dependency"]() is second, (
+            "the override must key on the object the LIVE app depends on"
+        )
+
+    def test_the_dependency_is_not_bound_at_import(self, tmp_path):
+        # The regression itself: a module-level `from ... import get_clock`
+        # freezes the identity before the fixture ever rebuilds the app.
+        _, src = self._clock_ns(tmp_path)
+        assert "import get_clock as _CLOCK_DEP" not in src
+        assert "_clock_dependency()" in src
+
+    def test_a_freeze_that_matches_nothing_fails_loudly(self, tmp_path):
+        # Silence is what cost three runs: the test read as pinned while the
+        # app kept real time.
+        _, src = self._clock_ns(tmp_path)
+        assert "could not install its clock override" in src
+        assert "no longer exists" in src

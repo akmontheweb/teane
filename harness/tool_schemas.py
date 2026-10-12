@@ -797,6 +797,39 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
     return None
 
 
+def tool_call_to_dsl(call: dict[str, Any]) -> Optional[str]:
+    """Render one patch or ``read_file`` tool call as the harness's text DSL.
+
+    For a node whose pipeline is built on the DSL (repair) but which is
+    dispatched with native tools: the call becomes exactly the block the
+    model would have written in text mode, so every downstream consumer —
+    the READ_FILE cycle, the screens, the tamper guard, the stored history
+    — runs unchanged. None for an unknown tool, a read naming no file, or
+    a block the DSL cannot carry losslessly (see ``render_patch_block``).
+    """
+    from harness.patcher import render_patch_block
+
+    if call.get("name") == "read_file":
+        args = call.get("input") or {}
+        path = str(args.get("file_path") or "").strip() if isinstance(args, dict) else ""
+        if not path or "\n" in path:
+            return None
+        lines = ["<<<READ_FILE>>>", f"file: {path}"]
+        try:
+            start = int(args.get("start_line") or 0)
+            end = int(args.get("end_line") or 0)
+        except (TypeError, ValueError):
+            start = end = 0
+        if start > 0:
+            lines.append(f"range: {start}-{max(end, start)}")
+        lines.append("<<<END_READ_FILE>>>")
+        return "\n".join(lines)
+    block = tool_call_to_patch_block(call)
+    if block is None or not block.file:
+        return None
+    return render_patch_block(block)
+
+
 def tool_calls_to_patch_blocks(
     calls: list[dict[str, Any]],
 ) -> tuple[list[PatchBlock], list[dict[str, Any]]]:

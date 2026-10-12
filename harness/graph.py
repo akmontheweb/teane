@@ -4010,6 +4010,118 @@ async def _patching_tool_loop(
     return response, budget, messages, files_seen
 
 
+async def _dispatch_tools_as_dsl(
+    *,
+    gateway: Any,
+    messages: list["MessageDict"],
+    budget: float,
+    role: Any,
+    cache_family: str,
+    tools: list[dict[str, Any]],
+    workspace: str,
+    state: "AgentState",
+    node_label: str,
+    model_override: Optional[str] = None,
+) -> tuple[Any, float]:
+    """Dispatch with native tools, and hand back a response in the text DSL.
+
+    The shared system prompt tells every node "Native tool-use is ENABLED…
+    call the tools" whenever ``patcher.use_structured_tools`` is on. Repair
+    was dispatched with no tools at all, so the model was told to call tools
+    that did not exist, and wrote the calls as text in whatever syntax its
+    training held: Anthropic XML (run 5, 14), DeepSeek DSML and bare
+    ``<read_file><path>`` (lumina-run24-20260929-2327, five rounds lost,
+    two zero_patch_loop HITLs). Each was patched in tool_dialects as a new
+    dialect; the contradiction kept producing the next one.
+
+    Repair's pipeline — READ_FILE cycle, pre-patch screen, tamper guard,
+    stored history — is built on the DSL, so this does not rebuild it. Read-
+    only retrieval calls (grep/glob/list_dir/…) are resolved here, against a
+    private copy of ``messages``, because the DSL has no form for them.
+    Patch and ``read_file`` calls are rendered as the exact blocks the model
+    would have written in text mode and appended to ``content``; the
+    response leaves with no tool calls, so nothing downstream, and no later
+    dispatch, carries a tool_use id it must answer.
+    """
+    from harness.retrieval_tools import RETRIEVAL_TOOL_NAMES, resolve_retrieval_call
+    from harness.tool_schemas import tool_call_to_dsl
+
+    extra: dict[str, Any] = {"model_override": model_override} if model_override else {}
+    local = list(messages)
+
+    async def _once(msgs: list["MessageDict"], b: float) -> tuple[Any, float]:
+        return await gateway.dispatch(
+            messages=list(msgs), role=role, budget_remaining_usd=b,
+            cache_family=cache_family, tools=tools, **extra,
+        )
+
+    response, budget = await _once(local, budget)
+    usages = [response.usage]
+    cap = _resolve_patching_read_file_cap(state)
+    retrieval_cfg = {"retrieval_tools": (state.get("retrieval_tools_config") or {})}
+    rounds = 0
+    while rounds < cap:
+        calls = getattr(response, "tool_calls", None) or []
+        searches = [c for c in calls if c.get("name") in RETRIEVAL_TOOL_NAMES]
+        # Only a pure-search turn is resolved here. A turn that also edits or
+        # reads goes to the DSL now; its searches are dropped below, since
+        # the edit is what the round is for.
+        if not searches or len(searches) < len(calls):
+            break
+        rounds += 1
+        local.append(_build_assistant_tool_turn(response))
+        local.append(MessageDict(role="user", content=[
+            {
+                "type": "tool_result",
+                "tool_use_id": c.get("id") or "",
+                "content": await resolve_retrieval_call(
+                    c, workspace, config=retrieval_cfg,
+                ),
+            }
+            for c in searches
+        ]))
+        response, budget = await _once(local, budget)
+        usages.append(response.usage)
+
+    if len(usages) > 1:
+        # The caller aggregates response.usage once; make it the whole turn.
+        from dataclasses import fields as _dc_fields
+        total = response.usage
+        for f in _dc_fields(total):
+            if isinstance(getattr(total, f.name), (int, float)):
+                setattr(total, f.name, sum(getattr(u, f.name) or 0 for u in usages))
+
+    calls = list(getattr(response, "tool_calls", None) or [])
+    if not calls:
+        return response, budget
+    rendered: list[str] = []
+    dropped: list[str] = []
+    for c in calls:
+        dsl = None if c.get("name") in RETRIEVAL_TOOL_NAMES else tool_call_to_dsl(c)
+        if dsl:
+            rendered.append(dsl)
+        else:
+            dropped.append(str(c.get("name") or "?"))
+    response.content = "\n\n".join(
+        p for p in [(response.content or "").strip(), *rendered] if p
+    )
+    response.tool_calls = []
+    if dropped:
+        logger.warning(
+            "[%s] %d native tool call(s) had no DSL form and were dropped: %s "
+            "(%d rendered).", node_label, len(dropped), dropped, len(rendered),
+        )
+    try:
+        from harness.observability import emit_event
+        emit_event(
+            "native_tools_folded_to_dsl", node=node_label,
+            rendered=len(rendered), dropped=dropped, search_rounds=rounds,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    return response, budget
+
+
 async def _run_tool_loop(
     *,
     initial_response_content: str,
@@ -18365,6 +18477,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             "node_state": {"current_node": "repair", "error": "No gateway configured"},
             "loop_counter": loop_counter,
         }
+    # The same switch that puts "Native tool-use is ENABLED" into the shared
+    # system prompt (_build_system_prompt). Repair must honour it, or it tells
+    # the model to call tools it was never given — see _dispatch_tools_as_dsl.
+    _repair_use_tools = bool(getattr(gateway.config, "use_structured_tools", False))
 
     # Detect security-finding repair: every diagnostic carries an
     # error_code prefixed by the scanner name (BANDIT:, SEMGREP:, TRIVY:,
@@ -19579,8 +19695,11 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     "is to fix the failing diagnostic the judge names "
                     "in the banner below. The SRS above is workspace "
                     "context you may reference; do not re-derive the "
-                    "goal from it. Emit patches in the block DSL only "
-                    "— no prose."
+                    "goal from it. "
+                    + ("Make every change by calling the patch tools "
+                       "— no prose."
+                       if _repair_use_tools else
+                       "Emit patches in the block DSL only — no prose.")
                 )),
                 MessageDict(role="system", content=reflection_msg),
             ]
@@ -19816,9 +19935,30 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # In change-request mode prepend the CR-N attribution rules so
         # repair patches also carry the marker comments.
         _read_file_rounds = _resolve_read_file_rounds(state)
+        # Tool mode keeps the DSL out of the reminder: the system prompt has
+        # already said "never write the <<<...>>> markers: call the tools",
+        # and a reminder teaching the markers as the ONLY syntax is the
+        # contradiction that sent the model to its trained tool syntax.
+        _REPAIR_TOOL_REMINDER = f"""[REPAIR — NATIVE TOOL-USE MODE]
+Make every change by calling the patch tools (`edit_file`, `create_file`,
+`rewrite_file`, `delete_block`, `insert_at_block`, `insert_at_line`,
+`replace_line_range`). Where this prompt names a block (REPLACE_BLOCK,
+CREATE_FILE, REWRITE_FILE, …), call the tool of the same meaning. Do NOT
+write patch or read markers, or any other tool syntax, as text.
+
+`read_file` is budgeted: at most {_read_file_rounds} read rounds per repair
+iteration, after which further reads are dropped and you must patch with
+what you have. Read only files you have not been shown.
+
+The only things that belong in your message text are the declarations
+this prompt asks for by name — an `UNSATISFIABLE_TEST: …` line or a
+`<<<PROMOTE_DEFERRED>>>` block — no explanation, no plan.
+
+Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
+Make your fix NOW."""
         _REPAIR_FORMAT_REMINDER = _build_change_request_preamble(
             state, "patching"
-        ) + f"""[CRITICAL FORMAT INSTRUCTION]
+        ) + (_REPAIR_TOOL_REMINDER if _repair_use_tools else f"""[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more blocks.
@@ -19853,7 +19993,7 @@ patches with whatever context you have. So read only files you genuinely
 need to see and have not been shown; everything else, patch directly.
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
-Generate your fix patches NOW. Only the blocks above. No other text."""
+Generate your fix patches NOW. Only the blocks above. No other text.""")
         # Give the round's blocking correction the last word. The repair
         # prompt already carries it, ~93% of the way through a ~240k-char
         # message and buried under diagnostics, an 83-file inventory and
@@ -19924,12 +20064,26 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                         _emit_sl("spec_context_scoped", **_slice_tel)
                     except Exception:  # noqa: BLE001 — telemetry must not block
                         pass
-            if use_escalation and escalation_model:
+            _override = escalation_model if (use_escalation and escalation_model) else None
+            if _repair_use_tools:
+                return await _dispatch_tools_as_dsl(
+                    gateway=gateway,
+                    messages=cur_messages,
+                    budget=cur_budget,
+                    role=NodeRole.REPAIR,
+                    cache_family=_repair_cache_family,
+                    tools=_patch_tools_for_state(state),
+                    workspace=state.get("workspace_path", os.getcwd()),
+                    state=state,
+                    node_label="repair_node",
+                    model_override=_override,
+                )
+            if _override:
                 return await gateway.dispatch(
                     messages=list(cur_messages),
                     role=NodeRole.REPAIR,
                     budget_remaining_usd=cur_budget,
-                    model_override=escalation_model,
+                    model_override=_override,
                     cache_family=_repair_cache_family,
                 )
             return await gateway.dispatch(
@@ -19995,6 +20149,11 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             messages=messages,
             dispatch=_dispatch_repair,
             continue_prompt=(
+                "You hit the output token cap mid-repair. Continue "
+                "with ADDITIONAL patch tool calls for the remaining "
+                "files. Do NOT repeat changes you've already made. "
+                "No prose."
+                if _repair_use_tools else
                 "You hit the output token cap mid-repair. Continue "
                 "with ADDITIONAL CREATE_FILE / REPLACE_BLOCK / "
                 "DELETE_BLOCK / INSERT_AT_BLOCK blocks for the "

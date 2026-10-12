@@ -821,6 +821,57 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
     return blocks
 
 
+def render_patch_block(block: PatchBlock) -> Optional[str]:
+    """The DSL text that :func:`parse_patch_blocks` reads back as ``block``.
+
+    The inverse of the parser, for a caller that receives a patch as a
+    native tool call but runs a pipeline built on the text form. Returns
+    None when the block cannot survive the round trip: a multi-line
+    ``anchor``, or a body containing a block marker the parser stops at.
+    The check is the parser itself, so the two cannot drift apart.
+    """
+    op = block.operation
+    name = op.name
+    head = [f"<<<{name}>>>", f"file: {block.file}"]
+    count = (block.count or "unique").strip().lower()
+    if op in (OperationType.REPLACE_BLOCK, OperationType.DELETE_BLOCK):
+        if count != "unique":
+            head.append(f"count: {count}")
+        body = ["search:", block.search]
+        if op == OperationType.REPLACE_BLOCK:
+            body += ["replace:", block.replace]
+    elif op == OperationType.INSERT_AT_BLOCK:
+        head += [f"anchor: {block.anchor}",
+                 f"placement: {block.placement.value}"]
+        body = ["content:", block.content]
+    elif op == OperationType.INSERT_AT_LINE:
+        head.append(f"line: {block.line}")
+        if block.expected_file_hash:
+            head.append(f"hash: {block.expected_file_hash}")
+        body = ["content:", block.content]
+    elif op == OperationType.REPLACE_LINE_RANGE:
+        head += [f"start_line: {block.line}", f"end_line: {block.end_line}"]
+        if block.expected_file_hash:
+            head.append(f"hash: {block.expected_file_hash}")
+        body = ["content:", block.content]
+    else:  # CREATE_FILE / REWRITE_FILE
+        body = ["content:", block.content]
+    text = "\n".join(head + body + [f"<<<END_{name}>>>"])
+
+    parsed = parse_patch_blocks(text)
+    if len(parsed) != 1:
+        return None
+    back = parsed[0]
+    # The parser rstrips bodies; compare on the same footing.
+    if (back.operation != op or back.file != block.file.strip()
+            or back.search != block.search.rstrip()
+            or back.replace != block.replace.rstrip()
+            or back.content != block.content.rstrip()
+            or back.anchor != block.anchor.strip()):
+        return None
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 3. File Extension → Language Mapping for Tree-Sitter
 # ---------------------------------------------------------------------------

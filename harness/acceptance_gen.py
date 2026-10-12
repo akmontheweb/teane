@@ -152,6 +152,11 @@ class StoryAcceptanceContext:
     other until the run died).
     """
 
+    db_tables: dict[str, list[str]] = field(default_factory=dict)
+    """Real table name → column definitions, read off the code
+    (:func:`discover_db_tables`). What ``client.seed`` inserts into: the
+    spec's "Employee table" is the app's ``employees``."""
+
     def ac_keys(self) -> set[str]:
         return {a.get("ac_key", "") for a in self.acceptance_criteria if a.get("ac_key")}
 
@@ -257,10 +262,7 @@ Hard requirements — a scenario with any of these is useless and will be reject
   `<Response [500 Internal Server Error]>`, whose repr hides the body — so the \
   server's own explanation never reaches the repair loop and it fixes the \
   wrong thing for several rounds.
-- integration bodies MUST be SELF-CONTAINED: arrange every prerequisite via the \
-  API inside the test (e.g. POST a contact before you PATCH or DELETE it), and use \
-  unique/generated field values so the test is robust to any shared state. NEVER \
-  assume pre-seeded rows exist.
+{arrange_rule}
 {db_isolation_rule}
 {clock_rule}
 - e2e bodies: use `page` and real selectors/roles + `await expect(...)`. Assume \
@@ -291,6 +293,34 @@ of the test function only (the harness adds the signature and the @verifies mark
 
 _DB_ISOLATION_SLOT = "{db_isolation_rule}"
 
+#: How a scenario arranges its prerequisites. Under isolation a criterion's
+#: Given is seeded straight into the test's own database; the API is for the
+#: When. lumina-run24-20260929-2327: STORY-003.AC-2 says "Given the database
+#: contains 250 employee records", the API-only rule turned that into 250
+#: POSTs, and NFR-004 (30 mutations a minute, then 429) made the arrangement
+#: itself fail. The generator saw it coming — "Maybe we can seed using
+#: database? The hard rule… Could use client.post 250 times and hope" — and
+#: the repair loop then flipped the rate limiter between 30 and 250 until the
+#: run died, because no production value satisfies both.
+_ARRANGE_SLOT = "{arrange_rule}"
+_ARRANGE_SEED_RULE = """\
+- integration bodies MUST be SELF-CONTAINED. Arrange a criterion's GIVEN — \
+  rows that already exist before the action — with \
+  `ids = client.seed("table", [{"col": value, ...}, ...])`, which inserts \
+  straight into this test's own database and returns the new rows' ids. Use \
+  the HTTP API for the WHEN — the action the criterion is about — and for \
+  nothing the criterion states as already true. Seeding a Given through the \
+  API runs every endpoint rule (rate limits, audit logging, validation) \
+  against data the criterion says simply exists, and a rule such as "30 \
+  mutations per minute, then 429" makes the arrangement itself fail. Use the \
+  table and column names under "Database tables" below, not the \
+  specification's prose names."""
+_ARRANGE_API_RULE = """\
+- integration bodies MUST be SELF-CONTAINED: arrange every prerequisite via the \
+  API inside the test (e.g. POST a contact before you PATCH or DELETE it), and use \
+  unique/generated field values so the test is robust to any shared state. NEVER \
+  assume pre-seeded rows exist."""
+
 #: Filled when the app exposes an injectable clock the conftest can pin.
 _CLOCK_SLOT = "{clock_rule}"
 _CLOCK_AVAILABLE_RULE = """\
@@ -319,7 +349,10 @@ def build_system_prompt(*, db_isolated: bool, clock_available: bool = False) -> 
     """
     # ``str.replace``, not ``str.format``: the prompt embeds a literal JSON
     # schema full of braces.
+    # Seeding needs the per-test database path, which only isolation provides.
     return _SYSTEM_PROMPT_TEMPLATE.replace(
+        _ARRANGE_SLOT, _ARRANGE_SEED_RULE if db_isolated else _ARRANGE_API_RULE,
+    ).replace(
         _DB_ISOLATION_SLOT, _DB_ISOLATED_RULE if db_isolated else _DB_SHARED_RULE,
     ).replace(
         _CLOCK_SLOT,
@@ -377,6 +410,21 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
             "envelope key from the criterion's wording: the unit-test tier "
             "asserts the same schema, so a body key you guess at will "
             "contradict it and no production change can satisfy both.",
+        ]
+    if ctx.db_tables:
+        table_lines = "\n".join(
+            f"- {name}({', '.join(cols)})"
+            for name, cols in sorted(ctx.db_tables.items())
+        )
+        parts += [
+            "",
+            "## Database tables (read from the code — the REAL names)",
+            table_lines,
+            "",
+            "Seed with THESE table and column names, which may differ from "
+            "the specification's prose. Fill every NOT NULL column that has "
+            "no default, and keep UNIQUE columns distinct across the rows "
+            "you seed.",
         ]
     if ctx.cross_cutting_rules.strip():
         parts += [
@@ -923,6 +971,122 @@ def discover_routes(workspace_path: str, *, max_files: int = 200) -> list[dict[s
     return routes
 
 
+_CREATE_TABLE_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?(\w+)[\"'`\]]?\s*\((.*?)\)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_top_level(body: str) -> list[str]:
+    """Split a column list on commas outside parentheses."""
+    out, depth, cur = [], 0, []
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [" ".join(p.split()) for p in out if p.strip()]
+
+
+def discover_db_tables(
+    workspace_path: str, *, max_files: int = 300,
+) -> dict[str, list[str]]:
+    """Real table name → its column definitions, read off the code.
+
+    For ``client.seed(table, rows)``: a scenario that seeds a criterion's
+    Given needs the table the APP created, not the one the specification
+    describes. The spec's data model says "Employee table"; lumina's schema
+    says ``CREATE TABLE IF NOT EXISTS employees``. Seeding from the prose
+    alone guesses the name and the NOT NULL columns it must fill.
+
+    Two sources, both best-effort hints like :func:`discover_routes`:
+    ``CREATE TABLE`` statements in ``.py``/``.sql`` files (raw SQL, migrations),
+    and SQLAlchemy declarative classes (``__tablename__`` plus ``Column`` /
+    ``mapped_column`` attributes). Each column is reported with the
+    constraints that decide whether a seeded row inserts: type, NOT NULL,
+    PRIMARY KEY, DEFAULT, and the table's UNIQUE / FOREIGN KEY clauses.
+    """
+    import ast
+
+    tables: dict[str, list[str]] = {}
+    scanned = 0
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith((".py", ".sql")) or scanned >= max_files:
+                continue
+            scanned += 1
+            try:
+                with open(os.path.join(root, name), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for table, body in _CREATE_TABLE_RE.findall(text):
+                # Table constraints stay: UNIQUE and FOREIGN KEY decide whether
+                # a seeded row inserts as surely as NOT NULL does.
+                cols = _split_top_level(body)
+                if cols:
+                    tables.setdefault(table, cols)
+            if not name.endswith(".py") or "__tablename__" not in text:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    found = _sqlalchemy_table(node)
+                    if found:
+                        tables.setdefault(found[0], found[1])
+    return tables
+
+
+def _sqlalchemy_table(node: Any) -> "Optional[tuple[str, list[str]]]":
+    """``(tablename, column descriptions)`` for a declarative model class."""
+    import ast
+
+    tablename = ""
+    cols: list[str] = []
+    for stmt in node.body:
+        target = value = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target, value = stmt.targets[0], stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            target, value = stmt.target, stmt.value
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id == "__tablename__" and isinstance(value, ast.Constant):
+            tablename = str(value.value)
+            continue
+        if not (isinstance(value, ast.Call)
+                and getattr(value.func, "id", getattr(value.func, "attr", ""))
+                in ("Column", "mapped_column")):
+            continue
+        desc = [target.id]
+        for arg in value.args:
+            kind = getattr(arg, "id", None) or getattr(getattr(arg, "func", None), "id", None)
+            if kind:
+                desc.append(kind.upper())
+                break
+        kw = {k.arg: k.value for k in value.keywords if k.arg}
+        if isinstance(kw.get("primary_key"), ast.Constant) and kw["primary_key"].value:
+            desc.append("PRIMARY KEY")
+        if isinstance(kw.get("nullable"), ast.Constant) and kw["nullable"].value is False:
+            desc.append("NOT NULL")
+        if "default" in kw or "server_default" in kw:
+            desc.append("DEFAULT")
+        cols.append(" ".join(desc))
+    return (tablename, cols) if tablename and cols else None
+
+
 def discover_route_response_literals(
     workspace_path: str, *, max_files: int = 200,
 ) -> dict[str, list[str]]:
@@ -1312,6 +1476,66 @@ def _apply_seed(db_path):
 '''
 
 
+# ``client.seed(table, rows)`` — a criterion's Given, inserted straight into the
+# test's own database (see _ARRANGE_SEED_RULE for why not through the API).
+# Rendered into EVERY conftest, isolated or not: the conftest is re-rendered on
+# each acceptance pass while test files persist, and a method that comes and
+# goes with discovery is the freeze_today withdrawal of lumina-run18 again.
+# Without isolation there is no per-test database to write to, so the call
+# fails saying exactly that. A failed insert names the tables and columns the
+# database really has, so whoever reads the failure sees the test's mistake.
+_SEED_METHOD_SRC = """
+    def seed(self, table, rows):
+        \"\"\"Insert ``rows`` (a list of column→value dicts) into ``table`` in
+        this test's own database, bypassing the API. Returns the new rows'
+        ids. For a criterion's Given: data that already exists before the
+        action under test.
+        \"\"\"
+        import datetime, json, sqlite3
+        _db = getattr(self, "_acceptance_db", None)
+        if not _db:
+            raise RuntimeError(
+                "client.seed needs a per-test database, and this conftest "
+                "could not isolate one; arrange the data through the API.")
+        _conn = sqlite3.connect(_db)
+        _ids = []
+        try:
+            for _row in rows:
+                _cols = list(_row)
+                _vals = []
+                for _v in _row.values():
+                    if isinstance(_v, (datetime.date, datetime.datetime)):
+                        _v = _v.isoformat()
+                    elif isinstance(_v, (dict, list)):
+                        _v = json.dumps(_v)
+                    _vals.append(_v)
+                try:
+                    _cur = _conn.execute(
+                        "INSERT INTO %s (%s) VALUES (%s)"
+                        % (table, ",".join(_cols), ",".join("?" * len(_cols))),
+                        _vals,
+                    )
+                except sqlite3.Error as _exc:
+                    _schema = "; ".join(
+                        "%s(%s)" % (_t, ", ".join(
+                            _c[1] for _c in _conn.execute(
+                                "PRAGMA table_info(%s)" % _t)))
+                        for (_t,) in _conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' "
+                            "AND name NOT LIKE 'sqlite_%'")
+                    )
+                    raise RuntimeError(
+                        "client.seed could not insert into %r: %s. This "
+                        "test's database has: %s" % (table, _exc, _schema)
+                    ) from None
+                _ids.append(_cur.lastrowid)
+            _conn.commit()
+        finally:
+            _conn.close()
+        return _ids
+"""
+
+
 # Fresh-import helper inlined into the ISOLATED conftest. Re-pointing the DB env
 # var is not enough on its own: apps routinely bind the engine at import time
 # (``engine = create_engine(get_settings().database_url)``) and cache settings
@@ -1664,6 +1888,7 @@ def render_acceptance_conftest(
         "                                 if k.lower() not in ('host', 'origin')}\n"
         "        return super().request(method, url, **kwargs)\n"
         + clock_method_src
+        + _SEED_METHOD_SRC
         + "\n\n"
     )
     if db_env_var:
@@ -1693,6 +1918,7 @@ def render_acceptance_conftest(
             "    try:\n"
             "        app = _build_app()\n"
             "        with _Client(app, base_url=_ACCEPTANCE_BASE_URL, raise_server_exceptions=False) as c:\n"
+            "            c._acceptance_db = _db\n"
             f"{seed_call}"
             "            yield c\n"
             "    finally:\n"
@@ -1764,6 +1990,7 @@ def gather_story_acceptance_context(
             **discover_route_response_literals(workspace_path),
             **discover_response_models(workspace_path),
         },
+        db_tables=discover_db_tables(workspace_path),
         cross_cutting_rules=_cross_cutting_rules(workspace_path),
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
         architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),

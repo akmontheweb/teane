@@ -12874,6 +12874,34 @@ def _build_repair_reflection_prompt(
             "naming a test whose expectation is incorrect is a valid and "
             "expected answer here.\n"
         )
+        # Name each side by its tests and the criteria they verify, with the
+        # specification's own words. Fingerprints alone told the run-24 judge
+        # nothing it could rule on, and it alternated between the two sides.
+        for _label, _side in zip(("A", "B"), _con.get("sides") or []):
+            if not (_side.get("tests") or _side.get("criteria")):
+                continue
+            contradiction_block += (
+                f"  Side {_label} — failing tests: "
+                + (", ".join(_side.get("tests") or []) or "(unlocated)") + "\n"
+            )
+            for _ac, _txt in (_side.get("criteria") or {}).items():
+                contradiction_block += (
+                    f"    verifies {_ac}, which the specification states as:\n"
+                    + "\n".join("      " + ln for ln in (_txt or "(text unavailable)").splitlines())
+                    + "\n"
+                )
+        if any((sd.get("tests") for sd in (_con.get("sides") or []))):
+            contradiction_block += (
+                "  Read both criteria as written. A test is wrong when it "
+                "requires something its OWN criterion does not — for example, "
+                "arranging a Given (\"the database contains N records\") "
+                "through an endpoint the other criterion constrains. When one "
+                "side's test is the wrong one, set ``wrong_test`` to that "
+                "test's file path (the part before ``::``); the harness will "
+                "regenerate that scenario from its criterion. Leave it empty "
+                "only if both tests faithfully implement their criteria and "
+                "the SPECIFICATION itself conflicts.\n"
+            )
 
     revert_block = ""
     # Keyed on a PER-FILE count. A global streak is diluted by progress
@@ -13231,6 +13259,11 @@ def _build_repair_reflection_prompt(
             'backend/services/edgar.py — REQUIRED per the TEST-ASSERTION '
             'HINT unless the test itself is genuinely wrong>"'
             if _is_test_assertion else ""
+        )
+        + (
+            ', "wrong_test": "<workspace-relative path of the test file on '
+            'the WRONG side of the PROVED CONTRADICTION, or empty>"'
+            if contradiction_block else ""
         )
         + "}\n"
     )
@@ -14896,6 +14929,13 @@ def _parse_repair_reflection_verdict(
     }
     if impl_file:
         result["impl_file"] = impl_file
+    # Only requested alongside a PROVED CONTRADICTION; repair_node checks it
+    # against the proof's own test list before acting on it.
+    wrong_test = parsed.get("wrong_test", "")
+    if isinstance(wrong_test, str) and wrong_test.strip() and not any(
+        m in wrong_test for m in _placeholder_markers
+    ):
+        result["wrong_test"] = wrong_test.strip().split("::", 1)[0]
     return result
 
 
@@ -17938,6 +17978,39 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "budget_remaining_usd": new_budget,
                     }
 
+    # --- Adjudicated contradiction ---------------------------------------
+    # The judge has ruled which side of a PROVED contradiction is the wrong
+    # test. Another repair round cannot help: no production value satisfies
+    # both sides, which is what was proved. Declare the test unsatisfiable so
+    # the ladder regenerates it from its criterion. lumina-run24-20260929-2327
+    # had the proof and no way to act on it, and flipped the rate limiter
+    # between 30 and 250 until the auto-resume cap ended the run.
+    _adjudicated = _adjudicated_wrong_test(reflection_verdict, loop_counter, state)
+    if _adjudicated is not None:
+        _wt_path, _wt_reason = _adjudicated
+        loop_counter.pop("oscillation_contradiction", None)
+        logger.warning(
+            "[repair_node] Judge ruled %s the wrong side of a proved "
+            "contradiction — declaring it unsatisfiable for regeneration "
+            "instead of another repair round. %s", _wt_path, _wt_reason,
+        )
+        try:
+            from harness.observability import emit_event as _emit_adj
+            _emit_adj("contradiction_adjudicated", file=_wt_path,
+                      reason=_wt_reason[:300])
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        return {
+            "loop_counter": loop_counter,
+            "node_state": {
+                "current_node": "repair",
+                "repair_context": "contradiction adjudicated by the judge",
+                "unsatisfiable_test": _wt_path,
+                "unsatisfiable_test_reason": _wt_reason,
+                "unsatisfiable_test_proof": "oscillation_contradiction",
+            },
+        }
+
     # --- Deterministic autofix pass (R1+R2+R3+R4+R5+R6) ---
     # Try to resolve diagnostics with compiler-suggested fixes,
     # missing-import insertion, known-safe security autofixes, or
@@ -20799,6 +20872,9 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
             # Revert detection. An A->B->A cycle reads as progress to every
             # other counter because each patch applies cleanly; this is the
             # only signal that notices the round undid an earlier one.
+            _record_fingerprint_locations(
+                loop_counter, state.get("compiler_errors", []) or [], workspace,
+            )
             _reverted = _detect_state_reverts(
                 workspace, modified_files, loop_counter,
                 round_diagnostics=_fingerprint_diagnostics(
@@ -20821,6 +20897,9 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                     loop_counter, _reverted,
                 )
                 if _contradiction:
+                    _contradiction["sides"] = _contradiction_sides(
+                        _contradiction, loop_counter, workspace,
+                    )
                     loop_counter["oscillation_contradiction"] = _contradiction
                     logger.warning(
                         "[repair_node] CONTRADICTION proved on %s: one state "
@@ -21564,6 +21643,10 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 "unsatisfiable_test_reason": (
                     _unsat_declared[1] if _unsat_declared else ""
                 ),
+                # Only the adjudicated-contradiction return sets this; clear
+                # it here so a stale proof never vouches for a later,
+                # unrelated declaration.
+                "unsatisfiable_test_proof": "",
             },
         }
     except RuntimeError as exc:
@@ -22484,6 +22567,132 @@ def _fingerprint_diagnostics(
             continue
         out.add(_diagnostic_fingerprint(err))
     return sorted(out)
+
+
+def _adjudicated_wrong_test(
+    verdict: Optional[dict[str, str]],
+    loop_counter: dict[str, Any],
+    state: "AgentState",
+) -> Optional[tuple[str, str]]:
+    """``(test_path, reason)`` when the judge named the wrong side of a proof.
+
+    Acted on only when it can be checked: a contradiction is proved, the named
+    file is one of that proof's own failing tests, and it is still failing.
+    A judge naming any other file is ignored rather than trusted.
+    """
+    if not verdict or not verdict.get("wrong_test"):
+        return None
+    con = loop_counter.get("oscillation_contradiction")
+    if not isinstance(con, dict):
+        return None
+    ws = str(state.get("workspace_path", "") or "")
+    named = _normalize_ws_path(verdict["wrong_test"], ws)
+    on_a_side = {
+        _normalize_ws_path(t.split("::", 1)[0], ws)
+        for side in (con.get("sides") or [])
+        for t in (side.get("tests") or [])
+    }
+    if not named or named not in on_a_side or not _file_in_failing_set(state, named):
+        return None
+    reason = (
+        "Proved contradiction with the other side's criterion; the judge "
+        "ruled this test wrong: " + str(verdict.get("real_blocker") or "")
+    ).strip()
+    return named, reason
+
+
+def _record_fingerprint_locations(
+    loop_counter: dict[str, Any],
+    errors: "list[DiagnosticObjectDict]",
+    workspace: str,
+) -> None:
+    """Remember which ``file:line`` each diagnostic fingerprint came from.
+
+    Fingerprints normalise the message (``AssertionError::{'*':'*'}``) so
+    survival matching tolerates a changed value, which also makes them
+    unreadable as evidence. A proved contradiction named its two sides only
+    that way on lumina-run24-20260929-2327, and the judge could not tell
+    which test, let alone which criterion, sat on either side.
+    """
+    store = loop_counter.setdefault("diag_fp_locations", {})
+    if not isinstance(store, dict):
+        store = {}
+        loop_counter["diag_fp_locations"] = store
+    for err in errors or []:
+        if str(err.get("severity", "error")).lower() == "warning":
+            continue
+        raw = str(err.get("file") or "").strip()
+        if not raw:
+            continue
+        rel = _normalize_ws_path(raw, workspace) or raw
+        try:
+            line = int(err.get("line") or 0)
+        except (TypeError, ValueError):
+            line = 0
+        locs = store.setdefault(_diagnostic_fingerprint(err), [])
+        loc = f"{rel}:{line}"
+        if loc not in locs:
+            locs.append(loc)
+            del locs[:-4]
+    while len(store) > 300:
+        store.pop(next(iter(store)))
+
+
+def _contradiction_sides(
+    contradiction: dict[str, Any],
+    loop_counter: dict[str, Any],
+    workspace: str,
+) -> list[dict[str, Any]]:
+    """Each side of a proved contradiction as tests and the criteria they verify.
+
+    ``[{"tests": ["path::func"], "criteria": {ac_key: spec_text}}, ...]`` for
+    ``only_a`` then ``only_b``. The criteria text is what lets the judge rule:
+    run 24's two sides were "Given the database contains 250 records" and
+    "more than 30 mutation requests ... returns 429", and only with both in
+    view is it visible that one test arranged its Given through an endpoint
+    the other criterion throttles.
+    """
+    import ast as _ast
+
+    store = loop_counter.get("diag_fp_locations") or {}
+    sides: list[dict[str, Any]] = []
+    for key in ("only_a", "only_b"):
+        tests: list[str] = []
+        criteria: dict[str, str] = {}
+        for fp in contradiction.get(key) or []:
+            for loc in (store.get(fp) or []) if isinstance(store, dict) else []:
+                path, _, line_s = loc.rpartition(":")
+                try:
+                    line = int(line_s)
+                    with open(os.path.join(workspace, path), "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        src = fh.read()
+                    tree = _ast.parse(src)
+                except (ValueError, OSError, SyntaxError):
+                    continue
+                src_lines = src.splitlines()
+                for node in _ast.walk(tree):
+                    if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        continue
+                    if not (node.lineno <= line <= (node.end_lineno or node.lineno)):
+                        continue
+                    ref = f"{path}::{node.name}"
+                    if ref not in tests:
+                        tests.append(ref)
+                    # The generated suite puts `# @verifies: KEY` right above
+                    # the def (decorators, if any, sit between).
+                    for above in reversed(src_lines[max(0, node.lineno - 4):node.lineno - 1]):
+                        m = re.search(r"#\s*@verifies:\s*(\S+)", above)
+                        if m and m.group(1) not in criteria:
+                            try:
+                                from harness.acceptance_gen import criterion_as_specified
+                                criteria[m.group(1)] = criterion_as_specified(
+                                    workspace, m.group(1))
+                            except Exception:  # noqa: BLE001 — evidence is best-effort
+                                criteria[m.group(1)] = ""
+                            break
+        sides.append({"tests": tests, "criteria": criteria})
+    return sides
 
 
 def _diagnostic_fingerprint(err: Any) -> str:
@@ -23485,6 +23694,14 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
 
     from harness.test_contradiction import machine_unsatisfiable_reason
     provable = machine_unsatisfiable_reason(source, filename=declared_file)
+    # A contradiction proved behaviourally across files (repair_node's
+    # revert proof) and adjudicated by the judge is a machine proof too, of
+    # a kind the single-file AST check cannot see.
+    if provable is None and (
+        state.get("node_state", {}).get("unsatisfiable_test_proof")
+        == "oscillation_contradiction"
+    ):
+        provable = "proved cross-file contradiction, adjudicated by the judge"
     if provable is not None:
         logger.warning(
             "[router] Test %s is PROVABLY unsatisfiable (%s) — routing to "

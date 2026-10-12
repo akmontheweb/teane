@@ -123,13 +123,14 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
             clock_override["module"], clock_override["symbol"],
         )
 
-    scenarios, budget = await _generate_batch_scenarios(
+    scenarios, not_runtime, budget = await _generate_batch_scenarios(
         workspace, story_keys, cfg, gateway=gateway, budget=budget,
         db_isolated=db_override is not None,
         clock_available=clock_override is not None,
     )
     # ui-only ACs (no integration scenario) are recorded as needs-browser deferrals.
     _persist_ui_only_deferrals(workspace, app_name, scenarios)
+    _persist_not_runtime_deferrals(workspace, app_name, not_runtime)
 
     runnable = ar.select_runnable(scenarios, already_passed=already_passed)
     # Include re-queued dependency-blocked ACs whose scenario is in this set.
@@ -300,12 +301,21 @@ async def _generate_batch_scenarios(
     budget: float,
     db_isolated: bool = False,
     clock_available: bool = False,
-) -> tuple[list[ag.AcceptanceScenario], float]:
-    """Generate scenarios for every story in the batch (LLM or fallback)."""
+) -> tuple[list[ag.AcceptanceScenario], dict[str, str], float]:
+    """Generate scenarios for every story in the batch (LLM or fallback).
+
+    Also returns the not-runtime criteria (AC key → rationale), which have
+    no scenarios to carry their classification.
+    """
     all_scen: list[ag.AcceptanceScenario] = []
+    not_runtime: dict[str, str] = {}
     use_llm = str(cfg.get("scenario_source", "fallback")) == "llm" and gateway is not None
     for sk in story_keys:
-        ctx = ag.gather_story_acceptance_context(workspace, sk, stack={"backend": "fastapi"})
+        ctx = ag.gather_story_acceptance_context(
+            workspace, sk, stack={"backend": "fastapi"},
+            suite_dir=os.path.join(
+                workspace, str(cfg.get("integration_dir", "tests/acceptance"))),
+        )
         if ctx is None:
             continue
         if use_llm:
@@ -317,7 +327,8 @@ async def _generate_batch_scenarios(
         else:
             res = ag.fallback_acceptance_scenarios(ctx)
         all_scen.extend(res.scenarios)
-    return all_scen, budget
+        not_runtime.update(res.not_runtime)
+    return all_scen, not_runtime, budget
 
 
 async def _generate_seed(
@@ -632,6 +643,33 @@ def _persist_ui_only_deferrals(
         _close(conn)
 
 
+def _persist_not_runtime_deferrals(
+    workspace: str, app_name: str, not_runtime: dict[str, str],
+) -> None:
+    """Record not-runtime ACs as deferrals carrying what would verify them."""
+    if not not_runtime:
+        return
+    logger.info(
+        "[acceptance] %d criterion/criteria are about the repository or "
+        "process, not the running app — deferred, no runtime test: %s",
+        len(not_runtime), sorted(not_runtime),
+    )
+    try:
+        conn = story_state.open_story_db(workspace_path=workspace)
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        for ac_key, why in not_runtime.items():
+            ac = story_state.get_ac_by_key(conn, app_name, ac_key)
+            if ac is not None:
+                story_state.record_acceptance_deferral(
+                    conn, app_name, int(ac["id"]),
+                    ar.STATUS_DEFERRED_NOT_RUNTIME,
+                    f"not-runtime: {why}" if why else "not-runtime")
+    finally:
+        _close(conn)
+
+
 def _park_over_cap(
     workspace: str, app_name: str, attributable: list[ar.ACOutcome],
 ) -> None:
@@ -660,12 +698,16 @@ def _acceptance_diagnostics(
     repair at the PRODUCTION behaviour (repair is barred from editing tests, so it
     fixes the code, not the oracle — exactly the intended flow).
     """
-    test_path = written[0] if written else "tests/acceptance"
+    # Locate each criterion's OWN test. This used to be ``written[0]``, line
+    # 0, for every criterion — the first suite file in the batch, whichever
+    # story it belonged to — so the diagnostic pointed at the wrong file and
+    # no test, and a proved contradiction built on it could not name its side.
     out: list[dict[str, Any]] = []
     for o in attributable:
+        test_path, line = _locate_ac_test(o.ac_key, written)
         out.append({
             "file": test_path,
-            "line": 0,
+            "line": line,
             "severity": "error",
             "error_code": "ACCEPTANCE_GAP",
             "message": (
@@ -675,6 +717,24 @@ def _acceptance_diagnostics(
             ),
         })
     return out
+
+
+def _locate_ac_test(ac_key: str, written: list[str]) -> tuple[str, int]:
+    """``(file, def_line)`` of the generated test verifying ``ac_key``."""
+    story = ac_key.rsplit(".AC", 1)[0]
+    fname = f"test_{story.lower().replace('-', '_')}_acceptance.py"
+    candidates = [p for p in written if os.path.basename(p) == fname] or list(written)
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        for key, first, _last in ag.verifies_by_function(src).values():
+            if key == ac_key:
+                # The def sits on the line after its @verifies marker.
+                return path, first + 1
+    return (candidates[0] if candidates else "tests/acceptance"), 0
 
 
 # ---------------------------------------------------------------------------

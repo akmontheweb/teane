@@ -50,6 +50,10 @@ STATUS_ATTRIBUTABLE = "attributable"
 STATUS_DEFERRED_DEP = "deferred:blocked-by-dependency"
 STATUS_DEFERRED_COLLECTION = "deferred:collection-error"
 STATUS_DEFERRED_UI = "deferred:needs-browser"
+# A criterion about the repository or process (CI scanning, deployment,
+# documentation) rather than the running app: no in-process or browser test
+# can prove it, and one that tries ends up asserting files exist.
+STATUS_DEFERRED_NOT_RUNTIME = "deferred:not-runtime"
 STATUS_TEST_BUG = "test-bug"
 
 # The statuses that mean "not verified, but not this batch's fault" — parked,
@@ -66,7 +70,7 @@ STATUS_TEST_BUG = "test-bug"
 # was merely under-provisioned.
 _DEFERRED = frozenset({
     STATUS_DEFERRED_DEP, STATUS_DEFERRED_COLLECTION,
-    STATUS_DEFERRED_UI, STATUS_TEST_BUG,
+    STATUS_DEFERRED_UI, STATUS_DEFERRED_NOT_RUNTIME, STATUS_TEST_BUG,
 })
 
 
@@ -424,7 +428,8 @@ def summarize(result: AcceptanceRunResult) -> dict[str, Any]:
 
 __all__ = [
     "STATUS_PASSED", "STATUS_ATTRIBUTABLE", "STATUS_DEFERRED_DEP",
-    "STATUS_DEFERRED_COLLECTION", "STATUS_DEFERRED_UI", "STATUS_TEST_BUG",
+    "STATUS_DEFERRED_COLLECTION", "STATUS_DEFERRED_UI",
+    "STATUS_DEFERRED_NOT_RUNTIME", "STATUS_TEST_BUG",
     "AcceptanceCollectionError",
     "TestOutcome", "ACOutcome", "AcceptanceRunResult", "AcceptanceRunner",
     "classify_acceptance_failure", "select_runnable", "run_acceptance", "summarize",

@@ -55,7 +55,14 @@ _ALTITUDES = frozenset({ALTITUDE_INTEGRATION, ALTITUDE_E2E})
 
 CLASS_BACKEND = "backend-verifiable"
 CLASS_UI = "ui-only"
-_CLASSES = frozenset({CLASS_BACKEND, CLASS_UI})
+# The repository or process, not the running app: "Given the project runs CI,
+# dependency scanning fails on high vulnerabilities". lumina-run24-20260929-2327
+# had only the two classes above, so that criterion became an integration test
+# reading .github/workflows/ci.yml from the working directory. Repair may not
+# write .github/, so it created a three-line pyproject.toml holding the string
+# the test looked for, and broke the app's editable install.
+CLASS_NOT_RUNTIME = "not-runtime"
+_CLASSES = frozenset({CLASS_BACKEND, CLASS_UI, CLASS_NOT_RUNTIME})
 
 # Config defaults — every cap is config-driven (see config/config.json
 # ``acceptance``); these are the fall-throughs when a key is absent.
@@ -152,6 +159,10 @@ class StoryAcceptanceContext:
     other until the run died).
     """
 
+    scenario_feedback: dict[str, list[str]] = field(default_factory=dict)
+    """AC key → why earlier scenarios for it were ruled wrong
+    (:func:`load_scenario_feedback`). Shown on every later generation of that
+    criterion, so a rewrite is not undone by the next pass's fresh one."""
     db_tables: dict[str, list[str]] = field(default_factory=dict)
     """Real table name → column definitions, read off the code
     (:func:`discover_db_tables`). What ``client.seed`` inserts into: the
@@ -198,6 +209,9 @@ class AcceptanceGenResult:
     dropped: list[dict[str, str]] = field(default_factory=list)
     """Rejected candidates: ``{"verifies": ..., "altitude": ..., "reason": ...}``."""
     source: str = "llm"    # "llm" | "fallback"
+    not_runtime: dict[str, str] = field(default_factory=dict)
+    """AC key → the model's rationale, for criteria classified not-runtime.
+    They have no scenarios, so this is the only place the verdict survives."""
 
     def integration(self) -> list[AcceptanceScenario]:
         return [s for s in self.scenarios if s.altitude == ALTITUDE_INTEGRATION]
@@ -248,6 +262,12 @@ scenarios:
 - classification "ui-only": the criterion is about rendered UI/interaction that \
   cannot be proven from the API alone (a modal opens, a toast appears, focus \
   moves). Emit ONLY an "e2e" scenario; set "integration" to null.
+- classification "not-runtime": the criterion is about the repository or the \
+  delivery process, not the running application — CI runs a scanner, a \
+  deployment step, a dependency policy, documentation. Neither the API nor \
+  a browser can prove it, and a test that reads config files from disk is \
+  not an acceptance test. Set BOTH "integration" and "e2e" to null and say \
+  in "rationale" what would verify it.
 
 Hard requirements — a scenario with any of these is useless and will be rejected:
 - Every scenario MUST contain at least one SUBSTANTIVE assertion tied to the \
@@ -280,7 +300,7 @@ Return STRICT JSON, no prose, no markdown fences, exactly:
   "scenarios": [
     {
       "verifies": "STORY-001.AC-3",
-      "classification": "backend-verifiable" | "ui-only",
+      "classification": "backend-verifiable" | "ui-only" | "not-runtime",
       "rationale": "one sentence on what is checked / why this classification",
       "integration": { "name": "test_...", "body": "<pytest body, no def line>" } | null,
       "e2e": { "name": "human readable", "body": "<playwright body, no test() line>" }
@@ -411,6 +431,17 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
             "asserts the same schema, so a body key you guess at will "
             "contradict it and no production change can satisfy both.",
         ]
+    _fb = {k: v for k, v in ctx.scenario_feedback.items() if k in ctx.ac_keys() and v}
+    if _fb:
+        parts += [
+            "",
+            "## Earlier scenarios for these criteria were ruled WRONG",
+            "Each note says what a previous scenario for the criterion did "
+            "and why it could not be right. Write the scenario differently; "
+            "repeating it reproduces the same failure.",
+        ]
+        for key in sorted(_fb):
+            parts += [f"- {key}:"] + [f"  * {note}" for note in _fb[key]]
     if ctx.db_tables:
         table_lines = "\n".join(
             f"- {name}({', '.join(cols)})"
@@ -518,7 +549,28 @@ async def generate_acceptance_scenarios(
         budget_remaining_usd=new_budget,
         dropped=dropped,
         source="llm",
+        not_runtime=_not_runtime_acs(data, ctx),
     )
+
+
+def _not_runtime_acs(data: Any, ctx: StoryAcceptanceContext) -> dict[str, str]:
+    """AC key → rationale for every criterion the model classified not-runtime.
+
+    Read off the raw objects, not the scenarios: a not-runtime criterion has
+    none, so ``_parse_candidates`` never sees it.
+    """
+    known = ctx.ac_keys()
+    out: dict[str, str] = {}
+    scen = data.get("scenarios") if isinstance(data, dict) else None
+    for obj in scen if isinstance(scen, list) else []:
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("classification", "")).strip() != CLASS_NOT_RUNTIME:
+            continue
+        key = str(obj.get("verifies", "")).strip()
+        if key and (not known or key in known):
+            out[key] = str(obj.get("rationale", "")).strip()
+    return out
 
 
 def _resolve_altitudes(config: dict[str, Any]) -> frozenset[str]:
@@ -600,6 +652,9 @@ def validate_scenarios(
             continue
         if known and sc.verifies not in known:
             drop(sc, f"verifies {sc.verifies!r} not an AC of {ctx.story_key}")
+            continue
+        if sc.classification == CLASS_NOT_RUNTIME:
+            drop(sc, "not-runtime criterion has no runtime scenario")
             continue
         # ui-only criteria have no integration altitude by construction.
         if sc.classification == CLASS_UI and sc.altitude == ALTITUDE_INTEGRATION:
@@ -770,6 +825,96 @@ def render_integration_file(story_key: str, scenarios: list[AcceptanceScenario])
         lines.append("")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+SCENARIO_FEEDBACK_FILE = "scenario_feedback.json"
+
+
+def load_scenario_feedback(suite_dir: str) -> dict[str, list[str]]:
+    """AC key → notes on scenarios ruled wrong, from the suite directory.
+
+    Kept beside the generated suite (like ``seed.json``) because it describes
+    that suite, and so it outlives node_state, HITL resets and batch
+    boundaries — a criterion from a sealed batch can be ruled wrong batches
+    later, and its next generation must still see why.
+    """
+    try:
+        with open(os.path.join(suite_dir, SCENARIO_FEEDBACK_FILE),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return {
+        str(k): [str(n) for n in v if n]
+        for k, v in (data.items() if isinstance(data, dict) else [])
+        if isinstance(v, list)
+    }
+
+
+def record_scenario_feedback(
+    suite_dir: str, ac_key: str, note: str, *, keep: int = 3,
+) -> None:
+    """Append ``note`` to ``ac_key``'s feedback (last ``keep`` notes kept)."""
+    data = load_scenario_feedback(suite_dir)
+    notes = [n for n in data.get(ac_key, []) if n != note] + [note]
+    data[ac_key] = notes[-keep:]
+    os.makedirs(suite_dir, exist_ok=True)
+    with open(os.path.join(suite_dir, SCENARIO_FEEDBACK_FILE), "w",
+              encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+
+
+def verifies_by_function(source: str) -> dict[str, tuple[str, int, int]]:
+    """Function name → ``(ac_key, first_line, last_line)`` for a generated suite.
+
+    ``first_line`` is the ``# @verifies:`` marker's 1-indexed line, so a
+    span covers marker and function together.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    lines = source.splitlines()
+    out: dict[str, tuple[str, int, int]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        above = lines[first - 2] if first >= 2 else ""
+        m = re.match(r"\s*#\s*@verifies:\s*(\S+)", above)
+        if m:
+            out[node.name] = (m.group(1), first - 1, node.end_lineno or node.lineno)
+    return out
+
+
+def splice_integration_scenarios(
+    source: str, replacements: dict[str, Optional[AcceptanceScenario]],
+) -> str:
+    """Replace the test verifying each AC key in ``source`` with its new
+    scenario, or delete it when the replacement is None.
+
+    Every other test in the file is left byte-for-byte alone: they verify
+    other criteria, some already passed and sealed.
+    """
+    lines = source.splitlines()
+    spans = sorted(
+        (span for span in verifies_by_function(source).values()
+         if span[0] in replacements),
+        key=lambda sp: sp[1], reverse=True,
+    )
+    for ac_key, first, last in spans:
+        sc = replacements[ac_key]
+        new = [] if sc is None else [
+            f"# @verifies: {sc.verifies}",
+            f"def {integration_function_name(sc)}(client):",
+            *_indent_body(sc.body).splitlines(),
+        ]
+        lines[first - 1:last] = new
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}(?=# @verifies:)", "\n\n\n", text)
+    return text.rstrip("\n") + "\n"
 
 
 def render_e2e_spec(story_key: str, scenarios: list[AcceptanceScenario]) -> str:
@@ -1244,6 +1389,51 @@ def _story_criteria_text(
         if nl != -1:
             body = body[nl + 1:]
     return body.strip()[:max_chars]
+
+
+def criterion_as_specified(
+    workspace_path: str, ac_key: str, *, max_chars: int = 1500,
+) -> str:
+    """One criterion's Given/When/Then as the specification states it, or "".
+
+    The story's criteria section holds every scenario; this cuts out the one
+    whose title is ``ac_key``'s stored text, falling back to the N-th
+    ``Scenario:`` block for ``…AC-N``. For a reader that must judge a single
+    criterion — the reflection judge weighing two criteria a proved
+    contradiction sets against each other — rather than write a whole story.
+    """
+    story_key = ac_key.rsplit(".AC", 1)[0]
+    body = _story_criteria_text(workspace_path, story_key, max_chars=50000)
+    if not body:
+        return ""
+    title = ""
+    try:
+        from harness import story_state as sst
+        conn = sst.open_story_db(workspace_path=workspace_path)
+        try:
+            row = sst.get_ac_by_key(
+                conn, sst.app_name_for_workspace(workspace_path), ac_key)
+        finally:
+            conn.close()
+        title = str((row or {}).get("text") or "").strip()
+    except Exception as exc:  # noqa: BLE001 — best-effort lookup
+        logger.debug("[acceptance_gen] AC title unavailable: %s", exc)
+    lines = body.splitlines()
+    starts = [i for i, ln in enumerate(lines) if "scenario:" in ln.lower()]
+    if not starts:
+        return ""
+    pick = None
+    if title:
+        pick = next((i for i in starts if title.lower() in lines[i].lower()), None)
+    if pick is None:
+        m = re.search(r"\.AC-(\d+)$", ac_key)
+        n = int(m.group(1)) if m else 0
+        if 1 <= n <= len(starts):
+            pick = starts[n - 1]
+    if pick is None:
+        return ""
+    end = next((i for i in starts if i > pick), len(lines))
+    return "\n".join(lines[pick:end]).strip()[:max_chars]
 
 
 def _cross_cutting_rules(
@@ -1944,8 +2134,12 @@ def gather_story_acceptance_context(
     *,
     stack: Optional[dict[str, Any]] = None,
     excerpt_chars: int = 6000,
+    suite_dir: Optional[str] = None,
 ) -> Optional[StoryAcceptanceContext]:
     """Assemble the :class:`StoryAcceptanceContext` for one story.
+
+    ``suite_dir`` is the generated suite's directory; when given, notes on
+    scenarios earlier ruled wrong (:func:`load_scenario_feedback`) are loaded.
 
     Pulls the story + AC prose from the shared story DB, discovers routes, and
     reads data-model / architecture excerpts. Returns None when the story can't
@@ -1991,6 +2185,7 @@ def gather_story_acceptance_context(
             **discover_response_models(workspace_path),
         },
         db_tables=discover_db_tables(workspace_path),
+        scenario_feedback=load_scenario_feedback(suite_dir) if suite_dir else {},
         cross_cutting_rules=_cross_cutting_rules(workspace_path),
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
         architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),
@@ -2263,6 +2458,7 @@ def gather_seed_context(
 
 __all__ = [
     "ALTITUDE_INTEGRATION", "ALTITUDE_E2E", "CLASS_BACKEND", "CLASS_UI",
+    "CLASS_NOT_RUNTIME",
     "StoryAcceptanceContext", "AcceptanceScenario", "AcceptanceGenResult",
     "generate_acceptance_scenarios", "fallback_acceptance_scenarios",
     "validate_scenarios", "build_user_prompt", "build_system_prompt",

@@ -159,12 +159,23 @@ _TEST_BUG_RES = (
     re.compile(r"cannot import name '.*' from"),
     re.compile(r"AttributeError: .* does not have the attribute"),
     re.compile(r"SyntaxError|IndentationError"),
+    # Body-shape mismatch: the test read the response as a shape it is not.
+    # The acceptance client runs with raise_server_exceptions=False, so the app
+    # can only fail through the response — a KeyError/TypeError here was raised
+    # by the test's own subscripting, never by the handler. Only the structural
+    # forms are listed: a string-key KeyError could be a field the app omitted.
+    re.compile(r"^KeyError: -?\d+\b"),  # body[0] on an object
+    re.compile(r"^TypeError: (string|list|tuple) indices must be integers"),
+    re.compile(r"\bwhere \d+ = len\(\{"),  # len(body) of an object, as a list
 )
 
 # Attributable — the app responded and behaved wrong. A plain assertion mismatch
 # on a received response is the class the repair loop is good at.
 _ATTRIBUTABLE_RES = (
     re.compile(r"\bAssertionError\b"),
+    # pytest prints the "AssertionError: " prefix only when a "where" clause
+    # follows; a bare compared-values failure starts at "assert".
+    re.compile(r"^assert\b"),
     re.compile(r"\bassert\b.*\b(status_code|response|json)\b"),
     re.compile(r"\b(500|502|503)\b"),  # server error on a route that DID respond
 )
@@ -177,7 +188,7 @@ def classify_acceptance_failure(message: str) -> str:
     attributable, because a 404/import-error can co-occur with an assertion in
     the same traceback and must not be mistaken for a real code defect.
     """
-    m = message or ""
+    m = (message or "").strip()
     for rx in _DEP_BLOCKED_RES:
         if rx.search(m):
             return STATUS_DEFERRED_DEP

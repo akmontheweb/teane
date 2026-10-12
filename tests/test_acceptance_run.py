@@ -53,6 +53,39 @@ class TestClassify:
     def test_empty_defaults_to_deferred(self):
         assert ar.classify_acceptance_failure("") == STATUS_DEFERRED_DEP
 
+    # Messages below are verbatim pytest 9.1 E-lines (-rA --tb=short), as
+    # _extract_failure_messages joins them.
+
+    def test_bare_assert_is_attributable(self):
+        # pytest omits "AssertionError: " when no where-clause follows — a wrong
+        # days_left must still reach repair, not be deferred as unknown.
+        assert ar.classify_acceptance_failure("assert 1 == 0") == STATUS_ATTRIBUTABLE
+
+    def test_bare_assert_on_404_stays_dependency_blocked(self):
+        msg = "assert 404 == 201 +  where 404 = <Response [404 Not Found]>.status_code"
+        assert ar.classify_acceptance_failure(msg) == STATUS_DEFERRED_DEP
+
+    def test_indexing_an_envelope_as_a_list_is_test_bug(self):
+        # lumina run 11: body[0]['first_name'] against {"birthdays": [...], ...}
+        assert ar.classify_acceptance_failure("KeyError: 0") == STATUS_TEST_BUG
+
+    def test_iterating_an_envelope_as_a_list_is_test_bug(self):
+        msg = "TypeError: string indices must be integers, not 'str'"
+        assert ar.classify_acceptance_failure(msg) == STATUS_TEST_BUG
+
+    def test_len_of_an_envelope_is_test_bug_not_attributable(self):
+        msg = ("AssertionError: assert 4 == 1 +  where 4 = len({'birthdays': "
+               "[{'first_name': 'Alice', 'days_left': 1}], 'total': 1, 'limit': 50, 'offset': 0})")
+        assert ar.classify_acceptance_failure(msg) == STATUS_TEST_BUG
+
+    def test_len_of_a_list_stays_attributable(self):
+        msg = "AssertionError: assert 2 == 1 +  where 2 = len([{'first_name': 'Alice'}, {'first_name': 'Bob'}])"
+        assert ar.classify_acceptance_failure(msg) == STATUS_ATTRIBUTABLE
+
+    def test_string_key_error_stays_deferred(self):
+        # Could be a field the app omitted, not a shape the test invented.
+        assert ar.classify_acceptance_failure("KeyError: 'items'") == STATUS_DEFERRED_DEP
+
     def test_dep_wins_over_assertion_when_both_present(self):
         # A 404 assertion must NOT be mistaken for an attributable code defect.
         msg = "AssertionError: assert 404 == 201"

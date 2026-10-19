@@ -231,6 +231,47 @@ class TestUnsatOfferFloor:
                 declined, floor=0, verdict_says_distraction=True,
             ) is None
 
+    def test_distraction_with_real_patches_accumulates(self):
+        """The exact live condition from lumina 01a15406 (2026-10-19).
+
+        Observed in that run at 18:34:31 and 18:37:53: the declined counter
+        incremented on rounds where ``consecutive_zero_patch_rounds == 0``,
+        i.e. real patches HAD landed, while the judge called the round
+        DISTRACTION. Under the old ``any_real_patch`` gate those rounds popped
+        the counter, so it could never reach the floor. With the gate fixed
+        the third such round forced the escape and routed to test
+        regeneration, which rebuilt the criterion and went green — the
+        recovery 01a15308 spent five auto-resumes failing to reach.
+        """
+        declined: dict[str, int] = {}
+        forced = None
+        for _ in range(3):
+            forced = graph._apply_unsat_offer_floor(
+                declined, self.OFFER,
+                # Real patches landed, and the judge still says the round
+                # did not touch the blocker.
+                any_real_patch=True,
+                verdict_says_distraction=True,
+                already_declared=False,
+                floor=3,
+            )
+        assert forced is not None, (
+            "three distraction rounds that each landed a patch must still "
+            "reach the floor"
+        )
+        assert forced[0] == "server/tests/test_main.py"
+
+    def test_progress_round_between_distractions_resets(self):
+        # The conservative half: a round the judge calls PROGRESS still
+        # clears the counter, so an intermittently-working loop is never
+        # pushed toward regenerating a test that may be correct.
+        declined: dict[str, int] = {}
+        self._floor(declined, verdict_says_distraction=True)
+        self._floor(declined, verdict_says_distraction=True)
+        assert declined.get("server/tests/test_main.py") == 2
+        self._floor(declined, verdict_says_distraction=False)
+        assert "server/tests/test_main.py" not in declined
+
     def test_asserted_correct_counts_double(self):
         declined: dict[str, int] = {}
         assert self._floor(

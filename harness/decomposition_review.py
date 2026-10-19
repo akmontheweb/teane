@@ -597,7 +597,20 @@ async def remediate_acceptance_criteria(
 # ---------------------------------------------------------------------------
 
 
-def render_review_doc(findings: list[dict[str, Any]], story_count: int) -> str:
+def render_review_doc(
+    findings: list[dict[str, Any]],
+    story_count: int,
+    remediated: int = 0,
+) -> str:
+    """Render the review doc.
+
+    ``findings`` is the PRE-remediation list, which is what an operator needs
+    to see — it is the reviewer's verdict on the decomposition as authored.
+    ``remediated`` is stated alongside it so the doc does not read as though
+    criteria the harness already rewrote are still outstanding: on lumina
+    01a15406 the doc listed 10 ac_quality findings whose criteria had in fact
+    been rewritten in place before any test was generated.
+    """
     lines = [
         "# Decomposition Quality Review (ADR-0007)",
         "",
@@ -605,6 +618,17 @@ def render_review_doc(findings: list[dict[str, Any]], story_count: int) -> str:
         f"{len(findings)} finding(s).",
         "",
     ]
+    if remediated:
+        lines += [
+            f"**{remediated} acceptance criterion/criteria were rewritten in "
+            "place by Phase-2 auto-remediation after this review ran "
+            "(`decomposition.quality_remediate`).** The findings below are the "
+            "reviewer's verdict on the decomposition *as authored*; the "
+            "criteria for `ac_quality` / `rewrite_ac` rows have since been "
+            "replaced with testable wording in the story DB, which is what "
+            "test generation reads.",
+            "",
+        ]
     if not findings:
         lines.append("No quality findings — decomposition is well-formed.")
         return "\n".join(lines) + "\n"
@@ -718,12 +742,36 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
                 except Exception:  # noqa: BLE001
                     pass
     node_state["decomposition_acs_remediated"] = remediated
+    # Log the outcome EITHER WAY. The count previously went only onto
+    # node_state, so a remediation pass that rewrote nothing was
+    # indistinguishable in the logs from one that rewrote ten criteria — and
+    # that opacity is why the empty-intersection filter bug survived a live
+    # validation (lumina 01a15308: enabled, entered, rewrote nothing, logged
+    # nothing). A pass with eligible targets that rewrites none of them is a
+    # defect worth seeing, so it warns.
+    if remediate:
+        _eligible = len(_remediable_findings(findings, remediable_severities))
+        if remediated:
+            logger.info(
+                "[decomposition_review] remediation rewrote %d acceptance "
+                "criterion/criteria (%d finding(s) were eligible).",
+                remediated, _eligible,
+            )
+        elif _eligible:
+            logger.warning(
+                "[decomposition_review] remediation had %d eligible "
+                "finding(s) but rewrote nothing — the criteria reached code "
+                "generation unchanged. Check the severity filter "
+                "(decomposition.remediable_severities = %s) and the "
+                "[NFR:...] ownership guard.",
+                _eligible, list(remediable_severities),
+            )
 
     try:
         doc_path = os.path.join(workspace_path, "docs", "DECOMPOSITION_REVIEW.md")
         os.makedirs(os.path.dirname(doc_path), exist_ok=True)
         with open(doc_path, "w", encoding="utf-8") as fh:
-            fh.write(render_review_doc(findings, len(stories)))
+            fh.write(render_review_doc(findings, len(stories), remediated))
     except OSError as exc:
         logger.debug("[decomposition_review] could not write review doc: %s", exc)
 

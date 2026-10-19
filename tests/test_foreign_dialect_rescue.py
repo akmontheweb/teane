@@ -83,8 +83,10 @@ class TestWhatMustNotBeTranslated:
     def test_a_read_is_a_host_round_trip_not_a_patch(self):
         # read_file has its own resolver path; turning it into a patch block
         # would apply an edit the model never asked for.
-        text = ('<invoke name="read_file">'
-                '<parameter name="file_path">a.py</parameter></invoke>')
+        # The raw form this covers, for reference:
+        #   <invoke name="read_file">
+        #     <parameter name="file_path">a.py</parameter>
+        #   </invoke>
         blocks, untranslated = invocations_to_patch_blocks(
             # unmapped_invocations already routes read_file away; pass the
             # raw invocation to prove the translator refuses it too.

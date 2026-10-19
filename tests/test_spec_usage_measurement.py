@@ -9,8 +9,6 @@ shared vocabulary, and must never break a dispatch.
 
 from __future__ import annotations
 
-import pytest
-
 from harness import spec_usage
 from harness.spec_usage import (
     build_index,

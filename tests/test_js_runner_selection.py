@@ -198,12 +198,35 @@ class TestStackTestCommand:
             "(cd web && npx --no-install vitest run)"
         )
 
-    def test_no_js_package_falls_back_to_the_static_entry(self, tmp_path):
-        # A .test.ts with no package.json anywhere — nothing to scope to.
+    def test_no_js_package_reports_no_runner(self, tmp_path):
+        """A .test.ts with no package.json anywhere — nothing to scope to.
+
+        This used to fall back to the static ``npx --no-install jest
+        --silent`` entry, which is the command this module's resolver exists
+        to replace: with no package.json it cannot run, exits 1 in ~0.6s with
+        no diagnostics, gets synthesised into a ``<test_runner>``
+        TEST_FAILURE, and is triaged ``code_gap`` — so the repair LLM is sent
+        to fix application code because a package manager was never set up.
+        lumina 01a15406 (2026-10-19) hit exactly that at 17:39:14, in the
+        window after the patcher wrote its first .tsx and before
+        client/package.json landed.
+
+        With a workspace in hand "no runner" is an established fact, so the
+        caller should take its "tests written but unverified" path rather
+        than run something that cannot resolve.
+        """
         (tmp_path / "a.test.ts").write_text("")
         assert _stack_test_command(
             "typescript", str(tmp_path), ["a.test.ts"],
-        ) == "npx --no-install jest --silent"
+        ) is None
+
+    def test_workspaceless_js_call_keeps_the_static_entry(self):
+        # Without a workspace we cannot establish that no package exists, and
+        # back-compat callers rely on getting a command. Distinct from the
+        # case above, where the resolver actually looked.
+        assert _stack_test_command("typescript") == (
+            "npx --no-install jest --silent"
+        )
 
     def test_non_js_stacks_are_untouched(self, tmp_path):
         assert _stack_test_command("java", str(tmp_path), []) == "mvn -q test"

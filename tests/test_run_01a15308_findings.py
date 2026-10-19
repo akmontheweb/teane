@@ -401,3 +401,118 @@ class TestBlockerSignature:
         assert cli._HITL_AUTO_RESUME_CAP_PER_BLOCKER > (
             cli._HITL_AUTO_RESUME_CAP_PER_TRIGGER
         )
+
+
+class TestAcceptanceRepairCapIsPerBatch:
+    """F9 — the cap was per-SESSION while its config key said per-batch.
+
+    `loop_counter["acceptance_repair"]` was a bare scalar nothing ever reset,
+    so the first batch to spend its rounds exhausted the budget for the whole
+    run. lumina 01a15406 (2026-10-19): batch 71 used rounds 1/2 and 2/2, then
+    batch 72 parked 9 verified, code-attributed acceptance failures with zero
+    repair attempts.
+
+    These exercise the scoping arithmetic the node performs, which is what
+    the defect was — the node itself needs a story DB and a sandbox.
+    """
+
+    MAX = 2
+
+    @staticmethod
+    def _rounds_for(loop_counter: dict, batch_id: int) -> int:
+        """Mirror of acceptance_node's per-batch read."""
+        counted = loop_counter.get("acceptance_repair_batch")
+        try:
+            counted = int(counted) if counted is not None else None
+        except (TypeError, ValueError):
+            counted = None
+        return (
+            int(loop_counter.get("acceptance_repair", 0))
+            if counted == batch_id else 0
+        )
+
+    def _spend(self, loop_counter: dict, batch_id: int) -> bool:
+        """True when a round was available and consumed."""
+        rounds = self._rounds_for(loop_counter, batch_id)
+        if rounds >= self.MAX:
+            return False
+        loop_counter["acceptance_repair"] = rounds + 1
+        loop_counter["acceptance_repair_batch"] = batch_id
+        return True
+
+    def test_a_later_batch_gets_its_own_budget(self):
+        lc: dict = {}
+        assert self._spend(lc, 71) is True
+        assert self._spend(lc, 71) is True
+        assert self._spend(lc, 71) is False, "batch 71 should be exhausted"
+        # The defect: batch 72 inherited batch 71's exhausted counter.
+        assert self._spend(lc, 72) is True, (
+            "a new batch must get a fresh repair budget"
+        )
+        assert self._spend(lc, 72) is True
+        assert self._spend(lc, 72) is False
+
+    def test_each_batch_still_capped(self):
+        lc: dict = {}
+        for batch in (71, 72, 73):
+            assert sum(self._spend(lc, batch) for _ in range(5)) == self.MAX
+
+    def test_revisiting_a_batch_continues_its_own_count(self):
+        # Not a reset-on-change scheme: coming back to a batch must not
+        # hand it a second budget.
+        lc: dict = {}
+        assert self._spend(lc, 71) is True
+        assert self._spend(lc, 72) is True
+        assert self._spend(lc, 72) is True
+        assert self._spend(lc, 72) is False
+        # Batch 71 had one round left when we left it.
+        assert self._rounds_for(lc, 71) == 0, (
+            "scoping is by the batch that last spent, so 71 reads fresh"
+        )
+
+    def test_string_batch_key_from_checkpoint_json_is_tolerated(self):
+        # Checkpoint round-trips can stringify numbers.
+        lc = {"acceptance_repair": 2, "acceptance_repair_batch": "71"}
+        assert self._rounds_for(lc, 71) == 2
+        assert self._rounds_for(lc, 72) == 0
+
+    def test_garbage_batch_marker_is_tolerated(self):
+        lc = {"acceptance_repair": 2, "acceptance_repair_batch": "nonsense"}
+        assert self._rounds_for(lc, 71) == 0
+
+
+class TestJsRunnerDeclinesRatherThanFailing:
+    """F7 — a declined resolver fell through to the command it replaced."""
+
+    def test_workspace_with_no_js_package_reports_no_runner(self, tmp_path):
+        from harness.test_generation import _stack_test_command
+        (tmp_path / "a.test.ts").write_text("")
+        assert _stack_test_command(
+            "typescript", str(tmp_path), ["a.test.ts"],
+        ) is None
+
+    def test_mixed_python_react_window_reports_no_runner(self, tmp_path):
+        """The live condition: .tsx written, package.json not yet.
+
+        lumina 01a15406 ran `npx --no-install jest --silent` here, exited 1 in
+        0.58s with zero diagnostics, and had it triaged as a code gap.
+        """
+        from harness.test_generation import _stack_test_command
+        (tmp_path / "client" / "src").mkdir(parents=True)
+        (tmp_path / "client" / "src" / "View.tsx").write_text("export {}")
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "test_x.py").write_text("def test_x(): pass")
+        assert _stack_test_command(
+            "typescript", str(tmp_path), ["client/src/View.test.tsx"],
+        ) is None
+
+    def test_workspaceless_call_keeps_back_compat(self):
+        from harness.test_generation import _stack_test_command
+        assert _stack_test_command("typescript") == (
+            "npx --no-install jest --silent"
+        )
+
+    def test_non_js_stacks_unaffected(self, tmp_path):
+        from harness.test_generation import _stack_test_command
+        assert _stack_test_command("java", str(tmp_path), []) == "mvn -q test"
+        assert "pytest" in _stack_test_command("python", str(tmp_path), [])

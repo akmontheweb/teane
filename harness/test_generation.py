@@ -1336,6 +1336,30 @@ def _stack_test_command(
         resolved = _js_test_command(workspace_path, generated_tests or [])
         if resolved:
             return resolved
+        # Resolver declined: it inspected this workspace and found no JS
+        # package owning any generated test. Falling through to the static
+        # entry here reinstated the exact command c3a5a07 was written to
+        # delete — ``npx --no-install jest --silent``, which with no
+        # package.json cannot run and exits 1 in ~0.6s with no diagnostics.
+        # The node then synthesises a <test_runner> TEST_FAILURE from the
+        # tail and the router triages it ``code_gap``, so the repair LLM is
+        # asked to fix application code because a package manager was never
+        # set up. lumina 01a15406 (2026-10-19) did exactly that at 17:39:14,
+        # in the window after the patcher wrote its first .tsx and before
+        # client/package.json landed.
+        #
+        # With a workspace in hand, "no runner" is a fact we established, so
+        # report it and let the caller take its "tests written but
+        # unverified" path. The workspace-less call form below keeps the
+        # static entry: without a workspace we cannot know, and back-compat
+        # callers rely on getting a command.
+        logger.info(
+            "[test_generation] stack=%s but no JS package in %s owns any "
+            "generated test — no deterministic runner. Reporting none rather "
+            "than running a jest that cannot resolve.",
+            primary, workspace_path,
+        )
+        return None
     return _STACK_TEST_COMMANDS.get(primary)
 
 

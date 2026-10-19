@@ -55,8 +55,29 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     batch_id = int(state.get("current_batch_id") or 0)
     budget = float(state.get("budget_remaining_usd", 0.0) or 0.0)
     loop_counter = dict(state.get("loop_counter") or {})
-    repair_rounds = int(loop_counter.get("acceptance_repair", 0))
     max_repair = int(cfg.get("max_repair_rounds_per_batch", 2))
+    # The budget is PER BATCH, as the config key and this module's docstring
+    # both say — so the counter has to be scoped to the batch that spent it.
+    # It was a bare session-wide scalar that nothing ever reset, so the first
+    # batch to use its two rounds exhausted the budget for the whole run and
+    # every later batch parked its attributable failures without a single
+    # repair attempt. lumina 01a15406 (2026-10-19): batch 71 used rounds 1/2
+    # and 2/2, then batch 72 parked 9 verified, code-attributed failures with
+    # zero attempts and batch 73 would have done the same.
+    #
+    # Scoped by remembering which batch the count belongs to rather than by
+    # making the counter a dict: the scalar survives checkpoint JSON
+    # round-trips unchanged, and a batch revisit correctly continues its own
+    # count instead of starting over.
+    _counted_batch = loop_counter.get("acceptance_repair_batch")
+    try:
+        _counted_batch = int(_counted_batch) if _counted_batch is not None else None
+    except (TypeError, ValueError):
+        _counted_batch = None
+    repair_rounds = (
+        int(loop_counter.get("acceptance_repair", 0))
+        if _counted_batch == batch_id else 0
+    )
     scenario_source = str(cfg.get("scenario_source", "fallback"))
     integ_dir_rel = str(cfg.get("integration_dir", "tests/acceptance"))
 
@@ -173,6 +194,7 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
         diags = list(state.get("compiler_errors") or [])
         diags.extend(_acceptance_diagnostics(attributable, written))
         loop_counter["acceptance_repair"] = repair_rounds + 1
+        loop_counter["acceptance_repair_batch"] = batch_id
         logger.info(
             "[acceptance] %d attributable failure(s) → repair (round %d/%d)",
             len(attributable), repair_rounds + 1, max_repair,
@@ -187,8 +209,10 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     if attributable:
         # Over cap → park as a defect and proceed (complete_with_blocks territory).
         logger.warning(
-            "[acceptance] %d attributable failure(s) exceed cap %d — parking as "
-            "deferred defects and proceeding.", len(attributable), max_repair,
+            "[acceptance] %d attributable failure(s) remain after %d/%d repair "
+            "round(s) for batch %s — parking as deferred defects and "
+            "proceeding.",
+            len(attributable), repair_rounds, max_repair, batch_id,
         )
         _park_over_cap(workspace, app_name, attributable)
 

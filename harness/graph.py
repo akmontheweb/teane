@@ -7849,8 +7849,9 @@ def _apply_unsat_offer_floor(
     logger.warning(
         "[repair_node] UNSATISFIABLE_TEST offer declined %d time(s) on %s "
         "without addressing the blocker. Taking the escape on the model's "
-        "behalf and routing to test regeneration — further production "
-        "rounds cannot satisfy this assertion.",
+        "behalf — further production rounds cannot satisfy this assertion. "
+        "The router will regenerate the test if it is still failing, or log "
+        "the declaration as stale and continue the loop if it is not.",
         count, worst,
     )
     declined.pop(worst, None)

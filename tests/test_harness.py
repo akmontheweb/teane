@@ -4927,13 +4927,37 @@ class TestToolchainAdaptation:
         ):
             assert _toolchain_image_for(cmd) == BUILDER_IMAGE
 
-    def test_docker_backend_default_image_is_builder_image(self):
+    def test_docker_backend_default_image_is_builder_image(self, monkeypatch):
         # The sandbox's default flows through DockerBackend's ``image``
-        # arg, which now defaults to BUILDER_IMAGE. So when the operator
+        # arg, which defaults to BUILDER_IMAGE. So when the operator
         # doesn't pin docker_image, the kitchen-sink is used automatically.
+        #
+        # ``__init__`` now runs the image through ``resolve_builder_image``,
+        # which degrades an unresolvable digest pin to the fallback tag
+        # (lumina 01a15308: the pinned digest was absent locally and every
+        # ``docker run`` exited 125 in ~4s with no diagnostics). Stub the
+        # probe so this asserts the wiring rather than the machine's image
+        # store.
+        from harness import sandbox as _sb
         from harness.sandbox import BUILDER_IMAGE, DockerBackend
+        monkeypatch.setattr(
+            _sb, "_image_resolves_locally", lambda img, *a, **k: True,
+        )
         backend = DockerBackend()
         assert backend.image == BUILDER_IMAGE
+
+    def test_docker_backend_degrades_an_unresolvable_pin(self, monkeypatch):
+        # Whatever the machine can resolve, an unpinned backend must still
+        # end up on a harness-builder reference — never some other image.
+        from harness import sandbox as _sb
+        from harness.sandbox import BUILDER_IMAGE_FALLBACK_TAG, DockerBackend
+        monkeypatch.setattr(
+            _sb, "_image_resolves_locally",
+            lambda img, *a, **k: img == BUILDER_IMAGE_FALLBACK_TAG,
+        )
+        backend = DockerBackend()
+        assert backend.image == BUILDER_IMAGE_FALLBACK_TAG
+        assert backend.image.startswith("harness-builder")
 
     def test_image_was_adapted_is_permanently_false(self):
         # The image-swap branch of _apply_toolchain_adaptation is retired —

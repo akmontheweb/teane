@@ -6147,14 +6147,55 @@ def _build_command_writes_root_fs(build_command: str) -> bool:
     :meth:`DockerBackend._default_user_mode_env`), so those land under
     ``$HOME/.local`` regardless of a read-only root.
     """
+    return _root_fs_write_reason(build_command) is not None
+
+
+# ``--system`` as a standalone flag, NOT the ``--system-site-packages`` venv
+# flag it is a prefix of. ``uv venv --system-site-packages`` creates a venv
+# under the tmpfs-writable path and touches nothing on the read-only root;
+# matching it as a system install dropped ``--read-only`` on every greenfield
+# Python build (lumina 01a15308, 2026-10-19 — the seeded Python build command
+# contains both ``--system-site-packages`` and ``uv pip install``, so the old
+# substring test matched on every compile). The flag must also sit inside the
+# same shell segment as the install verb: ``--system`` belonging to some other
+# tool in a later ``&&`` clause says nothing about where pip writes.
+_SYSTEM_INSTALL_RE = re.compile(
+    r"(?:uv pip install|uv pip|pip install)[^&|;]*?(?<!-)--system(?![-\w])"
+)
+
+_GLOBAL_NPM_TOKENS: tuple[str, ...] = (
+    "npm install -g", "npm install --global", "npm i -g",
+)
+
+
+def _root_fs_write_reason(build_command: str) -> Optional[str]:
+    """Why ``build_command`` needs a writable root FS, or ``None``.
+
+    Same three cases as :func:`_build_command_writes_root_fs` — which is now a
+    thin wrapper over this — but it returns the branch that fired so callers
+    can log the real reason. The three ``read_only_root`` adaptation log sites
+    previously hard-coded the ``npm install -g`` explanation regardless of
+    which branch matched, so an operator debugging a pip-only build was told
+    the command ran ``npm install -g`` when it contained no npm at all.
+    """
     if _command_is_make(build_command):
-        return True
+        return (
+            "runs a `make` target, whose recipe installs into the managed "
+            "interpreter at /opt/uv-python on the container's root FS"
+        )
     cmd = re.sub(r"\s+", " ", build_command.strip().lower())
-    if "--system" in cmd and ("pip install" in cmd or "uv pip" in cmd):
-        return True
-    return any(token in cmd for token in (
-        "npm install -g", "npm install --global", "npm i -g",
-    ))
+    if _SYSTEM_INSTALL_RE.search(cmd):
+        return (
+            "runs a `--system` pip/uv install, which writes to the "
+            "interpreter's site-packages on the container's root FS"
+        )
+    for token in _GLOBAL_NPM_TOKENS:
+        if token in cmd:
+            return (
+                f"runs `{token}`, which writes to "
+                "/usr/local/lib/node_modules on the container's root FS"
+            )
+    return None
 
 
 # Patterns that mean the build container is missing a required runtime
@@ -7734,6 +7775,7 @@ def _apply_unsat_offer_floor(
     already_declared: bool,
     floor: int,
     asserted_correct: bool = False,
+    verdict_says_distraction: bool = False,
 ) -> Optional[tuple[str, str]]:
     """Count declined ``UNSATISFIABLE_TEST`` offers and, at the floor, take
     the escape on the model's behalf.
@@ -7754,16 +7796,31 @@ def _apply_unsat_offer_floor(
 
     ``declined`` is mutated in place (it lives in ``loop_counter``).
 
-    Only rounds that landed NO real patch count toward the floor, and a
-    round that DID land one clears the counters: production moving means
-    the loop is working, not stuck. ``floor <= 0`` disables the mechanism.
+    Only rounds that made no progress count toward the floor, and a round
+    that DID progress clears the counters. "Progress" is a real patch that
+    the reflection judge did not call DISTRACTION/REGRESSION — see
+    ``progressed_this_round``. The original test was ``any_real_patch``
+    alone, on the reasoning that production moving means the loop is
+    working; a distraction loop is precisely the case where production
+    moves and the loop is NOT working, so that test cleared the counter
+    every round and the floor was unreachable. On lumina 01a15308
+    (2026-10-19) the escape was offered 4 times across 2 files, the
+    declined map stayed ``{}`` throughout, and the run died on the HITL
+    auto-resume cap — the same ending this mechanism was written to
+    prevent. ``floor <= 0`` disables the mechanism.
 
     ``asserted_correct`` marks a round in which the model re-emitted a
     production file byte-for-byte after being told the patch changed
     nothing (see Layer 5 in ``repair_node``). That is the same claim as the
     escape itself, made without the keyword, so it counts double.
     """
-    if any_real_patch:
+    # A patch only clears the floor when it was PROGRESS. The reflection
+    # judge calling the round DISTRACTION/REGRESSION is the harness's own
+    # statement that the bytes that moved did not address the blocker, so
+    # letting those bytes reset the counter is what made this mechanism
+    # unreachable in a distraction loop (see the docstring).
+    progressed_this_round = any_real_patch and not verdict_says_distraction
+    if progressed_this_round:
         for path in offer_files:
             declined.pop(path, None)
         return None
@@ -15873,9 +15930,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         )
     if ro_root_was_adapted:
         logger.info(
-            "[compiler_node] Adapting sandbox.read_only_root from True to False "
-            "because build command runs `npm install -g`, which writes to "
-            "/usr/local/lib/node_modules on the container's root FS: %s",
+            "[compiler_node] Adapting sandbox.read_only_root from True to "
+            "False because the build command %s: %s",
+            _root_fs_write_reason(build_cmd) or "needs a writable root FS",
             build_cmd,
         )
 
@@ -20788,6 +20845,13 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 set() if _unparsed_this_round else _unsat_offer_files,
                 any_real_patch=_any_real_patch,
                 already_declared=_unsat_declared is not None,
+                # The judge has already ruled on this round by here (the
+                # verdict block runs earlier in repair_node), so a round it
+                # called DISTRACTION/REGRESSION does not get to clear the
+                # declined-offer floor just because some bytes landed.
+                verdict_says_distraction=int(
+                    loop_counter.get("consecutive_distraction_rounds", 0) or 0
+                ) > 0,
                 asserted_correct=bool(
                     loop_counter.get("asserted_correct_round")
                 ),
@@ -30837,9 +30901,9 @@ async def run_graph(
         initial_state["allow_network"] = adapted_allow_network
     if ro_root_was_adapted:
         logger.info(
-            "[run_graph] Pre-flight sandbox.read_only_root=False because build "
-            "command runs `npm install -g`, which writes to "
-            "/usr/local/lib/node_modules on the container's root FS: %s",
+            "[run_graph] Pre-flight sandbox.read_only_root=False because the "
+            "build command %s: %s",
+            _root_fs_write_reason(build_command) or "needs a writable root FS",
             build_command,
         )
     if sandbox_config is not None or image_was_adapted or ro_root_was_adapted:

@@ -143,6 +143,124 @@ BUILDER_IMAGE = (
     "@sha256:2a33e7a71a2ec57f3f3bc51a99bce16fac6b79f0d8d3e95c878a7020c3c6af60"
 )
 
+# Tag to fall back to when the pinned digest above is not present locally.
+# ``name@sha256:<digest>`` only resolves against a repo digest, which a
+# locally-built image that was never pushed to a registry does not have — so
+# on any machine whose ``harness-builder`` predates the last re-pin, every
+# ``docker run`` of BUILDER_IMAGE exits 125 ("invalid reference" / no such
+# image) in a few seconds with no diagnostics. lumina 01a15308 (2026-10-19)
+# lost a build and a 118k-token repair dispatch to exactly that: the digest
+# was re-pinned by 0e82c4f on 2026-08-25, the operator's local image was
+# built weeks earlier, and the failure was triaged as a code gap.
+BUILDER_IMAGE_FALLBACK_TAG = "harness-builder:latest"
+
+
+# ``docker run`` exits 125 when the DAEMON could not start the container at
+# all — unresolvable image reference, bad mount, refused resource limit. It
+# is categorically not a build result: nothing inside the container ran, so
+# there is no code for a repair LLM to fix. 126/127 are deliberately NOT here
+# — those come from the container's own shell (not executable / not found)
+# and are already classified by the env-misconfig patterns in graph.py.
+DOCKER_LAUNCH_FAILURE_EXIT = 125
+
+
+def is_docker_launch_failure(
+    exit_code: Optional[int],
+    diagnostic_count: int = 0,
+) -> bool:
+    """True when a build "failure" is really docker refusing to launch.
+
+    Requires zero parsed diagnostics: a real suite that happens to exit 125
+    while reporting genuine failures is still a build result. lumina 01a15308
+    (2026-10-19) hit the no-diagnostics case — exit 125 in 3.9s from an
+    unresolvable digest pin — and it was triaged ``code_gap=1`` and handed to
+    the repair LLM as a 118k-token dispatch asking it to fix application code
+    for a container that never started.
+    """
+    return int(exit_code or 0) == DOCKER_LAUNCH_FAILURE_EXIT and diagnostic_count <= 0
+
+
+def _image_resolves_locally(image: str, docker_path: str = "docker") -> bool:
+    """True when ``docker`` can resolve ``image`` without pulling.
+
+    Fail-open: an unusable docker binary returns True so this probe can never
+    be the reason a build does not start — the run then fails the way it did
+    before this check existed, with docker's own error.
+    """
+    if not shutil.which(docker_path):
+        return True
+    # Two probes, because they disagree across Docker's image stores. With
+    # the classic store ``image inspect`` exits 0/1 cleanly. With Docker
+    # Desktop's containerd store it has been observed returning 0 and an
+    # empty ``[]`` body for an image that is present, so a second check on
+    # ``images -q`` (which prints an id when the ref resolves and nothing
+    # when it does not, exiting 0 either way) backs it up. Present per either
+    # probe counts as present: a false "absent" on the pin costs only a
+    # fallback to a working tag, while a false "absent" on both would strand
+    # a usable image.
+    for argv, presence in (
+        ([docker_path, "image", "inspect", image], "returncode"),
+        ([docker_path, "images", "-q", image], "stdout"),
+    ):
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, timeout=15, text=True,
+                encoding="utf-8", errors="replace",
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug(
+                "[sandbox] image-resolution probe %r failed (%s); assuming "
+                "resolvable.", argv[1:3], exc,
+            )
+            return True
+        if presence == "returncode":
+            if proc.returncode == 0 and (proc.stdout or "").strip() not in ("", "[]"):
+                return True
+        elif (proc.stdout or "").strip():
+            return True
+    return False
+
+
+def resolve_builder_image(
+    image: str = BUILDER_IMAGE,
+    docker_path: str = "docker",
+    fallback_tag: str = BUILDER_IMAGE_FALLBACK_TAG,
+) -> str:
+    """``image`` if docker can resolve it, else ``fallback_tag`` if it can.
+
+    Only digest-pinned ``harness-builder`` references are rewritten. An
+    operator who pointed the sandbox at some other image gets it verbatim:
+    silently swapping a project's own image for the harness builder would be
+    far worse than the 125 this function exists to prevent.
+
+    Keeping the digest pin is deliberate — it is what makes every operator run
+    bit-for-bit the same toolchain. This only stops an *unresolvable* pin from
+    presenting as a code defect. Rebuild and re-pin per the recipe above to
+    get the pinned image back.
+    """
+    img = (image or "").strip()
+    if "@sha256:" not in img or not img.lower().startswith("harness-builder"):
+        return image
+    if _image_resolves_locally(img, docker_path):
+        return img
+    if not _image_resolves_locally(fallback_tag, docker_path):
+        logger.error(
+            "[sandbox] Pinned builder image %s is not present locally and "
+            "neither is the fallback tag %s. `docker run` will fail; rebuild "
+            "the image per the recipe in harness/sandbox.py and re-pin.",
+            img, fallback_tag,
+        )
+        return img
+    logger.warning(
+        "[sandbox] Pinned builder image %s does not resolve locally (a "
+        "locally-built image has no repo digest unless it was pushed), so "
+        "`docker run` would exit 125 with no diagnostics. Falling back to %s. "
+        "Rebuild + re-pin per the recipe in harness/sandbox.py to restore the "
+        "pinned toolchain.",
+        img, fallback_tag,
+    )
+    return fallback_tag
+
 
 # ---------------------------------------------------------------------------
 # 1. Types
@@ -554,7 +672,12 @@ class DockerBackend(SandboxBackend):
         cache_volumes_session_id: Optional[str] = None,
         cache_volumes_prefix: str = "harness",
     ):
-        self.image = image
+        # Resolve a digest-pinned builder image against what docker can
+        # actually see. An unresolvable pin would exit 125 in ~4s with zero
+        # diagnostics, which the compiler path then triages as a code gap and
+        # hands to the repair LLM (lumina 01a15308). Done here rather than at
+        # the call sites so every backend construction is covered.
+        self.image = resolve_builder_image(image, docker_path)
         self.memory_limit = memory_limit
         self.cpu_limit = cpu_limit
         self.pids_limit = pids_limit

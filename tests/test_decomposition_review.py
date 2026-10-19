@@ -296,16 +296,36 @@ def _finding_rewrite(story_key: str, sev: str = "high") -> dict:
 
 
 class TestRemediableSelection:
-    """Only high-severity AC rewrites qualify. Structural recommendations
-    would reshape the decomposition and invalidate story keys downstream
-    nodes have already committed to."""
+    """AC rewrites at any configured severity qualify. Structural
+    recommendations would reshape the decomposition and invalidate story keys
+    downstream nodes have already committed to, so they never do.
+
+    This used to require ``high`` as well, which made the selection empty in
+    practice: the reviewer prompt gives the model no rubric tying ``high`` to
+    a dimension, and it reserves ``high`` for the structural dimensions that
+    are excluded here. lumina 01a15308 (2026-10-19) produced 9
+    ac_quality/medium rewrite_ac findings and 8 high findings that were all
+    structural, so remediation ran and rewrote nothing. See
+    ``dr._REMEDIABLE_SEVERITIES_DEFAULT``.
+    """
 
     def test_high_ac_quality_rewrite_qualifies(self):
         assert dr._remediable_findings([_finding_rewrite("STORY-001")])
 
-    def test_medium_does_not_qualify(self):
-        assert not dr._remediable_findings(
+    def test_medium_ac_quality_rewrite_qualifies(self):
+        # The severity the reviewer actually assigns to AC-wording problems.
+        assert dr._remediable_findings(
             [_finding_rewrite("STORY-001", sev="medium")]
+        )
+
+    def test_medium_can_still_be_excluded_by_config(self):
+        assert not dr._remediable_findings(
+            [_finding_rewrite("STORY-001", sev="medium")], ("high",)
+        )
+
+    def test_low_does_not_qualify_by_default(self):
+        assert not dr._remediable_findings(
+            [_finding_rewrite("STORY-001", sev="low")]
         )
 
     @pytest.mark.parametrize("dim,action", [

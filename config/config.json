@@ -68,7 +68,7 @@
     "hitl": {
         "requirement": false,
         "architecture": false,
-        "repair": true,
+        "repair": false,
         "deployment": true,
         "layout_divergence": true
     },
@@ -401,7 +401,8 @@
         "quality_review": true,
         "quality_enforce": false,
         "quality_remediate": true,
-        "max_stories_per_review": 60
+        "max_stories_per_review": 60,
+        "remediable_severities": ["high", "medium"]
     },
     "traceability": {
         "enforce": true

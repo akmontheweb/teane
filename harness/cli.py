@@ -1051,6 +1051,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # quality_enforce. Phase-2 auto-remediation keys land with that phase.
     "decomposition": frozenset({
         "quality_review", "quality_enforce", "max_stories_per_review",
+        # Which ac_quality severities Phase-2 remediation rewrites.
+        "remediable_severities",
         # Phase-2 bounded AC remediation (ADR-0007).
         "quality_remediate",
     }),
@@ -1327,6 +1329,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # caps for headless-mode HITL loop. See ``_HITL_AUTO_RESUME_CAP``
         # / ``_HITL_AUTO_RESUME_CAP_PER_TRIGGER`` at module top.
         "auto_resume_cap", "auto_resume_cap_per_trigger",
+        "auto_resume_cap_per_blocker",
     }),
     # Agile tuning knobs. batch_size = max stories per dependency batch;
     # commit_on_story = git-commit after each green story; repair_cap =
@@ -1390,6 +1393,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "hitl.layout_divergence": (bool,),
     "hitl.auto_resume_cap": (int,),
     "hitl.auto_resume_cap_per_trigger": (int,),
+    "hitl.auto_resume_cap_per_blocker": (int,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -1500,6 +1504,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "decomposition.quality_enforce": (bool,),
     "decomposition.quality_remediate": (bool,),
     "decomposition.max_stories_per_review": (int,),
+    "decomposition.remediable_severities": (list,),
     # End-of-run traceability gate. See installation_doc_node.
     "traceability.enforce": (bool,),
     "traceability.enforce_reqs": (bool,),
@@ -2865,6 +2870,49 @@ MAX_GATEKEEPER_REFINES = 5
 # failures — this per-trigger cap prevents that shape. Operators can
 # override via ``state['hitl_auto_resume_cap_per_trigger']``.
 _HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
+
+# Ceiling on auto-resumes attributable to the SAME blocker, across every
+# trigger class. The per-trigger cap stops one failure CLASS monopolising the
+# pool, but a single root cause routinely presents as several classes —
+# lumina 01a15308 (2026-10-19) tripped zero_patch_loop, then
+# reflection_distraction_loop, then persistent_build_failure, all from the
+# same two failing test locations, and so drew on three separate 3-resume
+# budgets before the session cap could bite. Keying on the blocker itself
+# closes that: the pathology gets one budget however it presents.
+_HITL_AUTO_RESUME_CAP_PER_BLOCKER = 4
+
+# How many diagnostic locations form the signature. Enough to distinguish
+# genuinely different failures, few enough that one diagnostic
+# appearing/disappearing at the tail doesn't mint a "new" blocker and reset
+# the count.
+_BLOCKER_SIGNATURE_LOCATIONS = 3
+
+
+def _blocker_signature(state: dict[str, Any]) -> str:
+    """Stable identity for what is currently blocking the build.
+
+    The sorted ``file:line`` set of the current diagnostics, truncated to
+    :data:`_BLOCKER_SIGNATURE_LOCATIONS`. Returns ``""`` when there are no
+    diagnostics to key on, which disables per-blocker accounting for that
+    trip rather than lumping unrelated failures under one empty key.
+    """
+    errors = state.get("compiler_errors") or []
+    locs: set[str] = set()
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        f = str(err.get("file") or "").strip()
+        if not f:
+            continue
+        line = err.get("line")
+        try:
+            line_s = str(int(line)) if line is not None else "?"
+        except (TypeError, ValueError):
+            line_s = "?"
+        locs.add(f"{f}:{line_s}")
+    if not locs:
+        return ""
+    return "|".join(sorted(locs)[:_BLOCKER_SIGNATURE_LOCATIONS])
 
 # Per-session cap on consecutive headless HITL auto-resumes for
 # loop-stuck triggers (repair_loop_limit, persistent_build_failure,
@@ -4698,9 +4746,33 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 # auto-resume pool.
                 _trigger_class = trigger.split(":", 1)[0].strip() or trigger
                 _trigger_taken = int(_per_trigger.get(_trigger_class, 0) or 0)
+                # Per-blocker accounting, orthogonal to the class cap: the
+                # same root cause presenting under three trigger classes
+                # used to draw three class budgets (see
+                # _HITL_AUTO_RESUME_CAP_PER_BLOCKER).
+                _cap_per_blocker = int(
+                    state.get("hitl_auto_resume_cap_per_blocker")
+                    or _hitl_config.get("auto_resume_cap_per_blocker")
+                    or _HITL_AUTO_RESUME_CAP_PER_BLOCKER
+                )
+                _blocker_sig = _blocker_signature(state)
+                _per_blocker_raw = _lc_for_cap.get(
+                    "hitl_auto_resumes_per_blocker"
+                )
+                _per_blocker: dict[str, int] = (
+                    dict(_per_blocker_raw)
+                    if isinstance(_per_blocker_raw, dict) else {}
+                )
+                _blocker_taken = (
+                    int(_per_blocker.get(_blocker_sig, 0) or 0)
+                    if _blocker_sig else 0
+                )
                 _session_cap_hit = _resumes_taken >= _cap
                 _trigger_cap_hit = _trigger_taken >= _cap_per_trigger
-                if _session_cap_hit or _trigger_cap_hit:
+                _blocker_cap_hit = bool(_blocker_sig) and (
+                    _blocker_taken >= _cap_per_blocker
+                )
+                if _session_cap_hit or _trigger_cap_hit or _blocker_cap_hit:
                     # Direct-abandon: bypass the ``[q]`` handler's
                     # confirmation prompt. In headless mode the confirm
                     # channel returns False by default, so falling through
@@ -4709,12 +4781,19 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     # ``while True:`` iteration — a tight loop that spams
                     # this WARNING millions of times per second (session
                     # cec4d124 hit 18M repetitions in ~10 minutes).
-                    _cap_reason = (
-                        f"session cap {_resumes_taken}/{_cap}"
-                        if _session_cap_hit else
-                        f"per-trigger cap {_trigger_taken}/"
-                        f"{_cap_per_trigger} for '{_trigger_class}'"
-                    )
+                    if _session_cap_hit:
+                        _cap_reason = f"session cap {_resumes_taken}/{_cap}"
+                    elif _trigger_cap_hit:
+                        _cap_reason = (
+                            f"per-trigger cap {_trigger_taken}/"
+                            f"{_cap_per_trigger} for '{_trigger_class}'"
+                        )
+                    else:
+                        _cap_reason = (
+                            f"per-blocker cap {_blocker_taken}/"
+                            f"{_cap_per_blocker} for '{_blocker_sig}' "
+                            "(same blocker across every trigger class)"
+                        )
                     logger.warning(
                         "[HITL] Auto-resume cap reached (%s) in headless "
                         "mode — terminating instead of looping. No "
@@ -4819,13 +4898,25 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         _per_trigger.get(_trigger_class, 0) or 0
                     ) + 1
                     _lc_for_cap["hitl_auto_resumes_per_trigger"] = _per_trigger
+                    if _blocker_sig:
+                        _per_blocker[_blocker_sig] = int(
+                            _per_blocker.get(_blocker_sig, 0) or 0
+                        ) + 1
+                        _lc_for_cap["hitl_auto_resumes_per_blocker"] = (
+                            _per_blocker
+                        )
                     logger.info(
                         "[HITL] Repair menu auto-resumed "
                         "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE "
                         "/ no TTY). Auto-resume %d/%d for this session "
-                        "(trigger '%s' → class '%s' cumulative: %d/%d).",
+                        "(trigger '%s' → class '%s' cumulative: %d/%d; "
+                        "blocker '%s' cumulative: %d/%d).",
                         _resumes_taken + 1, _cap, trigger, _trigger_class,
                         _per_trigger[_trigger_class], _cap_per_trigger,
+                        _blocker_sig or "<none>",
+                        int(_per_blocker.get(_blocker_sig, 0) or 0)
+                        if _blocker_sig else 0,
+                        _cap_per_blocker,
                     )
         else:
             # Structured envelope for remote UIs (the dashboard's HITL
@@ -5873,6 +5964,59 @@ updated SPEC_REQUIREMENTS.md document."""
 
     logger.info("[requirements] SPEC_REQUIREMENTS.md refined (%d chars).", len(content))
     return content
+
+
+# Longest product-goal context handed to the NFR classifier and the spec
+# reviewers. The prompt slices to this, so deriving a goal longer than it is
+# wasted work.
+_USER_GOAL_CONTEXT_CHARS = 400
+
+# Lines the product-spec consolidator adds around the operator's own text
+# (:func:`_load_consolidated_product_spec`). They carry no product intent, so
+# a goal derived from the consolidated spec must skip them or the model gets
+# 400 characters of file manifest.
+_CONSOLIDATION_NOISE = (
+    "# product specification (consolidated",
+    "source files:",
+)
+
+
+def _derive_user_goal(
+    explicit_prompt: Optional[str],
+    consolidated_spec: Optional[str],
+    *,
+    limit: int = _USER_GOAL_CONTEXT_CHARS,
+) -> str:
+    """The product goal to hand downstream LLM calls as context.
+
+    ``--prompt`` wins when the operator typed one. When they did not — the
+    normal path, since the spec arrives as files in ``product_spec_dir`` —
+    fall back to the consolidated spec's own prose instead of sending an
+    empty context. lumina 01a15308 (2026-10-19) shipped
+    ``Product goal (context): `` with nothing after it to the ADR-0004 NFR
+    classifier on every dispatch, because ``args.prompt`` is ``None`` whenever
+    the spec comes from files.
+
+    Markdown headings, horizontal rules and the consolidator's own file
+    manifest are skipped: the first ``limit`` characters must be product
+    intent, not a list of filenames.
+    """
+    if explicit_prompt and explicit_prompt.strip():
+        return explicit_prompt.strip()[:limit]
+    if not consolidated_spec:
+        return ""
+    kept: list[str] = []
+    for raw in consolidated_spec.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "---", "===", "-  ", "- ", "* ", "|")):
+            continue
+        low = line.lower()
+        if any(low.startswith(n) for n in _CONSOLIDATION_NOISE):
+            continue
+        kept.append(line)
+        if sum(len(k) + 1 for k in kept) >= limit:
+            break
+    return " ".join(kept)[:limit]
 
 
 async def _llm_classify_ambiguous_nfrs(
@@ -8039,7 +8183,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
                         "REQUIREMENTS",
                         gateway=gateway,
                         budget_remaining_usd=budget_usd,
-                        user_goal=args.prompt or "",
+                        user_goal=_derive_user_goal(
+                            getattr(args, "prompt", None),
+                            preloaded_consolidated_spec,
+                        ),
                         llm_dispatch_config=config.get("llm_dispatch", {}),
                         original_product_spec=_orig_product_spec,
                     )
@@ -8074,7 +8221,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # constraint NFRs. Gated + non-fatal; no-op when the flag is off.
             budget_usd = await _classify_and_tag_nfrs_in_spec(
                 spec_path, gateway, config, budget_usd,
-                user_goal=args.prompt or "",
+                user_goal=_derive_user_goal(
+                    getattr(args, "prompt", None),
+                    preloaded_consolidated_spec,
+                ),
             )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
             _raw_reviewed_spec = await interactive_review_loop(
@@ -8133,7 +8283,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
                                 "ARCHITECTURE",
                                 gateway=gateway,
                                 budget_remaining_usd=budget_usd,
-                                user_goal=args.prompt or "",
+                                user_goal=_derive_user_goal(
+                                    getattr(args, "prompt", None),
+                                    preloaded_consolidated_spec,
+                                ),
                                 llm_dispatch_config=config.get("llm_dispatch", {}),
                             )
                             if arch_review_result["ok"] and arch_review_result.get("review_path"):

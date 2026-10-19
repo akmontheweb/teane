@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from typing import Any
 
 logger = logging.getLogger("harness.decomposition_review")
@@ -395,19 +396,43 @@ Return ONLY a JSON array (no prose, no code fence):
 """
 
 
-def _remediable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The subset this pass will act on: high-severity AC-quality findings
-    whose recommended action is a rewrite.
+# Severities that qualify an ``ac_quality`` finding for rewriting, widest
+# first. The reviewer prompt lets the model pick a severity freely and gives
+# it no rubric tying ``high`` to any dimension; in practice it reserves
+# ``high`` for the STRUCTURAL dimensions (right_sizing / overlap /
+# dependency) and rates AC-wording problems ``medium``. The enforce gate
+# agrees with that reading — it blocks only on HIGH, "the provable/structural
+# ones". So requiring ``high`` AND ``ac_quality`` asked for an intersection
+# the design's own severity semantics make empty: on lumina 01a15308
+# (2026-10-19) the reviewer emitted 9 ac_quality/medium rewrite_ac findings
+# and 8 high findings that were all structural, so Phase-2 remediation was
+# enabled, entered, and silently rewrote nothing.
+_REMEDIABLE_SEVERITIES_DEFAULT: tuple[str, ...] = ("high", "medium")
+
+
+def _remediable_findings(
+    findings: list[dict[str, Any]],
+    severities: Sequence[str] = _REMEDIABLE_SEVERITIES_DEFAULT,
+) -> list[dict[str, Any]]:
+    """The subset this pass will act on: AC-quality findings whose recommended
+    action is a rewrite, at any severity in ``severities``.
 
     Structural recommendations (split / merge / resize / add_dependency)
     are deliberately excluded — acting on those would reshape the
     decomposition, which is the operator's call and would invalidate the
-    story keys downstream nodes have already committed to.
+    story keys downstream nodes have already committed to. That exclusion is
+    why the severity filter cannot also demand ``high``: the two together
+    admit nothing (see :data:`_REMEDIABLE_SEVERITIES_DEFAULT`).
+
+    ``low`` is excluded by default: rewriting a criterion the reviewer itself
+    called cosmetic spends a dispatch to churn text. Operators who want it can
+    widen ``decomposition.remediable_severities``.
     """
+    allowed = {str(sev).strip().lower() for sev in severities if str(sev).strip()}
     return [
         f for f in findings
         if f.get("dimension") == "ac_quality"
-        and f.get("severity") == "high"
+        and str(f.get("severity", "")).strip().lower() in allowed
         and f.get("suggested_action") == "rewrite_ac"
         and f.get("remediable", True)
     ]
@@ -428,6 +453,7 @@ async def remediate_acceptance_criteria(
     stories: list[dict[str, Any]],
     findings: list[dict[str, Any]],
     budget: float,
+    severities: Sequence[str] = _REMEDIABLE_SEVERITIES_DEFAULT,
 ) -> tuple[int, float]:
     """Rewrite flagged acceptance criteria in place. Returns (count, budget).
 
@@ -435,7 +461,7 @@ async def remediate_acceptance_criteria(
     """
     from harness import story_state
 
-    targets = _remediable_findings(findings)
+    targets = _remediable_findings(findings, severities)
     if not targets:
         return 0, budget
     flagged_keys = {f.get("story_key") for f in targets}
@@ -620,6 +646,16 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
     # leave on: it rewrites flagged criterion TEXT in place, preserving row
     # ids, ordinals and AC counts, so traceability is untouched.
     remediate = bool(cfg.get("quality_remediate", True))
+    # Which ac_quality severities remediation will rewrite. Config-driven so
+    # an operator can narrow it to ("high",) or widen it to include "low"
+    # without a code change; the default admits high+medium because demanding
+    # ``high`` alone matches nothing (see _REMEDIABLE_SEVERITIES_DEFAULT).
+    _sev_raw = cfg.get("remediable_severities")
+    remediable_severities: Sequence[str] = (
+        tuple(str(x) for x in _sev_raw)
+        if isinstance(_sev_raw, (list, tuple)) and _sev_raw
+        else _REMEDIABLE_SEVERITIES_DEFAULT
+    )
     max_stories = int(cfg.get("max_stories_per_review", 60))
     workspace_path = state.get("workspace_path") or os.getcwd()
 
@@ -668,6 +704,7 @@ async def decomposition_quality_review_node(state: dict[str, Any]) -> dict[str, 
             try:
                 remediated, budget = await remediate_acceptance_criteria(
                     gateway, conn, app, stories, findings, budget,
+                    remediable_severities,
                 )
                 out["budget_remaining_usd"] = budget
             except Exception as exc:  # noqa: BLE001 — never break the build

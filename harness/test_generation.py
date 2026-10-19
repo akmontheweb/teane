@@ -3309,7 +3309,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 — telemetry must not block
             pass
 
-    from harness.sandbox import SandboxExecutor
+    from harness.sandbox import SandboxExecutor, is_docker_launch_failure
     sandbox_cfg = dict(state.get("sandbox_config", {}) or {})
     allow_network = bool(state.get("allow_network", False))
 
@@ -3325,7 +3325,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # installed → exit 127 in 0.2s, and the LLM gets routed to a wasted
     # repair iteration with a spurious "test failure". compiler_node does
     # the same adaptation via _toolchain_image_for; reuse it here.
-    from harness.graph import _toolchain_image_for, _build_command_writes_root_fs
+    from harness.graph import _toolchain_image_for, _root_fs_write_reason
     desired_image = _toolchain_image_for(test_cmd)
     if desired_image and sandbox_cfg.get("docker_image") != desired_image:
         logger.info(
@@ -3338,12 +3338,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # tmpfs-backed HOME can't cover (/usr/local/lib/node_modules); every
     # other install path (pip/poetry/uv/local npm) lands under $HOME on
     # tmpfs and is compatible with read_only_root=True.
-    if _build_command_writes_root_fs(test_cmd) and sandbox_cfg.get("read_only_root", True):
+    _ro_reason = _root_fs_write_reason(test_cmd)
+    if _ro_reason and sandbox_cfg.get("read_only_root", True):
         logger.info(
             "[test_generation_node] Adapting sandbox.read_only_root to False "
-            "because test command runs `npm install -g`, which writes to "
-            "/usr/local/lib/node_modules on the container's root FS: %s",
-            test_cmd,
+            "because the test command %s: %s",
+            _ro_reason, test_cmd,
         )
         sandbox_cfg["read_only_root"] = False
 
@@ -3422,7 +3422,30 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # --- Failures → flow into the standard repair path ---
     raw_diags = [d.to_dict() for d in build_result.diagnostics]
-    if not raw_diags:
+    if is_docker_launch_failure(build_result.exit_code, len(raw_diags)):
+        # The container never started, so no generated test actually ran.
+        # Framing this as a TEST_FAILURE sends the repair LLM to edit code
+        # for an infrastructure fault (lumina 01a15308). Label it for what
+        # it is so the router escalates instead of burning a repair round.
+        logger.error(
+            "[test_generation_node] docker could not start the container "
+            "(exit=%s, no diagnostics) — infrastructure fault, not a test "
+            "failure. Command: %s. Tail: ...%s",
+            build_result.exit_code, test_cmd,
+            (build_result.raw_output or "")[-800:],
+        )
+        raw_diags = [_synth_diag(
+            file="<sandbox>",
+            message=(
+                f"Docker could not start the build container "
+                f"(exit={build_result.exit_code}); nothing inside it ran, so "
+                "no application or test code is implicated. Check the image "
+                "reference, mounts and resource limits. "
+                f"Tail: ...{(build_result.raw_output or '')[-1500:]}"
+            ),
+            error_code="SANDBOX_LAUNCH_FAILURE",
+        )]
+    elif not raw_diags:
         # No structured parser hit — synthesize one from the tail.
         raw_diags = [_synth_diag(
             file="<test_runner>",

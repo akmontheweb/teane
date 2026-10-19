@@ -1,6 +1,6 @@
 # ADR-0009: Business Specification Gate Before Requirements Synthesis
 
-**Status:** Proposed — implementation not started. Action item 1 is a measurement that decides whether anything after it gets built: this ADR's own premise is unverified, and the mechanism it proposes is the kind that most easily becomes ceremony. Default off when it lands.
+**Status:** Proposed — implementation not started. **Amended 2026-10-19**, the day it was drafted, by the first half of the action-item-1 measurement (lumina session `01a15308`), which **refuted two of the three defects the Context was built on and one claim in the Trade-off Analysis**. One defect class of four survives as systematic. The premise is weaker than drafted and the ADR should not proceed to Phase 1 until the second half of action item 1 (the `--spec-discovery` comparison) is in. Default off if it lands.
 **Date:** 2026-10-19
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0008]] (scoped spec context — the direct, measured cost of adding a third upstream document), [[ADR-0007]] (decomposition-quality review — the consumer for the anti-scope and epic-coverage checks), [[ADR-0006]] (in-build acceptance verification — business KPIs become verifiable thresholds), [[ADR-0004]] (NFR embedding). Builds on the existing docgen gate machinery: `write_spec_node` (`graph.py:26529`), `spec_review_node` (`graph.py:27104`), `_HITL_GATES` (`cli.py:2922`).
@@ -79,6 +79,60 @@ does run it produces the *same* artifact rather than a distinct business one.
   and whether a stated objective reached any Epic, are *provable*. Whether the
   vision is any good is not. This is the [[ADR-0003]]/[[ADR-0005]]/[[ADR-0007]]
   two-tier split applied one altitude up.
+
+### Measured, not assumed (action item 1, first half, lumina `01a15308`)
+
+A fresh `teane build --agile --reuse-specs false` on lumina regenerated
+`SPEC_REQUIREMENTS.md` from a 4,778-char product spec. Scored **after** the
+independent `doc_reviewer` critique and the planning model's revise pass — the
+draft was 37,854 bytes / 14 stories and the revision took it to 59,987 bytes /
+16 stories, adding `## API error handling` and `## Security and authorization`
+sections in response to the critique (3 calls, $0.050, ~9½ min). Scored against
+the three business-level defects found the same morning in lumina's August RSD —
+the evidence this ADR's Context was written from:
+
+| Predicted defect | August RSD | Fresh run `01a15308` | Verdict |
+|---|---|---|---|
+| `EPIC-001` referenced but never defined | 14 refs, 0 definitions | declared at line 5 as `## Epic: EPIC-001` | **did not reproduce** |
+| Hybrid doc shape + self-invented "Vision Statement" §1 | numbered SRS §1–§10 wrapping agile blocks | clean Path A: Epic → 3 Features → 13 + 3 stories | **did not reproduce** |
+| Degenerate MoSCoW | 10/10 "Must Have" | 32 "Must Have", 0 of any other priority | **reproduced (2 for 2)** |
+| Capability-NFR with no measurable threshold ([[ADR-0008]] item 7) | — | `P95 latency under 300 ms over 100 sequential requests` | **did not reproduce** |
+
+**The sharpest item in the Context does not survive.** The dangling `EPIC-001`
+was a one-off, not a systematic prompt failure, which removes the concrete
+anchor for the deterministic BO↔EPIC coverage gate that Decision §3 item 2
+calls the valuable half. One class of four is systematic — degenerate MoSCoW —
+and that one is a *priority-rationale* defect, the cheapest of the four to
+address and the one least dependent on a new document: nothing upstream
+justifies a priority because nothing upstream is asked to.
+
+**The surviving finding survived a reviewer that had the whole document.** The
+critique-and-revise cycle read all 37,854 chars, raised 30 findings across
+completeness, contradictions and ambiguity, and rewrote the spec by +58% — and
+left the priority column uniformly "Must Have" in all 32 places. It was not
+asked to look, and no rubric in `requirements_doc.md`'s eight gates mentions
+priority distribution. That is the shape of a real gap, and it is a one-line
+gate rather than a fourth document (action item 7).
+
+**The doc reviewer already catches part of what §3 item 3 claims is
+uncovered.** On the same artifact, the independent `doc_reviewer` reported *"No
+story covers anniversary/milestone records despite epic scope mentioning
+anniversaries"* — for a product named "Birthday & **Milestone** Tracker". That
+is the orphan-outcome class, detected today by machinery that already exists
+and is already enabled. See the Trade-off Analysis for the narrowed claim that
+survives. Reviewer output on that run was strong generally: 10 completeness
+gaps, 10 contradictions, 10 ambiguities, `dropped_requirements: []`, several
+specific and real (STORY-011 specifies 422 for a malformed file while its own
+Gherkin expects 400/415; STORY-NFR-002 requires auth no other story mentions).
+
+**Caveats on this measurement.** One project, one run, and the input was not the
+August input — the product spec had been rewritten and shortened (4,778 vs
+12,965 chars), so "did not reproduce" may reflect a cleaner input rather than a
+robust pipeline. The requirements prompt itself was unchanged (`requirements_doc.md`
+last modified 2026-07-11, untouched by the intervening 84 commits), so the
+pipeline half is a fair comparison. The second half of action item 1 —
+`--spec-discovery true` on the same input — has not been run, and it is the
+comparison that decides between Option B and Option C.
 
 ## Decision
 
@@ -260,12 +314,17 @@ decomposition altitude, while a dropped outcome is, today, undetectable at any
 altitude. Option B may capture much of the first effect with no new machinery,
 which is precisely why it is measured before anything is built.
 
-The out-of-scope list is the piece with no existing substitute anywhere in the
-chain. `spec_reconciler` owns structural integrity, `semantic_review` owns
-coverage of what was *stated*, and [[ADR-0007]] owns craftsmanship — but no
-mechanism asks whether the system is building something nobody asked for.
-Coverage review cannot find it by construction: unrequested scope is perfectly
-self-consistent.
+The out-of-scope list was drafted as the piece with no existing substitute
+anywhere in the chain. The measurement narrowed that claim and it must be stated
+in its surviving form. `spec_reconciler` owns structural integrity,
+`semantic_review` owns coverage of what was *stated*, and [[ADR-0007]] owns
+craftsmanship — and the `doc_reviewer` turns out to catch **requested scope that
+went missing**, which run `01a15308` demonstrated unprompted. What remains
+genuinely uncovered is the opposite direction: scope that was **invented** —
+built, storied and self-consistent, but never asked for. Coverage review cannot
+find that by construction, because unrequested scope contradicts nothing. That
+is a narrower gap than the ADR was drafted on, and it is one half of a check
+rather than a whole mechanism.
 
 The HITL cost is real and partly offsetting. A fourth gate on a subjective
 artifact cuts against the autonomy north-star, and it is defensible only because
@@ -309,15 +368,18 @@ decomposition.
 
 ## Action Items
 
-1. [ ] **Phase 0 — measure the premise; this gates everything below.** Take
-       lumina's real `product_spec/` plus one or two other inputs. Run the
-       existing pipeline, then run it again with `--spec-discovery true`, and
-       hand-audit both `SPEC_REQUIREMENTS.md` outputs for *business-level*
-       defects specifically: invented scope, dropped/unaddressed outcome,
-       unjustified MoSCoW, absent success metric, Epic boundary around no stated
-       outcome. **If those classes are rare, or if discovery alone closes them,
-       stop and close this ADR as Rejected** — record the finding either way, as
-       [[ADR-0008]] item 2 did.
+1. [~] **Phase 0 — measure the premise; this gates everything below.**
+       **First half done** (lumina `01a15308`, 2026-10-19 — see *Measured, not
+       assumed* above): of four predicted defect classes, three did not
+       reproduce and one did (degenerate MoSCoW). The `EPIC-001` finding that
+       anchored the Context was a one-off, and the `doc_reviewer` was shown to
+       catch dropped requested scope on its own. **Second half outstanding:**
+       `--spec-discovery true` on the same input, which is the comparison that
+       decides between Option B and Option C. Also still worth one more input
+       besides lumina, since a single project cannot separate "robust pipeline"
+       from "clean spec". **On the evidence so far the ADR is closer to Rejected
+       than to Phase 1**, and the surviving defect may not need a new document at
+       all — see item 7.
 2. [ ] **Phase 1 — the gate, advisory, no consumer.** `NodeRole.BUSINESS_ANALYST`,
        `skills/docgen/business_spec.md` with a hard section list, `BUSINESS` gate
        branches in `write_spec_node` / `spec_review_node`, `_HITL_GATES` entry,
@@ -340,3 +402,12 @@ decomposition.
 6. [ ] **Decide the discovery question separately.** Whatever action item 1 shows
        about `--spec-discovery`'s default is a standalone change and should not
        wait on this ADR.
+7. [ ] **Cost the surviving defect on its own terms, before Phase 1.** Degenerate
+       MoSCoW is the one class measured as systematic, and the cheapest fix is
+       almost certainly *not* this ADR: either a [[ADR-0007]] deterministic
+       finding ("every story is the same priority, so priority carries no
+       information") or a `requirements_doc.md` Gate that rejects a uniform
+       priority column. If that closes it, the business document's remaining
+       justification is the invented-scope half of §3 item 3 alone — which is
+       not enough to carry a fourth gate, and this ADR should be closed as
+       Rejected with the cheap fix taken instead.

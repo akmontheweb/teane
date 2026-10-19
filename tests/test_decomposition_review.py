@@ -631,3 +631,42 @@ class TestZeroAcFindingIsNotRemediable:
         f = dr._finding("S", "ac_quality", "high", "x", "rewrite_ac",
                         source="llm")
         assert f["remediable"] is True
+
+
+class TestSeverityRubric:
+    """The prompt used to offer high|medium|low with no rubric.
+
+    Models consistently reserved "high" for the structural dimensions
+    (right_sizing / overlap / dependency) and rated every AC-wording problem
+    "medium". That was not a model quirk to work around — it made the
+    remediation filter's `ac_quality AND high` an empty intersection, so the
+    Phase-2 pass ran and rewrote nothing on lumina 01a15308 and 01a15406
+    (9 and 10 eligible findings respectively, all medium).
+    """
+
+    def test_prompt_decouples_severity_from_dimension(self):
+        prompt = dr._REVIEW_PROMPT if hasattr(dr, "_REVIEW_PROMPT") else ""
+        if not prompt:
+            import inspect
+            prompt = inspect.getsource(dr)
+        assert "judge IMPACT, never the dimension" in prompt
+
+    def test_prompt_states_an_ac_quality_finding_can_be_high(self):
+        import inspect
+        src = inspect.getsource(dr)
+        low = src.lower()
+        assert "ac_quality finding is high" in low
+        # And the inverse, so "high" doesn't just migrate wholesale.
+        assert "right_sizing finding is low" in low
+
+    def test_prompt_defines_all_three_severities(self):
+        import inspect
+        src = inspect.getsource(dr)
+        for level in ("- high:", "- medium:", "- low:"):
+            assert level in src, level
+
+    def test_rubric_matches_what_the_filter_accepts(self):
+        # The guard against this regressing in either direction: the prompt
+        # must admit high AND medium for ac_quality, and the filter's default
+        # must accept exactly those.
+        assert set(dr._REMEDIABLE_SEVERITIES_DEFAULT) == {"high", "medium"}

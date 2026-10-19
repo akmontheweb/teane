@@ -382,6 +382,33 @@ public contracts: signatures, types, error paths, module placement.
 Everything you can't derive from the notes goes under an `ASM-NNN`
 assumption row in §Assumptions and dependencies.
 
+### Gate 9 — Priority must carry information
+
+The `Priority` column in the traceability matrix must **discriminate**. If
+every row reads `Must Have`, the column says nothing and every downstream
+consumer that could use it — batch ordering, scope negotiation, what to cut
+when a build runs long — is left with no signal.
+
+Before emitting, audit the matrix:
+
+- At most **~60%** of rows may be `Must Have`. A Must Have is something the
+  product is *unusable* without, not something desirable.
+- Every requirement not needed for the first usable release is `Should Have`
+  or lower. Convenience, polish, secondary formats, bulk operations,
+  additional filters and export variants are rarely Must Have.
+- If you genuinely cannot justify demoting anything below `Must Have`, the
+  scope is too small to need a matrix — say so in one line under
+  §Assumptions and dependencies rather than marking everything Must Have by
+  default.
+- Priority is about the RELEASE, not about effort or risk. A hard story can
+  be `Could Have`; a trivial one can be `Must Have`.
+
+Rationale: observed on two consecutive lumina builds (2026-10-19) — 10/10
+then 32/32 rows emitted as `Must Have`, in a document that had already been
+critiqued by an independent reviewer and rewritten by 58%. Nothing in Gates
+1–8 asked about priority, so nothing differentiated it, and the column was
+dead weight in both runs.
+
 ---
 
 ## ID numbering convention

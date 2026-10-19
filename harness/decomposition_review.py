@@ -221,9 +221,22 @@ Return ONLY a JSON array (no prose, no code fence). One element per problem foun
 "severity": "high"|"medium"|"low", "problem": "<one sentence>", \
 "suggested_action": "split"|"merge"|"rewrite_ac"|"add_dependency"|"resize"}
 
+SEVERITY — judge IMPACT, never the dimension. Any dimension can be any \
+severity; an ac_quality finding is high when the criterion cannot be \
+implemented or tested as written, and a right_sizing finding is low when a \
+large story is merely inelegant. Without this rule models reserve "high" for \
+the structural dimensions and rate every wording problem "medium", which \
+silently excludes the one class the harness can fix automatically.
+- high:   a reader cannot act on this without guessing. The criterion has no \
+          observable outcome or contradicts another; a story depends on work \
+          no story builds; two stories both claim ownership of one behaviour.
+- medium: actionable but will cost rework. Ambiguous wording with an obvious \
+          intent, a non-atomic criterion, a story that should be split.
+- low:    cosmetic. Phrasing, ordering, naming.
+
 Be specific and strict, but do not invent problems — a clean, well-formed story \
-produces no finding. Prefer high/medium severity only for issues that would cause \
-real downstream churn.
+produces no finding. Do not report "low" unless asked for it; a finding must be \
+worth an engineer's attention.
 """
 
 # Matches either the embedded-AC tag ``[NFR:NFR-002]`` or a bare policy

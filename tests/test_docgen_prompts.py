@@ -210,3 +210,31 @@ def test_get_docgen_prompt_threads_agile_flag_to_requirements():
     # arch_doc carries no placeholder — flag is inert, no leakage.
     arch_prompt = skills._get_docgen_prompt("arch_doc", agile=True)
     assert "{AGILE_MODE_DIRECTIVE}" not in arch_prompt
+
+
+def test_requirements_doc_gate_9_constrains_priority_distribution():
+    """Gate 9 — nothing used to ask about the Priority column.
+
+    Two consecutive lumina builds (2026-10-19) emitted 10/10 then 32/32
+    traceability rows as `Must Have`, the second after an independent
+    reviewer had raised 30 findings and driven a 58% rewrite. Gates 1-8
+    never mentioned priority, so nothing differentiated it and the column
+    carried no information for batch ordering or scope negotiation.
+    """
+    body = docgen_prompts.load("requirements_doc")
+    assert "### Gate 9" in body
+    low = body.lower()
+    assert "must have" in low
+    # A ceiling has to be stated or the gate is unenforceable advice.
+    assert "60%" in body
+    # And it must say priority is about the release, not effort/risk —
+    # otherwise models re-derive "everything is critical".
+    assert "not about effort" in low or "about the release" in low
+
+
+def test_requirements_doc_gates_are_contiguous():
+    """No gaps or duplicates in the gate numbering a reader navigates by."""
+    import re
+    body = docgen_prompts.load("requirements_doc")
+    nums = [int(m) for m in re.findall(r"^### Gate (\d+)", body, re.M)]
+    assert nums == list(range(1, len(nums) + 1)), nums

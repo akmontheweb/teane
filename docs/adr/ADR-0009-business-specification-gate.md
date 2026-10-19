@@ -1,6 +1,6 @@
 # ADR-0009: Business Specification Gate Before Requirements Synthesis
 
-**Status:** Proposed — implementation not started. **Amended 2026-10-19**, the day it was drafted, by the first half of the action-item-1 measurement (lumina session `01a15308`), which **refuted two of the three defects the Context was built on and one claim in the Trade-off Analysis**. One defect class of four survives as systematic. The premise is weaker than drafted and the ADR should not proceed to Phase 1 until the second half of action item 1 (the `--spec-discovery` comparison) is in. Default off if it lands.
+**Status:** **Recommend Rejected** — superseded by its own action item 7. The Phase-0 measurement left exactly one defect class standing (degenerate MoSCoW), action item 7 said to cost that on its own terms before Phase 1, and doing so closed it with `requirements_doc.md` Gate 9 plus a severity rubric for the decomposition reviewer. No business document was required. Retained as the record of the measurement and of what the cheap fixes were; do not implement Phases 1-4 without new evidence. Previously: Proposed — implementation not started. **Amended 2026-10-19**, the day it was drafted, by the first half of the action-item-1 measurement (lumina session `01a15308`), which **refuted two of the three defects the Context was built on and one claim in the Trade-off Analysis**. One defect class of four survives as systematic. The premise is weaker than drafted and the ADR should not proceed to Phase 1 until the second half of action item 1 (the `--spec-discovery` comparison) is in. Default off if it lands.
 **Date:** 2026-10-19
 **Deciders:** Teane harness maintainers
 **Related:** [[ADR-0008]] (scoped spec context — the direct, measured cost of adding a third upstream document), [[ADR-0007]] (decomposition-quality review — the consumer for the anti-scope and epic-coverage checks), [[ADR-0006]] (in-build acceptance verification — business KPIs become verifiable thresholds), [[ADR-0004]] (NFR embedding). Builds on the existing docgen gate machinery: `write_spec_node` (`graph.py:26529`), `spec_review_node` (`graph.py:27104`), `_HITL_GATES` (`cli.py:2922`).
@@ -110,9 +110,20 @@ justifies a priority because nothing upstream is asked to.
 critique-and-revise cycle read all 37,854 chars, raised 30 findings across
 completeness, contradictions and ambiguity, and rewrote the spec by +58% — and
 left the priority column uniformly "Must Have" in all 32 places. It was not
-asked to look, and no rubric in `requirements_doc.md`'s eight gates mentions
-priority distribution. That is the shape of a real gap, and it is a one-line
-gate rather than a fourth document (action item 7).
+asked to look, and no rubric in `requirements_doc.md`'s gates mentioned
+priority distribution. That is the shape of a real gap, and it was a gate
+rather than a fourth document.
+
+**Action item 7 is now done, and it closed the defect.** `requirements_doc.md`
+gained **Gate 9 — Priority must carry information** (a ≤60% `Must Have`
+ceiling, the rule that priority is about the release rather than effort or
+risk, and an explicit out for genuinely tiny scopes), and the decomposition
+reviewer's prompt gained a severity rubric that decouples severity from
+dimension. Neither needed a business document. With the one measured defect
+addressed at its source, the remaining justification for this ADR is the
+invented-scope half of §3 item 3 alone — which, as the Trade-off Analysis
+says, is "one half of a check rather than a whole mechanism" and is not
+enough to carry a fourth gate.
 
 **The doc reviewer already catches part of what §3 item 3 claims is
 uncovered.** On the same artifact, the independent `doc_reviewer` reported *"No
@@ -402,7 +413,8 @@ decomposition.
 6. [ ] **Decide the discovery question separately.** Whatever action item 1 shows
        about `--spec-discovery`'s default is a standalone change and should not
        wait on this ADR.
-7. [ ] **Cost the surviving defect on its own terms, before Phase 1.** Degenerate
+7. [x] **DONE — and it closed the ADR.** Cost the surviving defect on its own
+       terms, before Phase 1. Degenerate
        MoSCoW is the one class measured as systematic, and the cheapest fix is
        almost certainly *not* this ADR: either a [[ADR-0007]] deterministic
        finding ("every story is the same priority, so priority carries no

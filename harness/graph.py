@@ -30150,17 +30150,32 @@ async def _reset_stale_gate_counters_on_resume(
     per_trigger_stale = bool(
         loop_counter.get("hitl_auto_resumes_per_trigger")
     )
-    if not any(before.values()) and not per_trigger_stale:
+    # Same reasoning for the per-BLOCKER dict: it is the third ceiling on the
+    # same auto-resume budget, so leaving it populated while the session and
+    # per-trigger counters are zeroed makes each successive resume weaker than
+    # the last, and eventually caps a build at four blocker-trips no matter how
+    # many times the operator resumes. That defeats the purpose of resume being
+    # the way to finish a long build.
+    per_blocker_stale = bool(
+        loop_counter.get("hitl_auto_resumes_per_blocker")
+    )
+    if (
+        not any(before.values())
+        and not per_trigger_stale
+        and not per_blocker_stale
+    ):
         return
     for k in gate_keys:
         loop_counter[k] = 0
     if per_trigger_stale:
         loop_counter["hitl_auto_resumes_per_trigger"] = {}
+    if per_blocker_stale:
+        loop_counter["hitl_auto_resumes_per_blocker"] = {}
     logger.info(
         "[run_graph] Resume: zeroing stale gate counters %s (per_trigger "
-        "cleared=%s) so the operator's explicit resume gets a fresh "
-        "repair budget. total_repairs preserved.",
-        before, per_trigger_stale,
+        "cleared=%s, per_blocker cleared=%s) so the operator's explicit "
+        "resume gets a fresh repair budget. total_repairs preserved.",
+        before, per_trigger_stale, per_blocker_stale,
     )
     try:
         await compiled_graph.aupdate_state(

@@ -516,3 +516,51 @@ class TestJsRunnerDeclinesRatherThanFailing:
         from harness.test_generation import _stack_test_command
         assert _stack_test_command("java", str(tmp_path), []) == "mvn -q test"
         assert "pytest" in _stack_test_command("python", str(tmp_path), [])
+
+
+class TestResumeClearsEveryAutoResumeCeiling:
+    """All three ceilings on the auto-resume budget must clear on resume.
+
+    `run_graph`'s resume path zeroes `hitl_auto_resumes_taken` and clears
+    `hitl_auto_resumes_per_trigger`, on the stated reasoning that an operator
+    invoking resume IS the manual intervention and the slack exists to bound
+    drain within one run. The per-BLOCKER dict added for finding #6 was not in
+    that list, so it carried across resumes — making each successive resume
+    weaker and eventually capping a build at four blocker-trips however many
+    times the operator resumed. That defeats resume as the way to finish a
+    long build, which is how all three lumina runs were meant to continue.
+    """
+
+    KEYS = (
+        "hitl_auto_resumes_taken",
+        "hitl_auto_resumes_per_trigger",
+        "hitl_auto_resumes_per_blocker",
+    )
+
+    def test_all_three_ceilings_are_handled_in_the_reset_block(self):
+        import inspect
+        from harness import graph
+        src = inspect.getsource(graph)
+        i = src.find("hitl_auto_resumes_taken")
+        assert i > 0
+        # The reset block is small; all three must appear inside it.
+        window = src[i - 3000:i + 3000]
+        for key in self.KEYS:
+            assert key in window, f"{key} missing from the resume reset block"
+
+    def test_per_blocker_is_cleared_not_merely_mentioned(self):
+        import inspect
+        from harness import graph
+        src = inspect.getsource(graph)
+        assert 'loop_counter["hitl_auto_resumes_per_blocker"] = {}' in src
+
+    def test_staleness_check_considers_per_blocker(self):
+        # Otherwise a state whose ONLY populated ceiling is per_blocker
+        # returns early and never clears it.
+        import inspect
+        from harness import graph
+        src = inspect.getsource(graph)
+        assert "per_blocker_stale" in src
+        j = src.find("if (\n        not any(before.values())")
+        assert j > 0, "early-return guard not found in expected form"
+        assert "per_blocker_stale" in src[j:j + 220]

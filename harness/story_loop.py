@@ -940,6 +940,77 @@ def route_after_story_complete(state: dict[str, Any]) -> str:
 # batch_commit_node — per-batch sealing (replaces per-story commit)
 # ---------------------------------------------------------------------------
 
+# Directories that never hold deliverables worth attributing to a batch.
+_RECOVERY_SKIP_DIRS = frozenset({
+    ".git", ".teane", ".harness", "__pycache__", ".pytest_cache",
+    ".hypothesis", ".ruff_cache", ".mypy_cache", "node_modules",
+    ".venv", "venv", "dist", "build", "htmlcov", ".tox", "docs",
+    "product_spec", "change_requests",
+})
+_RECOVERY_SKIP_SUFFIXES = (".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal")
+
+
+def _recover_batch_files(
+    workspace_path: str, conn: Any, batch_id: int,
+) -> list[str]:
+    """Best-effort reconstruction of a batch's modified files from disk.
+
+    ``batch_modified_files`` is session-scoped working state: nodes append to
+    it as they patch and ``batch_commit`` clears it. Nothing restores it on
+    resume — ``cli.py`` never references it. So a batch PATCHED in one process
+    and SEALED in another reaches the seal with an empty list, ``seal_batch``
+    reads that as "no code was produced", and every story in the batch is
+    parked ``blocked`` even though its implementation is on disk.
+
+    lumina 01a15562: batch 75's five CRUD stories were patched during one
+    resume, that resume hit an auto-resume cap, and a later resume sealed the
+    batch. All five were blocked with ``empty_batch_seal`` while
+    ``birthday_service.py`` (22 KB), ``birthdays.py`` (15 KB) and
+    ``birthday_repository.py`` (5 KB) sat in the workspace. Resuming is the
+    designed way to finish a long build and a capped run is nearly always
+    mid-batch, so this blocks a batch almost every time.
+
+    ``batches.started_at`` is durable, so files modified at or after it are a
+    sound lower bound on what the batch touched. Slightly over-inclusive —
+    anything else that wrote to the workspace in the window is caught too —
+    which is the right direction to err: the guard this feeds exists to catch
+    a batch that delivered NOTHING, and a false "empty" costs a whole batch of
+    stories while a false "non-empty" costs some traceability precision.
+    """
+    try:
+        row = conn.execute(
+            "SELECT started_at FROM batches WHERE id = ?", (batch_id,),
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 — recovery must never break a seal
+        logger.debug("[batch_commit] file-recovery query failed: %s", exc)
+        return []
+    started = str((row[0] if row else "") or "")
+    if not started:
+        return []
+    try:
+        from datetime import datetime
+        cutoff = datetime.fromisoformat(
+            started.replace("Z", "+00:00")
+        ).timestamp()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[batch_commit] unparseable started_at %r: %s", started, exc)
+        return []
+    found: list[str] = []
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _RECOVERY_SKIP_DIRS]
+        for fn in files:
+            if fn.startswith(".") or fn.endswith(_RECOVERY_SKIP_SUFFIXES):
+                continue
+            abs_p = os.path.join(root, fn)
+            try:
+                if os.path.getmtime(abs_p) + 1.0 < cutoff:
+                    continue
+            except OSError:
+                continue
+            found.append(os.path.relpath(abs_p, workspace_path))
+    return sorted(found)
+
+
 def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
     """Seal a batch after its verification pipeline has passed.
 
@@ -1037,6 +1108,28 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         # Per-file (path, kind) for traceability attribution. batch_files
         # is a plain list of rel paths from state; classify each so
         # TRACEABILITY.md can split "code" vs "test" vs "doc" columns.
+        # A batch patched in an earlier process arrives here with an empty
+        # list (see _recover_batch_files). Recover from disk rather than
+        # letting seal_batch read the gap as "this batch delivered nothing"
+        # and park every story in it as blocked.
+        if not batch_files:
+            batch_files = _recover_batch_files(workspace_path, conn, batch_id)
+            if batch_files:
+                logger.warning(
+                    "[batch_commit] batch %s had no session-tracked modified "
+                    "files (patched before a resume); recovered %d file(s) "
+                    "from disk via batches.started_at so the batch is not "
+                    "sealed as empty. Traceability attribution for this batch "
+                    "is approximate.",
+                    batch_id, len(batch_files),
+                )
+            else:
+                logger.warning(
+                    "[batch_commit] batch %s has no modified files in state "
+                    "and none recoverable from disk — sealing as an empty "
+                    "batch; its stories will be parked as blocked.",
+                    batch_id,
+                )
         classified_files = [(p, _classify_file(p)) for p in batch_files]
         done_keys, blocked_count = story_state.seal_batch_atomically(
             conn,

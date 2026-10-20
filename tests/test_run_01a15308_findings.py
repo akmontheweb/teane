@@ -621,3 +621,96 @@ class TestResumeClearsEveryAutoResumeCeiling:
         j = src.find("if (\n        not any(before.values())")
         assert j > 0, "early-return guard not found in expected form"
         assert "per_blocker_stale" in src[j:j + 220]
+
+
+class TestEmptyBatchSealAfterResume:
+    """F: a batch patched in one process and sealed in another parked all its
+    stories as blocked, with their implementation sitting on disk.
+
+    ``batch_modified_files`` is session-scoped working state — nodes append as
+    they patch, ``batch_commit`` clears it, and nothing restores it on resume.
+    ``seal_batch`` reads an empty list as "no code was produced" and parks
+    every story in the batch. lumina 01a15562 lost its five CRUD stories
+    (STORY-005..009) that way: patched during one resume, sealed by a later
+    one, blocked with ``empty_batch_seal`` while birthday_service.py (22 KB),
+    birthdays.py (15 KB) and birthday_repository.py (5 KB) were present.
+
+    Resuming is the designed way to finish a long build and a capped run is
+    nearly always mid-batch, so this blocked a batch almost every time.
+    """
+
+    def _db(self, tmp_path):
+        import sqlite3
+        db = tmp_path / "s.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE batches (id INTEGER PRIMARY KEY, started_at TEXT)"
+        )
+        return conn
+
+    def test_recovers_files_modified_since_the_batch_started(self, tmp_path):
+        import os
+        import time
+        from datetime import datetime, timezone
+
+        from harness.story_loop import _recover_batch_files
+        ws = tmp_path / "ws"
+        (ws / "server" / "app").mkdir(parents=True)
+        ancient = ws / "server" / "app" / "ancient.py"
+        ancient.write_text("x")
+        os.utime(ancient, (1_600_000_000, 1_600_000_000))
+        conn = self._db(tmp_path)
+        conn.execute(
+            "INSERT INTO batches (id, started_at) VALUES (?, ?)",
+            (75, datetime.now(timezone.utc).isoformat()),
+        )
+        time.sleep(0.01)
+        (ws / "server" / "app" / "service.py").write_text("def f(): ...")
+        got = _recover_batch_files(str(ws), conn, 75)
+        assert "server/app/service.py" in got
+        assert "server/app/ancient.py" not in got
+
+    def test_skips_noise_directories_and_artefacts(self, tmp_path):
+        from harness.story_loop import _recover_batch_files
+        ws = tmp_path / "ws"
+        for d in ("node_modules", "docs", "__pycache__", ".git"):
+            (ws / d).mkdir(parents=True)
+            (ws / d / "f.py").write_text("x")
+        (ws / "server").mkdir(parents=True)
+        (ws / "server" / "real.py").write_text("x")
+        (ws / "server" / "junk.pyc").write_text("x")
+        (ws / "app.db").write_text("x")
+        conn = self._db(tmp_path)
+        conn.execute(
+            "INSERT INTO batches (id, started_at) VALUES (?, ?)",
+            (1, "1970-01-01T00:00:00+00:00"),
+        )
+        got = _recover_batch_files(str(ws), conn, 1)
+        assert got == ["server/real.py"], got
+
+    def test_unknown_batch_recovers_nothing(self, tmp_path):
+        from harness.story_loop import _recover_batch_files
+        conn = self._db(tmp_path)
+        assert _recover_batch_files(str(tmp_path), conn, 999) == []
+
+    def test_unparseable_started_at_is_tolerated(self, tmp_path):
+        from harness.story_loop import _recover_batch_files
+        conn = self._db(tmp_path)
+        conn.execute(
+            "INSERT INTO batches (id, started_at) VALUES (?, ?)",
+            (2, "not-a-timestamp"),
+        )
+        assert _recover_batch_files(str(tmp_path), conn, 2) == []
+
+    def test_recovery_never_raises_on_a_broken_db(self, tmp_path):
+        import sqlite3
+        from harness.story_loop import _recover_batch_files
+        conn = sqlite3.connect(tmp_path / "empty.db")  # no batches table
+        assert _recover_batch_files(str(tmp_path), conn, 1) == []
+
+    def test_seal_site_consults_the_recovery(self):
+        import inspect
+        from harness import story_loop
+        src = inspect.getsource(story_loop.batch_commit_node)
+        assert "_recover_batch_files" in src
+        assert "if not batch_files:" in src

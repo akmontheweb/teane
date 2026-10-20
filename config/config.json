@@ -70,7 +70,8 @@
         "architecture": false,
         "repair": false,
         "deployment": true,
-        "layout_divergence": true
+        "layout_divergence": true,
+        "auto_resume_cap_per_blocker": 9
     },
     "models": {
         "google:gemini-3.5-flash": {

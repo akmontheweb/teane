@@ -390,17 +390,27 @@ class TestBlockerSignature:
         ]})
         assert s == "a.py:?|b.py:?"
 
-    def test_per_blocker_cap_default_is_below_the_session_cap(self):
-        # Otherwise the session cap would always bind first and the
-        # per-blocker ceiling would be decorative.
+    def test_per_blocker_cap_is_a_backstop_not_a_throughput_limit(self):
+        """This replaces an assertion that had the invariant backwards.
+
+        It originally required the per-blocker cap to be BELOW the session cap,
+        on the reasoning that otherwise the session cap "would always bind
+        first and the per-blocker ceiling would be decorative". That is the
+        error itself: a fourth ceiling set below the three it complements
+        becomes the binding constraint on every long build. lumina 01a15562's
+        second resume terminated on per-blocker 4/4 with the session cap at
+        4/9, no class cap past 2/3, a batch mid-repair and $7.67 of $10
+        unspent. Being "decorative" in the common case is the correct
+        behaviour for a backstop whose value is its diagnostic — the
+        termination line naming which blocker consumed the budget.
+        """
         assert (
             cli._HITL_AUTO_RESUME_CAP_PER_BLOCKER
-            < int(cli._HITL_AUTO_RESUME_CAP)
-            if hasattr(cli, "_HITL_AUTO_RESUME_CAP") else True
-        )
+            >= int(cli._HITL_AUTO_RESUME_CAP)
+        ), "a per-blocker cap under the session cap caps throughput, not drain"
         assert cli._HITL_AUTO_RESUME_CAP_PER_BLOCKER > (
             cli._HITL_AUTO_RESUME_CAP_PER_TRIGGER
-        )
+        ), "and it must still exceed a single class budget to mean anything"
 
 
 class TestAcceptanceRepairCapIsPerBatch:
@@ -553,6 +563,53 @@ class TestResumeClearsEveryAutoResumeCeiling:
         from harness import graph
         src = inspect.getsource(graph)
         assert 'loop_counter["hitl_auto_resumes_per_blocker"] = {}' in src
+
+    def test_regen_attempts_is_cleared_on_resume(self):
+        """The per-test regeneration budget must reset too.
+
+        `test_regen_attempts` caps each test file at `max_attempts_per_test`
+        (2) rewrites and nothing reset it across runs, so a file that spent
+        both attempts was permanently out of them for every future resume —
+        the only way past it was a human editing the test by hand. lumina
+        01a15562 hit exactly that: test_birthday_service.py sat at 2/2 with a
+        pytest.raises placement bug no production change could satisfy, and
+        resume 1 died on it in 93 seconds with five more files already at 2/2
+        behind it.
+        """
+        import inspect
+        from harness import graph
+        src = inspect.getsource(graph)
+        assert "regen_attempts_stale" in src
+        assert 'loop_counter["test_regen_attempts"] = {}' in src
+
+    def test_regen_attempts_participates_in_the_early_return(self):
+        # A state whose ONLY populated counter is test_regen_attempts must
+        # still be cleared, not short-circuited past.
+        import inspect
+        from harness import graph
+        src = inspect.getsource(graph)
+        i = src.find("not any(before.values())")
+        assert i > 0
+        assert "regen_attempts_stale" in src[i:i + 260]
+
+    def test_per_blocker_cap_is_not_tighter_than_the_session_cap(self):
+        """The regression that stopped resume 2 of lumina 01a15562.
+
+        It terminated on per-blocker 4/4 while the session cap sat at 4/9 and
+        no class cap exceeded 2/3 — a fourth ceiling, set below the design it
+        was meant to complement, binding before any of the original three.
+        Three classes x 3 gives a shifting blocker up to 9 resumes; capping it
+        at 4 regardless made it the throughput limit.
+        """
+        import json
+        cfg = json.load(open("config/config.json"))
+        per_blocker = (cfg.get("hitl") or {}).get("auto_resume_cap_per_blocker")
+        assert per_blocker is not None, "should be pinned in config, not left to the code default"
+        from harness import cli
+        assert per_blocker >= int(cli._HITL_AUTO_RESUME_CAP), (
+            "a per-blocker cap below the session cap makes itself the "
+            "binding constraint on every long build"
+        )
 
     def test_staleness_check_considers_per_blocker(self):
         # Otherwise a state whose ONLY populated ceiling is per_blocker

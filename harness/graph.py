@@ -30159,10 +30159,27 @@ async def _reset_stale_gate_counters_on_resume(
     per_blocker_stale = bool(
         loop_counter.get("hitl_auto_resumes_per_blocker")
     )
+    # The per-test REGENERATION budget goes the same way, for the same reason.
+    # ``test_regen_attempts`` caps each test file at
+    # ``test_regeneration.max_attempts_per_test`` (2) rewrites, and nothing
+    # reset it across runs — so a file that spent both attempts was
+    # permanently out of them for every future resume, and the only way past
+    # it was a human editing the test by hand. lumina 01a15562 hit exactly
+    # that: `server/tests/test_birthday_service.py` sat at 2/2 with a
+    # `pytest.raises` placement bug no production change could satisfy, the
+    # ladder had nothing left to try, and resume 1 died on it in 93 seconds.
+    # Five more files were already at 2/2 behind it.
+    #
+    # An operator invoking resume IS the manual intervention the ladder was
+    # waiting for, which is the argument the gate-counter reset above already
+    # makes. Giving the test author a fresh budget per resume is what lets a
+    # long build finish without a hand-edit per defective test per cycle.
+    regen_attempts_stale = bool(loop_counter.get("test_regen_attempts"))
     if (
         not any(before.values())
         and not per_trigger_stale
         and not per_blocker_stale
+        and not regen_attempts_stale
     ):
         return
     for k in gate_keys:
@@ -30171,11 +30188,16 @@ async def _reset_stale_gate_counters_on_resume(
         loop_counter["hitl_auto_resumes_per_trigger"] = {}
     if per_blocker_stale:
         loop_counter["hitl_auto_resumes_per_blocker"] = {}
+    regen_before = dict(loop_counter.get("test_regen_attempts") or {})
+    if regen_attempts_stale:
+        loop_counter["test_regen_attempts"] = {}
     logger.info(
         "[run_graph] Resume: zeroing stale gate counters %s (per_trigger "
-        "cleared=%s, per_blocker cleared=%s) so the operator's explicit "
-        "resume gets a fresh repair budget. total_repairs preserved.",
+        "cleared=%s, per_blocker cleared=%s, test_regen_attempts cleared=%s) "
+        "so the operator's explicit resume gets a fresh repair budget. "
+        "total_repairs preserved.",
         before, per_trigger_stale, per_blocker_stale,
+        {k.rsplit("/", 1)[-1]: v for k, v in regen_before.items()} or False,
     )
     try:
         await compiled_graph.aupdate_state(

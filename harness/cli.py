@@ -2879,7 +2879,15 @@ _HITL_AUTO_RESUME_CAP_PER_TRIGGER = 3
 # same two failing test locations, and so drew on three separate 3-resume
 # budgets before the session cap could bite. Keying on the blocker itself
 # closes that: the pathology gets one budget however it presents.
-_HITL_AUTO_RESUME_CAP_PER_BLOCKER = 4
+# Equal to the session cap, deliberately: this is a BACKSTOP and a diagnostic
+# (its log line names which blocker consumed the budget), not a throughput
+# limit. At 4 it was tighter than the design it was added to complement and
+# became the binding constraint on every long build — lumina 01a15562's second
+# resume terminated on per-blocker 4/4 while the session cap sat at 4/9 and no
+# class cap exceeded 2/3, with $7.67 of $10 unspent and a batch mid-repair.
+# Three trigger classes x 3 each already allow a shifting blocker up to 9
+# resumes; capping it below that just moved the ceiling down.
+_HITL_AUTO_RESUME_CAP_PER_BLOCKER = 9
 
 # How many diagnostic locations form the signature. Enough to distinguish
 # genuinely different failures, few enough that one diagnostic

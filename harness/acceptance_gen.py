@@ -553,14 +553,75 @@ async def generate_acceptance_scenarios(
     )
 
 
+# Positive evidence that a criterion really is about the repository or the
+# delivery process rather than the running application — i.e. the things the
+# prompt's own ``not-runtime`` definition enumerates. The guard below is a
+# WHITELIST on purpose: the first version of this check looked for runtime
+# vocabulary ("returns", "200", "request") and rejected the classification
+# when it appeared, which caught only the criteria phrased in HTTP terms.
+# lumina 01a15562 (2026-10-20) produced two bad classifications and that
+# shape caught one of them:
+#
+#   STORY-004.AC-1  "A request for a 30-day horizon returns a 200 response
+#                    with birthdays grouped into relative time buckets."
+#                   -> caught (says "200", "request", "returns")
+#   STORY-002.AC-3  "A February 29 birthday in a non-leap year resolves to
+#                    March 1 when the Mar1 policy is selected."
+#                   -> MISSED: a pure date-resolution rule, trivially
+#                      verifiable by calling the API, but phrased without any
+#                      HTTP vocabulary at all.
+#
+# Keying on repo/process evidence instead catches both, and it matches the
+# instruction the model was given rather than inventing a parallel rule.
+_NOT_RUNTIME_EVIDENCE = re.compile(
+    r"\b("
+    r"ci|cd|pipeline|workflow|github actions|pre-?commit|lint(er|ing)?|"
+    r"deploy(ment|s|ed|ing)?|release|rollback|docker(file)?|image|"
+    r"readme|changelog|docs?|documentation|licen[cs]e|"
+    r"dependenc(y|ies)|lock-?file|requirements\.txt|package\.json|"
+    r"pyproject|\.ya?ml|\.toml|\.cfg|\.ini|repositor(y|ies)|"
+    r"scanner|sbom|audit|coverage threshold|branch protection"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _not_runtime_evidence(text: str) -> list[str]:
+    """Repo/process terms found in ``text``; empty when the label is suspect."""
+    return sorted({m.group(0).lower()
+                   for m in _NOT_RUNTIME_EVIDENCE.finditer(text or "")})
+
+
 def _not_runtime_acs(data: Any, ctx: StoryAcceptanceContext) -> dict[str, str]:
     """AC key → rationale for every criterion the model classified not-runtime.
 
     Read off the raw objects, not the scenarios: a not-runtime criterion has
     none, so ``_parse_candidates`` never sees it.
+
+    A ``not-runtime`` label is the one classification that costs the criterion
+    all of its verification — no integration scenario, no e2e scenario, just a
+    deferral record. The model is given a precise definition (the repository or
+    the delivery process, not the running application) and it still
+    misclassified both of the criteria it labelled this way on lumina
+    01a15562. So the label is checked against the criterion's own prose: with
+    no repo/process evidence in the text, the deferral is still recorded — the
+    alternative is a criterion with no scenario AND no record, which is
+    strictly worse — but it is logged, annotated and emitted as an event so it
+    is auditable instead of silent.
+
+    This surfaces the misclassification rather than repairing it. Restoring
+    the lost coverage needs the ``ui-only`` question settled too (that tier
+    routes to an e2e suite which ADR-0006 Phase 2 has not built yet), which is
+    a separate decision.
     """
     known = ctx.ac_keys()
+    texts = {
+        str(ac.get("ac_key", "")).strip(): str(ac.get("text", "") or "")
+        for ac in (ctx.acceptance_criteria or [])
+        if isinstance(ac, dict)
+    }
     out: dict[str, str] = {}
+    suspect: list[str] = []
     scen = data.get("scenarios") if isinstance(data, dict) else None
     for obj in scen if isinstance(scen, list) else []:
         if not isinstance(obj, dict):
@@ -568,8 +629,37 @@ def _not_runtime_acs(data: Any, ctx: StoryAcceptanceContext) -> dict[str, str]:
         if str(obj.get("classification", "")).strip() != CLASS_NOT_RUNTIME:
             continue
         key = str(obj.get("verifies", "")).strip()
-        if key and (not known or key in known):
-            out[key] = str(obj.get("rationale", "")).strip()
+        if not key or (known and key not in known):
+            continue
+        rationale = str(obj.get("rationale", "")).strip()
+        body = texts.get(key, "")
+        if body and not _not_runtime_evidence(body):
+            suspect.append(key)
+            logger.warning(
+                "[acceptance_gen] %s was classified not-runtime but its text "
+                "names nothing about the repository or delivery process — "
+                "it looks verifiable against the running app. Deferring it "
+                "anyway (so the criterion is at least recorded), but this is "
+                "very likely lost coverage. Criterion: %r  Model rationale: %r",
+                key, body[:200], rationale[:200],
+            )
+            rationale = (
+                "SUSPECT CLASSIFICATION — no repository/process terms in the "
+                "criterion text; likely verifiable against the running app. "
+                + rationale
+            )
+        out[key] = rationale
+    if suspect:
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "not_runtime_classification_suspect",
+                story_key=ctx.story_key,
+                ac_keys=sorted(suspect),
+                count=len(suspect),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
     return out
 
 

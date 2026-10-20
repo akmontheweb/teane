@@ -706,3 +706,102 @@ class TestGenerateSeedLLM:
         sent = gw.calls[0]["messages"][1]["content"]
         assert "CREATE TABLE contacts" in sent
         assert "STORY-004.AC-1" in sent
+
+
+class TestNotRuntimeClassificationGuard:
+    """A `not-runtime` label costs the criterion ALL of its verification.
+
+    No integration scenario, no e2e scenario, just a deferral record. The
+    model is given a precise definition — the repository or the delivery
+    process, not the running application — and on lumina 01a15562
+    (2026-10-20) it misclassified both of the criteria it labelled this way.
+    """
+
+    # Verbatim from that run.
+    MISCLASSIFIED = [
+        "A request for a 30-day horizon returns a 200 response with "
+        "birthdays grouped into relative time buckets.",
+        "A February 29 birthday in a non-leap year resolves to March 1 when "
+        "the Mar1 policy is selected.",
+    ]
+
+    GENUINE = [
+        "The CI pipeline runs a dependency scanner on every pull request.",
+        "The README documents the installation steps.",
+        "A deployment rollback restores the previous image.",
+        "requirements.txt pins every direct dependency.",
+        "Coverage threshold is enforced by pre-commit.",
+    ]
+
+    def test_real_misclassifications_are_flagged(self):
+        from harness.acceptance_gen import _not_runtime_evidence
+        for text in self.MISCLASSIFIED:
+            assert _not_runtime_evidence(text) == [], text
+
+    def test_date_rule_without_http_vocabulary_is_still_flagged(self):
+        """The case that killed the first version of this guard.
+
+        Keying on runtime vocabulary ("returns", "200", "request") caught the
+        first criterion above and missed this one, which is a pure
+        date-resolution rule — trivially verifiable by calling the API, but
+        phrased without any HTTP words. The whitelist shape catches both.
+        """
+        from harness.acceptance_gen import _not_runtime_evidence
+        assert _not_runtime_evidence(self.MISCLASSIFIED[1]) == []
+
+    def test_genuine_repo_process_criteria_pass_through(self):
+        from harness.acceptance_gen import _not_runtime_evidence
+        for text in self.GENUINE:
+            assert _not_runtime_evidence(text), text
+
+    def test_evidence_is_deduplicated_and_sorted(self):
+        from harness.acceptance_gen import _not_runtime_evidence
+        got = _not_runtime_evidence("CI runs CI again, and the pipeline too.")
+        assert got == sorted(set(got))
+
+    def test_empty_text_is_not_evidence(self):
+        from harness.acceptance_gen import _not_runtime_evidence
+        assert _not_runtime_evidence("") == []
+        assert _not_runtime_evidence(None) == []
+
+    def _ctx(self, ac_key, text):
+        from harness.acceptance_gen import StoryAcceptanceContext
+        return StoryAcceptanceContext(
+            story_key="STORY-004", title="t", description="d",
+            acceptance_criteria=[{"ac_key": ac_key, "text": text}],
+        )
+
+    def _payload(self, ac_key):
+        return {"scenarios": [{
+            "verifies": ac_key, "classification": "not-runtime",
+            "rationale": "would need a repo check",
+        }]}
+
+    def test_suspect_label_is_still_recorded_but_annotated(self):
+        """Dropping it would leave the criterion with no scenario AND no
+        record, which is strictly worse than a loud deferral."""
+        from harness.acceptance_gen import _not_runtime_acs
+        key = "STORY-004.AC-1"
+        out = _not_runtime_acs(
+            self._payload(key), self._ctx(key, self.MISCLASSIFIED[0]),
+        )
+        assert key in out, "the deferral record must survive"
+        assert "SUSPECT CLASSIFICATION" in out[key]
+        assert "would need a repo check" in out[key], "keeps the model's reason"
+
+    def test_genuine_label_is_recorded_unannotated(self):
+        from harness.acceptance_gen import _not_runtime_acs
+        key = "STORY-004.AC-9"
+        out = _not_runtime_acs(
+            self._payload(key), self._ctx(key, self.GENUINE[0]),
+        )
+        assert out[key] == "would need a repo check"
+        assert "SUSPECT" not in out[key]
+
+    def test_unknown_ac_keys_are_ignored(self):
+        from harness.acceptance_gen import _not_runtime_acs
+        out = _not_runtime_acs(
+            self._payload("STORY-999.AC-1"),
+            self._ctx("STORY-004.AC-1", self.GENUINE[0]),
+        )
+        assert out == {}

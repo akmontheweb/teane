@@ -649,7 +649,18 @@ _PARSE_MISS_MARKERS: tuple[str, ...] = (
     "INSERT_AT_BLOCK",
     "INSERT_AT_LINE",
     "REPLACE_LINE_RANGE",
+    # Aliases too, so a block that needed normalising is still reported if it
+    # somehow fails to parse afterwards.
+    "EDIT_FILE",
 )
+
+# Any ``<<<WORD>>>`` opener at all. An UNKNOWN marker used to make
+# ``summarize_parse_miss`` return "" — identical to the model having emitted
+# no patch blocks whatsoever — so a response carrying a real, correct fix under
+# an unrecognised name was indistinguishable from an empty one. That silence is
+# what let the EDIT_FILE mismatch above cost a whole resume before anyone
+# noticed the patch had simply been dropped.
+_ANY_MARKER_RE = re.compile(r"<<<(?!END_)([A-Z][A-Z0-9_]{2,})>>>")
 
 
 def summarize_parse_miss(llm_output: str) -> str:
@@ -678,6 +689,23 @@ def summarize_parse_miss(llm_output: str) -> str:
     message the LLM sees next round, and long context there hurts more
     than it helps.
     """
+    # An UNRECOGNISED marker is the worst case, not a no-op: the model emitted
+    # something it believed was a patch and the harness threw it away without
+    # a word. Report it by name so the retry prompt can tell the model which
+    # vocabulary to use, and so the operator sees a dropped patch rather than
+    # an apparently empty round.
+    unknown = sorted({
+        m.group(1) for m in _ANY_MARKER_RE.finditer(llm_output or "")
+        if m.group(1) not in _PARSE_MISS_MARKERS
+    })
+    if unknown:
+        return (
+            f"Output contained unrecognised patch marker(s): "
+            f"{', '.join('<<<' + u + '>>>' for u in unknown)}. The text DSL "
+            f"accepts only: {', '.join(_PARSE_MISS_MARKERS[:7])}. Re-emit the "
+            "same edit using one of those markers — the body fields are "
+            "unchanged. Nothing was applied."
+        )
     counts: dict[str, tuple[int, int]] = {}
     for name in _PARSE_MISS_MARKERS:
         opens = llm_output.count(f"<<<{name}>>>")
@@ -722,6 +750,53 @@ def summarize_parse_miss(llm_output: str) -> str:
     return f"Markers seen: {kinds}. {hint_str}"
 
 
+# The native tool schemas in :mod:`harness.tool_schemas` and this text DSL name
+# the same operations, with ONE divergence: the tool is ``edit_file`` while the
+# DSL marker is ``REPLACE_BLOCK``. Its own schema says so — "Equivalent to
+# <<<REPLACE_BLOCK>>> in the text DSL". create_file / rewrite_file /
+# delete_block / insert_at_block / insert_at_line / replace_line_range are
+# spelled identically in both, so EDIT_FILE is the only name a model can carry
+# across from the tool vocabulary into DSL syntax and have it silently discarded.
+#
+# It does exactly that. On lumina 01a15562 (2026-10-20, resume 3) the repair
+# model diagnosed a real IDOR — traced test -> resolve_owner -> service.get ->
+# repository.get and found a None owner skipping the ownership filter — and
+# emitted the correct fix as ``<<<EDIT_FILE>>>`` with REPLACE_BLOCK's own
+# ``file:``/``search:``/``replace:`` body. No pattern matched, zero blocks were
+# parsed, the round counted as a zero-patch round, the stall counters climbed
+# and the resume capped out. The patch never reached disk.
+#
+# Aliasing rather than teaching the prompt harder is the same principle
+# e3a4140 / 9d8e4b9 established for foreign tool dialects: understand what the
+# model meant when the intent is unambiguous.
+_DSL_MARKER_ALIASES: dict[str, str] = {
+    "EDIT_FILE": "REPLACE_BLOCK",
+}
+
+
+def normalize_dsl_markers(llm_output: str) -> str:
+    """Rewrite known alias markers to their canonical DSL names.
+
+    Body fields are untouched — an aliased block must already carry the
+    canonical op's fields (``EDIT_FILE`` does: file/search/replace), so only
+    the opener and closer are renamed.
+    """
+    if not llm_output:
+        return llm_output
+    for alias, canonical in _DSL_MARKER_ALIASES.items():
+        if f"<<<{alias}>>>" in llm_output:
+            llm_output = (
+                llm_output
+                .replace(f"<<<{alias}>>>", f"<<<{canonical}>>>")
+                .replace(f"<<<END_{alias}>>>", f"<<<END_{canonical}>>>")
+            )
+            logger.info(
+                "[patcher] Normalised <<<%s>>> to <<<%s>>> — the native tool "
+                "name for the same operation.", alias, canonical,
+            )
+    return llm_output
+
+
 def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
     """
     Extract all SEARCH/REPLACE patch blocks from an LLM's output text.
@@ -745,6 +820,7 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
         List of PatchBlock objects in the order they appear in the text.
     """
     blocks: list[PatchBlock] = []
+    llm_output = normalize_dsl_markers(llm_output)
 
     for op_type, pattern in _BLOCK_PATTERNS.items():
         for match in pattern.finditer(llm_output):

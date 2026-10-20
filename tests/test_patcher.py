@@ -89,3 +89,70 @@ class TestEditFileAliasAndUnknownMarkers:
         # dropped one.
         from harness.patcher import summarize_parse_miss
         assert summarize_parse_miss("I could not determine a fix.") == ""
+
+
+class TestControlMarkersAreNotPatchOperations:
+    """READ_FILE and PROMOTE_DEFERRED are the model's control channel.
+
+    The harness consumes both inline during prompt assembly — READ_FILE
+    requests file bytes, PROMOTE_DEFERRED forces named error codes into the
+    top-N diagnostic set. Emitting either is CORRECT behaviour.
+
+    The first version of the unknown-marker check compared only against
+    _PARSE_MISS_MARKERS (patch ops), so it told a model that had correctly
+    used <<<PROMOTE_DEFERRED>>> that "nothing was applied, re-emit using one
+    of those markers" — advising it to rewrite a prioritisation directive as a
+    patch block. Caught on lumina 01a15562 resume 4, twenty minutes after the
+    check shipped.
+    """
+
+    def test_promote_deferred_is_not_reported(self):
+        from harness.patcher import summarize_parse_miss
+        msg = summarize_parse_miss(
+            "<<<PROMOTE_DEFERRED>>>\ncodes: TS2769, TS2353\n"
+            "<<<END_PROMOTE_DEFERRED>>>"
+        )
+        assert "unrecognised patch marker" not in msg
+
+    def test_read_file_is_not_reported(self):
+        from harness.patcher import summarize_parse_miss
+        msg = summarize_parse_miss(
+            "<<<READ_FILE>>>\nfile: server/app/main.py\n<<<END_READ_FILE>>>"
+        )
+        assert "unrecognised patch marker" not in msg
+
+    def test_a_genuinely_unknown_marker_is_still_reported(self):
+        from harness.patcher import summarize_parse_miss
+        msg = summarize_parse_miss(
+            "<<<APPLY_PATCH>>>\nfile: x\nsearch:\na\nreplace:\nb\n"
+            "<<<END_APPLY_PATCH>>>"
+        )
+        assert "APPLY_PATCH" in msg
+
+    def test_control_markers_are_still_parsed_by_their_own_parsers(self):
+        # Excluding them from the diagnostic must not stop them working.
+        from harness.patcher import parse_promote_deferred_blocks
+        codes = parse_promote_deferred_blocks(
+            "<<<PROMOTE_DEFERRED>>>\ncodes: TS2769, TS2353\n"
+            "<<<END_PROMOTE_DEFERRED>>>"
+        )
+        assert codes == ["TS2769", "TS2353"]
+
+    def test_every_control_marker_in_the_dsl_is_registered(self):
+        """A new control marker must be added to _CONTROL_MARKERS or it will
+        be misreported the moment a model uses it."""
+        import re as _re
+        from harness.patcher import (
+            _CONTROL_MARKERS, _PARSE_MISS_MARKERS,
+        )
+        src = open("harness/patcher.py").read()
+        found = {
+            m for m in _re.findall(r"<<<([A-Z][A-Z0-9_]{2,})>>>", src)
+            if not m.startswith("END_") and m not in ("WORD", "XYZ")
+        }
+        for marker in found:
+            assert (
+                marker in _PARSE_MISS_MARKERS
+                or marker in _CONTROL_MARKERS
+                or marker == "EDIT_FILE"
+            ), f"<<<{marker}>>> is neither a patch op nor a registered control marker"

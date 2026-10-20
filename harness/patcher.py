@@ -654,6 +654,22 @@ _PARSE_MISS_MARKERS: tuple[str, ...] = (
     "EDIT_FILE",
 )
 
+# Markers that are NOT patch operations. The harness consumes these inline
+# during prompt assembly and acts on them — they are the model's control
+# channel, not edits:
+#   READ_FILE        — request the bytes of a file before patching
+#   PROMOTE_DEFERRED — force named error codes into the top-N diagnostic set
+# Emitting one is correct behaviour and must never be reported as an
+# unrecognised patch marker. The first version of the check below omitted them
+# and immediately told a model that had correctly used <<<PROMOTE_DEFERRED>>>
+# that "nothing was applied, re-emit using one of those markers" — advising it
+# to rewrite a prioritisation directive as a patch block (lumina 01a15562,
+# resume 4, within 20 minutes of the check shipping).
+_CONTROL_MARKERS: frozenset[str] = frozenset({
+    "READ_FILE",
+    "PROMOTE_DEFERRED",
+})
+
 # Any ``<<<WORD>>>`` opener at all. An UNKNOWN marker used to make
 # ``summarize_parse_miss`` return "" — identical to the model having emitted
 # no patch blocks whatsoever — so a response carrying a real, correct fix under
@@ -697,6 +713,7 @@ def summarize_parse_miss(llm_output: str) -> str:
     unknown = sorted({
         m.group(1) for m in _ANY_MARKER_RE.finditer(llm_output or "")
         if m.group(1) not in _PARSE_MISS_MARKERS
+        and m.group(1) not in _CONTROL_MARKERS
     })
     if unknown:
         return (

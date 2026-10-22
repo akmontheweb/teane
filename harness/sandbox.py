@@ -27,9 +27,10 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
 
 # Credential scrubbing is centralised in harness/trust.py so every
@@ -535,6 +536,18 @@ _CACHE_CORRUPTION_SIGNATURES: tuple[str, ...] = (
 _NPM_INTEGRITY_PAIR = ("sha512-", "eintegrity")
 
 
+def _new_container_name() -> str:
+    """A unique ``docker run --name`` for one build invocation.
+
+    Unique per invocation rather than per session: a repair loop runs many
+    builds, and reusing a name races a container that is still shutting
+    down (``docker run`` then fails outright with a name conflict). The
+    ``teane-build-`` prefix makes strays identifiable in ``docker ps`` when
+    cleanup could not run at all — e.g. the harness itself was SIGKILLed.
+    """
+    return f"teane-build-{uuid.uuid4().hex[:12]}"
+
+
 def _cache_corruption_hint(raw_output: str) -> Optional[str]:
     """Return a one-line hint when the build output looks cache-corrupted,
     or None otherwise. Caller appends to BuildResult.raw_output."""
@@ -804,6 +817,7 @@ class DockerBackend(SandboxBackend):
         ] + effective_mounts
         if self.cache_volumes_enabled:
             self._ensure_cache_volumes(effective_mounts)
+        container_name = _new_container_name()
         docker_cmd = self._build_docker_command(
             command,
             workspace_path,
@@ -811,11 +825,16 @@ class DockerBackend(SandboxBackend):
             effective_mounts,
             extra_env or {},
             timeout_seconds,
+            container_name,
         )
         logger.info("[sandbox:docker] Running in Docker container (image=%s, mem=%s).", self.image, self.memory_limit)
         logger.debug("[sandbox:docker] Command: %s", " ".join(docker_cmd))
         try:
-            return await _execute_subprocess_with_timeout(docker_cmd, timeout_seconds)
+            return await _execute_subprocess_with_timeout(
+                docker_cmd,
+                timeout_seconds,
+                on_timeout=lambda: self._kill_container(container_name),
+            )
         finally:
             # Belt-and-suspenders: if the in-container ownership-restore
             # trailer was skipped (container OOM-killed, SIGKILLed by the
@@ -833,6 +852,51 @@ class DockerBackend(SandboxBackend):
                 )
             except Exception as sweep_exc:  # noqa: BLE001
                 logger.debug("[sandbox] host-side sweep failed: %s", sweep_exc)
+
+    async def _kill_container(self, container_name: str) -> None:
+        """Kill a named container that outlived its ``docker run`` client.
+
+        The outer build timeout kills our own process group, which takes
+        down the ``docker run`` client but NOT the container — that belongs
+        to the Docker daemon. The orphan keeps consuming its memory and CPU
+        share and keeps hammering the network (re-downloading wheels), so
+        the next build round is slower than the one that just timed out,
+        and the loop degenerates into timing out every round.
+
+        Best-effort and idempotent: a container that already exited makes
+        ``docker kill`` fail with "No such container", which is the
+        outcome we want anyway. ``--rm`` removes it once it is dead.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "kill", container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except (asyncio.TimeoutError, FileNotFoundError, OSError) as exc:
+            logger.warning(
+                "[sandbox:docker] Could not kill timed-out container %s: %s. "
+                "It may still be running — `docker ps` to check.",
+                container_name, exc,
+            )
+            return
+        if proc.returncode == 0:
+            logger.info(
+                "[sandbox:docker] Killed timed-out container %s.", container_name,
+            )
+        else:
+            detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+            # Already gone is the normal race, not a problem.
+            if "No such container" in detail or "is not running" in detail:
+                logger.debug(
+                    "[sandbox:docker] Container %s already stopped.", container_name,
+                )
+            else:
+                logger.warning(
+                    "[sandbox:docker] `docker kill %s` failed: %s",
+                    container_name, detail[:200],
+                )
 
     def _ensure_cache_volumes(self, cache_mounts: list[str]) -> None:
         """Idempotently `docker volume create` each cache mount's named volume.
@@ -900,11 +964,24 @@ class DockerBackend(SandboxBackend):
         cache_mounts: list[str],
         extra_env: dict[str, str],
         timeout_seconds: int,
+        container_name: Optional[str] = None,
     ) -> list[str]:
-        """Build the docker run command with resource limits and volume mounts."""
+        """Build the docker run command with resource limits and volume mounts.
+
+        ``container_name`` is the handle the timeout path kills the container
+        by; :meth:`run` generates one and passes it so it can clean up after
+        itself. Callers that only inspect the argv may omit it and get a
+        fresh name.
+        """
+        container_name = container_name or _new_container_name()
         cmd = [
             self.docker_path, "run",
             "--rm",                              # Auto-cleanup container on exit
+            # ``--rm`` only fires once the container *exits*. The outer
+            # timeout kills our ``docker run`` client, which leaves the
+            # container orphaned and running, so we need a stable handle
+            # to kill it by. See ``DockerBackend.run``'s on_timeout hook.
+            "--name", container_name,
             "--tmpfs", "/tmp:exec",              # Writable /tmp for build artifacts
             f"--memory={self.memory_limit}",     # Memory limit
             f"--cpus={self.cpu_limit}",          # CPU limit
@@ -1315,6 +1392,7 @@ async def _execute_subprocess_with_timeout(
     log_buffer_mode: str = "disk",
     max_log_size_mb: int = 500,
     log_temp_dir: Optional[str] = None,
+    on_timeout: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> tuple[int, str, bool, bool]:
     """
     Execute a command with asyncio subprocess, strict timeout, and PGID
@@ -1333,6 +1411,12 @@ async def _execute_subprocess_with_timeout(
         log_buffer_mode: "disk" or "memory" — how to buffer build output.
         max_log_size_mb: Maximum combined log size before truncation (disk mode only).
         log_temp_dir: Directory for temp log files (disk mode only).
+        on_timeout: Optional async hook invoked after the host process group
+                    is killed. Killing the PGID only reaps processes in *this*
+                    process tree; a backend that delegates the real work to a
+                    daemon (Docker) must tear that down itself or the work
+                    keeps running after we've declared the build dead. See
+                    ``DockerBackend.run``.
 
     Returns:
         Tuple of (exit_code, combined_stdout_stderr, timed_out, log_truncated).
@@ -1433,6 +1517,21 @@ async def _execute_subprocess_with_timeout(
                 pgid,
             )
             await _kill_process_group_async(pgid, proc)
+            # Killing the PGID reaps only our own process tree. When the
+            # real work runs under another supervisor (the Docker daemon),
+            # the client dying leaves the container running: it keeps
+            # holding CPU, memory and network while the next round starts
+            # its own, and each leaked container makes the next one slower
+            # until every round times out. Let the backend tear its own
+            # workload down. Best-effort — a failure here must not mask
+            # the timeout itself.
+            if on_timeout is not None:
+                try:
+                    await on_timeout()
+                except Exception as exc:  # noqa: BLE001 - never mask a timeout
+                    logger.warning(
+                        "[sandbox] Timeout cleanup hook failed: %s", exc,
+                    )
             # Do NOT call proc.communicate() here — the reader tasks below
             # are still draining stdout/stderr, and communicate() racing
             # them on the same pipes can deadlock or duplicate output. Just

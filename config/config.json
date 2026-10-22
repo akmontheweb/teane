@@ -25,9 +25,9 @@
             "~/.m2",
             "~/.gradle"
         ],
-        "cache_volumes": false,
+        "cache_volumes": true,
         "cache_volumes_prefix": "harness",
-        "timeout_seconds": 300,
+        "timeout_seconds": 900,
         "test_timeout_seconds": 30,
         "pgid_kill_on_timeout": true,
         "restore_workspace_ownership": true

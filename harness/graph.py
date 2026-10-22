@@ -8612,6 +8612,45 @@ async def _run_prod_import_smoke_check(
     # Without this short-circuit the smoke check falls through to the
     # coarse PROD_IMPORT_SMOKE catch-all, and the router dispatches to
     # repair_node — burning iterations on a problem the LLM cannot fix.
+    # The smoke check was SIGKILLed before it could report anything. Its
+    # output has no FAIL: lines — not because the imports are fine, but
+    # because the script never reached them, so every classification below
+    # would be a guess. Surface it the same way as BUILD_COMMAND_BLOCKED:
+    # an environment problem the repair LLM cannot patch its way out of.
+    # Without this the coarse PROD_IMPORT_SMOKE catch-all hands the model a
+    # wheel-download stall at `<prod-import-smoke>:0:0`, the judge reports
+    # "insufficient data — no diagnostic locations available", and the model
+    # burns rounds guessing at unrelated files (session 01a1648d: patch
+    # success fell 3/3 → 1/2 → 0/2 across three such rounds).
+    if result.timed_out:
+        logger.warning(
+            "[prod-smoke] Smoke check timed out after %.0fs — no import "
+            "result was produced. Surfacing as BUILD_ENV_TIMEOUT.",
+            result.elapsed_seconds,
+        )
+        return [{
+            "error_code": "BUILD_ENV_TIMEOUT",
+            "message": (
+                f"The prod-import smoke check was killed after "
+                f"{result.elapsed_seconds:.0f}s (sandbox timeout). No module "
+                f"was proved to fail — the check never finished. This is an "
+                f"environment/toolchain problem (dependency install stalling, "
+                f"a slow or failing package download, or a timeout set below "
+                f"what this project's install needs), not a defect in the "
+                f"generated code, so it cannot be fixed by patching the "
+                f"workspace. Operator action: raise "
+                f"`sandbox.timeout_seconds`, enable "
+                f"`sandbox.cache_volumes` so downloads persist across "
+                f"rounds, or check network reachability from the sandbox.\n\n"
+                f"Last output before the kill:\n"
+                f"{_surface_salient_errors(result.raw_output or '')}"
+            ),
+            "file": "<harness:sandbox-timeout>",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "semantic_context": "",
+        }]
     blocked_rule = _is_command_blocked_by_security(result.raw_output or "")
     if blocked_rule:
         logger.warning(
@@ -8749,6 +8788,14 @@ async def _run_prod_import_smoke_check(
             "of %d per-module cascade failures.",
             len(packages), ", ".join(packages), affected_count,
         )
+    # Distinguish "we identified these failing modules" from "we identified
+    # nothing and are forwarding raw output". The log line below used to
+    # report ``len(diagnostics)`` as a module count, so the coarse
+    # fallback — which always appends exactly one entry — announced
+    # "1 production module(s) failed to import" when no module had been
+    # shown to fail at all. On a build that died during dependency
+    # install that reads as a confident finding about the generated code.
+    identified_failures = len(diagnostics)
     if not diagnostics:
         # Fall back to a single coarse diagnostic carrying the tail of
         # the output so the LLM has something to work with. The tail
@@ -8787,12 +8834,24 @@ async def _run_prod_import_smoke_check(
             "severity": "error",
             "semantic_context": "",
         })
-    logger.warning(
-        "[prod-smoke] %d production module(s) failed to import. Surfacing "
-        "as diagnostics; the actual build (pytest) will NOT run this "
-        "round — repair must fix prod imports first.",
-        len(diagnostics),
-    )
+    if identified_failures:
+        logger.warning(
+            "[prod-smoke] %d production module(s) failed to import. "
+            "Surfacing as diagnostics; the actual build (pytest) will NOT "
+            "run this round — repair must fix prod imports first.",
+            identified_failures,
+        )
+    else:
+        logger.warning(
+            "[prod-smoke] Smoke check exited %d without naming a failing "
+            "module — forwarding the raw output as a single %s diagnostic. "
+            "No module was proved to fail; the check most likely died "
+            "before the import phase (dependency install, download, or "
+            "toolchain error). The actual build (pytest) will NOT run "
+            "this round.",
+            result.exit_code,
+            diagnostics[0].get("error_code", "PROD_IMPORT_SMOKE"),
+        )
     return diagnostics
 # Error codes that almost certainly mean "test fails to import / collect
 # because something in production is wrong." These point the cascade at
@@ -16143,6 +16202,16 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                         "not user code — routing to HITL."
                     )
                     break
+                if diag.get("error_code") == "BUILD_ENV_TIMEOUT":
+                    short_circuit_state["build_env_timeout"] = True
+                    short_circuit_state["last_build_output"] = (
+                        "The prod-import smoke check was killed by the "
+                        "sandbox timeout before it produced any import "
+                        "result. No module was proved to fail. This is an "
+                        "environment/toolchain problem — repair cannot "
+                        "patch it — so routing to HITL."
+                    )
+                    break
             # Rotate survival-tracking fingerprints — see
             # _rotate_diag_fingerprints_delta. Regression fix for the
             # runaway repair loop in session 7e4cba32.
@@ -16878,6 +16947,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         and not compiler_errors
         and not node_state.get("env_misconfig")
         and not node_state.get("build_command_blocked")
+        and not node_state.get("build_env_timeout")
         and not node_state.get("build_command_cd_missing")
         and not node_state.get("no_tests_collected")
     ):
@@ -21813,6 +21883,13 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     if node_state.get("build_command_blocked"):
         rule = str(node_state.get("build_command_blocked_rule", "") or "")
         return f"build_command_blocked:{rule}" if rule else "build_command_blocked"
+    # Sandbox timeout with no diagnostic produced — operator-side fix
+    # (timeout / cache / network). Same reasoning as
+    # ``build_command_blocked``: a precise label beats the generic
+    # "persistent_build_failure" story, which would send the operator
+    # looking for a code defect that isn't there.
+    if node_state.get("build_env_timeout"):
+        return "build_env_timeout"
     if node_state.get("build_command_cd_missing"):
         d = node_state.get("build_command_cd_missing_dir", "")
         return f"build_command_cd_missing:{d}" if d else "build_command_cd_missing"
@@ -23940,6 +24017,21 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "(rule=%s). Repair loop cannot reach the global validator config. "
             "Routing to HITL.",
             rule,
+        )
+        return _transition("human_intervention_node")
+
+    # The sandbox killed the build before it reported anything, so there is
+    # no diagnostic to repair against — only the tail of an install that
+    # never finished. Repair rounds here are pure guesswork: the judge gets
+    # the "insufficient data" sentinel and the model patches unrelated
+    # files (session 01a1648d burned 3 rounds this way, patch success
+    # 3/3 → 1/2 → 0/2). The fix is operator-side — timeout, cache, or
+    # network — so escalate instead of dispatching repair.
+    if state.get("node_state", {}).get("build_env_timeout"):
+        logger.warning(
+            "[router] Build environment timed out before producing any "
+            "result. Repair cannot fix a toolchain/network stall. "
+            "Routing to HITL.",
         )
         return _transition("human_intervention_node")
 

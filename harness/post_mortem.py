@@ -164,6 +164,15 @@ _TRIGGER_ADVICE: dict[str, str] = {
         "validator config; adjust the policy or rewrite the build "
         "command to use only whitelisted primitives"
     ),
+    "build_env_timeout": (
+        "the sandboxed build was killed by sandbox.timeout_seconds before "
+        "it produced any result, so no module was shown to fail and there "
+        "was no code defect to repair. The build died during setup — "
+        "typically a dependency install stalling on a slow or unreachable "
+        "package download. Raise sandbox.timeout_seconds, enable "
+        "sandbox.cache_volumes so downloads persist across rounds, or fix "
+        "network reachability from the sandbox"
+    ),
 }
 
 _GENERIC_ADVICE = (

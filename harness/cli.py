@@ -4348,6 +4348,38 @@ def _build_outside_harness_actions(
             "After fixing the policy or the command, `[r]` Resume."
         )
 
+    # ---- build_env_timeout -------------------------------------------
+    # The sandbox killed the build before it reported anything, so there
+    # is no code-level diagnostic to act on. Repair rounds here are pure
+    # guesswork — the fix is operator-side.
+    elif trigger.startswith("build_env_timeout"):
+        actions.append(
+            "The sandboxed build was killed by `sandbox.timeout_seconds` "
+            "before it produced any result, so NO module was shown to "
+            "fail and there is no code defect to repair. The build died "
+            "during setup — almost always a dependency install stalling "
+            "on a slow or unreachable package download."
+        )
+        actions.append(
+            "Check, in this order: (a) is `sandbox.timeout_seconds` "
+            "(currently governs the whole install + test run) large "
+            "enough for a cold install of this project's dependencies? "
+            "(b) is `sandbox.cache_volumes` enabled, so a download that "
+            "does happen persists across rounds instead of being "
+            "re-fetched every time? (c) can the sandbox reach the "
+            "package index at all — `docker run --rm "
+            "harness-builder:latest curl -sI https://pypi.org/simple/` "
+            "to confirm."
+        )
+        actions.append(
+            "The diagnostic carries the last output before the kill — "
+            "read it for the specific package that stalled."
+        )
+        actions.append(
+            "After raising the timeout, enabling the cache, or fixing "
+            "network reachability, `[r]` Resume."
+        )
+
     # ---- repair_loop_limit / persistent_build_failure ----------------
     # The two most generic triggers — derive specifics from state.
     elif trigger in {"repair_loop_limit", "persistent_build_failure",
@@ -5006,6 +5038,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         "llm_behavior_symbol",
                         "build_command_blocked",
                         "build_command_blocked_rule",
+                        # Cleared on resume like the other operator-action
+                        # flags: the operator has just raised the timeout /
+                        # enabled the cache, so the next round must be
+                        # allowed to actually run the build and find out.
+                        "build_env_timeout",
                         "llm_silent",
                         "unsatisfiable_test",
                         "unsatisfiable_test_reason",
@@ -8699,6 +8736,10 @@ def _resolve_cli_exit_code(
         "llm_behavior",
         "build_command_blocked",
         "build_command_cd_missing",
+        # A build killed by the sandbox timeout is an environment
+        # condition, not a code failure — same "something outside the
+        # harness must change" semantics as the flags around it.
+        "build_env_timeout",
         "llm_silent",
         # A declared-unsatisfiable generated test left unresolved shares
         # the same semantics: a human must fix the test before another
@@ -13724,6 +13765,11 @@ def _dispatch_command() -> int:
                 "%(asctime)s %(levelname)-8s %(name)s — %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             ))
+            # Mark it as operator-owned so configure_logging's handler
+            # reset keeps it. Without the marker the file goes silent the
+            # moment the session's logging stack is configured.
+            from harness.observability import OPERATOR_HANDLER_ATTR
+            setattr(_log_handler, OPERATOR_HANDLER_ATTR, True)
             logging.getLogger().addHandler(_log_handler)
         except OSError as exc:
             # Don't halt the run for a log-write failure — the operator

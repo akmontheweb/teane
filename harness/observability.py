@@ -387,6 +387,11 @@ def log_failure(name: str, **fields: Any) -> None:
 _DEFAULT_LOG_MAX_BYTES = 10_000_000
 _DEFAULT_LOG_BACKUP_COUNT = 5
 
+# Marker attribute for log handlers the operator attached from the CLI
+# (``--log``). ``configure_logging`` owns the root logger's handler set and
+# clears it, but must leave these in place — see the comment there.
+OPERATOR_HANDLER_ATTR = "_teane_operator_handler"
+
 
 def configure_logging(
     session_id: str,
@@ -434,8 +439,20 @@ def configure_logging(
     root = logging.getLogger()
     root.setLevel(numeric_level)
 
-    # Remove any handlers the root logger already has so we own the config.
+    # Remove any handlers the root logger already has so we own the config —
+    # EXCEPT ones the operator explicitly attached (``--log``). Those are not
+    # ours to discard: clearing them unconditionally meant a ``--log`` file
+    # captured only the handful of lines emitted before this function ran
+    # and then went silent for the rest of the run, which is the opposite of
+    # what the flag promises (its own help text tells operators to prefer it
+    # over shell redirection for headless runs).
+    preserved = [
+        h for h in root.handlers
+        if getattr(h, OPERATOR_HANDLER_ATTR, False)
+    ]
     root.handlers.clear()
+    for handler in preserved:
+        root.addHandler(handler)
 
     # --- stderr (console) handler ---
     # console_level governs what the operator sees live on the terminal,

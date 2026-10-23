@@ -629,3 +629,53 @@ class TestLifecycleOpsRespectTheExistingGuards:
         ])
         assert len(kept) == 2
         assert rejected == []
+
+
+class TestImportPruningRule:
+    """Observed in all three lumina runs: the model prunes an import it
+    believes is unused while making a functional edit, the post-patch
+    validator rejects the WHOLE patch over the resulting NameError, and
+    the change the round was for is rolled back with it.
+
+    Run 01a167cd, one single edit_file call — not two, so nothing about
+    validation SCOPE is implicated:
+
+        old_string: from fastapi import APIRouter, Depends, Query, Request
+        new_string: from fastapi import APIRouter, Depends, Request
+
+    ``Query`` was still called in the body. Earlier runs lost `Generator`,
+    `ZoneInfoNotFoundError`, `re`, `get_settings` and `date` the same way.
+    """
+
+    def test_the_rule_is_in_the_native_invariants(self):
+        from harness.graph import _NATIVE_EDIT_INVARIANTS
+
+        assert "Never tidy imports" in _NATIVE_EDIT_INVARIANTS
+
+    def test_it_reaches_the_assembled_prompt(self):
+        block = _build_patch_interface_block(True)
+        assert "Never tidy imports" in block
+
+    def test_it_states_the_consequence_not_just_the_prohibition(self):
+        """A bare "don't" teaches nothing. The model needs to know the
+        whole patch is rejected, because that is what makes the rule worth
+        obeying over its own tidiness instinct."""
+        from harness.graph import _NATIVE_EDIT_INVARIANTS
+
+        low = _NATIVE_EDIT_INVARIANTS.lower()
+        assert "whole" in low and "rolled back" in low
+
+    def test_it_offers_the_sanctioned_alternative(self):
+        """Rules with no permitted path get worked around."""
+        from harness.graph import _NATIVE_EDIT_INVARIANTS
+
+        assert "its own separate edit" in _NATIVE_EDIT_INVARIANTS
+        assert "grep" in _NATIVE_EDIT_INVARIANTS
+
+    def test_the_invariants_stay_short(self):
+        """The whole point of splitting the dialects was a compact set of
+        semantics; an invariants block that grows without bound recreates
+        the 10,696-char reference it replaced."""
+        from harness.graph import _DSL_PATCH_SYNTAX, _NATIVE_EDIT_INVARIANTS
+
+        assert len(_NATIVE_EDIT_INVARIANTS) < len(_DSL_PATCH_SYNTAX) / 3

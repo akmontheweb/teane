@@ -249,3 +249,67 @@ class TestTheLoopIsWiredIntoRepair:
         import harness.graph as g
 
         assert '"repair_inturn_retry"' in inspect.getsource(g)
+
+
+class TestTheRetryActuallyRuns:
+    """The 33 tests above all asserted on SOURCE TEXT or exercised the
+    helpers in isolation. None of them ever executed the retry block, so
+    none could catch a runtime signature mismatch — and lumina 01a167cd,
+    the first run in which a zero-landing round occurred, raised:
+
+        TypeError: compose_patch_feedback() missing 3 required
+        keyword-only arguments: 'success_count', 'fail_count',
+        and 'no_op_count'
+
+    A source-scanning test cannot see that. This one calls the real
+    function with the real arguments the block passes.
+    """
+
+    def test_compose_patch_feedback_accepts_what_the_block_passes(self):
+        from harness.patch_feedback import compose_patch_feedback
+        from harness.patcher import OperationType, PatchResult
+
+        results = [
+            PatchResult(success=False, file="a.py",
+                        operation=OperationType.REPLACE_BLOCK,
+                        error="Search text not found in file"),
+            PatchResult(success=True, file="b.py",
+                        operation=OperationType.CREATE_FILE, no_op=True),
+        ]
+        success = sum(1 for r in results if r.success)
+        no_op = sum(1 for r in results if r.success and r.no_op)
+        msg, failures, rejections = compose_patch_feedback(
+            results,
+            ["a.py", "b.py"],
+            "",
+            prefix="[System]: Your patches did NOT land (in-turn retry 1/1):",
+            success_count=success,
+            fail_count=len(results) - success,
+            no_op_count=no_op,
+        )
+        assert isinstance(msg, str) and msg
+        assert "in-turn retry 1/1" in msg
+        assert isinstance(failures, list) and isinstance(rejections, list)
+
+    def test_the_blocks_call_supplies_every_required_kwarg(self):
+        """Signature parity, checked against the live signature rather
+        than against a copy of it — so a future kwarg added to
+        compose_patch_feedback fails here instead of at runtime in a
+        zero-landing repair round."""
+        import inspect
+
+        from harness.patch_feedback import compose_patch_feedback
+
+        required = {
+            name for name, p in
+            inspect.signature(compose_patch_feedback).parameters.items()
+            if p.kind is inspect.Parameter.KEYWORD_ONLY
+            and p.default is inspect.Parameter.empty
+        }
+        block = TestTheLoopIsWiredIntoRepair._retry_block()
+        missing = [kw for kw in required if f"{kw}=" not in block]
+        assert not missing, (
+            f"the in-turn retry omits required keyword-only argument(s) "
+            f"{missing} of compose_patch_feedback — this raises TypeError "
+            f"the first time a repair round lands zero patches"
+        )

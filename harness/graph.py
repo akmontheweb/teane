@@ -1760,6 +1760,15 @@ not apply, and costs an iteration.
    `edit_file` for surgical changes: a whole-file rewrite silently drops
    unrelated code whenever your copy of the file is stale or truncated.
    Reach for it only when the change is genuinely structural.
+
+7. **Never tidy imports as a side effect.** When your edit happens to
+   span an import block, carry every existing name through unchanged. An
+   import you believe is unused is almost always used somewhere you were
+   not shown — and the patcher's post-patch check rejects the WHOLE
+   patch over one missing name, so the functional change you actually
+   wanted is rolled back with it and the round is spent. If an import is
+   genuinely dead, remove it in its own separate edit, after confirming
+   with `grep` that nothing else in the file references it.
 """
 
 
@@ -21049,15 +21058,31 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 strip_read_blocks as _inturn_strip_read,
                 summarize_parse_miss as _inturn_parse_miss,
             )
-            _inturn_msg, _, _ = _compose_inturn(
+            # The counts are keyword-ONLY and required; omitting them
+            # raised TypeError from inside the retry on lumina 01a167cd,
+            # the first run in which this path ever executed. Derived
+            # from the same results list passed in, so the message's
+            # headline numbers match its body.
+            _inturn_all = (
                 list(_test_tamper_rejections) + list(_screen_rejections)
-                + list(patch_results),
+                + list(patch_results)
+            )
+            _it_success = sum(1 for r in _inturn_all if r.success)
+            _it_no_op = sum(
+                1 for r in _inturn_all
+                if r.success and getattr(r, "no_op", False)
+            )
+            _inturn_msg, _, _ = _compose_inturn(
+                _inturn_all,
                 list(allowed_paths or []),
                 _parse_miss_diag or "",
                 prefix=(
                     f"[System]: Your patches did NOT land (in-turn retry "
                     f"{_inturn_round}/{_inturn_cap}):"
                 ),
+                success_count=_it_success,
+                fail_count=len(_inturn_all) - _it_success,
+                no_op_count=_it_no_op,
             )
             # This retry does NOT run the READ_FILE resolution cycle — it
             # strips read requests rather than answering them. Saying so

@@ -4232,8 +4232,18 @@ def _note_dsl_in_native_mode(
     is why callers invoke it before any "no calls, nothing to do" exit.
 
     Never rejects. The text is parsed by the same ``PatchBlock`` backend the
-    tool calls fold into, so a DSL emission still applies; refusing it would
-    burn a round over a perfectly good patch. Measure, apply, move on.
+    tool calls fold into, so a patch-op DSL emission still applies; refusing
+    it would burn a round over a perfectly good patch. Measure, apply, move
+    on. A marker with no PatchBlock form does NOT apply, though -- lumina
+    01a16872 emitted ``<<<GREP>>>`` and ``<<<READ_FILE>>>`` as text and both
+    rounds closed at ``patches=0``.
+
+    NOT a model prior, despite what this used to claim. In ``repair_node``
+    the fold renders the model's own native calls into ``<<<...>>>`` text and
+    stores THAT as the assistant turn, so the next round ships the model four
+    of its own turns written in the dialect the bridge message forbids. The
+    model is copying the harness. ``patching_node`` keeps native calls in the
+    history and shows no drift.
 
     Returns the patch markers found, for the caller's own logging.
     """
@@ -4255,9 +4265,12 @@ def _note_dsl_in_native_mode(
     if prompt_was_native:
         logger.warning(
             "[%s] model emitted text patch DSL (%s) on a tools-enabled "
-            "dispatch whose prompt taught no DSL — a model prior, not a "
-            "harness instruction. Applied anyway via the shared backend "
-            "(%d tool call(s) alongside).",
+            "dispatch whose SYSTEM prompt taught no DSL. Check the "
+            "conversation history before blaming the model: the repair fold "
+            "writes native calls back as DSL text and stores them as the "
+            "assistant turn. Patch ops still apply via the shared backend; "
+            "a marker with no PatchBlock form does not (%d tool call(s) "
+            "alongside).",
             node_label, ", ".join(markers), n_tool_calls,
         )
     else:

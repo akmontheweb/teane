@@ -1703,17 +1703,21 @@ instead of guessing from file reads:
 _NATIVE_TOOL_MODE_BRIDGE = """
 ## How to emit changes — NATIVE TOOL-USE MODE (authoritative)
 Native tool-use is ENABLED. Emit every change by CALLING a tool. Never write
-tool syntax as text. Each change operation is a tool, and each tool's own
-schema documents its fields and the rules they must satisfy:
-  - `create_file`        — a new file with its full content
-  - `edit_file`          — exact-byte search/replace in a file
-  - `rewrite_file`       — overwrite an EXISTING file wholesale
-  - `delete_block`       — remove an exact-byte span
-  - `insert_at_block`    — insert relative to an anchor
-  - `insert_at_line`     — insert before a 1-indexed line
-  - `replace_line_range` — replace a 1-indexed inclusive range
-`insert_at_line` / `replace_line_range` are for when you only have line
-coordinates (a scanner or compiler span).
+tool syntax as text. There are exactly three ways to change a file, and each
+tool's own schema documents its fields and the rules they must satisfy:
+  - `edit_file`    — exact-byte search/replace in an existing file. The
+                     default: use it for every surgical change, including
+                     deleting code (replace the span with nothing) and
+                     inserting code (replace an adjacent span with itself
+                     plus your addition).
+  - `create_file`  — a new file with its full content
+  - `rewrite_file` — overwrite an EXISTING file wholesale; the escape hatch
+  - `delete_file`  — remove a file the refactor made obsolete
+  - `move_file`    — rename / relocate a file, content preserved
+When a change makes a file obsolete — a module you split, a duplicate test
+suite, a scratch file — DELETE it. Leaving it behind means it keeps being
+compiled and tested forever. Rename with `move_file`, not create+delete,
+and update the imports that named the old path.
 Read-only navigation (never changes files, available the whole turn):
 `read_file` (fetch a file's current bytes), plus `list_dir`, `glob`, `grep`,
 `find_symbol`, and `file_outline` for exploring the workspace.
@@ -1728,7 +1732,7 @@ _NATIVE_EDIT_INVARIANTS = """
 Not style guidance. Violating any of these produces a tool call that does
 not apply, and costs an iteration.
 
-1. **EXACT-BYTE matching.** An `edit_file` / `delete_block` search string
+1. **EXACT-BYTE matching.** An `edit_file` `old_string`
    must be a verbatim substring of the on-disk file. Whitespace,
    punctuation, quote style, trailing newlines and Unicode all matter. Do
    not "clean up" the text you are matching — copy it byte-for-byte.
@@ -1971,37 +1975,23 @@ def _change_roles_can_call_tools(config: Optional[dict[str, Any]]) -> bool:
     ships ``ollama:gemma4:12b`` with ``supports_tools: false``, and
     ``force_local_only`` / ``ollama_local_model`` make it reachable.
 
-    A model PRESENT in ``models`` is judged exactly as the gateway judges
-    it — ``supports_tools`` missing means False there (gateway.py:320), so
-    it must mean False here too, or an entry that simply omits the key
-    reopens the same mismatch. A model ABSENT from ``models`` is left to
-    the documented default (native): its capability lives in the bundled
-    price table the gateway consults, which this layer cannot see, and the
-    gateway logs loudly if it then suppresses. A bare ``config={}``
-    therefore behaves exactly as before.
+    Delegates to ``gateway.can_roles_call_tools``, which owns the rule.
+    Keeping a second copy here is what produced the mismatch in the first
+    place, and the copy missed ``force_local_only`` and the ``*_fallback``
+    models. A bare ``config={}`` resolves to native, as documented.
     """
-    cfg = config or {}
-    models = cfg.get("models") or {}
-    routing = cfg.get("model_routing") or {}
-    if not isinstance(models, dict) or not isinstance(routing, dict):
+    try:
+        from harness.gateway import can_roles_call_tools
+    except Exception:  # noqa: BLE001 — prompt build must never break
         return True
-    for role in _CHANGE_EMITTING_ROLES:
-        for suffix in ("_primary", "_fallback"):
-            key = routing.get(f"{role}{suffix}")
-            if not key:
-                continue
-            spec = models.get(str(key))
-            # Default False, matching the gateway's own ModelSpec parse.
-            if isinstance(spec, dict) and not spec.get("supports_tools", False):
-                logger.warning(
-                    "[prompt] %s routes to %s, which declares "
-                    "supports_tools=false — the gateway will suppress the "
-                    "tools array, so the system prompt ships the text-DSL "
-                    "reference instead of the native tool interface.",
-                    f"{role}{suffix}", key,
-                )
-                return False
-    return True
+    try:
+        return bool(can_roles_call_tools(config, _CHANGE_EMITTING_ROLES))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[prompt] could not resolve tool capability (%s); assuming "
+            "native tool mode, the documented default.", exc,
+        )
+        return True
 
 
 def _build_patch_interface_block(
@@ -4133,6 +4123,73 @@ async def _patching_tool_loop(
     return response, budget, messages, files_seen
 
 
+#: Text markers that are NOT patch operations: a read, a deferral
+#: promotion, or a web/MCP block. They have no tool equivalent (or are
+#: resolved host-side), so emitting them as text is correct in any mode
+#: and must not be counted as a dialect regression.
+_NON_PATCH_DSL_MARKERS = frozenset({
+    "READ_FILE", "PROMOTE_DEFERRED", "WEB_FETCH", "WEB_SEARCH", "MCP_CALL",
+})
+
+
+def _note_dsl_in_native_mode(
+    *, text: str, state: "AgentState", node_label: str, n_tool_calls: int,
+) -> list[str]:
+    """Record that a model wrote patch DSL as TEXT on a tools-enabled turn.
+
+    This is the residual signal for whether removing the dual dialect from
+    the prompt (4f935d6) actually changed behaviour. Across the pre-change
+    corpus 158 of 1,128 patching/repair responses (14%) emitted text DSL
+    while tools were on offer, and 157 of those made NO tool call at all —
+    so the measurement must run even on a turn with zero tool calls, which
+    is why callers invoke it before any "no calls, nothing to do" exit.
+
+    Never rejects. The text is parsed by the same ``PatchBlock`` backend the
+    tool calls fold into, so a DSL emission still applies; refusing it would
+    burn a round over a perfectly good patch. Measure, apply, move on.
+
+    Returns the patch markers found, for the caller's own logging.
+    """
+    if "<<<" not in (text or ""):
+        return []
+    markers = sorted({
+        m for m in re.findall(r"<<<([A-Z_]+)>>>", text)
+        if m not in _NON_PATCH_DSL_MARKERS and not m.startswith("END_")
+    })
+    if not markers:
+        return []
+    # Was the prompt actually built in native mode? A tools-enabled dispatch
+    # is NOT the same question: when the routed model cannot take tools the
+    # gateway strips the array and the prompt ships the DSL deliberately, so
+    # DSL there is correct behaviour rather than a model prior.
+    prompt_was_native = _change_roles_can_call_tools(
+        (state or {}).get("harness_config") or {}
+    )
+    if prompt_was_native:
+        logger.warning(
+            "[%s] model emitted text patch DSL (%s) on a tools-enabled "
+            "dispatch whose prompt taught no DSL — a model prior, not a "
+            "harness instruction. Applied anyway via the shared backend "
+            "(%d tool call(s) alongside).",
+            node_label, ", ".join(markers), n_tool_calls,
+        )
+    else:
+        logger.debug(
+            "[%s] text patch DSL (%s) with tools suppressed for the routed "
+            "model — expected, the prompt taught the DSL.",
+            node_label, ", ".join(markers),
+        )
+    try:
+        from harness.observability import emit_event
+        emit_event(
+            "dsl_in_native_mode", node=node_label, markers=markers,
+            tool_calls=n_tool_calls, prompt_was_native=prompt_was_native,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    return markers
+
+
 async def _dispatch_tools_as_dsl(
     *,
     gateway: Any,
@@ -4214,60 +4271,12 @@ async def _dispatch_tools_as_dsl(
             if isinstance(getattr(total, f.name), (int, float)):
                 setattr(total, f.name, sum(getattr(u, f.name) or 0 for u in usages))
 
-    # Did the model write patch DSL as TEXT while tools were on offer?
-    # In native mode the prompt now teaches no DSL at all (see
-    # ``_build_patch_interface_block``), so any marker here came from the
-    # model's own priors rather than from us. It still works — the text is
-    # concatenated with the rendered tool calls below and parsed by the
-    # same backend — but it is the residual signal for whether removing
-    # the dual dialect actually stopped the behaviour. Measure it; do not
-    # reject it, because rejecting would burn a round over a patch that is
-    # perfectly applicable.
-    _own_text = (getattr(response, "content", "") or "")
-    if "<<<" in _own_text:
-        import re as _re
-        _markers = sorted(set(_re.findall(r"<<<([A-Z_]+)>>>", _own_text)))
-        _patch_markers = [
-            m for m in _markers
-            if m not in ("READ_FILE", "PROMOTE_DEFERRED", "WEB_FETCH",
-                         "WEB_SEARCH", "MCP_CALL")
-            and not m.startswith("END_")
-        ]
-        if _patch_markers:
-            # Was the prompt actually built in native mode? The dispatch
-            # being tools-enabled is NOT the same question: when the routed
-            # model declares supports_tools=false the gateway suppresses the
-            # tools array and the prompt ships the DSL on purpose, so DSL
-            # here is correct behaviour, not a model prior. Resolve it the
-            # same way the prompt did rather than asserting something that
-            # can be false.
-            _prompt_was_native = _change_roles_can_call_tools(
-                (state or {}).get("harness_config") or {}
-            )
-            _n_calls = len(list(getattr(response, "tool_calls", None) or []))
-            if _prompt_was_native:
-                logger.warning(
-                    "[%s] model emitted text patch DSL (%s) on a "
-                    "tools-enabled dispatch whose prompt taught no DSL — a "
-                    "model prior, not a harness instruction. Applied anyway "
-                    "via the shared backend (%d tool call(s) alongside).",
-                    node_label, ", ".join(_patch_markers), _n_calls,
-                )
-            else:
-                logger.debug(
-                    "[%s] text patch DSL (%s) with tools suppressed for the "
-                    "routed model — expected, the prompt taught the DSL.",
-                    node_label, ", ".join(_patch_markers),
-                )
-            try:
-                from harness.observability import emit_event
-                emit_event(
-                    "dsl_in_native_mode", node=node_label,
-                    markers=_patch_markers, tool_calls=_n_calls,
-                    prompt_was_native=_prompt_was_native,
-                )
-            except Exception:  # noqa: BLE001 — telemetry must not block
-                pass
+    _note_dsl_in_native_mode(
+        text=getattr(response, "content", "") or "",
+        state=state,
+        node_label=node_label,
+        n_tool_calls=len(list(getattr(response, "tool_calls", None) or [])),
+    )
 
     calls = list(getattr(response, "tool_calls", None) or [])
     if not calls:
@@ -5196,8 +5205,8 @@ Generate your patches NOW. Only the blocks above. No other text."""
             + _IMPORT_CONVENTION_RULE
             + "[PATCHING — NATIVE TOOL-USE MODE]\n"
             "The harness has exposed the patch operations as native tools "
-            "(`read_file`, `edit_file`, `create_file`, `delete_block`, "
-            "`insert_at_block`). Call them directly via the provider's "
+            "(`read_file`, `edit_file`, `create_file`, `rewrite_file`). "
+            "Call them directly via the provider's "
             "tool-use API; never write tool syntax as text. `read_file` "
             "stays available for the WHOLE turn — call it any time you need a "
             "file's current bytes, before OR between patch operations, and the "
@@ -5205,7 +5214,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "content (it is never rejected as \"not a patch operation\"). "
             "Reads are budgeted per turn, so once you have the bytes you need, "
             "emit the patch operations — do not keep reading. Only "
-            "`create_file` / `edit_file` / `delete_block` / `insert_at_block` "
+            "`create_file` / `edit_file` / `rewrite_file` "
             "change files; `read_file` alone never produces code, so a turn "
             "that only reads makes no progress. "
             "Production code only this turn; test files are handled by "
@@ -5328,6 +5337,19 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # produces structured tool_calls and never has a parse miss.
         _parse_miss_diag = ""
         _resp_tool_calls = getattr(response, "tool_calls", None) or []
+        # A1: instrument this path too. Unlike repair, patching does NOT
+        # fold tool calls into the text, so ``combined_response_text`` is
+        # what the model actually authored. Must run before the
+        # ``if _resp_tool_calls`` split: a DSL-only emission carries zero
+        # tool calls and falls to the text branch, and that was 157 of the
+        # 158 pre-change cases. Measuring only repair under-reported the
+        # residual rate by roughly half.
+        _note_dsl_in_native_mode(
+            text=combined_response_text,
+            state=state,
+            node_label="patching_node",
+            n_tool_calls=len(_resp_tool_calls),
+        )
         if _resp_tool_calls:
             # Native tool-use path. Convert the LLM's tool calls into
             # PatchBlock objects and apply via the structured pipeline.
@@ -20320,8 +20342,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # would reintroduce the only place the model could learn them.
         _REPAIR_TOOL_REMINDER = f"""[REPAIR — NATIVE TOOL-USE MODE]
 Make every change by calling the patch tools (`edit_file`, `create_file`,
-`rewrite_file`, `delete_block`, `insert_at_block`, `insert_at_line`,
-`replace_line_range`). Do NOT write patch or read markers, or any other
+`rewrite_file`). Do NOT write patch or read markers, or any other
 tool syntax, as text.
 
 `read_file` is budgeted: at most {_read_file_rounds} read rounds per repair

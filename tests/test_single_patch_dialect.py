@@ -49,12 +49,22 @@ class TestExactlyOneDialectIsTaught:
         for op in _PATCH_OPS:
             assert op not in block, f"native prompt still names {op}"
 
-    def test_native_mode_names_the_tools(self):
+    def test_native_mode_names_the_tools_it_offers(self):
         block = _build_patch_interface_block(True)
-        for tool in ("create_file", "edit_file", "rewrite_file",
-                     "delete_block", "insert_at_block", "insert_at_line",
-                     "replace_line_range", "read_file"):
+        for tool in ("edit_file", "create_file", "rewrite_file", "read_file"):
             assert f"`{tool}`" in block, f"native prompt omits {tool}"
+
+    def test_native_mode_does_not_name_the_internal_only_ops(self):
+        """The four line/anchor ops totalled 17 of 1,229 observed calls and
+        ``delete_block`` was never called once. Their schemas and apply
+        paths stay (autofix and security_fix_rules build them
+        programmatically), but offering them to the model is surface it
+        can only get wrong — every one is an ``edit_file`` once the bytes
+        are in hand, which read-before-edit guarantees."""
+        block = _build_patch_interface_block(True)
+        for tool in ("delete_block", "insert_at_block", "insert_at_line",
+                     "replace_line_range"):
+            assert f"`{tool}`" not in block, f"native prompt still offers {tool}"
 
     def test_dsl_mode_keeps_every_operation_it_documented(self):
         block = _build_patch_interface_block(False)
@@ -160,14 +170,49 @@ class TestNeitherDialectIsTheRealHazard:
             shipped = json.load(fh)
         assert "NATIVE TOOL-USE" in _build_patch_interface_block(True, shipped)
 
-    def test_unknown_model_keeps_the_documented_default(self):
-        """Capability for a model absent from ``models`` lives in the
-        bundled price table this layer cannot see; the gateway logs loudly
-        if it then suppresses."""
+    def test_a_model_in_neither_config_nor_catalogue_gets_the_dsl(self):
+        """Capability now resolves config-first, then the bundled
+        ``model_prices.json`` registry. A key in NEITHER is tool-less as
+        far as dispatch is concerned (``ModelSpec`` would be absent), so
+        the safe dialect is the DSL."""
         block = _build_patch_interface_block(True, self._cfg(
-            {"patching_primary": "mystery"}, {},
+            {"patching_primary": "mystery:not-a-real-model"}, {},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+    def test_a_catalogue_model_absent_from_config_still_gets_native(self):
+        """The bundled catalogue is consulted, so an operator who routes to
+        a shipped model without re-declaring it in ``models`` keeps the
+        native interface."""
+        from harness.gateway import _MODEL_REGISTRY
+
+        capable = next(
+            (k for k, s in _MODEL_REGISTRY.items() if s.supports_tools), None,
+        )
+        if capable is None:
+            import pytest as _pytest
+            _pytest.skip("bundled catalogue declares no tool-capable model")
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": capable, "repair_primary": capable}, {},
         ))
         assert "NATIVE TOOL-USE" in block
+
+    def test_force_local_only_is_honoured(self):
+        """``select_model`` short-circuits every role to the local model, so
+        the dialect must follow that model's capability — a path the
+        graph-local duplicate missed entirely."""
+        block = _build_patch_interface_block(True, {
+            "model_routing": {
+                "force_local_only": True,
+                "ollama_local_model": "ollama:gemma4:12b",
+                "patching_primary": "capable",
+            },
+            "models": {
+                "capable": {"supports_tools": True},
+                "ollama:gemma4:12b": {"supports_tools": False},
+            },
+        })
+        assert "<<<REPLACE_BLOCK>>>" in block
 
     def test_bare_and_absent_config_behave_as_before(self):
         for cfg in (None, {}, {"patcher": {"use_structured_tools": True}}):
@@ -254,6 +299,54 @@ class TestToolSchemasDoNotTeachTheDsl:
         assert "escape hatch" in desc
 
 
+class TestInternalOnlyOpsStillWork:
+    """Narrowing the model-facing menu must not break the harness's own
+    deterministic fixers, which construct these operations directly."""
+
+    def test_they_are_not_advertised(self):
+        offered = {t["name"] for t in ts.PATCH_TOOLS}
+        for name in ("delete_block", "insert_at_block", "insert_at_line",
+                     "replace_line_range"):
+            assert name not in offered
+
+    def test_the_offered_set_is_exactly_the_industry_shape(self):
+        """Read, three ways to change a file, two whole-file lifecycle ops —
+        and nothing else."""
+        offered = {t["name"] for t in ts.PATCH_TOOLS}
+        assert offered == {
+            "read_file", "edit_file", "create_file", "rewrite_file",
+            "delete_file", "move_file",
+        }
+
+    def test_but_they_are_still_declared_and_dispatchable(self):
+        internal = {t["name"] for t in ts.INTERNAL_ONLY_PATCH_TOOLS}
+        assert internal == {
+            "delete_block", "insert_at_block", "insert_at_line",
+            "replace_line_range",
+        }
+        # A stored call from an older checkpoint must still apply.
+        block = ts.tool_call_to_patch_block({
+            "name": "delete_block",
+            "input": {"file_path": "a.py", "search": "x = 1"},
+        })
+        assert block is not None and block.file == "a.py"
+
+    def test_the_operation_types_autofix_depends_on_still_exist(self):
+        from harness.patcher import OperationType
+
+        for name in ("DELETE_BLOCK", "INSERT_AT_BLOCK", "INSERT_AT_LINE",
+                     "REPLACE_LINE_RANGE"):
+            assert hasattr(OperationType, name), (
+                f"{name} removed, but autofix.py / security_fix_rules.py "
+                f"build it programmatically"
+            )
+
+    def test_advertised_and_internal_sets_are_disjoint(self):
+        a = {t["name"] for t in ts.PATCH_TOOLS}
+        b = {t["name"] for t in ts.INTERNAL_ONLY_PATCH_TOOLS}
+        assert not (a & b)
+
+
 class TestTheSharedBackendIsStillReachable:
     """Tool calls are rendered to DSL and parsed by the same backend, so the
     parser is the convergence point for both dialects — not dead code."""
@@ -284,3 +377,149 @@ class TestTheSharedBackendIsStillReachable:
         blocks = parse_patch_blocks(dsl)
         assert len(blocks) == 1
         assert blocks[0].file == "a/b.py"
+
+
+class TestWholeFileLifecycleTools:
+    """Until ``delete_file`` / ``move_file`` existed the patcher could
+    create, edit and overwrite a file but never remove or rename one, so a
+    refactor that split or renamed a module left the original behind with
+    no operation capable of cleaning it up. Every industry editor covers
+    this, usually through a shell the harness does not expose.
+    """
+
+    def test_both_are_offered_to_the_model(self):
+        offered = {t["name"] for t in ts.PATCH_TOOLS}
+        assert {"delete_file", "move_file"} <= offered
+
+    def test_the_prompt_names_them_and_says_to_use_them(self):
+        block = _build_patch_interface_block(True)
+        assert "`delete_file`" in block
+        assert "`move_file`" in block
+        # The capability is useless if the model never thinks to reach for
+        # it; the prompt has to say obsolete files must go.
+        assert "obsolete" in block.lower()
+
+    def test_tool_calls_map_to_patch_blocks(self):
+        from harness.patcher import OperationType
+
+        d = ts.tool_call_to_patch_block({
+            "name": "delete_file", "input": {"file_path": "a/old.py"},
+        })
+        assert d.operation is OperationType.DELETE_FILE and d.file == "a/old.py"
+        m = ts.tool_call_to_patch_block({
+            "name": "move_file",
+            "input": {"file_path": "a/old.py", "dest_path": "b/new.py"},
+        })
+        assert m.operation is OperationType.MOVE_FILE
+        assert m.file == "a/old.py" and m.dest == "b/new.py"
+
+    def test_they_round_trip_through_the_dsl(self):
+        """``render_patch_block`` is what lets a native tool call reach the
+        shared apply backend in repair. An op the DSL cannot carry is an op
+        the repair fold silently DROPS, so the round trip is load-bearing —
+        not cosmetic."""
+        from harness.patcher import (
+            OperationType, PatchBlock, parse_patch_blocks, render_patch_block,
+        )
+
+        for block in (
+            PatchBlock(operation=OperationType.DELETE_FILE, file="a/old.py"),
+            PatchBlock(operation=OperationType.MOVE_FILE, file="a/old.py",
+                       dest="b/new.py"),
+        ):
+            dsl = render_patch_block(block)
+            assert dsl, f"{block.operation.name} has no DSL form"
+            back = parse_patch_blocks(dsl)
+            assert len(back) == 1
+            assert back[0].operation is block.operation
+            assert back[0].file == block.file
+            assert back[0].dest == block.dest
+
+    def test_the_repair_fold_does_not_drop_them(self):
+        for call in (
+            {"name": "delete_file", "input": {"file_path": "a/old.py"}},
+            {"name": "move_file",
+             "input": {"file_path": "a/old.py", "dest_path": "b/new.py"}},
+        ):
+            assert ts.tool_call_to_dsl(call), f"{call['name']} folds to None"
+
+
+class TestLifecycleSafety:
+    def _patcher(self, tmp_path):
+        from harness.patcher import HybridPatcher
+        return HybridPatcher(workspace_root=str(tmp_path))
+
+    def _apply(self, p, block):
+        import asyncio
+        return asyncio.run(p.apply_patch(block))
+
+    def _block(self, op, **kw):
+        from harness.patcher import OperationType, PatchBlock
+        return PatchBlock(operation=getattr(OperationType, op), **kw)
+
+    def test_move_refuses_to_clobber(self, tmp_path):
+        """A rename that eats another file is damage a repair loop cannot
+        see it has done."""
+        (tmp_path / "a.py").write_text("x = 1\n")
+        (tmp_path / "b.py").write_text("y = 2\n")
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("MOVE_FILE", file="a.py", dest="b.py"))
+        assert not r.success
+        assert "already exists" in (r.error or "")
+        assert (tmp_path / "b.py").read_text() == "y = 2\n"
+
+    def test_move_destination_cannot_escape_the_workspace(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("MOVE_FILE", file="a.py",
+                                    dest="../escaped.py"))
+        assert not r.success
+        assert (tmp_path / "a.py").exists()
+
+    def test_move_needs_a_destination(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("MOVE_FILE", file="a.py", dest=""))
+        assert not r.success
+
+    def test_move_of_a_missing_source_fails(self, tmp_path):
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("MOVE_FILE", file="nope.py", dest="b.py"))
+        assert not r.success
+
+    def test_move_onto_itself_is_a_no_op(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = 1\n")
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("MOVE_FILE", file="a.py", dest="a.py"))
+        assert r.success
+        assert (tmp_path / "a.py").read_text() == "x = 1\n"
+
+    def test_delete_is_idempotent(self, tmp_path):
+        """Resume-safe, matching create_file's semantics: re-running a
+        batch must not fail on a file the first pass already removed."""
+        (tmp_path / "a.py").write_text("x = 1\n")
+        p = self._patcher(tmp_path)
+        assert self._apply(p, self._block("DELETE_FILE", file="a.py")).success
+        assert self._apply(p, self._block("DELETE_FILE", file="a.py")).success
+
+    def test_delete_refuses_a_directory(self, tmp_path):
+        """A recursive delete is not something a generation loop should be
+        able to reach for."""
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "keep.py").write_text("x = 1\n")
+        r = self._apply(self._patcher(tmp_path),
+                        self._block("DELETE_FILE", file="pkg"))
+        assert not r.success
+        assert (tmp_path / "pkg" / "keep.py").exists()
+
+    def test_delete_cannot_escape_the_workspace(self, tmp_path):
+        outside = tmp_path.parent / "victim.py"
+        outside.write_text("precious\n")
+        try:
+            r = self._apply(self._patcher(tmp_path),
+                            self._block("DELETE_FILE", file="../victim.py"))
+            assert not r.success
+            assert outside.exists(), "deleted a file outside the workspace"
+        finally:
+            if outside.exists():
+                outside.unlink()

@@ -239,6 +239,10 @@ async def _apply_block(patcher: TextPatcher, block: PatchBlock) -> PatchResult:
             block.file, block.line, block.end_line, block.content,
             expected_file_hash=block.expected_file_hash,
         )
+    if block.operation == OperationType.DELETE_FILE:
+        return await patcher.delete_file(block.file)
+    if block.operation == OperationType.MOVE_FILE:
+        return await patcher.move_file(block.file, block.dest)
     return PatchResult(
         success=False,
         file=block.file,

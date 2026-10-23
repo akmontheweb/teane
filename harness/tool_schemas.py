@@ -341,16 +341,95 @@ REPLACE_LINE_RANGE_SCHEMA: dict[str, Any] = {
 }
 
 
-# Canonical ordering of tool schemas. Order matters because some
-# providers (notably Anthropic) preserve the order in their UI surfaces;
-# we want the most-used tools first. The line-coordinate ops sit at the
-# end of the patch tools — they're for the rare cases where the LLM has
-# line numbers but not content/anchor.
+DELETE_FILE_SCHEMA: dict[str, Any] = {
+    "name": "delete_file",
+    "description": (
+        "Delete a file from the workspace. Use it when a refactor makes a "
+        "file obsolete — a module you split, a duplicate suite, a scratch "
+        "file. Without it an obsolete file stays in the tree forever and "
+        "keeps being compiled and tested. Deleting an already-absent path "
+        "is a successful no-op; directories are refused."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path of the file to delete.",
+            },
+        },
+        "required": ["file_path"],
+    },
+}
+
+MOVE_FILE_SCHEMA: dict[str, Any] = {
+    "name": "move_file",
+    "description": (
+        "Move or rename a file within the workspace, preserving its "
+        "content. Prefer this over create_file + delete_file for a rename: "
+        "it is atomic and cannot lose the content in between. Will NOT "
+        "overwrite an existing destination — delete that first if it is "
+        "genuinely meant to go. Remember to update imports that referenced "
+        "the old path."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path of the file to move.",
+            },
+            "dest_path": {
+                "type": "string",
+                "description": (
+                    "Workspace-relative destination path. Parent "
+                    "directories are created as needed."
+                ),
+            },
+        },
+        "required": ["file_path", "dest_path"],
+    },
+}
+
+
+# What the MODEL is offered, in canonical order — some providers
+# (notably Anthropic) preserve it in their UI surfaces, so the most-used
+# tools come first.
+#
+# Narrowed to the three edit shapes the model actually reaches for.
+# Measured over 1,229 tool calls across 21 sessions:
+#
+#   read_file 520 (42%) · edit_file 353 (28%) · create_file 260 (21%)
+#   rewrite_file 8 · replace_line_range 5 · insert_at_block 3
+#   insert_at_line 1 · delete_block 0  (never called, ever)
+#
+# The four line/anchor ops totalled 17 calls — 1.4% — and every one of
+# them is expressible as an ``edit_file`` once the model has the bytes,
+# which read-before-edit (B5) now guarantees it does. Each advertised
+# tool is a choice the model can get wrong and a schema in every prompt,
+# so the surface costs more than those 17 calls were worth. For scale,
+# Claude Code ships three edit tools in total.
+#
+# Their SCHEMAS and apply paths stay: ``OperationType.DELETE_BLOCK``,
+# ``INSERT_AT_BLOCK``, ``INSERT_AT_LINE`` and ``REPLACE_LINE_RANGE`` are
+# load-bearing for deterministic harness code — ``autofix.py`` uses all
+# four and ``security_fix_rules.py`` builds INSERT_AT_LINE blocks — and
+# ``tool_call_to_patch_block`` still dispatches them, so a stored call
+# from an older checkpoint still applies. Only the model-facing menu
+# shrank. ``MODEL_FACING_PATCH_OPS`` records that split.
 PATCH_TOOLS: list[dict[str, Any]] = [
     READ_FILE_SCHEMA,
     EDIT_FILE_SCHEMA,
     CREATE_FILE_SCHEMA,
     REWRITE_FILE_SCHEMA,
+    DELETE_FILE_SCHEMA,
+    MOVE_FILE_SCHEMA,
+]
+
+#: Tool schemas defined and dispatchable, but deliberately NOT advertised
+#: to the model. Kept for programmatic construction by autofix / security
+#: fixes and for replaying a stored call. See the note on PATCH_TOOLS.
+INTERNAL_ONLY_PATCH_TOOLS: list[dict[str, Any]] = [
     DELETE_BLOCK_SCHEMA,
     INSERT_AT_BLOCK_SCHEMA,
     INSERT_AT_LINE_SCHEMA,
@@ -798,6 +877,17 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
             end_line=end_line,
             content=str(args.get("content", "")),
             expected_file_hash=str(args.get("expected_file_hash", "") or "").strip().lower(),
+        )
+    if name == "delete_file":
+        return PatchBlock(
+            operation=OperationType.DELETE_FILE,
+            file=str(args.get("file_path", "")).strip(),
+        )
+    if name == "move_file":
+        return PatchBlock(
+            operation=OperationType.MOVE_FILE,
+            file=str(args.get("file_path", "")).strip(),
+            dest=str(args.get("dest_path", "")).strip(),
         )
     # read_file is host-resolved, not a patch.
     return None

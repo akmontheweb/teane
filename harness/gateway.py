@@ -25,6 +25,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from collections.abc import Sequence
 from typing import Any, Awaitable, Callable, Optional, Union
 
 import httpx
@@ -345,6 +346,108 @@ def get_model_spec(model_key: str) -> Optional[ModelSpec]:
     models can be registered via .harness_config.json or register_model().
     """
     return _MODEL_REGISTRY.get(model_key)
+
+
+#: Role name → the ``model_routing`` key :meth:`Gateway.select_model`
+#: consults for it. Mirrors that method's dispatch table; a role absent
+#: here falls back to ``patching_primary``, exactly as it does there.
+_ROLE_PRIMARY_KEY: dict[str, str] = {
+    "planning": "planning_primary",
+    "patching": "patching_primary",
+    "repair": "repair_primary",
+    "judgment": "repair_primary",
+    "doc_reviewer": "doc_reviewer_primary",
+    "code_reviewer": "code_reviewer_primary",
+    "decomposition": "decomposition_primary",
+    "decomposition_reviewer": "decomposition_reviewer_primary",
+}
+
+
+def model_supports_tools(
+    model_key: str, config_dict: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Does ``model_key`` accept a native tools array?
+
+    Config wins over the bundled catalogue, because an operator entry in
+    ``models`` overrides ``model_prices.json`` at registry load. A key
+    missing from BOTH is False: :class:`ModelSpec` parses an absent
+    ``supports_tools`` as False (see the constructor above), and a prompt
+    that assumed otherwise would promise tools the dispatch then strips.
+    """
+    key = (model_key or "").strip()
+    if not key:
+        return False
+    models = ((config_dict or {}).get("models") or {})
+    if isinstance(models, dict):
+        entry = models.get(key)
+        if isinstance(entry, dict):
+            return bool(entry.get("supports_tools", False))
+    spec = _MODEL_REGISTRY.get(key)
+    return bool(spec.supports_tools) if spec is not None else False
+
+
+def can_roles_call_tools(
+    config_dict: Optional[dict[str, Any]], role_names: Sequence[str],
+) -> bool:
+    """Would ``dispatch`` actually send a tools array for every one of
+    ``role_names``?
+
+    SINGLE SOURCE OF TRUTH for a question two layers need to agree on.
+    ``dispatch`` sends tools only when ``use_structured_tools`` AND the
+    routed model's ``supports_tools`` both hold, and silently strips the
+    array otherwise. The system prompt must pick its patch dialect from
+    the SAME answer: since it teaches exactly one dialect, a prompt that
+    says "call the tools" while dispatch strips them leaves the model with
+    no way to emit a change at all.
+
+    Duplicating the rule in graph.py is what produced that mismatch in the
+    first place — and the duplicate missed two routing paths this function
+    covers: ``force_local_only`` (select_model short-circuits to the local
+    Ollama key, which may well be tool-less) and the ``*_fallback`` models
+    dispatched on a primary's empty-content exhaustion.
+
+    The budget-triggered local fallback (``force_local_below_usd``) is NOT
+    covered and cannot be: it fires mid-run on a prompt that was anchored
+    long before. ``dispatch`` logs a warning when it strips tools, which is
+    the only signal available for that case.
+    """
+    cfg = config_dict or {}
+    patcher_cfg = cfg.get("patcher") or {}
+    if isinstance(patcher_cfg, dict) and not patcher_cfg.get(
+        "use_structured_tools", True
+    ):
+        return False
+
+    routing = cfg.get("model_routing") or {}
+    if not isinstance(routing, dict):
+        routing = {}
+
+    # select_model short-circuits every role to the local model here.
+    if bool(routing.get("force_local_only", False)):
+        return model_supports_tools(
+            str(routing.get("ollama_local_model") or ""), cfg,
+        )
+
+    for role in role_names:
+        primary_key = _ROLE_PRIMARY_KEY.get(str(role), "patching_primary")
+        candidates = [routing.get(primary_key)]
+        # The fallback is dispatched on the primary's empty-content
+        # exhaustion, so it needs a usable dialect too.
+        fallback_key = primary_key.replace("_primary", "_fallback")
+        if fallback_key != primary_key:
+            candidates.append(routing.get(fallback_key))
+        for key in candidates:
+            if not key:
+                continue
+            if not model_supports_tools(str(key), cfg):
+                logger.warning(
+                    "[gateway] %s routes to %s, which does not accept a "
+                    "tools array — dispatch will strip it. Callers that "
+                    "pick a patch dialect must use the text DSL.",
+                    role, key,
+                )
+                return False
+    return True
 
 
 def register_model(model_key: str, spec: ModelSpec) -> None:

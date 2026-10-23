@@ -715,6 +715,12 @@ class TestOperationTypeDispatchCoverage:
                 operation=OperationType.REPLACE_LINE_RANGE, file="x",
                 line=1, end_line=1, content="y",
             ),
+            OperationType.DELETE_FILE: PatchBlock(
+                operation=OperationType.DELETE_FILE, file="x",
+            ),
+            OperationType.MOVE_FILE: PatchBlock(
+                operation=OperationType.MOVE_FILE, file="x", dest="z",
+            ),
         }
         # Sanity: we wrote a sample for every enum member.
         assert set(sample_blocks.keys()) == set(OperationType), (
@@ -755,6 +761,10 @@ class TestOperationTypeDispatchCoverage:
             OperationType.REPLACE_LINE_RANGE: (
                 "replace_line_range",
                 {"file_path": "x", "line": 1, "end_line": 1, "content": "y"},
+            ),
+            OperationType.DELETE_FILE: ("delete_file", {"file_path": "x"}),
+            OperationType.MOVE_FILE: (
+                "move_file", {"file_path": "x", "dest_path": "z"},
             ),
         }
         assert set(tool_inputs.keys()) == set(OperationType), (

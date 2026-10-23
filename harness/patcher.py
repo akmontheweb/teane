@@ -235,6 +235,16 @@ class OperationType(Enum):
     INSERT_AT_BLOCK = "insert_at_block"
     INSERT_AT_LINE = "insert_at_line"
     REPLACE_LINE_RANGE = "replace_line_range"
+    # Whole-file lifecycle. Until these existed the patcher could create,
+    # edit and overwrite a file but never remove or rename one, so any
+    # refactor that split or renamed a module left the original behind
+    # with no way to clean it up. That is a plausible contributor to the
+    # recurring split-test-tree problem (two divergent suites for the
+    # same module): the harness could author the second tree but had no
+    # operation capable of deleting the first. Every industry editor
+    # covers this, usually via a shell.
+    DELETE_FILE = "delete_file"
+    MOVE_FILE = "move_file"
     # Full-file overwrite. Emitted as an escape hatch when surgical
     # patches on a single file have failed to converge across multiple
     # repair rounds — the LLM's mental model of the file has drifted so
@@ -288,6 +298,9 @@ class PatchBlock:
     # re-extract diagnostics fresh per round can leave it blank).
     line: int = 0
     end_line: int = 0
+    #: Destination path for MOVE_FILE. ``file`` is the source; this is
+    #: where it lands. Unused by every other operation.
+    dest: str = ""
     expected_file_hash: str = ""
 
     raw_block: str = ""  # The full matched block text for debugging
@@ -635,6 +648,24 @@ _BLOCK_PATTERNS = {
         r'<<<END_REPLACE_LINE_RANGE>>>',
         re.DOTALL,
     ),
+    # Whole-file lifecycle. No body: a delete needs only the path, and a
+    # move needs the path plus its destination. They must round-trip
+    # through the DSL like every other op, because ``render_patch_block``
+    # is what lets a native tool call reach the shared apply backend —
+    # an op the parser does not know is an op the repair fold DROPS.
+    OperationType.DELETE_FILE: re.compile(
+        r'<<<DELETE_FILE>>>\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'<<<END_DELETE_FILE>>>',
+        re.DOTALL,
+    ),
+    OperationType.MOVE_FILE: re.compile(
+        r'<<<MOVE_FILE>>>\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'dest:\s*(?P<dest>' + _FIELD_VALUE + r')\s*\n'
+        r'<<<END_MOVE_FILE>>>',
+        re.DOTALL,
+    ),
 }
 
 
@@ -649,6 +680,8 @@ _PARSE_MISS_MARKERS: tuple[str, ...] = (
     "INSERT_AT_BLOCK",
     "INSERT_AT_LINE",
     "REPLACE_LINE_RANGE",
+    "DELETE_FILE",
+    "MOVE_FILE",
     # Aliases too, so a block that needed normalising is still reported if it
     # somehow fails to parse afterwards.
     "EDIT_FILE",
@@ -867,6 +900,19 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
                     content=gd["content"].rstrip(),
                     raw_block=raw,
                 ))
+            elif op_type == OperationType.DELETE_FILE:
+                blocks.append(PatchBlock(
+                    operation=OperationType.DELETE_FILE,
+                    file=gd["file"].strip(),
+                    raw_block=raw,
+                ))
+            elif op_type == OperationType.MOVE_FILE:
+                blocks.append(PatchBlock(
+                    operation=OperationType.MOVE_FILE,
+                    file=gd["file"].strip(),
+                    dest=gd["dest"].strip(),
+                    raw_block=raw,
+                ))
             elif op_type == OperationType.DELETE_BLOCK:
                 blocks.append(PatchBlock(
                     operation=OperationType.DELETE_BLOCK,
@@ -947,6 +993,11 @@ def render_patch_block(block: PatchBlock) -> Optional[str]:
         if block.expected_file_hash:
             head.append(f"hash: {block.expected_file_hash}")
         body = ["content:", block.content]
+    elif op == OperationType.DELETE_FILE:
+        body = []
+    elif op == OperationType.MOVE_FILE:
+        head.append(f"dest: {block.dest}")
+        body = []
     else:  # CREATE_FILE / REWRITE_FILE
         body = ["content:", block.content]
     text = "\n".join(head + body + [f"<<<END_{name}>>>"])
@@ -1828,6 +1879,128 @@ class TextPatcher(BasePatcher):
                 operation=OperationType.REWRITE_FILE,
                 error=str(exc),
             )
+
+    async def delete_file(self, filepath: str) -> PatchResult:
+        """Remove ``filepath`` from the workspace.
+
+        Idempotent: a path that is already gone is a successful no-op, so a
+        crash-then-resume of the same batch does not fail. Refuses a
+        directory — the operation is deliberately one file at a time, since
+        a recursive delete is not something a generation loop should be
+        able to reach for.
+        """
+        full_path = self._resolve_safe(filepath, OperationType.DELETE_FILE)
+        if isinstance(full_path, PatchResult):
+            return full_path
+        if not os.path.exists(full_path):
+            logger.info(
+                "[patcher:text] DELETE_FILE no-op: %s is already absent "
+                "(resume-safe).", filepath,
+            )
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.DELETE_FILE,
+                lines_changed=0,
+            )
+        if os.path.isdir(full_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.DELETE_FILE,
+                error=(
+                    f"`{filepath}` is a directory. delete_file removes a "
+                    f"single file; delete the files individually."
+                ),
+            )
+        try:
+            removed_lines = 0
+            try:
+                removed_lines = len((await _aread(full_path)).splitlines())
+            except (OSError, UnicodeDecodeError):
+                pass
+            os.unlink(full_path)
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.DELETE_FILE,
+                error=f"Could not delete: {exc}",
+            )
+        logger.info("[patcher:text] DELETE_FILE %s", filepath)
+        return PatchResult(
+            success=True, file=filepath,
+            operation=OperationType.DELETE_FILE,
+            lines_changed=removed_lines,
+        )
+
+    async def move_file(self, filepath: str, dest: str) -> PatchResult:
+        """Rename / move ``filepath`` to ``dest``.
+
+        BOTH paths go through ``_resolve_safe``, so a destination escaping
+        the workspace is refused exactly like a source would be. Will not
+        clobber: an existing destination is an error rather than a silent
+        overwrite, because a rename that eats another file is the kind of
+        damage a repair loop cannot see it has done.
+        """
+        src_path = self._resolve_safe(filepath, OperationType.MOVE_FILE)
+        if isinstance(src_path, PatchResult):
+            return src_path
+        if not (dest or "").strip():
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE,
+                error="move_file needs a destination path.",
+            )
+        dest_path = self._resolve_safe(dest, OperationType.MOVE_FILE)
+        if isinstance(dest_path, PatchResult):
+            return dest_path
+        if not os.path.exists(src_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE,
+                error=f"Source `{filepath}` does not exist.",
+            )
+        if os.path.isdir(src_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE,
+                error=f"`{filepath}` is a directory; move files individually.",
+            )
+        if os.path.abspath(src_path) == os.path.abspath(dest_path):
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.MOVE_FILE, lines_changed=0,
+            )
+        if os.path.exists(dest_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE,
+                error=(
+                    f"Destination `{dest}` already exists. move_file will "
+                    f"not overwrite it — delete it first if that is the "
+                    f"intent, or pick another destination."
+                ),
+            )
+        # A move into a tests root is a new test file as far as the
+        # one-canonical-tree invariant is concerned.
+        dup_err = _detect_duplicate_test_root(dest, self.workspace_root)
+        if dup_err:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE, error=dup_err,
+            )
+        try:
+            os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+            os.replace(src_path, dest_path)
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.MOVE_FILE,
+                error=f"Could not move to `{dest}`: {exc}",
+            )
+        logger.info("[patcher:text] MOVE_FILE %s -> %s", filepath, dest)
+        return PatchResult(
+            success=True, file=dest,
+            operation=OperationType.MOVE_FILE, lines_changed=0,
+        )
 
     async def replace_block(
         self, filepath: str, search: str, replace: str,
@@ -3385,6 +3558,13 @@ class HybridPatcher:
                 block.file, block.line, block.end_line, block.content,
                 expected_file_hash=block.expected_file_hash,
             )
+        elif block.operation == OperationType.DELETE_FILE:
+            # Whole-file lifecycle is a filesystem operation, not an
+            # AST edit — tree-sitter buys nothing, so take the text path
+            # directly like REWRITE_FILE does.
+            return await self._text_patcher.delete_file(block.file)
+        elif block.operation == OperationType.MOVE_FILE:
+            return await self._text_patcher.move_file(block.file, block.dest)
         else:
             return PatchResult(
                 success=False,
@@ -4650,9 +4830,11 @@ async def apply_patch_blocks(
                         operation=block.operation,
                         error=(
                             f"You have not been shown the current bytes of "
-                            f"`{block.file}`. Emit a READ_FILE block for it "
-                            f"first; the harness will resolve it inline and "
-                            f"re-dispatch you in the same iteration."
+                            f"`{block.file}`. Read it first — call the "
+                            f"`read_file` tool, or emit a READ_FILE block if "
+                            f"this turn offered you no tools; the harness "
+                            f"resolves either inline and re-dispatches you "
+                            f"in the same iteration."
                         ),
                     ))
                     continue

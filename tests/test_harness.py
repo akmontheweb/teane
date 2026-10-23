@@ -5747,10 +5747,14 @@ class TestClaudeCodeStyleEditPipeline:
     def test_b6_patch_tools_have_canonical_names(self):
         from harness.tool_schemas import PATCH_TOOLS
         names = [t["name"] for t in PATCH_TOOLS]
+        # The model-facing menu is read + three ways to change a file +
+        # two whole-file lifecycle ops. The four line/anchor ops moved to
+        # INTERNAL_ONLY_PATCH_TOOLS: measured at 17 of 1,229 observed
+        # calls, with delete_block never called once, while their schemas
+        # and apply paths stay for autofix / security_fix_rules.
         assert names == [
             "read_file", "edit_file", "create_file", "rewrite_file",
-            "delete_block", "insert_at_block", "insert_at_line",
-            "replace_line_range",
+            "delete_file", "move_file",
         ]
 
     def test_b6_anthropic_shape_keeps_input_schema(self):

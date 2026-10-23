@@ -24,14 +24,18 @@ class TestNativeToolBridge:
     def test_tool_mode_injects_bridge(self, tmp_path: Path):
         p = _prompt(tmp_path, True)
         assert "NATIVE TOOL-USE MODE (authoritative)" in p
-        # Maps each tool to the DSL operation it replaces.
-        assert "= REPLACE_BLOCK" in p and "edit_file" in p
-        assert "= CREATE_FILE" in p and "create_file" in p
+        # Names every change tool. It no longer maps them onto DSL
+        # operations ("edit_file (= REPLACE_BLOCK)"): naming the block is
+        # how the model learned the syntax it was then told not to write,
+        # and the DSL reference is no longer in this prompt at all.
+        for tool in ("edit_file", "create_file", "rewrite_file"):
+            assert f"`{tool}`" in p, tool
         # Documents the read-only navigation tools the prompt never named.
         for tool in ("read_file", "list_dir", "glob", "grep", "find_symbol"):
             assert tool in p, tool
-        # Tells the model to call tools, not write the <<<>>> markers.
-        assert "DO NOT reproduce the `<<<>>>` markers" in p
+        # Tells the model to call tools rather than write syntax as text.
+        # Whitespace-normalised: the prompt hard-wraps this sentence.
+        assert "never write tool syntax as text" in " ".join(p.lower().split())
 
     def test_text_mode_omits_bridge(self, tmp_path: Path):
         p = _prompt(tmp_path, False)
@@ -80,9 +84,8 @@ class TestNativeToolBridge:
             )
 
     def test_rewrite_file_is_a_callable_tool_not_just_prose(self, tmp_path: Path):
-        """The prompt tells the model to use REWRITE_FILE for whole-file
-        overwrites; that only works if ``rewrite_file`` is a real advertised
-        tool (native mode forbids emitting the raw ``<<<>>>`` markers).
+        """Whole-file overwrite must be reachable as a real advertised tool,
+        not only describable in prose — native mode offers no text syntax.
         """
         from harness.tool_schemas import PATCH_TOOLS, tool_call_to_patch_block
 
@@ -96,4 +99,7 @@ class TestNativeToolBridge:
         assert block is not None and block.file == "a.py"
 
         p = _prompt(tmp_path, True)
-        assert "`rewrite_file`" in p and "= REWRITE_FILE" in p
+        assert "`rewrite_file`" in p
+        # Its escape-hatch framing must survive, since that is the part
+        # that stops a stale whole-file rewrite dropping unrelated code.
+        assert "escape hatch" in p

@@ -3970,10 +3970,14 @@ class TestAgentState:
             content = state["messages"][0]["content"]
             assert "## Edit Invariants" in content
             assert "EXACT-BYTE matching" in content
-            # READ_FILE doc and count: modifier doc (Phase B2/B3) also
-            # live in the built-in prompt; they must also reach the LLM.
-            assert "READ_FILE" in content
-            assert "count: unique" in content or "count:" in content
+            # The read-before-edit and count guidance must reach the LLM
+            # too. Spelled for whichever dialect this run offers: native
+            # mode names the `read_file` TOOL and leaves the count enum to
+            # the tool schema, DSL mode documents the READ_FILE block and
+            # `count: unique` inline. Either is the full contract; what
+            # must never happen is neither.
+            assert "read_file" in content.lower()
+            assert "count" in content
 
     def test_route_after_compiler_success(self):
         from harness.graph import route_after_compiler

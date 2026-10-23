@@ -1681,36 +1681,286 @@ instead of guessing from file reads:
 """
 
 
-# Injected into the system prompt when native tool-use is active, so the
-# patcher contract that follows is framed as tools from the start instead of a
-# text DSL the end-of-prompt reminder then contradicts (prompt defect #3). Also
-# documents the read-only navigation tools (list_dir/glob/…) the model uses but
-# the prompt never named.
+# ONE dialect per call, chosen by provider capability — never both.
+#
+# The prompt used to carry the native-tool bridge AND the full text-DSL
+# reference (``## Patch Syntax`` + ``## Edit Invariants``, 10,696 chars)
+# at the same time, with the bridge saying "DO NOT reproduce the <<<>>>
+# markers" while the sections below taught that exact syntax in detail.
+# A model shown a syntax uses it: that is the whole explanation for the
+# ``<<<EDIT_FILE>>>`` emissions the patcher parsed as zero blocks
+# (1e08364), the non-canonical ``REWRITE_FILE`` output that needed
+# ``salvage_canonical_rewrite`` (5cb41d7), and the zero-patch rounds that
+# cascade into the distraction loop. It is not a model failing to follow
+# instructions; it is two instruction sets in one prompt.
+#
+# So: native mode gets the tool list plus the invariants that still apply
+# to a tool call, and the per-operation FIELD semantics live in each
+# tool's own JSON-Schema ``description`` (harness/tool_schemas.py), where
+# the provider renders them next to the call site. DSL mode — a provider
+# that cannot do tool use — gets the full text reference and no tool talk.
+# ``_build_patch_interface_block`` picks exactly one.
 _NATIVE_TOOL_MODE_BRIDGE = """
 ## How to emit changes — NATIVE TOOL-USE MODE (authoritative)
-Native tool-use is ENABLED. Emit every change by CALLING a tool — never by
-writing the `<<<...>>>` text markers. Each change operation is a tool:
-  - `create_file`      — a new file with its full content       (= CREATE_FILE)
-  - `edit_file`        — exact-byte search/replace in a file     (= REPLACE_BLOCK)
-  - `rewrite_file`     — overwrite an EXISTING file wholesale    (= REWRITE_FILE)
-  - `delete_block`     — remove an exact-byte span               (= DELETE_BLOCK)
-  - `insert_at_block`  — insert relative to an anchor            (= INSERT_AT_BLOCK)
-  - `insert_at_line`   — insert before a 1-indexed line          (= INSERT_AT_LINE)
-  - `replace_line_range` — replace a 1-indexed inclusive range   (= REPLACE_LINE_RANGE)
-`rewrite_file` is the escape hatch for whole-file replacement — prefer
-`edit_file` for surgical changes; `insert_at_line` / `replace_line_range`
-are for when you only have line coordinates (a scanner/compiler span).
+Native tool-use is ENABLED. Emit every change by CALLING a tool. Never write
+tool syntax as text. Each change operation is a tool, and each tool's own
+schema documents its fields and the rules they must satisfy:
+  - `create_file`        — a new file with its full content
+  - `edit_file`          — exact-byte search/replace in a file
+  - `rewrite_file`       — overwrite an EXISTING file wholesale
+  - `delete_block`       — remove an exact-byte span
+  - `insert_at_block`    — insert relative to an anchor
+  - `insert_at_line`     — insert before a 1-indexed line
+  - `replace_line_range` — replace a 1-indexed inclusive range
+`insert_at_line` / `replace_line_range` are for when you only have line
+coordinates (a scanner or compiler span).
 Read-only navigation (never changes files, available the whole turn):
 `read_file` (fetch a file's current bytes), plus `list_dir`, `glob`, `grep`,
 `find_symbol`, and `file_outline` for exploring the workspace.
-
-The "Patch Syntax" and "Edit Invariants" sections below document the FIELDS and
-RULES of each operation (file / search / replace / content / anchor / count …).
-Those fields map 1:1 to the tool arguments, and the Edit Invariants —
-exact-byte matching, stripping any `  N| ` line-number prefix, read-before-edit
-— apply to `edit_file` exactly as written. Read them to understand each
-operation's semantics, but DO NOT reproduce the `<<<>>>` markers: call the tools.
 """
+
+
+# The invariants that survive the move to tool calls. These are semantics,
+# not syntax, so they belong in the prompt; the per-field formats do not.
+_NATIVE_EDIT_INVARIANTS = """
+## Edit Invariants — the contract the patcher enforces
+
+Not style guidance. Violating any of these produces a tool call that does
+not apply, and costs an iteration.
+
+1. **EXACT-BYTE matching.** An `edit_file` / `delete_block` search string
+   must be a verbatim substring of the on-disk file. Whitespace,
+   punctuation, quote style, trailing newlines and Unicode all matter. Do
+   not "clean up" the text you are matching — copy it byte-for-byte.
+
+2. **Strip the line-number prefix.** When file content is shown to you
+   with a `  N| ` prefix (`## Current Content of Files You Need to Edit`,
+   or a patcher "Closest match" window), that prefix is navigation only.
+   The file's real content starts AFTER `  N| `. Never include it in a
+   search string — that text is not in the file.
+
+3. **Indentation is part of the match.** Preserve every leading space and
+   tab exactly as shown. A call that re-indents or normalises whitespace
+   will miss.
+
+4. **Read before you edit.** If the conversation has not shown you a
+   file's current bytes, you are guessing. Call `read_file` and use the
+   result — it stays available for the whole turn. Do not edit a file you
+   have not seen.
+
+5. **Use `count` instead of pasting more context.** When the same text
+   matches in several places, do not bloat the search to force uniqueness
+   — pass `count: "all"` or `count: "first"`.
+
+6. **`rewrite_file` is an escape hatch, not the default.** Prefer
+   `edit_file` for surgical changes: a whole-file rewrite silently drops
+   unrelated code whenever your copy of the file is stale or truncated.
+   Reach for it only when the change is genuinely structural.
+"""
+
+
+# The full text-DSL reference, used ONLY when the provider cannot do tool
+# use. Verbatim from the pre-change prompt, so a DSL-mode run behaves
+# exactly as before. Never emitted alongside the native bridge.
+_DSL_PATCH_SYNTAX = """\
+## Edit Invariants — read before writing any REPLACE_BLOCK
+
+These rules are not style guidance — they are the contract the patcher
+enforces. Violating any of them produces a patch that will not apply.
+
+1. **EXACT-BYTE matching.** A REPLACE_BLOCK / DELETE_BLOCK `search:` block
+   must be a verbatim substring of the on-disk file. Whitespace,
+   punctuation, quote style, trailing newlines, and Unicode characters
+   all matter. Do not "clean up" the search text — copy it byte-for-byte.
+
+2. **Strip the line-number prefix.** When file content is shown to you
+   with a `  N| ` prefix (look for `## Current Content of Files You
+   Need to Edit` or any patcher "Closest match" window), the prefix is
+   navigation only. The actual file content starts AFTER `  N| `. Never
+   include `  N| ` in a `search:` block — that string is not in the file.
+
+3. **Indentation is part of the search.** Preserve every leading space
+   and tab exactly as it appears in the line-numbered view. Patches that
+   re-indent or normalize whitespace will miss.
+
+4. **Read before you edit.** If the conversation has not shown you a
+   file's current bytes — either in `## Current Content of Files You
+   Need to Edit` or in a patcher "Closest match" window — you are
+   guessing. Do not guess. Either limit your edit to a file you have
+   been shown, or emit a `READ_FILE` block (see below) and stop. The
+   harness will resolve it and re-dispatch with the content present
+   before counting an iteration.
+
+5. **Use `count:` instead of pasting larger context.** When the same
+   search text would match multiple places, do NOT bloat your search to
+   force uniqueness — set `count: all` to replace every occurrence or
+   `count: first` to replace only the first. (See REPLACE_BLOCK below.)
+
+## Patch Syntax
+When applying patches, use these exact formats:
+
+### REPLACE_BLOCK
+```
+<<<REPLACE_BLOCK>>>
+file: path/to/file.ext
+count: unique          # optional; one of: unique (default) | all | first
+search:
+<exact lines to find>
+replace:
+<exact replacement lines>
+<<<END_REPLACE_BLOCK>>>
+```
+
+`count:` is OPTIONAL. Values:
+- `unique` (default) — fail when `search` matches more than once. Matches
+  historical strict behaviour.
+- `all` — apply the replacement to every occurrence.
+- `first` — apply only to the first occurrence.
+
+Use `all` / `first` when you need to fix multiple identical lines and
+adding context to make `search` unique would be redundant. Same field
+works on `DELETE_BLOCK`.
+
+### READ_FILE
+```
+<<<READ_FILE>>>
+file: path/to/foo.py
+range: 1-200          # optional; default = whole file (capped)
+<<<END_READ_FILE>>>
+```
+
+Use this when you do not know — or are not sure of — a file's current
+bytes. The harness will:
+
+1. Read the file from disk in the same sandbox the build runs in.
+2. Append the line-numbered current content to the conversation as a
+   user message.
+3. Re-dispatch you in the same iteration, so READ_FILE does NOT consume
+   a repair-loop slot.
+
+You may emit READ_FILE blocks alongside patch blocks in the same
+response; the patches still apply. If you only need to read, emit ONLY
+the READ_FILE block(s) and no patches. Cap: READ_FILE resolution rounds
+per iteration are budgeted (the exact budget is stated in the format
+instruction each turn) — past the budget the harness ignores further
+READ_FILE blocks and applies whatever patches you emitted.
+
+When to use READ_FILE:
+- Your REPLACE_BLOCK keeps missing and the diagnostic does not include a
+  "Closest match" window with the file content.
+- The diagnostic points at a file you have not been shown in the
+  conversation.
+- You are about to write a patch but your mental model of the file is
+  stale (e.g. several iterations have happened since you last saw it).
+
+### CREATE_FILE
+```
+<<<CREATE_FILE>>>
+file: path/to/new/file.ext
+content:
+<complete file contents>
+<<<END_CREATE_FILE>>>
+```
+
+### REWRITE_FILE — escape hatch, NOT the default
+```
+<<<REWRITE_FILE>>>
+file: path/to/existing/file.ext
+content:
+<complete new file contents>
+<<<END_REWRITE_FILE>>>
+```
+
+REWRITE_FILE overwrites an existing file wholesale. Use it when EITHER:
+  - the JUDGE'S VERDICT banner explicitly says "You MAY now emit
+    REWRITE_FILE on X" (fires when the SAME file:line has been the
+    blocker for 3+ rounds), OR
+  - the "## REPLACE_BLOCK pattern-repetition trap — REWRITE_FILE
+    UNLOCKED" section names the file (fires at ≥2 consecutive
+    REPLACE_BLOCK misses on the same file). Both grants are equivalent
+    — either one authorises REWRITE_FILE for the named files this
+    turn. The ≥2-miss grant is the escape hatch for stuck-file loops
+    where REPLACE_BLOCK searches keep missing (session 6177bcec
+    terminated at the HITL cap because this grant did not exist).
+For everyday edits, use REPLACE_BLOCK.
+
+Because REWRITE_FILE clobbers the file, you MUST supply the COMPLETE
+corrected contents (imports, every class, every def, every existing
+test). A partial rewrite deletes whatever you didn't include —
+recovery is expensive. Post-patch parse validation still applies: if
+your REWRITE_FILE produces unparseable Python or JSON the patcher rolls
+the file back to its pre-patch state and reports the block as failed.
+
+**CREATE_FILE vs REPLACE_BLOCK — read this carefully.**
+- `CREATE_FILE` is for files that **do not yet exist**.
+- If a file already exists with the **same** content, `CREATE_FILE` is a safe no-op (used for resumes).
+- If a file already exists with **different** content, `CREATE_FILE` will be **REJECTED** by the patcher with the error "File already exists with different content". The patcher will NOT overwrite.
+- To change an existing file, use **`REPLACE_BLOCK`** (find the exact lines you want to change, replace them with the new lines). If you need to replace an existing file **wholesale**, use **`REWRITE_FILE`** (the escape hatch documented above) — do NOT force a whole-file `REPLACE_BLOCK` whose `search:` has to byte-match the entire file, which is brittle and misses on the smallest drift.
+- **If you created a file in a previous turn**, that file now exists — any subsequent edit to it must use `REPLACE_BLOCK`, not `CREATE_FILE`. The "## Files currently in workspace" section in your repair prompt (when present) is authoritative on what exists.
+- **Never emit two `CREATE_FILE` blocks for the same path in a single response.** Each path gets exactly one block per response. The patcher applies blocks in order, so the SECOND `CREATE_FILE` for the same path will be REJECTED ("File already exists with different content") even though it was you who just created the file moments earlier. If you need to refine the content as you draft, edit your own response before submitting; if you need two variants, pick the one you want and emit just that. Symptom: an initial patching round logs `Applied N-2/N patches` with the rejected file appearing in the "Failed" list paired with itself.
+
+**Imports — do NOT duplicate.** When you need a symbol that requires a new import:
+- First scan the existing imports in the file for the same symbol (e.g. `AsyncGenerator`, `Optional`, `Path`).
+- If an import for that symbol already exists — even from a different source module — **replace it** with `REPLACE_BLOCK`. Do NOT add a second `from ... import <same_symbol>` line; Python will shadow the first import silently and lint will flag F811 ("redefinition of unused"), but the underlying problem is that future REPLACE_BLOCK searches against the import region keep missing because the file has drifted from your mental model.
+- Concretely: if the file has `from typing import AsyncGenerator` and you want the `collections.abc` version, replace the typing line — don't append the collections.abc line.
+
+**Imports — placement.** Every `import` / `from ... import ...` statement MUST appear at the **top of the file**, above any non-import code (class, def, module-level expression). This applies to NEW files (CREATE_FILE) AND to existing files (REPLACE_BLOCK / INSERT_AT_BLOCK). Concretely:
+- When CREATE_FILE'ing a new module, put every import at the top, before any class / def / assignment.
+- When REPLACE_BLOCK'ing to add a new import, place it next to the existing import block at the top — NEVER at the bottom of the file, NEVER inside a function/class body, NEVER between `def` and `class` definitions further down.
+- If a symbol is only used inside one function and you're tempted to "import locally" — still put it at the top unless you have a documented reason (circular-import workaround, optional-dependency guard).
+- Bottom-of-file imports cause `NameError` at module import time when the bottom-imported symbol is referenced anywhere above its line. Lint will catch it as F811 or F821, but more importantly the test collector will fail before the repair LLM ever sees the actual root cause.
+
+**Makefile — MUST declare a `build:` target.** If you CREATE_FILE a `Makefile` (or `makefile` / `GNUmakefile`) at workspace root, it MUST declare a `build:` target. The harness invokes `make build` by default — a Makefile with `install:`, `test:`, `run:`, etc. but no `build:` target crashes the sandbox immediately:
+- The shell can't find `build` → `make` reports "No rule to make target 'build'"; before that, the base `ubuntu:22.04` image doesn't even ship `make` itself → exit 127 in under a second.
+- Zero diagnostics get extracted, the repair LLM has nothing to act on, the loop spins for 5 iterations and routes to HITL.
+- Minimum acceptable shape for a Python project (uv is pre-installed in
+  the sandbox and 10-30× faster than pip; ALWAYS prefer `uv pip install`
+  over plain `pip install`, see harness/skills/makefile_python.md):
+  ```
+  .PHONY: build test
+  PYTHON := /usr/local/bin/python3
+  build:
+  	uv pip install --python $(PYTHON) --break-system-packages -r requirements.txt
+  test:
+  	$(PYTHON) -m pytest -q
+  ```
+  Use a TAB to indent recipe lines (not spaces — `make` rejects spaces with `*** missing separator. Stop.`).
+- The `build:` target should perform the install / compile step a CI would need to run before tests. Tests live under `test:` (or a separate target wired into `test:`).
+- If you're not sure whether to emit a Makefile at all, DON'T — the harness picks the right install + test command from `pyproject.toml` / `requirements.txt` / `package.json` / etc. A Makefile is only useful when YOU genuinely want operators to run `make build` themselves.
+
+### DELETE_BLOCK
+```
+<<<DELETE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to delete>
+<<<END_DELETE_BLOCK>>>
+```
+
+### INSERT_AT_BLOCK
+```
+<<<INSERT_AT_BLOCK>>>
+file: path/to/file.ext
+anchor: <function or class name to insert relative to>
+placement: before|after
+content:
+<lines to insert>
+<<<END_INSERT_AT_BLOCK>>>
+```
+"""
+
+
+def _build_patch_interface_block(uses_tools: bool) -> str:
+    """The ONE patch interface this call offers.
+
+    ``uses_tools`` is the per-run ``patcher.use_structured_tools`` value,
+    so the anchored prompt stays cache-stable within a run. Returning both
+    halves is what caused the dual-dialect emissions — see the comment on
+    ``_NATIVE_TOOL_MODE_BRIDGE``.
+    """
+    if uses_tools:
+        return _NATIVE_TOOL_MODE_BRIDGE + _NATIVE_EDIT_INVARIANTS
+    return _DSL_PATCH_SYNTAX
 
 
 def _build_system_prompt(
@@ -1920,15 +2170,15 @@ def _build_system_prompt(
     except Exception:  # noqa: BLE001 — prompt build must never break on LSP
         pass
 
-    # When native tool-use is active (the default), the operations below are
-    # exposed as tools — reconcile the two so the model isn't taught a text DSL
-    # in the system prompt and then told to use tools instead (prompt defect
-    # #3: dual interface). A stable per-run config value, so the anchored
-    # prompt stays cache-stable within a run.
+    # ONE patch interface, chosen by whether this run can call tools. A
+    # stable per-run config value, so the anchored prompt stays cache-stable
+    # within a run. In native mode the per-operation field semantics come
+    # from the tool schemas, not from here — see
+    # ``_build_patch_interface_block``.
     _uses_tools = bool(
         (config or {}).get("patcher", {}).get("use_structured_tools", True)
     )
-    tool_mode_bridge = _NATIVE_TOOL_MODE_BRIDGE if _uses_tools else ""
+    patch_interface_block = _build_patch_interface_block(_uses_tools)
 
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
@@ -1982,192 +2232,7 @@ NOT read prose. Your reply must BE the code changes, not a description of them:
    zero patches, and on models that reason by default it can exhaust the whole
    output budget (finish_reason=length) before a single change is written.
 3. Only modify files that need changes — never touch unrelated code.
-{tool_mode_bridge}
-## Edit Invariants — read before writing any REPLACE_BLOCK
-
-These rules are not style guidance — they are the contract the patcher
-enforces. Violating any of them produces a patch that will not apply.
-
-1. **EXACT-BYTE matching.** A REPLACE_BLOCK / DELETE_BLOCK `search:` block
-   must be a verbatim substring of the on-disk file. Whitespace,
-   punctuation, quote style, trailing newlines, and Unicode characters
-   all matter. Do not "clean up" the search text — copy it byte-for-byte.
-
-2. **Strip the line-number prefix.** When file content is shown to you
-   with a `  N| ` prefix (look for `## Current Content of Files You
-   Need to Edit` or any patcher "Closest match" window), the prefix is
-   navigation only. The actual file content starts AFTER `  N| `. Never
-   include `  N| ` in a `search:` block — that string is not in the file.
-
-3. **Indentation is part of the search.** Preserve every leading space
-   and tab exactly as it appears in the line-numbered view. Patches that
-   re-indent or normalize whitespace will miss.
-
-4. **Read before you edit.** If the conversation has not shown you a
-   file's current bytes — either in `## Current Content of Files You
-   Need to Edit` or in a patcher "Closest match" window — you are
-   guessing. Do not guess. Either limit your edit to a file you have
-   been shown, or emit a `READ_FILE` block (see below) and stop. The
-   harness will resolve it and re-dispatch with the content present
-   before counting an iteration.
-
-5. **Use `count:` instead of pasting larger context.** When the same
-   search text would match multiple places, do NOT bloat your search to
-   force uniqueness — set `count: all` to replace every occurrence or
-   `count: first` to replace only the first. (See REPLACE_BLOCK below.)
-
-## Patch Syntax
-When applying patches, use these exact formats:
-
-### REPLACE_BLOCK
-```
-<<<REPLACE_BLOCK>>>
-file: path/to/file.ext
-count: unique          # optional; one of: unique (default) | all | first
-search:
-<exact lines to find>
-replace:
-<exact replacement lines>
-<<<END_REPLACE_BLOCK>>>
-```
-
-`count:` is OPTIONAL. Values:
-- `unique` (default) — fail when `search` matches more than once. Matches
-  historical strict behaviour.
-- `all` — apply the replacement to every occurrence.
-- `first` — apply only to the first occurrence.
-
-Use `all` / `first` when you need to fix multiple identical lines and
-adding context to make `search` unique would be redundant. Same field
-works on `DELETE_BLOCK`.
-
-### READ_FILE
-```
-<<<READ_FILE>>>
-file: path/to/foo.py
-range: 1-200          # optional; default = whole file (capped)
-<<<END_READ_FILE>>>
-```
-
-Use this when you do not know — or are not sure of — a file's current
-bytes. The harness will:
-
-1. Read the file from disk in the same sandbox the build runs in.
-2. Append the line-numbered current content to the conversation as a
-   user message.
-3. Re-dispatch you in the same iteration, so READ_FILE does NOT consume
-   a repair-loop slot.
-
-You may emit READ_FILE blocks alongside patch blocks in the same
-response; the patches still apply. If you only need to read, emit ONLY
-the READ_FILE block(s) and no patches. Cap: READ_FILE resolution rounds
-per iteration are budgeted (the exact budget is stated in the format
-instruction each turn) — past the budget the harness ignores further
-READ_FILE blocks and applies whatever patches you emitted.
-
-When to use READ_FILE:
-- Your REPLACE_BLOCK keeps missing and the diagnostic does not include a
-  "Closest match" window with the file content.
-- The diagnostic points at a file you have not been shown in the
-  conversation.
-- You are about to write a patch but your mental model of the file is
-  stale (e.g. several iterations have happened since you last saw it).
-
-### CREATE_FILE
-```
-<<<CREATE_FILE>>>
-file: path/to/new/file.ext
-content:
-<complete file contents>
-<<<END_CREATE_FILE>>>
-```
-
-### REWRITE_FILE — escape hatch, NOT the default
-```
-<<<REWRITE_FILE>>>
-file: path/to/existing/file.ext
-content:
-<complete new file contents>
-<<<END_REWRITE_FILE>>>
-```
-
-REWRITE_FILE overwrites an existing file wholesale. Use it when EITHER:
-  - the JUDGE'S VERDICT banner explicitly says "You MAY now emit
-    REWRITE_FILE on X" (fires when the SAME file:line has been the
-    blocker for 3+ rounds), OR
-  - the "## REPLACE_BLOCK pattern-repetition trap — REWRITE_FILE
-    UNLOCKED" section names the file (fires at ≥2 consecutive
-    REPLACE_BLOCK misses on the same file). Both grants are equivalent
-    — either one authorises REWRITE_FILE for the named files this
-    turn. The ≥2-miss grant is the escape hatch for stuck-file loops
-    where REPLACE_BLOCK searches keep missing (session 6177bcec
-    terminated at the HITL cap because this grant did not exist).
-For everyday edits, use REPLACE_BLOCK.
-
-Because REWRITE_FILE clobbers the file, you MUST supply the COMPLETE
-corrected contents (imports, every class, every def, every existing
-test). A partial rewrite deletes whatever you didn't include —
-recovery is expensive. Post-patch parse validation still applies: if
-your REWRITE_FILE produces unparseable Python or JSON the patcher rolls
-the file back to its pre-patch state and reports the block as failed.
-
-**CREATE_FILE vs REPLACE_BLOCK — read this carefully.**
-- `CREATE_FILE` is for files that **do not yet exist**.
-- If a file already exists with the **same** content, `CREATE_FILE` is a safe no-op (used for resumes).
-- If a file already exists with **different** content, `CREATE_FILE` will be **REJECTED** by the patcher with the error "File already exists with different content". The patcher will NOT overwrite.
-- To change an existing file, use **`REPLACE_BLOCK`** (find the exact lines you want to change, replace them with the new lines). If you need to replace an existing file **wholesale**, use **`REWRITE_FILE`** (the escape hatch documented above) — do NOT force a whole-file `REPLACE_BLOCK` whose `search:` has to byte-match the entire file, which is brittle and misses on the smallest drift.
-- **If you created a file in a previous turn**, that file now exists — any subsequent edit to it must use `REPLACE_BLOCK`, not `CREATE_FILE`. The "## Files currently in workspace" section in your repair prompt (when present) is authoritative on what exists.
-- **Never emit two `CREATE_FILE` blocks for the same path in a single response.** Each path gets exactly one block per response. The patcher applies blocks in order, so the SECOND `CREATE_FILE` for the same path will be REJECTED ("File already exists with different content") even though it was you who just created the file moments earlier. If you need to refine the content as you draft, edit your own response before submitting; if you need two variants, pick the one you want and emit just that. Symptom: an initial patching round logs `Applied N-2/N patches` with the rejected file appearing in the "Failed" list paired with itself.
-
-**Imports — do NOT duplicate.** When you need a symbol that requires a new import:
-- First scan the existing imports in the file for the same symbol (e.g. `AsyncGenerator`, `Optional`, `Path`).
-- If an import for that symbol already exists — even from a different source module — **replace it** with `REPLACE_BLOCK`. Do NOT add a second `from ... import <same_symbol>` line; Python will shadow the first import silently and lint will flag F811 ("redefinition of unused"), but the underlying problem is that future REPLACE_BLOCK searches against the import region keep missing because the file has drifted from your mental model.
-- Concretely: if the file has `from typing import AsyncGenerator` and you want the `collections.abc` version, replace the typing line — don't append the collections.abc line.
-
-**Imports — placement.** Every `import` / `from ... import ...` statement MUST appear at the **top of the file**, above any non-import code (class, def, module-level expression). This applies to NEW files (CREATE_FILE) AND to existing files (REPLACE_BLOCK / INSERT_AT_BLOCK). Concretely:
-- When CREATE_FILE'ing a new module, put every import at the top, before any class / def / assignment.
-- When REPLACE_BLOCK'ing to add a new import, place it next to the existing import block at the top — NEVER at the bottom of the file, NEVER inside a function/class body, NEVER between `def` and `class` definitions further down.
-- If a symbol is only used inside one function and you're tempted to "import locally" — still put it at the top unless you have a documented reason (circular-import workaround, optional-dependency guard).
-- Bottom-of-file imports cause `NameError` at module import time when the bottom-imported symbol is referenced anywhere above its line. Lint will catch it as F811 or F821, but more importantly the test collector will fail before the repair LLM ever sees the actual root cause.
-
-**Makefile — MUST declare a `build:` target.** If you CREATE_FILE a `Makefile` (or `makefile` / `GNUmakefile`) at workspace root, it MUST declare a `build:` target. The harness invokes `make build` by default — a Makefile with `install:`, `test:`, `run:`, etc. but no `build:` target crashes the sandbox immediately:
-- The shell can't find `build` → `make` reports "No rule to make target 'build'"; before that, the base `ubuntu:22.04` image doesn't even ship `make` itself → exit 127 in under a second.
-- Zero diagnostics get extracted, the repair LLM has nothing to act on, the loop spins for 5 iterations and routes to HITL.
-- Minimum acceptable shape for a Python project (uv is pre-installed in
-  the sandbox and 10-30× faster than pip; ALWAYS prefer `uv pip install`
-  over plain `pip install`, see harness/skills/makefile_python.md):
-  ```
-  .PHONY: build test
-  PYTHON := /usr/local/bin/python3
-  build:
-  	uv pip install --python $(PYTHON) --break-system-packages -r requirements.txt
-  test:
-  	$(PYTHON) -m pytest -q
-  ```
-  Use a TAB to indent recipe lines (not spaces — `make` rejects spaces with `*** missing separator. Stop.`).
-- The `build:` target should perform the install / compile step a CI would need to run before tests. Tests live under `test:` (or a separate target wired into `test:`).
-- If you're not sure whether to emit a Makefile at all, DON'T — the harness picks the right install + test command from `pyproject.toml` / `requirements.txt` / `package.json` / etc. A Makefile is only useful when YOU genuinely want operators to run `make build` themselves.
-
-### DELETE_BLOCK
-```
-<<<DELETE_BLOCK>>>
-file: path/to/file.ext
-search:
-<exact lines to delete>
-<<<END_DELETE_BLOCK>>>
-```
-
-### INSERT_AT_BLOCK
-```
-<<<INSERT_AT_BLOCK>>>
-file: path/to/file.ext
-anchor: <function or class name to insert relative to>
-placement: before|after
-content:
-<lines to insert>
-<<<END_INSERT_AT_BLOCK>>>
-```
-
+{patch_interface_block}
 ## Code Quality Standards
 - Write modular, self-contained functions/classes with single responsibility.
 - Include proper error handling: try/except, input validation, graceful fallbacks.
@@ -4091,6 +4156,44 @@ async def _dispatch_tools_as_dsl(
             if isinstance(getattr(total, f.name), (int, float)):
                 setattr(total, f.name, sum(getattr(u, f.name) or 0 for u in usages))
 
+    # Did the model write patch DSL as TEXT while tools were on offer?
+    # In native mode the prompt now teaches no DSL at all (see
+    # ``_build_patch_interface_block``), so any marker here came from the
+    # model's own priors rather than from us. It still works — the text is
+    # concatenated with the rendered tool calls below and parsed by the
+    # same backend — but it is the residual signal for whether removing
+    # the dual dialect actually stopped the behaviour. Measure it; do not
+    # reject it, because rejecting would burn a round over a patch that is
+    # perfectly applicable.
+    _own_text = (getattr(response, "content", "") or "")
+    if "<<<" in _own_text:
+        import re as _re
+        _markers = sorted(set(_re.findall(r"<<<([A-Z_]+)>>>", _own_text)))
+        _patch_markers = [
+            m for m in _markers
+            if m not in ("READ_FILE", "PROMOTE_DEFERRED", "WEB_FETCH",
+                         "WEB_SEARCH", "MCP_CALL")
+            and not m.startswith("END_")
+        ]
+        if _patch_markers:
+            logger.warning(
+                "[%s] model emitted text patch DSL (%s) in NATIVE TOOL "
+                "mode. Applied anyway via the shared backend, but the "
+                "prompt taught no DSL — this is a model prior, not a "
+                "harness instruction.",
+                node_label, ", ".join(_patch_markers),
+            )
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    "dsl_in_native_mode", node=node_label,
+                    markers=_patch_markers, tool_calls=len(
+                        list(getattr(response, "tool_calls", None) or [])
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+
     calls = list(getattr(response, "tool_calls", None) or [])
     if not calls:
         return response, budget
@@ -5020,7 +5123,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "The harness has exposed the patch operations as native tools "
             "(`read_file`, `edit_file`, `create_file`, `delete_block`, "
             "`insert_at_block`). Call them directly via the provider's "
-            "tool-use API instead of emitting the text DSL. `read_file` "
+            "tool-use API; never write tool syntax as text. `read_file` "
             "stays available for the WHOLE turn — call it any time you need a "
             "file's current bytes, before OR between patch operations, and the "
             "harness resolves it inline and re-dispatches you with the "
@@ -20136,16 +20239,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # In change-request mode prepend the CR-N attribution rules so
         # repair patches also carry the marker comments.
         _read_file_rounds = _resolve_read_file_rounds(state)
-        # Tool mode keeps the DSL out of the reminder: the system prompt has
-        # already said "never write the <<<...>>> markers: call the tools",
-        # and a reminder teaching the markers as the ONLY syntax is the
-        # contradiction that sent the model to its trained tool syntax.
+        # Tool mode keeps the DSL out of the reminder. In native mode the
+        # system prompt carries no DSL at all (see
+        # ``_build_patch_interface_block``), so naming block markers here
+        # would reintroduce the only place the model could learn them.
         _REPAIR_TOOL_REMINDER = f"""[REPAIR — NATIVE TOOL-USE MODE]
 Make every change by calling the patch tools (`edit_file`, `create_file`,
 `rewrite_file`, `delete_block`, `insert_at_block`, `insert_at_line`,
-`replace_line_range`). Where this prompt names a block (REPLACE_BLOCK,
-CREATE_FILE, REWRITE_FILE, …), call the tool of the same meaning. Do NOT
-write patch or read markers, or any other tool syntax, as text.
+`replace_line_range`). Do NOT write patch or read markers, or any other
+tool syntax, as text.
 
 `read_file` is budgeted: at most {_read_file_rounds} read rounds per repair
 iteration, after which further reads are dropped and you must patch with

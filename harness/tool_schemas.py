@@ -48,10 +48,16 @@ EDIT_FILE_SCHEMA: dict[str, Any] = {
     "name": "edit_file",
     "description": (
         "Replace an exact-match block of text within an existing file. "
-        "Equivalent to <<<REPLACE_BLOCK>>> in the text DSL. The search "
-        "string MUST be a verbatim substring of the on-disk file — copy "
-        "bytes from a READ_FILE result or a closest-match window, never "
-        "guess."
+        "This is the default way to change code. `old_string` MUST be a "
+        "verbatim substring of the on-disk file: whitespace, "
+        "punctuation, quote style and Unicode all matter, and "
+        "indentation is part of the match. Copy the bytes from a "
+        "`read_file` result or a closest-match window — never "
+        "reconstruct them from memory. When content was shown with a "
+        "`  N| ` line-number prefix, that prefix is navigation only and "
+        "is NOT in the file; the real content starts after it. If you "
+        "have not seen the file's current bytes this turn, call "
+        "`read_file` first rather than guessing."
     ),
     "input_schema": {
         "type": "object",
@@ -86,8 +92,8 @@ EDIT_FILE_SCHEMA: dict[str, Any] = {
 CREATE_FILE_SCHEMA: dict[str, Any] = {
     "name": "create_file",
     "description": (
-        "Create a new file with the given content. Equivalent to "
-        "<<<CREATE_FILE>>> in the text DSL. Rejected if the target "
+        "Create a new file with the given content. "
+        "Rejected if the target "
         "already exists with different content; safe no-op when the "
         "target already exists with identical content."
     ),
@@ -110,11 +116,10 @@ CREATE_FILE_SCHEMA: dict[str, Any] = {
 REWRITE_FILE_SCHEMA: dict[str, Any] = {
     "name": "rewrite_file",
     "description": (
-        "Overwrite an EXISTING file wholesale with new content. "
-        "Equivalent to <<<REWRITE_FILE>>> in the text DSL. This is the "
+        "Overwrite an EXISTING file wholesale with new content. This is the "
         "escape hatch for whole-file replacement — prefer edit_file for "
         "surgical changes and reach for this only when a file needs to be "
-        "rebuilt end-to-end (or when a stuck-file REPLACE_BLOCK loop has "
+        "rebuilt end-to-end (or when a stuck-file edit loop has "
         "unlocked it). You MUST supply the COMPLETE corrected contents "
         "(imports, every class, every def, every existing test) — a "
         "partial rewrite deletes whatever you leave out. Emitting content "
@@ -142,7 +147,8 @@ DELETE_BLOCK_SCHEMA: dict[str, Any] = {
     "name": "delete_block",
     "description": (
         "Remove an exact-match block of text from an existing file. "
-        "Equivalent to <<<DELETE_BLOCK>>> in the text DSL."
+        "`search` must match the on-disk bytes exactly, under the same "
+        "rules as `edit_file`'s `old_string`."
     ),
     "input_schema": {
         "type": "object",
@@ -170,7 +176,7 @@ INSERT_AT_BLOCK_SCHEMA: dict[str, Any] = {
     "name": "insert_at_block",
     "description": (
         "Insert content immediately before or after a named function or "
-        "class. Equivalent to <<<INSERT_AT_BLOCK>>> in the text DSL."
+        "class, named by `anchor`."
     ),
     "input_schema": {
         "type": "object",
@@ -249,7 +255,7 @@ INSERT_AT_LINE_SCHEMA: dict[str, Any] = {
     "name": "insert_at_line",
     "description": (
         "Insert content BEFORE a specific 1-indexed line in a file. "
-        "Equivalent to <<<INSERT_AT_LINE>>> in the text DSL. Prefer "
+        "Prefer "
         "edit_file / insert_at_block when you can describe the target "
         "by content or anchor name; use this when you only have line "
         "coordinates (e.g. a diagnostic from a scanner)."
@@ -291,7 +297,7 @@ REPLACE_LINE_RANGE_SCHEMA: dict[str, Any] = {
     "name": "replace_line_range",
     "description": (
         "Replace a 1-indexed inclusive line range with new content. "
-        "Equivalent to <<<REPLACE_LINE_RANGE>>> in the text DSL. Empty "
+        "Empty "
         "``content`` deletes the range. Use when you only have line "
         "coordinates (scanner diagnostic, compiler error span)."
     ),

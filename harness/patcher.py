@@ -4740,6 +4740,30 @@ async def apply_patch_blocks(
         from harness.trust import is_path_allowed
         allowed_list = list(allowed_paths)
         for block in other_blocks:
+            # MOVE_FILE writes to ``dest``, so the allowlist has to cover
+            # BOTH ends. Checking only ``file`` let a move carry a
+            # permitted file to an off-limits path: ``_resolve_safe``
+            # stops a workspace escape but knows nothing about the
+            # story's allowed scope.
+            if (block.operation == OperationType.MOVE_FILE
+                    and not is_path_allowed(
+                        block.dest, workspace_root, allowed_list)):
+                results.append(PatchResult(
+                    success=False,
+                    file=block.file,
+                    operation=block.operation,
+                    error=(
+                        f"move destination `{block.dest}` is outside this "
+                        f"round's allowed paths. A move writes to the "
+                        f"destination, so it must be allowed too — pick a "
+                        f"destination inside the allowed scope."
+                    ),
+                ))
+                logger.warning(
+                    "[patcher] Rejected MOVE_FILE: dest %s not in allowlist.",
+                    block.dest,
+                )
+                continue
             if is_path_allowed(block.file, workspace_root, allowed_list):
                 blocks_to_apply.append(block)
             elif os.path.isabs(block.file):
@@ -4934,7 +4958,28 @@ async def apply_patch_blocks(
     modified_files = list(existing_modified_files or [])
     newly_modified: list[str] = []
     for result in results:
-        if result.success and result.file not in modified_files:
+        if not result.success:
+            continue
+        # A path that no longer exists must NOT enter ``modified_files``:
+        # that list is what lintgate, the diagnostics gate and
+        # traceability iterate over, and they would be handed a file to
+        # format, type-check and attribute that is gone. A DELETE_FILE
+        # drops the path instead, and a MOVE_FILE (whose result.file is
+        # already the DESTINATION) also retires the source it emptied.
+        if result.operation == OperationType.DELETE_FILE:
+            if result.file in modified_files:
+                modified_files.remove(result.file)
+            continue
+        if result.operation == OperationType.MOVE_FILE:
+            src = next(
+                (b.file for b in blocks_to_apply
+                 if b.operation == OperationType.MOVE_FILE
+                 and b.dest == result.file),
+                "",
+            )
+            if src and src in modified_files:
+                modified_files.remove(src)
+        if result.file not in modified_files:
             modified_files.append(result.file)
             newly_modified.append(result.file)
 

@@ -7499,6 +7499,31 @@ def _reject_test_patch_blocks(
     rejections: list[Any] = []
     for block in blocks:
         file_path = getattr(block, "file", "") or ""
+        # A MOVE_FILE writes to its destination, so the destination is
+        # subject to the same protection as the source. Checking only
+        # ``file`` would let this node author a test file it is forbidden
+        # to write — move a non-test file to ``tests/test_x.py`` and the
+        # guard, which only ever saw a non-test source, waves it through.
+        _dest = str(getattr(block, "dest", "") or "")
+        if _dest and _is_test_artifact(_dest) and not (
+            workspace_path
+            and _is_harness_generated_fixture(_dest, workspace_path)
+        ):
+            rejections.append(
+                PatchResult(
+                    success=False,
+                    file=file_path,
+                    operation=getattr(block, "operation", None),
+                    error=(
+                        f"move destination `{_dest}` is a test file. This "
+                        f"node may not author or replace tests — a move "
+                        f"into a test path is authoring one. Fix the "
+                        f"production code instead, or declare the test "
+                        f"unsatisfiable if it cannot be satisfied."
+                    ),
+                )
+            )
+            continue
         if (
             allow_parse_broken
             and _normalize_ws_path(file_path, workspace_path)

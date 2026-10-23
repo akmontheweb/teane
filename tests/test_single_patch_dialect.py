@@ -523,3 +523,109 @@ class TestLifecycleSafety:
         finally:
             if outside.exists():
                 outside.unlink()
+
+
+class TestLifecycleOpsRespectTheExistingGuards:
+    """Adding a tool that WRITES to a second path reopens every guard that
+    only ever inspected one. ``move_file`` has a destination the allowlist
+    and the test-tamper guard had no reason to look at, and ``delete_file``
+    produces a path that must not flow downstream as "modified"."""
+
+    def _apply(self, blocks, ws, allowed=None, existing=None):
+        import asyncio
+
+        from harness.patcher import apply_patch_blocks
+        return asyncio.run(apply_patch_blocks(
+            blocks, str(ws), list(existing or []), allowed_paths=allowed,
+        ))
+
+    def _mv(self, src, dest):
+        from harness.patcher import OperationType, PatchBlock
+        return PatchBlock(
+            operation=OperationType.MOVE_FILE, file=src, dest=dest,
+        )
+
+    def _rm(self, path):
+        from harness.patcher import OperationType, PatchBlock
+        return PatchBlock(operation=OperationType.DELETE_FILE, file=path)
+
+    def test_move_destination_must_be_in_the_allowlist(self, tmp_path):
+        """``_resolve_safe`` stops a workspace escape but knows nothing
+        about the round's allowed scope, so a move could carry a permitted
+        file to an off-limits path."""
+        (tmp_path / "allowed.py").write_text("x = 1\n")
+        results, _ = self._apply(
+            [self._mv("allowed.py", "forbidden/x.py")], tmp_path,
+            allowed=["allowed.py"],
+        )
+        assert not results[0].success
+        assert "destination" in (results[0].error or "")
+        assert (tmp_path / "allowed.py").exists(), "source was moved anyway"
+
+    def test_move_within_the_allowlist_still_applies(self, tmp_path):
+        (tmp_path / "ok").mkdir()
+        (tmp_path / "ok" / "a.py").write_text("x = 1\n")
+        results, modified = self._apply(
+            [self._mv("ok/a.py", "ok/b.py")], tmp_path, allowed=["ok/"],
+        )
+        assert results[0].success
+        assert modified == ["ok/b.py"]
+
+    def test_a_deleted_path_never_enters_modified_files(self, tmp_path):
+        """``modified_files`` is what lintgate, the diagnostics gate and
+        traceability iterate over. A removed path there hands them a file
+        to format, type-check and attribute that no longer exists."""
+        (tmp_path / "doomed.py").write_text("y = 2\n")
+        results, modified = self._apply(
+            [self._rm("doomed.py")], tmp_path,
+            allowed=["doomed.py"], existing=["doomed.py"],
+        )
+        assert results[0].success
+        assert "doomed.py" not in modified
+
+    def test_a_move_retires_the_source_it_emptied(self, tmp_path):
+        (tmp_path / "ok").mkdir()
+        (tmp_path / "ok" / "a.py").write_text("z = 3\n")
+        results, modified = self._apply(
+            [self._mv("ok/a.py", "ok/b.py")], tmp_path,
+            allowed=["ok/"], existing=["ok/a.py"],
+        )
+        assert results[0].success
+        assert "ok/a.py" not in modified, "stale source left in modified_files"
+        assert "ok/b.py" in modified
+
+    def test_repair_cannot_author_a_test_by_moving_one_in(self):
+        """Repair may not write test files. The guard only ever inspected
+        the SOURCE, so moving a non-test file to a test path would have
+        authored one through a path it never looked at."""
+        from harness.graph import _reject_test_patch_blocks
+
+        kept, rejected = _reject_test_patch_blocks([
+            self._mv("src/helper.py", "server/tests/test_sneaky.py"),
+        ])
+        assert kept == []
+        assert len(rejected) == 1
+        assert "test file" in (rejected[0].error or "")
+
+    def test_repair_cannot_delete_a_protected_test(self):
+        """Deleting a failing test is the purest form of the reward hack
+        the guard exists to stop."""
+        from harness.graph import _reject_test_patch_blocks
+
+        kept, rejected = _reject_test_patch_blocks([
+            self._rm("server/tests/test_failing.py"),
+        ])
+        assert kept == []
+        assert len(rejected) == 1
+
+    def test_ordinary_lifecycle_changes_are_still_allowed(self):
+        """The guards must not become a blanket ban — deleting an obsolete
+        module and renaming a source file are the point of these tools."""
+        from harness.graph import _reject_test_patch_blocks
+
+        kept, rejected = _reject_test_patch_blocks([
+            self._mv("src/a.py", "src/b.py"),
+            self._rm("src/obsolete.py"),
+        ])
+        assert len(kept) == 2
+        assert rejected == []

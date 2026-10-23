@@ -313,3 +313,85 @@ class TestTheRetryActuallyRuns:
             f"{missing} of compose_patch_feedback — this raises TypeError "
             f"the first time a repair round lands zero patches"
         )
+
+
+class TestItOnlyRetriesARoundThatWasREJECTED:
+    """Narrowed after measuring 8 firings across two live runs.
+
+        round shape            firings   recovered
+        patches=0 (nothing)       5          0
+        failed / rolled-back      3          2
+
+    lumina 01a16872 fired three times on ``patches=0`` rounds (#8, #9, #10)
+    and recovered none. 01a1682e's two recoveries were both after a
+    post-patch validation ROLLBACK, where the patcher's diagnostic names
+    the exact broken symbol and the model can act on it.
+
+    A round that emitted nothing has no feedback to act on — the model is
+    out of ideas, and re-prompting with the same context produces the same
+    silence. Firing there spends a dispatch to be told nothing twice.
+    """
+
+    def _retry_would_fire(self, results):
+        """Mirror of the block's guards, in order, for the zero-real case."""
+        from harness.graph import _repair_failures_are_policy_only
+
+        real = sum(
+            1 for r in results if r.success and not getattr(r, "no_op", False)
+        )
+        if real:
+            return False
+        if not any(not r.success for r in results):
+            return False
+        if _repair_failures_are_policy_only(results):
+            return False
+        return True
+
+    def test_an_empty_round_does_not_retry(self):
+        """patches=0 — the shape that wasted 3 of run 01a16872's 4 firings."""
+        assert not self._retry_would_fire([])
+
+    def test_a_rolled_back_patch_does_retry(self):
+        """The shape behind both of run 01a1682e's recoveries."""
+        assert self._retry_would_fire([
+            _result(False, "Post-patch validation failed: Undefined name(s): "
+                           "`resolve_caller_timezone`. … ROLLED BACK"),
+        ])
+
+    def test_a_no_match_does_retry(self):
+        assert self._retry_would_fire(
+            [_result(False, "Search text not found in file")]
+        )
+
+    def test_a_round_of_only_no_ops_does_not_retry(self):
+        """Successful-but-idempotent results carry no rejection to correct,
+        so there is nothing for a retry to act on."""
+        assert not self._retry_would_fire([_result(True, no_op=True)])
+
+    def test_a_landed_patch_does_not_retry(self):
+        assert not self._retry_would_fire([_result(True)])
+
+    def test_a_policy_only_round_still_does_not_retry(self):
+        """The earlier guard is unchanged: an allowlist rejection is not
+        correctable by re-asking."""
+        assert not self._retry_would_fire(
+            [_result(False, "x not in skill allowlist")]
+        )
+
+    def test_a_mix_of_landed_and_failed_does_not_retry(self):
+        """Something real landed, so the round did its job — the failure
+        rides to the next round's feedback as before."""
+        assert not self._retry_would_fire([
+            _result(True), _result(False, "Search text not found in file"),
+        ])
+
+    def test_the_guard_is_present_and_ordered_before_the_policy_check(self):
+        block = TestTheLoopIsWiredIntoRepair._retry_block()
+        assert "not any(not r.success for r in patch_results)" in block
+        empty_at = block.index("not any(not r.success")
+        policy_at = block.index("_repair_failures_are_policy_only")
+        assert empty_at < policy_at, (
+            "the empty-round guard must precede the policy check, or an "
+            "empty round reaches the policy classifier which returns False "
+            "for an empty failure list and lets the retry fire"
+        )

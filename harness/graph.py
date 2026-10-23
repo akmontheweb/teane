@@ -21035,6 +21035,30 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
             )
             if _rs:
                 break  # something real landed; the round did its job
+            # Only a round that TRIED and was REJECTED is worth re-asking.
+            # A round that emitted nothing has no feedback to act on: the
+            # model is out of ideas, and re-prompting it with the same
+            # context produces the same silence. Measured across two runs,
+            # 8 firings:
+            #
+            #   round shape           firings   recovered
+            #   patches=0 (nothing)      5          0
+            #   failed/rolled-back       3          2
+            #
+            # lumina 01a16872 fired three times on ``patches=0`` rounds
+            # (#8, #9, #10) and recovered none; 01a1682e's two recoveries
+            # were both after a post-patch validation rollback, where the
+            # patcher's diagnostic names the exact broken symbol and the
+            # model can correct it. Firing on an empty round spends a
+            # dispatch to be told nothing twice.
+            if not any(not r.success for r in patch_results):
+                logger.info(
+                    "[repair_node:in-turn] Round emitted no failed patch to "
+                    "correct (%d result(s)) — not re-dispatching; there is "
+                    "no feedback a retry could act on.",
+                    len(patch_results),
+                )
+                break
             if _repair_failures_are_policy_only(patch_results):
                 logger.info(
                     "[repair_node:in-turn] Zero patches landed but every "

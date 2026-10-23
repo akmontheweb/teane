@@ -91,6 +91,102 @@ class TestExactlyOneDialectIsTaught:
         assert len(_DSL_PATCH_SYNTAX) > 10_000
 
 
+class TestNeitherDialectIsTheRealHazard:
+    """Teaching one dialect is only safe if it is the one the gateway will
+    honour. The prompt reads ``patcher.use_structured_tools``; the gateway
+    requires that AND ``spec.supports_tools`` for the routed model,
+    suppressing the tools array otherwise (gateway.py:3605). While the
+    prompt carried BOTH dialects that mismatch was survivable — the model
+    wrote DSL. With native mode teaching no DSL, a tool-incapable model
+    would have no tools to call and no syntax to write, and every patching
+    turn would produce nothing. ``config.json`` ships
+    ``ollama:gemma4:12b`` with ``supports_tools: false``.
+    """
+
+    def _cfg(self, routing, models):
+        return {"model_routing": routing, "models": models}
+
+    def test_tool_less_primary_falls_back_to_the_dsl(self):
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": "ollama:gemma4:12b"},
+            {"ollama:gemma4:12b": {"supports_tools": False}},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+    def test_tool_less_fallback_also_falls_back(self):
+        """The fallback is dispatched on the primary's empty-content
+        exhaustion, so it needs a dialect it can actually use too."""
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": "good", "patching_fallback": "bad"},
+            {"good": {"supports_tools": True}, "bad": {"supports_tools": False}},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+    def test_repair_role_is_checked_too_not_just_patching(self):
+        block = _build_patch_interface_block(True, self._cfg(
+            {"repair_primary": "bad"}, {"bad": {"supports_tools": False}},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+    def test_missing_key_is_read_as_FALSE_like_the_gateway(self):
+        """``ModelSpec`` parses a missing ``supports_tools`` as False
+        (gateway.py:320). Reading it as True here would let an entry that
+        merely omits the key reopen the mismatch."""
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": "m"}, {"m": {}},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+    def test_capable_models_still_get_native(self):
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": "ok", "repair_primary": "ok"},
+            {"ok": {"supports_tools": True}},
+        ))
+        assert "NATIVE TOOL-USE" in block
+        assert "<<<" not in block
+
+    def test_the_shipped_config_resolves_to_native(self):
+        """Guard against a routing edit silently downgrading every prompt."""
+        import json
+        import os
+
+        import harness.graph as g
+
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(g.__file__))),
+            "config", "config.json",
+        )
+        with open(cfg_path, encoding="utf-8") as fh:
+            shipped = json.load(fh)
+        assert "NATIVE TOOL-USE" in _build_patch_interface_block(True, shipped)
+
+    def test_unknown_model_keeps_the_documented_default(self):
+        """Capability for a model absent from ``models`` lives in the
+        bundled price table this layer cannot see; the gateway logs loudly
+        if it then suppresses."""
+        block = _build_patch_interface_block(True, self._cfg(
+            {"patching_primary": "mystery"}, {},
+        ))
+        assert "NATIVE TOOL-USE" in block
+
+    def test_bare_and_absent_config_behave_as_before(self):
+        for cfg in (None, {}, {"patcher": {"use_structured_tools": True}}):
+            assert "NATIVE TOOL-USE" in _build_patch_interface_block(True, cfg)
+
+    def test_malformed_config_does_not_raise(self):
+        for cfg in ({"models": "oops", "model_routing": {}},
+                    {"models": {}, "model_routing": "oops"},
+                    {"models": {"m": "notadict"},
+                     "model_routing": {"patching_primary": "m"}}):
+            assert _build_patch_interface_block(True, cfg)
+
+    def test_the_flag_off_still_wins_regardless_of_capability(self):
+        block = _build_patch_interface_block(False, self._cfg(
+            {"patching_primary": "ok"}, {"ok": {"supports_tools": True}},
+        ))
+        assert "<<<REPLACE_BLOCK>>>" in block
+
+
 class TestNativeInvariantsKeepTheSemantics:
     """The field FORMATS moved to the schemas; the RULES stay in the prompt
     because they are semantics, not syntax."""

@@ -3605,10 +3605,23 @@ class Gateway:
         if tools and self.config.use_structured_tools and spec.supports_tools:
             effective_tools = list(tools)
         elif tools and not (self.config.use_structured_tools and spec.supports_tools):
-            logger.debug(
-                "[gateway] tools= passed but suppressed (use_structured_tools=%s, "
-                "model=%s supports_tools=%s).",
+            # WARNING, not debug: the system prompt now teaches exactly one
+            # dialect (graph._build_patch_interface_block). It resolves tool
+            # capability from config's ``models``/``model_routing``, which
+            # covers a model the config declares tool-incapable — but not one
+            # whose capability is only known here (bundled price defaults, a
+            # late routing override). In that case the prompt says "call the
+            # tools" while this suppresses them, leaving the model no way to
+            # emit a change. Loud so the mismatch is diagnosable from the log
+            # instead of looking like an unexplained empty response.
+            logger.warning(
+                "[gateway] tools= passed but SUPPRESSED (use_structured_tools=%s, "
+                "model=%s supports_tools=%s). If the system prompt was built in "
+                "native-tool mode, this model has neither tools nor a text DSL "
+                "to use — set patcher.use_structured_tools=false, or declare "
+                "supports_tools for %s in config models.",
                 self.config.use_structured_tools, model_key, spec.supports_tools,
+                model_key,
             )
         # tool_choice is meaningless — and a 400 on OpenAI-compat backends —
         # without the tools array it names, so it dies with the suppression

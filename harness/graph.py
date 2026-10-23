@@ -1950,15 +1950,73 @@ content:
 """
 
 
-def _build_patch_interface_block(uses_tools: bool) -> str:
+#: Roles that emit file changes. Only these decide the dialect: a
+#: tool-less reviewer or planner never needs a patch interface at all.
+_CHANGE_EMITTING_ROLES = ("patching", "repair")
+
+
+def _change_roles_can_call_tools(config: Optional[dict[str, Any]]) -> bool:
+    """Would the GATEWAY actually send tools for the change-emitting roles?
+
+    The prompt and the gateway used to answer "tools or DSL?" from
+    different conditions. The prompt read ``patcher.use_structured_tools``;
+    the gateway requires that AND ``spec.supports_tools`` for the routed
+    model, suppressing the tools array otherwise so "the caller's text-DSL
+    parsing handles the response" (gateway.py:3605).
+
+    While the prompt carried BOTH dialects that mismatch was survivable —
+    the model simply wrote DSL. Now that native mode teaches no DSL, a
+    tool-incapable model would be left with no tools to call AND no syntax
+    to write, and every patching turn would produce nothing. ``config``
+    ships ``ollama:gemma4:12b`` with ``supports_tools: false``, and
+    ``force_local_only`` / ``ollama_local_model`` make it reachable.
+
+    A model PRESENT in ``models`` is judged exactly as the gateway judges
+    it — ``supports_tools`` missing means False there (gateway.py:320), so
+    it must mean False here too, or an entry that simply omits the key
+    reopens the same mismatch. A model ABSENT from ``models`` is left to
+    the documented default (native): its capability lives in the bundled
+    price table the gateway consults, which this layer cannot see, and the
+    gateway logs loudly if it then suppresses. A bare ``config={}``
+    therefore behaves exactly as before.
+    """
+    cfg = config or {}
+    models = cfg.get("models") or {}
+    routing = cfg.get("model_routing") or {}
+    if not isinstance(models, dict) or not isinstance(routing, dict):
+        return True
+    for role in _CHANGE_EMITTING_ROLES:
+        for suffix in ("_primary", "_fallback"):
+            key = routing.get(f"{role}{suffix}")
+            if not key:
+                continue
+            spec = models.get(str(key))
+            # Default False, matching the gateway's own ModelSpec parse.
+            if isinstance(spec, dict) and not spec.get("supports_tools", False):
+                logger.warning(
+                    "[prompt] %s routes to %s, which declares "
+                    "supports_tools=false — the gateway will suppress the "
+                    "tools array, so the system prompt ships the text-DSL "
+                    "reference instead of the native tool interface.",
+                    f"{role}{suffix}", key,
+                )
+                return False
+    return True
+
+
+def _build_patch_interface_block(
+    uses_tools: bool, config: Optional[dict[str, Any]] = None,
+) -> str:
     """The ONE patch interface this call offers.
 
-    ``uses_tools`` is the per-run ``patcher.use_structured_tools`` value,
-    so the anchored prompt stays cache-stable within a run. Returning both
-    halves is what caused the dual-dialect emissions — see the comment on
-    ``_NATIVE_TOOL_MODE_BRIDGE``.
+    ``uses_tools`` is the per-run ``patcher.use_structured_tools`` value and
+    ``config`` supplies the routing, so the anchored prompt stays
+    cache-stable within a run. Returning both halves is what caused the
+    dual-dialect emissions — see the comment on
+    ``_NATIVE_TOOL_MODE_BRIDGE``. Returning NEITHER is the failure mode
+    ``_change_roles_can_call_tools`` exists to prevent.
     """
-    if uses_tools:
+    if uses_tools and _change_roles_can_call_tools(config):
         return _NATIVE_TOOL_MODE_BRIDGE + _NATIVE_EDIT_INVARIANTS
     return _DSL_PATCH_SYNTAX
 
@@ -2178,7 +2236,7 @@ def _build_system_prompt(
     _uses_tools = bool(
         (config or {}).get("patcher", {}).get("use_structured_tools", True)
     )
-    patch_interface_block = _build_patch_interface_block(_uses_tools)
+    patch_interface_block = _build_patch_interface_block(_uses_tools, config)
 
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
@@ -4176,20 +4234,37 @@ async def _dispatch_tools_as_dsl(
             and not m.startswith("END_")
         ]
         if _patch_markers:
-            logger.warning(
-                "[%s] model emitted text patch DSL (%s) in NATIVE TOOL "
-                "mode. Applied anyway via the shared backend, but the "
-                "prompt taught no DSL — this is a model prior, not a "
-                "harness instruction.",
-                node_label, ", ".join(_patch_markers),
+            # Was the prompt actually built in native mode? The dispatch
+            # being tools-enabled is NOT the same question: when the routed
+            # model declares supports_tools=false the gateway suppresses the
+            # tools array and the prompt ships the DSL on purpose, so DSL
+            # here is correct behaviour, not a model prior. Resolve it the
+            # same way the prompt did rather than asserting something that
+            # can be false.
+            _prompt_was_native = _change_roles_can_call_tools(
+                (state or {}).get("harness_config") or {}
             )
+            _n_calls = len(list(getattr(response, "tool_calls", None) or []))
+            if _prompt_was_native:
+                logger.warning(
+                    "[%s] model emitted text patch DSL (%s) on a "
+                    "tools-enabled dispatch whose prompt taught no DSL — a "
+                    "model prior, not a harness instruction. Applied anyway "
+                    "via the shared backend (%d tool call(s) alongside).",
+                    node_label, ", ".join(_patch_markers), _n_calls,
+                )
+            else:
+                logger.debug(
+                    "[%s] text patch DSL (%s) with tools suppressed for the "
+                    "routed model — expected, the prompt taught the DSL.",
+                    node_label, ", ".join(_patch_markers),
+                )
             try:
                 from harness.observability import emit_event
                 emit_event(
                     "dsl_in_native_mode", node=node_label,
-                    markers=_patch_markers, tool_calls=len(
-                        list(getattr(response, "tool_calls", None) or [])
-                    ),
+                    markers=_patch_markers, tool_calls=_n_calls,
+                    prompt_was_native=_prompt_was_native,
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
                 pass

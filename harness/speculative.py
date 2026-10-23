@@ -667,6 +667,11 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
                 response, _ = await gateway.dispatch(
                     messages=seeded_messages,
                     role=NodeRole.PATCHING,
+                    # Per VARIANT: _seed_messages_with_style gives each one
+                    # a different prefix, so a shared family would report
+                    # drift on every variant and let them evict each other
+                    # — and the real patching node besides.
+                    cache_family=f"patching:speculative:{spec.index}",
                     budget_remaining_usd=budget,
                     temperature=spec.temperature,
                     model_override=spec.model_override,
@@ -694,6 +699,7 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
                 gateway.dispatch(
                     messages=_seed_messages_with_style(messages, spec),
                     role=NodeRole.PATCHING,
+                    cache_family=f"patching:speculative:{spec.index}",
                     budget_remaining_usd=budget,
                     temperature=spec.temperature,
                     model_override=spec.model_override,

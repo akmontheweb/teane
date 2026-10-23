@@ -204,6 +204,10 @@ async def _handle_user_turn(session: ChatSession, user_text: str) -> bool:
         response, new_budget = await session.gateway.dispatch(
             messages=list(session.messages),
             role=NodeRole.PLANNING,
+            # The REPL's conversation has nothing in common with a build's
+            # planning prompt, so the bare "planning" family would make
+            # every chat turn look like prefix drift against it.
+            cache_family="planning:chat",
             budget_remaining_usd=session.budget_remaining_usd,
         )
     except Exception as exc:  # noqa: BLE001 — never crash the REPL on a bad dispatch

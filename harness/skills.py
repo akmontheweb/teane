@@ -210,6 +210,12 @@ class SubAgentSkill(SkillBase):
                 response, new_budget = await gateway.dispatch(
                     messages=list(messages),
                     role=NodeRole.PATCHING,
+                    # Scoped per skill: a subagent carries its OWN system
+                    # prompt, so sharing the bare "patching" family would
+                    # thrash the patching node's cache — the largest one
+                    # in a run (4.6M input tokens at 89% hit). Each skill
+                    # also differs from every other, hence the name.
+                    cache_family=f"patching:skill:{self.schema.name}",
                     budget_remaining_usd=budget,
                 )
 
@@ -538,6 +544,7 @@ Use <<<CREATE_FILE>>> blocks to create the documentation file."""
         response, budget = await gateway.dispatch(
             messages=messages,
             role=NodeRole.PLANNING,
+            cache_family="planning:generate_documentation",
             budget_remaining_usd=_synth_budget,
         )
 

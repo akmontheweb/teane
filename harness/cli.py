@@ -1183,6 +1183,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "request_timeout_seconds", "connect_timeout_seconds",
         "request_timeout_per_role", "retry_network_cooloff_seconds",
         "network_cooloff_attempts", "fallback_on_timeout",
+        # request_timeout_seconds is a BETWEEN-BYTES clock, not a deadline:
+        # a provider trickling keep-alive bytes resets it forever (lumina
+        # 01a16872 stalled 68 min in one read with it set to 600).
+        # total_request_timeout_seconds is the end-to-end ceiling on one
+        # dispatch attempt; the _per_role map overrides it per role.
+        "total_request_timeout_seconds", "total_request_timeout_per_role",
     }),
     # Observability knobs. dump_llm_calls captures every LLM dispatch
     # (across all roles) to ~/.harness/debug for post-mortem analysis;
@@ -1558,6 +1564,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.request_timeout_seconds": (int, float),
     "llm_dispatch.connect_timeout_seconds": (int, float),
     "llm_dispatch.request_timeout_per_role": (dict,),
+    "llm_dispatch.total_request_timeout_seconds": (int, float),
+    "llm_dispatch.total_request_timeout_per_role": (dict,),
     "llm_dispatch.retry_network_cooloff_seconds": (int, float),
     "llm_dispatch.network_cooloff_attempts": (int,),
     "llm_dispatch.fallback_on_timeout": (bool,),

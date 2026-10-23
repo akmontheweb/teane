@@ -2523,8 +2523,18 @@ DEFAULT_RETRY_MAX_TOTAL_SECONDS = 300.0    # cumulative-sleep ceiling before giv
 DEFAULT_EMPTY_CONTENT_RETRIES = 2          # re-dispatches on empty provider content
 # HTTP request timeouts for LLM calls (generous — a slow reasoning model taking a
 # minute+ is NOT a failure; don't misread a working call as a timeout).
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0    # read/overall per-call HTTP timeout
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0    # BETWEEN-BYTES read timeout, not a deadline
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0     # connection-establishment timeout
+# Wall-clock ceiling on ONE dispatch attempt, end to end. httpx has no total
+# timeout: ``httpx.Timeout(read=...)`` bounds the gap between consecutive
+# bytes, so a provider that dribbles keep-alive bytes resets that clock
+# forever and the request never fails. lumina 01a16872 sat in one such read
+# for 68 MINUTES after its 200 header (20:24:18 -> 21:32:50) with
+# request_timeout_seconds=600 in force; the retry that followed succeeded in
+# two seconds. Generous by design -- the longest legitimate call in that run
+# was 252s -- but finite, because an unbounded dispatch is indistinguishable
+# from a dead harness.
+DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS = 1200.0
 # Network-stall recovery: on a connect/network error surviving fast retries, wait
 # this long and retry the PRIMARY (network issues usually clear in ~a minute)
 # before failing over to the fallback model.
@@ -2795,6 +2805,11 @@ class GatewayConfig:
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     request_timeout_per_role: dict[str, float] = field(default_factory=dict)
+    # Total wall-clock ceiling per dispatch ATTEMPT (see
+    # DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS). request_timeout_seconds cannot
+    # serve this role: it is a between-bytes timeout, not a deadline.
+    total_request_timeout_seconds: float = DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS
+    total_request_timeout_per_role: dict[str, float] = field(default_factory=dict)
     # Network-stall recovery + timeout failover.
     retry_network_cooloff_seconds: float = DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS
     network_cooloff_attempts: int = DEFAULT_NETWORK_COOLOFF_ATTEMPTS
@@ -3452,16 +3467,35 @@ class Gateway:
     def _request_timeout_for(self, role: NodeRole) -> "httpx.Timeout":
         """Resolve the per-call HTTP timeout for ``role`` as an ``httpx.Timeout``.
 
-        Read/overall = ``llm_dispatch.request_timeout_per_role.<role>`` when set,
-        else ``llm_dispatch.request_timeout_seconds``; connect =
+        Read = ``llm_dispatch.request_timeout_per_role.<role>`` when set, else
+        ``llm_dispatch.request_timeout_seconds``; connect =
         ``llm_dispatch.connect_timeout_seconds``. Generous by design — a slow
         reasoning model that takes a minute+ is a working call, not a failure,
         so we never treat a long-but-progressing dispatch as a timeout.
+
+        NOT a deadline, despite what this docstring used to claim by saying
+        "read/overall". httpx applies it BETWEEN consecutive bytes, so a
+        trickle of keep-alive bytes resets it indefinitely. The end-to-end
+        ceiling is :meth:`_total_timeout_for`, enforced in ``_call``.
         """
         per_role = self.config.request_timeout_per_role or {}
         role_key = role.value if hasattr(role, "value") else str(role)
         read = float(per_role.get(role_key, self.config.request_timeout_seconds))
         return httpx.Timeout(read, connect=float(self.config.connect_timeout_seconds))
+
+    def _total_timeout_for(self, role: NodeRole) -> float:
+        """Wall-clock ceiling in seconds for ONE dispatch attempt by ``role``.
+
+        ``llm_dispatch.total_request_timeout_per_role.<role>`` when set, else
+        ``llm_dispatch.total_request_timeout_seconds``. See
+        DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS for why this exists separately
+        from the httpx read timeout.
+        """
+        per_role = self.config.total_request_timeout_per_role or {}
+        role_key = role.value if hasattr(role, "value") else str(role)
+        return float(
+            per_role.get(role_key, self.config.total_request_timeout_seconds)
+        )
 
     def _max_tokens_for(self, role: NodeRole) -> Optional[int]:
         """Resolve the per-call max_tokens ceiling for ``role``.
@@ -3976,8 +4010,35 @@ class Gateway:
                 request_timeout=self._request_timeout_for(role),
                 **llm_kwargs,
             )
+            async def _bounded(**kw: Any) -> LLMResponse:
+                """One provider call under a TOTAL wall-clock deadline.
+
+                Converts the expiry into ``httpx.ReadTimeout`` so every
+                existing timeout path -- retry_with_backoff, the network
+                cool-off, fallback_on_timeout -- handles it unchanged. A
+                stalled read is exactly what this is, just detected by us
+                instead of by a between-bytes clock that never fires.
+                """
+                _deadline = self._total_timeout_for(role)
+                try:
+                    async with asyncio.timeout(_deadline):
+                        return await provider.chat_completion(**kw)
+                except TimeoutError as _exc:
+                    logger.warning(
+                        "[gateway] dispatch exceeded its total deadline of "
+                        "%.0fs (role=%s, model=%s) — aborting the attempt. "
+                        "The HTTP read was still open: httpx bounds the gap "
+                        "between bytes, not the call.",
+                        _deadline,
+                        role.value if hasattr(role, "value") else role,
+                        model_key,
+                    )
+                    raise httpx.ReadTimeout(
+                        f"total dispatch deadline of {_deadline:.0f}s exceeded"
+                    ) from _exc
+
             try:
-                return await provider.chat_completion(
+                return await _bounded(
                     tools=_tools, tool_choice=_tc, **_kw,
                 )
             except Exception as exc:  # noqa: BLE001 — re-raised unless it is OURS
@@ -3997,7 +4058,7 @@ class Gateway:
                         model_key,
                     )
                     _tools = _strip_strict(_tools)
-                    return await provider.chat_completion(
+                    return await _bounded(
                         tools=_tools, tool_choice=_tc, **_kw,
                     )
                 if _tc is None or _tc == _TC_AUTO:
@@ -4022,7 +4083,7 @@ class Gateway:
                     "thinking on" if thinking else "thinking off",
                 )
                 _tc = _TC_AUTO
-                return await provider.chat_completion(
+                return await _bounded(
                     tools=_tools, tool_choice=_tc, **_kw,
                 )
 
@@ -5217,6 +5278,22 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         request_timeout_per_role={
             str(k): float(v)
             for k, v in (llm_dispatch.get("request_timeout_per_role") or {}).items()
+            if isinstance(v, (int, float)) and float(v) > 0
+        },
+        total_request_timeout_seconds=_clamp_positive_float(
+            llm_dispatch.get(
+                "total_request_timeout_seconds",
+                DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS,
+            ),
+            name="llm_dispatch.total_request_timeout_seconds",
+            default=DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS,
+            floor=1.0, ceiling=86400.0,
+        ),
+        total_request_timeout_per_role={
+            str(k): float(v)
+            for k, v in (
+                llm_dispatch.get("total_request_timeout_per_role") or {}
+            ).items()
             if isinstance(v, (int, float)) and float(v) > 0
         },
         retry_network_cooloff_seconds=_clamp_positive_float(

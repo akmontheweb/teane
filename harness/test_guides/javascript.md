@@ -20,8 +20,31 @@ Write Jest-style unit tests for the JavaScript source files just modified. Tests
 - `expect(() => fn()).toThrow(/pattern/)` for exceptions.
 - `await expect(promise).resolves.toEqual(value)` / `.rejects.toThrow(...)` for async.
 
+### Dates and times — a test must not depend on the day it runs
+A test whose expected value changes with the calendar passes today and fails
+months later with no code change. Jest's fake timers are the clock, not a mock,
+so the no-mocking rule does not forbid them.
+
+```js
+beforeEach(() => jest.useFakeTimers().setSystemTime(new Date('2026-03-01')));
+afterEach(() => jest.useRealTimers());
+```
+
+Or assert the invariant rather than a literal arrangement:
+```js
+expect(dates).toEqual([...dates].sort());        // "sorted by date"
+expect(new Set(names)).toEqual(new Set(['Early', 'Late']));  // membership
+```
+
+Never assert a hardcoded order or value that depends on today — recurring
+dates, ages, "upcoming"/"within N days" windows, expiry, relative buckets
+("this week"), and timezone-dependent day boundaries all qualify. If the
+expected value would differ were the test run in another month or timezone,
+freeze the clock or assert the rule.
+
 ### What NOT to do
 - No `jest.mock('...')`, no `jest.spyOn()`, no `jest.fn()`.
+- No assertion whose expected value depends on today's date — see "Dates and times" above.
 - No `nock`, no `sinon`. If the code under test makes an HTTP call, the test starts a local `http.createServer` on `port: 0`, points the code at it, asserts, then closes it in `afterEach`.
 - No "test doubles" implemented inline (e.g., `const fakeDb = { query: () => [] }`). Use an in-process real implementation instead.
 

@@ -111,7 +111,11 @@ class TestSeedMethod:
         with pytest.raises(RuntimeError) as exc:
             s.seed("employee", [{"first_name": "A", "born": "2000-01-01"}])
         msg = str(exc.value)
-        assert "no such table" in msg
+        # The seeder now checks the table against ``PRAGMA table_info``
+        # before it builds an INSERT, so sqlite's own "no such table" is
+        # never raised. What matters is unchanged and asserted below: the
+        # message says which table was wrong and lists the real schema.
+        assert "no table 'employee'" in msg
         assert "employees(id, first_name, born, tags)" in msg
 
     def test_without_a_test_database_it_says_so(self):

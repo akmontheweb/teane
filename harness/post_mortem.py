@@ -164,6 +164,14 @@ _TRIGGER_ADVICE: dict[str, str] = {
         "validator config; adjust the policy or rewrite the build "
         "command to use only whitelisted primitives"
     ),
+    "unauthorable_test_blocker": (
+        "the failure's only remedy was an edit to a test file no node may "
+        "author — repair_node cannot edit tests and the regeneration node "
+        "writes unit tests only, so an acceptance suite has no owner in the "
+        "repair path. Auto-resume cannot help: it re-runs the same build and "
+        "returns to the same refusal. A human edits that file, or the "
+        "generator that produced it stops producing it wrong"
+    ),
     "build_env_timeout": (
         "the sandboxed build was killed by sandbox.timeout_seconds before "
         "it produced any result, so no module was shown to fail and there "
@@ -270,6 +278,9 @@ def deterministic_rule(trigger: str, state: Mapping[str, Any]) -> str:
         "replace_block_stuck", "no_progress_repairs",
         "hard_iteration_ceiling", "same_missing_dep",
         "build_command_blocked", "unsatisfiable_test",
+        # The path IS the finding here — "a test file has no owner" is
+        # useless without naming which one.
+        "unauthorable_test_blocker",
     ):
         detail = f" ({trigger.split(':', 1)[1]})"
     errs = _top_errors(state)

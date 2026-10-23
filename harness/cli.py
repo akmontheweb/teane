@@ -4380,6 +4380,34 @@ def _build_outside_harness_actions(
             "network reachability, `[r]` Resume."
         )
 
+    # ---- unauthorable_test_blocker:<file> ----------------------------
+    # The only remedy names a test file no node in the graph may write.
+    # `[r]` Resume without editing it re-runs the identical build and
+    # returns straight here, so say what to change.
+    elif trigger.startswith("unauthorable_test_blocker"):
+        blocked = ""
+        if ":" in trigger:
+            blocked = trigger.split(":", 1)[1].strip()
+        ref = f"`{blocked}`" if blocked else "the blocking test file"
+        actions.append(
+            f"The failure's only remedy is an edit to {ref}, and no node "
+            "may write it: repair_node is forbidden to edit test files, "
+            "and the regeneration node authors unit tests only — an "
+            "acceptance suite belongs to acceptance_node. `[r]` Resume on "
+            "its own re-runs the identical build and comes straight back "
+            "here without a repair turn, so edit the file first."
+        )
+        actions.append(
+            "Open it and read the failure: if the test asserts something "
+            "the specification does not require, fix the test; if it is "
+            "right and the app is wrong, note which production file should "
+            "change and use `[e]` Inject hint to point repair at it."
+        )
+        actions.append(
+            "Once the file is correct, `[m]` Pause for manual edits → Enter, "
+            "or `[r]` Resume if you edited it outside this session."
+        )
+
     # ---- repair_loop_limit / persistent_build_failure ----------------
     # The two most generic triggers — derive specifics from state.
     elif trigger in {"repair_loop_limit", "persistent_build_failure",
@@ -4721,6 +4749,52 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 )
                 node_state["budget_terminated"] = True
                 state["node_state"] = node_state
+            elif (node_state.get("test_regen_unsupported")
+                  or node_state.get("test_regen_stuck")):
+                # The remedy is an edit to a test file that NO node in the
+                # graph may make: repair_node is forbidden to edit tests,
+                # and test_regeneration_node has either declined this exact
+                # path as one it cannot author (``test_regen_unsupported``)
+                # or no-opped repeatedly because it was routed in without a
+                # test to write (``test_regen_stuck``). Both answers are
+                # properties of the state, not of the round, so resuming
+                # re-runs the same build, re-derives the same refusal and
+                # lands back here without a single repair turn. lumina
+                # 01a164b2 burned auto-resumes 2..5 that way in 22 seconds
+                # — ~4s per empty cycle — until the per-class cap stopped
+                # it. Nothing can change between cycles in headless mode,
+                # because the fix is a human editing that file. Terminate
+                # honestly instead of spending the allowance.
+                _blocked_file = str(
+                    node_state.get("test_regen_unsupported") or ""
+                )
+                choice = "q"
+                auto_resumed_this_round = False
+                if _blocked_file:
+                    logger.warning(
+                        "[HITL] %s is a test file no node may author (repair "
+                        "cannot edit tests; the regeneration node declined "
+                        "it) — terminating instead of auto-resuming. "
+                        "Resuming would re-run the identical build and "
+                        "return here with no repair turn in between. Fix "
+                        "that file, then `teane resume --session-id %s`.",
+                        _blocked_file,
+                        str(state.get("session_id") or "<id>"),
+                    )
+                else:
+                    logger.warning(
+                        "[HITL] the test-regeneration node has no test it "
+                        "can author for this failure — terminating instead "
+                        "of auto-resuming, which would re-run the identical "
+                        "no-op. Inject a hint naming the file to change, or "
+                        "fix it directly, then `teane resume --session-id "
+                        "%s`.",
+                        str(state.get("session_id") or "<id>"),
+                    )
+                node_state["unauthorable_test_blocker"] = (
+                    _blocked_file or "unknown"
+                )
+                state["node_state"] = node_state
             else:
                 # Per-session cap on consecutive headless auto-resumes.
                 # See ``_HITL_AUTO_RESUME_CAP`` at module top for the
@@ -5043,6 +5117,13 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         # enabled the cache, so the next round must be
                         # allowed to actually run the build and find out.
                         "build_env_timeout",
+                        # Cleared together: the operator resuming means
+                        # they have edited the blocking test (or decided
+                        # it is fine). Leaving either set would terminate
+                        # the resumed run on the stale refusal before the
+                        # graph re-derives it from the new file.
+                        "test_regen_unsupported",
+                        "unauthorable_test_blocker",
                         "llm_silent",
                         "unsatisfiable_test",
                         "unsatisfiable_test_reason",
@@ -8740,6 +8821,9 @@ def _resolve_cli_exit_code(
         # condition, not a code failure — same "something outside the
         # harness must change" semantics as the flags around it.
         "build_env_timeout",
+        # A blocking test file no node may author: only a human can edit
+        # it, so the run cannot go clean without intervention.
+        "unauthorable_test_blocker",
         "llm_silent",
         # A declared-unsatisfiable generated test left unresolved shares
         # the same semantics: a human must fix the test before another

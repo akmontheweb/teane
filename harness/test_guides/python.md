@@ -30,8 +30,47 @@ Write pytest-style unit tests for the Python source files just modified. Tests e
 - For floats: `pytest.approx(expected, rel=1e-6)`.
 - For collections: `assert result == expected` — never check `len` and a sample element separately when an equality check works.
 
+### Dates and times — a test must not depend on the day it runs
+A test whose outcome changes with the calendar is a time bomb: it passes in CI
+today and fails months later with no code change. `freezegun` is installed in
+every build environment — use it, or assert the invariant instead of a literal.
+
+Two ways to make a date-dependent test deterministic. Pick one:
+
+1. **Freeze the clock** when the expected value depends on "now":
+   ```python
+   from freezegun import freeze_time
+
+   @freeze_time("2026-03-01")
+   def test_next_occurrence_rolls_to_next_year():
+       assert next_occurrence(month=2, day=10).year == 2027
+   ```
+2. **Assert the rule, not a hardcoded order**, when the behaviour is "sorted by
+   X" rather than a specific arrangement:
+   ```python
+   dates = [b["next_occurrence"] for b in response.json()["birthdays"]]
+   assert dates == sorted(dates)          # the invariant
+   assert {b["name"] for b in ...} == {"Early", "Late"}   # membership
+   ```
+
+Never do this — the order depends on today's date, so it passes part of the
+year and fails the rest:
+```python
+_seed(may_10_birthday, dec_25_birthday)
+assert names == ["Early", "Late"]   # WRONG: May 10's next occurrence is in
+                                    # 2027 once today is past May 10, so it
+                                    # correctly sorts AFTER Dec 25
+```
+
+This applies to anything derived from the current moment: recurring dates,
+ages, "upcoming"/"within N days" windows, expiry, relative buckets ("this
+week"), and timezone-dependent day boundaries. If the expected value would be
+different were the test run in a different month — or in a different timezone —
+freeze it or assert the invariant.
+
 ### What NOT to do
 - Do not use `unittest.mock.patch`, `Mock`, `MagicMock`, `mocker.patch`, or `pytest-mock`. The tests must call the real function.
+- Do not write an assertion whose expected value depends on today's date — see "Dates and times" above. `freeze_time` is not a mock; it is the clock, and the no-mocking rule does not forbid it.
 - Do not stub HTTP — if the code under test makes network calls, the test runner uses a local fake server (e.g., `http.server` in a thread) or marks the test `pytest.mark.network` and the harness skips it deterministically.
 - Do not import the production code under a fake name; use the actual import path.
 

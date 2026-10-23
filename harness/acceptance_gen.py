@@ -453,9 +453,15 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
             table_lines,
             "",
             "Seed with THESE table and column names, which may differ from "
-            "the specification's prose. Fill every NOT NULL column that has "
-            "no default, and keep UNIQUE columns distinct across the rows "
-            "you seed.",
+            "the specification's prose. Seeding a column the table does not "
+            "have is an error. Fill every NOT NULL column that has no "
+            "default, and keep UNIQUE columns distinct across the rows you "
+            "seed. A column marked PYTHON-DEFAULT gets its default from the "
+            "ORM in application code, NOT from the database — `client.seed` "
+            "writes rows directly, so supply a real value for it whenever "
+            "the criterion cares what it is. `client.seed` returns the rows' "
+            "primary keys (a uuid string when the model generates one), so "
+            "address a seeded row in later requests by the returned id.",
         ]
     if ctx.cross_cutting_rules.strip():
         parts += [
@@ -1316,8 +1322,16 @@ def _sqlalchemy_table(node: Any) -> "Optional[tuple[str, list[str]]]":
             desc.append("PRIMARY KEY")
         if isinstance(kw.get("nullable"), ast.Constant) and kw["nullable"].value is False:
             desc.append("NOT NULL")
-        if "default" in kw or "server_default" in kw:
+        # ``server_default`` lands in the DDL, so a raw INSERT gets it.
+        # ``default`` is applied by the ORM in Python and never reaches the
+        # database, so a seeded row that omits the column inserts NULL (or
+        # fails, when the column is NOT NULL). Reporting both as "DEFAULT"
+        # told the generator it could leave ``category`` out of a seed and
+        # the insert then failed on a NOT NULL violation — lumina 01a164b2.
+        if "server_default" in kw:
             desc.append("DEFAULT")
+        elif "default" in kw:
+            desc.append("PYTHON-DEFAULT")
         cols.append(" ".join(desc))
     return (tablename, cols) if tablename and cols else None
 
@@ -1764,14 +1778,40 @@ def _apply_seed(db_path):
 # Without isolation there is no per-test database to write to, so the call
 # fails saying exactly that. A failed insert names the tables and columns the
 # database really has, so whoever reads the failure sees the test's mistake.
+#
+# The method binds itself to the REAL schema at run time (``PRAGMA
+# table_info``) rather than trusting the row dicts, because a raw INSERT
+# bypasses the ORM and therefore gets none of its Python-side behaviour.
+# lumina 01a164b2 lost a whole run to the two consequences:
+#
+#   * ``id`` is ``Mapped[str]`` with ``default=lambda: str(uuid4())`` — a
+#     PYTHON-side default that never reaches the DDL. Raw inserts left it
+#     unset, and returning ``_cur.lastrowid`` handed the test sqlite's
+#     integer rowid instead of the uuid the API routes by, so every
+#     ``GET /birthdays/{ids[0]}`` after a seed returned 404 Not Found.
+#   * ``created_at`` / ``updated_at`` are NOT NULL with Python-side defaults
+#     too, so the insert failed outright. The repair LLM "fixed" that by
+#     editing this conftest to ``setdefault`` those columns on every row —
+#     table-blind, so seeding ``device_profiles`` (which has neither column)
+#     then failed. repair_node may not edit test files and the regeneration
+#     node does not author acceptance suites, so the run had no way out.
+#
+# Filling the gap here is what stops that: the helper supplies what the ORM
+# would have supplied, per table, and returns the row's real identity.
 _SEED_METHOD_SRC = """
     def seed(self, table, rows):
         \"\"\"Insert ``rows`` (a list of column→value dicts) into ``table`` in
         this test's own database, bypassing the API. Returns the new rows'
-        ids. For a criterion's Given: data that already exists before the
-        action under test.
+        primary keys. For a criterion's Given: data that already exists
+        before the action under test.
+
+        Columns the row omits are filled from the table's real schema the
+        way the ORM would have: a text primary key gets a uuid, a NOT NULL
+        timestamp gets now, and any other NOT NULL column with no database
+        default gets a typed placeholder. Supplying the column yourself
+        always wins.
         \"\"\"
-        import datetime, json, sqlite3
+        import datetime, json, sqlite3, uuid
         _db = getattr(self, "_acceptance_db", None)
         if not _db:
             raise RuntimeError(
@@ -1780,7 +1820,59 @@ _SEED_METHOD_SRC = """
         _conn = sqlite3.connect(_db)
         _ids = []
         try:
+            def _schema_dump():
+                return "; ".join(
+                    "%s(%s)" % (_t, ", ".join(
+                        _c[1] for _c in _conn.execute(
+                            "PRAGMA table_info(%s)" % _t)))
+                    for (_t,) in _conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%'")
+                )
+            # (cid, name, type, notnull, dflt_value, pk)
+            _info = list(_conn.execute("PRAGMA table_info(%s)" % table))
+            if not _info:
+                raise RuntimeError(
+                    "client.seed: this test's database has no table %r. "
+                    "It has: %s" % (table, _schema_dump()))
+            _known = set(_c[1] for _c in _info)
+            _pks = [_c for _c in _info if _c[5]]
+            _pk = _pks[0] if len(_pks) == 1 else None
             for _row in rows:
+                _row = dict(_row)
+                _bad = sorted(_k for _k in _row if _k not in _known)
+                if _bad:
+                    raise RuntimeError(
+                        "client.seed: table %r has no column(s) %s. Its real "
+                        "columns are: %s. Seed the columns the app actually "
+                        "defines." % (table, ", ".join(_bad),
+                                      ", ".join(sorted(_known))))
+                _now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                for _c in _info:
+                    _name, _type = _c[1], (_c[2] or "").upper()
+                    _notnull, _dflt, _ispk = _c[3], _c[4], _c[5]
+                    # Present, or the DATABASE itself fills it in.
+                    if _name in _row or _dflt is not None:
+                        continue
+                    if not (_notnull or _ispk):
+                        continue
+                    if _ispk:
+                        # An INTEGER PRIMARY KEY is sqlite's rowid alias and
+                        # autoincrements; anything else is an app-generated
+                        # identifier the ORM would have produced in Python.
+                        if "INT" not in _type:
+                            _row[_name] = str(uuid.uuid4())
+                        continue
+                    if "DATE" in _type or "TIME" in _type:
+                        _row[_name] = _now
+                    elif ("INT" in _type or "REAL" in _type
+                          or "NUM" in _type or "DEC" in _type
+                          or "FLOA" in _type or "DOUB" in _type):
+                        _row[_name] = 0
+                    elif "BLOB" in _type:
+                        _row[_name] = b""
+                    else:
+                        _row[_name] = ""
                 _cols = list(_row)
                 _vals = []
                 for _v in _row.values():
@@ -1796,19 +1888,17 @@ _SEED_METHOD_SRC = """
                         _vals,
                     )
                 except sqlite3.Error as _exc:
-                    _schema = "; ".join(
-                        "%s(%s)" % (_t, ", ".join(
-                            _c[1] for _c in _conn.execute(
-                                "PRAGMA table_info(%s)" % _t)))
-                        for (_t,) in _conn.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' "
-                            "AND name NOT LIKE 'sqlite_%'")
-                    )
                     raise RuntimeError(
                         "client.seed could not insert into %r: %s. This "
-                        "test's database has: %s" % (table, _exc, _schema)
+                        "test's database has: %s" % (table, _exc, _schema_dump())
                     ) from None
-                _ids.append(_cur.lastrowid)
+                # The row's identity as the APP sees it. sqlite's rowid is
+                # not it when the primary key is a uuid string, and routing
+                # a request by the rowid is a guaranteed 404.
+                if _pk is not None and _pk[1] in _row:
+                    _ids.append(_row[_pk[1]])
+                else:
+                    _ids.append(_cur.lastrowid)
             _conn.commit()
         finally:
             _conn.close()

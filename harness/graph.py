@@ -21890,6 +21890,17 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
     # looking for a code defect that isn't there.
     if node_state.get("build_env_timeout"):
         return "build_env_timeout"
+    # The blocker is a test file NO node may author: repair_node is
+    # forbidden to edit tests, and test_regeneration_node declined it as
+    # not a unit test it can write (an acceptance suite belongs to
+    # acceptance_node). That is a property of the file, not of the round,
+    # so every retry re-derives it. Must precede ``persistent_build_failure``
+    # — labelling it that way sent lumina 01a164b2 through four auto-resumes
+    # in 22 seconds, each one re-running the same build and routing straight
+    # back here with no repair turn in between.
+    if node_state.get("test_regen_unsupported") or node_state.get("test_regen_stuck"):
+        _f = str(node_state.get("test_regen_unsupported") or "")
+        return f"unauthorable_test_blocker:{_f}" if _f else "unauthorable_test_blocker"
     if node_state.get("build_command_cd_missing"):
         d = node_state.get("build_command_cd_missing_dir", "")
         return f"build_command_cd_missing:{d}" if d else "build_command_cd_missing"

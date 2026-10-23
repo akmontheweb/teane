@@ -18,8 +18,31 @@ Same conventions as the JavaScript guide — Jest, real implementations, no mock
 - Use `async`/`await` test functions; do not return promises from sync test functions.
 - `await expect(promise).resolves.toEqual(...)` / `.rejects.toThrow(...)`.
 
+### Dates and times — a test must not depend on the day it runs
+A test whose expected value changes with the calendar passes today and fails
+months later with no code change. Jest's fake timers are the clock, not a mock,
+so the no-mocking rule does not forbid them.
+
+```ts
+beforeEach(() => jest.useFakeTimers().setSystemTime(new Date('2026-03-01')));
+afterEach(() => jest.useRealTimers());
+```
+
+Or assert the invariant rather than a literal arrangement:
+```ts
+expect(dates).toEqual([...dates].sort());        // "sorted by date"
+expect(new Set(names)).toEqual(new Set(['Early', 'Late']));  // membership
+```
+
+Never assert a hardcoded order or value that depends on today — recurring
+dates, ages, "upcoming"/"within N days" windows, expiry, relative buckets
+("this week"), and timezone-dependent day boundaries all qualify. If the
+expected value would differ were the test run in another month or timezone,
+freeze the clock or assert the rule.
+
 ### What NOT to do
 - No `jest.mock`, no `jest.fn`, no `ts-mockito`, no `sinon`.
+- No assertion whose expected value depends on today's date — see "Dates and times" above.
 - Do not invent `Partial<T>` shapes to stand in for real values; construct full objects (use a factory function defined in the test file if the type has many required fields).
 
 ### Test-environment scaffolding — create the config WITH the tests

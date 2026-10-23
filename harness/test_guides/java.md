@@ -28,8 +28,33 @@ Write JUnit 5 (`jupiter`) tests for the Java source files just modified. **Do no
   - `assertTrue` / `assertFalse` — prefer the specific form where possible.
 - `assertAll(...)` to bundle related assertions so all fire even when one fails.
 
+### Dates and times — a test must not depend on the day it runs
+A test whose expected value changes with the calendar passes today and fails
+months later with no code change. `Clock.fixed` is a real stdlib implementation,
+not a mock, so the no-mocking rule does not forbid it — this is exactly the
+"real fakes from JUnit / stdlib" rule above.
+
+```java
+Clock fixed = Clock.fixed(Instant.parse("2026-03-01T00:00:00Z"), ZoneOffset.UTC);
+assertEquals(2027, service.nextOccurrence(MonthDay.of(2, 10), fixed).getYear());
+```
+
+If the production code reads `LocalDate.now()` with no injectable `Clock`, that
+is an actual design problem and taking a `Clock` parameter is the correct fix —
+unlike adding a parameter solely to inject a fake.
+
+Or assert the invariant rather than a literal arrangement:
+```java
+assertEquals(dates.stream().sorted().toList(), dates);   // "sorted by date"
+```
+
+Never assert a hardcoded order or value that depends on today — recurring
+dates, ages, "upcoming"/"within N days" windows, expiry, relative buckets
+("this week"), and timezone-dependent day boundaries all qualify.
+
 ### What NOT to do
 - No `@Mock`, no `Mockito.mock(...)`, no `Mockito.when(...).thenReturn(...)`, no `@InjectMocks`.
+- No assertion whose expected value depends on today's date — see "Dates and times" above.
 - No PowerMock, no EasyMock, no JMockit.
 - Do not introduce a constructor parameter solely to inject a fake — refactor the production code only if it has an actual design problem, not for the test.
 

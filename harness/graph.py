@@ -3412,6 +3412,84 @@ def _resolve_patching_emission_rounds(state: "AgentState") -> int:
     return max(1, min(30, val))
 
 
+# Cap on EXTRA in-turn repair dispatches after a round landed nothing.
+#
+# patching has had this since lumina 019f71b0 (``patching_emission_rounds``
+# — apply, feed each result back, re-dispatch). repair never did: it
+# applied once, appended the composed feedback to ``messages`` and
+# RETURNED, so the model learned its patch had not landed only on the next
+# repair round — after a full compiler cycle (build + prod-smoke, measured
+# at 1.2s warm but 120-446s cold on lumina 01a164b2). A round that lands
+# zero patches is therefore the most expensive possible way to tell a model
+# "your search string did not match".
+#
+# Repair is 77% of all LLM calls in a run (profiled on 019ff418: 133 of
+# 173), so it is the half that was running the weaker protocol. One extra
+# dispatch costs one call; the cycle it replaces costs a container build.
+#
+# 0 disables the retry entirely (pre-change behaviour). Operators override
+# via ``llm_dispatch.repair_emission_rounds`` in config.json, clamped to
+# [0, 5] at read time.
+_REPAIR_EMISSION_ROUNDS_DEFAULT = 1
+
+
+def _resolve_repair_emission_rounds(state: "AgentState") -> int:
+    """Extra in-turn repair dispatches allowed after a zero-landing round.
+
+    Reads ``state.llm_dispatch_config.repair_emission_rounds`` and clamps
+    to ``[0, 5]``; falls back to :data:`_REPAIR_EMISSION_ROUNDS_DEFAULT`
+    when the config omits it or supplies a non-int.
+    """
+    cfg = (state.get("llm_dispatch_config") or {})
+    raw = cfg.get("repair_emission_rounds", _REPAIR_EMISSION_ROUNDS_DEFAULT)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _REPAIR_EMISSION_ROUNDS_DEFAULT
+    return max(0, min(5, val))
+
+
+#: Failure reasons a re-dispatch CANNOT fix, because they are properties of
+#: the round's policy rather than of the patch the model wrote. Retrying on
+#: these burns a call to be told the same thing: the allowlist is fixed for
+#: the round, a protected test needs an UNSATISFIABLE_TEST declaration
+#: instead of another patch, and an operator diff rejection is an operator
+#: decision. Everything else — a search that did not match, a no-op, a
+#: rolled-back validation failure, read-before-edit, an unparsed emission —
+#: is exactly what another attempt fixes.
+_REPAIR_POLICY_FAILURE_MARKERS: tuple[str, ...] = (
+    "not in skill allowlist",
+    "[test-protected]",
+    "is outside this round's allowed paths",
+    "rejected by operator",
+    "path traversal rejected",
+    "absolute path rejected",
+)
+
+
+def _repair_failures_are_policy_only(results: list[Any]) -> bool:
+    """True when every failure in ``results`` is one a retry cannot fix.
+
+    Deliberately asymmetric: a MIX of a policy rejection and a correctable
+    failure still retries, because the correctable one is worth another
+    attempt. Only an all-policy round is pointless to re-dispatch.
+
+    Classification is by message substring because ``PatchResult`` carries
+    no reason code. That is fragile in one direction only — an unrecognised
+    message reads as correctable and costs one extra call, whereas an
+    over-broad policy match would silently disable the retry. Erring
+    toward retrying is the cheap mistake.
+    """
+    failures = [r for r in results if not getattr(r, "success", False)]
+    if not failures:
+        return False
+    for r in failures:
+        err = str(getattr(r, "error", "") or "")
+        if not any(m in err for m in _REPAIR_POLICY_FAILURE_MARKERS):
+            return False
+    return True
+
+
 # Cap on ``<<<READ_FILE>>>`` DSL resolve rounds inside one repair /
 # patching iteration (distinct from ``patching_read_file_cap``, which
 # bounds the tool-use read_file loop). Each round re-dispatches without
@@ -20922,6 +21000,160 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
             files_seen_by_llm=files_seen_by_llm,
             enforce_read_before_edit=enforce_read,
         )
+
+        # ---- In-turn correction (B2) -------------------------------------
+        # A round that landed nothing used to end here: the composed
+        # feedback went onto ``messages`` and the node returned, so the
+        # model first learned its search string had not matched on the NEXT
+        # repair round, one full compiler cycle later. patching has fed each
+        # result back and re-dispatched since lumina 019f71b0; repair never
+        # did, and repair is 77% of a run's LLM calls.
+        #
+        # Everything below this block reads ``patch_results``,
+        # ``modified_files``, ``_blocks_kept``, the rejection lists,
+        # ``patch_payload``, ``_parse_miss_diag`` and ``response``. The loop
+        # therefore ACCUMULATES into those same names and leaves the ~450
+        # lines of downstream bookkeeping untouched — it sees one merged
+        # round, which is what it is: this is a single repair iteration, so
+        # the loop deliberately does NOT re-bump ``total_repairs`` or any
+        # per-round counter.
+        _inturn_cap = _resolve_repair_emission_rounds(state)
+        _inturn_round = 0
+        while _inturn_cap > _inturn_round:
+            _rs = sum(
+                1 for r in patch_results
+                if r.success and not getattr(r, "no_op", False)
+            )
+            if _rs:
+                break  # something real landed; the round did its job
+            if _repair_failures_are_policy_only(patch_results):
+                logger.info(
+                    "[repair_node:in-turn] Zero patches landed but every "
+                    "failure is a policy rejection a retry cannot fix — "
+                    "not re-dispatching.",
+                )
+                break
+            if new_budget <= 0:
+                break
+            _inturn_round += 1
+            # Imported here rather than relying on the first pass's
+            # bindings: ``_strip_promote_blocks`` is bound inside a
+            # try/except above, so a failed import there would turn this
+            # retry into a NameError mid-round.
+            from harness.patch_feedback import (
+                compose_patch_feedback as _compose_inturn,
+            )
+            from harness.patcher import (
+                parse_patch_blocks as _inturn_parse,
+                strip_promote_deferred_blocks as _inturn_strip_promote,
+                strip_read_blocks as _inturn_strip_read,
+                summarize_parse_miss as _inturn_parse_miss,
+            )
+            _inturn_msg, _, _ = _compose_inturn(
+                list(_test_tamper_rejections) + list(_screen_rejections)
+                + list(patch_results),
+                list(allowed_paths or []),
+                _parse_miss_diag or "",
+                prefix=(
+                    f"[System]: Your patches did NOT land (in-turn retry "
+                    f"{_inturn_round}/{_inturn_cap}):"
+                ),
+            )
+            # This retry does NOT run the READ_FILE resolution cycle — it
+            # strips read requests rather than answering them. Saying so
+            # matters because the read-before-edit rejection above tells
+            # the model to go and read, which it cannot do here; without
+            # this the two instructions contradict each other and the
+            # retry is spent on a read that gets dropped. Asking anyway is
+            # survivable (zero parseable patches closes the round and the
+            # NEXT round resolves the read as before) but it wastes the
+            # attempt.
+            _inturn_msg += (
+                "\n\n[System]: This is a retry INSIDE the current "
+                "iteration, so file reads are NOT resolved here. Re-emit "
+                "a corrected patch using the file bytes already shown to "
+                "you above. If you genuinely cannot proceed without "
+                "reading a file you have not been shown, emit no patch "
+                "and the next round will resolve the read for you."
+            )
+            logger.warning(
+                "[repair_node:in-turn] Round landed 0 real patches — "
+                "re-dispatching within the same iteration (%d/%d) instead "
+                "of spending a compiler cycle to say so.",
+                _inturn_round, _inturn_cap,
+            )
+            try:
+                from harness.observability import emit_event
+                emit_event(
+                    "repair_inturn_retry", node="repair_node",
+                    attempt=_inturn_round, cap=_inturn_cap,
+                    prior_results=len(patch_results),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+            messages.append(MessageDict(
+                role="assistant", content=response.content or "",
+            ))
+            messages.append(MessageDict(role="system", content=_inturn_msg))
+            response, new_budget = await _dispatch_repair(messages, new_budget)
+            # Re-derive the payload exactly as the first pass did, so a
+            # retry that emits READ_FILE / PROMOTE_DEFERRED blocks is
+            # handled identically rather than parsed as a patch.
+            patch_payload = _inturn_strip_read(response.content or "")
+            if "<<<PROMOTE_DEFERRED>>>" in patch_payload:
+                patch_payload = _inturn_strip_promote(patch_payload)
+            _retry_blocks = _inturn_parse(patch_payload)
+            _parse_miss_diag = (
+                "" if _retry_blocks
+                else _inturn_parse_miss(patch_payload or "")
+            )
+            if not _retry_blocks:
+                logger.warning(
+                    "[repair_node:in-turn] Retry %d emitted no parseable "
+                    "patch either; letting the round close.", _inturn_round,
+                )
+                break
+            # Same arguments as the first pass, carve-out included: a
+            # parse-broken test the first pass was allowed to repair must
+            # not become untouchable just because this is the retry.
+            _retry_blocks, _retry_tamper = _reject_test_patch_blocks(
+                _retry_blocks,
+                allow_parse_broken=_parse_broken_tests,
+                workspace_path=workspace,
+            )
+            _retry_kept, _retry_screen = _pre_patch_screen(
+                _retry_blocks, loop_counter, files_seen_by_llm, workspace,
+            )
+            _test_tamper_rejections = (
+                list(_test_tamper_rejections) + list(_retry_tamper)
+            )
+            _screen_rejections = (
+                list(_screen_rejections) + list(_retry_screen)
+            )
+            _blocks_kept = list(_blocks_kept) + list(_retry_kept)
+            if not _retry_kept:
+                break
+            _retry_results, modified_files = await apply_patch_blocks(
+                _retry_kept,
+                workspace,
+                modified_files,
+                allowed_paths=allowed_paths,
+                files_seen_by_llm=files_seen_by_llm,
+                enforce_read_before_edit=enforce_read,
+            )
+            patch_results = list(patch_results) + list(_retry_results)
+        if _inturn_round:
+            _landed = sum(
+                1 for r in patch_results
+                if r.success and not getattr(r, "no_op", False)
+            )
+            logger.info(
+                "[repair_node:in-turn] %d extra dispatch(es) this "
+                "iteration; %d real patch(es) landed in total.",
+                _inturn_round, _landed,
+            )
+        # ------------------------------------------------------------------
+
         # Record what this round actually changed, for the NEXT
         # round's reflection judge. See _summarize_round_patches: the
         # judge is asked whether "the round's patches addressed

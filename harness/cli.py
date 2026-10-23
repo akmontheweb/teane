@@ -1150,6 +1150,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # 10. Added after lumina 019f71b0 — see the emission loop in
         # graph.patching_node's tool-use branch.
         "patching_emission_rounds",
+        # Cap on EXTRA in-turn repair dispatches after a round landed zero
+        # real patches. Clamped to [0, 5] in
+        # graph._resolve_repair_emission_rounds; default 1, 0 disables.
+        # repair previously applied once and returned, so the model learned
+        # its patch had not landed only after a full compiler cycle.
+        "repair_emission_rounds",
         # Cap on <<<READ_FILE>>> DSL resolve rounds per repair/patching
         # iteration. Clamped to [1, 20] in
         # graph._resolve_read_file_rounds; default 6. One bonus round is
@@ -1541,6 +1547,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.max_continuation_cycles": (int,),
     "llm_dispatch.patching_read_file_cap": (int,),
     "llm_dispatch.patching_emission_rounds": (int,),
+    "llm_dispatch.repair_emission_rounds": (int,),
     "llm_dispatch.read_file_rounds": (int,),
     "llm_dispatch.prompt_cache_enabled": (bool,),
     "llm_dispatch.max_retries": (int,),

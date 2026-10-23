@@ -70,6 +70,88 @@ def tier1_preamble(spec_region: str) -> str:
     return spec_region[:match.start()].rstrip() + "\n"
 
 
+#: Any ATX heading, with its level, so a requirement-bearing span can be
+#: closed at the next heading of the same or shallower depth.
+_ANY_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
+
+
+def cross_cutting_context(spec_region: str) -> str:
+    """Everything in the region that is NOT a per-story requirement body.
+
+    ``tier1_preamble`` truncates at the FIRST requirement heading, which
+    assumes every cross-cutting section precedes every story. Real specs
+    do not look like that. lumina's pair measures:
+
+        SPEC_REQUIREMENTS.md   59,660 chars
+          # Software Requirements Specification        @0      (38 chars)
+          ## Epic: EPIC-001 + every story body         @39     53,049 chars
+          ## Assumptions and dependencies              @53,088
+          ## API error handling                        @56,772
+          ## Security and authorization                @57,371
+          ## Traceability matrix                       @58,125  } 6,572 chars
+        SPEC_ARCHITECTURE.md   48,632 chars  (no requirement heading at all)
+
+    The region handed to a node is ``requirements + architecture``, so the
+    first requirement heading sits at offset 39 and ``tier1_preamble``
+    returns 38 characters: it drops the story bodies (correct) AND the
+    6,572 chars of cross-cutting requirements that follow them AND the
+    entire architecture document — data model, external interfaces,
+    cross-cutting concerns, test strategy, required inventory blocks.
+
+    The ADR's safety rule does not catch that. It fires on an unresolved
+    scope or an empty extract; here the scope resolves and the extract is
+    non-empty, so the loss is silent. That is very likely why
+    ``planning.scoped_spec_context`` has never been switched on.
+
+    So instead of truncating at the first story, remove each story's SPAN:
+    a requirement heading opens one, and the next heading at the same or
+    shallower depth that is NOT itself requirement-bearing closes it.
+    Deeper headings (lumina writes stories at ``####`` under a ``##``
+    epic) stay inside the span. A region with no requirement heading is
+    returned unchanged, as before — the architecture document is
+    cross-cutting in its entirety.
+
+    The result is what every node needs regardless of which story it is
+    working on, which is also what makes it a stable cache prefix:
+    identical for every call in the run, while the per-story detail rides
+    in a later message (see :func:`apply_to_messages`).
+    """
+    if not spec_region:
+        return ""
+    headings = [
+        (m.start(), len(m.group(1)), bool(_REQ_HEADING_RE.match(m.group(0))))
+        for m in _ANY_HEADING_RE.finditer(spec_region)
+    ]
+    if not any(is_req for _, _, is_req in headings):
+        return spec_region
+
+    drops: list[tuple[int, int]] = []
+    i = 0
+    while i < len(headings):
+        start, level, is_req = headings[i]
+        if not is_req:
+            i += 1
+            continue
+        end = len(spec_region)
+        j = i + 1
+        while j < len(headings):
+            nxt_start, nxt_level, nxt_is_req = headings[j]
+            if nxt_level <= level and not nxt_is_req:
+                end = nxt_start
+                break
+            j += 1
+        drops.append((start, end))
+        i = j
+
+    kept: list[str] = []
+    cursor = 0
+    for start, end in drops:
+        kept.append(spec_region[cursor:start])
+        cursor = end
+    kept.append(spec_region[cursor:])
+    return "".join(kept).rstrip() + "\n"
+
+
 def _parents_of(body: str) -> list[str]:
     return [m.group(1) for m in _PARENT_RE.finditer(body or "")]
 
@@ -238,7 +320,10 @@ def apply_to_messages(
         )
         return messages, None
 
-    preamble = tier1_preamble(region)
+    # Not ``tier1_preamble``: that truncates at the first story heading and
+    # would take the post-story cross-cutting requirements and the whole
+    # architecture document with it. See ``cross_cutting_context``.
+    preamble = cross_cutting_context(region)
     msgs[0] = dict(msgs[0])
     msgs[0]["content"] = preamble + system_content[len(region):]
     entry = {"role": "user", "content": extract}

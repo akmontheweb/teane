@@ -410,7 +410,8 @@
         "enforce": true
     },
     "planning": {
-        "embed_constraint_nfrs": true
+        "embed_constraint_nfrs": true,
+        "scoped_spec_context": true
     },
     "fanout": {
         "max_concurrency": 8,

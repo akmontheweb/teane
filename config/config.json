@@ -72,6 +72,7 @@
         "deployment": true,
         "layout_divergence": true,
         "auto_resume_cap_per_blocker": 9,
+        "auto_resume_class_cap_resets_on_progress": true,
         "auto_resume_cap_per_trigger": 6,
         "auto_resume_cap": 18
     },

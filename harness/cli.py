@@ -1342,6 +1342,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # / ``_HITL_AUTO_RESUME_CAP_PER_TRIGGER`` at module top.
         "auto_resume_cap", "auto_resume_cap_per_trigger",
         "auto_resume_cap_per_blocker",
+        # The class cap bounds thrash on ONE problem, so a class budget is
+        # refunded when the blocker it was charged for is gone and the new
+        # one is novel. False restores lifetime counting, which terminated
+        # lumina 01a169ed at 6/6 after it resolved five blockers.
+        "auto_resume_class_cap_resets_on_progress",
     }),
     # Agile tuning knobs. batch_size = max stories per dependency batch;
     # commit_on_story = git-commit after each green story; repair_cap =
@@ -1406,6 +1411,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "hitl.auto_resume_cap": (int,),
     "hitl.auto_resume_cap_per_trigger": (int,),
     "hitl.auto_resume_cap_per_blocker": (int,),
+    "hitl.auto_resume_class_cap_resets_on_progress": (bool,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -2909,6 +2915,88 @@ _HITL_AUTO_RESUME_CAP_PER_BLOCKER = 9
 # appearing/disappearing at the tail doesn't mint a "new" blocker and reset
 # the count.
 _BLOCKER_SIGNATURE_LOCATIONS = 3
+
+
+#: Whether a class budget is refunded when the harness demonstrably made
+#: progress. Operators can set ``hitl.auto_resume_class_cap_resets_on_progress``
+#: false to restore lifetime counting.
+_HITL_CLASS_CAP_RESETS_ON_PROGRESS = True
+
+
+def _blocker_locations(signature: str) -> frozenset[str]:
+    """The ``file:line`` locations inside a blocker signature."""
+    return frozenset(
+        part for part in (signature or "").split("|") if part.strip()
+    )
+
+
+def _class_budget_progress_reset(
+    *,
+    trigger_class: str,
+    blocker_sig: str,
+    history: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Should ``trigger_class``'s cap budget be refunded, and the new history.
+
+    The class cap exists to bound THRASH ON ONE PROBLEM. Counted over a
+    session's lifetime it instead punishes success: lumina 01a169ed (run 6,
+    2026-10-24) terminated on ``zero_patch_loop`` 6/6 having RESOLVED five
+    successive blockers --
+
+        resume  class  blocker  signature
+          1,2   1,2    1/9,2/9  story_001:29|story_004:66
+          3,4   3,4    1/9,2/9  story_004:66            (001 resolved)
+           5    5/6    1/9      contract:0|story_008:160|story_008:49
+           6    6/6    1/9      contract:0|story_008:158|story_008:49
+
+    -- while the session cap sat at 7/18, every blocker counter sat at 1/9,
+    and $8.02 of $10 was unspent. Each blocker-counter reset is the harness
+    telling us the previous blocker is GONE. The class counter ratcheted
+    through all of it and ended a run that was working.
+
+    This is the third counter in this family to do it: the per-blocker cap
+    was 4 and terminated lumina 01a15562 at 4/4 with session 4/9 and no
+    class above 2/3 ($7.67 unspent); the per-trigger cap keyed on the raw
+    label so embedded round numbers minted a "new" trigger every round.
+    Same lesson each time -- a counter must measure the thing its cap is
+    named for.
+
+    So refund only on PROVEN progress, which needs both:
+
+    * **novel** -- this signature has never been charged to this class.
+      Without it, a loop oscillating A -> B -> A refunds on every hop and
+      the cap bounds nothing; B's arrival looks like A's resolution and
+      vice versa. A returning blocker is thrash, not progress.
+    * **resolved** -- the signature charged last for this class shares NO
+      location with the current one. A set that merely grew or shrank at
+      the tail is the same pathology shifting, and
+      :data:`_BLOCKER_SIGNATURE_LOCATIONS` already truncates to 3 so a tail
+      diagnostic cannot mint a new blocker on its own.
+
+    Progress refunds the class budget only. The session cap is untouched and
+    remains the real bound on a long tail of distinct problems -- which is
+    what it is for, and why loosening this one is safe.
+    """
+    entry = history.get(trigger_class)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    previous = str(entry.get("last") or "")
+    charged = {str(x) for x in (entry.get("seen") or []) if str(x)}
+
+    novel = bool(blocker_sig) and blocker_sig not in charged
+    resolved = bool(previous) and bool(blocker_sig) and not (
+        _blocker_locations(previous) & _blocker_locations(blocker_sig)
+    )
+
+    if blocker_sig:
+        entry["last"] = blocker_sig
+        # Bounded: the signature set only needs to answer "have we paid for
+        # this before", and an unbounded list would ride every checkpoint.
+        charged.add(blocker_sig)
+        entry["seen"] = sorted(charged)[-32:]
+
+    updated = dict(history)
+    updated[trigger_class] = entry
+    return (novel and resolved), updated
 
 
 def _blocker_signature(state: dict[str, Any]) -> str:
@@ -4896,6 +4984,47 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     int(_per_blocker.get(_blocker_sig, 0) or 0)
                     if _blocker_sig else 0
                 )
+                # Refund this class's budget when the previous blocker it was
+                # charged for is demonstrably GONE (see
+                # _class_budget_progress_reset). Runs before the cap test, so
+                # progress made on THIS trip counts against termination rather
+                # than after it.
+                _progress_resets = bool(
+                    state.get("hitl_auto_resume_class_cap_resets_on_progress")
+                    if state.get(
+                        "hitl_auto_resume_class_cap_resets_on_progress"
+                    ) is not None
+                    else _hitl_config.get(
+                        "auto_resume_class_cap_resets_on_progress",
+                        _HITL_CLASS_CAP_RESETS_ON_PROGRESS,
+                    )
+                )
+                _class_hist_raw = _lc_for_cap.get("hitl_class_blocker_history")
+                _class_hist: dict[str, Any] = (
+                    dict(_class_hist_raw)
+                    if isinstance(_class_hist_raw, dict) else {}
+                )
+                if _progress_resets:
+                    _made_progress, _class_hist = (
+                        _class_budget_progress_reset(
+                            trigger_class=_trigger_class,
+                            blocker_sig=_blocker_sig,
+                            history=_class_hist,
+                        )
+                    )
+                    if _made_progress and _trigger_taken:
+                        logger.info(
+                            "[HITL] Class '%s' budget refunded (was %d/%d): "
+                            "the blocker it was charged for is gone and '%s' "
+                            "is new, so the loop is making progress rather "
+                            "than thrashing. The session cap (%d/%d) still "
+                            "bounds the run.",
+                            _trigger_class, _trigger_taken, _cap_per_trigger,
+                            _blocker_sig, _resumes_taken, _cap,
+                        )
+                        _per_trigger[_trigger_class] = 0
+                        _trigger_taken = 0
+                _lc_for_cap["hitl_class_blocker_history"] = _class_hist
                 _session_cap_hit = _resumes_taken >= _cap
                 _trigger_cap_hit = _trigger_taken >= _cap_per_trigger
                 _blocker_cap_hit = bool(_blocker_sig) and (

@@ -493,6 +493,39 @@ def unparseable_reason(source: str, *, filename: str = "") -> Optional[str]:
         return f"test file does not parse ({loc}: {exc.msg})"
 
 
+def proven_unsatisfiable_tests(
+    source: str, *, filename: str = "",
+) -> frozenset[str]:
+    """Test function names a PROOF names as mutually contradictory.
+
+    The companion to :func:`machine_unsatisfiable_reason`, which returns only
+    a human-readable string. Downstream needs the NAMES: once an AST proof
+    says these functions cannot all hold, deleting them is the correct fix
+    rather than coverage vandalism, and the anti-reward-hack gate in
+    ``test_regeneration`` must be told which removals were sanctioned.
+
+    lumina 01a17704 is why this exists. The router proved
+    ``test_birthday_service.py`` unsatisfiable, regeneration produced the
+    corrected suite, and ``coverage_nonregression_ok`` threw it away for
+    dropping 18 test functions to 16 — its tolerance is one, because the only
+    shape :func:`find_contradictions` can prove is a contradictory PAIR. Both
+    regeneration attempts went that way and the run died with the proof
+    sitting unused in the log.
+
+    Empty when nothing is provable, so a caller can never mistake "no proof"
+    for "delete freely".
+    """
+    if filename and not filename.endswith(".py"):
+        return frozenset()
+    names: set[str] = set()
+    for c in find_contradictions(source, filename=filename):
+        if c.expect_raise_test:
+            names.add(c.expect_raise_test)
+        if c.expect_success_test:
+            names.add(c.expect_success_test)
+    return frozenset(names)
+
+
 def machine_unsatisfiable_reason(
     source: str, *, filename: str = "",
 ) -> Optional[str]:

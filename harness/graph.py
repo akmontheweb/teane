@@ -24373,10 +24373,26 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
     ):
         provable = "proved cross-file contradiction, adjudicated by the judge"
     if provable is not None:
+        # Carry the PROOF forward, not just its prose. The coverage gate in
+        # test_regeneration must know which removals a proof sanctioned, or it
+        # vetoes the fix the ladder exists to produce (lumina 01a17704 died
+        # that way with the proof sitting unused in the log).
+        try:
+            from harness.test_contradiction import proven_unsatisfiable_tests
+            _proof_tests = sorted(
+                proven_unsatisfiable_tests(source, filename=declared_file)
+            )
+        except Exception:  # noqa: BLE001 — never block routing on telemetry
+            _proof_tests = []
+        if _proof_tests:
+            _ns_proof = state.setdefault("node_state", {})
+            _ns_proof["unsatisfiable_proof_tests"] = _proof_tests
         logger.warning(
             "[router] Test %s is PROVABLY unsatisfiable (%s) — routing to "
-            "test-author regeneration (attempt %d/%d).",
+            "test-author regeneration (attempt %d/%d). Proof names %s; those "
+            "removals are sanctioned.",
             declared_file, provable, attempts + 1, cap,
+            _proof_tests or "no specific function",
         )
         return "test_regeneration_node"
 

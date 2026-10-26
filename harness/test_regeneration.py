@@ -105,14 +105,79 @@ def count_assertion_sites(source: str) -> int:
                 else func.id if isinstance(func, ast.Name)
                 else ""
             )
-            if name in ("raises", "assertRaises", "assertRaisesRegex", "warns") \
-                    or name.startswith("assert"):
+            if _is_assertion_call_name(name):
                 n += 1
     return n
 
 
+def _is_assertion_call_name(name: str) -> bool:
+    """Shared by both assertion counters so they cannot drift apart."""
+    return (
+        name in ("raises", "assertRaises", "assertRaisesRegex", "warns")
+        or name.startswith("assert")
+    )
+
+
+def _assertion_sites_outside(source: str, skip: "frozenset[str]") -> int:
+    """Assertion sites in ``source``, ignoring functions named in ``skip``.
+
+    Removing a test that a proof showed false necessarily removes its
+    assertions, so the >50%-weakened floor must measure what the rewrite was
+    responsible for KEEPING — not what the proof licensed it to delete.
+    Without this the gate still vetoes a sanctioned removal, just via the
+    assertion check instead of the function check.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return 0
+    skipped_spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name in skip:
+            skipped_spans.append(
+                (node.lineno, node.end_lineno or node.lineno)
+            )
+
+    def _inside_skipped(lineno: int) -> bool:
+        return any(a <= lineno <= b for a, b in skipped_spans)
+
+    n = 0
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", None)
+        if line is None or _inside_skipped(line):
+            continue
+        if isinstance(node, ast.Assert):
+            n += 1
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = (
+                func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name)
+                else ""
+            )
+            if _is_assertion_call_name(name):
+                n += 1
+    return n
+
+
+def _test_function_names(source: str) -> frozenset[str]:
+    """Top-level and method test function names in ``source``."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return frozenset()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name.startswith("test"):
+            names.add(node.name)
+    return frozenset(names)
+
+
 def coverage_nonregression_ok(
     old_source: str, new_source: str,
+    *, sanctioned_removals: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[bool, str]:
     """Reject a regeneration that weakens coverage (the anti-reward-hack gate).
 
@@ -122,6 +187,25 @@ def coverage_nonregression_ok(
     rewrite to keep the bulk of the assertion sites. A rewrite that guts the
     file to pass — no assertions, or a collapse below half the original — is
     rejected.
+
+    ``sanctioned_removals`` names test functions an AST PROOF has shown cannot
+    all hold (see ``test_contradiction.proven_unsatisfiable_tests``). Those are
+    discounted from the before-count, because deleting a function proven false
+    is the correct fix and not vandalism — this gate exists to stop the MODEL
+    trading coverage for a green build, and a proof is not the model's opinion.
+
+    Without that distinction the gate vetoes the very fix the ladder exists to
+    produce. lumina 01a17704: the router proved
+    ``test_birthday_service.py`` unsatisfiable, regeneration returned the
+    corrected suite, and this gate rejected it for "test-function count
+    dropped 18->16 (>1 removed)" — twice, which spent the file's whole
+    regeneration budget and killed the run with the proof unused. The
+    one-function tolerance encoded an assumption that falsity always arrives
+    as a contradictory PAIR, which is merely the only shape the prover can
+    currently see.
+
+    Everything not named by the proof is still held to the original floor, so
+    a genuine gutting is still refused.
     """
     if not new_source.strip():
         return False, "regenerated test is empty"
@@ -133,13 +217,44 @@ def coverage_nonregression_ok(
     of, nf = count_test_functions(old_source), count_test_functions(new_source)
     oa, na = count_assertion_sites(old_source), count_assertion_sites(new_source)
 
+    # Discount proof-named functions that the rewrite actually dropped: the
+    # proof sanctioned exactly those removals. A proof-named function the
+    # rewrite KEPT is not discounted, so keeping-and-correcting (the ideal
+    # fix) is unaffected.
+    _sanctioned = frozenset(sanctioned_removals or ())
+    _removed_by_proof = 0
+    _note = ""
+    if _sanctioned:
+        _still_present = _test_function_names(new_source)
+        _removed_by_proof = sum(
+            1 for name in _sanctioned if name not in _still_present
+        )
+        if _removed_by_proof:
+            _note = (
+                f", {_removed_by_proof} proof-sanctioned removal(s) discounted"
+            )
+
     if na == 0:
         return False, "regenerated test has no assertions (gutted)"
-    if nf < max(1, of - 1):
-        return False, f"test-function count dropped {of}->{nf} (>1 removed)"
-    if oa and na * 2 < oa:
-        return False, f"assertion sites dropped {oa}->{na} (>50% weakened)"
-    return True, f"functions {of}->{nf}, assertions {oa}->{na}"
+    _floor = max(1, of - 1 - _removed_by_proof)
+    if nf < _floor:
+        return False, (
+            f"test-function count dropped {of}->{nf} (>1 removed{_note})"
+        )
+    # The assertion floor measures what the rewrite had to KEEP, so discount
+    # the assertions that lived inside proof-sanctioned removals.
+    _oa_effective = oa
+    if _removed_by_proof:
+        _dropped_names = frozenset(
+            n for n in _sanctioned if n not in _still_present
+        )
+        _oa_effective = _assertion_sites_outside(old_source, _dropped_names)
+    if _oa_effective and na * 2 < _oa_effective:
+        return False, (
+            f"assertion sites dropped {_oa_effective}->{na} (>50% weakened"
+            f"{_note})"
+        )
+    return True, f"functions {of}->{nf}, assertions {oa}->{na}{_note}"
 
 
 def has_code_linkage(test_source: str) -> bool:
@@ -508,6 +623,12 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     node_state = state.get("node_state", {}) or {}
     rel = str(node_state.get("unsatisfiable_test", "") or "")
     reason = str(node_state.get("unsatisfiable_test_reason", "") or "")
+    # Test functions an AST proof named as mutually contradictory; the
+    # coverage gate discounts exactly these removals. Empty unless the
+    # router proved it, so "no proof" never licenses a deletion.
+    proof_tests = frozenset(
+        str(x) for x in (node_state.get("unsatisfiable_proof_tests") or []) if x
+    )
     workspace = str(state.get("workspace_path", "") or "")
     loop_counter = dict(state.get("loop_counter", {}) or {})
     cfg = state.get("test_regeneration_config", {}) or {}
@@ -819,6 +940,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         targets = {_norm(t, workspace) for t in patch_target_paths(content)}
         stray = {t for t in targets if t != _norm(rel, workspace)}
         if stray:
+            # NOT refunded: aiming at another file is the model's error.
             return _give_up("targeted_other_files",
                             f"regeneration tried to touch {sorted(stray)}")
         if targets:
@@ -847,6 +969,8 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
                 len(getattr(response, "reasoning_content", "") or ""),
             )
     if not targets:
+        # NOT refunded here: the zero-emission case already has its own
+        # bounded reprieve (``test_regen_zero_block``) further up.
         return _give_up("no_patch", "regeneration emitted no REWRITE_FILE block")
 
     # Apply the rewrite (test-author phase — writing tests is permitted). The
@@ -878,14 +1002,25 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     # --- Gate: code linkage (@tests marker) — unit tests link to code ---
     if cfg.get("require_code_linkage", True) and not has_code_linkage(written):
         _rollback()
+        # NOT refunded: dropping the marker is the MODEL's error, so this is
+        # a fix that was tried and failed. Only a HARNESS judgement that
+        # refuses plausibly-correct output earns a refund (see the coverage
+        # gate below).
         return _give_up("no_code_linkage",
                         "regenerated test dropped its `# @tests:` marker")
 
     # --- Gate: coverage non-regression (anti-reward-hack floor) ---
     if cfg.get("coverage_nonregression", True):
-        ok, detail = coverage_nonregression_ok(old_source, written)
+        # FIX 2 — a proof sanctions the removals it names.
+        ok, detail = coverage_nonregression_ok(
+            old_source, written, sanctioned_removals=proof_tests,
+        )
         if not ok:
             _rollback()
+            _refund_attempt(
+                loop_counter, rel,
+                why=f"coverage gate rejected the rewrite ({detail})",
+            )
             return _give_up("coverage_regression", detail)
 
     # --- Advisory: comprehensiveness against the module's public surface ---

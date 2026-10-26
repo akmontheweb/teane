@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -218,6 +220,93 @@ async def _configure_sqlite_pragmas(conn: Any, db_path: str) -> None:
     await conn.commit()
 
 
+#: Every aiosqlite connection this module has opened, weakly held.
+#:
+#: ``aiosqlite.Connection`` runs its queries on a worker ``Thread`` created
+#: WITHOUT ``daemon=True``, and that thread exits only when ``close()``/
+#: ``stop()`` puts the stop sentinel on its queue. CPython joins non-daemon
+#: threads in ``threading._shutdown`` BEFORE atexit hooks run, so one
+#: unclosed connection parks the interpreter in ``wait_for_thread_shutdown``
+#: forever -- and the atexit hook that would reap stdio MCP servers never
+#: runs either.
+#:
+#: This module opened such a connection on every command path and closed it
+#: on NONE (``storage.py`` contained no ``close`` call at all), so the only
+#: thing retiring the thread was :func:`harness.cli._arm_exit_watchdog`
+#: forcing ``os._exit`` after a 60s stall. lumina 01a16c1e hit it when a 402
+#: propagated out of ``gateway.dispatch``:
+#:
+#:   [harness] shutdown did not complete within 60s (a non-daemon worker
+#:   thread is wedged) -- forcing exit(1).
+_OPEN_SQLITE_CONNECTIONS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def _open_tracked_connection(aiosqlite_mod: Any, path: str) -> Any:
+    """``aiosqlite.connect(path)`` with the worker marked daemon and tracked.
+
+    The flag must be set BEFORE the thread starts: aiosqlite builds the
+    Thread in ``__init__`` and starts it in ``__await__``, so this awaitable
+    is the only window. With it, an unclosed connection can no longer park
+    the interpreter -- the process exits immediately instead of stalling 60s
+    for :func:`harness.cli._arm_exit_watchdog`, which killed the thread
+    mid-flight anyway AND skipped the atexit hooks that reap stdio MCP
+    servers. WAL keeps the database crash-safe either way; the worst case is
+    abandoning an in-flight checkpoint write that the forced exit abandoned
+    too, 60 seconds later.
+
+    Returns the awaitable connection, so callers keep ``await`` semantics.
+    """
+    pending = aiosqlite_mod.connect(path)
+    try:
+        pending._thread.daemon = True
+    except Exception:  # noqa: BLE001 — private attribute
+        logger.debug(
+            "[storage] could not mark the aiosqlite worker daemon "
+            "(internals changed?); aclose() and _release_sqlite_workers "
+            "still cover shutdown."
+        )
+    return _TrackedConnect(pending)
+
+
+class _TrackedConnect:
+    """Awaits ``pending`` and registers the live connection for cleanup."""
+
+    __slots__ = ("_pending",)
+
+    def __init__(self, pending: Any) -> None:
+        self._pending = pending
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        conn = yield from self._pending.__await__()
+        _OPEN_SQLITE_CONNECTIONS.add(conn)
+        return conn
+
+
+def _release_sqlite_workers() -> None:
+    """Retire every still-running aiosqlite worker thread.
+
+    Registered through ``threading._register_atexit``, which runs BEFORE
+    non-daemon threads are joined -- unlike ``atexit``, which runs after and
+    is therefore useless here. Best-effort by construction: this is the last
+    line of defence on a teardown path that has already gone wrong.
+    """
+    for conn in list(_OPEN_SQLITE_CONNECTIONS):
+        try:
+            conn.stop()  # sync-safe: no running loop needed
+        except Exception:  # noqa: BLE001 — never block interpreter exit
+            pass
+
+
+try:
+    # Private, and deliberately so: the public atexit runs too late to help.
+    threading._register_atexit(_release_sqlite_workers)  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001 — the daemon flag below still covers us
+    logger.debug(
+        "[storage] threading._register_atexit unavailable; relying on the "
+        "daemon flag to keep an unclosed connection from wedging shutdown."
+    )
+
+
 class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
     """
     Thin wrapper around the official langgraph-checkpoint-sqlite AsyncSqliteSaver
@@ -236,6 +325,28 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
     # keeps secrets the user pasted into a prompt out of the on-disk SQLite
     # blob. Defaults to True; opt out via persistence.redact_messages: false.
     _redact_messages_on_checkpoint: bool
+
+    async def aclose(self) -> None:
+        """Close the connection and retire its worker thread. Idempotent.
+
+        Safe to call from a ``finally`` on a path already unwinding from an
+        exception -- exactly where the old code leaked the thread. Prefer it
+        over the daemon flag: it flushes the last checkpoint write instead
+        of abandoning it.
+        """
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        try:
+            await conn.close()
+        except Exception as exc:  # noqa: BLE001 — teardown must not raise
+            logger.debug("[storage] connection close failed: %s", exc)
+            try:
+                conn.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            _OPEN_SQLITE_CONNECTIONS.discard(conn)
 
     @classmethod
     async def from_db_path(
@@ -257,7 +368,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
-        conn = await aiosqlite.connect(expanded_path)
+        conn = await _open_tracked_connection(aiosqlite, expanded_path)
         await _configure_sqlite_pragmas(conn, expanded_path)
 
         instance = cls(conn)
@@ -514,7 +625,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
-        conn = await aiosqlite.connect(expanded_path)
+        conn = await _open_tracked_connection(aiosqlite, expanded_path)
         await _configure_sqlite_pragmas(conn, expanded_path)
 
         instance = cls(conn)

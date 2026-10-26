@@ -395,6 +395,43 @@ def _bump_attempt(loop_counter: dict[str, Any], rel: str) -> None:
     loop_counter[_REGEN_ATTEMPTS_KEY] = attempts
 
 
+def _refund_attempt(loop_counter: dict[str, Any], rel: str, *, why: str) -> bool:
+    """Give ``rel`` its attempt back, at most once per file. True if refunded.
+
+    An attempt is meant to count a FIX that was tried and failed. A dispatch
+    that wrote nothing, or a duplicate of work already done, is neither --
+    charging it spends the file's scarce budget (``max_attempts_per_test``,
+    2 by default) without ever touching the defect.
+
+    Bounded to one reprieve per file, like the unit-test path's
+    ``test_regen_zero_block``: a generator that never emits must still
+    converge to HITL rather than looping on refunds.
+    """
+    granted = loop_counter.setdefault("test_regen_refunds", {})
+    if not isinstance(granted, dict) or granted.get(rel):
+        logger.warning(
+            "[test_regeneration_node] %s: %s — attempt NOT refunded (the "
+            "one reprieve for this file is already spent).", rel, why,
+        )
+        return False
+    granted[rel] = 1
+    attempts = dict(loop_counter.get(_REGEN_ATTEMPTS_KEY, {}) or {})
+    if int(attempts.get(rel, 0) or 0) > 0:
+        attempts[rel] = int(attempts[rel]) - 1
+        loop_counter[_REGEN_ATTEMPTS_KEY] = attempts
+    logger.warning(
+        "[test_regeneration_node] %s: %s — refunding the attempt (now %d) so "
+        "a non-fix does not spend the file's regeneration budget.",
+        rel, why, int(attempts.get(rel, 0) or 0),
+    )
+    try:
+        from harness.observability import emit_event as _emit_rf
+        _emit_rf("test_regen_attempt_refunded", file=rel, reason=why)
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    return True
+
+
 def _failing_output(state: dict[str, Any], rel: str, workspace: str) -> str:
     """Best-effort pytest tail for the declared test, from compiler_errors.
 
@@ -982,9 +1019,53 @@ async def _regenerate_acceptance_suite(
         for ac_key, first, last in by_func.values():
             if first <= line <= last and ac_key not in failing:
                 failing[ac_key] = str(err.get("message") or "")[:400]
+    # FIX 2 — honour the criterion the DECLARATION names. ``failing`` above is
+    # derived purely from compiler_errors line ranges, which answers "what is
+    # red" and not "what was declared impossible". Those differ: lumina
+    # 01a17661 regenerated STORY-004.AC-2 while the model's declaration named
+    # ``test_empty_horizon_returns_empty_buckets`` (a different criterion), so
+    # the contradiction it correctly diagnosed NINE times was never touched
+    # and both attempts were spent elsewhere. The model's reason is evidence,
+    # not just prose to record beside the suite.
+    for _fn_name, (_ac_key, _first, _last) in by_func.items():
+        if _ac_key in failing:
+            continue
+        if _fn_name and _fn_name in (reason or ""):
+            failing[_ac_key] = (
+                f"named in the unsatisfiable declaration: {reason}"[:400]
+            )
+            logger.warning(
+                "[test_regeneration_node] declaration names %s → adding its "
+                "criterion %s to the regeneration set (line-mapped failures "
+                "alone pointed elsewhere).", _fn_name, _ac_key,
+            )
     if not failing:
         return give_up("no_failing_criterion",
                        f"no failing test in {rel} maps to a @verifies criterion")
+
+    # FIX 3 — never spend an attempt re-doing identical work. The router mints
+    # its own regeneration request whenever repair is blocked needing a test
+    # edit (graph.py: ``_ns_blocked["unsatisfiable_test"] = _blocked_file``),
+    # so a file that is still red gets re-routed here even when the previous
+    # attempt SUCCEEDED. lumina 01a17661 regenerated STORY-002.AC-4 twice from
+    # one declaration, six seconds apart, and that duplicate consumed the
+    # file's second and last attempt. Regenerating the same criteria from the
+    # same criterion text yields the same scenario, so refuse and refund.
+    _sig = "|".join(sorted(failing))
+    _prev_sigs = loop_counter.setdefault("test_regen_last_signature", {})
+    if isinstance(_prev_sigs, dict) and _prev_sigs.get(rel) == _sig:
+        _refund_attempt(
+            loop_counter, rel,
+            why=f"the same criteria ({_sig}) were regenerated last attempt",
+        )
+        return give_up(
+            "acceptance_regen_repeat",
+            f"criteria {sorted(failing)} were regenerated on the previous "
+            f"attempt and are still failing — re-running the same generation "
+            f"cannot differ. Attempt refunded; the ladder escalates instead.",
+        )
+    if isinstance(_prev_sigs, dict):
+        _prev_sigs[rel] = _sig
 
     for ac_key, msg in failing.items():
         ag.record_scenario_feedback(
@@ -1032,6 +1113,18 @@ async def _regenerate_acceptance_suite(
             elif ac_key in res.not_runtime or ui_only:
                 replacements[ac_key] = None
     if not replacements:
+        # FIX 1 — nothing was written, so this was a failed DISPATCH and not a
+        # failed fix. Charging it spends a scarce attempt (cap 2) on zero
+        # code: lumina 01a17661 burnt STORY-004's second and last attempt
+        # here, after its first had rewritten the wrong criterion, leaving no
+        # way to act on a contradiction the model named nine times. Mirrors
+        # the ``test_regen_zero_block`` reprieve the unit-test path already
+        # grants, and is likewise bounded to once per file so a generator
+        # that never emits still converges to HITL.
+        _refund_attempt(
+            loop_counter, rel,
+            why="the scenario generator returned nothing usable",
+        )
         return give_up("acceptance_regen_empty",
                        f"the scenario generator returned nothing usable for "
                        f"{sorted(failing)}")

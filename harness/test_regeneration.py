@@ -424,6 +424,40 @@ _REGEN_SYSTEM = (
 )
 
 
+#: Markers that a declaration blames the SPEC, not the code. Deliberately
+#: narrow: a false positive promotes the spec over the code contract for a
+#: plain code-gap test, which is the wrong anchor for the common case.
+_SPEC_CONFLICT_MARKERS = (
+    "srs", "spec", "specification", "asm-", "req-", "nfr-",
+    "acceptance criterion", "acceptance criteria", "mandates", "contract says",
+)
+
+
+def reason_cites_spec_conflict(reason: str) -> bool:
+    """True when an unsatisfiable declaration blames a SPEC rule.
+
+    Unit-test regeneration anchors on the CODE by design (the 1:1
+    ``# @tests:`` traceability model). That is right for a test that
+    disagrees with its module -- and exactly wrong for a test that
+    disagrees with the SRS, because the production code was written to
+    satisfy that test. Regenerating from such code reproduces the
+    falsehood with more confidence, since the code now encodes it and the
+    code is the stated source of truth.
+
+    Four of the six false tests observed across lumina runs 5-9 were unit
+    tests contradicting the SRS and every one was rebuilt from code:
+    ``test_api_birthdays.py:103`` asserting an unconditional 400 against
+    ASM-009's stored-profile fallback; ``test_quick_action_service.py:41``
+    demanding ``wa.me/+1555`` where the spec says no ``+``;
+    ``test_dashboard_service.py``'s inconsistent ``_relative_label`` rule;
+    ``test_birthday_service.py:135`` asserting 2 results in a 30-day window
+    holding 1. The two ACCEPTANCE cases were rebuilt from their criteria and
+    came back correct -- run 8's envelope test is the worked example.
+    """
+    low = (reason or "").lower()
+    return any(m in low for m in _SPEC_CONFLICT_MARKERS)
+
+
 def build_regeneration_messages(
     *,
     test_rel_path: str,
@@ -436,11 +470,36 @@ def build_regeneration_messages(
     spec_tiebreaker: str = "",
     judge_diagnosis: str = "",
     prior_attempt_note: str = "",
+    spec_authoritative: bool = False,
 ) -> list[dict[str, str]]:
-    """Assemble the regeneration prompt, code-contract first. Pure/testable."""
+    """Assemble the regeneration prompt. Pure/testable.
+
+    Code-contract first by default: a unit test anchors on the module it
+    maps to 1:1. But when the declaration blames a SPEC rule
+    (:func:`reason_cites_spec_conflict`), the code has lost its authority --
+    it was written to satisfy the very test being replaced -- so the spec
+    leads instead, with precedence stated outright. Normal generation is
+    untouched; only the repair-of-a-proven-false-test path flips.
+    """
     symbols = ", ".join(module_symbols) if module_symbols else "(none detected)"
-    parts = [
-        f"## Regenerate the unit tests for module: {code_module_path}\n",
+    parts: list[str] = []
+    if spec_authoritative and spec_tiebreaker.strip():
+        parts.append(
+            "## THE SPECIFICATION IS AUTHORITATIVE FOR THIS REWRITE\n"
+            "The repair loop declared this test unsatisfiable because it "
+            "contradicts the specification below — not because the code is "
+            "incomplete.\n\n"
+            "Where the code under test and this specification DISAGREE, the "
+            "specification wins and your test MUST follow the specification. "
+            "Do not derive the expected values from the code: that code was "
+            "written to satisfy the defective test you are replacing, so it "
+            "very likely encodes the same error. Repair will correct the code "
+            "to match once your test states the right expectation.\n\n"
+            f"### Specification (AUTHORITATIVE)\n{spec_tiebreaker[:12000]}\n"
+        )
+    parts.append(
+        f"## Regenerate the unit tests for module: {code_module_path}\n")
+    parts += [
         f"### Code under test ({code_module_path})\n```\n{code_module_source[:12000]}\n```\n",
         f"### Public symbols to cover comprehensively\n{symbols}\n",
         f"### Defective test file: {test_rel_path}\n"
@@ -460,7 +519,7 @@ def build_regeneration_messages(
         parts.append(
             f"### Your previous attempt on this file\n{prior_attempt_note}\n"
         )
-    if spec_tiebreaker.strip():
+    if spec_tiebreaker.strip() and not spec_authoritative:
         parts.append(
             "### Specification (TIEBREAKER ONLY — do not cite in the test)\n"
             f"{spec_tiebreaker[:4000]}\n"
@@ -791,6 +850,21 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             spec_tiebreaker = m["content"]
             break
 
+    # A declaration blaming a SPEC rule flips the anchor: the code was
+    # written to satisfy the test being replaced, so rebuilding from it
+    # reproduces the error. See reason_cites_spec_conflict.
+    _spec_authoritative = bool(
+        spec_tiebreaker.strip() and reason_cites_spec_conflict(reason)
+    )
+    if _spec_authoritative:
+        logger.warning(
+            "[test_regeneration_node] %s: the declaration blames a SPEC rule, "
+            "so the SPECIFICATION leads this rewrite and the code under test "
+            "is demoted — it was written to satisfy the test being replaced. "
+            "Reason: %s",
+            rel, (reason or "")[:200],
+        )
+
     # Anti-repetition. repair_node has had a fixation trap since 04a9968 —
     # a byte-identical re-emission is the model CLAIMING the file is already
     # right, and it must be told so rather than silently spending a round.
@@ -841,6 +915,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         spec_tiebreaker=spec_tiebreaker,
         judge_diagnosis=_judge_diagnosis(state, rel),
         prior_attempt_note=prior_attempt_note,
+        spec_authoritative=_spec_authoritative,
     )
 
     budget = float(state.get("budget_remaining_usd", 2.00))

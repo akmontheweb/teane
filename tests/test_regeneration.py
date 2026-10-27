@@ -909,6 +909,15 @@ class TestRepeatedEmissionIsNamed:
 
     @pytest.mark.asyncio
     async def test_a_changed_file_gets_no_repetition_note(self, monkeypatch):
+        """The edit must be to something OTHER than the original.
+
+        Restoring the pre-regeneration bytes is the one "change" that makes
+        round 2's request byte-for-byte identical to round 1's — same file,
+        same reason, same failure — and the repeat guard now refuses it
+        before dispatch rather than paying to ask again
+        (``unit_regen_repeat``). A real external edit leaves a file that
+        matches neither the original nor this node's emission.
+        """
         import harness.graph as g
         changed = self._block().replace("== 1", "== 2")
         with tempfile.TemporaryDirectory() as ws:
@@ -920,8 +929,11 @@ class TestRepeatedEmissionIsNamed:
 
             # Someone (repair, the operator) changed the file since.
             with open(os.path.join(ws, rel), "w") as fh:
-                fh.write("# @tests: app/m.py\n" + ORIGINAL)
-            state2 = _regen_setup(ws, rel)
+                fh.write(
+                    "# @tests: app/m.py\n" + ORIGINAL
+                    + "\n# adjusted by repair\n"
+                )
+            state2 = _state(ws, rel)
             state2["loop_counter"] = first["loop_counter"]
             fake2 = _QueueGateway(contents=[changed])
             monkeypatch.setattr(g, "get_gateway", lambda: fake2)

@@ -688,6 +688,63 @@ def _refund_attempt(loop_counter: dict[str, Any], rel: str, *, why: str) -> bool
     return True
 
 
+def _record_regen_request(
+    loop_counter: dict[str, Any], rel: str, signature: str,
+) -> None:
+    """Remember the request this file's author has now been ASKED.
+
+    Deliberately separate from :func:`_regen_request_repeated`, and called
+    only once a round has an answer in hand. Recording at the check instead
+    would let a round that never got one — a gateway error, a 402 like run
+    7's, a truncated response — stand as the file's last request, so the
+    retry would be refused as a repeat. Nothing about a provider failure
+    makes the question a bad one, and a file whose regeneration is poisoned
+    by a transient error is how one external fault turns into a dead story.
+
+    It is the same distinction FIX 1 draws for the attempt counter: a call
+    that produced nothing is a failed CALL, not a failed fix.
+    """
+    _prev = loop_counter.setdefault("test_regen_last_signature", {})
+    if isinstance(_prev, dict):
+        _prev[rel] = signature
+
+
+def _regen_request_repeated(
+    loop_counter: dict[str, Any], rel: str, signature: str,
+) -> bool:
+    """True when this file's LAST regeneration ran on the same request.
+
+    The router mints its own regeneration request whenever repair is blocked
+    needing a test edit (graph.py: ``_ns_blocked["unsatisfiable_test"]``), so
+    a file that is still red comes back here even when the previous attempt
+    SUCCEEDED. Nothing about the request has changed, so the author produces
+    what it produced last time and the duplicate eats an attempt out of
+    ``max_attempts_per_test`` (2).
+
+    Both regeneration paths need this and both found it the hard way:
+    lumina 01a17661 regenerated STORY-002.AC-4 twice from one declaration six
+    seconds apart (acceptance path), and run 10 took test_main.py from
+    attempt 1/2 to 2/2 in TEN SECONDS with both attempts writing the same
+    bytes (unit path). The unit path had only a prompt note to show for it —
+    "the file on disk is byte-identical to this node's previous emission" —
+    which makes the repetition visible to the author but still pays for the
+    dispatch and the attempt when the author ignores it.
+
+    Keyed by file, and a given file takes one path or the other for its
+    whole life (``_is_generated_acceptance_suite`` decides on content), so
+    one store cannot confuse the two signatures.
+
+    Pure: the signature is stored by :func:`_record_regen_request` once the
+    round has an answer, not here. A refused round therefore cannot
+    overwrite the signature that refused it, and a round that failed before
+    it got an answer cannot pose as one that did.
+    """
+    _prev = loop_counter.get("test_regen_last_signature")
+    if not isinstance(_prev, dict):
+        return False
+    return bool(_prev.get(rel) == signature)
+
+
 def _failing_output(state: dict[str, Any], rel: str, workspace: str) -> str:
     """Best-effort pytest tail for the declared test, from compiler_errors.
 
@@ -924,6 +981,39 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         out["node_state"]["test_regen_unsupported"] = rel
         return out
 
+    # Never spend an attempt re-asking an identical question. The unit path's
+    # whole request is (the file on disk, the declared reason, the failure it
+    # produced); when all three are what they were last attempt, the author
+    # has already answered this and the answer is on disk. Run 10 took
+    # test_main.py from regeneration 1/2 to 2/2 in TEN SECONDS, both attempts
+    # writing the same bytes, with the node logging "byte-identical to this
+    # node's previous emission" each time — the note was shown, ignored, and
+    # paid for twice.
+    #
+    # Byte-identity of the FILE alone is not the signal: it holds on every
+    # second attempt, because this node wrote the file and nothing else edits
+    # tests, so refusing on it would kill the productive round where the note
+    # is itself the new information. Folding in the reason and the failing
+    # output is what distinguishes "nothing has changed" from "repair moved
+    # production and there is something new to work from".
+    _failing_out = _failing_output(state, rel, workspace)
+    _request_signature = _content_md5(
+        f"{_content_md5(old_source)}|{reason}|{_failing_out}"
+    )
+    if _regen_request_repeated(loop_counter, rel, _request_signature):
+        _refund_attempt(
+            loop_counter, rel,
+            why="the same file, reason and failure were regenerated last "
+                "attempt",
+        )
+        return _give_up(
+            "unit_regen_repeat",
+            f"{rel} is unchanged since the previous regeneration and fails "
+            "the same way for the same declared reason — re-asking the same "
+            "question cannot differ. Attempt refunded; the ladder escalates "
+            "instead.",
+        )
+
     # SRS is a TIEBREAKER only (anchored system prompt for spec-driven builds).
     spec_tiebreaker = ""
     for m in state.get("messages", []) or []:
@@ -1005,7 +1095,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         code_module_source=code_module_source,
         module_symbols=module_symbols,
         unsat_reason=reason,
-        failing_output=_failing_output(state, rel, workspace),
+        failing_output=_failing_out,
         spec_tiebreaker=spec_tiebreaker,
         judge_diagnosis=_judge_dx,
         prior_attempt_note=prior_attempt_note,
@@ -1141,6 +1231,10 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         # NOT refunded here: the zero-emission case already has its own
         # bounded reprieve (``test_regen_zero_block``) further up.
         return _give_up("no_patch", "regeneration emitted no REWRITE_FILE block")
+
+    # The author has answered this question. Record it only now, so a round
+    # that died before getting an answer leaves the file free to ask again.
+    _record_regen_request(loop_counter, rel, _request_signature)
 
     # Apply the rewrite (test-author phase — writing tests is permitted). The
     # allowlist still constrains where writes may land as defence in depth.
@@ -1347,17 +1441,12 @@ async def _regenerate_acceptance_suite(
         return give_up("no_failing_criterion",
                        f"no failing test in {rel} maps to a @verifies criterion")
 
-    # FIX 3 — never spend an attempt re-doing identical work. The router mints
-    # its own regeneration request whenever repair is blocked needing a test
-    # edit (graph.py: ``_ns_blocked["unsatisfiable_test"] = _blocked_file``),
-    # so a file that is still red gets re-routed here even when the previous
-    # attempt SUCCEEDED. lumina 01a17661 regenerated STORY-002.AC-4 twice from
-    # one declaration, six seconds apart, and that duplicate consumed the
-    # file's second and last attempt. Regenerating the same criteria from the
-    # same criterion text yields the same scenario, so refuse and refund.
+    # FIX 3 — never spend an attempt re-doing identical work. Regenerating the
+    # same criteria from the same criterion text yields the same scenario, so
+    # refuse and refund. See _regen_request_repeated for why the router sends
+    # a successful attempt straight back here.
     _sig = "|".join(sorted(failing))
-    _prev_sigs = loop_counter.setdefault("test_regen_last_signature", {})
-    if isinstance(_prev_sigs, dict) and _prev_sigs.get(rel) == _sig:
+    if _regen_request_repeated(loop_counter, rel, _sig):
         _refund_attempt(
             loop_counter, rel,
             why=f"the same criteria ({_sig}) were regenerated last attempt",
@@ -1368,8 +1457,6 @@ async def _regenerate_acceptance_suite(
             f"attempt and are still failing — re-running the same generation "
             f"cannot differ. Attempt refunded; the ladder escalates instead.",
         )
-    if isinstance(_prev_sigs, dict):
-        _prev_sigs[rel] = _sig
 
     for ac_key, msg in failing.items():
         ag.record_scenario_feedback(
@@ -1432,6 +1519,11 @@ async def _regenerate_acceptance_suite(
         return give_up("acceptance_regen_empty",
                        f"the scenario generator returned nothing usable for "
                        f"{sorted(failing)}")
+
+    # The generator has answered for these criteria. Recorded here rather
+    # than at the check above so the empty generation refunded by FIX 1 does
+    # not also stand as this file's last request and get the retry refused.
+    _record_regen_request(loop_counter, rel, _sig)
 
     new_source = ag.splice_integration_scenarios(source, replacements)
     try:

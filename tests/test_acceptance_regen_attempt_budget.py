@@ -23,7 +23,12 @@ from __future__ import annotations
 import pytest
 
 from harness.acceptance_gen import verifies_by_function
-from harness.test_regeneration import _REGEN_ATTEMPTS_KEY, _refund_attempt
+from harness.test_regeneration import (
+    _REGEN_ATTEMPTS_KEY,
+    _record_regen_request,
+    _refund_attempt,
+    _regen_request_repeated,
+)
 
 
 def _lc(rel: str, attempts: int) -> dict:
@@ -160,11 +165,20 @@ class TestTheRepeatGuard:
     successful attempt could be immediately repeated at full cost."""
 
     def _would_repeat(self, lc: dict, rel: str, failing: set[str]) -> bool:
+        """Calls the SHIPPED guard, not a copy of it.
+
+        This used to mirror the logic inline, which is how a test keeps
+        passing after the thing it covers has moved — the guard is now a
+        shared function because the unit path needed it too.
+
+        Check then record, which is what a round that gets an answer does;
+        the node records only at that point, so a failed call leaves the
+        file free to ask again.
+        """
         sig = "|".join(sorted(failing))
-        prev = lc.setdefault("test_regen_last_signature", {})
-        if prev.get(rel) == sig:
+        if _regen_request_repeated(lc, rel, sig):
             return True
-        prev[rel] = sig
+        _record_regen_request(lc, rel, sig)
         return False
 
     def test_the_same_criteria_twice_is_refused(self):
@@ -353,11 +367,29 @@ class TestTheRealNodeExecutes:
         self, tmp_path, monkeypatch
     ):
         """Fix 3, executed: second call with the same criteria must refuse
-        BEFORE dispatching and refund."""
+        BEFORE dispatching and refund.
+
+        Round 1 has to SUCCEED, which is 01a17661's actual shape — AC-4's
+        first regeneration produced a correct test and the duplicate six
+        seconds later is what wasted the attempt. A generator returning
+        nothing twice is a different case: two failed CALLS, refunded once
+        by FIX 1 and converging on the attempt cap, and the request is no
+        longer recorded by a round that never got an answer (a gateway
+        error or a 402 must not poison the retry).
+        """
+        from harness import acceptance_gen as ag
         from harness.test_regeneration import _regenerate_acceptance_suite
 
         state, rel, abs_path = self._env(tmp_path, DECLARATION)
-        asked = self._stub_generator(monkeypatch, scenarios=[])
+        asked = self._stub_generator(monkeypatch, scenarios=[
+            ag.AcceptanceScenario(
+                ac, f"test_regenerated_{ac.replace('.', '_').lower()}",
+                ag.ALTITUDE_INTEGRATION, ag.CLASS_BACKEND,
+                "assert client.get('/api/v1/birthdays/dashboard')"
+                ".status_code == 200",
+            )
+            for ac in ("STORY-004.AC-2", "STORY-004.AC-3")
+        ])
         lc = _lc(rel, 1)
         statuses = []
 

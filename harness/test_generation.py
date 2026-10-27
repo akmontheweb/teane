@@ -1386,6 +1386,51 @@ def _inside_workspace(file_rel: str, workspace_path: str) -> bool:
         return False
 
 
+def _merge_corrected_tests(
+    generated_tests: list[str],
+    call_modified: Any,
+    *,
+    existing_modified: Any,
+    workspace_path: str,
+) -> tuple[list[str], list[str]]:
+    """Fold ONE correction round's writes into the generated-test set.
+
+    ``process_llm_patch_output`` returns ``existing_modified`` plus the files
+    *that call* applied — it is not an accumulated list, because every
+    correction round passes the same pre-node baseline. So replacing the
+    generated-test set with the delta drops every generated test the
+    correction did not happen to touch, and drops **all** of them when the
+    correction lands nothing (the patcher rejects a byte-identical
+    re-emission as a no-op, which is the likeliest way to get there). Marker
+    persistence and the runner's selection key off this list, so either way
+    tests that were generated perfectly well silently vanish from the build.
+
+    Found by executing the extracted gate rather than grepping it, and
+    present in BOTH correction loops — hence one helper, so they cannot
+    disagree about it again.
+
+    Returns ``(merged, written)``: the union, minus anything no longer on
+    disk (a correction may legitimately DELETE_FILE or MOVE_FILE a test
+    away, and a path the runner cannot open is worse than one it never
+    knew about), plus this round's own writes so the caller can tell a
+    no-op round from a real one.
+    """
+    _baseline = set(existing_modified or ())
+    written = [
+        rel for rel in (call_modified or ())
+        if rel not in _baseline and _inside_workspace(rel, workspace_path)
+    ]
+    merged = list(generated_tests)
+    for rel in written:
+        if rel not in merged:
+            merged.append(rel)
+    merged = [
+        rel for rel in merged
+        if os.path.exists(os.path.join(workspace_path, rel))
+    ]
+    return merged, written
+
+
 # ---------------------------------------------------------------------------
 # v5 @verifies marker parser
 # ---------------------------------------------------------------------------
@@ -2361,6 +2406,164 @@ async def _run_pre_repair_triage_gate(
 # Public node
 # ---------------------------------------------------------------------------
 
+async def _run_contradiction_gate(
+    *,
+    gateway: Any,
+    workspace_path: str,
+    generated_tests: list[str],
+    messages: list[dict[str, Any]],
+    existing_modified: Any,
+    allowed_paths: Any,
+    budget: float,
+    token_tracker: Any,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Bounce a proven cross-file contradiction back to the AUTHOR, before
+    the build ever sees it.
+
+    Lumina 019f803f: the test-author emitted a same-input / opposite-
+    expectation pair split across two files — ``ContactUpdate(first_name="  ")``
+    required to RAISE in test_contact_schemas.py and to SUCCEED in
+    test_contact_service.py. No production change satisfies both; the repair
+    loop is forbidden from editing tests, so it oscillated ~2.5h and
+    dead-ended. Catch it deterministically here and re-prompt the author with
+    the exact pair — NOT repair. Prevention upstream of ADR-0001's
+    repair-side regeneration. Bounded by ``max_contradiction_reprompts`` so a
+    model that cannot reconcile still exits to the normal build path.
+
+    Extracted from ``test_generation_node`` for the same reason
+    ``_run_spec_consistency_gate`` was: while it was inline, nothing executed
+    it, and it carried a bookkeeping defect for as long as it was inline (see
+    :func:`_merge_corrected_tests`).
+
+    Returns the possibly-updated ``generated_tests``, ``budget`` and
+    ``token_tracker``, the re-prompts spent, and every file a re-prompt
+    actually wrote so the caller can fold them into its modified-files list.
+    """
+    from harness.gateway import NodeRole
+    from harness.patcher import process_llm_patch_output
+
+    contra_cap = int(cfg.get("max_contradiction_reprompts", 2))
+    contra_reprompts = 0
+    applied: list[str] = []
+    while contra_cap > 0 and generated_tests:
+        _py_tests = {
+            rel: _read_text(os.path.join(workspace_path, rel))
+            for rel in generated_tests
+            if rel.endswith(".py")
+        }
+        _py_tests = {k: v for k, v in _py_tests.items() if v is not None}
+        contradictions = find_contradictions_across(_py_tests)
+        if not contradictions:
+            break
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "test_generation_contradiction_detected",
+                count=len(contradictions),
+                reprompt=contra_reprompts + 1,
+                files=sorted({
+                    f for c in contradictions
+                    for f in (c.expect_raise_file, c.expect_success_file) if f
+                }),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        if contra_reprompts >= contra_cap:
+            logger.warning(
+                "[test_generation_node] Cross-file contradiction persists "
+                "after %d re-prompt(s); proceeding to the build (repair / "
+                "ADR-0001 regeneration will handle the residue). Pairs: %s",
+                contra_cap,
+                "; ".join(c.describe() for c in contradictions[:3]),
+            )
+            break
+        contra_reprompts += 1
+        _pairs = "\n".join(f"- {c.describe()}" for c in contradictions)
+        logger.warning(
+            "[test_generation_node] Detected %d cross-file test "
+            "contradiction(s); bouncing back to the author (re-prompt "
+            "%d/%d).\n%s",
+            len(contradictions), contra_reprompts, contra_cap, _pairs,
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "STOP — the tests you just generated are mutually "
+                "UNSATISFIABLE. The following call(s) are required to both "
+                "raise and succeed on identical input, across different "
+                "test files:\n" + _pairs + "\n\n"
+                "No production code can satisfy both, and the repair loop "
+                "may NOT edit test files to break the tie. Reconcile by "
+                "deciding which single layer OWNS the rejection (see RULE 6 "
+                "/ RULE 7): if the value is rejected at CONSTRUCTION, keep "
+                "the schema-level `pytest.raises(...)` assertion and REMOVE "
+                "the downstream test that constructs the same invalid value; "
+                "if the value is meant to construct and be rejected "
+                "downstream, loosen the schema test instead. Re-emit ONLY "
+                "the corrected test file(s) as REWRITE_FILE blocks, keeping "
+                "each file's `@tests` marker. Only patch blocks, no prose."
+            ),
+        })
+        try:
+            response, new_budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                cache_family='patching:test_contradiction_reprompt',
+                budget_remaining_usd=budget,
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                "[test_generation_node] Gateway refused during "
+                "contradiction re-prompt: %s — proceeding to build.", exc,
+            )
+            break
+        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        budget = new_budget
+        messages.append({"role": "assistant", "content": response.content})
+        _re_results, _call_modified = await process_llm_patch_output(
+            response.content,
+            workspace_path,
+            existing_modified,
+            allowed_paths=allowed_paths,
+        )
+        # Fold this round's writes into the generated-test set (a
+        # REWRITE_FILE of an existing generated test keeps it in the set; a
+        # brand-new corrected file joins it) WITHOUT discarding the tests
+        # this round did not touch. Assigning the per-call delta through —
+        # which is what this did — dropped every untouched generated test,
+        # and all of them when the re-emission landed nothing.
+        generated_tests, _written = _merge_corrected_tests(
+            generated_tests, _call_modified,
+            existing_modified=existing_modified,
+            workspace_path=workspace_path,
+        )
+        for _rel in _written:
+            if _rel not in applied:
+                applied.append(_rel)
+        if not _written:
+            # Nothing landed, so nothing has changed for the next round to
+            # read — the contradiction is still there and a re-ask produces
+            # the same bytes the patcher just rejected. Hand the residue to
+            # the build, where repair and ADR-0001 regeneration can act.
+            logger.warning(
+                "[test_generation_node] The contradiction re-prompt landed "
+                "no patch (re-emitted content, or every block rejected) — "
+                "proceeding to the build with the %d generated test file(s) "
+                "as they stand.",
+                len(generated_tests),
+            )
+            break
+
+    return {
+        "generated_tests": generated_tests,
+        "budget": budget,
+        "token_tracker": token_tracker,
+        "reprompts": contra_reprompts,
+        "applied": applied,
+    }
+
+
 async def _run_spec_consistency_gate(
     *,
     gateway: Any,
@@ -2415,6 +2618,11 @@ async def _run_spec_consistency_gate(
     _sc_cap = int(cfg.get("max_spec_review_rounds", 2))
     _sc_rounds = 0
     _sc_findings: list[Any] = []
+    # Every file a correction actually wrote. The node's own ``new_modified``
+    # is what it reports as ``modified_files``, and a correction that creates
+    # a file the first dispatch never wrote would otherwise never appear in
+    # it — written to disk but invisible to everything downstream.
+    _sc_applied: list[str] = []
     # The cap bounds CORRECTIONS, not the review: at 0 the pass still runs and
     # still logs, which is the mode to watch a run in before letting it rewrite
     # anything.
@@ -2501,26 +2709,26 @@ async def _run_spec_consistency_gate(
         token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
         budget = new_budget
         messages.append({"role": "assistant", "content": response.content})
-        _sc_results, new_modified = await process_llm_patch_output(
+        _sc_results, _sc_call_modified = await process_llm_patch_output(
             response.content,
             workspace_path,
             existing_modified,
             allowed_paths=allowed_paths,
         )
-        _sc_written = [
-            rel for rel in new_modified
-            if rel not in existing_modified
-            and _inside_workspace(rel, workspace_path)
-        ]
+        generated_tests, _sc_written = _merge_corrected_tests(
+            generated_tests, _sc_call_modified,
+            existing_modified=existing_modified,
+            workspace_path=workspace_path,
+        )
+        for _rel in _sc_written:
+            if _rel not in _sc_applied:
+                _sc_applied.append(_rel)
         if not _sc_written:
-            # Assigning this empty list through would WIPE the generated-test
-            # set over a correction that simply landed nothing — and the
-            # patcher rejects a byte-identical re-emission as a no-op, which
-            # is the most likely way to get here. Downstream work keys off
-            # this list (marker persistence, the runner's selection), so
-            # losing it would silently drop tests that were generated fine.
-            # Stop instead: a correction that wrote nothing this round will
-            # not write anything next round either.
+            # A correction that wrote nothing this round will not write
+            # anything next round either — the likeliest cause is a
+            # byte-identical re-emission, which the patcher rejects as a
+            # no-op. Stop rather than re-dispatch. (The generated-test set
+            # survives either way; see _merge_corrected_tests.)
             logger.warning(
                 "[test_generation_node] The spec-review correction landed no "
                 "patch (re-emitted content, or every block rejected). "
@@ -2529,7 +2737,6 @@ async def _run_spec_consistency_gate(
                 len(generated_tests),
             )
             break
-        generated_tests = _sc_written
         # No cap check here: the loop re-reviews, and the branch above reports
         # whatever survived the last correction. Stopping at the cap without
         # re-reviewing would leave the log claiming findings the correction
@@ -2541,6 +2748,7 @@ async def _run_spec_consistency_gate(
         "token_tracker": token_tracker,
         "rounds": _sc_rounds,
         "findings": _sc_findings,
+        "applied": _sc_applied,
     }
 
 
@@ -3326,107 +3534,26 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         # test run without spending an iteration.
 
     # --- Cross-file contradiction gate (generation-side prevention) ---
-    # Lumina 019f803f: the test-author emitted a same-input / opposite-
-    # expectation pair split across two files — ContactUpdate(first_name="  ")
-    # required to RAISE in test_contact_schemas.py and to SUCCEED in
-    # test_contact_service.py. No production change satisfies both; the
-    # repair loop is forbidden from editing tests, so it oscillated ~2.5h
-    # and dead-ended. Catch it deterministically HERE, before the build,
-    # and bounce it back to the AUTHOR (a re-prompt naming the exact pair) —
-    # NOT to repair. Prevention upstream of ADR-0001's repair-side
-    # regeneration. Bounded by ``max_contradiction_reprompts`` so a model
-    # that can't reconcile still exits to the normal build path.
-    contra_cap = int(cfg.get("max_contradiction_reprompts", 2))
-    contra_reprompts = 0
-    while contra_cap > 0 and generated_tests:
-        _py_tests = {
-            rel: _read_text(os.path.join(workspace_path, rel))
-            for rel in generated_tests
-            if rel.endswith(".py")
-        }
-        _py_tests = {k: v for k, v in _py_tests.items() if v is not None}
-        contradictions = find_contradictions_across(_py_tests)
-        if not contradictions:
-            break
-        try:
-            from harness.observability import emit_event
-            emit_event(
-                "test_generation_contradiction_detected",
-                count=len(contradictions),
-                reprompt=contra_reprompts + 1,
-                files=sorted({
-                    f for c in contradictions
-                    for f in (c.expect_raise_file, c.expect_success_file) if f
-                }),
-            )
-        except Exception:  # noqa: BLE001 — telemetry must not block
-            pass
-        if contra_reprompts >= contra_cap:
-            logger.warning(
-                "[test_generation_node] Cross-file contradiction persists "
-                "after %d re-prompt(s); proceeding to the build (repair / "
-                "ADR-0001 regeneration will handle the residue). Pairs: %s",
-                contra_cap,
-                "; ".join(c.describe() for c in contradictions[:3]),
-            )
-            break
-        contra_reprompts += 1
-        _pairs = "\n".join(f"- {c.describe()}" for c in contradictions)
-        logger.warning(
-            "[test_generation_node] Detected %d cross-file test "
-            "contradiction(s); bouncing back to the author (re-prompt "
-            "%d/%d).\n%s",
-            len(contradictions), contra_reprompts, contra_cap, _pairs,
-        )
-        messages.append({
-            "role": "system",
-            "content": (
-                "STOP — the tests you just generated are mutually "
-                "UNSATISFIABLE. The following call(s) are required to both "
-                "raise and succeed on identical input, across different "
-                "test files:\n" + _pairs + "\n\n"
-                "No production code can satisfy both, and the repair loop "
-                "may NOT edit test files to break the tie. Reconcile by "
-                "deciding which single layer OWNS the rejection (see RULE 6 "
-                "/ RULE 7): if the value is rejected at CONSTRUCTION, keep "
-                "the schema-level `pytest.raises(...)` assertion and REMOVE "
-                "the downstream test that constructs the same invalid value; "
-                "if the value is meant to construct and be rejected "
-                "downstream, loosen the schema test instead. Re-emit ONLY "
-                "the corrected test file(s) as REWRITE_FILE blocks, keeping "
-                "each file's `@tests` marker. Only patch blocks, no prose."
-            ),
-        })
-        try:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.PATCHING,
-                cache_family='patching:test_contradiction_reprompt',
-                budget_remaining_usd=budget,
-            )
-        except RuntimeError as exc:
-            logger.warning(
-                "[test_generation_node] Gateway refused during "
-                "contradiction re-prompt: %s — proceeding to build.", exc,
-            )
-            break
-        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
-        budget = new_budget
-        messages.append({"role": "assistant", "content": response.content})
-        _re_results, new_modified = await process_llm_patch_output(
-            response.content,
-            workspace_path,
-            existing_modified,
-            allowed_paths=allowed_paths,
-        )
-        # Recompute the generated-test set from the accumulated modified
-        # list (a REWRITE_FILE of an existing generated test keeps it in
-        # the set; a brand-new corrected file joins it).
-        generated_tests = [
-            rel for rel in new_modified
-            if rel not in existing_modified
-            and _inside_workspace(rel, workspace_path)
-        ]
+    # Extracted so it can be driven directly with fakes; see
+    # _run_contradiction_gate for what it catches and why it re-prompts the
+    # AUTHOR rather than routing to repair.
+    _cg_out = await _run_contradiction_gate(
+        gateway=gateway,
+        workspace_path=workspace_path,
+        generated_tests=generated_tests,
+        messages=messages,
+        existing_modified=existing_modified,
+        allowed_paths=allowed_paths,
+        budget=budget,
+        token_tracker=token_tracker,
+        cfg=cfg,
+    )
+    generated_tests = _cg_out["generated_tests"]
+    budget = _cg_out["budget"]
+    token_tracker = _cg_out["token_tracker"]
+    for _rel in _cg_out.get("applied") or ():
+        if _rel not in new_modified:
+            new_modified.append(_rel)
 
     # --- Spec-consistency self-check (the dominant failure mode) ---
     # Extracted so it can be driven directly with fakes; see
@@ -3445,6 +3572,21 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     generated_tests = _sc_out["generated_tests"]
     budget = _sc_out["budget"]
     token_tracker = _sc_out["token_tracker"]
+    for _rel in _sc_out.get("applied") or ():
+        if _rel not in new_modified:
+            new_modified.append(_rel)
+
+    # Re-sync the variable this node REPORTS its spend through. Every dispatch
+    # above threads ``new_budget`` and then copies it into ``budget``; both
+    # gates are the other way round — they take ``budget`` and return the
+    # remainder — so leaving ``new_budget`` alone silently discards whatever
+    # they spent. Each of the node's own returns, and the acceptance/build
+    # gate it feeds further down, carries ``new_budget``, so the graph would
+    # go on believing money it had already spent was still available. Found
+    # reviewing the extraction; the spec gate has leaked this way since it was
+    # extracted, which is a day, and the contradiction gate would have started
+    # the moment it was.
+    new_budget = budget
 
     # Ensure a pytest.ini selecting --import-mode=importlib exists whenever a
     # Python test tree is present — this MUST run before the early returns

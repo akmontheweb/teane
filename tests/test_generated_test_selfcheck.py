@@ -385,14 +385,22 @@ class TestTheWiring:
 
     def test_it_runs_after_the_deterministic_gate(self):
         """The AST prover is free; spend a dispatch only on what it cannot
-        decide."""
+        decide.
+
+        Both gates are now extracted helpers, so the order is the order of
+        the two calls in the node — ``find_contradictions_across`` itself
+        lives inside ``_run_contradiction_gate``.
+        """
         import inspect
 
         import harness.test_generation as tg
 
         node = inspect.getsource(tg.test_generation_node)
-        assert node.index("find_contradictions_across(_py_tests)") < node.index(
+        assert node.index("_run_contradiction_gate(") < node.index(
             "_run_spec_consistency_gate("
+        )
+        assert "find_contradictions_across(_py_tests)" in inspect.getsource(
+            tg._run_contradiction_gate
         )
 
     def test_it_feeds_the_reviewer_the_mapped_modules(self):

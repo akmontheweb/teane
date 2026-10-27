@@ -2535,6 +2535,19 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0     # connection-establishment timeout
 # was 252s -- but finite, because an unbounded dispatch is indistinguishable
 # from a dead harness.
 DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS = 1200.0
+# Stall watchdog: dump every thread and task stack once a dispatch has been in
+# flight this long. Diagnostic only -- it aborts nothing, so it is safe to set
+# well below the total deadline above, and it has to be: the deadline cancels
+# the await without saying what the await WAS. 300s sits just above the longest
+# legitimate dispatch observed in lumina 01a16872 (252s), so a breach means
+# something abnormal rather than something slow. See harness/stall_watchdog.py
+# for why asyncio.timeout cannot do this job.
+DEFAULT_STALL_WATCHDOG_SECONDS = 300.0
+DEFAULT_STALL_WATCHDOG_REPEAT_SECONDS = 300.0
+# The GIL-proof backstop (faulthandler.dump_traceback_later), armed only once a
+# dispatch is already suspect. Larger than the soft budget on purpose: it is
+# for the case where even the watchdog thread can no longer run.
+DEFAULT_STALL_WATCHDOG_HARD_SECONDS = 600.0
 # Network-stall recovery: on a connect/network error surviving fast retries, wait
 # this long and retry the PRIMARY (network issues usually clear in ~a minute)
 # before failing over to the fallback model.
@@ -2810,6 +2823,10 @@ class GatewayConfig:
     # serve this role: it is a between-bytes timeout, not a deadline.
     total_request_timeout_seconds: float = DEFAULT_TOTAL_REQUEST_TIMEOUT_SECONDS
     total_request_timeout_per_role: dict[str, float] = field(default_factory=dict)
+    # Stall diagnostics (see DEFAULT_STALL_WATCHDOG_SECONDS). 0 disables.
+    stall_watchdog_seconds: float = DEFAULT_STALL_WATCHDOG_SECONDS
+    stall_watchdog_repeat_seconds: float = DEFAULT_STALL_WATCHDOG_REPEAT_SECONDS
+    stall_watchdog_hard_seconds: float = DEFAULT_STALL_WATCHDOG_HARD_SECONDS
     # Network-stall recovery + timeout failover.
     retry_network_cooloff_seconds: float = DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS
     network_cooloff_attempts: int = DEFAULT_NETWORK_COOLOFF_ATTEMPTS
@@ -3541,6 +3558,42 @@ class Gateway:
         *,
         messages: list[dict[str, Any]],
         role: NodeRole,
+        **kwargs: Any,
+    ) -> tuple[LLMResponse, float]:
+        """Dispatch under the stall watchdog; see :meth:`_dispatch_guarded`.
+
+        A separate wrapper rather than a ``try``/``finally`` inside the body
+        below because the whole dispatch has to be covered, post-response work
+        included. Run 01a1790b stopped dead with the provider call already
+        returned, and a watch that ended where ``chat_completion`` ends would
+        have had nothing to say about it.
+
+        The watchdog never raises, cancels or retries. It writes stacks.
+        """
+        from harness.stall_watchdog import watch
+
+        role_str = role.value if hasattr(role, "value") else str(role)
+        with watch(
+            f"dispatch-{role_str}",
+            soft_seconds=float(
+                getattr(self.config, "stall_watchdog_seconds", 0.0) or 0.0
+            ),
+            repeat_seconds=float(
+                getattr(self.config, "stall_watchdog_repeat_seconds", 0.0) or 0.0
+            ),
+            hard_seconds=float(
+                getattr(self.config, "stall_watchdog_hard_seconds", 0.0) or 0.0
+            ),
+        ):
+            return await self._dispatch_guarded(
+                messages=messages, role=role, **kwargs,
+            )
+
+    async def _dispatch_guarded(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        role: NodeRole,
         budget_remaining_usd: float,
         force_local: bool = False,
         model_override: Optional[str] = None,
@@ -4019,7 +4072,13 @@ class Gateway:
                 stalled read is exactly what this is, just detected by us
                 instead of by a between-bytes clock that never fires.
                 """
+                from harness.stall_watchdog import mark_phase
+
                 _deadline = self._total_timeout_for(role)
+                # Phase marks are what let a stall dump say whether the
+                # provider call is still open or already returned -- the exact
+                # question run 01a1790b could not be answered from its log.
+                mark_phase(f"provider_call({model_key})")
                 try:
                     async with asyncio.timeout(_deadline):
                         return await provider.chat_completion(**kw)
@@ -4391,6 +4450,13 @@ class Gateway:
         # budget at zero rather than letting it go negative — negative
         # values used to surface in the dashboard as a negative dollar
         # figure even though the next dispatch correctly refuses at <=0.
+        # The provider call is behind us. Everything from here to the return
+        # is harness work -- accounting, the session tracker, the on-disk dump
+        # -- and a stall in it looks exactly like a stall in the provider call
+        # from the log's point of view. Name it so a dump can tell them apart.
+        from harness.stall_watchdog import mark_phase as _mark_phase
+        _mark_phase("post_response")
+
         cost = accumulated_cost or response.usage.cost_usd
         new_budget = max(0.0, budget_remaining_usd - cost)
         elapsed_ms = round((_time.monotonic() - _dispatch_start) * 1000)
@@ -5296,6 +5362,35 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             ).items()
             if isinstance(v, (int, float)) and float(v) > 0
         },
+        # floor=0.0 on all three: 0 is the documented "off" value, so clamping
+        # it up to 1.0 would silently re-enable a watchdog an operator turned
+        # off (and, at 1s, make it dump constantly).
+        stall_watchdog_seconds=_clamp_positive_float(
+            llm_dispatch.get(
+                "stall_watchdog_seconds", DEFAULT_STALL_WATCHDOG_SECONDS,
+            ),
+            name="llm_dispatch.stall_watchdog_seconds",
+            default=DEFAULT_STALL_WATCHDOG_SECONDS,
+            floor=0.0, ceiling=86400.0,
+        ),
+        stall_watchdog_repeat_seconds=_clamp_positive_float(
+            llm_dispatch.get(
+                "stall_watchdog_repeat_seconds",
+                DEFAULT_STALL_WATCHDOG_REPEAT_SECONDS,
+            ),
+            name="llm_dispatch.stall_watchdog_repeat_seconds",
+            default=DEFAULT_STALL_WATCHDOG_REPEAT_SECONDS,
+            floor=0.0, ceiling=86400.0,
+        ),
+        stall_watchdog_hard_seconds=_clamp_positive_float(
+            llm_dispatch.get(
+                "stall_watchdog_hard_seconds",
+                DEFAULT_STALL_WATCHDOG_HARD_SECONDS,
+            ),
+            name="llm_dispatch.stall_watchdog_hard_seconds",
+            default=DEFAULT_STALL_WATCHDOG_HARD_SECONDS,
+            floor=0.0, ceiling=86400.0,
+        ),
         retry_network_cooloff_seconds=_clamp_positive_float(
             llm_dispatch.get("retry_network_cooloff_seconds", DEFAULT_RETRY_NETWORK_COOLOFF_SECONDS),
             name="llm_dispatch.retry_network_cooloff_seconds",

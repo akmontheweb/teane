@@ -271,6 +271,9 @@
         "empty_content_retries": 2,
         "request_timeout_seconds": 600.0,
         "total_request_timeout_seconds": 1200.0,
+        "stall_watchdog_seconds": 300.0,
+        "stall_watchdog_repeat_seconds": 300.0,
+        "stall_watchdog_hard_seconds": 600.0,
         "connect_timeout_seconds": 10.0,
         "request_timeout_per_role": {
             "patching": 900.0,

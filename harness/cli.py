@@ -1189,6 +1189,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # total_request_timeout_seconds is the end-to-end ceiling on one
         # dispatch attempt; the _per_role map overrides it per role.
         "total_request_timeout_seconds", "total_request_timeout_per_role",
+        # Stall diagnostics. A deadline cancels the await without ever saying
+        # what the await was; these dump every thread and asyncio-task stack
+        # to ~/.harness/stalls instead. Purely diagnostic — nothing is
+        # aborted — so they are set well below the deadline. 0 disables.
+        "stall_watchdog_seconds", "stall_watchdog_repeat_seconds",
+        "stall_watchdog_hard_seconds",
     }),
     # Observability knobs. dump_llm_calls captures every LLM dispatch
     # (across all roles) to ~/.harness/debug for post-mortem analysis;
@@ -1572,6 +1578,9 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.request_timeout_per_role": (dict,),
     "llm_dispatch.total_request_timeout_seconds": (int, float),
     "llm_dispatch.total_request_timeout_per_role": (dict,),
+    "llm_dispatch.stall_watchdog_seconds": (int, float),
+    "llm_dispatch.stall_watchdog_repeat_seconds": (int, float),
+    "llm_dispatch.stall_watchdog_hard_seconds": (int, float),
     "llm_dispatch.retry_network_cooloff_seconds": (int, float),
     "llm_dispatch.network_cooloff_attempts": (int,),
     "llm_dispatch.fallback_on_timeout": (bool,),

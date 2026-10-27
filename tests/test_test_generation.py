@@ -74,6 +74,19 @@ class _StubGateway:
         return out
 
 
+def _author_turns(gw):
+    """Only the AUTHOR's dispatches.
+
+    test_generation_node also dispatches as CODE_REVIEWER for the
+    spec-consistency review, so a total count no longer measures how many
+    times the author was asked for tests.
+    """
+    return [
+        d for d in gw.dispatched
+        if getattr(d.get("role"), "value", str(d.get("role"))) != "code_reviewer"
+    ]
+
+
 class _StubBuildResult:
     def __init__(self, exit_code: int, raw_output: str):
         self.exit_code = exit_code
@@ -474,8 +487,12 @@ class TestHappyPath:
             "token_tracker": {},
         })
 
-        # 1. LLM was called exactly once
-        assert len(gw.dispatched) == 1
+        # Counted by ROLE, not in total: test_generation_node also runs the
+        # spec-consistency review (test_generation.spec_consistency_review),
+        # which dispatches as CODE_REVIEWER. What these tests assert is about
+        # the AUTHOR's turns, so count those and stay robust to further gates.
+        # 1. The author was called exactly once
+        assert len(_author_turns(gw)) == 1
         sent = gw.dispatched[0]["messages"]
         # 2. The Python test guide was injected into the system messages
         guide_sys = [m for m in sent if m.get("role") == "system" and "monkeypatch" in m.get("content", "")]
@@ -626,8 +643,12 @@ class TestContradictionGate:
             "token_tracker": {},
         })
 
+        # Counted by ROLE, not in total: test_generation_node also runs the
+        # spec-consistency review (test_generation.spec_consistency_review),
+        # which dispatches as CODE_REVIEWER. What these tests assert is about
+        # the AUTHOR's turns, so count those and stay robust to further gates.
         # The author was re-prompted: 1 initial + 1 contradiction bounce.
-        assert len(gw.dispatched) == 2
+        assert len(_author_turns(gw)) == 2
         # The re-prompt named the exact unsatisfiable call.
         bounce = gw.dispatched[1]["messages"]
         joined = "\n".join(m.get("content", "") for m in bounce)
@@ -670,7 +691,11 @@ class TestContradictionGate:
             "budget_remaining_usd": 2.0,
             "token_tracker": {},
         })
-        assert len(gw.dispatched) == 1
+        # Counted by ROLE, not in total: test_generation_node also runs the
+        # spec-consistency review (test_generation.spec_consistency_review),
+        # which dispatches as CODE_REVIEWER. What these tests assert is about
+        # the AUTHOR's turns, so count those and stay robust to further gates.
+        assert len(_author_turns(gw)) == 1
         assert result["node_state"]["test_generation"]["status"] == "passed"
 
 
@@ -2090,9 +2115,13 @@ class TestZeroEmitRetrySucceeds:
         finally:
             graph_mod.set_gateway(None)
 
-        # Two dispatches: the first was the zero-emit re-prompt, the
+        # Counted by ROLE, not in total: test_generation_node also runs the
+        # spec-consistency review (test_generation.spec_consistency_review),
+        # which dispatches as CODE_REVIEWER. What these tests assert is about
+        # the AUTHOR's turns, so count those and stay robust to further gates.
+        # Two author dispatches: the first was the zero-emit re-prompt, the
         # second landed a real patch.
-        assert len(gw.dispatched) == 2
+        assert len(_author_turns(gw)) == 2
         # The zero-emit counter recorded the single retry.
         assert result["loop_counter"]["test_generation_zero_emit"] == 1
         # The REAL iteration counter only advanced for the successful

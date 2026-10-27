@@ -1030,6 +1030,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_generation": frozenset({
         "enabled", "max_iterations", "max_contradiction_reprompts",
         "property_based_tests", "pre_repair_triage", "triage_gate_max_regens",
+        # Spec-consistency self-check on freshly generated tests. The
+        # deterministic gate beside it proves only raise-vs-success on one
+        # call; the false tests that killed runs 6/8/9/10 were sort orders,
+        # labels, windows and error envelopes, which no AST can adjudicate.
+        "spec_consistency_review", "max_spec_review_rounds",
     }),
     "test_regeneration": frozenset({
         "enabled", "max_attempts_per_test", "tier_b_auto",
@@ -1505,6 +1510,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     # regenerate unambiguous test-authoring bugs before the repair loop.
     "test_generation.pre_repair_triage": (bool,),
     "test_generation.triage_gate_max_regens": (int,),
+    "test_generation.spec_consistency_review": (bool,),
+    "test_generation.max_spec_review_rounds": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.
     "llm_dispatch.deliberation_head_chars": (int,),
     "test_regeneration.enabled": (bool,),

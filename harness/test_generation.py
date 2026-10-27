@@ -2361,6 +2361,189 @@ async def _run_pre_repair_triage_gate(
 # Public node
 # ---------------------------------------------------------------------------
 
+async def _run_spec_consistency_gate(
+    *,
+    gateway: Any,
+    workspace_path: str,
+    generated_tests: list[str],
+    messages: list[dict[str, Any]],
+    existing_modified: Any,
+    allowed_paths: Any,
+    budget: float,
+    token_tracker: Any,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Review the freshly generated tests' computed expectations, and correct
+    the false ones before the build ever sees them.
+
+    Four consecutive lumina runs (6, 8, 9, 10) died on a generated test that
+    contradicts the spec or itself. ``find_contradictions_across``, which runs
+    just before this, proves exactly ONE shape -- the same normalised call
+    required to both raise and succeed -- and not one of those six false tests
+    had it: a sort order is not a raise, nor is a label, a window count, an
+    error envelope or a URI. Every one was diagnosed correctly by the model,
+    but only AFTER the build went red, by which point nothing can act: no
+    production change satisfies a false assertion and repair may not edit
+    tests.
+
+    Extracted from ``test_generation_node`` so the loop can be driven directly
+    with injected fakes, the way ``_run_pre_repair_triage_gate`` is. A source
+    grep is not a test: 33 tests once passed against an in-turn retry that
+    raised TypeError on every firing because none of them ran it.
+
+    Returns the possibly-updated ``generated_tests``, ``budget`` and
+    ``token_tracker``, plus the rounds spent and the last findings. Never
+    raises -- a gate that cannot run leaves the build exactly as it was.
+    """
+    # --- Spec-consistency self-check (the dominant failure mode) ---
+    #
+    # The gate above proves ONE shape: the same normalised call required to
+    # both raise and succeed. Not one of the false tests that killed runs 6,
+    # 8, 9 and 10 had that shape — a sort order is not a raise, nor is a
+    # label, a window count, an error envelope or a URI. They were all
+    # computed expectations that contradict a spec rule or a sibling
+    # assertion, every one diagnosed correctly by the model only AFTER the
+    # build went red, by which point repair cannot act: no production change
+    # satisfies a false assertion and repair may not edit tests.
+    #
+    # So ask the question an AST cannot, while the author is still here and
+    # the fix is still cheap. Review + remediate on the ADR-0007 pattern.
+    from harness.gateway import NodeRole
+    from harness.patcher import process_llm_patch_output
+
+    _sc_cfg = cfg.get("spec_consistency_review", True)
+    _sc_cap = int(cfg.get("max_spec_review_rounds", 2))
+    _sc_rounds = 0
+    _sc_findings: list[Any] = []
+    # The cap bounds CORRECTIONS, not the review: at 0 the pass still runs and
+    # still logs, which is the mode to watch a run in before letting it rewrite
+    # anything.
+    while _sc_cfg and generated_tests:
+        from harness.test_selfcheck import (
+            actionable as _sc_actionable,
+            build_remediation_message as _sc_remediation,
+            review_generated_tests as _sc_review,
+        )
+        _sc_tests = {
+            rel: _read_text(os.path.join(workspace_path, rel))
+            for rel in generated_tests
+            if rel.endswith(".py")
+        }
+        _sc_tests = {k: v for k, v in _sc_tests.items() if v}
+        if not _sc_tests:
+            break
+        # The modules the tests map to, so the reviewer can recognise a test
+        # that merely outruns the implementation and leave it alone.
+        _sc_modules: dict[str, str] = {}
+        for _rel in sorted(_sc_tests):
+            for _src_rel in _parse_tests_marker(_sc_tests[_rel] or ""):
+                _body = _read_text(os.path.join(workspace_path, _src_rel))
+                if _body:
+                    _sc_modules[_src_rel] = _body
+        _sc_findings, budget, token_tracker = await _sc_review(
+            gateway=gateway,
+            test_files=_sc_tests,
+            module_sources=_sc_modules,
+            cross_cutting_rules=_cross_cutting_rules_for_tests(workspace_path),
+            budget=budget,
+            token_tracker=token_tracker,
+        )
+        _sc_act = _sc_actionable(_sc_findings)
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "test_generation_spec_review",
+                round=_sc_rounds + 1,
+                findings=len(_sc_findings),
+                actionable=len(_sc_act),
+                files=sorted({f.file for f in _sc_act}),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        if not _sc_act:
+            logger.info(
+                "[test_generation_node] Spec review found no false computed "
+                "expectations in %d generated test file(s).", len(_sc_tests),
+            )
+            break
+        if _sc_rounds >= _sc_cap:
+            logger.warning(
+                "[test_generation_node] Spec review found %d false computed "
+                "expectation(s) and the correction cap (%d) is spent — "
+                "proceeding to the build. The repair-side ladder (ADR-0001 "
+                "regeneration) handles the residue, at the cost of a compiler "
+                "cycle per finding.\n%s",
+                len(_sc_act), _sc_cap,
+                "\n".join(f.describe() for f in _sc_act[:6]),
+            )
+            break
+        _sc_rounds += 1
+        logger.warning(
+            "[test_generation_node] Spec review found %d false computed "
+            "expectation(s); bouncing back to the author (round %d/%d).\n%s",
+            len(_sc_act), _sc_rounds, _sc_cap,
+            "\n".join(f.describe() for f in _sc_act[:6]),
+        )
+        messages.append(_sc_remediation(_sc_act))
+        try:
+            response, new_budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                cache_family='patching:test_spec_review_reprompt',
+                budget_remaining_usd=budget,
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                "[test_generation_node] Gateway refused during the spec-review "
+                "correction: %s — proceeding to build.", exc,
+            )
+            break
+        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        budget = new_budget
+        messages.append({"role": "assistant", "content": response.content})
+        _sc_results, new_modified = await process_llm_patch_output(
+            response.content,
+            workspace_path,
+            existing_modified,
+            allowed_paths=allowed_paths,
+        )
+        _sc_written = [
+            rel for rel in new_modified
+            if rel not in existing_modified
+            and _inside_workspace(rel, workspace_path)
+        ]
+        if not _sc_written:
+            # Assigning this empty list through would WIPE the generated-test
+            # set over a correction that simply landed nothing — and the
+            # patcher rejects a byte-identical re-emission as a no-op, which
+            # is the most likely way to get here. Downstream work keys off
+            # this list (marker persistence, the runner's selection), so
+            # losing it would silently drop tests that were generated fine.
+            # Stop instead: a correction that wrote nothing this round will
+            # not write anything next round either.
+            logger.warning(
+                "[test_generation_node] The spec-review correction landed no "
+                "patch (re-emitted content, or every block rejected). "
+                "Keeping the %d generated test file(s) as they stand and "
+                "leaving the residue to the repair-side ladder.",
+                len(generated_tests),
+            )
+            break
+        generated_tests = _sc_written
+        # No cap check here: the loop re-reviews, and the branch above reports
+        # whatever survived the last correction. Stopping at the cap without
+        # re-reviewing would leave the log claiming findings the correction
+        # may already have fixed.
+
+    return {
+        "generated_tests": generated_tests,
+        "budget": budget,
+        "token_tracker": token_tracker,
+        "rounds": _sc_rounds,
+        "findings": _sc_findings,
+    }
+
+
 async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     """LangGraph node: generate tests for the just-patched source files and
     verify them deterministically in the sandbox.
@@ -3244,6 +3427,24 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             if rel not in existing_modified
             and _inside_workspace(rel, workspace_path)
         ]
+
+    # --- Spec-consistency self-check (the dominant failure mode) ---
+    # Extracted so it can be driven directly with fakes; see
+    # _run_spec_consistency_gate for why it exists at all.
+    _sc_out = await _run_spec_consistency_gate(
+        gateway=gateway,
+        workspace_path=workspace_path,
+        generated_tests=generated_tests,
+        messages=messages,
+        existing_modified=existing_modified,
+        allowed_paths=allowed_paths,
+        budget=budget,
+        token_tracker=token_tracker,
+        cfg=cfg,
+    )
+    generated_tests = _sc_out["generated_tests"]
+    budget = _sc_out["budget"]
+    token_tracker = _sc_out["token_tracker"]
 
     # Ensure a pytest.ini selecting --import-mode=importlib exists whenever a
     # Python test tree is present — this MUST run before the early returns

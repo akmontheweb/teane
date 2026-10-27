@@ -458,6 +458,88 @@ def reason_cites_spec_conflict(reason: str) -> bool:
     return any(m in low for m in _SPEC_CONFLICT_MARKERS)
 
 
+#: Floor-synthesised reasons that are themselves proof-grade. The router mints
+#: "contradictory test expectations" only when ``node_state["contradictory_
+#: tests"]`` is set, i.e. the harness's own deterministic detector found the
+#: pair -- not a model opinion. It matters separately from ``proof_tests``
+#: because a CROSS-FILE contradiction (run 10's shape, and ASM-007's) cannot
+#: be proven within one file, so ``proven_unsatisfiable_tests`` returns empty
+#: for exactly the case that dominated the runs.
+#:
+#: "suite-order pollution" is deliberately NOT here: a test that passes or
+#: fails by suite order has an isolation defect, not a wrong expectation, and
+#: its module is still the right anchor. Nor is "the judge's own
+#: recommendation is a test edit", which carries no verdict of its own -- the
+#: judge's diagnosis is weighed on its own terms below.
+_PROVEN_CONTRADICTION_REASONS = ("contradictory test expectations",)
+
+
+def spec_outranks_the_code(
+    *,
+    reason: str,
+    judge_diagnosis: str = "",
+    proof_tests: Any = (),
+) -> tuple[bool, str]:
+    """Decide whether the SPEC, not the module, anchors this rewrite.
+
+    :func:`reason_cites_spec_conflict` alone was scoped to the wrong half of
+    reality. It needs a MODEL declaration whose prose blames a spec rule, and
+    lumina run 10 produced **zero** model declarations: the floor took every
+    escape after three declined offers, and the floor synthesises its reason
+    from a fixed set of three labels --
+
+        "contradictory test expectations"
+        "suite-order pollution"
+        "the judge's own recommendation is a test edit"
+
+    -- none of which cites a spec. So the predicate correctly returned False
+    every time and the rebuild stayed code-anchored. The floor path dominated
+    runs 5, 8, 9 and 10, which means the fix shipped in 9c4eec2 was dormant
+    in the only case that actually occurs.
+
+    Three triggers now, in order of strength:
+
+    1. **A PROOF.** An AST proof that two tests demand opposite outcomes for
+       the identical call is, on its own, grounds to demote the code. The
+       production module satisfies at most ONE side of a proven
+       contradiction, so it is not a neutral authority -- it was shaped by
+       whichever side it happens to satisfy, and rebuilding from it
+       reproduces that side with a 50/50 chance of being the false one. Only
+       the spec can say which side is right. This trigger needs no prose at
+       all, which is exactly why it reaches the floor path.
+    2. **The declaration**, as before.
+    3. **The judge's diagnosis.** Already computed for the prompt
+       (:func:`_judge_diagnosis`) and already in scope; the judge routinely
+       names the real defect in prose that cites the rule it violates. A
+       judge verdict naming a code gap -- run 10's "call
+       _effective_month_day with the required reference_year argument" --
+       contains no spec marker and correctly does not flip the anchor.
+
+    Demotion is bounded: the spec-authoritative prompt keeps the module in
+    context, so a spec that is silent on some internal helper's label still
+    leaves the code contract available. Returns ``(flip, why)`` so the log
+    line can say WHICH evidence moved it -- without that, a post-mortem
+    cannot tell a proof-driven rebuild from a prose-driven one.
+    """
+    if proof_tests:
+        return True, (
+            f"an AST proof named {len(tuple(proof_tests))} mutually "
+            "contradictory test(s), so the code satisfies at most one side"
+        )
+    _low = (reason or "").lower()
+    for _proven in _PROVEN_CONTRADICTION_REASONS:
+        if _proven in _low:
+            return True, (
+                f"the harness detected {_proven} — a contradiction the code "
+                "cannot arbitrate, since it satisfies at most one side"
+            )
+    if reason_cites_spec_conflict(reason):
+        return True, "the declaration blames a spec rule"
+    if reason_cites_spec_conflict(judge_diagnosis):
+        return True, "the repair judge's diagnosis blames a spec rule"
+    return False, ""
+
+
 def build_regeneration_messages(
     *,
     test_rel_path: str,
@@ -850,19 +932,31 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
             spec_tiebreaker = m["content"]
             break
 
-    # A declaration blaming a SPEC rule flips the anchor: the code was
-    # written to satisfy the test being replaced, so rebuilding from it
-    # reproduces the error. See reason_cites_spec_conflict.
-    _spec_authoritative = bool(
-        spec_tiebreaker.strip() and reason_cites_spec_conflict(reason)
+    # A SPEC conflict flips the anchor: the code was written to satisfy the
+    # test being replaced, so rebuilding from it reproduces the error. The
+    # evidence may be the declaration, the judge's diagnosis, or an AST proof
+    # — see spec_outranks_the_code for why a proof alone is sufficient and
+    # why the prose-only predicate missed every run.
+    _judge_dx = _judge_diagnosis(state, rel)
+    _spec_flip, _spec_why = spec_outranks_the_code(
+        reason=reason, judge_diagnosis=_judge_dx, proof_tests=proof_tests,
     )
+    _spec_authoritative = bool(spec_tiebreaker.strip() and _spec_flip)
+    if _spec_flip and not spec_tiebreaker.strip():
+        logger.warning(
+            "[test_regeneration_node] %s: %s, but no specification is in "
+            "context — rebuilding from the code anyway. The rebuild can only "
+            "be as good as its anchor; this is the case to watch if the "
+            "rewrite comes back still wrong.",
+            rel, _spec_why,
+        )
     if _spec_authoritative:
         logger.warning(
-            "[test_regeneration_node] %s: the declaration blames a SPEC rule, "
-            "so the SPECIFICATION leads this rewrite and the code under test "
-            "is demoted — it was written to satisfy the test being replaced. "
-            "Reason: %s",
-            rel, (reason or "")[:200],
+            "[test_regeneration_node] %s: %s, so "
+            "the SPECIFICATION leads this rewrite"
+            " and the code under test is demoted — it was written to satisfy "
+            "the test being replaced. Reason: %s",
+            rel, _spec_why, (reason or "")[:200],
         )
 
     # Anti-repetition. repair_node has had a fixation trap since 04a9968 —
@@ -913,7 +1007,7 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
         unsat_reason=reason,
         failing_output=_failing_output(state, rel, workspace),
         spec_tiebreaker=spec_tiebreaker,
-        judge_diagnosis=_judge_diagnosis(state, rel),
+        judge_diagnosis=_judge_dx,
         prior_attempt_note=prior_attempt_note,
         spec_authoritative=_spec_authoritative,
     )

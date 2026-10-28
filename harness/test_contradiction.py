@@ -32,6 +32,7 @@ unit-testable in isolation.
 from __future__ import annotations
 
 import ast
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
@@ -524,6 +525,79 @@ def proven_unsatisfiable_tests(
         if c.expect_success_test:
             names.add(c.expect_success_test)
     return frozenset(names)
+
+
+def _same_test_path(a: str, b: str) -> bool:
+    """Exact path identity, normalised. Deliberately NOT basename-matched:
+    this repo has a recurring split-test-tree problem (``server/tests/`` and
+    ``tests/`` holding files of the same name), and sanctioning a deletion in
+    the wrong one of those would be the worst possible failure of the gate
+    this feeds.
+    """
+    return bool(a) and bool(b) and os.path.normpath(a) == os.path.normpath(b)
+
+
+def proven_unsatisfiable_tests_across(
+    files: Mapping[str, str], *, target: str,
+) -> frozenset[str]:
+    """Test functions IN ``target`` that a CROSS-FILE proof names.
+
+    The companion :func:`proven_unsatisfiable_tests` proves contradictions
+    only WITHIN one file, and that is the whole problem: the dominant shape
+    in the lumina runs is a pair split across two files -- ASM-007's
+    directory order asserted backwards beside a sibling demanding the
+    opposite sort -- so the proof set came back EMPTY for precisely the case
+    that killed the runs. ``coverage_nonregression_ok`` then held the rewrite
+    to its one-function tolerance and vetoed the fix the ladder exists to
+    produce, which is how a provably-impossible unit test became impossible
+    to REMOVE.
+
+    Only ``target``'s own side of each pair is named, because regeneration
+    rewrites that one file. That is sound without deciding which side is
+    wrong: the proof says at most one side can hold, so dropping the target's
+    side is always a legitimate resolution of the pair. Which side *should*
+    go is the spec's call, and ``spec_outranks_the_code`` makes it.
+
+    Empty when nothing is provable, so a caller can never read "no proof" as
+    "delete freely".
+    """
+    if target and not target.endswith(".py"):
+        return frozenset()
+    names: set[str] = set()
+    for c in find_contradictions_across(files):
+        for fname, fn in (
+            (c.expect_raise_file, c.expect_raise_test),
+            (c.expect_success_file, c.expect_success_test),
+        ):
+            if fn and _same_test_path(fname, target):
+                names.add(fn)
+    return frozenset(names)
+
+
+def machine_unsatisfiable_reason_across(
+    files: Mapping[str, str], *, target: str,
+) -> Optional[str]:
+    """Tier-A classifier for a contradiction ``target`` is HALF of.
+
+    :func:`machine_unsatisfiable_reason` reads one file, so a cross-file pair
+    is invisible to it and the router could only reach regeneration for one
+    via the judge's behavioural ``oscillation_contradiction`` proof -- which
+    requires repair to have oscillated first, i.e. after the cost has already
+    been paid. This proves the same thing from the AST, before any of that.
+
+    Returns the pair's description, or None when nothing involving ``target``
+    is provable. A pair wholly inside ``target`` is reported too (the
+    single-file classifier reaches the same verdict first and more cheaply;
+    this is for when the caller has only the batch map to hand).
+    """
+    if target and not target.endswith(".py"):
+        return None
+    for c in find_contradictions_across(files):
+        if _same_test_path(c.expect_raise_file, target) or _same_test_path(
+            c.expect_success_file, target
+        ):
+            return c.describe()
+    return None
 
 
 def machine_unsatisfiable_reason(

@@ -24288,6 +24288,48 @@ def route_after_diagnostics(state: AgentState) -> Literal["repair_node", "compil
     return _transition("repair_node")
 
 
+def _batch_test_sources(
+    state: AgentState, declared_file: str, declared_source: str,
+) -> dict[str, str]:
+    """The batch's Python test files, keyed by the path the state spells them.
+
+    Scoped to files this batch declared — ``generated_tests`` plus the test
+    files in ``modified_files`` — and NOT a workspace scan. A cross-file
+    contradiction is a contradiction between tests the same author emitted
+    together, so the batch's own set is both the right scope and naturally
+    bounded by the batch planner; walking the tree would make routing cost
+    grow with the workspace and would pair tests from unrelated stories.
+
+    ``declared_source`` is already in hand, so it is used rather than re-read.
+    Unreadable siblings are skipped: a prover missing one file reaches a
+    weaker conclusion, which is the safe direction.
+    """
+    workspace = str(state.get("workspace_path", "") or "")
+    out: dict[str, str] = {declared_file: declared_source}
+    _candidates: list[str] = []
+    for key in ("generated_tests", "modified_files"):
+        for rel in state.get(key) or []:
+            _rel = str(rel or "")
+            if _rel.endswith(".py") and os.path.basename(_rel).startswith(
+                "test_"
+            ):
+                _candidates.append(_rel)
+    for rel in _candidates:
+        if any(_norm_rel_path(rel) == _norm_rel_path(k) for k in out):
+            continue
+        _abs = rel if os.path.isabs(rel) else os.path.join(workspace, rel)
+        try:
+            with open(_abs, "r", encoding="utf-8") as fh:
+                out[rel] = fh.read()
+        except OSError:
+            continue
+    return out
+
+
+def _norm_rel_path(path: str) -> str:
+    return os.path.normpath(str(path or ""))
+
+
 def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
     """ADR-0001 autonomy ladder for a declared-unsatisfiable test.
 
@@ -24364,36 +24406,86 @@ def route_after_unsatisfiable(state: AgentState, declared_file: str) -> str:
 
     from harness.test_contradiction import machine_unsatisfiable_reason
     provable = machine_unsatisfiable_reason(source, filename=declared_file)
+
+    # The single-file prover above reads ONE file, so a contradiction the
+    # declared test is only HALF of is invisible to it — and that is the
+    # shape that dominated the lumina runs (ASM-007's directory order
+    # asserted backwards beside a sibling demanding the opposite sort).
+    # Until now such a pair could reach regeneration only via the judge's
+    # behavioural oscillation proof, i.e. after repair had already paid to
+    # oscillate, and it arrived with an EMPTY proof set — which left the
+    # coverage gate holding the rewrite to its one-function tolerance and
+    # vetoing the only fix available. Prove it from the AST instead, using
+    # the batch's own test files.
+    _sibling_sources = _batch_test_sources(state, declared_file, source)
+    _proof_tests: list[str] = []
+    try:
+        from harness.test_contradiction import (
+            machine_unsatisfiable_reason_across,
+            proven_unsatisfiable_tests,
+            proven_unsatisfiable_tests_across,
+        )
+        if provable is None and len(_sibling_sources) > 1:
+            _across = machine_unsatisfiable_reason_across(
+                _sibling_sources, target=declared_file,
+            )
+            if _across is not None:
+                provable = _across
+                logger.warning(
+                    "[router] %s is half of a PROVEN cross-file "
+                    "contradiction (%s) — the single-file check cannot see "
+                    "this shape.", declared_file, _across,
+                )
+        # Carry the PROOF forward, not just its prose. The coverage gate in
+        # test_regeneration must know which removals a proof sanctioned, or
+        # it vetoes the fix the ladder exists to produce (lumina 01a17704
+        # died that way with the proof sitting unused in the log). Union of
+        # both provers: the cross-file one names only this file's side of
+        # each pair, which is the side regeneration can rewrite.
+        _names = set(
+            proven_unsatisfiable_tests(source, filename=declared_file)
+        )
+        if len(_sibling_sources) > 1:
+            _names |= proven_unsatisfiable_tests_across(
+                _sibling_sources, target=declared_file,
+            )
+        _proof_tests = sorted(_names)
+    except Exception:  # noqa: BLE001 — never block routing on a prover fault
+        _proof_tests = []
+
     # A contradiction proved behaviourally across files (repair_node's
     # revert proof) and adjudicated by the judge is a machine proof too, of
-    # a kind the single-file AST check cannot see.
+    # a kind the AST checks cannot see.
     if provable is None and (
         state.get("node_state", {}).get("unsatisfiable_test_proof")
         == "oscillation_contradiction"
     ):
         provable = "proved cross-file contradiction, adjudicated by the judge"
     if provable is not None:
-        # Carry the PROOF forward, not just its prose. The coverage gate in
-        # test_regeneration must know which removals a proof sanctioned, or it
-        # vetoes the fix the ladder exists to produce (lumina 01a17704 died
-        # that way with the proof sitting unused in the log).
-        try:
-            from harness.test_contradiction import proven_unsatisfiable_tests
-            _proof_tests = sorted(
-                proven_unsatisfiable_tests(source, filename=declared_file)
-            )
-        except Exception:  # noqa: BLE001 — never block routing on telemetry
-            _proof_tests = []
         if _proof_tests:
             _ns_proof = state.setdefault("node_state", {})
             _ns_proof["unsatisfiable_proof_tests"] = _proof_tests
-        logger.warning(
-            "[router] Test %s is PROVABLY unsatisfiable (%s) — routing to "
-            "test-author regeneration (attempt %d/%d). Proof names %s; those "
-            "removals are sanctioned.",
-            declared_file, provable, attempts + 1, cap,
-            _proof_tests or "no specific function",
-        )
+            logger.warning(
+                "[router] Test %s is PROVABLY unsatisfiable (%s) — routing "
+                "to test-author regeneration (attempt %d/%d). Proof names "
+                "%s; those removals are sanctioned.",
+                declared_file, provable, attempts + 1, cap, _proof_tests,
+            )
+        else:
+            # Say what is actually true. This used to report "Proof names no
+            # specific function; those removals are sanctioned", which reads
+            # as a sanction being granted when the opposite is the case —
+            # the coverage floor still applies in full, and that is the
+            # single most useful thing to know when the rewrite comes back
+            # rejected for dropping a function.
+            logger.warning(
+                "[router] Test %s is PROVABLY unsatisfiable (%s) — routing "
+                "to test-author regeneration (attempt %d/%d). The proof "
+                "names no function, so NO removal is sanctioned and the "
+                "coverage floor applies in full: a rewrite that drops more "
+                "than one test will be rejected.",
+                declared_file, provable, attempts + 1, cap,
+            )
         return "test_regeneration_node"
 
     if cfg.get("tier_b_auto", False):

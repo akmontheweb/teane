@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -431,6 +432,34 @@ def build_user_prompt(ctx: StoryAcceptanceContext, *, max_scenarios: int) -> str
             "asserts the same schema, so a body key you guess at will "
             "contradict it and no production change can satisfy both.",
         ]
+    # Error bodies have no discovered schema: the envelope is built by a
+    # helper (``to_error_response``) rather than declared as a response model,
+    # so it never reaches ``response_models`` above and the model is left to
+    # read the requirement's shorthand literally. lumina run 11 died on
+    # exactly that: SPEC_REQUIREMENTS states the contract as
+    # ``404 { code: "NOT_FOUND" }`` while the architecture mandates a nested
+    # ``{"error": {...}}`` envelope, so the scenario asserted
+    # ``body == {'code': 'NOT_FOUND'}`` — unsatisfiable without breaking the
+    # envelope everywhere, un-repairable (repair may not edit tests), and
+    # un-regenerable (regeneration re-reads the same shorthand criterion).
+    parts += [
+        "",
+        "## Error responses — the SHAPE comes from the architecture, not the "
+        "criterion's shorthand",
+        "A requirement that writes a contract like `404 { code: \"NOT_FOUND\" }` "
+        "is naming the error CODE, not giving you the literal response body. "
+        "The response SHAPE is whatever the architecture section and the "
+        "application's error-envelope helper define — commonly a nested "
+        "envelope such as `{\"error\": {\"code\": ..., \"message\": ...}}`.",
+        "So: assert the CODE at the path the envelope puts it "
+        "(`body[\"error\"][\"code\"] == \"NOT_FOUND\"`), and NEVER assert "
+        "exact equality against a whole error body — an envelope carries "
+        "fields a test cannot predict (`message`, `error_ref_id`, `type`), so "
+        "`body == {...}` can only pass if the application abandons its own "
+        "envelope. Where the requirement and the architecture disagree on "
+        "shape, the MORE DETAILED statement wins, and that is the "
+        "architecture.",
+    ]
     _fb = {k: v for k, v in ctx.scenario_feedback.items() if k in ctx.ac_keys() and v}
     if _fb:
         parts += [
@@ -1693,6 +1722,124 @@ def _cross_cutting_rules(
     return head[:cut] if cut > 0 else head[:max_chars]
 
 
+#: Budget for the architecture excerpt. Sibling of
+#: ``_CROSS_CUTTING_MAX_CHARS`` and sized the same way: large enough to carry
+#: the contract and error-shape sections together, since those are what an
+#: assertion is written against.
+_ARCH_EXCERPT_MAX_CHARS = 12000
+
+#: Section headings that define RESPONSE SHAPE rather than behaviour. These are
+#: always selected regardless of the story, because every assertion about a
+#: response body depends on them and they are nowhere near the top of the file.
+_SHAPE_SECTION_RE = re.compile(
+    r"error\s*handling|error\s*envelope|api\s*(convention|contract|design)|"
+    r"response\s*(shape|format|envelope)|convention|security\s*boundar|"
+    r"edge\s*case|test\s*matrix",
+    re.IGNORECASE,
+)
+
+_MD_HEADING_RE = re.compile(r"^(#{2,4})\s+(.*)$", re.MULTILINE)
+
+
+def _split_md_sections(text: str) -> list[tuple[str, str]]:
+    """``[(heading, body_including_heading), ...]`` for a Markdown document.
+
+    Content above the first heading is returned under the heading ``""`` so a
+    document's preamble is never silently dropped.
+    """
+    matches = list(_MD_HEADING_RE.finditer(text or ""))
+    if not matches:
+        return [("", text or "")]
+    out: list[tuple[str, str]] = []
+    if matches[0].start() > 0:
+        out.append(("", text[: matches[0].start()]))
+    for idx, m in enumerate(matches):
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        out.append((m.group(2).strip(), text[m.start():end]))
+    return out
+
+
+def architecture_contract_excerpt(
+    workspace_path: str,
+    *,
+    routes: "Iterable[str]" = (),
+    max_chars: int = _ARCH_EXCERPT_MAX_CHARS,
+) -> str:
+    """The architecture sections an assertion actually depends on.
+
+    Replaces a blind ``fh.read(max_chars)`` of ``SPEC_ARCHITECTURE.md``, which
+    was a head truncation: on lumina the doc is 48,812 bytes / 772 lines and
+    the 6,000-char excerpt ended at **line 96** — the overview and the start of
+    the module inventory. It never reached the API contract sections, "Error
+    handling" (line 496), or the "Edge Case & Security Test Matrix" (line 564).
+
+    So the component whose whole job is writing assertions against API
+    contracts could not see the contracts, and the one document that defines
+    the error envelope was structurally invisible to it. Meanwhile the
+    requirements doc states the same contract in shorthand --
+    ``404 { code: "NOT_FOUND" }`` -- and IS fully visible, so the generator
+    wrote ``body['code']`` against a nested ``{"error": {...}}`` envelope. That
+    test cannot pass without breaking the envelope everywhere, repair may not
+    edit tests, and regeneration anchors on the same criterion, so it rewrote
+    the same wrong assertion until the class cap killed run 11 at 4/16.
+
+    Selection, in document order so the result reads like the document:
+      * every section whose heading names a response-shape or security
+        convention (:data:`_SHAPE_SECTION_RE`) -- always, story-independent;
+      * every section mentioning one of this story's ``routes``;
+      * the preamble/overview, with whatever budget remains.
+
+    Sections are kept whole: a mid-section cut drops the tail of the rule it
+    was quoting, which is how this failed in the first place.
+    """
+    path = os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    sections = _split_md_sections(text)
+    _routes = [str(r).strip() for r in (routes or ()) if str(r).strip()]
+
+    shape: list[int] = []
+    routey: list[int] = []
+    preamble: list[int] = []
+    for idx, (heading, body) in enumerate(sections):
+        if heading and _SHAPE_SECTION_RE.search(heading):
+            shape.append(idx)
+        elif _routes and any(r in body for r in _routes):
+            routey.append(idx)
+        elif not heading:
+            preamble.append(idx)
+
+    chosen: dict[int, str] = {}
+    used = 0
+    # Shape first: it is the smallest, most load-bearing content and must not
+    # lose its budget to a long route section.
+    for group in (shape, routey, preamble):
+        for idx in group:
+            body = sections[idx][1]
+            if used + len(body) > max_chars:
+                if chosen:
+                    continue
+                # Nothing has landed yet and this one alone overflows. An
+                # empty excerpt is worse than a clipped one, but returning it
+                # whole is worse still: a heading-less document is ONE
+                # section, so "always include at least one" would have handed
+                # the prompt the entire file (50,000 chars against a 100-char
+                # budget, in the test that caught this).
+                body = body[:max_chars]
+            chosen[idx] = body
+            used += len(body)
+    if not chosen:
+        return text[:max_chars]
+    return "\n".join(
+        chosen[idx].rstrip() for idx in sorted(chosen)
+    ).strip()
+
+
 def _read_excerpt(workspace_path: str, rel: str, *, max_chars: int) -> str:
     path = os.path.join(workspace_path, rel)
     if not os.path.isfile(path):
@@ -2473,13 +2620,14 @@ def gather_story_acceptance_context(
         except Exception:  # noqa: BLE001
             pass
 
+    _routes = discover_routes(workspace_path)
     return StoryAcceptanceContext(
         story_key=story_key,
         title=story.get("title", story_key),
         description=story.get("description", "") or "",
         acceptance_criteria=ac_rows,
         criteria_as_specified=_story_criteria_text(workspace_path, story_key),
-        routes=discover_routes(workspace_path),
+        routes=_routes,
         response_models={
             # Declared models first; literals fill only the endpoints that
             # declare no shape, so a declared model is never overridden.
@@ -2490,7 +2638,14 @@ def gather_story_acceptance_context(
         scenario_feedback=load_scenario_feedback(suite_dir) if suite_dir else {},
         cross_cutting_rules=_cross_cutting_rules(workspace_path),
         data_model_excerpt=_read_excerpt(workspace_path, "docs/SPEC_DATA_MODEL.md", max_chars=excerpt_chars),
-        architecture_excerpt=_read_excerpt(workspace_path, "docs/SPEC_ARCHITECTURE.md", max_chars=excerpt_chars),
+        # Section-selected, NOT head-truncated: the sections an assertion
+        # depends on (contracts, error envelope, security matrix) sit at the
+        # END of this document and a head read never reached them. See
+        # architecture_contract_excerpt.
+        architecture_excerpt=architecture_contract_excerpt(
+            workspace_path,
+            routes=[str(r.get("path", "")) for r in _routes],
+        ),
         stack=dict(stack or {}),
     )
 

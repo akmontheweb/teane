@@ -166,6 +166,11 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
         workspace, story_keys, cfg, gateway=gateway, budget=budget,
         db_isolated=db_override is not None,
         clock_available=clock_override is not None,
+        # Criteria verified in an earlier pass need no new scenario: they are
+        # filtered out of ``runnable`` below and never written to the suite,
+        # so generating them was pure waste — about half of run 11's wall
+        # clock. See _generate_batch_scenarios.
+        already_passed=already_passed,
     )
     # ui-only ACs (no integration scenario) are recorded as needs-browser deferrals.
     _persist_ui_only_deferrals(workspace, app_name, scenarios)
@@ -350,15 +355,37 @@ async def _generate_batch_scenarios(
     budget: float,
     db_isolated: bool = False,
     clock_available: bool = False,
+    already_passed: Optional[set[str]] = None,
 ) -> tuple[list[ag.AcceptanceScenario], dict[str, str], float]:
-    """Generate scenarios for every story in the batch (LLM or fallback).
+    """Generate scenarios for the criteria in this batch that still need one.
 
     Also returns the not-runtime criteria (AC key → rationale), which have
     no scenarios to carry their classification.
+
+    ``already_passed`` names criteria verified in an earlier pass. They are
+    SKIPPED, and a story with nothing left to verify costs no dispatch at
+    all. This used to generate every criterion of every story on every
+    entry, and the node is re-entered on every green build, so the work was
+    redone from scratch each time and then thrown away:
+    :func:`acceptance_run.select_runnable` filtered by ``already_passed``
+    only AFTER generation, and ``_write_integration_suite`` writes only the
+    runnable set, so a passed criterion's scenario was generated, discarded,
+    and never written.
+
+    Measured on lumina run 11, batch 94: 4 acceptance entries, 19
+    scenario-gen dispatches, 13 of them over 300s — **roughly 75-90 of the
+    batch's 164 minutes, about half its wall clock**, spent regenerating
+    scenarios for criteria that had already passed. Four stories took 2h45m;
+    sixteen at that rate is about eleven hours, which is the real reason no
+    run has ever finished. Nothing was behaving incorrectly, which is why it
+    stayed invisible for ten runs.
     """
     all_scen: list[ag.AcceptanceScenario] = []
     not_runtime: dict[str, str] = {}
+    _passed = set(already_passed or ())
     use_llm = str(cfg.get("scenario_source", "fallback")) == "llm" and gateway is not None
+    _skipped_stories = 0
+    _skipped_criteria = 0
     for sk in story_keys:
         ctx = ag.gather_story_acceptance_context(
             workspace, sk, stack={"backend": "fastapi"},
@@ -367,6 +394,22 @@ async def _generate_batch_scenarios(
         )
         if ctx is None:
             continue
+        if _passed:
+            _before = len(ctx.acceptance_criteria)
+            # Same shape as the regeneration path, which has always narrowed
+            # the context to the criteria it is actually asking about.
+            ctx.acceptance_criteria = [
+                a for a in ctx.acceptance_criteria
+                if a.get("ac_key") not in _passed
+            ]
+            _skipped_criteria += _before - len(ctx.acceptance_criteria)
+            if not ctx.acceptance_criteria:
+                _skipped_stories += 1
+                logger.info(
+                    "[acceptance] %s: every criterion already verified in an "
+                    "earlier pass — no scenario generation needed.", sk,
+                )
+                continue
         if use_llm:
             res = await ag.generate_acceptance_scenarios(
                 ctx, gateway=gateway, budget_remaining_usd=budget, config=cfg,
@@ -377,6 +420,21 @@ async def _generate_batch_scenarios(
             res = ag.fallback_acceptance_scenarios(ctx)
         all_scen.extend(res.scenarios)
         not_runtime.update(res.not_runtime)
+    if _skipped_criteria or _skipped_stories:
+        logger.info(
+            "[acceptance] Scenario generation skipped %d already-verified "
+            "criterion/criteria and %d whole story/stories. Each skipped "
+            "story is one LLM dispatch not made; in run 11 those ran 5-6 "
+            "minutes each.", _skipped_criteria, _skipped_stories,
+        )
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "acceptance_scenario_gen_skipped",
+                criteria=_skipped_criteria, stories=_skipped_stories,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
     return all_scen, not_runtime, budget
 
 

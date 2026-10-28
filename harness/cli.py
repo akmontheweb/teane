@@ -1358,6 +1358,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # one is novel. False restores lifetime counting, which terminated
         # lumina 01a169ed at 6/6 after it resolved five blockers.
         "auto_resume_class_cap_resets_on_progress",
+        "auto_resume_class_charged_to_first_owner",
     }),
     # Agile tuning knobs. batch_size = max stories per dependency batch;
     # commit_on_story = git-commit after each green story; repair_cap =
@@ -1423,6 +1424,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "hitl.auto_resume_cap_per_trigger": (int,),
     "hitl.auto_resume_cap_per_blocker": (int,),
     "hitl.auto_resume_class_cap_resets_on_progress": (bool,),
+    "hitl.auto_resume_class_charged_to_first_owner": (bool,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -2937,6 +2939,48 @@ _BLOCKER_SIGNATURE_LOCATIONS = 3
 #: progress. Operators can set ``hitl.auto_resume_class_cap_resets_on_progress``
 #: false to restore lifetime counting.
 _HITL_CLASS_CAP_RESETS_ON_PROGRESS = True
+
+#: Whether every resume for one blocker is charged to the FIRST trigger class
+#: that saw it, so a rotating root cause draws ONE class budget instead of
+#: several. Operators can set ``hitl.auto_resume_class_charged_to_first_owner``
+#: false to restore per-trigger-class charging.
+_HITL_CLASS_CHARGED_TO_FIRST_OWNER = True
+
+
+def _charged_trigger_class(
+    *, trigger_class: str, blocker_sig: str, owners: dict[str, Any],
+    enabled: bool,
+) -> tuple[str, dict[str, Any]]:
+    """The class this resume is charged to, and the updated owner map.
+
+    One pathology routinely presents as several trigger classes. lumina run 5:
+    a single blocker walked ``reflection_distraction_loop`` ->
+    ``repair_loop_limit`` -> ``persistent_build_failure``, each staying around
+    1/6, so no class ever capped and the run spun until it was killed by hand.
+    Run 10 charged ``_004:80`` to two classes. The per-blocker cap (9) is the
+    existing backstop, but it sits ABOVE the class cap (6), so a blocker that
+    rotates still buys 50% more resumes than one that sits still -- the
+    accounting rewards presenting under a fresh label.
+
+    Charging every resume for a blocker to the class that first saw it makes
+    rotation worth nothing: three hops draw 3/6 of one budget, exactly as
+    three hops on an unchanging label would. The firing class is still
+    reported, so a post-mortem can see the rotation; it just no longer pays
+    for it.
+
+    Mirror image of ``_class_budget_progress_reset``, which stops the same
+    counter punishing success. Both exist because a per-class counter has to
+    measure thrash on ONE problem, which is neither "lifetime firings of this
+    label" nor "firings summed across labels".
+    """
+    _owners = dict(owners or {})
+    if not enabled or not blocker_sig:
+        return trigger_class, _owners
+    _owner = str(_owners.get(blocker_sig) or "")
+    if _owner:
+        return _owner, _owners
+    _owners[blocker_sig] = trigger_class
+    return trigger_class, _owners
 
 
 def _blocker_locations(signature: str) -> frozenset[str]:
@@ -4978,7 +5022,6 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 # intent: one exhausted failure CLASS can't monopolize the
                 # auto-resume pool.
                 _trigger_class = trigger.split(":", 1)[0].strip() or trigger
-                _trigger_taken = int(_per_trigger.get(_trigger_class, 0) or 0)
                 # Per-blocker accounting, orthogonal to the class cap: the
                 # same root cause presenting under three trigger classes
                 # used to draw three class budgets (see
@@ -4989,6 +5032,36 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     or _HITL_AUTO_RESUME_CAP_PER_BLOCKER
                 )
                 _blocker_sig = _blocker_signature(state)
+                # ...and now make the class cap immune to rotation: every
+                # resume for one blocker is charged to the class that first
+                # saw it. See _charged_trigger_class. ``_trigger_class`` is
+                # still what gets REPORTED, so a rotation stays visible in
+                # the log and the termination banner.
+                _owners_raw = _lc_for_cap.get("hitl_blocker_owner_class")
+                _charged_class, _owners = _charged_trigger_class(
+                    trigger_class=_trigger_class,
+                    blocker_sig=_blocker_sig,
+                    owners=_owners_raw if isinstance(_owners_raw, dict) else {},
+                    enabled=bool(
+                        state.get("hitl_auto_resume_class_charged_to_first_owner")
+                        if state.get(
+                            "hitl_auto_resume_class_charged_to_first_owner"
+                        ) is not None
+                        else _hitl_config.get(
+                            "auto_resume_class_charged_to_first_owner",
+                            _HITL_CLASS_CHARGED_TO_FIRST_OWNER,
+                        )
+                    ),
+                )
+                _lc_for_cap["hitl_blocker_owner_class"] = _owners
+                if _charged_class != _trigger_class:
+                    logger.info(
+                        "[HITL] Trigger class '%s' fired, but blocker '%s' "
+                        "was first charged to '%s' — charging there so a "
+                        "rotating root cause draws ONE class budget.",
+                        _trigger_class, _blocker_sig, _charged_class,
+                    )
+                _trigger_taken = int(_per_trigger.get(_charged_class, 0) or 0)
                 _per_blocker_raw = _lc_for_cap.get(
                     "hitl_auto_resumes_per_blocker"
                 )
@@ -5023,7 +5096,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 if _progress_resets:
                     _made_progress, _class_hist = (
                         _class_budget_progress_reset(
-                            trigger_class=_trigger_class,
+                            trigger_class=_charged_class,
                             blocker_sig=_blocker_sig,
                             history=_class_hist,
                         )
@@ -5035,10 +5108,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                             "is new, so the loop is making progress rather "
                             "than thrashing. The session cap (%d/%d) still "
                             "bounds the run.",
-                            _trigger_class, _trigger_taken, _cap_per_trigger,
+                            _charged_class, _trigger_taken, _cap_per_trigger,
                             _blocker_sig, _resumes_taken, _cap,
                         )
-                        _per_trigger[_trigger_class] = 0
+                        _per_trigger[_charged_class] = 0
                         _trigger_taken = 0
                 _lc_for_cap["hitl_class_blocker_history"] = _class_hist
                 _session_cap_hit = _resumes_taken >= _cap
@@ -5060,7 +5133,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     elif _trigger_cap_hit:
                         _cap_reason = (
                             f"per-trigger cap {_trigger_taken}/"
-                            f"{_cap_per_trigger} for '{_trigger_class}'"
+                            f"{_cap_per_trigger} for '{_charged_class}'"
+                            + (
+                                f" (fired as '{_trigger_class}')"
+                                if _charged_class != _trigger_class else ""
+                            )
                         )
                     else:
                         _cap_reason = (
@@ -5168,8 +5245,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     _lc_for_cap["hitl_auto_resumes_taken"] = (
                         _resumes_taken + 1
                     )
-                    _per_trigger[_trigger_class] = int(
-                        _per_trigger.get(_trigger_class, 0) or 0
+                    _per_trigger[_charged_class] = int(
+                        _per_trigger.get(_charged_class, 0) or 0
                     ) + 1
                     _lc_for_cap["hitl_auto_resumes_per_trigger"] = _per_trigger
                     if _blocker_sig:
@@ -5185,8 +5262,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         "/ no TTY). Auto-resume %d/%d for this session "
                         "(trigger '%s' → class '%s' cumulative: %d/%d; "
                         "blocker '%s' cumulative: %d/%d).",
-                        _resumes_taken + 1, _cap, trigger, _trigger_class,
-                        _per_trigger[_trigger_class], _cap_per_trigger,
+                        _resumes_taken + 1, _cap, trigger, _charged_class,
+                        _per_trigger[_charged_class], _cap_per_trigger,
                         _blocker_sig or "<none>",
                         int(_per_blocker.get(_blocker_sig, 0) or 0)
                         if _blocker_sig else 0,

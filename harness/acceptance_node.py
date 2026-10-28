@@ -34,16 +34,34 @@ from harness import story_state
 logger = logging.getLogger(__name__)
 
 
-def _passthrough(state: dict, *, reason: str) -> dict[str, Any]:
+def _passthrough(
+    state: dict, *, reason: str,
+    unverifiable: Optional[dict[str, tuple[str, str]]] = None,
+) -> dict[str, Any]:
+    """Skip acceptance for this batch, reporting whatever was in scope.
+
+    ``unverifiable`` names criteria no in-build test can decide. Passing
+    through without them was how a batch whose whole scope was ui criteria
+    reported nothing at all — see :func:`_unverifiable_in_build`.
+    """
     logger.info("[acceptance] %s — passing through.", reason)
-    return {
-        "node_state": {
-            **(state.get("node_state") or {}),
-            "current_node": "acceptance",
-            "skipped": True,
-            "acceptance_attributable": False,
-        }
+    _ns: dict[str, Any] = {
+        **(state.get("node_state") or {}),
+        "current_node": "acceptance",
+        "skipped": True,
+        "acceptance_attributable": False,
     }
+    if unverifiable:
+        _result = ar.AcceptanceRunResult(
+            ran=False, outcomes=ar.unverifiable_outcomes(unverifiable),
+        )
+        _ns["acceptance_summary"] = ar.summarize(_result)
+        logger.info(
+            "[acceptance] %d criterion/criteria were in scope and cannot be "
+            "verified in-build (%s) — reported unverified, not omitted.",
+            len(unverifiable), ", ".join(sorted(unverifiable)),
+        )
+    return {"node_state": _ns}
 
 
 async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at runtime
@@ -152,11 +170,17 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     # ui-only ACs (no integration scenario) are recorded as needs-browser deferrals.
     _persist_ui_only_deferrals(workspace, app_name, scenarios)
     _persist_not_runtime_deferrals(workspace, app_name, not_runtime)
+    _unverifiable = _unverifiable_in_build(scenarios, not_runtime)
 
     runnable = ar.select_runnable(scenarios, already_passed=already_passed)
     # Include re-queued dependency-blocked ACs whose scenario is in this set.
     if not runnable:
-        return _passthrough(state, reason="no runnable integration ACs this batch")
+        # A batch of nothing but ui criteria is not a batch with nothing in
+        # it, and this path used to report exactly that.
+        return _passthrough(
+            state, reason="no runnable integration ACs this batch",
+            unverifiable=_unverifiable,
+        )
 
     # Optional schema-typed baseline seed (applied to the isolated DB in conftest).
     seed_dict, budget = await _generate_seed(workspace, cfg, gateway=gateway, budget=budget)
@@ -173,7 +197,7 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     runner = _make_sandbox_runner(state, integ_dir_rel)
     result = ar.run_acceptance(
         runnable, written, workspace, runner=runner, story_keys=story_keys,
-        already_passed=already_passed,
+        already_passed=already_passed, unverifiable=_unverifiable,
     )
     logger.info("[acceptance] batch %s: %s", batch_id, ar.summarize(result))
 
@@ -641,16 +665,56 @@ def _record_outcomes(
         _close(conn)
 
 
-def _persist_ui_only_deferrals(
-    workspace: str, app_name: str, scenarios: list[ag.AcceptanceScenario],
-) -> None:
-    """Record ui-only ACs (e2e only, no integration) as needs-browser deferrals."""
+def _ui_only_acs(scenarios: list[ag.AcceptanceScenario]) -> set[str]:
+    """ACs with an e2e/ui scenario and no integration one.
+
+    Extracted so the reporting path and the deferral-recording path cannot
+    disagree about which criteria these are — they did, silently, for as long
+    as only the latter existed.
+    """
     ui_acs = {
         s.verifies for s in scenarios
         if s.classification == ag.CLASS_UI and s.altitude == ag.ALTITUDE_E2E
     }
-    has_integration = {s.verifies for s in scenarios if s.altitude == ag.ALTITUDE_INTEGRATION}
-    ui_only = ui_acs - has_integration
+    has_integration = {
+        s.verifies for s in scenarios
+        if s.altitude == ag.ALTITUDE_INTEGRATION
+    }
+    return ui_acs - has_integration
+
+
+def _unverifiable_in_build(
+    scenarios: list[ag.AcceptanceScenario], not_runtime: dict[str, str],
+) -> dict[str, tuple[str, str]]:
+    """``{ac_key: (status, detail)}`` for every criterion in this batch's
+    scope that no in-build test can decide.
+
+    ui-only criteria need a browser against the app running on Docker, which
+    is ``teane test``'s job; not-runtime criteria are about the repository or
+    process. Deferring both is right. Leaving them out of the run result —
+    which is where ``summarize`` and node_state's ``acceptance_summary`` come
+    from — is what made batch 88 report ``total:10`` for 17 criteria and let
+    STORY-003 seal ``done`` with 0 of 4 verified, silently.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for ac_key in sorted(_ui_only_acs(scenarios)):
+        out[ac_key] = (
+            ar.STATUS_DEFERRED_UI,
+            "ui-only: deferred to post-deploy teane test",
+        )
+    for ac_key, why in sorted(not_runtime.items()):
+        out[ac_key] = (
+            ar.STATUS_DEFERRED_NOT_RUNTIME,
+            f"not-runtime: {why}" if why else "not-runtime",
+        )
+    return out
+
+
+def _persist_ui_only_deferrals(
+    workspace: str, app_name: str, scenarios: list[ag.AcceptanceScenario],
+) -> None:
+    """Record ui-only ACs (e2e only, no integration) as needs-browser deferrals."""
+    ui_only = _ui_only_acs(scenarios)
     if not ui_only:
         return
     try:

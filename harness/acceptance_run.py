@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from harness.acceptance_gen import (
+    ALTITUDE_E2E,
     ALTITUDE_INTEGRATION,
     AcceptanceScenario,
     integration_function_name,
@@ -242,6 +243,30 @@ def select_runnable(
     ]
 
 
+def unverifiable_outcomes(
+    unverifiable: Optional[dict[str, tuple[str, str]]],
+) -> list[ACOutcome]:
+    """``{ac_key: (status, detail)}`` → outcomes, for criteria no in-build
+    test can decide.
+
+    These used to exist only as rows in the deferral table. The run result —
+    and therefore ``summarize`` and the ``acceptance_summary`` in node_state
+    — was built from the RUNNABLE scenarios alone, so a ui-only or
+    not-runtime criterion never entered the denominator. lumina batch 88
+    reported ``total:10`` for a batch whose scope was 17 criteria, and
+    STORY-003 sealed ``done`` with 0 of its 4 criteria verified by anything.
+    Nothing in the log said so.
+
+    Deferring them is correct — a ui criterion needs a browser and the app up
+    on Docker, which is ``teane test``'s job, not the build's. Reporting the
+    batch as if they were not in scope is not.
+    """
+    return [
+        ACOutcome(ac_key, status, ALTITUDE_E2E, detail)
+        for ac_key, (status, detail) in sorted((unverifiable or {}).items())
+    ]
+
+
 def run_acceptance(
     scenarios: list[AcceptanceScenario],
     written_paths: list[str],
@@ -250,6 +275,7 @@ def run_acceptance(
     runner: AcceptanceRunner,
     story_keys: Optional[list[str]] = None,
     already_passed: Optional[set[str]] = None,
+    unverifiable: Optional[dict[str, tuple[str, str]]] = None,
 ) -> AcceptanceRunResult:
     """Run the batch's integration scenarios and triage the results.
 
@@ -257,10 +283,22 @@ def run_acceptance(
     writes them); ``runner`` executes them in the sandbox. Each scenario maps to a
     pytest function via :func:`integration_function_name`; the outcome for that
     function determines the AC's status.
+
+    ``unverifiable`` carries the criteria in this batch's scope that no
+    in-build test can decide — ui-only and not-runtime — as
+    ``{ac_key: (status, detail)}``. They are reported as outcomes so the
+    denominator is the batch's real scope; see :func:`unverifiable_outcomes`.
     """
+    _unverifiable = unverifiable_outcomes(unverifiable)
     runnable = select_runnable(scenarios, already_passed=already_passed)
     if not runnable:
-        return AcceptanceRunResult(story_keys=list(story_keys or []), ran=False)
+        # Still report what was in scope. ``ran`` stays False — nothing
+        # executed — but a batch of nothing but ui criteria is not a batch
+        # with nothing in it.
+        return AcceptanceRunResult(
+            story_keys=list(story_keys or []), ran=False,
+            outcomes=_unverifiable,
+        )
 
     # func-name → scenario, to map nodeids back to ACs.
     by_func: dict[str, AcceptanceScenario] = {
@@ -282,14 +320,16 @@ def run_acceptance(
         return AcceptanceRunResult(
             story_keys=list(story_keys or []),
             outcomes=[ACOutcome(s.verifies, STATUS_DEFERRED_COLLECTION,
-                                s.altitude, str(exc)[:500]) for s in runnable],
+                                s.altitude, str(exc)[:500])
+                      for s in runnable] + _unverifiable,
         )
     except Exception as exc:  # noqa: BLE001 — a runner crash defers the batch, never fails it
         logger.warning("[acceptance_run] runner crashed: %s — deferring batch", exc)
         return AcceptanceRunResult(
             story_keys=list(story_keys or []),
             outcomes=[ACOutcome(s.verifies, STATUS_DEFERRED_DEP, s.altitude,
-                                f"runner error: {exc}") for s in runnable],
+                                f"runner error: {exc}")
+                      for s in runnable] + _unverifiable,
         )
 
     outcome_by_func = _index_outcomes_by_func(outcomes)
@@ -315,7 +355,10 @@ def run_acceptance(
             status = classify_acceptance_failure(out.message)
             ac_outcomes.append(ACOutcome(sc.verifies, status, sc.altitude,
                                          out.message[:500]))
-    return AcceptanceRunResult(story_keys=list(story_keys or []), outcomes=ac_outcomes)
+    return AcceptanceRunResult(
+        story_keys=list(story_keys or []),
+        outcomes=ac_outcomes + _unverifiable,
+    )
 
 
 def _index_outcomes_by_func(outcomes: list[TestOutcome]) -> dict[str, TestOutcome]:
@@ -453,11 +496,17 @@ def summarize(result: AcceptanceRunResult) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for o in result.outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
+    _passed = result.passed()
     return {
         "ran": result.ran,
         "total": len(result.outcomes),
+        # ``total`` alone was read as "criteria verified" often enough to be
+        # worth ending: it is the batch's SCOPE. These two say what actually
+        # happened, and unverified is the number that should be zero.
+        "verified": len(_passed),
+        "unverified": len(result.outcomes) - len(_passed),
         "counts": counts,
-        "passed_acs": [o.ac_key for o in result.passed()],
+        "passed_acs": [o.ac_key for o in _passed],
         "attributable_acs": [o.ac_key for o in result.attributable()],
         "deferred_acs": [(o.ac_key, o.status) for o in result.deferred()],
     }
@@ -470,5 +519,6 @@ __all__ = [
     "AcceptanceCollectionError",
     "TestOutcome", "ACOutcome", "AcceptanceRunResult", "AcceptanceRunner",
     "classify_acceptance_failure", "select_runnable", "run_acceptance", "summarize",
+    "unverifiable_outcomes", "STATUS_DEFERRED_QUARANTINED",
     "parse_pytest_outcomes", "is_collection_error",
 ]

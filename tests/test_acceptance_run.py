@@ -230,9 +230,36 @@ ERROR tests/acceptance/test_s1.py::test_del - fixture 'client' not found
         assert statuses["STORY-1.AC-1"] == STATUS_PASSED
         assert statuses["STORY-1.AC-2"] == STATUS_ATTRIBUTABLE
 
-    def test_xfail_counts_as_passed(self):
+    def test_xfail_does_not_count_as_passed(self):
+        """Reverses the original ADR-0006 reading, which was that an xfail is
+        "expected-fail, not a real failure" — true, and not the same thing as
+        a pass. A PASSED outcome calls ``link_test_to_ac(provenance="build")``
+        and clears the criterion's deferral, so counting an xfail as a pass
+        recorded an unverified criterion as verified by a test that did not
+        hold. It is carried as its own status instead: not a pass, not this
+        batch's failure.
+        """
         outcomes = ar.parse_pytest_outcomes("XFAIL f.py::test_known_gap")
+        assert outcomes[0].passed is False
+        assert outcomes[0].pytest_status == "XFAIL"
+
+    def test_xpass_counts_as_passed(self):
+        """The test ran and passed, so the criterion holds — and a quarantine
+        that outlived its cause must clear rather than linger. This used to
+        fall through as a failure with no matching fingerprint and land on
+        ``deferred:blocked-by-dependency``: a genuine pass filed as blocked.
+        """
+        outcomes = ar.parse_pytest_outcomes("XPASS f.py::test_fixed_since")
         assert outcomes[0].passed is True
+        assert outcomes[0].pytest_status == "XPASS"
+
+    def test_a_strict_xpass_is_also_a_pass(self):
+        """``strict=True`` markers surface the same event as a FAILED line."""
+        outcomes = ar.parse_pytest_outcomes(
+            "FAILED f.py::test_fixed_since - [XPASS(strict)] parked earlier"
+        )
+        assert outcomes[0].passed is True
+        assert outcomes[0].pytest_status == "XPASS"
 
     def test_ignores_non_summary_lines(self):
         assert ar.parse_pytest_outcomes("random text\n=== 0 passed ===") == []

@@ -180,6 +180,7 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
     # --- 4. record outcomes ----------------------------------------------------
     _record_outcomes(workspace, app_name, result, integ_dir_rel, runnable,
                      deferred_before=deferred_before)
+    _unquarantine_passed(result, written)
 
     # --- 5. route --------------------------------------------------------------
     attributable = result.attributable()
@@ -214,7 +215,7 @@ async def acceptance_node(state: "dict") -> dict[str, Any]:  # AgentState at run
             "proceeding.",
             len(attributable), repair_rounds, max_repair, batch_id,
         )
-        _park_over_cap(workspace, app_name, attributable)
+        _park_over_cap(workspace, app_name, attributable, written)
 
     return {
         "loop_counter": loop_counter,
@@ -696,8 +697,23 @@ def _persist_not_runtime_deferrals(
 
 def _park_over_cap(
     workspace: str, app_name: str, attributable: list[ar.ACOutcome],
+    written: Optional[list[str]] = None,
 ) -> None:
-    """Park over-cap attributable failures as deferrals (complete_with_blocks)."""
+    """Park over-cap attributable failures as deferrals (complete_with_blocks),
+    and QUARANTINE their tests so the next batch does not re-pay for them.
+
+    Recording the deferral was only half the job. The failing test stayed
+    live, so the next batch collected it, failed it, and spent its own repair
+    rounds on a defect already written down: batch 89 burnt 6 empty rounds
+    and 2 resumes on batch 88's ``STORY-004.AC-1``. Sealing on an
+    attributable failure is ADR-0006 Phase 1 working as designed; inheriting
+    it is not.
+
+    The quarantine is self-clearing — see
+    :func:`acceptance_gen.quarantine_criterion` and the XPASS handling in
+    ``parse_pytest_outcomes`` — so a criterion that later starts passing
+    reports a real pass and :func:`_unquarantine_passed` strips the marker.
+    """
     try:
         conn = story_state.open_story_db(workspace_path=workspace)
     except Exception:  # noqa: BLE001
@@ -711,6 +727,63 @@ def _park_over_cap(
                     f"over repair cap: {o.detail}")
     finally:
         _close(conn)
+    for o in attributable:
+        _rewrite_suite(
+            o.ac_key, written or [],
+            lambda src, key=o.ac_key, detail=o.detail: ag.quarantine_criterion(
+                src, key, detail,
+            ),
+            action="quarantined",
+        )
+
+
+def _unquarantine_passed(
+    result: ar.AcceptanceRunResult, written: Optional[list[str]],
+) -> None:
+    """Strip the quarantine marker from every criterion that now passes.
+
+    A stale marker is worse than none: a later regression would report XFAIL
+    — "quarantined, not verified" — instead of the attributable failure it
+    is, so the marker meant to stop a batch inheriting a defect would start
+    hiding one.
+    """
+    for o in result.outcomes:
+        if o.status != ar.STATUS_PASSED:
+            continue
+        _rewrite_suite(
+            o.ac_key, written or [],
+            lambda src, key=o.ac_key: ag.unquarantine_criterion(src, key),
+            action="un-quarantined",
+        )
+
+
+def _rewrite_suite(
+    ac_key: str, written: list[str], edit: Any, *, action: str,
+) -> None:
+    """Apply ``edit`` to the suite file holding ``ac_key``, if it changes it.
+
+    ``edit`` returns None for "nothing to do", which is the common case on
+    both paths (already quarantined / never was), so the file is left
+    untouched rather than rewritten with identical bytes.
+    """
+    path, _line = _locate_ac_test(ac_key, written)
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        new = edit(src)
+        if not new or new == src:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(new)
+    except OSError as exc:
+        logger.warning(
+            "[acceptance] could not %s %s in %s: %s",
+            action, ac_key, path, exc,
+        )
+        return
+    logger.info("[acceptance] %s %s in %s", action, ac_key, path)
 
 
 def _acceptance_diagnostics(

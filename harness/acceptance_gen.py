@@ -1013,6 +1013,128 @@ def splice_integration_scenarios(
     return text.rstrip("\n") + "\n"
 
 
+#: The marker a quarantined criterion's test carries. ``strict=False`` on
+#: purpose: a strict marker surfaces an unexpected pass as a FAILED line and a
+#: non-zero exit, which would make the build red for the one event everybody
+#: wants — the criterion finally being satisfied. The non-strict form reports
+#: XPASS instead, which ``parse_pytest_outcomes`` reads as a real pass, clears
+#: the deferral, and strips this marker. The quarantine is self-clearing
+#: either way; this spelling just does not set fire to the build on its way out.
+_QUARANTINE_MARKER_RE = re.compile(
+    r"^\s*@pytest\.mark\.xfail\(.*?\bteane-quarantine\b.*?\)\s*$",
+)
+_QUARANTINE_TAG = "teane-quarantine"
+
+
+def quarantine_criterion(
+    source: str, ac_key: str, reason: str,
+) -> Optional[str]:
+    """Carry ``ac_key``'s generated test as an expected failure.
+
+    ADR-0006 Phase 1 seals a batch on ``attributable`` failures by design —
+    advisory, so a build is never blocked by acceptance. But it left the
+    failing test LIVE, so the next batch collected it, failed it, and spent
+    its own repair rounds rediscovering a defect already recorded as a
+    deferral: batch 89 burnt 6 empty rounds and 2 resumes on batch 88's
+    ``STORY-004.AC-1``. The defect is still a defect and still recorded; the
+    quarantine only stops the next batch paying for it again.
+
+    Returns the new source, or None when nothing was changed (no such
+    criterion, unparseable, or already quarantined) so the caller can skip
+    a pointless write.
+
+    The marker is tagged ``teane-quarantine`` so
+    :func:`unquarantine_criterion` only ever removes one the harness put
+    there — a hand-written xfail in a generated suite would be a deliberate
+    statement by somebody, and removing it silently is not this function's
+    business.
+    """
+    span = None
+    for fn_name, (key, first, last) in verifies_by_function(source).items():
+        if key == ac_key:
+            span = (fn_name, first, last)
+            break
+    if span is None:
+        return None
+    _fn, first, _last = span
+    lines = source.splitlines()
+    # ``first`` is the 1-indexed ``# @verifies:`` line; the decorator belongs
+    # between it and the def so the marker parser still sees the marker.
+    _def_idx = first  # 0-indexed line of the def (marker is at first - 1)
+    if _def_idx >= len(lines):
+        return None
+    if any(
+        _QUARANTINE_MARKER_RE.match(ln)
+        for ln in lines[max(0, _def_idx - 1):_def_idx + 1]
+    ):
+        return None  # already quarantined — idempotent
+    _indent = re.match(r"\s*", lines[_def_idx]).group(0)
+    _reason = (reason or "parked over the acceptance repair cap").replace(
+        '"', "'"
+    )[:300]
+    lines.insert(_def_idx, (
+        f'{_indent}@pytest.mark.xfail(reason="{_QUARANTINE_TAG}: {_reason}", '
+        f'strict=False)'
+    ))
+    text = "\n".join(lines)
+    if not re.search(r"^import pytest$", text, re.MULTILINE):
+        text = _ensure_pytest_import(text)
+    return text.rstrip("\n") + "\n"
+
+
+def unquarantine_criterion(source: str, ac_key: str) -> Optional[str]:
+    """Remove the harness's quarantine marker from ``ac_key``'s test.
+
+    Called when the criterion passes again. Leaving a stale marker behind
+    would be worse than never adding one: a later regression would be
+    reported XFAIL — "quarantined, not verified" — instead of the
+    attributable failure it is, so the thing the marker exists to prevent
+    would start hiding real defects.
+
+    Returns None when there was nothing to remove.
+    """
+    spans = verifies_by_function(source)
+    if not any(key == ac_key for key, _f, _l in spans.values()):
+        return None
+    lines = source.splitlines()
+    out = []
+    removed = False
+    for idx, ln in enumerate(lines):
+        if _QUARANTINE_MARKER_RE.match(ln):
+            # Only the marker guarding THIS criterion: the next @verifies
+            # above it decides which test it belongs to.
+            _owner = ""
+            for back in range(idx - 1, -1, -1):
+                m = re.match(r"\s*#\s*@verifies:\s*(\S+)", lines[back])
+                if m:
+                    _owner = m.group(1)
+                    break
+                if lines[back].strip().startswith("def "):
+                    break
+            if _owner == ac_key:
+                removed = True
+                continue
+        out.append(ln)
+    if not removed:
+        return None
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _ensure_pytest_import(text: str) -> str:
+    """Add ``import pytest`` after the generated header, if it is missing."""
+    lines = text.splitlines()
+    _at = 0
+    for idx, ln in enumerate(lines[:20]):
+        if ln.startswith(("import ", "from ")):
+            _at = idx
+            break
+        if ln.strip() and not ln.lstrip().startswith("#"):
+            _at = idx
+            break
+    lines.insert(_at, "import pytest")
+    return "\n".join(lines)
+
+
 def render_e2e_spec(story_key: str, scenarios: list[AcceptanceScenario]) -> str:
     """Render e2e scenarios into one Playwright ``.spec.ts`` string.
 

@@ -55,6 +55,11 @@ STATUS_DEFERRED_UI = "deferred:needs-browser"
 # can prove it, and one that tries ends up asserting files exist.
 STATUS_DEFERRED_NOT_RUNTIME = "deferred:not-runtime"
 STATUS_TEST_BUG = "test-bug"
+# A criterion whose test is QUARANTINED — carried as an xfail because an
+# earlier batch parked it over the repair cap. Not verified, and deliberately
+# not a failure either: the point of the quarantine is that the next batch
+# stops paying to rediscover it. See acceptance_gen.quarantine_criterion.
+STATUS_DEFERRED_QUARANTINED = "deferred:quarantined"
 
 # The statuses that mean "not verified, but not this batch's fault" — parked,
 # re-queued, or handed to the post-deploy browser pass.
@@ -71,6 +76,7 @@ STATUS_TEST_BUG = "test-bug"
 _DEFERRED = frozenset({
     STATUS_DEFERRED_DEP, STATUS_DEFERRED_COLLECTION,
     STATUS_DEFERRED_UI, STATUS_DEFERRED_NOT_RUNTIME, STATUS_TEST_BUG,
+    STATUS_DEFERRED_QUARANTINED,
 })
 
 
@@ -103,6 +109,10 @@ class TestOutcome:
     nodeid: str
     passed: bool
     message: str = ""
+    pytest_status: str = ""
+    """Raw pytest outcome (PASSED/FAILED/ERROR/XFAIL/XPASS) when the runner
+    reported one. ``passed`` alone cannot express XFAIL: an expected failure
+    is neither a pass (nothing was verified) nor this batch's failure."""
 
 
 @dataclass
@@ -293,6 +303,14 @@ def run_acceptance(
             continue
         if out.passed:
             ac_outcomes.append(ACOutcome(sc.verifies, STATUS_PASSED, sc.altitude))
+        elif out.pytest_status == "XFAIL":
+            # Quarantined by an earlier batch, still failing. Not verified,
+            # but not this batch's defect to chase either — which is the
+            # whole point of the marker.
+            ac_outcomes.append(ACOutcome(
+                sc.verifies, STATUS_DEFERRED_QUARANTINED, sc.altitude,
+                out.message[:500] or "carried as an expected failure",
+            ))
         else:
             status = classify_acceptance_failure(out.message)
             ac_outcomes.append(ACOutcome(sc.verifies, status, sc.altitude,
@@ -391,14 +409,33 @@ def parse_pytest_outcomes(raw_output: str) -> list[TestOutcome]:
             continue
         seen.add(nodeid)
         status = m.group("status")
-        passed = status in ("PASSED", "XFAIL")  # xfail = expected-fail, not a real failure
         message = (m.group("message") or "").strip()
+        # XFAIL used to count as PASSED here, which made an expected failure
+        # indistinguishable from a verified criterion. That is the worst
+        # possible reading: a quarantined test (see
+        # acceptance_gen.quarantine_criterion) would have sealed its story
+        # ``done`` with nothing verified at all. An xfail is neither a pass
+        # nor this batch's failure — it is carried as its own status.
+        #
+        # XPASS is the reverse: the test RAN and PASSED, so the quarantine
+        # has outlived its cause and the criterion really is satisfied. It
+        # used to fall through as a failure with no matching fingerprint and
+        # end up ``deferred:blocked-by-dependency`` — a genuine pass filed as
+        # blocked. ``strict=True`` markers surface the same event as FAILED
+        # with an ``[XPASS(strict)]`` message, so both spellings are handled.
+        _strict_xpass = status == "FAILED" and "[XPASS(strict)]" in message
+        if _strict_xpass:
+            status = "XPASS"
+        passed = status in ("PASSED", "XPASS")
         if not passed and not message:
             func = nodeid.rsplit("::", 1)[-1].split("[", 1)[0].strip()
             message = detail.get(func, "")
         if status == "ERROR" and not message:
             message = "collection/setup error"
-        outcomes.append(TestOutcome(nodeid=nodeid, passed=passed, message=message))
+        outcomes.append(TestOutcome(
+            nodeid=nodeid, passed=passed, message=message,
+            pytest_status=status,
+        ))
     return outcomes
 
 

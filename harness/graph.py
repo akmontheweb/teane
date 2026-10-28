@@ -12272,6 +12272,93 @@ _TEST_EDIT_RECOMMENDATION_RE = re.compile(
 )
 
 
+#: Failure signatures that PROVE the defect is in production code, so a
+#: recommendation to edit the test cannot be right. Each is a thing the
+#: application did — not a thing the test asserted — so no test edit can
+#: change the underlying fact.
+_CODE_GAP_EVIDENCE: tuple[tuple[Any, str], ...] = (
+    (
+        # Starlette/FastAPI's own 405/404 bodies. The framework emits these
+        # when NO handler is registered for the method/path, so the route
+        # does not exist. A test cannot be wrong about a route the
+        # application never defined. lumina run 11, STORY-008.AC-2:
+        # `AssertionError: {"detail":"Method Not Allowed"}` — PATCH was
+        # simply not implemented, and the judge called it a test defect.
+        re.compile(
+            r'"detail"\s*:\s*"(?:Method Not Allowed|Not Found)"',
+        ),
+        "the framework returned its own default body, so no handler is "
+        "registered for that method/path — the route does not exist yet",
+    ),
+    (
+        # The application SUCCEEDED where the criterion requires rejection.
+        # Editing the test to accept a 2xx would delete the requirement:
+        # lumina run 11, STORY-006.AC-3 asserted 404 for another owner's
+        # record and got 200 with the record, i.e. a data leak. Trading that
+        # test away to go green is the worst outcome the ladder can produce.
+        re.compile(r"\bassert\s+2\d{2}\s*==\s*[45]\d{2}\b"),
+        "the application returned success where the criterion requires "
+        "rejection — accepting that would delete the requirement, not fix it",
+    ),
+    (
+        re.compile(r"\bNotImplementedError\b"),
+        "the production path raised NotImplementedError — it is a stub",
+    ),
+)
+
+
+def _code_gap_evidence(state: AgentState, test_file: str) -> str:
+    """Why ``test_file``'s current failure is a PRODUCTION defect, or ``""``.
+
+    The escape ladder's other rungs are evidence-based: an AST contradiction,
+    a cross-file proof, an unparseable file. The judge's recommendation is the
+    one rung that is prose, matched by regex
+    (:func:`_verdict_demands_test_edit`) and grounded only by "is this file
+    still failing". That is a staleness check, not a correctness one — so a
+    confidently-worded verdict could divert a real code gap into the
+    test-author ladder, where the only tool available is rewriting a test
+    that was already right.
+
+    lumina run 11 died of exactly that. Both terminal blockers were
+    production defects the judge reported as test edits:
+
+      * ``STORY-008.AC-2`` — ``{"detail":"Method Not Allowed"}``: the PATCH
+        endpoint did not exist.
+      * ``STORY-006.AC-3`` — asserted 404 for another owner's record, got 200
+        and the record: an authorization hole. The handler's own docstring
+        promised owner scoping that the code never implemented.
+
+    Regeneration rewrote the tests, correctly, from their criteria — so they
+    kept demanding the right behaviour, kept failing, and charged
+    ``unsatisfiable_test`` until the class cap terminated the run at 4/16
+    with $7 of $10 unspent. Repair, the one component that could have closed
+    either gap, was being diverted away from them.
+
+    So: prose loses to evidence. When the failure carries a signature only
+    the application can be responsible for, the diversion is refused and the
+    round goes to repair instead.
+    """
+    ws = str(state.get("workspace_path", "") or "")
+    target = _normalize_ws_path(test_file, ws)
+    for d in state.get("compiler_errors", []) or []:
+        if not isinstance(d, dict):
+            continue
+        f = _normalize_ws_path(str(d.get("file", "") or ""), ws)
+        if target and f and not (
+            f == target
+            or f.endswith(os.sep + target)
+            or target.endswith(os.sep + f)
+        ):
+            continue
+        blob = " ".join(str(d.get(k) or "") for k in (
+            "message", "semantic_context", "raw",
+        ))
+        for rx, why in _CODE_GAP_EVIDENCE:
+            if rx.search(blob):
+                return why
+    return ""
+
+
 def _verdict_demands_test_edit(verdict: Any) -> str:
     """The test path a reflection verdict says must change, or ``""``.
 
@@ -13559,6 +13646,24 @@ def _build_repair_reflection_prompt(
             "or 'backwards': a numeric summary like [1,2,3] vs [3,2,1] "
             "hides the real sort key (by-name, by-date, nulls-first) and "
             "must never be the basis for calling a test wrong.\n"
+            "  A FRAMEWORK DEFAULT ERROR BODY IS NOT EVIDENCE THE TEST IS "
+            "WRONG. A response body of {\"detail\": \"Method Not Allowed\"} "
+            "or {\"detail\": \"Not Found\"} is what the web framework emits "
+            "when NO handler is registered for that method and path. It "
+            "means the endpoint does not exist yet. The test is describing "
+            "an endpoint that still has to be written — name the router/API "
+            "module in ``impl_file`` and recommend implementing it. "
+            "Recommending a test edit here asks for the requirement to be "
+            "deleted.\n"
+            "  THE APPLICATION SUCCEEDING WHERE THE TEST EXPECTED A "
+            "REJECTION IS NEVER EVIDENCE THE TEST IS WRONG. If the test "
+            "asserts a 4xx and the response was 2xx — especially when the "
+            "body carries data the criterion says must not be returned — "
+            "the application performed an operation it is required to "
+            "refuse. That is a production defect, frequently a security "
+            "one (missing ownership or permission scoping). Editing the "
+            "test to accept the success would remove the only thing "
+            "detecting it. Name the module that should enforce the rule.\n"
             "  The repair loop CANNOT modify test files — they are "
             "tamper-guarded and any edit to them is rejected. NEVER "
             "phrase ``recommendation`` as editing, updating, changing, "
@@ -24770,7 +24875,31 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         _verdict_file = _verdict_demands_test_edit(
             _lc_blocked.get("last_reflection_verdict")
         )
-        if _verdict_file and _file_in_failing_set(state, _verdict_file):
+        _code_gap = (
+            _code_gap_evidence(state, _verdict_file) if _verdict_file else ""
+        )
+        if _code_gap:
+            # Prose loses to evidence. The judge is confident and wrong, and
+            # the ladder's only tool is rewriting a test that is already
+            # right — see _code_gap_evidence for the two run-11 blockers
+            # this describes. Fall through to repair, which can close the gap.
+            logger.warning(
+                "[router] The judge recommends editing %s, but the failure "
+                "evidence says the defect is in PRODUCTION code: %s. Not "
+                "diverting to the test-author ladder — a test edit cannot "
+                "change what the application did. Routing the round to "
+                "repair instead.",
+                _verdict_file, _code_gap,
+            )
+            try:
+                from harness.observability import emit_event as _emit_cg
+                _emit_cg(
+                    "router_test_edit_refused_code_gap",
+                    file=_verdict_file, evidence=_code_gap,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+        elif _verdict_file and _file_in_failing_set(state, _verdict_file):
             _blocked_reason = "the judge's own recommendation is a test edit"
             _blocked_file = _verdict_file
         elif _verdict_file:

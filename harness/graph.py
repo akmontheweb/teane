@@ -3717,6 +3717,44 @@ async def _continue_on_length(
     ):
         return initial_response, initial_budget, accumulated_chunks
 
+    # Refuse continuation when the truncated turn contains NO attempt at all.
+    # Continuation exists so a genuinely large patch set is not lost halfway —
+    # that case must always continue, and does. But a turn with no block and
+    # no tool call is not a half-finished patch, it is deliberation that ran
+    # out of room, and continuing it re-sends the whole argument as context
+    # and asks for more of it. lumina run 13: eight rounds, each ~123,000
+    # characters of "let me reconsider", zero blocks, 303 seconds apiece.
+    # Same reasoning as the json_output gate above: a truncated attempt
+    # degrades gracefully, a re-primed loop does not.
+    if getattr(initial_response, "finish_reason", "stop") == "length":
+        _partial = initial_response.content or ""
+        try:
+            from harness.patcher import parse_patch_blocks, parse_read_blocks
+            _has_attempt = bool(
+                parse_patch_blocks(_partial) or parse_read_blocks(_partial)
+            )
+        except Exception:  # noqa: BLE001 — on a parser fault, continue
+            _has_attempt = True
+        if not _has_attempt and len(_partial) > _DELIBERATION_HEAD_CHARS:
+            logger.warning(
+                "[%s] truncated output is %d chars with NO patch or READ_FILE "
+                "block — the round deliberated without attempting a fix. "
+                "Refusing continuation: there is no half-finished work to "
+                "complete, and re-sending the argument only asks for more of "
+                "it. A truncated turn that DID contain blocks still "
+                "continues.",
+                role_label, len(_partial),
+            )
+            try:
+                from harness.observability import emit_event as _emit_nb
+                _emit_nb(
+                    "continuation_refused_no_attempt",
+                    role=role_label, chars=len(_partial),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+            return initial_response, initial_budget, accumulated_chunks
+
     # ``getattr`` with a "stop" default keeps stub responses in tests
     # (which historically omit finish_reason) on the non-continuation
     # path — only real gateway responses with an explicit "length"
@@ -9377,6 +9415,60 @@ def _format_rewrite_file_noop_directive(rw_noops: dict[str, int]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _trimmed_prior_turn(msg: "MessageDict") -> "MessageDict":
+    """The previous assistant turn, with blockless prose cut to its head.
+
+    The DISTRACTION rebuild replays the last assistant turn so the model can
+    see what it just tried. That is right when the turn CONTAINED an attempt —
+    patch blocks or READ_FILE requests are the work, and the model needs them
+    to avoid repeating itself. It is actively harmful when the turn was pure
+    deliberation: lumina run 13 replayed 121,174 characters of "But wait,
+    let me reconsider" into every subsequent prompt, which both inflated the
+    input (75,616 -> 94,351 tokens across seven rounds) and showed the model
+    that thinking in circles is what happens here.
+
+    A blockless turn's only value is its opening diagnosis, which is what
+    ``_cap_runaway_deliberation`` keeps for the same reason. Beyond that it is
+    the model arguing with itself, and re-sending an argument is how you get
+    more of it.
+
+    Judged by the same ``parse_patch_blocks`` / ``parse_read_blocks`` test the
+    cap uses, so the two cannot disagree about what counts as an attempt.
+    """
+    content = str((msg or {}).get("content", "") or "")
+    if len(content) <= _DELIBERATION_HEAD_CHARS:
+        return msg
+    try:
+        from harness.patcher import parse_patch_blocks, parse_read_blocks
+        if parse_patch_blocks(content) or parse_read_blocks(content):
+            return msg  # real work — replay it whole
+    except Exception:  # noqa: BLE001 — never drop a turn on a parser fault
+        return msg
+    logger.warning(
+        "[repair_node] The previous assistant turn was %d chars of prose with "
+        "no patch or READ_FILE block. Replaying its first %d chars (the "
+        "diagnosis) instead of all of it — re-sending a round of "
+        "deliberation inflates every later prompt and primes the model to "
+        "deliberate again.",
+        len(content), _DELIBERATION_HEAD_CHARS,
+    )
+    try:
+        from harness.observability import emit_event as _emit_trim
+        _emit_trim(
+            "repair_prior_turn_trimmed",
+            chars=len(content), kept=_DELIBERATION_HEAD_CHARS,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    out = dict(msg)
+    out["content"] = (
+        content[:_DELIBERATION_HEAD_CHARS]
+        + "\n\n[... the rest of this turn was deliberation with no patch "
+          "block; dropped by the harness. Emit a patch block this round.]"
+    )
+    return out  # type: ignore[return-value]
+
+
 def _cap_runaway_deliberation(
     response: Any, *, head_chars: int, node_label: str,
 ) -> bool:
@@ -9406,6 +9498,15 @@ def _cap_runaway_deliberation(
     Keeping the head preserves that reasoning for the next round; dropping
     the tail stops it compounding.
     """
+    # Gated on finish_reason DELIBERATELY. I widened this to "any blockless
+    # prose over the threshold" and test_normal_completion_untouched caught
+    # it: repair parses prose SIGNALS out of a normally-completed response —
+    # the UNSATISFIABLE_TEST declaration above all — and truncating at
+    # head_chars would cut a declaration that lands late. A response that
+    # STOPPED said what it meant to say; only one the provider cut off is
+    # unfinished by definition. All eight runaway rounds in lumina run 13
+    # were finish=length, so the widening was speculation against a shape
+    # never observed, traded for a real protection.
     if str(getattr(response, "finish_reason", "") or "") != "length":
         return False
     content = str(getattr(response, "content", "") or "")
@@ -20420,7 +20521,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     continue  # likely a planning blob
                 _focused.append(_m)
             if _last_assistant_msg is not None:
-                _focused.append(_last_assistant_msg)
+                _focused.append(_trimmed_prior_turn(_last_assistant_msg))
             _before = len(messages)
             messages = _focused
             # cache_family scopes drift tracking so the focused-reflection

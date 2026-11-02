@@ -272,6 +272,7 @@
         "empty_content_retries": 2,
         "request_timeout_seconds": 600.0,
         "total_request_timeout_seconds": 1200.0,
+        "repair_tool_choice": "required",
         "stall_watchdog_seconds": 300.0,
         "stall_watchdog_repeat_seconds": 300.0,
         "stall_watchdog_hard_seconds": 600.0,

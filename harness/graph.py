@@ -3349,6 +3349,34 @@ def _resolve_deliberation_head_chars(state_or_cfg: Any) -> int:
     return max(500, min(40000, val))
 
 
+#: Default ``tool_choice`` for repair's native-tool path. Config:
+#: ``llm_dispatch.repair_tool_choice``. "required" compels a tool call so the
+#: model cannot answer in prose instead of a patch; "auto" restores the old
+#: behaviour if a provider ever rejects forcing outright rather than letting
+#: the gateway downgrade it.
+_DEFAULT_REPAIR_TOOL_CHOICE = "required"
+
+
+def _resolve_repair_tool_choice(state: "AgentState") -> str:
+    """Resolve repair's ``tool_choice`` for the native-tool path.
+
+    lumina run 13: eight repair rounds, each ~123,000 characters of prose
+    with ZERO tool calls, 303 seconds and $0.036 apiece, no patch written.
+    The prompts already said "no prose outside blocks" and the model ignored
+    them, so prompt pressure is spent — forcing is the structural answer.
+
+    Safe for this model specifically: the documented conflict is that
+    deepseek-v4-pro 400s when a THINKING request also carries a compelled
+    tool_choice, and repair never asks for thinking (the model is configured
+    ``supports_thinking: false``). ``resolve_tool_choice_for_thinking``
+    downgrades a compelled choice to "auto" rather than raising, so even a
+    provider that refuses forcing degrades instead of failing the round.
+    """
+    cfg = state.get("llm_dispatch_config", {}) or {}
+    val = str(cfg.get("repair_tool_choice", "") or "").strip()
+    return val or _DEFAULT_REPAIR_TOOL_CHOICE
+
+
 def _resolve_max_continuation_cycles(
     state_or_cfg: Any,
 ) -> int:
@@ -4340,6 +4368,7 @@ async def _dispatch_tools_as_dsl(
     state: "AgentState",
     node_label: str,
     model_override: Optional[str] = None,
+    tool_choice: Optional[str] = None,
 ) -> tuple[Any, float]:
     """Dispatch with native tools, and hand back a response in the text DSL.
 
@@ -4365,6 +4394,8 @@ async def _dispatch_tools_as_dsl(
     from harness.tool_schemas import tool_call_to_dsl
 
     extra: dict[str, Any] = {"model_override": model_override} if model_override else {}
+    if tool_choice:
+        extra["tool_choice"] = tool_choice
     local = list(messages)
 
     async def _once(msgs: list["MessageDict"], b: float) -> tuple[Any, float]:
@@ -20870,6 +20901,21 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                     workspace=state.get("workspace_path", os.getcwd()),
                     state=state,
                     node_label="repair_node",
+                    # Compel a tool call. lumina run 13 spent eight rounds
+                    # emitting 123,000 characters of prose with ZERO tool
+                    # calls — 303 seconds and $0.036 apiece, no patch — and
+                    # no amount of "no prose outside blocks" in the prompt
+                    # changed it. With "required" the model cannot answer in
+                    # commentary instead of a patch; structure stops being a
+                    # request. The thinking/forced-choice conflict this model
+                    # has does NOT apply: deepseek-v4-pro is configured
+                    # supports_thinking=false, so repair never asks for
+                    # thinking, and resolve_tool_choice_for_thinking only
+                    # downgrades a compelled choice when thinking is ON. The
+                    # gateway downgrades rather than raises anyway, so a model
+                    # that refuses forcing degrades to "auto" instead of
+                    # failing the round.
+                    tool_choice=_resolve_repair_tool_choice(state),
                     model_override=_override,
                 )
             if _override:

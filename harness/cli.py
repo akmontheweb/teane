@@ -1199,6 +1199,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # what the await was; these dump every thread and asyncio-task stack
         # to ~/.harness/stalls instead. Purely diagnostic — nothing is
         # aborted — so they are set well below the deadline. 0 disables.
+        "repair_tool_choice",
         "stall_watchdog_seconds", "stall_watchdog_repeat_seconds",
         "stall_watchdog_hard_seconds",
     }),
@@ -1589,6 +1590,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.request_timeout_per_role": (dict,),
     "llm_dispatch.total_request_timeout_seconds": (int, float),
     "llm_dispatch.total_request_timeout_per_role": (dict,),
+    "llm_dispatch.repair_tool_choice": (str,),
     "llm_dispatch.stall_watchdog_seconds": (int, float),
     "llm_dispatch.stall_watchdog_repeat_seconds": (int, float),
     "llm_dispatch.stall_watchdog_hard_seconds": (int, float),

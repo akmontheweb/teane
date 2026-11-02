@@ -407,6 +407,7 @@
         "max_seed_rows_per_table": 20,
         "integration_dir": "tests/acceptance",
         "max_repair_rounds_per_batch": 2,
+        "scenario_gen_concurrency": 4,
         "db_path_env": ""
     },
     "decomposition": {

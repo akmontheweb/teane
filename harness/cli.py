@@ -1051,6 +1051,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "scenario_source", "seed_source", "altitudes",
         "max_scenarios_per_story", "max_seed_rows_per_table", "integration_dir",
         "max_repair_rounds_per_batch", "db_path_env",
+        "scenario_gen_concurrency",
     }),
     # ADR-0007 decomposition-quality review. Off by default; advisory unless
     # quality_enforce. Phase-2 auto-remediation keys land with that phase.
@@ -1531,6 +1532,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "acceptance.max_seed_rows_per_table": (int,),
     "acceptance.integration_dir": (str,),
     "acceptance.max_repair_rounds_per_batch": (int,),
+    "acceptance.scenario_gen_concurrency": (int,),
     "acceptance.db_path_env": (str,),
     # ADR-0007 decomposition-quality review.
     "decomposition.quality_review": (bool,),

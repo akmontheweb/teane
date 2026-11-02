@@ -23,6 +23,7 @@ Safety invariants (ADR-0006 + the finsearch-156032347 lesson):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -30,6 +31,12 @@ from typing import Any, Optional
 from harness import acceptance_gen as ag
 from harness import acceptance_run as ar
 from harness import story_state
+
+#: How many per-story scenario-generation dispatches may be in flight at once.
+#: Config: ``acceptance.scenario_gen_concurrency``. Four is a batch's typical
+#: story count, so the common case collapses to one call's latency without
+#: opening an unbounded number of 32k-token requests at one provider.
+_DEFAULT_SCENARIO_GEN_CONCURRENCY = 4
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +393,12 @@ async def _generate_batch_scenarios(
     use_llm = str(cfg.get("scenario_source", "fallback")) == "llm" and gateway is not None
     _skipped_stories = 0
     _skipped_criteria = 0
+
+    # --- Phase 1: assemble the work, sequentially ---------------------------
+    # Context gathering is local file + sqlite reads measured in milliseconds
+    # against a 300-SECOND dispatch, and concurrent sqlite readers on one
+    # connection are a hazard for no gain. So only the dispatch goes wide.
+    _jobs: list[tuple[str, ag.StoryAcceptanceContext]] = []
     for sk in story_keys:
         ctx = ag.gather_story_acceptance_context(
             workspace, sk, stack={"backend": "fastapi"},
@@ -410,16 +423,66 @@ async def _generate_batch_scenarios(
                     "earlier pass — no scenario generation needed.", sk,
                 )
                 continue
-        if use_llm:
-            res = await ag.generate_acceptance_scenarios(
-                ctx, gateway=gateway, budget_remaining_usd=budget, config=cfg,
-                db_isolated=db_isolated, clock_available=clock_available,
+        _jobs.append((sk, ctx))
+
+    # --- Phase 2: dispatch concurrently ------------------------------------
+    # This loop was the single largest cost in the harness. Measured across
+    # lumina runs 11 and 12, the `planning` role was 66% then 72% of ALL LLM
+    # time at ~300s and ~18,000 output tokens per call -- and 96% / 95% of
+    # each run's wall clock was time inside LLM calls. Four stories ran
+    # strictly one after another, so an acceptance pass cost 4 x 300s even
+    # though the per-story contexts share nothing and the results are only
+    # appended. Concurrency turns the pass into roughly one call's latency.
+    #
+    # Bounded by ``scenario_gen_concurrency`` so a wide batch cannot open an
+    # unbounded number of 32k-token requests at one provider.
+    _results: list[Any] = []
+    if _jobs and use_llm:
+        _conc = max(1, int(
+            cfg.get("scenario_gen_concurrency", _DEFAULT_SCENARIO_GEN_CONCURRENCY)
+        ))
+        _sem = asyncio.Semaphore(_conc)
+
+        async def _one(_ctx: ag.StoryAcceptanceContext) -> Any:
+            async with _sem:
+                return await ag.generate_acceptance_scenarios(
+                    _ctx, gateway=gateway, budget_remaining_usd=budget,
+                    config=cfg, db_isolated=db_isolated,
+                    clock_available=clock_available,
+                )
+
+        logger.info(
+            "[acceptance] Generating scenarios for %d story/stories with "
+            "concurrency %d (sequentially this cost ~%d min at ~300s/call).",
+            len(_jobs), _conc, (len(_jobs) * 300) // 60,
+        )
+        # gather preserves INPUT order, so the scenario list — and therefore
+        # the rendered suite — does not depend on which call finished first.
+        _results = await asyncio.gather(
+            *(_one(c) for _sk, c in _jobs), return_exceptions=True,
+        )
+    else:
+        _results = [ag.fallback_acceptance_scenarios(c) for _sk, c in _jobs]
+
+    # --- Phase 3: fold results in a deterministic order --------------------
+    # Budget is summed from per-call DELTAS rather than chained: every
+    # concurrent call is handed the same starting figure, so the remainder one
+    # of them reports is not the remainder after all of them.
+    _spent = 0.0
+    for (sk, _ctx), res in zip(_jobs, _results):
+        if isinstance(res, BaseException):
+            # One story's failure must not cost the batch the others. The
+            # criteria it would have covered simply have no scenario, which
+            # the caller already reports as unverified rather than passed.
+            logger.warning(
+                "[acceptance] scenario generation failed for %s (%s) — "
+                "continuing with the rest of the batch.", sk, res,
             )
-            budget = res.budget_remaining_usd
-        else:
-            res = ag.fallback_acceptance_scenarios(ctx)
+            continue
         all_scen.extend(res.scenarios)
         not_runtime.update(res.not_runtime)
+        _spent += max(0.0, budget - float(res.budget_remaining_usd))
+    budget = max(0.0, budget - _spent)
     if _skipped_criteria or _skipped_stories:
         logger.info(
             "[acceptance] Scenario generation skipped %d already-verified "

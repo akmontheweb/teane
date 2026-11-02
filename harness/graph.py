@@ -12307,6 +12307,70 @@ _CODE_GAP_EVIDENCE: tuple[tuple[Any, str], ...] = (
 )
 
 
+def _unrunnable_blocked_file(state: AgentState, test_file: str) -> str:
+    """Why ``test_file`` cannot EXECUTE, or ``""``.
+
+    The mirror of :func:`_code_gap_evidence`. That one refuses the
+    test-author diversion when the evidence says the defect is in production.
+    This one refuses the REPAIR fallback when the evidence says the failure is
+    in the test harness and repair cannot possibly help — a test that raises
+    at patch or fixture setup never reaches an application frame.
+
+    Two sources, both proof-grade:
+      * the AST, via :func:`test_contradiction.immutable_patch_reason` —
+        CPython refuses ``setattr`` on an immutable built-in type, so
+        ``patch('datetime.date.today')`` can never run on any interpreter;
+      * the failure text, for the same condition observed at runtime, which
+        covers a shape the AST check has not learned yet.
+    """
+    ws = str(state.get("workspace_path", "") or "")
+    _abs = test_file
+    if _abs and not os.path.isabs(_abs) and ws:
+        _abs = os.path.join(ws, test_file)
+    try:
+        with open(_abs, "r", encoding="utf-8") as fh:
+            _src = fh.read()
+    except OSError:
+        _src = ""
+    if _src:
+        try:
+            from harness.test_contradiction import immutable_patch_reason
+            _why = immutable_patch_reason(_src, filename=test_file)
+            if _why:
+                return _why
+        except Exception:  # noqa: BLE001 — never block routing on a prover
+            pass
+    target = _normalize_ws_path(test_file, ws)
+    for d in state.get("compiler_errors", []) or []:
+        if not isinstance(d, dict):
+            continue
+        f = _normalize_ws_path(str(d.get("file", "") or ""), ws)
+        if target and f and not (
+            f == target
+            or f.endswith(os.sep + target)
+            or target.endswith(os.sep + f)
+        ):
+            continue
+        blob = " ".join(str(d.get(k) or "") for k in (
+            "message", "semantic_context", "raw",
+        ))
+        if _IMMUTABLE_SETATTR_RE.search(blob):
+            return (
+                "the failure is a TypeError setting an attribute on an "
+                "immutable type, raised at patch setup before any "
+                "application code ran"
+            )
+    return ""
+
+
+#: ``TypeError: cannot set 'today' attribute of immutable type 'datetime.date'``
+#: — CPython's wording for the one thing no production change can fix.
+_IMMUTABLE_SETATTR_RE = re.compile(
+    r"cannot set '[^']*' attribute of immutable type|"
+    r"can't set attributes of built-in/extension type",
+)
+
+
 def _code_gap_evidence(state: AgentState, test_file: str) -> str:
     """Why ``test_file``'s current failure is a PRODUCTION defect, or ``""``.
 
@@ -24619,12 +24683,64 @@ def _test_regen_exhausted(state: AgentState, path: str) -> bool:
     cfg = state.get("test_regeneration_config", {}) or {}
     if not cfg.get("enabled", False):
         return False
+    _lc = state.get("loop_counter", {}) or {}
     attempts = int(
-        ((state.get("loop_counter", {}) or {})
-         .get("test_regen_attempts", {}) or {})
-        .get(path, 0) or 0
+        (_lc.get("test_regen_attempts", {}) or {}).get(path, 0) or 0
     )
-    return attempts >= int(cfg.get("max_attempts_per_test", 1))
+    _cap = int(cfg.get("max_attempts_per_test", 1))
+    if attempts < _cap:
+        return False
+    # One grace attempt when the file on disk is THIS NODE'S OWN last
+    # emission. An attempt spent before a defect existed cannot be a fair
+    # charge against fixing that defect — and regeneration introducing its
+    # own blocker is not hypothetical: lumina run 12's un-runnable
+    # `patch('datetime.date.today')` was written BY a regeneration, which then
+    # found its budget already gone. Bounded to once per file, like every
+    # other reprieve in this family, so a generator that keeps breaking its
+    # own output still converges.
+    _emitted = _lc.get("test_regen_last_emission") or {}
+    _granted = _lc.get("test_regen_own_output_grace") or {}
+    if (
+        isinstance(_emitted, dict) and isinstance(_granted, dict)
+        and _emitted.get(path) and not _granted.get(path)
+        and _own_emission_on_disk(state, path, str(_emitted.get(path)))
+    ):
+        _granted_mut = dict(_granted)
+        _granted_mut[path] = 1
+        _lc["test_regen_own_output_grace"] = _granted_mut
+        logger.warning(
+            "[router] %s is at its regeneration cap (%d/%d), but the file on "
+            "disk is this node's OWN last emission — granting one grace "
+            "attempt so the author can fix what it wrote. Once per file.",
+            path, attempts, _cap,
+        )
+        try:
+            from harness.observability import emit_event as _emit_grace
+            _emit_grace("test_regen_own_output_grace", file=path)
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
+        return False
+    return True
+
+
+def _own_emission_on_disk(
+    state: AgentState, path: str, expected_md5: str,
+) -> bool:
+    """True when ``path``'s bytes match the regeneration node's last emission."""
+    if not expected_md5:
+        return False
+    ws = str(state.get("workspace_path", "") or "")
+    _abs = path if os.path.isabs(path) else os.path.join(ws, path)
+    try:
+        with open(_abs, "r", encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return False
+    try:
+        from harness.test_regeneration import _content_md5
+        return _content_md5(body) == expected_md5
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _file_in_failing_set(state: AgentState, path: str) -> bool:
@@ -24926,6 +25042,38 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # defect the test is reporting, and its own tripwires (zero_patch_loop,
     # the distraction loop) bound it if it cannot.
     if _blocked_file and _test_regen_exhausted(state, _blocked_file):
+        # ...unless the test cannot RUN. "Let repair fix the production side"
+        # assumes there IS a production side: a test that dies at patch setup
+        # never reaches an application frame, so repair is structurally
+        # powerless and every round it is handed re-declares the same thing.
+        # lumina run 12 looped exactly this way — six HITL charges in nine
+        # minutes on a byte-identical declaration — and the class cap killed a
+        # run holding 13 of 17 criteria verified with nothing attributable.
+        # Quarantine the test instead and let the batch carry on: the defect
+        # stays recorded, and the one thing that was never going to work stops
+        # being retried. See _unrunnable_blocked_file.
+        _unrunnable = _unrunnable_blocked_file(state, _blocked_file)
+        if _unrunnable:
+            logger.warning(
+                "[router] %s names %s, whose regeneration attempts are spent "
+                "— AND the test cannot execute: %s. Repair has no production "
+                "side to fix here, so quarantining the test instead of "
+                "looping. The batch continues; the defect stays recorded.",
+                _blocked_reason.capitalize() or "A blocked remedy",
+                _blocked_file, _unrunnable,
+            )
+            try:
+                from harness.observability import emit_event as _emit_unrun
+                _emit_unrun(
+                    "test_quarantine_unrunnable",
+                    file=_blocked_file, reason=_unrunnable,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+            _ns_q = state.setdefault("node_state", {})
+            _ns_q["quarantine_unrunnable"] = _blocked_file
+            _ns_q["quarantine_unrunnable_reason"] = _unrunnable
+            return "test_regeneration_node"
         logger.warning(
             "[router] %s names %s, whose regeneration attempts are spent — "
             "not diverting again. The test-author ladder has nothing left to "

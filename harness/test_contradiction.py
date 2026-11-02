@@ -494,6 +494,138 @@ def unparseable_reason(source: str, *, filename: str = "") -> Optional[str]:
         return f"test file does not parse ({loc}: {exc.msg})"
 
 
+#: Immutable built-in types. CPython refuses ``setattr`` on these
+#: unconditionally — ``TypeError: cannot set '<attr>' attribute of immutable
+#: type`` — so ``unittest.mock.patch`` against one of their attributes cannot
+#: succeed on any interpreter, under any production code. This is a proof, not
+#: a heuristic.
+_IMMUTABLE_PATCH_TARGETS: tuple[str, ...] = (
+    "datetime.date", "datetime.datetime", "datetime.time",
+    "datetime.timedelta", "datetime.timezone",
+    "builtins.str", "builtins.int", "builtins.float", "builtins.bool",
+    "builtins.bytes", "builtins.tuple", "builtins.frozenset",
+    "builtins.dict", "builtins.list", "builtins.set", "builtins.type",
+    "builtins.object",
+)
+
+#: Both spellings a test may use: ``patch('str.upper')`` and
+#: ``patch('builtins.str.upper')`` are the same impossible call, and matching
+#: only the bare form let the qualified one through (caught by
+#: ``test_the_whole_immutable_family_is_covered``).
+_IMMUTABLE_BARE_TARGETS: tuple[str, ...] = tuple(dict.fromkeys(
+    [t for t in _IMMUTABLE_PATCH_TARGETS]
+    + [
+        t.split(".", 1)[1]
+        for t in _IMMUTABLE_PATCH_TARGETS if t.startswith("builtins.")
+    ]
+))
+
+
+def _patch_target_strings(tree: "ast.AST") -> list[tuple[str, int]]:
+    """``(target, lineno)`` for every ``patch("…")`` / ``patch.object(…)``
+    and ``setattr(X, "…", …)`` in the tree."""
+    out: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = ""
+        if isinstance(fn, ast.Name):
+            name = fn.id
+        elif isinstance(fn, ast.Attribute):
+            name = fn.attr
+        if name in ("patch", "mock_patch") and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                out.append((first.value, getattr(node, "lineno", 0)))
+        elif name == "object" and isinstance(fn, ast.Attribute):
+            # patch.object(datetime.date, "today", ...)
+            base = fn.value
+            if isinstance(base, ast.Name) and base.id in ("patch", "mock"):
+                parts = _dotted(node.args[0]) if node.args else ""
+                attr = (
+                    node.args[1].value
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    else ""
+                )
+                if parts and attr:
+                    out.append((f"{parts}.{attr}", getattr(node, "lineno", 0)))
+        elif name == "setattr" and len(node.args) >= 2:
+            parts = _dotted(node.args[0])
+            attr = (
+                node.args[1].value
+                if isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                else ""
+            )
+            if parts and attr:
+                out.append((f"{parts}.{attr}", getattr(node, "lineno", 0)))
+    return out
+
+
+def _dotted(node: "ast.AST") -> str:
+    """``datetime.date`` for the expression ``datetime.date``, else ``""``."""
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def immutable_patch_reason(
+    source: str, *, filename: str = "",
+) -> Optional[str]:
+    """A one-line reason when ``source`` patches an immutable built-in type.
+
+    Companion to :func:`unparseable_reason`: both answer "this test cannot
+    RUN", as distinct from "this test cannot PASS". A test that fails at patch
+    setup never reaches an application frame, so no production change can
+    affect it -- repair is structurally powerless and the escape ladder is the
+    only thing that can help.
+
+    lumina run 12 ended 0/16 on exactly this. Acceptance regeneration emitted
+    ``patch('datetime.date.today', ...)``; ``datetime.date`` is an immutable C
+    type, so the call raised ``TypeError: cannot set 'today' attribute of
+    immutable type`` before any production code executed. The model's own
+    declaration was correct six times over -- and the router's floor, seeing
+    the regeneration attempts spent, handed the round to repair "which can
+    still fix the production side of the failure". There was no production
+    side. Six HITL charges in nine minutes exhausted the class cap and killed
+    a run that had 13 of 17 criteria verified and nothing attributable left.
+
+    Deterministic: CPython rejects ``setattr`` on these types unconditionally,
+    so this is provable from the AST without running anything.
+    """
+    if filename and not filename.endswith(".py"):
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None  # unparseable_reason owns that case
+    for target, lineno in _patch_target_strings(tree):
+        for bad in _IMMUTABLE_BARE_TARGETS:
+            # ``datetime.date.today`` starts with ``datetime.date``; a bare
+            # ``date.today`` does not match, because a module-level ``date``
+            # reference IS patchable and is the correct fix.
+            if target == bad or target.startswith(bad + "."):
+                where = f"{filename}:{lineno}" if filename else f"line {lineno}"
+                return (
+                    f"test patches `{target}` ({where}), but `{bad}` is an "
+                    "immutable built-in type — CPython raises `TypeError: "
+                    "cannot set attribute of immutable type` at patch setup, "
+                    "before any production code runs. No production change "
+                    "can make this test execute; it must use freezegun, an "
+                    "injectable clock, or patch the module-level reference "
+                    "that imports it."
+                )
+    return None
+
+
 def proven_unsatisfiable_tests(
     source: str, *, filename: str = "",
 ) -> frozenset[str]:
@@ -617,6 +749,12 @@ def machine_unsatisfiable_reason(
     unparse = unparseable_reason(source, filename=filename)
     if unparse is not None:
         return unparse
+    # "Cannot RUN" before "cannot PASS": a test that dies at patch setup never
+    # reaches an assertion, so there is nothing for the contradiction detector
+    # to read and nothing for repair to fix. See immutable_patch_reason.
+    unrunnable = immutable_patch_reason(source, filename=filename)
+    if unrunnable is not None:
+        return unrunnable
     contradictions = find_contradictions(source, filename=filename)
     if contradictions:
         return contradictions[0].describe()

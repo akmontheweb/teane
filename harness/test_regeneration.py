@@ -814,6 +814,115 @@ def _judge_diagnosis(state: dict[str, Any], rel: str) -> str:
     return "\n".join(parts)
 
 
+def _quarantine_unrunnable_test(
+    *, workspace: str, rel: str, reason: str,
+    state: dict[str, Any], loop_counter: dict[str, Any],
+) -> dict[str, Any]:
+    """xfail a test that cannot execute, so the batch stops retrying it.
+
+    lumina run 12 ended 0/16 because there was no such exit. Acceptance
+    regeneration emitted ``patch('datetime.date.today')`` — impossible against
+    an immutable C type — and once the file's two regeneration attempts were
+    spent the router's floor handed each round to repair "which can still fix
+    the production side". There was no production side: the TypeError fires at
+    patch setup, before any application frame. Repair re-declared the same
+    thing six times in nine minutes and the class cap terminated a run that
+    had 13 of 17 criteria verified and nothing attributable left.
+
+    Quarantining keeps the defect recorded (the marker carries the reason, and
+    the acceptance path's XPASS handling clears it if the test ever starts
+    passing) while removing the one thing that was never going to work from
+    the batch's critical path. Marks every failing function in the file, since
+    an un-runnable patch is usually shared by the module's fixtures.
+    """
+    from harness import acceptance_gen as ag
+
+    abs_path = rel if os.path.isabs(rel) else os.path.join(workspace, rel)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except OSError as exc:
+        logger.warning(
+            "[test_regeneration_node] cannot read %s to quarantine it (%s) — "
+            "returning to the compiler.", abs_path, exc,
+        )
+        return {
+            "loop_counter": loop_counter,
+            "node_state": {
+                "current_node": "test_regeneration",
+                "test_regeneration": {
+                    "status": "quarantine_read_failed", "file": rel,
+                },
+            },
+        }
+
+    _why = reason or "the test cannot execute (patch setup fails)"
+    _names = _failing_function_names(state, rel) or list(
+        ag.verifies_by_function(source)
+    )
+    _marked: list[str] = []
+    for _fn in _names:
+        _new = ag.quarantine_function(source, _fn, _why)
+        if _new:
+            source = _new
+            _marked.append(_fn)
+    if _marked:
+        try:
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(source)
+        except OSError as exc:
+            logger.warning(
+                "[test_regeneration_node] could not write the quarantine to "
+                "%s: %s", abs_path, exc,
+            )
+            _marked = []
+    logger.warning(
+        "[test_regeneration_node] QUARANTINED %d un-runnable test(s) in %s "
+        "(%s). No dispatch, no attempt charged — repair cannot fix a failure "
+        "that precedes production code, so the batch proceeds with this test "
+        "carried as an expected failure.",
+        len(_marked), rel, _why[:160],
+    )
+    try:
+        from harness.observability import emit_event as _emit_q
+        _emit_q(
+            "test_regen_quarantined_unrunnable",
+            file=rel, functions=_marked, reason=_why[:300],
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
+    return {
+        "loop_counter": loop_counter,
+        # unsatisfiable_test and the quarantine flags are intentionally
+        # omitted: node_state is replaced wholesale, so they clear and the
+        # recompile is judged on its own merits.
+        "node_state": {
+            "current_node": "test_regeneration",
+            "test_regeneration": {
+                "status": "quarantined_unrunnable",
+                "file": rel, "functions": _marked, "detail": _why[:300],
+            },
+        },
+    }
+
+
+def _failing_function_names(state: dict[str, Any], rel: str) -> list[str]:
+    """Test function names the current diagnostics blame inside ``rel``."""
+    out: list[str] = []
+    for d in state.get("compiler_errors", []) or []:
+        if not isinstance(d, dict):
+            continue
+        nodeid = str(d.get("pytest_nodeid", "") or "")
+        if not nodeid:
+            continue
+        if rel and os.path.basename(rel) not in nodeid:
+            continue
+        fn = nodeid.rsplit("::", 1)[-1].split("[", 1)[0].strip()
+        if fn and fn not in out:
+            out.append(fn)
+    return out
+
+
 async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     """LangGraph node: regenerate one declared-unsatisfiable unit-test file as
     a comprehensive suite for its 1:1-mapped code module, apply gates, write
@@ -830,6 +939,19 @@ async def test_regeneration_node(state: dict[str, Any]) -> dict[str, Any]:
     workspace = str(state.get("workspace_path", "") or "")
     loop_counter = dict(state.get("loop_counter", {}) or {})
     cfg = state.get("test_regeneration_config", {}) or {}
+
+    # The router found a test that cannot EXECUTE and whose regeneration
+    # attempts are spent. Quarantine it and return: no dispatch, no attempt
+    # charged, nothing to author. The router owns the decision (it is a pure
+    # read); this node owns the write, because it is the only test-author in
+    # the graph. See graph._unrunnable_blocked_file.
+    _q_file = str(node_state.get("quarantine_unrunnable", "") or "")
+    if _q_file:
+        return _quarantine_unrunnable_test(
+            workspace=workspace, rel=_q_file,
+            reason=str(node_state.get("quarantine_unrunnable_reason", "") or ""),
+            state=state, loop_counter=loop_counter,
+        )
 
     # Defensive: the router gates entry, but never trust that alone.
     if not rel:

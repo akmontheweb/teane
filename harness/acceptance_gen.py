@@ -356,7 +356,22 @@ _CLOCK_ABSENT_RULE = """\
   a criterion that depends on the date, arrange data RELATIVE to today \
   (e.g. a birthday N days out, computed from `datetime.date.today()`) and \
   keep it inside any window the rules above document. Never hard-code a \
-  month or a fixed date."""
+  month or a fixed date.
+- If the criterion REQUIRES one specific calendar date and cannot be \
+  expressed relative to today — a leap-day (29 February) policy, a \
+  year-boundary rollover, a named month — then with no injectable clock it \
+  cannot be verified in-process at all. Classify it "not-runtime" and say in \
+  "rationale" that it needs a clock injection point or freezegun. That is \
+  the correct answer and it is always available to you.
+- NEVER patch a built-in type to fake the clock. \
+  `patch('datetime.date.today')`, `patch('datetime.datetime.now')` and \
+  `setattr(datetime.date, 'today', ...)` all raise `TypeError: cannot set \
+  attribute of immutable type` at patch setup, before any application code \
+  runs, so the test can never execute and no production change can rescue \
+  it. The harness rejects such a scenario outright. If a module under test \
+  does `from datetime import date`, patching THAT module's `date` name \
+  (`patch('server.app.services.foo.date')`) is legitimate — the \
+  module-level reference is a normal attribute; the C type is not."""
 
 
 def build_system_prompt(*, db_isolated: bool, clock_available: bool = False) -> str:
@@ -789,8 +804,29 @@ def validate_scenarios(
         if reason:
             drop(sc, reason)
             continue
+        # A scenario that cannot RUN is worse than a weak one: it fails at
+        # patch setup before any production code executes, so repair has no
+        # production side to fix and the escape ladder is the only recourse.
+        # Rejecting it here costs nothing and keeps it off disk entirely —
+        # lumina run 12 ended 0/16 because one reached the build. Proof-based
+        # (CPython refuses setattr on these types), so it cannot misfire on a
+        # legitimate module-level patch.
+        unrunnable = _unrunnable_reason(sc)
+        if unrunnable:
+            drop(sc, unrunnable)
+            continue
         kept.append(sc)
     return kept, dropped
+
+
+def _unrunnable_reason(sc: AcceptanceScenario) -> Optional[str]:
+    """Rejection reason when the body cannot execute at all, else None."""
+    from harness.test_contradiction import immutable_patch_reason
+
+    try:
+        return immutable_patch_reason(sc.body or "")
+    except Exception:  # noqa: BLE001 — a prover fault must not drop a scenario
+        return None
 
 
 def _assertion_weakness(sc: AcceptanceScenario) -> Optional[str]:
@@ -1086,22 +1122,35 @@ def quarantine_criterion(
     if span is None:
         return None
     _fn, first, _last = span
+    # ``first`` is the 1-indexed ``# @verifies:`` line, so the 0-indexed def
+    # line is ``first`` — the decorator belongs between the marker and the def
+    # so the marker parser still sees the marker.
+    return _insert_quarantine_marker(
+        source, first,
+        reason or "parked over the acceptance repair cap",
+    )
+
+
+def _insert_quarantine_marker(
+    source: str, def_idx: int, reason: str,
+) -> Optional[str]:
+    """Insert the tagged xfail marker immediately above line ``def_idx``.
+
+    Shared by the criterion-keyed and function-keyed entry points so the
+    marker's spelling, its idempotence check and the ``import pytest``
+    backfill cannot drift between them.
+    """
     lines = source.splitlines()
-    # ``first`` is the 1-indexed ``# @verifies:`` line; the decorator belongs
-    # between it and the def so the marker parser still sees the marker.
-    _def_idx = first  # 0-indexed line of the def (marker is at first - 1)
-    if _def_idx >= len(lines):
+    if def_idx < 0 or def_idx >= len(lines):
         return None
     if any(
         _QUARANTINE_MARKER_RE.match(ln)
-        for ln in lines[max(0, _def_idx - 1):_def_idx + 1]
+        for ln in lines[max(0, def_idx - 1):def_idx + 1]
     ):
         return None  # already quarantined — idempotent
-    _indent = re.match(r"\s*", lines[_def_idx]).group(0)
-    _reason = (reason or "parked over the acceptance repair cap").replace(
-        '"', "'"
-    )[:300]
-    lines.insert(_def_idx, (
+    _indent = re.match(r"\s*", lines[def_idx]).group(0)
+    _reason = (reason or "quarantined by the harness").replace('"', "'")[:300]
+    lines.insert(def_idx, (
         f'{_indent}@pytest.mark.xfail(reason="{_QUARANTINE_TAG}: {_reason}", '
         f'strict=False)'
     ))
@@ -1109,6 +1158,40 @@ def quarantine_criterion(
     if not re.search(r"^import pytest$", text, re.MULTILINE):
         text = _ensure_pytest_import(text)
     return text.rstrip("\n") + "\n"
+
+
+def quarantine_function(
+    source: str, func_name: str, reason: str,
+) -> Optional[str]:
+    """Carry the test function ``func_name`` as an expected failure.
+
+    The function-keyed companion to :func:`quarantine_criterion`, for a test
+    file with no ``# @verifies:`` markers — a unit test. Both paths exist
+    because the router can reach this floor from either altitude: lumina run
+    12's un-runnable test happened to live in an acceptance suite, but
+    ``patch('datetime.date.today')`` is just as impossible in a unit test,
+    and the containment must not depend on which one it is.
+
+    Returns None when the function is absent or already quarantined.
+    """
+    import ast
+
+    if not func_name:
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != func_name:
+            continue
+        first = min(
+            [node.lineno] + [d.lineno for d in node.decorator_list]
+        )
+        return _insert_quarantine_marker(source, first - 1, reason)
+    return None
 
 
 def unquarantine_criterion(source: str, ac_key: str) -> Optional[str]:

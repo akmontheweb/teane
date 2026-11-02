@@ -675,6 +675,10 @@ def test_returns_records_in_directory_order(client):
         ws = self._workspace(tmp_path)
         gw = self._GW(scripted)
         out = await tg._run_spec_consistency_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=gw,
             workspace_path=str(ws),
             generated_tests=["server/tests/test_directory.py"],
@@ -822,6 +826,10 @@ def test_returns_records_in_directory_order(client):
 
         ws = self._workspace(tmp_path)
         await tg._run_spec_consistency_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=_Capture([self.CLEAN_REVIEW]),
             workspace_path=str(ws),
             generated_tests=["server/tests/test_directory.py"],
@@ -846,6 +854,10 @@ def test_returns_records_in_directory_order(client):
 
         ws = self._workspace(tmp_path)
         out = await tg._run_spec_consistency_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=_Broken([]),
             workspace_path=str(ws),
             generated_tests=["server/tests/test_directory.py"],
@@ -868,6 +880,10 @@ def test_returns_records_in_directory_order(client):
         (ws / "web" / "a.spec.ts").write_text("it('x', () => {})\n")
         gw = self._GW([self.REVIEW])
         out = await tg._run_spec_consistency_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=gw,
             workspace_path=str(ws),
             generated_tests=["web/a.spec.ts"],

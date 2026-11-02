@@ -392,6 +392,112 @@ MOVE_FILE_SCHEMA: dict[str, Any] = {
 }
 
 
+# Rung 2 of the escape ladder, as a tool rather than as prose.
+#
+# The repair loop's one model-DECLARED exit is the ``UNSATISFIABLE_TEST:
+# <path> — <reason>`` line (graph._parse_unsatisfiable_test_declaration).
+# Until this schema existed, that line was the ONLY way to take it, and
+# prose is exactly what ``tool_choice="required"`` forbids: compelling a
+# tool call and asking for a prose declaration are mutually exclusive
+# requests, and the model can only satisfy one. Measured on lumina: NINE
+# repair rounds (session 01a19a9c, calls 73-104) declared in pure prose
+# with zero tool calls, so this is a live path, not a theoretical one.
+#
+# With the declaration available as a call, compulsion and declaration
+# stop competing — the model can be required to call SOMETHING and still
+# say "no production change can satisfy this". The fold in
+# ``tool_call_to_dsl`` renders it back to the exact line the existing
+# regex parses, so the offer-set validation, the decline counter and the
+# floor in ``_apply_unsat_offer_floor`` all run unchanged: a call naming
+# a path the banner did not offer escalates nothing, exactly as a prose
+# line naming one does not.
+DECLARE_UNSATISFIABLE_TEST_SCHEMA: dict[str, Any] = {
+    "name": "declare_unsatisfiable_test",
+    "description": (
+        "Declare that a tamper-guarded test file encodes an expectation "
+        "NO production-code change can ever satisfy, so the harness hands "
+        "it to test regeneration instead of burning more repair rounds. "
+        "This is the ONLY sanctioned way to report a defective test — "
+        "never work around one by changing production behaviour the "
+        "specification requires. Call it ONLY when the harness has "
+        "offered the escape for this file in a PROTECTED TEST LOCATION "
+        "message this round, and ONLY after you have satisfied yourself "
+        "that no production change works; a call naming any other file is "
+        "ignored. Make no patch calls in the same turn — a turn that also "
+        "patches is treated as a patch attempt, not a declaration."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": (
+                    "Workspace-relative path of the defective test file, "
+                    "exactly as the PROTECTED TEST LOCATION message named "
+                    "it."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "One sentence, on a single line: why no production "
+                    "change can satisfy this test. Name the impossible "
+                    "expectation concretely (e.g. 'asserts SQLite WAL "
+                    "journal mode on an in-memory connection, which "
+                    "cannot support WAL')."
+                ),
+            },
+        },
+        "required": ["file_path", "reason"],
+    },
+}
+
+# Repair's second prose-only channel, for the same reason.
+#
+# ``<<<PROMOTE_DEFERRED>>>`` (patcher._PROMOTE_DEFERRED_PATTERN) is how the
+# model overrides the diagnostic formatter's cascade ranking. Like the
+# declaration above it lives in message TEXT, so a compelled tool call can
+# suppress it; unlike the declaration, losing it degrades prioritisation
+# rather than deadlocking the loop. Included anyway: the defect is
+# "model-to-harness signals depend on prose surviving", and leaving one of
+# the two behind would mean fixing the symptom twice.
+PROMOTE_DEFERRED_SCHEMA: dict[str, Any] = {
+    "name": "promote_deferred_diagnostics",
+    "description": (
+        "Override the harness's diagnostic prioritisation for the NEXT "
+        "repair iteration. When the error you believe is the root cause "
+        "was pushed into the 'for awareness' tail instead of the top-N "
+        "set, name its error code(s) here and the next iteration will "
+        "give them full semantic context. Use it when you disagree with "
+        "the harness's ranking — not to ask for more context in general."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "codes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "Error codes to promote, exactly as the diagnostics "
+                    "spell them (e.g. [\"TS2769\", \"F401\"])."
+                ),
+            },
+        },
+        "required": ["codes"],
+    },
+}
+
+#: Tools offered to ``repair_node`` ON TOP of :data:`PATCH_TOOLS`. Repair
+#: alone, deliberately: patching has no protected-test blocker to escape
+#: from and no deferred-diagnostic tail to reorder, and a tool offered
+#: where it cannot apply is a way to skip work.
+REPAIR_ESCAPE_TOOLS: list[dict[str, Any]] = [
+    DECLARE_UNSATISFIABLE_TEST_SCHEMA,
+    PROMOTE_DEFERRED_SCHEMA,
+]
+
+
 # What the MODEL is offered, in canonical order — some providers
 # (notably Anthropic) preserve it in their UI surfaces, so the most-used
 # tools come first.
@@ -894,7 +1000,7 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
 
 
 def tool_call_to_dsl(call: dict[str, Any]) -> Optional[str]:
-    """Render one patch or ``read_file`` tool call as the harness's text DSL.
+    """Render one patch, ``read_file`` or declaration call as the text DSL.
 
     For a node whose pipeline is built on the DSL (repair) but which is
     dispatched with native tools: the call becomes exactly the block the
@@ -905,6 +1011,50 @@ def tool_call_to_dsl(call: dict[str, Any]) -> Optional[str]:
     """
     from harness.patcher import render_patch_block
 
+    if call.get("name") == "declare_unsatisfiable_test":
+        args = call.get("input") or {}
+        if not isinstance(args, dict):
+            return None
+        path = str(args.get("file_path") or "").strip().strip("`'\"")
+        # The parser's path group is ``\S*``, so a path carrying whitespace
+        # would be truncated mid-token and the remainder would be read as
+        # the reason — a half-parsed declaration naming a file that is not
+        # the one the model meant. Refuse instead: a dropped call costs a
+        # round, a mis-parsed one can quarantine the wrong test.
+        if not path or any(ch.isspace() for ch in path):
+            return None
+        # Leading '-', ':' or a dash would be eaten by the separator
+        # alternation and leave the path group empty.
+        if path[0] in "-:—–":
+            return None
+        reason = " ".join(str(args.get("reason") or "").split())
+        return (
+            f"UNSATISFIABLE_TEST: {path} — {reason}" if reason
+            else f"UNSATISFIABLE_TEST: {path}"
+        )
+    if call.get("name") == "promote_deferred_diagnostics":
+        args = call.get("input") or {}
+        if not isinstance(args, dict):
+            return None
+        raw = args.get("codes")
+        # A single string is the predictable mis-call; accept it rather
+        # than drop the signal over the model's choice of container.
+        items = [raw] if isinstance(raw, str) else (raw or [])
+        if not isinstance(items, (list, tuple)):
+            return None
+        codes = [
+            c for c in (
+                " ".join(str(i).split()).strip().strip(",")
+                for i in items
+            ) if c
+        ]
+        if not codes:
+            return None
+        return (
+            "<<<PROMOTE_DEFERRED>>>\n"
+            f"codes: {', '.join(codes)}\n"
+            "<<<END_PROMOTE_DEFERRED>>>"
+        )
     if call.get("name") == "read_file":
         args = call.get("input") or {}
         path = str(args.get("file_path") or "").strip() if isinstance(args, dict) else ""

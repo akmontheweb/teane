@@ -496,10 +496,16 @@ def strip_read_blocks(llm_output: str) -> str:
 # patch operation, the harness consumes it inline and acts on it during
 # prompt assembly. The model knows when it disagrees with the harness's
 # prioritisation; this is how it says so.
+# Both spellings of the opener. ``PROMOTE_DEFERRED`` is the canonical DSL
+# marker; ``PROMOTE_DEFERRED_DIAGNOSTICS`` is the NATIVE TOOL name
+# (tool_schemas.PROMOTE_DEFERRED_SCHEMA), and a model told to call that tool
+# may well write it as text instead — the EDIT_FILE divergence cost a whole
+# resume for exactly that reason. Understanding what the model meant beats
+# dropping a prioritisation directive.
 _PROMOTE_DEFERRED_PATTERN = re.compile(
-    r'<<<PROMOTE_DEFERRED>>>\s*\n'
+    r'<<<PROMOTE_DEFERRED(?:_DIAGNOSTICS)?>>>\s*\n'
     r'codes:\s*(?P<codes>[^\n]+)\s*\n'
-    r'<<<END_PROMOTE_DEFERRED>>>',
+    r'<<<END_PROMOTE_DEFERRED(?:_DIAGNOSTICS)?>>>',
     re.DOTALL,
 )
 
@@ -701,6 +707,12 @@ _PARSE_MISS_MARKERS: tuple[str, ...] = (
 _CONTROL_MARKERS: frozenset[str] = frozenset({
     "READ_FILE",
     "PROMOTE_DEFERRED",
+    # The native tool names for the same two control channels. A model told
+    # to CALL a tool sometimes writes its name as text instead, and telling
+    # it "nothing was applied, re-emit as a patch block" would be advising
+    # it to rewrite a declaration as an edit.
+    "PROMOTE_DEFERRED_DIAGNOSTICS",
+    "DECLARE_UNSATISFIABLE_TEST",
 })
 
 # Any ``<<<WORD>>>`` opener at all. An UNKNOWN marker used to make

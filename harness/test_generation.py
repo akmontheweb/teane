@@ -42,6 +42,65 @@ from typing import Any, Optional, cast, TYPE_CHECKING
 
 from harness.test_contradiction import find_contradictions_across
 
+
+async def _dispatch_test_author(
+    *,
+    gateway: Any,
+    messages: list[dict[str, Any]],
+    budget: float,
+    cache_family: str,
+    state: Optional[dict[str, Any]],
+    workspace_path: str,
+) -> tuple[Any, float]:
+    """Dispatch a test-authoring call in the dialect the prompt teaches.
+
+    Test authoring inherits ``state["messages"]``, whose message 0 is the
+    shared system prompt — so when the run is in native tool-use mode its
+    prompt says "Native tool-use is ENABLED. Emit every change by CALLING a
+    tool. Never write tool syntax as text", and every one of these call
+    sites then dispatched with no ``tools`` array at all. The model had to
+    disobey its instructions to accomplish anything, and the only reason
+    this never showed up as a defect is that it guessed the right dialect
+    every measured time. ``graph._dispatch_tools_as_dsl``'s docstring is a
+    list of the occasions it guessed wrong elsewhere.
+
+    So: ask the one predicate the prompt itself asks, and supply tools when
+    the answer is yes. ``resolve_reads=True`` because this node has no
+    READ_FILE cycle of its own — a read nobody answers would spend the
+    round. The response comes back with its tool calls already folded into
+    ``content`` as DSL, which is exactly what ``process_llm_patch_output``
+    at every call site already consumes, so nothing downstream changes.
+    """
+    from harness.gateway import NodeRole
+    from harness.graph import (
+        _dispatch_tools_as_dsl,
+        _patch_tools_for_state,
+        _prompt_teaches_native_tools,
+        _resolve_test_authoring_tool_choice,
+    )
+
+    _st = state or {}
+    if not _prompt_teaches_native_tools(_st.get("harness_config") or {}):
+        return await gateway.dispatch(
+            messages=list(messages),
+            role=NodeRole.PATCHING,
+            cache_family=cache_family,
+            budget_remaining_usd=budget,
+        )
+    return await _dispatch_tools_as_dsl(
+        gateway=gateway,
+        messages=messages,
+        budget=budget,
+        role=NodeRole.PATCHING,
+        cache_family=cache_family,
+        tools=_patch_tools_for_state(_st),
+        workspace=workspace_path,
+        state=_st,
+        node_label="test_generation_node",
+        tool_choice=_resolve_test_authoring_tool_choice(_st),
+        resolve_reads=True,
+    )
+
 if TYPE_CHECKING:
     from harness.graph import AgentState
 
@@ -2409,6 +2468,7 @@ async def _run_pre_repair_triage_gate(
 async def _run_contradiction_gate(
     *,
     gateway: Any,
+    state: Optional[dict[str, Any]],
     workspace_path: str,
     generated_tests: list[str],
     messages: list[dict[str, Any]],
@@ -2440,7 +2500,6 @@ async def _run_contradiction_gate(
     ``token_tracker``, the re-prompts spent, and every file a re-prompt
     actually wrote so the caller can fold them into its modified-files list.
     """
-    from harness.gateway import NodeRole
     from harness.patcher import process_llm_patch_output
 
     contra_cap = int(cfg.get("max_contradiction_reprompts", 2))
@@ -2506,11 +2565,13 @@ async def _run_contradiction_gate(
             ),
         })
         try:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.PATCHING,
+            response, new_budget = await _dispatch_test_author(
+                gateway=gateway,
+                messages=messages,
+                budget=budget,
                 cache_family='patching:test_contradiction_reprompt',
-                budget_remaining_usd=budget,
+                state=state,
+                workspace_path=workspace_path,
             )
         except RuntimeError as exc:
             logger.warning(
@@ -2567,6 +2628,7 @@ async def _run_contradiction_gate(
 async def _run_spec_consistency_gate(
     *,
     gateway: Any,
+    state: Optional[dict[str, Any]],
     workspace_path: str,
     generated_tests: list[str],
     messages: list[dict[str, Any]],
@@ -2611,7 +2673,6 @@ async def _run_spec_consistency_gate(
     #
     # So ask the question an AST cannot, while the author is still here and
     # the fix is still cheap. Review + remediate on the ADR-0007 pattern.
-    from harness.gateway import NodeRole
     from harness.patcher import process_llm_patch_output
 
     _sc_cfg = cfg.get("spec_consistency_review", True)
@@ -2694,11 +2755,13 @@ async def _run_spec_consistency_gate(
         )
         messages.append(_sc_remediation(_sc_act))
         try:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.PATCHING,
+            response, new_budget = await _dispatch_test_author(
+                gateway=gateway,
+                messages=messages,
+                budget=budget,
                 cache_family='patching:test_spec_review_reprompt',
-                budget_remaining_usd=budget,
+                state=state,
+                workspace_path=workspace_path,
             )
         except RuntimeError as exc:
             logger.warning(
@@ -3017,7 +3080,6 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # --- Build the LLM prompt ---
-    from harness.gateway import NodeRole
     from harness.patcher import process_llm_patch_output
 
     test_guides_dir = os.path.join(os.path.dirname(__file__), "test_guides")
@@ -3233,11 +3295,13 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     response = None
     while True:
         try:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.PATCHING,
+            response, new_budget = await _dispatch_test_author(
+                gateway=gateway,
+                messages=messages,
+                budget=budget,
                 cache_family='patching:test_authoring',
-                budget_remaining_usd=budget,
+                state=state,
+                workspace_path=workspace_path,
             )
         except RuntimeError as exc:
             logger.warning("[test_generation_node] Gateway refused: %s", exc)
@@ -3539,6 +3603,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # AUTHOR rather than routing to repair.
     _cg_out = await _run_contradiction_gate(
         gateway=gateway,
+        state=state,
         workspace_path=workspace_path,
         generated_tests=generated_tests,
         messages=messages,
@@ -3560,6 +3625,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # _run_spec_consistency_gate for why it exists at all.
     _sc_out = await _run_spec_consistency_gate(
         gateway=gateway,
+        state=state,
         workspace_path=workspace_path,
         generated_tests=generated_tests,
         messages=messages,

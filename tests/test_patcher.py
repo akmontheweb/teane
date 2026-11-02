@@ -59,20 +59,48 @@ class TestEditFileAliasAndUnknownMarkers:
     def test_every_other_tool_name_already_matches_its_marker(self):
         """If a second divergence is ever introduced, this fails loudly."""
         from harness import tool_schemas
-        from harness.patcher import _DSL_MARKER_ALIASES, _PARSE_MISS_MARKERS
+        from harness.patcher import (
+            _CONTROL_MARKERS, _DSL_MARKER_ALIASES, _PARSE_MISS_MARKERS,
+        )
         import re as _re
         names = set(
             _re.findall(r'"name": "([a-z_]+)"', open(tool_schemas.__file__).read())
         )
+        # ``submit_decomposition`` has no text form at all — planning parses
+        # JSON, not blocks. Every other tool name must be recognised
+        # somewhere: as a patch marker, as an alias for one, or as a control
+        # marker the harness consumes inline (``read_file`` is the original
+        # of that kind; the two repair declarations joined it when they
+        # became tools).
         patch_ops = {
-            n.upper() for n in names
-            if n not in ("read_file", "submit_decomposition")
+            n.upper() for n in names if n not in ("submit_decomposition",)
         }
         for op in patch_ops:
-            assert op in _PARSE_MISS_MARKERS or op in _DSL_MARKER_ALIASES, (
-                f"tool '{op.lower()}' has no DSL marker and no alias — a model "
-                "using that name in text form would be silently dropped"
+            assert (
+                op in _PARSE_MISS_MARKERS
+                or op in _DSL_MARKER_ALIASES
+                or op in _CONTROL_MARKERS
+            ), (
+                f"tool '{op.lower()}' has no DSL marker, alias or control "
+                "entry — a model using that name in text form would be "
+                "silently dropped"
             )
+
+    def test_the_native_promote_tool_name_is_parsed_as_a_block(self):
+        """A model told to call ``promote_deferred_diagnostics`` may write
+        the name as text instead. Dropping it would silently discard a
+        prioritisation directive — the EDIT_FILE divergence again."""
+        from harness.patcher import parse_promote_deferred_blocks
+        assert parse_promote_deferred_blocks(
+            "<<<PROMOTE_DEFERRED_DIAGNOSTICS>>>\ncodes: TS2769, F401\n"
+            "<<<END_PROMOTE_DEFERRED_DIAGNOSTICS>>>"
+        ) == ["TS2769", "F401"]
+
+    def test_the_canonical_promote_marker_still_parses(self):
+        from harness.patcher import parse_promote_deferred_blocks
+        assert parse_promote_deferred_blocks(
+            "<<<PROMOTE_DEFERRED>>>\ncodes: TS2353\n<<<END_PROMOTE_DEFERRED>>>"
+        ) == ["TS2353"]
 
     def test_unknown_marker_is_reported_not_swallowed(self):
         from harness.patcher import summarize_parse_miss

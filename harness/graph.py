@@ -2003,6 +2003,32 @@ def _change_roles_can_call_tools(config: Optional[dict[str, Any]]) -> bool:
         return True
 
 
+def _prompt_teaches_native_tools(config: Optional[dict[str, Any]]) -> bool:
+    """Does the shared system prompt teach TOOL CALLS rather than the DSL?
+
+    The one predicate for that question, because there used to be two and
+    they disagreed. ``_build_patch_interface_block`` decided the dialect
+    from the config; each node decided whether to SUPPLY tools on its own.
+    ``test_generation_node`` inherits ``state["messages"]`` — msg 0 is this
+    very prompt — and dispatched with no ``tools`` at all, so its prompt
+    said "Native tool-use is ENABLED. Emit every change by CALLING a tool.
+    Never write tool syntax as text" (five times over, counting the
+    patching turns replayed in its history) while the only thing that
+    could possibly work was writing tool syntax as text.
+
+    It got away with it — every measured test-authoring round emitted
+    correct ``<<<CREATE_FILE>>>`` DSL — but on the model guessing against
+    its own instructions, which is exactly the contradiction
+    ``_dispatch_tools_as_dsl`` blames for runs 5 and 14's Anthropic-XML
+    emissions and lumina-run24's five lost rounds. A node asking this
+    function cannot drift from the prompt, because the prompt asks it too.
+    """
+    uses_tools = bool(
+        (config or {}).get("patcher", {}).get("use_structured_tools", True)
+    )
+    return uses_tools and _change_roles_can_call_tools(config)
+
+
 def _build_patch_interface_block(
     uses_tools: bool, config: Optional[dict[str, Any]] = None,
 ) -> str:
@@ -3377,6 +3403,27 @@ def _resolve_repair_tool_choice(state: "AgentState") -> str:
     return val or _DEFAULT_REPAIR_TOOL_CHOICE
 
 
+#: Default ``tool_choice`` for test authoring's native-tool path. Config:
+#: ``llm_dispatch.test_authoring_tool_choice``.
+#:
+#: ``"auto"``, NOT ``"required"``, and the asymmetry with repair is
+#: deliberate. Repair's prose rounds were the pathology — eight rounds,
+#: 123,000 characters, zero patches. Test authoring's were not: every
+#: measured zero-tool-call round emitted a correct ``<<<CREATE_FILE>>>``
+#: payload, and the rounds that carried no payload at all were terminal
+#: wrap-ups after the files had already landed. Compelling a call on a
+#: wrap-up turn buys a gratuitous write. The key exists so an operator can
+#: compel it if commentary ever does show up here.
+_DEFAULT_TEST_AUTHORING_TOOL_CHOICE = "auto"
+
+
+def _resolve_test_authoring_tool_choice(state: "AgentState") -> str:
+    """Resolve test authoring's ``tool_choice`` for the native-tool path."""
+    cfg = (state or {}).get("llm_dispatch_config", {}) or {}
+    val = str(cfg.get("test_authoring_tool_choice", "") or "").strip()
+    return val or _DEFAULT_TEST_AUTHORING_TOOL_CHOICE
+
+
 def _resolve_max_continuation_cycles(
     state_or_cfg: Any,
 ) -> int:
@@ -4078,6 +4125,34 @@ def _patch_tools_for_state(state: "AgentState") -> list[dict[str, Any]]:
     return list(PATCH_TOOLS) + list(RETRIEVAL_TOOLS)
 
 
+def _repair_tools_for_state(state: "AgentState") -> list[dict[str, Any]]:
+    """:func:`_patch_tools_for_state` plus repair's declared-dead-end escape.
+
+    ``declare_unsatisfiable_test`` is rung 2 of the escape ladder, which was
+    reachable ONLY as a prose line until now — and prose is what
+    ``tool_choice="required"`` forbids, so compelling a tool call and
+    accepting a prose declaration were mutually exclusive. Nine repair
+    rounds on lumina took that exit in prose with zero tool calls (session
+    01a19a9c), so the collision was live rather than theoretical.
+
+    Offered on EVERY repair round, not only the rounds the banner makes the
+    offer. Two reasons, and the first is the load-bearing one: honouring is
+    already gated downstream — the declared path must appear in
+    ``_unsat_offer_files`` and no real patch may have landed — so an
+    unoffered call escalates nothing, exactly as an unoffered prose line
+    escalates nothing. The second is that a tools array that changed shape
+    between rounds would move the cached prefix every time the offer
+    flipped.
+
+    Patching deliberately does NOT get it: there is no protected-test
+    blocker to escape from in prod generation, and an escape offered where
+    it cannot apply is a way to skip work.
+    """
+    from harness.tool_schemas import REPAIR_ESCAPE_TOOLS
+
+    return _patch_tools_for_state(state) + list(REPAIR_ESCAPE_TOOLS)
+
+
 async def _patching_tool_loop(
     *,
     gateway: Any,
@@ -4369,6 +4444,7 @@ async def _dispatch_tools_as_dsl(
     node_label: str,
     model_override: Optional[str] = None,
     tool_choice: Optional[str] = None,
+    resolve_reads: bool = False,
 ) -> tuple[Any, float]:
     """Dispatch with native tools, and hand back a response in the text DSL.
 
@@ -4389,6 +4465,15 @@ async def _dispatch_tools_as_dsl(
     would have written in text mode and appended to ``content``; the
     response leaves with no tool calls, so nothing downstream, and no later
     dispatch, carries a tool_use id it must answer.
+
+    ``resolve_reads`` decides who answers a ``read_file`` call. Repair
+    leaves it False because its own READ_FILE cycle consumes the rendered
+    block and re-dispatches with the bytes. A caller whose pipeline has no
+    such cycle — ``test_generation_node`` — passes True, and reads are
+    resolved here alongside the retrieval calls. Without that, a read would
+    be rendered as a ``<<<READ_FILE>>>`` block into content, the caller's
+    patch parser would find no patches in it, and the round would be spent
+    on a request nobody answered.
     """
     from harness.retrieval_tools import RETRIEVAL_TOOL_NAMES, resolve_retrieval_call
     from harness.tool_schemas import tool_call_to_dsl
@@ -4397,6 +4482,16 @@ async def _dispatch_tools_as_dsl(
     if tool_choice:
         extra["tool_choice"] = tool_choice
     local = list(messages)
+    # Calls this function answers itself and continues on, as opposed to
+    # the ones it renders into the DSL for the caller.
+    _nav_names = set(RETRIEVAL_TOOL_NAMES) | (
+        {"read_file"} if resolve_reads else set()
+    )
+
+    async def _resolve_nav(c: dict[str, Any]) -> str:
+        if c.get("name") == "read_file":
+            return _resolve_read_file_call(c, workspace)
+        return await resolve_retrieval_call(c, workspace, config=retrieval_cfg)
 
     async def _once(msgs: list["MessageDict"], b: float) -> tuple[Any, float]:
         return await gateway.dispatch(
@@ -4411,10 +4506,10 @@ async def _dispatch_tools_as_dsl(
     rounds = 0
     while rounds < cap:
         calls = getattr(response, "tool_calls", None) or []
-        searches = [c for c in calls if c.get("name") in RETRIEVAL_TOOL_NAMES]
-        # Only a pure-search turn is resolved here. A turn that also edits or
-        # reads goes to the DSL now; its searches are dropped below, since
-        # the edit is what the round is for.
+        searches = [c for c in calls if c.get("name") in _nav_names]
+        # Only a pure-navigation turn is resolved here. A turn that also
+        # edits goes to the DSL now; its navigation calls are dropped below,
+        # since the edit is what the round is for.
         if not searches or len(searches) < len(calls):
             break
         rounds += 1
@@ -4423,9 +4518,7 @@ async def _dispatch_tools_as_dsl(
             {
                 "type": "tool_result",
                 "tool_use_id": c.get("id") or "",
-                "content": await resolve_retrieval_call(
-                    c, workspace, config=retrieval_cfg,
-                ),
+                "content": await _resolve_nav(c),
             }
             for c in searches
         ]))
@@ -7889,6 +7982,34 @@ _UNSAT_TEST_DECL_RE = re.compile(
     r"(?:[ \t]*(?:—|–|-{1,2}|:)[ \t]*(?P<reason>\S.*?))?[ \t]*$",
     re.MULTILINE,
 )
+
+
+def _unsat_escape_directive(native_tools: bool) -> str:
+    """How to TAKE the declared-dead-end escape, in the dialect this round
+    actually offers.
+
+    Both PROTECTED TEST LOCATION banners used to say "emit ZERO patch
+    blocks and exactly one line of the form: UNSATISFIABLE_TEST: …". Under
+    ``tool_choice="required"`` that instruction is unsatisfiable by
+    construction — the model is compelled to call a tool and simultaneously
+    told to answer in prose — so the banner would be asking for the one
+    thing the wire forbids. In native mode it names the tool instead.
+
+    The DSL wording is kept verbatim for the text path: a provider that
+    cannot call tools still reaches this banner, and that path was working.
+    """
+    if native_tools:
+        return (
+            "make NO patch calls at all this turn and call "
+            "`declare_unsatisfiable_test` instead, passing the "
+            "workspace-relative test path and one sentence saying why no "
+            "production change can satisfy it.\n"
+        )
+    return (
+        "emit ZERO patch blocks and exactly one line of the form:\n"
+        "UNSATISFIABLE_TEST: <workspace-relative test path> — <one "
+        "sentence: why no production change can satisfy it>\n"
+    )
 
 
 _EVIDENCE_IMPORT_RE = re.compile(
@@ -20377,12 +20498,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "production-code change can EVER satisfy the "
                         "assertion (it encodes an impossible expectation, "
                         "e.g. asserting SQLite WAL journal mode on an "
-                        "in-memory connection), emit ZERO patch blocks and "
-                        "exactly one line of the form:\n"
-                        "UNSATISFIABLE_TEST: <workspace-relative test "
-                        "path> — <one sentence: why no production change "
-                        "can satisfy it>\n"
-                        "The harness will stop the repair loop and hand "
+                        "in-memory connection), "
+                        + _unsat_escape_directive(_repair_use_tools)
+                        + "The harness will stop the repair loop and hand "
                         "the defective test to a human instead of burning "
                         "further rounds."
                     )
@@ -20745,12 +20863,8 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "(the test encodes an impossible or self-"
                         "contradictory expectation, asserts on state it "
                         "never set up, or counts artifacts it does not own), "
-                        "emit ZERO patch blocks and exactly one line of the "
-                        "form:\n"
-                        "UNSATISFIABLE_TEST: <workspace-relative test path> "
-                        "— <one sentence: why no production change can "
-                        "satisfy it>\n"
-                        "That declaration hands the test to regeneration. It "
+                        + _unsat_escape_directive(_repair_use_tools)
+                        + "That declaration hands the test to regeneration. It "
                         "is the ONLY sanctioned way to report a defective "
                         "test — do not work around one by changing "
                         "production behaviour the specification requires."
@@ -20775,9 +20889,11 @@ tool syntax, as text.
 iteration, after which further reads are dropped and you must patch with
 what you have. Read only files you have not been shown.
 
-The only things that belong in your message text are the declarations
-this prompt asks for by name — an `UNSATISFIABLE_TEST: …` line or a
-`<<<PROMOTE_DEFERRED>>>` block — no explanation, no plan.
+Everything you need to tell the harness is a tool, not text. To report a
+protected test no production change can satisfy, call
+`declare_unsatisfiable_test`; to override the diagnostic ranking, call
+`promote_deferred_diagnostics`. Nothing belongs in your message text — no
+declaration lines, no explanation, no plan.
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Make your fix NOW."""
@@ -20897,7 +21013,7 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                     budget=cur_budget,
                     role=NodeRole.REPAIR,
                     cache_family=_repair_cache_family,
-                    tools=_patch_tools_for_state(state),
+                    tools=_repair_tools_for_state(state),
                     workspace=state.get("workspace_path", os.getcwd()),
                     state=state,
                     node_label="repair_node",

@@ -284,6 +284,10 @@ class TestTheContradictionGateActuallyRuns:
         ws = self._workspace(tmp_path)
         gw = _GW(scripted)
         out = await tg._run_contradiction_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=gw,
             workspace_path=str(ws),
             generated_tests=(
@@ -406,6 +410,10 @@ class TestTheContradictionGateActuallyRuns:
 
         ws = self._workspace(tmp_path)
         out = await tg._run_contradiction_gate(
+            # DSL mode: these fakes answer in text blocks and their
+            # gateway stubs take no tools array. The native-tool path is
+            # covered in tests/test_test_authoring_dialect.py.
+            state={"harness_config": {"patcher": {"use_structured_tools": False}}},
             gateway=_Refuses([]),
             workspace_path=str(ws),
             generated_tests=[SCHEMAS_REL, SERVICE_REL],

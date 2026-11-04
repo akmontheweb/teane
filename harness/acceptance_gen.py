@@ -599,7 +599,9 @@ async def generate_acceptance_scenarios(
         budget_remaining_usd=new_budget,
         dropped=dropped,
         source="llm",
-        not_runtime=_not_runtime_acs(data, ctx),
+        not_runtime=_not_runtime_acs(
+            data, ctx, clock_available=clock_available,
+        ),
     )
 
 
@@ -636,13 +638,25 @@ _NOT_RUNTIME_EVIDENCE = re.compile(
 )
 
 
+#: A rationale blaming a missing clock. Checked only when discovery proved a
+#: seam, so a match means the claim is false rather than merely unsupported.
+_CLOCK_CLAIM_RE = re.compile(
+    r"(injectable clock|clock injection|freezegun|freeze_today"
+    r"|pin(ning)? (today|the (calendar )?date)|fixed (calendar )?date"
+    r"|no clock|without a clock)",
+    re.IGNORECASE,
+)
+
+
 def _not_runtime_evidence(text: str) -> list[str]:
     """Repo/process terms found in ``text``; empty when the label is suspect."""
     return sorted({m.group(0).lower()
                    for m in _NOT_RUNTIME_EVIDENCE.finditer(text or "")})
 
 
-def _not_runtime_acs(data: Any, ctx: StoryAcceptanceContext) -> dict[str, str]:
+def _not_runtime_acs(
+    data: Any, ctx: StoryAcceptanceContext, *, clock_available: bool = False,
+) -> dict[str, str]:
     """AC key → rationale for every criterion the model classified not-runtime.
 
     Read off the raw objects, not the scenarios: a not-runtime criterion has
@@ -683,6 +697,30 @@ def _not_runtime_acs(data: Any, ctx: StoryAcceptanceContext) -> dict[str, str]:
             continue
         rationale = str(obj.get("rationale", "")).strip()
         body = texts.get(key, "")
+        # A "no injectable clock" rationale is DISPROVED when discovery found
+        # a seam and the prompt therefore carried _CLOCK_AVAILABLE_RULE. This
+        # is distinct from the suspect-text case below: there the model made a
+        # judgement call the prose does not support, here it asserted a fact
+        # about the workspace that is false. Recorded loudly and separately,
+        # because the two have different fixes — this one means the model
+        # ignored a rule it was given, not that discovery missed something.
+        if clock_available and _CLOCK_CLAIM_RE.search(rationale):
+            logger.warning(
+                "[acceptance_gen] %s was classified not-runtime for want of "
+                "a clock, but this workspace HAS an injectable clock and the "
+                "prompt said so — `client.freeze_today(...)` was available. "
+                "The rationale is false, not a judgement call. Criterion: "
+                "%r  Model rationale: %r",
+                key, body[:200], rationale[:200],
+            )
+            rationale = (
+                "FALSE CLASSIFICATION — the workspace exposes an injectable "
+                "clock (client.freeze_today) and the generator was told so; "
+                "this criterion is verifiable. " + rationale
+            )
+            out[key] = rationale
+            suspect.append(key)
+            continue
         if body and not _not_runtime_evidence(body):
             suspect.append(key)
             logger.warning(
@@ -2292,13 +2330,139 @@ _CLOCK_DATE_HINTS = ("today", "date")
 _CLOCK_DATETIME_HINTS = ("now", "utcnow", "timestamp")
 
 
+#: Module-level function names that READ the clock. The second seam kind: an
+#: app with no clock *dependency* almost always still funnels "what is today"
+#: through one helper, and a module-level function is patchable by name —
+#: which ``_CLOCK_ABSENT_RULE`` itself already calls legitimate ("patching
+#: THAT module's ``date`` name … the module-level reference is a normal
+#: attribute; the C type is not").
+#:
+#: Why this exists: discovery used to require a provider whose source text
+#: contained "clock", so lumina's ``today_in_timezone`` —
+#: ``server/app/services/timezone_service.py``, imported into
+#: ``server/app/api/birthdays.py`` — was invisible. ``clock_available`` came
+#: back False, ``_CLOCK_ABSENT_RULE`` told the generator that "not-runtime"
+#: was "the correct answer and it is always available to you", and run 14
+#: deferred 8 criteria across STORY-002 and STORY-004 on that instruction —
+#: every ``not-runtime`` classification in the run. The model was right about
+#: the HTTP surface (the API computes ``today`` internally and reads
+#: ``feb29_policy`` from settings, so neither is a request parameter) and it
+#: was obeying the prompt. A false negative in discovery became permanent
+#: lost coverage, which is how a story that cannot seal looks from the inside.
+_DATE_PROVIDER_NAME_RE = re.compile(
+    r"^_?("
+    r"(get_|current_|local_)?(today|now|utcnow|utc_now)"
+    r"(_in_timezone|_in_tz|_date|_datetime|_time|_utc|_local)?"
+    r"|current_(date|datetime|time)"
+    r"|(date|datetime|time)_now"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _module_date_provider_of(node: Any) -> "tuple[str, str]":
+    """``(symbol, returns)`` for a module-level date-reading function.
+
+    ``returns`` is "datetime" or "date", read off the return annotation and
+    defaulting to "date" when absent. It matters: the stub must hand back the
+    SAME type the real helper does, or the first arithmetic the app does with
+    it raises instead of running — lumina's ``today_in_timezone`` is annotated
+    ``-> datetime`` despite its name.
+
+    Zero-argument and one-argument forms both qualify (a timezone-taking
+    helper is the common shape); the stub ignores whatever it is passed.
+    """
+    import ast
+
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return "", ""
+    if not _DATE_PROVIDER_NAME_RE.match(node.name or ""):
+        return "", ""
+    args = node.args
+    if args.vararg or args.kwarg or len(args.posonlyargs) + len(args.args) > 2:
+        return "", ""
+    returns = "date"
+    ann = getattr(node, "returns", None)
+    text = ""
+    if isinstance(ann, ast.Name):
+        text = ann.id
+    elif isinstance(ann, ast.Attribute):
+        text = ann.attr
+    if text.lower() == "datetime":
+        returns = "datetime"
+    return node.name, returns
+
+
+def _date_provider_bindings(
+    workspace_path: str, symbol: str, definer: str, *, max_files: int = 300,
+) -> list[str]:
+    """Every module that BINDS ``symbol``, the definer included.
+
+    ``from x import today_in_timezone`` creates a new name in the importing
+    module, so patching only the defining module leaves every call site
+    pointing at the original function. Run 14's seam is exactly this shape:
+    defined in ``services.timezone_service``, called in ``api.birthdays``.
+    Patching one and not the other is a freeze that silently does nothing —
+    the lumina-run-17/21/22 failure, where ``freeze_today`` appeared to
+    succeed and the app kept real time.
+    """
+    import ast
+
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    found: list[str] = [definer]
+    scanned = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py") or scanned >= max_files:
+                continue
+            scanned += 1
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if symbol not in text:
+                continue
+            module = os.path.relpath(
+                path, workspace_path).replace(os.sep, ".")[:-3]
+            if module == definer:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and any(
+                    (a.asname or a.name) == symbol for a in node.names
+                ):
+                    found.append(module)
+                    break
+    return sorted(set(found))
+
+
 def discover_clock_override(
     workspace_path: str, *, max_files: int = 200,
 ) -> Optional[dict[str, Any]]:
     """The app's injectable clock, so date-dependent criteria can be pinned.
 
-    Returns ``{"module", "symbol", "date_methods", "datetime_methods"}`` for a
-    FastAPI dependency provider whose name mentions a clock, or None.
+    Two seam kinds, tried in this order:
+
+    * ``kind="dependency"`` — a FastAPI dependency provider whose name
+      mentions a clock. Overridden through ``app.dependency_overrides``.
+      Returns ``{"kind", "module", "symbol", "date_methods",
+      "datetime_methods"}``.
+    * ``kind="module_symbol"`` — a module-level function that reads the clock
+      (:data:`_DATE_PROVIDER_NAME_RE`). Overridden by ``setattr`` on every
+      module that binds the name. Returns ``{"kind", "module", "symbol",
+      "bindings", "returns"}``.
+
+    The dependency kind is preferred because an app that declares one means
+    the seam; the module kind is the fallback that stops a date-dependent
+    criterion being written off as unverifiable when a perfectly good patch
+    target exists. Returns None only when neither is present — and only then
+    is ``_CLOCK_ABSENT_RULE`` the truth.
 
     Exists because a criterion about dates is otherwise unverifiable except by
     accident of the calendar. lumina-run17-20260924-2351 generated a leap-day
@@ -2342,11 +2506,66 @@ def discover_clock_override(
                 module = os.path.relpath(
                     path, workspace_path).replace(os.sep, ".")[:-3]
                 return {
+                    "kind": "dependency",
                     "module": module, "symbol": node.name,
                     "date_methods": methods[0],
                     "datetime_methods": methods[1],
                 }
-    return None
+    return _discover_module_clock(workspace_path, max_files=max_files)
+
+
+def _discover_module_clock(
+    workspace_path: str, *, max_files: int = 200,
+) -> Optional[dict[str, Any]]:
+    """The ``module_symbol`` seam: a module-level clock-reading function.
+
+    Walked separately from the dependency scan because that one short-circuits
+    on ``"clock" not in text.lower()`` — the very filter that hid run 14's
+    seam. This scan keys on the FUNCTION NAME instead, so a helper called
+    ``today_in_timezone`` is found whether or not the word "clock" appears
+    anywhere in the file.
+    """
+    import ast
+
+    _skip = {"node_modules", ".venv", ".git", "__pycache__", "tests", "test"}
+    best: Optional[dict[str, Any]] = None
+    scanned = 0
+    for root, dirs, files in sorted(os.walk(workspace_path)):
+        dirs[:] = [d for d in dirs if d not in _skip and not d.startswith(".")]
+        for name in sorted(files):
+            if not name.endswith(".py") or scanned >= max_files:
+                continue
+            scanned += 1
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            module = os.path.relpath(
+                path, workspace_path).replace(os.sep, ".")[:-3]
+            for node in tree.body:
+                symbol, returns = _module_date_provider_of(node)
+                if not symbol:
+                    continue
+                cand = {
+                    "kind": "module_symbol",
+                    "module": module,
+                    "symbol": symbol,
+                    "returns": returns,
+                    "bindings": _date_provider_bindings(
+                        workspace_path, symbol, module,
+                    ),
+                }
+                # Prefer the seam the app actually routes through: more
+                # binding sites means more call sites a freeze will reach.
+                if best is None or len(cand["bindings"]) > len(best["bindings"]):
+                    best = cand
+    return best
 
 
 def _clock_provider_of(node: Any) -> "tuple[str, str]":
@@ -2467,6 +2686,8 @@ def _render_frozen_clock(clock: Optional[dict[str, Any]]) -> tuple[str, str]:
     """
     if not clock:
         return "", ""
+    if str(clock.get("kind") or "dependency") == "module_symbol":
+        return _render_module_clock(clock)
     date_methods = list(clock.get("date_methods") or [])
     stamp_methods = list(clock.get("datetime_methods") or [])
     if not date_methods and not stamp_methods:
@@ -2530,6 +2751,74 @@ def _render_frozen_clock(clock: Optional[dict[str, Any]]) -> tuple[str, str]:
         "        # test reads as pinned while the app keeps real time.\n"
         "        assert _dep in self.app.dependency_overrides, (\n"
         "            'freeze_today could not install its clock override')\n"
+    )
+    return module_src, method_src
+
+
+def _render_module_clock(clock: dict[str, Any]) -> tuple[str, str]:
+    """``(module_level_src, client_method_src)`` for the ``module_symbol`` seam.
+
+    Patches the clock helper on every module that binds it, resolved at CALL
+    time rather than at conftest import. That timing is not a detail: the
+    client fixture purges app modules from ``sys.modules`` and re-imports the
+    application for database isolation, so a module object captured when the
+    conftest loaded is a different object from the one the rebuilt app is
+    using, and a ``setattr`` on it reaches nothing. The dependency-kind
+    renderer carries the same warning for the same reason — runs 17, 21 and 22
+    were all lost to a freeze that appeared to work.
+
+    The stub returns the SAME type the real helper is annotated with: a
+    ``-> datetime`` helper replaced by something handing back a ``date`` makes
+    the app's own arithmetic raise, which looks like a production bug and is
+    not one.
+
+    No restore: every test gets a freshly re-imported app, so the patch cannot
+    outlive the test that set it. A freeze that reached NO binding raises
+    instead of passing quietly — a test that reads as pinned while the app
+    keeps real time is the failure this whole seam exists to prevent.
+    """
+    bindings = [str(b) for b in (clock.get("bindings") or []) if b]
+    symbol = str(clock.get("symbol") or "")
+    if not bindings or not symbol:
+        return "", ""
+    as_stamp = str(clock.get("returns") or "date") == "datetime"
+    module_src = (
+        "import datetime as _dt\n"
+        "import importlib as _importlib\n\n"
+        f"_CLOCK_BINDINGS = {bindings!r}\n"
+        f"_CLOCK_SYMBOL = {symbol!r}\n"
+        f"_CLOCK_RETURNS_DATETIME = {as_stamp!r}\n\n\n"
+        "def _frozen_clock_value(d):\n"
+        '    """The pinned value, in the type the real helper returns."""\n'
+        "    if _CLOCK_RETURNS_DATETIME:\n"
+        "        return _dt.datetime.combine(\n"
+        "            d, _dt.time(12, 0), tzinfo=_dt.timezone.utc)\n"
+        "    return d\n\n\n"
+    )
+    method_src = (
+        "\n    def freeze_today(self, d):\n"
+        '        """Pin the app\'s clock to date ``d`` for the rest of this test.\n\n'
+        "        Use this for any criterion whose outcome depends on today's\n"
+        "        date — a leap-day rule, a rolling window, an age, an expiry.\n"
+        "        Without it such a criterion only passes on the right\n"
+        "        calendar day.\n"
+        '        """\n'
+        "        _value = _frozen_clock_value(d)\n"
+        "        _patched = []\n"
+        "        for _name in _CLOCK_BINDINGS:\n"
+        "            try:\n"
+        "                _mod = _importlib.import_module(_name)\n"
+        "            except ImportError:\n"
+        "                continue\n"
+        "            if not hasattr(_mod, _CLOCK_SYMBOL):\n"
+        "                continue\n"
+        "            setattr(_mod, _CLOCK_SYMBOL, lambda *_a, **_k: _value)\n"
+        "            _patched.append(_name)\n"
+        "        # A freeze that matches nothing is worse than no freeze: the\n"
+        "        # test reads as pinned while the app keeps real time.\n"
+        "        assert _patched, (\n"
+        "            'freeze_today patched no module: expected '\n"
+        "            f'{_CLOCK_SYMBOL} on one of {_CLOCK_BINDINGS}')\n"
     )
     return module_src, method_src
 

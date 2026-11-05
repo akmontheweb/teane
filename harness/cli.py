@@ -933,6 +933,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "default_hard_cap_usd", "synthesis_envelope_usd",
         "installation_doc_floor_usd", "fanout_default_budget_usd",
         "gates",
+        # Charging for attempts the provider billed but whose response never
+        # reached us — a read timeout does not stop generation. Nested dict:
+        # enabled / charge_read_timeouts / charge_server_errors /
+        # fallback_output_tokens. See gateway._charge_unread_attempt.
+        "retry_charge",
     }),
     "node_throttle": frozenset({
         "max_patch_repair_iterations",
@@ -1451,6 +1456,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "token_budget.installation_doc_floor_usd": (int, float),
     "token_budget.fanout_default_budget_usd": (int, float),
     "token_budget.gates": (dict,),
+    "token_budget.retry_charge": (dict,),
     "node_throttle.max_patch_repair_iterations": (int,),
     "node_throttle.max_consecutive_distraction_rounds": (int,),
     "node_throttle.max_consecutive_low_signal_rounds": (int,),

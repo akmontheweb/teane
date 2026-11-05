@@ -2001,6 +2001,10 @@ class _PatchingResponse:
         cost_usd = 0.001
         cached_tokens = 0
 
+        @property
+        def prompt_tokens(self):
+            return self.input_tokens + self.cached_tokens
+
     def __init__(self, content: str, finish_reason: str):
         self.content = content
         self.finish_reason = finish_reason

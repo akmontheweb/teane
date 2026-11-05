@@ -54,6 +54,12 @@ class _Usage:
     cost_usd = 0.001
     cached_tokens = 0
 
+    @property
+    def prompt_tokens(self):
+        """Mirrors gateway.TokenUsage, whose input_tokens is the full-rate
+        slice only; prompt size is the sum with the cached reads."""
+        return self.input_tokens + self.cached_tokens
+
 
 class _Response:
     """Gateway-response stand-in: content, finish_reason, tool_calls, usage."""

@@ -1263,6 +1263,11 @@ class _StubResponse:
             input_tokens = 100
             output_tokens = 200
             cost_usd = 0.001
+            cached_tokens = 0
+
+            @property
+            def prompt_tokens(self):
+                return self.input_tokens + self.cached_tokens
         self.usage = _Usage()
 
 

@@ -3349,9 +3349,16 @@ class TestGatekeeperAutoApprove:
         assert _delay_from_rate_limit_headers({}, 1.0, 3) == 8.0  # 1.0 * 2^3
 
     def test_openai_compute_cost_applies_cached_discount(self):
-        # Regression: OpenAIProvider.compute_cost previously ignored
-        # cached_tokens and billed all input_tokens at the full rate.
-        from harness.gateway import OpenAIProvider, ModelSpec, TokenUsage
+        """Cache hits are billed at the cached rate, not the full one.
+
+        The DISCOUNT is unchanged; where it is applied moved. Until
+        2026-11-05 compute_cost subtracted cached_tokens from a
+        provider-shaped input_tokens that still contained them. Now
+        extract_usage splits the wire's prompt_tokens once, so the two cost
+        terms are disjoint by construction and nothing subtracts twice.
+        This asserts both halves: the split, then the price.
+        """
+        from harness.gateway import OpenAIProvider, ModelSpec
         spec = ModelSpec(
             provider="openai", model_id="gpt-4o-test",
             context_window=128000,
@@ -3360,10 +3367,15 @@ class TestGatekeeperAutoApprove:
             cached_input_cost_per_1m=2.50,
         )
         provider = OpenAIProvider(spec)
-        usage = TokenUsage(
-            input_tokens=1_000_000, output_tokens=0, cached_tokens=800_000,
-            model_name="gpt-4o-test",
-        )
+        # The wire shape: prompt_tokens INCLUDES the cached slice.
+        usage = provider.extract_usage({"usage": {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 800_000},
+        }})
+        assert usage.input_tokens == 200_000
+        assert usage.cached_tokens == 800_000
+        assert usage.prompt_tokens == 1_000_000
         # 200k uncached @ $10/M + 800k cached @ $2.50/M = $2.00 + $2.00 = $4.00
         # Previous broken behavior: 1M @ $10/M = $10.00
         assert abs(provider.compute_cost(usage) - 4.00) < 1e-6
@@ -6339,7 +6351,11 @@ class TestPriorPatchFailureSurfacing:
         body = out.read_text()
         assert "session: abc12345-rest-of-uuid" in body
         assert "role: repair" in body
-        assert "tokens_in=12" in body
+        # Header field renamed 2026-11-05: `prompt` is the whole prompt and
+        # `billed_in` the full-rate slice. `tokens_in` was ambiguous — it
+        # printed the total for DeepSeek/OpenAI and the net for Anthropic.
+        assert "prompt=12" in body
+        assert "billed_in=12" in body
         assert "system prompt" in body
         assert "fix this" in body
         assert "## response" in body

@@ -147,9 +147,15 @@ class TestWireShape:
         assert resp.reasoning_content == "let me think"
         assert len(resp.tool_calls) == 1
         assert resp.tool_calls[0]["name"] == "create_file"
-        assert resp.usage.input_tokens == 100
-        assert resp.usage.output_tokens == 20
+        # The wire still says prompt_tokens=100 INCLUSIVE of its 40 cached.
+        # extract_usage splits that into the canonical partition (2026-11-05):
+        # input_tokens is the full-rate slice, prompt_tokens the total. The
+        # provider-dependent meaning of input_tokens is exactly what made
+        # cache_hit_rate double-count its denominator.
+        assert resp.usage.input_tokens == 60
         assert resp.usage.cached_tokens == 40
+        assert resp.usage.prompt_tokens == 100
+        assert resp.usage.output_tokens == 20
         # cost: (60 uncached/1M * .60) + (40/1M * .15) + (20/1M * 2.50)
         expected = (60/1e6)*0.60 + (40/1e6)*0.15 + (20/1e6)*2.50
         assert resp.usage.cost_usd == pytest.approx(expected)

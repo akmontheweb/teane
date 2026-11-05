@@ -93,6 +93,13 @@ class _Usage:
     cached_tokens: int = 0
     model: str = "stub"
 
+    @property
+    def prompt_tokens(self) -> int:
+        """Mirrors gateway.TokenUsage. A property, not a field, so the
+        dataclasses.fields() summing above still sees only the four real
+        counters and does not try to add a derived total to itself."""
+        return self.input_tokens + self.cached_tokens
+
 
 class _Resp:
     def __init__(self, content="", tool_calls=None, finish_reason="stop"):

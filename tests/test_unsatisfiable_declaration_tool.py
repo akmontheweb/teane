@@ -271,6 +271,10 @@ class _Usage:
     cached_tokens = 0
     model = "stub"
 
+    @property
+    def prompt_tokens(self):
+        return self.input_tokens + self.cached_tokens
+
 
 class _Resp:
     def __init__(self, content, tool_calls):

@@ -5016,8 +5016,8 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             logger.debug("[planning_node] inventory cross-check skipped: %s", exc)
 
         logger.info(
-            "[planning_node] Blueprint generated. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f tool_rounds=%d inv_diags=%d",
-            response.usage.input_tokens,
+            "[planning_node] Blueprint generated. prompt=%d tokens_out=%d cost=$%.6f budget_left=$%.4f tool_rounds=%d inv_diags=%d",
+            response.usage.prompt_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
@@ -6439,9 +6439,9 @@ Generate your patches NOW. Only the blocks above. No other text."""
             zero_rounds_for_log = loop_counter["consecutive_zero_patch_rounds"]
 
         logger.info(
-            "[patching_node] Patches applied. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
+            "[patching_node] Patches applied. prompt=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
             "patches=%d succeed=%d fail=%d zero_rounds=%d%s",
-            response.usage.input_tokens,
+            response.usage.prompt_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
@@ -22663,10 +22663,10 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
         )
 
         logger.info(
-            "[repair_node] Repair #%d complete. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
+            "[repair_node] Repair #%d complete. prompt=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
             "patches=%d succeed=%d no_op=%d fail=%d consecutive_zero=%d",
             loop_counter["total_repairs"],
-            response.usage.input_tokens,
+            response.usage.prompt_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,

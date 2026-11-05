@@ -127,12 +127,32 @@ class SessionMetrics:
     recent_window_minutes: int = _DEFAULT_WINDOW_MINUTES
     log_files: list[str] = field(default_factory=list)
 
+    @property
+    def prompt_tokens(self) -> int:
+        """Whole prompt size: cache misses plus cache reads.
+
+        ``tokens_in`` is the full-rate billable slice only (see
+        ``gateway.TokenUsage``), so prompt size is the sum. Printing
+        ``tokens_in`` alone under an "in" label is what hid the cache's
+        effect: a 200k prompt at a 79% hit rate bills like a 42k one.
+        """
+        return self.tokens_in + self.cached_tokens
+
     def cache_hit_rate(self) -> float:
         """Ratio of cached input tokens over total input tokens consumed.
 
         ``cached_tokens / (cached_tokens + tokens_in)``. Returns 0.0 when no
         input tokens have been observed yet. The checklist target is >0.80;
         sustained values below 0.50 usually mean a prefix is breaking.
+
+        The formula is correct only because ``tokens_in`` carries the
+        canonical full-rate slice -- the two terms must be disjoint. It was
+        right all along; the DeepSeek and OpenAI providers used to feed it a
+        ``tokens_in`` that already contained the hits, which double-counted
+        them in the denominator and reported a real 79% as 44%. The fix went
+        into the providers (2026-11-05), not here: changing this formula
+        would have broken it for Anthropic, whose input count never included
+        them.
         """
         denom = self.cached_tokens + self.tokens_in
         if denom <= 0:
@@ -206,6 +226,7 @@ class SessionMetrics:
             "total_cost_usd": round(self.total_cost_usd, 6),
             "llm_call_count": self.llm_call_count,
             "tokens_in": self.tokens_in,
+            "prompt_tokens": self.prompt_tokens,
             "tokens_out": self.tokens_out,
             "cached_tokens": self.cached_tokens,
             "cache_hit_rate": round(self.cache_hit_rate(), 6),
@@ -574,7 +595,9 @@ def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
         f"  Log files:           {len(metrics.log_files)}",
         f"  Total LLM calls:     {metrics.llm_call_count}",
         f"  Total cost:          ${metrics.total_cost_usd:.4f}",
-        f"  Tokens (in/out):     {metrics.tokens_in:,} / {metrics.tokens_out:,}",
+        f"  Prompt tokens:       {metrics.prompt_tokens:,} "
+        f"({metrics.tokens_in:,} billed at full rate)",
+        f"  Output tokens:       {metrics.tokens_out:,}",
         f"  Cached tokens:       {metrics.cached_tokens:,} ({metrics.cache_hit_rate() * 100:.1f}% hit rate)",
         f"  System prompt:       {metrics.system_prompt_lines} lines / {metrics.system_prompt_chars:,} chars",
         f"  Errors:              {errs}",

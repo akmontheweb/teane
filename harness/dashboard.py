@@ -604,7 +604,16 @@ def _parse_session_log(session_id: str, path: str) -> SessionSummary:
                 if evt_name == "llm_call" or evt_name == "embedding_call":
                     summary.llm_calls += 1
                     summary.total_cost_usd += float(event.get("cost_usd", 0.0) or 0.0)
-                    summary.total_input_tokens += int(event.get("tokens_in", 0) or 0)
+                    # tokens_in became the full-rate slice on 2026-11-05;
+                    # prompt_tokens carries the whole prompt. Prefer it when
+                    # present and fall back to the bare tokens_in for older
+                    # logs, where adding cached_tokens would double-count the
+                    # hits DeepSeek used to fold into tokens_in.
+                    summary.total_input_tokens += int(
+                        event.get("prompt_tokens")
+                        or event.get("tokens_in", 0)
+                        or 0
+                    )
                     summary.total_output_tokens += int(event.get("tokens_out", 0) or 0)
                 if event.get("event") == "session_end":
                     summary.ended_at = str(event.get("timestamp") or summary.ended_at)

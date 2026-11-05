@@ -29,6 +29,10 @@ class _StubUsage:
     cost_usd = 0.0005
     model = "stub"
 
+    @property
+    def prompt_tokens(self):
+        return self.input_tokens + getattr(self, "cached_tokens", 0)
+
 
 class _StubResponse:
     def __init__(self, content: str):

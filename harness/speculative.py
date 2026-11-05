@@ -683,8 +683,8 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
                     spec.index,
                     spec.model_override or "(routed)",
                     spec.temperature,
-                    response.usage.input_tokens + response.usage.output_tokens,
-                    response.usage.input_tokens,
+                    response.usage.prompt_tokens + response.usage.output_tokens,
+                    response.usage.prompt_tokens,
                     response.usage.output_tokens,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -724,8 +724,8 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
                         spec.index,
                         spec.model_override or "(routed)",
                         spec.temperature,
-                        response.usage.input_tokens + response.usage.output_tokens,
-                        response.usage.input_tokens,
+                        response.usage.prompt_tokens + response.usage.output_tokens,
+                        response.usage.prompt_tokens,
                         response.usage.output_tokens,
                     )
         except Exception as exc:

@@ -787,6 +787,10 @@ class _StubResponse:
             cached_tokens = 0
             cost_usd = 0.001
             model = "stub"
+
+            @property
+            def prompt_tokens(self):
+                return self.input_tokens + self.cached_tokens
         self.usage = _Usage()
 
 

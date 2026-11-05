@@ -16,6 +16,7 @@ This module implements:
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import hashlib
 import json
 import logging
@@ -90,10 +91,39 @@ class _SkipDriftDetection(Exception):
 class TokenUsage:
     """Extracted token usage metadata from a single LLM response.
 
-    ``cached_tokens`` counts cache *reads* (priced at the discounted
-    cached input rate). ``cache_creation_tokens`` counts tokens written
-    into the cache for the first time — Anthropic charges these at a
-    surcharge (~1.25× input), other providers leave it 0.
+    **One canonical convention, enforced at the provider boundary.** The
+    four token fields partition the call with no overlap:
+
+    - ``input_tokens``          — prompt tokens billed at the FULL input rate
+                                  (i.e. cache MISSES only). Never includes
+                                  cache reads or cache writes.
+    - ``cached_tokens``         — cache *reads*, billed at the discounted
+                                  cached input rate.
+    - ``cache_creation_tokens`` — tokens written into the cache for the first
+                                  time. Anthropic charges these at a surcharge
+                                  (~1.25x input); other providers leave it 0.
+    - ``output_tokens``         — completion tokens, reasoning/thinking
+                                  tokens included (every provider folds
+                                  reasoning into its completion count).
+
+    The wire formats disagree about this, which is exactly why the
+    normalisation lives here rather than in each consumer. Anthropic reports
+    ``input_tokens`` already net of cache reads; DeepSeek and OpenAI report a
+    ``prompt_tokens`` TOTAL that *includes* its cache hits. Before 2026-11-05
+    the field simply carried whatever the provider said, so its meaning
+    depended on which model happened to serve the call -- and every consumer
+    that treated the number as one thing was wrong for half the providers.
+
+    ``metrics.SessionMetrics.cache_hit_rate`` was the visible casualty:
+    ``cached / (cached + tokens_in)`` is right under this convention and
+    double-counts the hits under DeepSeek's, so a genuine 79% hit rate was
+    displayed as 44% for every DeepSeek run. The ratio is a prefix-health
+    gauge with a documented 0.50 floor, so it read as a permanently broken
+    prefix while the cache was in fact working. Fixing the gauge's formula
+    would have broken it for Anthropic; normalising the input fixes both.
+
+    Use ``prompt_tokens`` when you want "how big was the prompt" -- that is
+    the sum, and it is what a provider's own dashboard shows.
     """
     input_tokens: int = 0
     output_tokens: int = 0
@@ -101,6 +131,23 @@ class TokenUsage:
     cache_creation_tokens: int = 0
     model_name: str = ""
     cost_usd: float = 0.0
+    #: True when ``cost_usd`` is an ESTIMATE rather than a figure derived
+    #: from a usage block the provider actually returned. Set for attempts
+    #: that were billed but whose response we never read (see
+    #: ``LLMGateway._charge_unread_attempt``). Keeps an estimate from being
+    #: mistaken for a measurement in any downstream total.
+    cost_is_estimated: bool = False
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Total prompt size: cache misses + cache reads + cache writes.
+
+        This is the number a provider dashboard reports as input, and the
+        one to put in a log line about prompt size. ``input_tokens`` alone
+        is the full-rate billable slice, which on a cache-warm harness run
+        is a small fraction of the prompt.
+        """
+        return self.input_tokens + self.cached_tokens + self.cache_creation_tokens
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,8 +155,10 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "cached_tokens": self.cached_tokens,
             "cache_creation_tokens": self.cache_creation_tokens,
+            "prompt_tokens": self.prompt_tokens,
             "model_name": self.model_name,
             "cost_usd": self.cost_usd,
+            "cost_is_estimated": self.cost_is_estimated,
         }
 
 
@@ -250,6 +299,150 @@ class ModelSpec:
     # it through. None (default) means honor the caller's temperature.
     fixed_temperature: Optional[float] = None
 
+    # ---- Time-of-day pricing -------------------------------------------
+    # Some providers bill the SAME tokens at different rates depending on
+    # when the request lands. DeepSeek publishes peak and off-peak columns
+    # for every model: off-peak is half of peak, and peak is 01:00-04:00
+    # and 06:00-10:00 UTC, Monday-Friday. The rate fields above are the
+    # PEAK (undiscounted) rates; outside the peak windows every one of them
+    # is multiplied by ``off_peak_multiplier``.
+    #
+    # Modelling this is not an optimisation. The harness ran for weeks with
+    # a single flat rate per model and underpriced every call; the runs that
+    # happened to straddle a peak window were underpriced by a further 2x on
+    # top of that. A machine in IST (UTC+5:30) sees the peak windows land at
+    # 06:30-09:30 and 11:30-15:30 local, i.e. squarely across a working day,
+    # so "it is probably off-peak" is not a safe default anywhere.
+    #
+    # Defaults are deliberately inert: multiplier 1.0 and no windows means
+    # flat pricing, which is correct for every provider that has no peak
+    # concept (Anthropic, OpenAI, Google, Moonshot, local).
+    off_peak_multiplier: float = 1.0
+    #: Peak windows as ``"HH:MM-HH:MM"`` strings in **UTC**. A window whose
+    #: end is <= its start wraps past midnight. Empty means no peak concept.
+    peak_windows_utc: tuple[str, ...] = ()
+    #: Weekday indices (Monday=0 ... Sunday=6) on which the peak windows
+    #: apply. DeepSeek's peak hours are weekdays only; weekends bill at the
+    #: off-peak rate around the clock.
+    peak_weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+    def is_peak(self, when: Optional[_dt.datetime] = None) -> bool:
+        """Is ``when`` inside a peak-rate window for this model?
+
+        ``when`` is interpreted in UTC; a naive datetime is ASSUMED to be
+        UTC rather than silently read as local time, because a 5.5-hour
+        timezone offset is exactly large enough to move a call from one
+        rate column to the other. Callers pass the request's start time,
+        not the response's: a 200-second planning call that begins off-peak
+        is billed off-peak.
+
+        A model with no declared windows is never peak, so flat-priced
+        models take the ``off_peak_multiplier`` of 1.0 and are unaffected.
+        """
+        if not self.peak_windows_utc:
+            return False
+        if when is None:
+            when = _dt.datetime.now(_dt.UTC)
+        elif when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.UTC)
+        else:
+            when = when.astimezone(_dt.UTC)
+        if self.peak_weekdays and when.weekday() not in self.peak_weekdays:
+            return False
+        minutes = when.hour * 60 + when.minute
+        for window in self.peak_windows_utc:
+            try:
+                start_s, end_s = str(window).split("-", 1)
+                sh, sm = (int(x) for x in start_s.strip().split(":", 1))
+                eh, em = (int(x) for x in end_s.strip().split(":", 1))
+            except (ValueError, AttributeError):
+                logger.warning(
+                    "[gateway] Ignoring malformed peak window %r on %s "
+                    "(expected 'HH:MM-HH:MM' in UTC).", window, self.model_id,
+                )
+                continue
+            start, end = sh * 60 + sm, eh * 60 + em
+            if start < end:
+                if start <= minutes < end:
+                    return True
+            elif start > end:  # wraps past midnight
+                if minutes >= start or minutes < end:
+                    return True
+        return False
+
+    def rates_at(self, when: Optional[_dt.datetime] = None) -> "_Rates":
+        """The four per-1M rates in effect at ``when``.
+
+        Returns the declared (peak) rates inside a peak window and those
+        rates scaled by ``off_peak_multiplier`` outside one. Every cost
+        calculation goes through here so a model cannot be priced by one
+        path and estimated by another.
+        """
+        factor = 1.0 if self.is_peak(when) else max(0.0, self.off_peak_multiplier)
+        creation = (
+            self.cache_creation_cost_per_1m
+            if self.cache_creation_cost_per_1m > 0
+            else self.input_cost_per_1m * 1.25
+        )
+        return _Rates(
+            input_per_1m=self.input_cost_per_1m * factor,
+            cached_input_per_1m=self.cached_input_cost_per_1m * factor,
+            cache_creation_per_1m=creation * factor,
+            output_per_1m=self.output_cost_per_1m * factor,
+            is_peak=factor == 1.0 and bool(self.peak_windows_utc),
+        )
+
+
+@dataclass(frozen=True)
+class _Rates:
+    """The per-1M rates resolved for one instant, in USD."""
+    input_per_1m: float
+    cached_input_per_1m: float
+    cache_creation_per_1m: float
+    output_per_1m: float
+    is_peak: bool = False
+
+    def price(self, usage: "TokenUsage") -> float:
+        """Price a usage record whose fields follow the canonical partition."""
+        return (
+            (usage.input_tokens / 1_000_000.0) * self.input_per_1m
+            + (usage.cached_tokens / 1_000_000.0) * self.cached_input_per_1m
+            + (usage.cache_creation_tokens / 1_000_000.0) * self.cache_creation_per_1m
+            + (usage.output_tokens / 1_000_000.0) * self.output_per_1m
+        )
+
+
+def _coerce_peak_windows(value: Any) -> tuple[str, ...]:
+    """JSON gives a list of strings; ModelSpec wants an immutable tuple."""
+    if not value:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    return tuple(str(v) for v in value if str(v).strip())
+
+
+def _coerce_peak_weekdays(value: Any) -> tuple[int, ...]:
+    """Weekday indices, Monday=0. Absent means DeepSeek's Mon-Fri default.
+
+    An explicitly empty list is honoured as "no weekday restriction applies"
+    -- i.e. the windows never match -- rather than being silently replaced by
+    the default, so a catalogue can switch peak pricing off per model without
+    having to also blank the windows.
+    """
+    if value is None:
+        return (0, 1, 2, 3, 4)
+    if isinstance(value, int):
+        value = [value]
+    out: list[int] = []
+    for v in value:
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= iv <= 6:
+            out.append(iv)
+    return tuple(out)
+
 
 # Model registry — populated from model_prices.json at import time, then
 # overridden by user .harness_config.json 'models' entries, then by
@@ -310,6 +503,9 @@ def load_model_prices(prices_path: Optional[str] = None, override: bool = False)
                 output_cost_per_1m=float(spec_dict.get("output_cost_per_1m", 0.0)),
                 cached_input_cost_per_1m=float(spec_dict.get("cached_input_cost_per_1m", 0.0)),
                 cache_creation_cost_per_1m=float(spec_dict.get("cache_creation_cost_per_1m", 0.0)),
+                off_peak_multiplier=float(spec_dict.get("off_peak_multiplier", 1.0)),
+                peak_windows_utc=_coerce_peak_windows(spec_dict.get("peak_windows_utc")),
+                peak_weekdays=_coerce_peak_weekdays(spec_dict.get("peak_weekdays")),
                 api_base_url=spec_dict.get("api_base_url", ""),
                 api_key=spec_dict.get("api_key", ""),
                 supports_thinking=bool(spec_dict.get("supports_thinking", False)),
@@ -516,6 +712,9 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                     "output_cost_per_1m": baseline.output_cost_per_1m,
                     "cached_input_cost_per_1m": baseline.cached_input_cost_per_1m,
                     "cache_creation_cost_per_1m": baseline.cache_creation_cost_per_1m,
+                    "off_peak_multiplier": baseline.off_peak_multiplier,
+                    "peak_windows_utc": baseline.peak_windows_utc,
+                    "peak_weekdays": baseline.peak_weekdays,
                     "api_base_url": baseline.api_base_url,
                     "api_key": baseline.api_key,
                     "supports_thinking": baseline.supports_thinking,
@@ -537,6 +736,9 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 output_cost_per_1m=float(merged.get("output_cost_per_1m", 0.0)),
                 cached_input_cost_per_1m=float(merged.get("cached_input_cost_per_1m", 0.0)),
                 cache_creation_cost_per_1m=float(merged.get("cache_creation_cost_per_1m", 0.0)),
+                off_peak_multiplier=float(merged.get("off_peak_multiplier", 1.0)),
+                peak_windows_utc=_coerce_peak_windows(merged.get("peak_windows_utc")),
+                peak_weekdays=_coerce_peak_weekdays(merged.get("peak_weekdays")),
                 api_base_url=merged.get("api_base_url", ""),
                 api_key=merged.get("api_key", ""),
                 supports_thinking=bool(merged.get("supports_thinking", False)),
@@ -663,8 +865,18 @@ class BaseLLM(ABC):
         ...
 
     @abstractmethod
-    def compute_cost(self, usage: TokenUsage) -> float:
-        """Compute USD cost based on token counts and model pricing rates."""
+    def compute_cost(
+        self, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
+        """Compute USD cost from token counts and the rates in effect at ``at``.
+
+        ``at`` is the instant the request was SENT, in UTC. It matters for
+        providers with peak/off-peak columns: a call that begins off-peak is
+        billed off-peak even if it returns an hour later, and a planning call
+        here can run for 200+ seconds. ``None`` means "now", which is right
+        for a response being priced the moment it arrives and wrong only for
+        a replay, so callers that have the real start time pass it.
+        """
         ...
 
 
@@ -1120,13 +1332,17 @@ class DeepSeekProvider(BaseLLM):
 
         logger.debug("[deepseek] Sending completion request. model=%s tokens_est=%d", self.spec.model_id, len(messages))
 
+        # Peak/off-peak pricing keys off when the request was SENT, not when
+        # it returned: a planning call can run for minutes and must not be
+        # repriced because it happened to cross a rate boundary mid-flight.
+        _sent_at = _dt.datetime.now(_dt.UTC)
         response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
-        usage.cost_usd = self.compute_cost(usage)
+        usage.cost_usd = self.compute_cost(usage, at=_sent_at)
 
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {}) or {}
@@ -1147,26 +1363,44 @@ class DeepSeekProvider(BaseLLM):
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
         usage_block = raw_response.get("usage", {})
-        # DeepSeek returns prompt_tokens_details.cached_tokens when cache hits occur
-        prompt_details = usage_block.get("prompt_tokens_details", {})
+        # DeepSeek reports the cache split two ways. The top-level
+        # ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens`` pair is
+        # authoritative and sums to ``prompt_tokens``; the OpenAI-compatible
+        # ``prompt_tokens_details.cached_tokens`` carries the hit count only.
+        # Prefer the explicit pair, fall back to the compat field, and derive
+        # the misses by subtraction when only the hit count is available.
+        #
+        # ``prompt_tokens`` INCLUDES the hits, so handing it to input_tokens
+        # unchanged -- as this did until 2026-11-05 -- broke the canonical
+        # partition TokenUsage documents and left every downstream cache
+        # metric double-counting the hits.
+        prompt_details = usage_block.get("prompt_tokens_details") or {}
+        _cached = int(
+            usage_block.get("prompt_cache_hit_tokens")
+            or prompt_details.get("cached_tokens")
+            or 0
+        )
+        _total = int(usage_block.get("prompt_tokens", 0) or 0)
+        _miss = usage_block.get("prompt_cache_miss_tokens")
+        _uncached = (
+            int(_miss) if _miss is not None else max(0, _total - _cached)
+        )
         return TokenUsage(
-            input_tokens=usage_block.get("prompt_tokens", 0),
+            input_tokens=_uncached,
             output_tokens=usage_block.get("completion_tokens", 0),
-            cached_tokens=prompt_details.get("cached_tokens", 0),
+            cached_tokens=_cached,
             model_name=self.spec.model_id,
         )
 
-    def compute_cost(self, usage: TokenUsage) -> float:
-        spec = self.spec
-        # Cache-hit tokens are billed at the lower cached rate
-        cached = usage.cached_tokens
-        uncached_input = max(0, usage.input_tokens - cached)
-
-        input_cost = (uncached_input / 1_000_000) * spec.input_cost_per_1m
-        cached_cost = (cached / 1_000_000) * spec.cached_input_cost_per_1m
-        output_cost = (usage.output_tokens / 1_000_000) * spec.output_cost_per_1m
-
-        return input_cost + cached_cost + output_cost
+    def compute_cost(
+        self, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
+        # The usage record already carries the canonical partition (see
+        # TokenUsage): input_tokens is misses only, so nothing is subtracted
+        # here. Subtracting again -- as this method used to -- would have
+        # been correct against a raw prompt_tokens and is a double-discount
+        # against a normalised one.
+        return self.spec.rates_at(at).price(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -1379,13 +1613,15 @@ class AnthropicProvider(BaseLLM):
         logger.debug("[anthropic] Sending completion request. model=%s thinking=%s",
                      self.spec.model_id, thinking and self.spec.supports_thinking)
 
+        # See DeepSeekProvider: priced at request time, not response time.
+        _sent_at = _dt.datetime.now(_dt.UTC)
         response = await client.post("/messages", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
-        usage.cost_usd = self.compute_cost(usage)
+        usage.cost_usd = self.compute_cost(usage, at=_sent_at)
 
         # Anthropic returns content as a list of typed blocks. Extract
         # the text parts AND the tool_use blocks separately — the model
@@ -1445,24 +1681,18 @@ class AnthropicProvider(BaseLLM):
             model_name=self.spec.model_id,
         )
 
-    def compute_cost(self, usage: TokenUsage) -> float:
-        # Anthropic billing tiers:
-        #   - input_tokens:          full input_cost_per_1m (already excludes cache hits)
-        #   - cache_read tokens:     cached_input_cost_per_1m (~10% of input)
-        #   - cache_creation tokens: cache_creation_cost_per_1m (~125% of input)
-        #     Falls back to 1.25x input rate when the spec doesn't carry an
-        #     explicit creation rate (matches Anthropic's published surcharge).
-        spec = self.spec
-        creation_rate = (
-            spec.cache_creation_cost_per_1m
-            if spec.cache_creation_cost_per_1m > 0
-            else spec.input_cost_per_1m * 1.25
-        )
-        input_cost = (usage.input_tokens / 1_000_000) * spec.input_cost_per_1m
-        cache_read_cost = (usage.cached_tokens / 1_000_000) * spec.cached_input_cost_per_1m
-        cache_creation_cost = (usage.cache_creation_tokens / 1_000_000) * creation_rate
-        output_cost = (usage.output_tokens / 1_000_000) * spec.output_cost_per_1m
-        return input_cost + cache_read_cost + cache_creation_cost + output_cost
+    def compute_cost(
+        self, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
+        # Anthropic billing tiers, all four handled by _Rates.price:
+        #   - input_tokens:          full input rate (already net of cache hits,
+        #                            which is why this provider needed no
+        #                            normalisation in extract_usage)
+        #   - cache_read tokens:     cached input rate (~10% of input)
+        #   - cache_creation tokens: creation rate (~125% of input), defaulted
+        #                            from the input rate when the spec carries
+        #                            no explicit figure
+        return self.spec.rates_at(at).price(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -1534,13 +1764,17 @@ class OpenAIProvider(BaseLLM):
 
         logger.debug("[openai] Sending completion request. model=%s", self.spec.model_id)
 
+        # Peak/off-peak pricing keys off when the request was SENT, not when
+        # it returned: a planning call can run for minutes and must not be
+        # repriced because it happened to cross a rate boundary mid-flight.
+        _sent_at = _dt.datetime.now(_dt.UTC)
         response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
         _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
-        usage.cost_usd = self.compute_cost(usage)
+        usage.cost_usd = self.compute_cost(usage, at=_sent_at)
 
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {}) or {}
@@ -1561,25 +1795,24 @@ class OpenAIProvider(BaseLLM):
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
         usage_block = raw_response.get("usage", {})
-        prompt_details = usage_block.get("prompt_tokens_details", {})
+        # OpenAI's prompt_tokens INCLUDES prompt_tokens_details.cached_tokens,
+        # so the hits come out here to keep TokenUsage's partition canonical.
+        prompt_details = usage_block.get("prompt_tokens_details") or {}
+        _cached = int(prompt_details.get("cached_tokens") or 0)
         return TokenUsage(
-            input_tokens=usage_block.get("prompt_tokens", 0),
+            input_tokens=max(0, int(usage_block.get("prompt_tokens", 0) or 0) - _cached),
             output_tokens=usage_block.get("completion_tokens", 0),
-            cached_tokens=prompt_details.get("cached_tokens", 0),
+            cached_tokens=_cached,
             model_name=self.spec.model_id,
         )
 
-    def compute_cost(self, usage: TokenUsage) -> float:
-        spec = self.spec
-        # OpenAI's prompt_tokens_details.cached_tokens are billed at the
-        # discounted cached rate; subtract them from input_tokens so they
-        # aren't double-charged at the full rate.
-        cached = usage.cached_tokens
-        uncached_input = max(0, usage.input_tokens - cached)
-        input_cost = (uncached_input / 1_000_000) * spec.input_cost_per_1m
-        cached_cost = (cached / 1_000_000) * spec.cached_input_cost_per_1m
-        output_cost = (usage.output_tokens / 1_000_000) * spec.output_cost_per_1m
-        return input_cost + cached_cost + output_cost
+    def compute_cost(
+        self, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
+        # OpenAI reports prompt_tokens INCLUSIVE of its cached slice, so
+        # extract_usage already removed it; the full-rate and cached-rate
+        # terms here are disjoint by construction.
+        return self.spec.rates_at(at).price(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -1711,6 +1944,8 @@ class OllamaProvider(BaseLLM):
 
         logger.debug("[ollama] Sending completion request. model=%s", self.spec.model_id)
 
+        # No send-time stamp here: local inference is free, so there is no
+        # rate to resolve against the clock.
         response = await client.post("/chat/completions", json=payload, timeout=self._post_timeout(kwargs))
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
@@ -1745,7 +1980,9 @@ class OllamaProvider(BaseLLM):
             model_name=self.spec.model_id,
         )
 
-    def compute_cost(self, usage: TokenUsage) -> float:
+    def compute_cost(
+        self, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
         return 0.0  # Local models incur no API cost
 
 
@@ -2512,6 +2749,17 @@ DEFAULT_FORCE_LOCAL_BELOW_USD = 0.05      # switch to local model below this
 DEFAULT_REFUSE_EST_COST_FRACTION = 0.80   # warn/refuse when est_cost > frac × remaining
 DEFAULT_LOW_BUDGET_SKIP_USD = 0.10        # skip optional review / node work below this
 DEFAULT_MIN_CALL_BUDGET_USD = 0.01        # minimum remaining to attempt a call
+# Charging for attempts the provider billed but whose response never reached
+# us (token_budget.retry_charge). On by default for read timeouts: those
+# tokens are charged to the account whether or not we booked them, and
+# booking them at $0 is the one option guaranteed to be wrong. Server errors
+# are off by default because a 5xx is usually a refusal before generation.
+DEFAULT_RETRY_CHARGE_ENABLED = True
+DEFAULT_RETRY_CHARGE_READ_TIMEOUTS = True
+DEFAULT_RETRY_CHARGE_SERVER_ERRORS = False
+# Cold-start output estimate, used only until the role has produced one
+# measured call this session; after that the role's own mean is used.
+DEFAULT_RETRY_CHARGE_FALLBACK_OUTPUT_TOKENS = 2000
 DEFAULT_PREFETCH_BUDGET_SECONDS_MAX = 10.0  # hard ceiling on LSP prefetch time budget
 
 # Provider retry / backoff resilience defaults. Config-controlled via
@@ -2753,6 +3001,11 @@ class GatewayConfig:
     refuse_if_est_cost_fraction_over: float = DEFAULT_REFUSE_EST_COST_FRACTION
     low_budget_skip_usd: float = DEFAULT_LOW_BUDGET_SKIP_USD
     min_call_budget_usd: float = DEFAULT_MIN_CALL_BUDGET_USD
+    # token_budget.retry_charge — see _charge_unread_attempt. Kept as a dict
+    # rather than four flat fields because it is read in exactly one place
+    # and grows per failure class; the keys are enabled,
+    # charge_read_timeouts, charge_server_errors, fallback_output_tokens.
+    retry_charge: dict[str, Any] = field(default_factory=dict)
     # Optional per-stage soft budget allocation (C4 scaffold). Maps
     # NodeRole values to target fractions of hard_cap_usd. Today only
     # surfaces warnings when a stage exceeds its share; hard enforcement
@@ -3042,6 +3295,15 @@ class Gateway:
         # Same mechanism for strict-mode tools, keyed by model_key alone —
         # strict support is a property of the model, not of thinking mode.
         self._strict_tools_unsupported: set[str] = set()
+        # Spend that the provider billed us for but that no usage block ever
+        # described, carried until the next dispatch can deduct it from the
+        # caller's budget. See _charge_unread_attempt: a read timeout does
+        # not stop the server generating, so the tokens are charged whether
+        # or not we ever see the response. Before 2026-11-05 every such
+        # attempt was booked at $0, which made an exhausted-retry dispatch
+        # look free and let the real account drain while the harness
+        # reported budget to spare.
+        self._unread_attempt_debt_usd: float = 0.0
         # 429/503 circuit breaker (P1.9). When too many rate-limit / server
         # failures pile up in a short window, fall the next call back to
         # local Ollama instead of burning retries with no chance of
@@ -3257,10 +3519,17 @@ class Gateway:
             + (f"# NOTE: {note}\n" if note else "")
             + f"# role: {role_str}  model: {response.model}  "
             f"finish: {response.finish_reason}\n"
-            f"# tokens_in={usage.input_tokens}  "
-            f"tokens_out={usage.output_tokens}  "
+            # prompt = the whole prompt; billed_in = the full-rate slice
+            # (prompt minus cache hits). Before 2026-11-05 this line printed
+            # the total under the name tokens_in, which made every analysis
+            # of these dumps read the billed slice as the whole prompt.
+            f"# prompt={usage.prompt_tokens}  "
+            f"billed_in={usage.input_tokens}  "
             f"cached={usage.cached_tokens}  "
-            f"cost=${cost_usd:.6f}  elapsed_ms={elapsed_ms}\n"
+            f"tokens_out={usage.output_tokens}  "
+            f"cost=${cost_usd:.6f}"
+            + ("~est" if usage.cost_is_estimated else "")
+            + f"  elapsed_ms={elapsed_ms}\n"
             f"# tool_calls={len(tool_calls)}  "
             f"content_chars={len(response.content) if isinstance(response.content, str) else 0}\n"
         )
@@ -3553,6 +3822,202 @@ class Gateway:
         """Return all registered Ollama model keys."""
         return [key for key, spec in _MODEL_REGISTRY.items() if spec.provider == "ollama"]
 
+    # ------------------------------------------------------------------
+    # Spend we are billed for but never get to read
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _provider_billed_despite_failure(
+        exc: BaseException, *, charge_read_timeouts: bool, charge_server_errors: bool,
+    ) -> str:
+        """Name the billing class of a failed attempt, or "" if unbilled.
+
+        The distinction is about how far the request got, not how it looked
+        to us:
+
+        - ``httpx.ReadTimeout`` — the request was delivered and the server
+          was generating when we stopped waiting. Generation does not stop
+          because the client hung up, so these tokens ARE billed. Our own
+          total-dispatch-deadline abort is deliberately raised as a
+          ReadTimeout, so it lands here too, which is correct: the only
+          difference from a real read timeout is which clock gave up.
+        - ``ConnectTimeout`` / ``ConnectError`` / ``WriteTimeout`` /
+          ``PoolTimeout`` — the prompt never fully reached the provider, so
+          there is nothing to bill. Note ConnectTimeout is a sibling of
+          ReadTimeout under TimeoutException, not a subclass, so the
+          isinstance check below separates them correctly.
+        - 429 — rejected before any generation. Not billed.
+        - 4xx — rejected (bad key, no credit, bad schema). Not billed.
+        - 5xx — ambiguous. Usually a gateway refusing the request before it
+          reached a GPU, occasionally a failure after generation. Defaults
+          to NOT charged, because guessing high on the common case would
+          inflate every total; operators who see otherwise on their own
+          provider can turn it on.
+        """
+        if charge_read_timeouts and isinstance(exc, httpx.ReadTimeout):
+            return "read_timeout"
+        if charge_server_errors and isinstance(exc, httpx.HTTPStatusError):
+            try:
+                if int(exc.response.status_code) >= 500:
+                    return "server_error"
+            except Exception:  # noqa: BLE001 — a malformed response is not billable
+                return ""
+        return ""
+
+    def _charge_unread_attempt(
+        self,
+        *,
+        exc: BaseException,
+        role: NodeRole,
+        model_key: str,
+        spec: ModelSpec,
+        est_prompt_tokens: int,
+        sent_at: Optional[_dt.datetime] = None,
+    ) -> float:
+        """Book an estimated charge for an attempt whose response we lost.
+
+        Both unknowns are estimated from THIS session's own measurements for
+        THIS role rather than from a constant, so the estimate tracks the
+        workload instead of a guess made when the code was written:
+
+        - how much of the prompt was a cache hit — taken from the hit ratio
+          the role has actually been getting. With no observation yet the
+          ratio is 0, which is not a pessimistic fudge but the truth: the
+          first call of a session has nothing to hit.
+        - how many output tokens came back — the role's mean so far, falling
+          back to ``token_budget.retry_charge.fallback_output_tokens`` on a
+          cold start.
+
+        The result is marked ``cost_is_estimated`` so no downstream total
+        can mistake it for something a provider told us, and it is added to
+        ``_unread_attempt_debt_usd`` so the next dispatch deducts it from
+        the caller's budget. Returns the amount charged (0.0 when disabled
+        or when the failure class is not billed).
+        """
+        cfg = getattr(self.config, "retry_charge", None) or {}
+        if not bool(cfg.get("enabled", True)):
+            return 0.0
+        kind = self._provider_billed_despite_failure(
+            exc,
+            charge_read_timeouts=bool(cfg.get("charge_read_timeouts", True)),
+            charge_server_errors=bool(cfg.get("charge_server_errors", False)),
+        )
+        if not kind:
+            return 0.0
+
+        role_key = role.value if hasattr(role, "value") else str(role)
+        stage = (self.session_tracker.get("per_stage") or {}).get(role_key) or {}
+        seen_cached = int(stage.get("cached_tokens", 0) or 0)
+        seen_input = int(stage.get("input_tokens", 0) or 0)
+        hit_ratio = (
+            seen_cached / (seen_cached + seen_input)
+            if (seen_cached + seen_input) > 0
+            else 0.0
+        )
+        calls = int(stage.get("calls", 0) or 0)
+        est_output = (
+            int(round(int(stage.get("output_tokens", 0) or 0) / calls))
+            if calls > 0
+            else int(cfg.get("fallback_output_tokens", 2000) or 0)
+        )
+
+        prompt = max(0, int(est_prompt_tokens))
+        cached = int(round(prompt * hit_ratio))
+        usage = TokenUsage(
+            input_tokens=max(0, prompt - cached),
+            output_tokens=max(0, est_output),
+            cached_tokens=cached,
+            model_name=spec.model_id,
+            cost_is_estimated=True,
+        )
+        usage.cost_usd = self.compute_cost_for(spec, usage, at=sent_at)
+        if usage.cost_usd <= 0.0:
+            return 0.0
+
+        self._unread_attempt_debt_usd += usage.cost_usd
+        self.aggregate_tokens(self.session_tracker, usage, role=role)
+        logger.warning(
+            "[gateway] Attempt lost to %s on %s (role=%s) but the provider "
+            "billed it. Charging an estimated $%.6f "
+            "(prompt~%d, cache_hit_ratio=%.2f, output~%d). Carried as debt "
+            "against the next dispatch's budget.",
+            kind, model_key, role_key, usage.cost_usd, prompt, hit_ratio,
+            usage.output_tokens,
+        )
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "llm_call_unread_attempt",
+                model=spec.model_id,
+                role=role_key,
+                failure_kind=kind,
+                tokens_in=usage.input_tokens,
+                cached_tokens=usage.cached_tokens,
+                tokens_out=usage.output_tokens,
+                cost_usd=usage.cost_usd,
+                estimated=True,
+            )
+        except Exception:  # noqa: BLE001 — observability must never break dispatch
+            pass
+        return usage.cost_usd
+
+    @staticmethod
+    def compute_cost_for(
+        spec: ModelSpec, usage: TokenUsage, *, at: Optional[_dt.datetime] = None
+    ) -> float:
+        """Price a usage record against a spec without a provider instance.
+
+        The estimated-charge path has a spec but no live provider (the call
+        it is pricing never completed), and the rate resolution must be the
+        same one the real billing path uses or the two will drift.
+        """
+        return spec.rates_at(at).price(usage)
+
+    async def _bounded_attempt(
+        self,
+        provider: BaseLLM,
+        kw: dict[str, Any],
+        *,
+        deadline: float,
+        role: NodeRole,
+        model_key: str,
+    ) -> LLMResponse:
+        """One provider call under a TOTAL wall-clock deadline.
+
+        Converts the expiry into ``httpx.ReadTimeout`` so every existing
+        timeout path -- retry_with_backoff, the network cool-off,
+        fallback_on_timeout -- handles it unchanged. A stalled read is
+        exactly what this is, just detected by us instead of by a
+        between-bytes clock that never fires.
+
+        A method rather than a closure so the attempt boundary has a name:
+        the unread-attempt charge wraps calls to THIS, and a nested
+        function that each retry redefined made it impossible to say where
+        one billed attempt ended and the next began.
+        """
+        try:
+            async with asyncio.timeout(deadline):
+                return await provider.chat_completion(**kw)
+        except TimeoutError as exc:
+            logger.warning(
+                "[gateway] dispatch exceeded its total deadline of "
+                "%.0fs (role=%s, model=%s) — aborting the attempt. "
+                "The HTTP read was still open: httpx bounds the gap "
+                "between bytes, not the call.",
+                deadline,
+                role.value if hasattr(role, "value") else role,
+                model_key,
+            )
+            raise httpx.ReadTimeout(
+                f"total dispatch deadline of {deadline:.0f}s exceeded"
+            ) from exc
+
+    def _drain_unread_attempt_debt(self) -> float:
+        """Take the accumulated unread-attempt charge and reset it."""
+        debt = self._unread_attempt_debt_usd
+        self._unread_attempt_debt_usd = 0.0
+        return debt
+
     async def dispatch(
         self,
         *,
@@ -3650,6 +4115,22 @@ class Gateway:
             raise RuntimeError(
                 f"[GUARDRAIL EXHAUSTED]: Active session hit the ${self.config.hard_cap_usd:.2f} threshold. "
                 f"Budget remaining: ${budget_remaining_usd:.4f}"
+            )
+
+        # Settle any spend billed to us since the last dispatch that no usage
+        # block described (lost attempts -- see _charge_unread_attempt). It is
+        # applied HERE, before the pre-flight estimate, so the debt narrows the
+        # budget this call is checked against and is reflected in the budget
+        # this call returns. Deliberately after the exhaustion guard above: if
+        # we are already at zero we return without draining, and the debt
+        # stays pending rather than evaporating.
+        _unread_debt = self._drain_unread_attempt_debt()
+        if _unread_debt > 0.0:
+            budget_remaining_usd = max(0.0, budget_remaining_usd - _unread_debt)
+            logger.warning(
+                "[gateway] Applying $%.6f of previously unbilled attempt "
+                "spend to the budget. Remaining: $%.4f",
+                _unread_debt, budget_remaining_usd,
             )
 
         # P1.9: 429/503 circuit breaker — if recent rate-limit bursts have
@@ -3973,16 +4454,28 @@ class Gateway:
         # close proxy otherwise) and fall back to chars/4; a fixed 4k output
         # reserve keeps the estimate on the safe side — better to refuse a
         # borderline call than overspend the cap silently.
+        # Hoisted out of the try below: the unread-attempt charge needs the
+        # prompt size even when the pre-flight estimate itself fell over, and
+        # a NameError there would turn a billing miss into a crash.
+        _est_prompt_tokens = 0
         try:
             est_input_tokens = max(1, sum(
                 count_text_tokens(m.get("content", ""))
                 if isinstance(m.get("content", ""), str) else 0
                 for m in messages
             ))
+            _est_prompt_tokens = est_input_tokens
             est_output_tokens = 4000  # pessimistic reserve for the response
+            # Same rate resolution as the post-hoc billing path, so a call
+            # cannot be waved through by an estimate that prices it off-peak
+            # and then charged at the peak rate. Cache hits are deliberately
+            # NOT modelled here: assuming a hit we have not had would
+            # under-estimate, and the point of this gate is to be
+            # conservative.
+            _est_rates = spec.rates_at()
             est_cost = (
-                (est_input_tokens / 1_000_000.0) * spec.input_cost_per_1m
-                + (est_output_tokens / 1_000_000.0) * spec.output_cost_per_1m
+                (est_input_tokens / 1_000_000.0) * _est_rates.input_per_1m
+                + (est_output_tokens / 1_000_000.0) * _est_rates.output_per_1m
             )
             if est_cost > budget_remaining_usd:
                 raise BudgetTooLowError(
@@ -4027,6 +4520,12 @@ class Gateway:
 
         import time as _time
         _dispatch_start = _time.monotonic()
+        # Wall-clock twin of _dispatch_start. The monotonic clock cannot be
+        # mapped to a UTC hour, and the rate column depends on the hour: a
+        # call that starts off-peak and returns after the boundary is billed
+        # off-peak, so the log label has to resolve against the start too or
+        # it will contradict the charge.
+        _sent_at_for_log = _dt.datetime.now(_dt.UTC)
 
         # --- Compelled tool_choice: learn-and-downgrade ---
         # If this (model, thinking) pair already refused a compelled choice
@@ -4064,13 +4563,13 @@ class Gateway:
                 **llm_kwargs,
             )
             async def _bounded(**kw: Any) -> LLMResponse:
-                """One provider call under a TOTAL wall-clock deadline.
+                """One billable attempt: deadline, phase mark, and charge.
 
-                Converts the expiry into ``httpx.ReadTimeout`` so every
-                existing timeout path -- retry_with_backoff, the network
-                cool-off, fallback_on_timeout -- handles it unchanged. A
-                stalled read is exactly what this is, just detected by us
-                instead of by a between-bytes clock that never fires.
+                The deadline itself lives in ``_bounded_attempt``; this
+                closure exists to bracket that call with the two things
+                that are per-attempt rather than per-dispatch -- the stall
+                watchdog's phase mark and the charge for an attempt whose
+                response we never read.
                 """
                 from harness.stall_watchdog import mark_phase
 
@@ -4079,22 +4578,30 @@ class Gateway:
                 # provider call is still open or already returned -- the exact
                 # question run 01a1790b could not be answered from its log.
                 mark_phase(f"provider_call({model_key})")
+                # EVERY attempt passes through here -- the first one, the
+                # strict-downgrade retry, the tool_choice-downgrade retry, and
+                # each round retry_with_backoff drives. So this is the one
+                # place that can see an attempt the provider billed and we
+                # never read. Charging any further out would miss the retries;
+                # charging inside _bounded_attempt would miss nothing today but
+                # would tie the charge to the deadline rather than to the
+                # attempt.
+                _attempt_sent_at = _dt.datetime.now(_dt.UTC)
                 try:
-                    async with asyncio.timeout(_deadline):
-                        return await provider.chat_completion(**kw)
-                except TimeoutError as _exc:
-                    logger.warning(
-                        "[gateway] dispatch exceeded its total deadline of "
-                        "%.0fs (role=%s, model=%s) — aborting the attempt. "
-                        "The HTTP read was still open: httpx bounds the gap "
-                        "between bytes, not the call.",
-                        _deadline,
-                        role.value if hasattr(role, "value") else role,
-                        model_key,
+                    return await self._bounded_attempt(
+                        provider, kw, deadline=_deadline, role=role,
+                        model_key=model_key,
                     )
-                    raise httpx.ReadTimeout(
-                        f"total dispatch deadline of {_deadline:.0f}s exceeded"
-                    ) from _exc
+                except BaseException as _billed_exc:
+                    self._charge_unread_attempt(
+                        exc=_billed_exc,
+                        role=role,
+                        model_key=model_key,
+                        spec=provider.spec,
+                        est_prompt_tokens=_est_prompt_tokens,
+                        sent_at=_attempt_sent_at,
+                    )
+                    raise
 
             try:
                 return await _bounded(
@@ -4468,13 +4975,20 @@ class Gateway:
         response.usage.cost_usd = cost
         self.aggregate_tokens(self.session_tracker, response.usage, role=role)
 
+        # ``prompt`` is the whole prompt (what a provider dashboard shows);
+        # ``billed_in`` is the full-rate slice left after cache hits. Printing
+        # only one of them is how the cache's effect became invisible in the
+        # log: a 200k prompt at a 79% hit rate bills like a 42k one.
         logger.info(
-            "[gateway] Response received. model=%s tokens_in=%d tokens_out=%d cache_hit=%d cost=$%.6f budget_left=$%.4f",
+            "[gateway] Response received. model=%s prompt=%d (billed_in=%d "
+            "cache_hit=%d) tokens_out=%d cost=$%.6f%s budget_left=$%.4f",
             response.model,
+            response.usage.prompt_tokens,
             response.usage.input_tokens,
-            response.usage.output_tokens,
             response.usage.cached_tokens,
+            response.usage.output_tokens,
             cost,
+            " @peak" if provider.spec.rates_at(_sent_at_for_log).is_peak else "",
             new_budget,
         )
 
@@ -4484,11 +4998,17 @@ class Gateway:
                 "llm_call",
                 model=response.model,
                 role=role.value,
+                # tokens_in is the CANONICAL full-rate slice (cache misses
+                # only) — metrics.cache_hit_rate divides by
+                # cached + tokens_in and needs them disjoint. prompt_tokens
+                # carries the total for anything that wants prompt size.
                 tokens_in=response.usage.input_tokens,
+                prompt_tokens=response.usage.prompt_tokens,
                 tokens_out=response.usage.output_tokens,
                 cached_tokens=response.usage.cached_tokens,
                 cache_creation_tokens=response.usage.cache_creation_tokens,
                 cost_usd=cost,
+                unread_attempt_debt_usd=_unread_debt,
                 budget_remaining_usd=new_budget,
                 elapsed_ms=elapsed_ms,
                 finish_reason=response.finish_reason,
@@ -4666,7 +5186,7 @@ class Gateway:
             )
             cost = 0.0
         else:
-            cost = (prompt_tokens / 1_000_000.0) * float(spec.input_cost_per_1m)
+            cost = (prompt_tokens / 1_000_000.0) * spec.rates_at().input_per_1m
 
         usage = TokenUsage(
             input_tokens=int(prompt_tokens),
@@ -5305,6 +5825,28 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             name="token_budget.gates.min_call_budget_usd",
             default=DEFAULT_MIN_CALL_BUDGET_USD, floor=0.0, ceiling=100000.0,
         ),
+        retry_charge={
+            "enabled": bool(
+                (token_budget.get("retry_charge", {}) or {}).get(
+                    "enabled", DEFAULT_RETRY_CHARGE_ENABLED)
+            ),
+            "charge_read_timeouts": bool(
+                (token_budget.get("retry_charge", {}) or {}).get(
+                    "charge_read_timeouts", DEFAULT_RETRY_CHARGE_READ_TIMEOUTS)
+            ),
+            "charge_server_errors": bool(
+                (token_budget.get("retry_charge", {}) or {}).get(
+                    "charge_server_errors", DEFAULT_RETRY_CHARGE_SERVER_ERRORS)
+            ),
+            "fallback_output_tokens": _clamp_positive_int(
+                (token_budget.get("retry_charge", {}) or {}).get(
+                    "fallback_output_tokens",
+                    DEFAULT_RETRY_CHARGE_FALLBACK_OUTPUT_TOKENS),
+                name="token_budget.retry_charge.fallback_output_tokens",
+                default=DEFAULT_RETRY_CHARGE_FALLBACK_OUTPUT_TOKENS,
+                floor=0, ceiling=1_000_000,
+            ),
+        },
         # Provider retry / backoff resilience (llm_dispatch).
         max_retries=_clamp_positive_int(
             llm_dispatch.get("max_retries", DEFAULT_MAX_RETRIES),

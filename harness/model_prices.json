@@ -154,50 +154,98 @@
     "provider": "deepseek",
     "model_id": "deepseek-v4-flash",
     "context_window": 1000000,
-    "input_cost_per_1m": 0.14,
-    "output_cost_per_1m": 0.28,
-    "cached_input_cost_per_1m": 0.0028,
+    "input_cost_per_1m": 0.3,
+    "output_cost_per_1m": 1.2,
+    "cached_input_cost_per_1m": 0.006,
     "api_base_url": "https://api.deepseek.com/v1",
     "supports_thinking": true,
     "supports_cache": true,
     "supports_tools": true,
-    "thinking_rejects_forced_tool_choice": true
+    "thinking_rejects_forced_tool_choice": true,
+    "off_peak_multiplier": 0.5,
+    "peak_windows_utc": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ],
+    "peak_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
   "deepseek:deepseek-v4-pro": {
     "provider": "deepseek",
     "model_id": "deepseek-v4-pro",
     "context_window": 1000000,
-    "input_cost_per_1m": 0.435,
-    "output_cost_per_1m": 0.87,
-    "cached_input_cost_per_1m": 0.003625,
+    "input_cost_per_1m": 1.32,
+    "output_cost_per_1m": 3.96,
+    "cached_input_cost_per_1m": 0.044,
     "api_base_url": "https://api.deepseek.com/v1",
     "supports_thinking": true,
     "supports_cache": true,
     "supports_tools": true,
-    "thinking_rejects_forced_tool_choice": true
+    "thinking_rejects_forced_tool_choice": true,
+    "off_peak_multiplier": 0.5,
+    "peak_windows_utc": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ],
+    "peak_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
-  "_deepseek_legacy_deprecation": "The deepseek-chat and deepseek-reasoner aliases are deprecated by DeepSeek on 2026-07-24 15:59 UTC. chat resolves to v4-flash non-thinking; reasoner to v4-flash thinking. The entries below are kept for the transition window only.",
+  "_deepseek_legacy_deprecation": "deepseek-chat / deepseek-reasoner / deepseek-v4-flash are retired names. DeepSeek still accepts them but serves every request from DeepSeek-V4.1-Flash and bills it at the Flash price, so all three are priced from the Flash column here. Use deepseek:deepseek-flash for new work. Rates below are the PEAK column; off_peak_multiplier halves them outside peak_windows_utc (DeepSeek's published off-peak discount).",
   "deepseek:deepseek-chat": {
     "provider": "deepseek",
     "model_id": "deepseek-chat",
     "context_window": 64000,
-    "input_cost_per_1m": 0.27,
-    "output_cost_per_1m": 1.1,
-    "cached_input_cost_per_1m": 0.07,
+    "input_cost_per_1m": 0.3,
+    "output_cost_per_1m": 1.2,
+    "cached_input_cost_per_1m": 0.006,
     "api_base_url": "https://api.deepseek.com/v1",
-    "supports_tools": true
+    "supports_tools": true,
+    "off_peak_multiplier": 0.5,
+    "peak_windows_utc": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ],
+    "peak_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
   "deepseek:deepseek-reasoner": {
     "provider": "deepseek",
     "model_id": "deepseek-reasoner",
     "context_window": 64000,
-    "input_cost_per_1m": 0.55,
-    "output_cost_per_1m": 2.19,
-    "cached_input_cost_per_1m": 0.14,
+    "input_cost_per_1m": 0.3,
+    "output_cost_per_1m": 1.2,
+    "cached_input_cost_per_1m": 0.006,
     "api_base_url": "https://api.deepseek.com/v1",
     "supports_thinking": true,
     "supports_tools": true,
-    "thinking_rejects_forced_tool_choice": true
+    "thinking_rejects_forced_tool_choice": true,
+    "off_peak_multiplier": 0.5,
+    "peak_windows_utc": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ],
+    "peak_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
   "moonshot:kimi-k3": {
     "provider": "moonshot",
@@ -249,5 +297,30 @@
     "input_cost_per_1m": 0.0,
     "output_cost_per_1m": 0.0,
     "api_base_url": "http://localhost:11434/v1"
+  },
+  "deepseek:deepseek-flash": {
+    "provider": "deepseek",
+    "model_id": "deepseek-flash",
+    "context_window": 1000000,
+    "input_cost_per_1m": 0.3,
+    "output_cost_per_1m": 1.2,
+    "cached_input_cost_per_1m": 0.006,
+    "off_peak_multiplier": 0.5,
+    "peak_windows_utc": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ],
+    "peak_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "api_base_url": "https://api.deepseek.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true,
+    "supports_tools": true,
+    "thinking_rejects_forced_tool_choice": true
   }
 }

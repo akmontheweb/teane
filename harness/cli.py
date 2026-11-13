@@ -1026,6 +1026,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "level", "log_dir", "json_stderr", "langsmith",
         # P2.3: rotation knobs for the per-session JSONL file handler.
         "max_bytes", "backup_count",
+        # Session-log retention. Nothing pruned these before 2026-11-13.
+        # 0 disables either axis; both apply together.
+        "retention_days", "max_session_logs",
         # Console (stderr) verbosity, independent of the file handler.
         # "WARNING" keeps the terminal quiet while the file captures the
         # full stream; "OFF"/"NONE" silences the console entirely; null
@@ -1511,6 +1514,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.langsmith": (bool,),
     "logging.max_bytes": (int,),
     "logging.backup_count": (int,),
+    "logging.retention_days": (int,),
+    "logging.max_session_logs": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
     "test_generation.max_contradiction_reprompts": (int,),
@@ -8123,7 +8128,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
     set_active_session_id(session_id)
 
     # Configure structured logging / per-session log file
-    from harness.observability import configure_logging
+    from harness.observability import (
+        DEFAULT_LOG_RETENTION_DAYS,
+        DEFAULT_MAX_SESSION_LOGS,
+        configure_logging,
+    )
     log_cfg = config.get("logging", {})
     configure_logging(
         session_id=session_id,
@@ -8134,6 +8143,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
         console_level=log_cfg.get("console_level"),
+        retention_days=int(
+            log_cfg.get("retention_days", DEFAULT_LOG_RETENTION_DAYS)),
+        max_session_logs=int(
+            log_cfg.get("max_session_logs", DEFAULT_MAX_SESSION_LOGS)),
         # Declares this process a real run, which emits ``session_start``.
         # ``teane web start`` calls configure_logging too and deliberately
         # does NOT pass this — its boot log must not read as a session.
@@ -9460,7 +9473,11 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     # and never lands in ~/.harness/logs/<session>.jsonl — leaving
     # `teane metrics`, the dashboard, and any post-hoc log grep blind
     # to the entire resumed run. Mirror cmd_run's block verbatim.
-    from harness.observability import configure_logging
+    from harness.observability import (
+        DEFAULT_LOG_RETENTION_DAYS,
+        DEFAULT_MAX_SESSION_LOGS,
+        configure_logging,
+    )
     log_cfg = config.get("logging", {})
     configure_logging(
         session_id=args.session_id,
@@ -9471,6 +9488,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
         console_level=log_cfg.get("console_level"),
+        retention_days=int(
+            log_cfg.get("retention_days", DEFAULT_LOG_RETENTION_DAYS)),
+        max_session_logs=int(
+            log_cfg.get("max_session_logs", DEFAULT_MAX_SESSION_LOGS)),
         # Declares this process a real run, which emits ``session_start``.
         # ``teane web start`` calls configure_logging too and deliberately
         # does NOT pass this — its boot log must not read as a session.
@@ -11630,8 +11651,13 @@ def cmd_web_start(args: argparse.Namespace) -> int:
 
     # === 2. Background dispatch =============================================
     background = (str(getattr(args, "background", "no")).lower() == "yes")
-    host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1")
-    port = int(getattr(args, "port", 9000) or 9000)
+    # Resolution order: typed flag > dashboard.{host,port} in config >
+    # the dataclass default. Before 2026-11-13 the flag's argparse default
+    # won unconditionally, so a config that said port 8729 still served on
+    # 9000 (_DEFAULT_PORT is 8729) and nothing reported the discrepancy.
+    _host_flag = getattr(args, "host", None)
+    _port_flag = getattr(args, "port", None)
+    host, port = _resolve_web_bind(_host_flag, _port_flag)
 
     if background:
         return _web_start_background(host=host, port=port)
@@ -11639,6 +11665,29 @@ def cmd_web_start(args: argparse.Namespace) -> int:
         host=host, port=port,
         print_mobile_url=bool(getattr(args, "print_mobile_url", False)),
     )
+
+
+def _resolve_web_bind(
+    host_flag: Optional[str], port_flag: Optional[int],
+) -> tuple[str, int]:
+    """Resolve the bind address: typed flag > config > dataclass default.
+
+    ``None`` means "not typed". Config discovery is best-effort — a broken
+    or absent config must not stop the operator starting the UI, so a
+    failure falls through to ``DashboardConfig``'s own defaults.
+    """
+    from harness.dashboard import DashboardConfig
+
+    try:
+        cfg = DashboardConfig.from_config(discover_config(os.getcwd()))
+    except Exception:  # noqa: BLE001 — never block a start
+        cfg = DashboardConfig()
+    # Fall back to the DATACLASS defaults, never to literals repeated here:
+    # a second hardcoded default is the bug this function exists to fix.
+    fallback = DashboardConfig()
+    host = str(host_flag or cfg.host or fallback.host)
+    port = int(port_flag or cfg.port or fallback.port)
+    return host, port
 
 
 def _web_start_foreground(*, host: str, port: int, print_mobile_url: bool = False) -> int:
@@ -13742,7 +13791,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  teane web start                          # foreground, http://127.0.0.1:9000\n"
+            "  teane web start                          # foreground, http://127.0.0.1:8729\n"
             "  teane web start --port 8080              # foreground on port 8080\n"
             "  teane web start --host 0.0.0.0           # bind all interfaces\n"
             "  teane web start --background yes         # detach; logs to ~/.harness/web.log\n"
@@ -13776,26 +13825,32 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  teane web start\n"
-            "      → http://127.0.0.1:9000 (foreground)\n\n"
+            "      → http://127.0.0.1:8729 (foreground; dashboard.port wins)\n\n"
             "  teane web start --port 8080\n"
             "      → http://127.0.0.1:8080 (foreground)\n\n"
             "  teane web start --host 0.0.0.0 --port 8080\n"
             "      → http://0.0.0.0:8080 (all interfaces, foreground)\n\n"
             "  teane web start --background yes\n"
-            "      → detached on http://127.0.0.1:9000, logs to ~/.harness/web.log\n"
+            "      → detached on http://127.0.0.1:8729, logs to ~/.harness/web.log\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # No argparse default on either: an omitted flag must stay
+    # DISTINGUISHABLE from a typed one, or config can never be consulted.
+    # Baking 9000 in here is what made dashboard.port silently dead — the
+    # flag's default beat the configured value on every start.
     web_start_parser.add_argument(
-        "--host", default="127.0.0.1", metavar="HOST",
-        help="Bind host. Default: 127.0.0.1 (localhost only). "
+        "--host", default=None, metavar="HOST",
+        help="Bind host. Overrides dashboard.host in config.json; "
+             "defaults to 127.0.0.1 (localhost only) when neither is set. "
              "Pass 0.0.0.0 to bind every interface — when you do, set "
              "dashboard.token_env in config.json so the server requires "
              "a bearer token.",
     )
     web_start_parser.add_argument(
-        "--port", type=int, default=9000, metavar="PORT",
-        help="Bind port. Default: 9000.",
+        "--port", type=int, default=None, metavar="PORT",
+        help="Bind port. Overrides dashboard.port in config.json; "
+             "defaults to 8729 when neither is set.",
     )
     web_start_parser.add_argument(
         "--background", choices=["yes", "no"], default="no", metavar="{yes,no}",

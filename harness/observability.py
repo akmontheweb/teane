@@ -448,6 +448,110 @@ _DEFAULT_LOG_BACKUP_COUNT = 5
 OPERATOR_HANDLER_ATTR = "_teane_operator_handler"
 
 
+#: Session-log retention. Nothing pruned these before 2026-11-13: the
+#: harness wrote one JSONL per session and kept every one forever, so the
+#: directory was either unbounded or — as actually happened — cleared by
+#: hand, which is how five of six lumina runs vanished and left the
+#: dashboard with a single log to show. Both axes are needed: days alone is
+#: unbounded for someone running fifty builds a day, and a file count alone
+#: can silently swallow a month of history in one busy afternoon. 0
+#: disables either axis. Mirrors persistence.ttl_days and
+#: dashboard.audit_log_retention_days.
+DEFAULT_LOG_RETENTION_DAYS = 90
+DEFAULT_MAX_SESSION_LOGS = 500
+
+
+def _session_log_groups(log_dir: str) -> dict[str, list[tuple[float, str]]]:
+    """Group a log dir's files by session.
+
+    Rotation turns one session into ``<sid>.jsonl`` plus ``<sid>.jsonl.1``,
+    ``.2`` ... and ``metrics`` globs ``<sid>.jsonl.*`` to re-assemble them,
+    so a session must be pruned as a UNIT — dropping only the backups would
+    leave metrics reading a truncated run and calling it complete.
+
+    Symlinks are skipped, never followed: ``latest.jsonl`` points at the
+    live session and deleting through it would take the real log with it.
+    """
+    groups: dict[str, list[tuple[float, str]]] = {}
+    try:
+        with os.scandir(log_dir) as it:
+            for ent in it:
+                if ent.is_symlink() or not ent.is_file():
+                    continue
+                name = ent.name
+                if ".jsonl" not in name:
+                    continue
+                sid = name.split(".jsonl", 1)[0]
+                try:
+                    groups.setdefault(sid, []).append((ent.stat().st_mtime, ent.path))
+                except OSError:
+                    continue
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return {}
+    return groups
+
+
+def prune_session_logs(
+    log_dir: str,
+    *,
+    retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
+    max_sessions: int = DEFAULT_MAX_SESSION_LOGS,
+    keep: Optional[str] = None,
+) -> int:
+    """Drop old session logs. Returns the number of SESSIONS removed.
+
+    ``keep`` is the session that must never be pruned — the one whose
+    handler was just attached. Without it a tight ``max_sessions`` would
+    delete the log the current run is in the middle of writing.
+
+    A session's age is its NEWEST file's mtime, so a long run that rotated
+    hours ago is not aged out by its own first backup.
+
+    Best-effort throughout: retention is housekeeping and must never stop a
+    run from starting.
+    """
+    groups = _session_log_groups(log_dir)
+    if keep is not None:
+        groups.pop(keep, None)
+    if not groups:
+        return 0
+
+    newest = {sid: max(m for m, _ in files) for sid, files in groups.items()}
+    doomed: set[str] = set()
+
+    if retention_days and retention_days > 0:
+        cutoff = time.time() - (retention_days * 86400)
+        doomed |= {sid for sid, m in newest.items() if m < cutoff}
+
+    if max_sessions and max_sessions > 0:
+        survivors = sorted(
+            (sid for sid in groups if sid not in doomed),
+            key=lambda sid: newest[sid], reverse=True,       # newest first
+        )
+        doomed |= set(survivors[max_sessions:])
+
+    removed = 0
+    for sid in doomed:
+        gone = True
+        for _mtime, path in groups[sid]:
+            try:
+                os.remove(path)
+            except OSError:
+                gone = False
+        removed += int(gone)
+
+    # A pruned target leaves ``latest.jsonl`` dangling. Harmless to the
+    # dashboard (it skips symlinks) but confusing to a human running
+    # `tail -f`, so clear it.
+    link = os.path.join(log_dir, "latest.jsonl")
+    try:
+        if os.path.islink(link) and not os.path.exists(link):
+            os.unlink(link)
+    except OSError:
+        pass
+    return removed
+
+
 def configure_logging(
     session_id: str,
     log_dir: str = "~/.harness/logs",
@@ -458,6 +562,8 @@ def configure_logging(
     backup_count: int = _DEFAULT_LOG_BACKUP_COUNT,
     console_level: Optional[str] = None,
     workspace_path: Optional[str] = None,
+    retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
+    max_session_logs: int = DEFAULT_MAX_SESSION_LOGS,
 ) -> Optional[str]:
     """
     Configure the harness logging stack for a session.
@@ -480,6 +586,11 @@ def configure_logging(
                            plain FileHandler for parity with legacy behavior).
         backup_count:      Number of rotated backups to keep alongside the
                            live file (oldest is deleted on the next rotation).
+        retention_days:    Delete session logs whose newest file is older
+                           than this many days (0 disables).
+        max_session_logs:  Keep at most this many sessions, newest first
+                           (0 disables). The session being configured is
+                           never pruned.
         workspace_path:    The workspace this session operates on. Supplying
                            it marks the session as a REAL harness run and
                            emits the ``session_start`` lifecycle event (see
@@ -610,6 +721,24 @@ def configure_logging(
         # The tests passed because their fixtures wrote the events by hand.
         if workspace_path is not None:
             _emit_session_start(session_id, workspace_path)
+        # Housekeeping AFTER the handler is live, so the current session is
+        # already on disk and protected by ``keep``, and so anything the
+        # prune logs lands in this session's own file.
+        try:
+            dropped = prune_session_logs(
+                expanded_dir,
+                retention_days=retention_days,
+                max_sessions=max_session_logs,
+                keep=session_id,
+            )
+            if dropped:
+                logging.getLogger("harness").info(
+                    "Pruned %d old session log(s) from %s "
+                    "(retention_days=%s, max_session_logs=%s).",
+                    dropped, expanded_dir, retention_days, max_session_logs,
+                )
+        except Exception:  # noqa: BLE001 — retention must never block a run
+            pass
     except OSError as e:
         logging.getLogger("harness").warning(
             "Could not create session log file in %s: %s", log_dir, e

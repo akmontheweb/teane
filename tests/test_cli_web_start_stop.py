@@ -287,7 +287,8 @@ def test_e2e_start_background_then_stop(tmp_path):
 
 def test_web_help_describes_start_and_stop():
     """`teane web --help` must explain both subcommands and show
-    the new defaults (port 9000, host 127.0.0.1, background no)."""
+    the defaults (port 8729 via dashboard.port, host 127.0.0.1,
+    background no)."""
     proc = subprocess.run(
         [sys.executable, "-m", "harness.cli", "web", "--help"],
         capture_output=True, text=True, timeout=10,
@@ -310,7 +311,12 @@ def test_web_start_help_describes_options():
     out = proc.stdout
     # New defaults surfaced.
     assert "127.0.0.1" in out
-    assert "9000" in out
+    # 8729 since 2026-11-13. The flag carried an argparse default of 9000,
+    # which beat dashboard.port (_DEFAULT_PORT = 8729) on every start — so
+    # the configured value was dead and the help advertised a port the
+    # config had never chosen. The flags now default to None so an omitted
+    # one stays distinguishable from a typed one.
+    assert "8729" in out
     # --background yes/no is documented.
     assert "background" in out
     assert "yes" in out and "no" in out

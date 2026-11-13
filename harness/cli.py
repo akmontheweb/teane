@@ -8134,6 +8134,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
         console_level=log_cfg.get("console_level"),
+        # Declares this process a real run, which emits ``session_start``.
+        # ``teane web start`` calls configure_logging too and deliberately
+        # does NOT pass this — its boot log must not read as a session.
+        workspace_path=workspace_path,
     )
 
     # Extract budget and sandbox settings
@@ -9467,6 +9471,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
         backup_count=int(log_cfg.get("backup_count", 5)),
         console_level=log_cfg.get("console_level"),
+        # Declares this process a real run, which emits ``session_start``.
+        # ``teane web start`` calls configure_logging too and deliberately
+        # does NOT pass this — its boot log must not read as a session.
+        workspace_path=workspace_path,
     )
 
     persistence_cfg = config.get("persistence", {})
@@ -14040,6 +14048,31 @@ def _arm_exit_watchdog(code: int, grace_seconds: float = 60.0) -> None:
 
 
 def main() -> int:
+    """Entry point. Wraps the real dispatch so the session lifecycle is
+    closed however the process leaves.
+
+    A run that dies on a provider 402, a traceback or a Ctrl-C is exactly
+    the run an operator most needs to see the end of, and before 2026-11-13
+    none of them wrote a ``session_end`` — so the dashboard could not tell a
+    crashed run from one still in flight. The exit code travels with the
+    event, so the sessions table can show WHY it ended.
+    """
+    from harness.observability import emit_session_end
+    rc = 1
+    try:
+        rc = _main_dispatch()
+        return rc
+    except SystemExit as exc:  # explicit sys.exit() somewhere downstream
+        rc = int(exc.code) if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        raise
+    except BaseException:  # noqa: BLE001 — crash / KeyboardInterrupt
+        rc = 1
+        raise
+    finally:
+        emit_session_end(rc)
+
+
+def _main_dispatch() -> int:
     """Console-script entry point: dispatch, then arm the exit watchdog
     so a wedged worker thread can never hold the process open past the
     decided exit code. See :func:`_arm_exit_watchdog`."""

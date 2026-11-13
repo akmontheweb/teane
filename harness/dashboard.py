@@ -565,11 +565,22 @@ def list_sessions(cfg: DashboardConfig) -> list[SessionSummary]:
         return []
     out: list[SessionSummary] = []
     try:
-        entries = [
-            (e, os.path.getmtime(os.path.join(log_dir, e)))
-            for e in os.listdir(log_dir)
-            if e.endswith(".jsonl")
-        ]
+        # ``latest.jsonl`` is a SYMLINK to the current session's file,
+        # maintained by observability.configure_logging so `tail -f` works
+        # without knowing the session id. Globbing it as a session parsed
+        # the newest run twice: a phantom row named "latest" in this table,
+        # the newest run double-counted in all three status windows, every
+        # point of its cost burn plotted twice, and a duplicate entry in the
+        # resume picker. Resolve-and-skip rather than match the name, so any
+        # other convenience link an operator drops here is handled too.
+        entries = []
+        for e in os.listdir(log_dir):
+            if not e.endswith(".jsonl"):
+                continue
+            full = os.path.join(log_dir, e)
+            if os.path.islink(full):
+                continue
+            entries.append((e, os.path.getmtime(full)))
     except OSError:
         return []
     entries.sort(key=lambda t: t[1], reverse=True)
@@ -579,6 +590,23 @@ def list_sessions(cfg: DashboardConfig) -> list[SessionSummary]:
         summary = _parse_session_log(session_id, path)
         out.append(summary)
     return out
+
+
+def _event_timestamp(event: dict[str, Any]) -> str:
+    """The time an event happened, however the writer spelled it.
+
+    Lifecycle events carry an explicit ``timestamp``; every other JSONL line
+    gets ``ts`` from ``observability.JSONFormatter``, which stamps all of
+    them. Both are ISO-8601 UTC.
+
+    Reading only ``timestamp`` is why the fallback below ("use the first
+    event's time when there is no session_start") never produced anything:
+    ordinary log lines have no such field, so every session came back with a
+    blank Started and Ended and could not be placed in a status window.
+    Accepting ``ts`` repairs that for logs already on disk, not just for runs
+    made after the lifecycle events started being emitted.
+    """
+    return str(event.get("timestamp") or event.get("ts") or "")
 
 
 def _parse_session_log(session_id: str, path: str) -> SessionSummary:
@@ -616,18 +644,18 @@ def _parse_session_log(session_id: str, path: str) -> SessionSummary:
                     )
                     summary.total_output_tokens += int(event.get("tokens_out", 0) or 0)
                 if event.get("event") == "session_end":
-                    summary.ended_at = str(event.get("timestamp") or summary.ended_at)
+                    summary.ended_at = _event_timestamp(event) or summary.ended_at
                     if event.get("exit_code") is not None:
                         summary.exit_code = int(event["exit_code"])
                 if event.get("event") == "session_start":
-                    summary.started_at = str(event.get("timestamp") or summary.started_at)
+                    summary.started_at = _event_timestamp(event) or summary.started_at
                     summary.workspace_path = str(event.get("workspace_path") or summary.workspace_path)
         # Fallback timestamps when explicit session_start/end events
         # weren't emitted.
         if not summary.started_at and first_event:
-            summary.started_at = str(first_event.get("timestamp") or "")
+            summary.started_at = _event_timestamp(first_event)
         if not summary.ended_at and last_event:
-            summary.ended_at = str(last_event.get("timestamp") or "")
+            summary.ended_at = _event_timestamp(last_event)
     except OSError:
         pass
     return summary
@@ -738,6 +766,10 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
         except OSError:
             entries = []
         for filename in entries:
+            # Same symlink skip as list_sessions — ``latest.jsonl`` would
+            # otherwise double every in-flight run in the "running now" list.
+            if os.path.islink(os.path.join(log_dir, filename)):
+                continue
             if not filename.endswith(".jsonl"):
                 continue
             path = os.path.join(log_dir, filename)
@@ -772,11 +804,11 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
                             continue
                         if evt.get("event") == "session_start":
                             has_session_start = True
-                            started_at = str(evt.get("timestamp") or "")
+                            started_at = _event_timestamp(evt)
                             workspace_path = str(evt.get("workspace_path") or "")
                             break
                         if not started_at:
-                            started_at = str(evt.get("timestamp") or "")
+                            started_at = _event_timestamp(evt)
             except OSError:
                 pass
             if not has_session_start:
@@ -847,7 +879,7 @@ def cost_burn_series(cfg: DashboardConfig) -> dict[str, Any]:
         for evt in session_events(s.log_path, max_events=5000):
             evt_name = evt.get("event")
             if evt_name == "llm_call" or evt_name == "embedding_call":
-                ts = str(evt.get("timestamp") or "")
+                ts = _event_timestamp(evt)
                 cost = float(evt.get("cost_usd", 0.0) or 0.0)
                 if ts:
                     rows.append((ts, cost))

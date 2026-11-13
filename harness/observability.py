@@ -142,6 +142,61 @@ class JSONFormatter(logging.Formatter):
 _event_logger = logging.getLogger("harness.events")
 
 
+#: True between ``session_start`` and ``session_end`` for THIS process.
+#: Guards ``emit_session_end`` so a command that never started a session
+#: (``teane doctor``, ``teane web start``) cannot close one, and so a
+#: second call is a no-op rather than a duplicate tail event.
+_session_open: bool = False
+
+
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC, matching ``JSONFormatter``'s ``ts`` field."""
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _emit_session_start(session_id: str, workspace_path: str) -> None:
+    """Open the session lifecycle. Called by :func:`configure_logging`.
+
+    ``timestamp`` is written explicitly rather than left to the formatter's
+    ``ts``: the field name is part of the contract every consumer reads, and
+    an event that carries its own time survives being copied out of the log
+    or replayed from a fixture.
+    """
+    global _session_open
+    emit_event(
+        "session_start",
+        timestamp=_utc_now_iso(),
+        session_id=session_id,
+        workspace_path=workspace_path,
+    )
+    _session_open = True
+
+
+def emit_session_end(exit_code: int) -> None:
+    """Close the session lifecycle, if one was opened in this process.
+
+    Called from the CLI's outermost ``finally`` so it fires on the paths
+    that matter most -- a crash, a provider 402, a KeyboardInterrupt -- not
+    just on a clean return. A run that dies without this event is
+    indistinguishable from one still in flight.
+
+    Idempotent and silent when no session was started, so commands that
+    only read state never write a dangling tail event.
+    """
+    global _session_open
+    if not _session_open:
+        return
+    _session_open = False
+    try:
+        emit_event(
+            "session_end",
+            timestamp=_utc_now_iso(),
+            exit_code=int(exit_code),
+        )
+    except Exception:  # noqa: BLE001 — never let telemetry mask an exit path
+        pass
+
+
 def emit_event(name: str, **fields: Any) -> None:
     """
     Emit a structured event record (INFO level — successful / observational).
@@ -402,6 +457,7 @@ def configure_logging(
     max_bytes: int = _DEFAULT_LOG_MAX_BYTES,
     backup_count: int = _DEFAULT_LOG_BACKUP_COUNT,
     console_level: Optional[str] = None,
+    workspace_path: Optional[str] = None,
 ) -> Optional[str]:
     """
     Configure the harness logging stack for a session.
@@ -424,6 +480,14 @@ def configure_logging(
                            plain FileHandler for parity with legacy behavior).
         backup_count:      Number of rotated backups to keep alongside the
                            live file (oldest is deleted on the next rotation).
+        workspace_path:    The workspace this session operates on. Supplying
+                           it marks the session as a REAL harness run and
+                           emits the ``session_start`` lifecycle event (see
+                           :func:`emit_session_end` for the other half).
+                           Leave it None for processes that configure logging
+                           without being a run -- notably ``teane web start``,
+                           whose boot log would otherwise show up in the
+                           dashboard as a phantom session.
         console_level:     Threshold for the live stderr (console) handler,
                            independent of the file handler. None → mirror
                            ``level`` (legacy behavior). "WARNING" keeps the
@@ -531,6 +595,21 @@ def configure_logging(
         # Print the resolved path unconditionally so it is visible even when
         # the console handler is quieted (console_level=WARNING/OFF).
         print(f"[teane] session log → {log_file_path}", file=sys.stderr, flush=True)
+        # Lifecycle event, emitted HERE because this is the one place that
+        # knows a per-session JSONL has just opened -- which also makes it
+        # the first event in the file, exactly as the dashboard's
+        # running-session scan assumes ("real runs always emit session_start
+        # at the top of the log", dashboard.list_running_sessions).
+        #
+        # Nothing emitted this pair until 2026-11-13, while the dashboard
+        # consumed it in ten places: the sessions table's Started / Ended /
+        # Status / Mode / Workspace columns were blank, all three status
+        # windows read zero because a session with no timestamp cannot be
+        # placed in one, and "is it still running?" -- decided by whether
+        # the tail event is ``session_end`` -- could never be answered.
+        # The tests passed because their fixtures wrote the events by hand.
+        if workspace_path is not None:
+            _emit_session_start(session_id, workspace_path)
     except OSError as e:
         logging.getLogger("harness").warning(
             "Could not create session log file in %s: %s", log_dir, e

@@ -29,11 +29,13 @@
         "cache_volumes_prefix": "harness",
         "timeout_seconds": 900,
         "test_timeout_seconds": 30,
+        "swallowed_exception_report_max": 2,
+        "swallowed_exception_traceback_lines": 20,
         "pgid_kill_on_timeout": true,
         "restore_workspace_ownership": true
     },
     "token_budget": {
-        "hard_cap_usd": 10.0,
+        "hard_cap_usd": 5.0,
         "context_window_threshold_pct": 0.85,
         "stages": {},
         "default_hard_cap_usd": 2.0,
@@ -225,9 +227,10 @@
             "api_key": "",
             "supports_cache": false
         },
-        "ollama:gemma4:12b": {
+        "ollama:qwen3.5:9b-mlx": {
             "provider": "ollama",
-            "model_id": "gemma4:12b",
+            "model_id": "qwen3.5:9b-mlx",
+            "supports_tools": true,
             "context_window": 32768,
             "input_cost_per_1m": 0.0,
             "output_cost_per_1m": 0.0,

@@ -282,10 +282,14 @@ def pytest_configure(config: Any) -> None:
     ``_debug_mode`` so the pre-call / task-exception collectors know
     to fire.
     """
-    global _disabled, _debug_mode
+    global _disabled, _debug_mode, _rootdir
     if _env_disabled() or _ini_disabled(config):
         _disabled = True
         return
+    try:
+        _rootdir = str(getattr(config, "rootpath", "") or getattr(config, "rootdir", "") or os.getcwd())
+    except Exception:
+        _rootdir = os.getcwd()
     if os.environ.get("TEANE_DIAGNOSTICS_MODE", "").strip().lower() == "debug":
         _debug_mode = True
         # Register the asyncio-exception collector on any running loop
@@ -367,6 +371,290 @@ def _extract_extra_lines(excinfo: Any) -> List[str]:
                 # Predicate or formatter blew up — never fatal.
                 continue
     return extra
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — swallowed-exception recorder.
+#
+# A route that wraps its body in ``except Exception: raise AppError("Internal
+# server error")`` turns every real failure into the same generic 500. The
+# test then sees only that body, and so does the repair LLM: lumina 01a1de20
+# (run 16) spent four repair rounds on a crash whose cause never reached any
+# diagnostic, because the only place it existed was the exception the
+# application caught and threw away.
+#
+# ``sys.monitoring`` (3.12+) fires EXCEPTION_HANDLED when control enters an
+# exception handler block, globally and across threads — which matters
+# because Starlette's TestClient runs the app in a worker thread. The event
+# names the try block, not the clause that matched, so the recorder resolves
+# the clause itself: it finds the innermost ``try`` whose BODY holds the
+# frame's current line and evaluates each handler's type in the frame's own
+# namespace, first match wins, exactly as the interpreter will. Only
+# exceptions caught by a BROAD clause (bare ``except``, ``Exception``,
+# ``BaseException``) in workspace PRODUCTION code are kept; a narrow handler
+# is the application handling a case it anticipated.
+#
+# Caps come from the harness's config via env (``sandbox.
+# swallowed_exception_report_max`` / ``swallowed_exception_traceback_lines``,
+# exported by ``harness/sandbox.py``); the defaults below apply when the
+# plugin runs outside the harness. ``TEANE_SWALLOWED_MAX=0`` disables it.
+# ---------------------------------------------------------------------------
+
+_SWALLOWED_MAX_DEFAULT = 2
+_SWALLOWED_TB_LINES_DEFAULT = 20
+
+#: Tool ids sys.monitoring reserves for others: 0 debugger, 1 coverage,
+#: 2 profiler, 5 optimizer. 3 and 4 are unassigned.
+_MONITOR_TOOL_CANDIDATES = (3, 4)
+
+_swallowed: list[dict[str, Any]] = []
+_swallowed_keys: set[tuple[str, int, str, int]] = set()
+_monitor_tool_id: Any = None
+_rootdir: str = ""
+_broad_try_cache: dict[str, Any] = {}
+
+_BROAD_NAMES = frozenset({"Exception", "BaseException"})
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _is_production_path(path: str) -> bool:
+    """A workspace source file that is not a test, fixture or dependency."""
+    if not path or not _rootdir:
+        return False
+    try:
+        ap = os.path.abspath(path)
+    except Exception:
+        return False
+    root = _rootdir.rstrip(os.sep) + os.sep
+    if not ap.startswith(root):
+        return False
+    rel = ap[len(root):]
+    parts = rel.split(os.sep)
+    if any(
+        p in ("site-packages", "dist-packages", "node_modules", "tests",
+              "test", "__pycache__") or p.startswith(".")
+        for p in parts[:-1]
+    ):
+        return False
+    base = parts[-1]
+    if base == "conftest.py" or base.startswith("test_") or base.endswith("_test.py"):
+        return False
+    return base.endswith(".py") and base != os.path.basename(__file__)
+
+
+_production_path_memo: dict[str, bool] = {}
+
+
+def _production_path_cached(path: str) -> bool:
+    hit = _production_path_memo.get(path)
+    if hit is None:
+        hit = _is_production_path(path)
+        _production_path_memo[path] = hit
+    return hit
+
+
+def _try_nodes(path: str) -> list[Any]:
+    """Every ``try`` statement in ``path`` (parsed once per file)."""
+    cached = _broad_try_cache.get(path)
+    if cached is not None:
+        return cached
+    nodes: list[Any] = []
+    try:
+        import ast
+        with open(path, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        try_types = tuple(
+            t for t in (getattr(ast, "Try", None), getattr(ast, "TryStar", None))
+            if t is not None
+        )
+        nodes = [n for n in ast.walk(tree) if isinstance(n, try_types)]
+    except Exception:
+        nodes = []
+    _broad_try_cache[path] = nodes
+    return nodes
+
+
+def _handler_is_broad(type_node: Any) -> bool:
+    import ast
+    if type_node is None:
+        return True
+    elts = type_node.elts if isinstance(type_node, ast.Tuple) else [type_node]
+    for e in elts:
+        name = e.id if isinstance(e, ast.Name) else (
+            e.attr if isinstance(e, ast.Attribute) else ""
+        )
+        if name in _BROAD_NAMES:
+            return True
+    return False
+
+
+def _matching_handler(path: str, line: int, exc: BaseException, frame: Any) -> Any:
+    """The ``except`` clause that will catch ``exc`` raised through ``line``,
+    or None (not inside a try body, or no clause matches)."""
+    import ast
+    best = None
+    for node in _try_nodes(path):
+        body = getattr(node, "body", None) or []
+        if not body:
+            continue
+        start = body[0].lineno
+        end = getattr(body[-1], "end_lineno", None) or body[-1].lineno
+        if start <= line <= end and (best is None or start >= best.body[0].lineno):
+            best = node
+    if best is None:
+        return None
+    ns: dict[str, Any] = {}
+    try:
+        import builtins
+        ns.update(vars(builtins))
+        ns.update(frame.f_globals)
+        ns.update(frame.f_locals)
+    except Exception:
+        pass
+    for handler in best.handlers:
+        if handler.type is None:
+            return handler
+        try:
+            expr = ast.Expression(body=handler.type)
+            typ = eval(compile(expr, path, "eval"), ns)  # noqa: S307 — the app's own handler expression
+            if isinstance(exc, typ):
+                return handler
+        except Exception:
+            # Unresolvable type expression: a broad-looking clause still
+            # names its intent statically, so fall back to the name.
+            if _handler_is_broad(handler.type):
+                return handler
+    return None
+
+
+def _on_exception_handled(code: Any, offset: int, exc: BaseException) -> Any:
+    # Always return None. EXCEPTION_HANDLED is one of the events that
+    # sys.monitoring refuses to DISABLE per location — returning DISABLE
+    # raises ValueError INSIDE the application's own except clause, which
+    # turns the observer into the failure. The per-file decision is cached
+    # instead, so a dependency's handled exceptions cost one dict lookup.
+    import sys
+    try:
+        path = code.co_filename
+        if not _production_path_cached(path):
+            return None
+        if len(_swallowed) >= _env_int("TEANE_SWALLOWED_MAX", _SWALLOWED_MAX_DEFAULT):
+            return None
+        tb = exc.__traceback__
+        if tb is None:
+            return None
+        frame = sys._getframe(1)
+        # The first traceback entry is the handling frame: its line is where
+        # the exception passed through this function's try body.
+        line = tb.tb_lineno
+        handler = _matching_handler(path, line, exc, frame)
+        if handler is None or not _handler_is_broad(handler.type):
+            return None
+        deepest = tb
+        while deepest.tb_next is not None:
+            deepest = deepest.tb_next
+        key = (path, handler.lineno, type(exc).__name__, deepest.tb_lineno)
+        if key in _swallowed_keys:
+            return None
+        _swallowed_keys.add(key)
+        import traceback
+        tb_lines = [
+            ln for chunk in traceback.format_exception(type(exc), exc, tb)
+            for ln in chunk.rstrip("\n").splitlines()
+        ]
+        _swallowed.append({
+            "handler": f"{os.path.relpath(path, _rootdir)}:{handler.lineno}",
+            "clause": "except" if handler.type is None else "except "
+                + _clause_text(handler.type),
+            "summary": f"{type(exc).__name__}: {_truncate(str(exc), 300)}",
+            "traceback": [
+                ln.replace(_rootdir.rstrip(os.sep) + os.sep, "") for ln in tb_lines
+            ],
+        })
+    except Exception:
+        return None
+    return None
+
+
+def _clause_text(type_node: Any) -> str:
+    try:
+        import ast
+        return ast.unparse(type_node)
+    except Exception:
+        return "Exception"
+
+
+def _start_swallow_recorder() -> None:
+    """Arm EXCEPTION_HANDLED for the duration of one test's call phase."""
+    global _monitor_tool_id
+    _swallowed.clear()
+    _swallowed_keys.clear()
+    if _env_int("TEANE_SWALLOWED_MAX", _SWALLOWED_MAX_DEFAULT) <= 0:
+        return
+    import sys
+    mon = getattr(sys, "monitoring", None)
+    if mon is None:
+        return
+    try:
+        if _monitor_tool_id is None:
+            for tid in _MONITOR_TOOL_CANDIDATES:
+                if mon.get_tool(tid) is None:
+                    mon.use_tool_id(tid, "teane_diagnostics")
+                    _monitor_tool_id = tid
+                    break
+            else:
+                return
+            mon.register_callback(
+                _monitor_tool_id, mon.events.EXCEPTION_HANDLED,
+                _on_exception_handled,
+            )
+        mon.restart_events()
+        mon.set_events(_monitor_tool_id, mon.events.EXCEPTION_HANDLED)
+    except Exception:
+        _monitor_tool_id = None
+
+
+def _stop_swallow_recorder() -> None:
+    import sys
+    mon = getattr(sys, "monitoring", None)
+    if mon is None or _monitor_tool_id is None:
+        return
+    try:
+        mon.set_events(_monitor_tool_id, 0)
+    except Exception:
+        pass
+
+
+def _render_swallowed_exceptions() -> List[str]:
+    """``[teane]`` lines for every exception production code swallowed
+    during the test that just failed. The leading phrase is matched by the
+    harness (``_CODE_GAP_EVIDENCE`` in graph.py) — keep them in step."""
+    cap = _env_int("TEANE_SWALLOWED_TB_LINES", _SWALLOWED_TB_LINES_DEFAULT)
+    out: List[str] = []
+    for rec in _swallowed:
+        out.append(
+            f"{_MARKER} exception swallowed by application code: "
+            f"{rec['summary']} — caught by broad `{rec['clause']}` at "
+            f"{rec['handler']}, so the response carried none of it. "
+            "Real traceback:"
+        )
+        tb = rec["traceback"]
+        if cap and len(tb) > cap:
+            # Keep the head (where it entered app code) and the tail (where
+            # it was raised) — the middle is the least informative part.
+            head = cap // 3
+            tb = tb[:head] + [f"... {len(tb) - cap} line(s) elided ..."] + tb[-(cap - head):]
+        out.extend(f"{_MARKER}   {ln}" for ln in tb)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +766,19 @@ try:
         yield
 
     @_pytest_module.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(item: Any):  # type: ignore[no-untyped-def]
+        """Layer 4 — record exceptions production code swallows while the
+        test body runs. Armed for the call phase only, so fixture setup and
+        teardown (which legitimately catch and retry) never contribute."""
+        if not _disabled:
+            _start_swallow_recorder()
+        try:
+            yield
+        finally:
+            if not _disabled:
+                _stop_swallow_recorder()
+
+    @_pytest_module.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(item: Any, call: Any):  # type: ignore[no-untyped-def]
         """After every test-phase, if the phase failed and the plugin is
         enabled, append renderer output to the report's ``longrepr`` under
@@ -504,6 +805,10 @@ try:
         # the re-run) so ordinary runs don't pay the format cost.
         if _debug_mode:
             extra = extra + _fmt_debug_lines(item)
+        try:
+            extra = extra + _render_swallowed_exceptions()
+        except Exception:
+            pass
         if not extra:
             return
         # Attach to longrepr. Handle both str and ``ReprEntry``-style

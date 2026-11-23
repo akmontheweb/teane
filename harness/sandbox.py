@@ -86,6 +86,14 @@ def _teane_diagnostics_injection_enabled() -> bool:
     return raw not in {"0", "off", "false", "no", "disabled"}
 
 
+#: ``sandbox.*`` config key → env var read by the teane_diagnostics plugin's
+#: swallowed-exception recorder (``harness/pytest_plugins/teane_diagnostics.py``).
+_SWALLOWED_EXCEPTION_ENV: dict[str, str] = {
+    "swallowed_exception_report_max": "TEANE_SWALLOWED_MAX",
+    "swallowed_exception_traceback_lines": "TEANE_SWALLOWED_TB_LINES",
+}
+
+
 def _apply_teane_diagnostics_env(
     env: dict[str, str], container_path: str,
 ) -> None:
@@ -2387,6 +2395,17 @@ class SandboxExecutor:
         self.pgid_kill_on_timeout = cfg.get(
             "pgid_kill_on_timeout", pgid_kill_on_timeout,
         )
+        # Layer 4 of the teane_diagnostics pytest plugin reports exceptions
+        # that production code caught in a broad ``except`` during a failing
+        # test. Its caps live in config like every other cap; the plugin runs
+        # inside the container, so they travel as env. setdefault: an
+        # explicit caller-supplied value wins.
+        self.extra_env = dict(self.extra_env)
+        for _cfg_key, _env_key in _SWALLOWED_EXCEPTION_ENV.items():
+            if _cfg_key in cfg:
+                self.extra_env.setdefault(
+                    _env_key, str(max(0, int(cfg[_cfg_key]))),
+                )
 
         if backend is not None:
             self.backend = backend

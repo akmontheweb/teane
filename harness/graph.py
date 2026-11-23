@@ -7830,9 +7830,18 @@ def _should_offer_unsatisfiable_escape(
     distraction_threshold: int = 2,
     low_signal_streak: int = 0,
     triage_test_bug: bool = False,
+    production_fault_evidence: str = "",
 ) -> bool:
     """Decide whether the defective-test banner should offer the
     ``UNSATISFIABLE_TEST`` escape this round.
+
+    ``production_fault_evidence`` vetoes every trigger below. It is the
+    harness's own proof (:func:`_code_gap_evidence`) that the failure is
+    something the APPLICATION did. Offering the escape then invites the one
+    wrong answer, and the declined-offer floor turns the model's correct
+    refusals into that answer on its behalf: lumina 01a1de20 (run 16)
+    declined four times, rightly, and the harness declared the test
+    unsatisfiable anyway until the class cap ended the run at 0/16.
 
     The escape is offered when the failing assertion sits in a tamper-guarded
     test file (``has_guarded_blocker``) AND either:
@@ -7874,6 +7883,12 @@ def _should_offer_unsatisfiable_escape(
         ``distraction_threshold`` rounds proving it.
     """
     if not has_guarded_blocker:
+        return False
+    # Evidence outranks every streak and the triage fingerprint: a test can
+    # carry an authoring smell and still be failing because production is
+    # broken, but the application cannot produce a crash body or a
+    # double-wrapped envelope because of anything the test got wrong.
+    if production_fault_evidence:
         return False
     if triage_test_bug:
         return True
@@ -8291,9 +8306,19 @@ def _apply_unsat_offer_floor(
     floor: int,
     asserted_correct: bool = False,
     verdict_says_distraction: bool = False,
+    production_fault_evidence: str = "",
 ) -> Optional[tuple[str, str]]:
     """Count declined ``UNSATISFIABLE_TEST`` offers and, at the floor, take
     the escape on the model's behalf.
+
+    Never against evidence. ``production_fault_evidence`` (from
+    :func:`_production_fault_evidence`) means the failure is something the
+    application did, so every decline was the model being RIGHT that the test
+    is sound. Forcing the escape then converts "repair has not fixed
+    production yet" into "the test is impossible" — lumina 01a1de20 (run 16)
+    died 0/16 of exactly that, the class cap charged six times on one correct
+    test. The counter is cleared rather than held at the floor so the
+    evidence going away later does not fire a stale, already-spent count.
 
     The escape is MODEL-DECLARED: the harness prints the offer and the model
     must emit an ``UNSATISFIABLE_TEST: <path>`` line for anything to happen.
@@ -8344,6 +8369,10 @@ def _apply_unsat_offer_floor(
         return None
     if not offer_files:
         return None
+    if production_fault_evidence:
+        for path in offer_files:
+            declined.pop(path, None)
+        return None
     # A silent decline and an asserted-correct round are not equal evidence.
     # Saying nothing is ambiguous; re-emitting a production file byte-for-
     # byte after being told the patch changed nothing is the model making
@@ -8373,8 +8402,8 @@ def _apply_unsat_offer_floor(
     return (
         worst,
         f"harness-declared after {count} declined UNSATISFIABLE_TEST "
-        "offer(s) with no production patch landing — the repair loop "
-        "cannot satisfy this test by changing production code",
+        "offer(s) with no round making progress on the blocker — the repair "
+        "loop cannot satisfy this test by changing production code",
     )
 
 
@@ -12557,6 +12586,49 @@ _CODE_GAP_EVIDENCE: tuple[tuple[Any, str], ...] = (
         re.compile(r"\bNotImplementedError\b"),
         "the production path raised NotImplementedError — it is a stub",
     ),
+    (
+        # The application's OWN error envelope nested under the framework's
+        # ``detail`` key. That shape only arises when a route raises
+        # ``HTTPException(detail=<envelope>)`` instead of letting the
+        # registered error handler build the response, so the envelope is
+        # wrapped twice. No test asked for that nesting — the test is reading
+        # the contract's shape and production is not producing it. lumina
+        # 01a1de20 (run 16): `KeyError: 'error'` on
+        # `{"detail":{"error":{"code":"INVALID_DAYS",...}}}`, and the
+        # harness declared the CORRECT test unsatisfiable six times.
+        re.compile(
+            r"""["']detail["']\s*:\s*\{\s*["']error["']\s*:""",
+        ),
+        "the application nested its own error envelope under the "
+        "framework's \"detail\" key — a route raised HTTPException with the "
+        "envelope as its detail instead of letting the registered error "
+        "handler build the response",
+    ),
+    (
+        # The application CRASHED and its catch-all turned the crash into a
+        # generic 500. Whatever the test sent, a server that answers with an
+        # unhandled-error body has a defect of its own; no edit to the test
+        # can make the crash not have happened. Same run: three of five
+        # failures were `{"code":"APP_ERROR","message":"Internal server
+        # error"}` from a route-level `except Exception`.
+        re.compile(
+            r"""["'](?:message|detail)["']\s*:\s*["']Internal server error["']"""
+            r"""|\bassert\s+500\s*==\s*[1-4]\d{2}\b""",
+            re.IGNORECASE,
+        ),
+        "the application crashed handling the request and answered with a "
+        "generic internal-server-error body — a production defect whatever "
+        "the test asserted",
+    ),
+    (
+        # The teane_diagnostics plugin saw production code catch an exception
+        # in a broad handler during this test (see
+        # ``_render_swallowed_exceptions`` in the plugin). That is a direct
+        # observation of the application failing, not an inference.
+        re.compile(r"exception swallowed by application code"),
+        "the test run observed application code catching an exception in a "
+        "broad `except` handler — the application failed and hid it",
+    ),
 )
 
 
@@ -12674,6 +12746,59 @@ def _code_gap_evidence(state: AgentState, test_file: str) -> str:
             if rx.search(blob):
                 return why
     return ""
+
+
+def _production_fault_evidence(
+    state: AgentState, test_files: Any,
+) -> tuple[str, str]:
+    """``(test_file, why)`` for the first of ``test_files`` whose current
+    failure carries :func:`_code_gap_evidence`, or ``("", "")``.
+
+    The gate every path that would blame a TEST consults first: the
+    UNSATISFIABLE_TEST offer, the declined-offer floor and the judge's
+    contradiction ruling. Prose and streaks are inferences; this is a thing
+    the application did, so it wins.
+    """
+    for f in sorted({str(x) for x in (test_files or []) if x}):
+        try:
+            why = _code_gap_evidence(state, f)
+        except Exception:  # noqa: BLE001 — evidence must never break repair
+            why = ""
+        if why:
+            return f, why
+    return "", ""
+
+
+def _production_fault_banner(test_file: str, why: str) -> str:
+    """The repair directive that replaces the UNSATISFIABLE_TEST offer when
+    the failure evidence says production is at fault."""
+    return (
+        f"PRODUCTION DEFECT EVIDENCE — the failure at {test_file} shows that "
+        f"{why}. The test is asserting what the specification requires; the "
+        "defect is in production code, so fix the production code path that "
+        "produced this response. The UNSATISFIABLE_TEST escape is NOT "
+        "available for this failure: no edit to the test can change what the "
+        "application did."
+    )
+
+
+def _log_production_fault_veto(test_file: str, why: str, path: str) -> None:
+    """Record that ``path`` would have blamed ``test_file`` and evidence
+    stopped it. Logged and emitted so a run audit can count the vetoes."""
+    logger.warning(
+        "[repair_node] Not treating %s as unsatisfiable (%s): the failure "
+        "evidence says the defect is in PRODUCTION code — %s. Keeping the "
+        "round on production repair.",
+        test_file, path, why,
+    )
+    try:
+        from harness.observability import emit_event as _emit_pfv
+        _emit_pfv(
+            "unsatisfiable_test_vetoed_by_evidence",
+            file=test_file, path=path, evidence=why,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not block
+        pass
 
 
 def _verdict_demands_test_edit(verdict: Any) -> str:
@@ -20441,6 +20566,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _distraction_streak = int(
                     loop_counter.get("consecutive_distraction_rounds", 0) or 0
                 )
+                _pf_file, _pf_why = _production_fault_evidence(
+                    state,
+                    _guarded_line_files | set(_guarded_tests_dropped),
+                )
                 # A protected-test blocker that survives repeated DISTRACTION
                 # verdicts means the prod targets aren't the fix — offer the
                 # UNSATISFIABLE_TEST escape instead of another futile prod
@@ -20460,7 +20589,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         _workspace_for_banner,
                         _guard_carveout_for_banner,
                     ),
+                    production_fault_evidence=_pf_why,
                 )
+                if _pf_why:
+                    _log_production_fault_veto(_pf_file, _pf_why, "judge-driven")
+                    reflection_banner_lines.append(
+                        _production_fault_banner(_pf_file, _pf_why)
+                    )
                 if _has_mandatable_target and _offer_unsat:
                     logger.warning(
                         "[repair_node] Protected-test blocker at %s survived "
@@ -20469,13 +20604,18 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         "distraction round.",
                         _guarded_display, _distraction_streak,
                     )
-                if _has_mandatable_target and not _offer_unsat:
+                # Production-fault evidence takes the no-offer branch even
+                # when no mandatable target remains: the ``else`` below is
+                # the offer, and "nothing mandatable" must not reopen it.
+                if (_has_mandatable_target or _pf_why) and not _offer_unsat:
                     reflection_banner_lines.append(
                         "PROTECTED TEST LOCATION — the failing assertion "
                         f"lives at {_guarded_display}, which is a test "
                         "file the repair loop may NOT modify (patches to "
                         "it are auto-rejected). Fix the production "
-                        "code named above so the assertion passes as "
+                        "code "
+                        + ("named above " if _has_mandatable_target else "")
+                        + "so the assertion passes as "
                         "written; do not emit any patch targeting the "
                         "test file."
                     )
@@ -20781,7 +20921,21 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _floor_triage = _triage_flags_guarded_test_bug(
                     _errs_floor, _ws_floor, _carveout_floor,
                 )
+                _floor_pf_file, _floor_pf_why = _production_fault_evidence(
+                    state, {f for f, _ in _floor_lines},
+                )
+                if _floor_pf_why:
+                    _log_production_fault_veto(
+                        _floor_pf_file, _floor_pf_why, "protected-test floor",
+                    )
+                    messages.append(MessageDict(
+                        role="system",
+                        content=_production_fault_banner(
+                            _floor_pf_file, _floor_pf_why,
+                        ),
+                    ))
                 _floor_offer = _should_offer_unsatisfiable_escape(
+                    production_fault_evidence=_floor_pf_why,
                     has_guarded_blocker=True,
                     # Deliberately True. With the judge path dark we have no
                     # verdict to tell us whether a prod target exists, and
@@ -21865,6 +22019,9 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 set() if _unparsed_this_round else _unsat_offer_files,
                 any_real_patch=_any_real_patch,
                 already_declared=_unsat_declared is not None,
+                production_fault_evidence=_production_fault_evidence(
+                    state, _unsat_offer_files,
+                )[1],
                 # The judge has already ruled on this round by here (the
                 # verdict block runs earlier in repair_node), so a round it
                 # called DISTRACTION/REGRESSION does not get to clear the
@@ -23695,6 +23852,14 @@ def _adjudicated_wrong_test(
         for t in (side.get("tests") or [])
     }
     if not named or named not in on_a_side or not _file_in_failing_set(state, named):
+        return None
+    # The judge picks a side; it does not get to pick the side the evidence
+    # rules out. Run 16's judge named test_story_001_acceptance.py "the wrong
+    # side" while its own blocker text said the API returned
+    # body['detail']['error'] — a double-wrapped envelope, i.e. production.
+    _pf_file, _pf_why = _production_fault_evidence(state, {named})
+    if _pf_why:
+        _log_production_fault_veto(_pf_file, _pf_why, "judge contradiction ruling")
         return None
     reason = (
         "Proved contradiction with the other side's criterion; the judge "

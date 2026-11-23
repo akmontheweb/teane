@@ -900,6 +900,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # (was a hardcoded --timeout=30). Operator-controlled (2026-08-17).
         "test_timeout_seconds",
         "pgid_kill_on_timeout", "log_buffer_max_mb",
+        # teane_diagnostics plugin: exceptions production code swallowed in a
+        # broad ``except`` during a failing test (lumina 01a1de20, run 16).
+        "swallowed_exception_report_max",
+        "swallowed_exception_traceback_lines",
         # P1.3: opt-in for auto-enabling network on detected pip/npm install.
         "auto_enable_network_for_install",
         # Chown bind-mounted files back to the host user on docker container
@@ -1443,6 +1447,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "sandbox.readonly_cache_mounts": (list,),
     "sandbox.timeout_seconds": (int,),
     "sandbox.test_timeout_seconds": (int,),
+    "sandbox.swallowed_exception_report_max": (int,),
+    "sandbox.swallowed_exception_traceback_lines": (int,),
     "sandbox.pgid_kill_on_timeout": (bool,),
     "sandbox.log_buffer_max_mb": (int,),
     "sandbox.auto_enable_network_for_install": (bool,),

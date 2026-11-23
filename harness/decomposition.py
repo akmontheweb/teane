@@ -2430,7 +2430,27 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
             spec_req, spec_arch, workspace,
             known_req_keys=known_req_keys,
         )
-    system_msg = state.get("messages", [{}])[0] if state.get("messages") else {}
+    # Decomposition is a WHOLE-SPEC reader: ``prompt`` above already carries
+    # SPEC_REQUIREMENTS.md + SPEC_ARCHITECTURE.md, read from disk, in full.
+    # ``messages[0]`` additionally anchors a SLIMMED copy of the same spec —
+    # ``_slim_spec_for_prompt`` drops business drivers, success metrics, size,
+    # priority and wave as "planner-only" — so taking it here handed the
+    # PLANNER every story twice: once with its priority/size/wave and once
+    # with them silently missing. Measured on lumina 01a1de20 call 1:
+    # ``# Software Requirements Specification`` appeared TWICE and the prompt
+    # was 82,415 input tokens; the spec-free contract takes it to ~56k.
+    # Safe for this node specifically because it supplies
+    # ``DECOMPOSITION_TOOL`` and compels it by name, so it never relied on
+    # msg 0's patch-DSL tool teaching (the inverse of the 14fcb9a trap).
+    # The local ``system_msg`` also feeds the prose-recovery and repair
+    # dispatches below, so all three paths inherit this. See ADR-0008.
+    _contract = state.get("system_prompt_no_spec")
+    if _contract:
+        system_msg = {"role": "system", "content": _contract}
+    else:
+        # Older checkpoint, or a caller that bypassed create_initial_state:
+        # degrade to the previous behaviour, never to no system message.
+        system_msg = state.get("messages", [{}])[0] if state.get("messages") else {}
     call_messages = [system_msg, {"role": "user", "content": prompt}]
 
     # The planning model (deepseek-v4-pro in thinking mode) sometimes emits

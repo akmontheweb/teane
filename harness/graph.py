@@ -100,6 +100,11 @@ class AgentState(TypedDict, total=False):
     Fields:
         workspace_path: Absolute path to the target repository root.
         messages: The conversation history array (system prompt anchored at index 0).
+        system_prompt_no_spec: The operating contract WITHOUT the spec
+                      prepended. Whole-spec readers (decomposition) take
+                      this instead of messages[0], which anchors a second,
+                      SLIMMED copy of a spec they already read from disk
+                      in full. See ADR-0008.
         modified_files: List of file paths edited during the active session.
         compiler_errors: Structured diagnostic objects from the last compiler run.
         token_tracker: Cumulative token usage and cost across all LLM calls.
@@ -114,6 +119,7 @@ class AgentState(TypedDict, total=False):
     """
     workspace_path: str
     messages: list[MessageDict]
+    system_prompt_no_spec: str
     modified_files: list[str]
     compiler_errors: list[DiagnosticObjectDict]
     # Sorted ``"<code>::<message>"`` fingerprints of the diagnostics from the
@@ -517,6 +523,13 @@ def create_initial_state(
     # strict OpenAI-compat backends reject. Substitute a real instruction.
     if not (initial_prompt or "").strip():
         initial_prompt = _DEFAULT_INITIAL_PROMPT
+    # Built ONCE and reused below. Both branches used to call this, so the
+    # call count is unchanged — but it must not be called twice now that the
+    # result is also stashed in state, because it emits ``system_prompt_built``
+    # telemetry and a second call would double-count it.
+    patcher_contract = _build_and_emit_system_prompt(
+        workspace_path, build_command, config=config,
+    )
     if spec_override:
         # Spec first (project context), then the patcher's operating
         # contract (DSL + Edit Invariants + workspace conventions). The
@@ -525,7 +538,7 @@ def create_initial_state(
         system_prompt = (
             spec_override
             + "\n\n---\n\n"
-            + _build_and_emit_system_prompt(workspace_path, build_command, config=config)
+            + patcher_contract
         )
         # When a user-approved spec already exists (from the pre-flight
         # product_spec_dir refinement), skip the graph's discovery
@@ -534,9 +547,11 @@ def create_initial_state(
         # conversation-history compilation.
         skip_discovery = True
     else:
-        system_prompt = _build_and_emit_system_prompt(workspace_path, build_command, config=config)
+        system_prompt = patcher_contract
     return AgentState(
         workspace_path=workspace_path,
+        # The spec-free contract, for nodes that read SPEC_*.md themselves.
+        system_prompt_no_spec=patcher_contract,
         messages=[
             MessageDict(role="system", content=system_prompt),
             MessageDict(role="user", content=initial_prompt),

@@ -2769,6 +2769,13 @@ DEFAULT_RETRY_BASE_DELAY_SECONDS = 1.0     # initial backoff delay
 DEFAULT_RETRY_MAX_DELAY_SECONDS = 60.0     # per-attempt backoff ceiling
 DEFAULT_RETRY_MAX_TOTAL_SECONDS = 300.0    # cumulative-sleep ceiling before giving up
 DEFAULT_EMPTY_CONTENT_RETRIES = 2          # re-dispatches on empty provider content
+#: Re-dispatches with REASONING SUPPRESSED after an empty response whose
+#: finish_reason is "length" — the model burned its whole output budget on
+#: chain-of-thought and emitted nothing. Retrying identically truncates
+#: identically (lumina 01a218ef/01a1de12 both died this way on the run's FIRST
+#: call), and every role's fallback is its own primary, so "route to fallback"
+#: has nowhere to go. Suppressing reasoning hands the whole budget to content.
+DEFAULT_EMPTY_TRUNCATION_SUPPRESS_RETRIES = 1
 # HTTP request timeouts for LLM calls (generous — a slow reasoning model taking a
 # minute+ is NOT a failure; don't misread a working call as a timeout).
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0    # BETWEEN-BYTES read timeout, not a deadline
@@ -3065,6 +3072,9 @@ class GatewayConfig:
     retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
     retry_max_total_seconds: float = DEFAULT_RETRY_MAX_TOTAL_SECONDS
     empty_content_retries: int = DEFAULT_EMPTY_CONTENT_RETRIES
+    empty_truncation_suppress_retries: int = (
+        DEFAULT_EMPTY_TRUNCATION_SUPPRESS_RETRIES
+    )
     # Per-call HTTP timeouts (config-controlled; previously hardcoded 300/10 at
     # the httpx client). request_timeout_per_role overrides request_timeout_seconds
     # for specific roles — e.g. give patching the largest read budget.
@@ -4835,15 +4845,106 @@ class Gateway:
                 "[gateway] Empty response from %s role=%s is a LENGTH TRUNCATION "
                 "(finish_reason=length, %d reasoning chars, %d tokens_out) — the "
                 "model spent its output budget without emitting content/tool_calls. "
-                "Skipping identical retries; routing to fallback. If this is a "
-                "reasoning-by-default model, set suppress_reasoning_when_off=true "
-                "for it in the model registry.",
+                "Skipping identical retries (they truncate identically). A "
+                "reasoning-suppressed re-dispatch follows when the model honours "
+                "suppress_reasoning_when_off; if it does not, set that flag for "
+                "it in the model registry — otherwise there is no recovery and "
+                "the role's fallback is its own primary.",
                 response.model, role.value,
                 len(getattr(response, "reasoning_content", "") or ""),
                 getattr(response.usage, "output_tokens", 0),
             )
             empty_retry_attempts = 0
         last_retry_exc: Optional[BaseException] = None
+
+        # --- The retry that is NOT identical ------------------------------
+        # An empty response with finish_reason=="length" is the model spending
+        # its whole output budget on chain-of-thought. The block above is right
+        # to refuse repeating the identical call, but "routing to fallback" has
+        # nowhere to go: every role's fallback is its own primary. Both
+        # lumina 01a1de12 and 01a21907 died exactly here, on the run's FIRST
+        # call, after ~120k reasoning chars and zero content.
+        #
+        # So re-dispatch with reasoning SUPPRESSED — the same budget, spent on
+        # the answer instead of the deliberation. Gated on the model actually
+        # honouring ``suppress_reasoning_when_off``: without it, thinking=False
+        # merely omits the parameter and a reasoning-by-default model keeps
+        # reasoning, so the retry would truncate identically and the existing
+        # warning's advice (set the flag) is the real remedy.
+        _suppress_left = self.config.empty_truncation_suppress_retries
+        while (
+            _suppress_left > 0
+            and _is_empty(response)
+            and getattr(response, "finish_reason", "") == "length"
+            and thinking
+            and getattr(
+                getattr(provider, "spec", None),
+                "suppress_reasoning_when_off", False,
+            )
+        ):
+            # Preserve the truncated response: its reasoning_content is the
+            # only evidence of what the budget went on, and the end-of-dispatch
+            # dump only ever sees the final one.
+            try:
+                await self._dump_llm_call_to_disk(
+                    messages=messages, response=response, role=role,
+                    cost_usd=float(
+                        getattr(response.usage, "cost_usd", 0.0) or 0.0
+                    ),
+                    elapsed_ms=0,
+                    note="length truncation (pre reasoning-suppressed retry)",
+                )
+            except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
+                logger.debug("[gateway] truncation dump skipped: %s", exc)
+            _suppress_left -= 1
+            logger.warning(
+                "[gateway] Re-dispatching %s role=%s with reasoning SUPPRESSED "
+                "after a length truncation (%d reasoning chars, no content). "
+                "%d suppression retry(ies) left.",
+                model_key, role.value,
+                len(getattr(response, "reasoning_content", "") or ""),
+                _suppress_left,
+            )
+            # ``_call`` reads ``thinking`` at call time, so this is what makes
+            # the next attempt different.
+            thinking = False
+            # Re-derive the compelled-choice decision for the (model, False)
+            # bucket. The memo is keyed on (model, thinking), and a compelled
+            # choice REFUSED in thinking mode is typically ACCEPTED with
+            # thinking off — which matters here, because the caller compelled a
+            # tool for a reason (decomposition compels submit_decomposition,
+            # and that tool call IS the payload we are missing).
+            _tc_key = (model_key, False)
+            _tc = effective_tool_choice
+            if (
+                _tc is not None and _tc != _TC_AUTO
+                and _tc_key in self._forced_tool_choice_unsupported
+            ):
+                _tc = _TC_AUTO
+            try:
+                response = await retry_with_backoff(
+                    _call,
+                    max_retries=self.config.max_retries,
+                    base_delay=self.config.base_delay,
+                    rate_limit_observer=_observer,
+                )
+                accumulated_cost += float(
+                    getattr(response.usage, "cost_usd", 0.0) or 0.0
+                )
+            except Exception as exc:  # noqa: BLE001 — surface the real failure
+                last_retry_exc = exc
+                logger.warning(
+                    "[gateway] Reasoning-suppressed retry raised: %s", exc,
+                )
+                break
+            if not _is_empty(response):
+                logger.info(
+                    "[gateway] Reasoning-suppressed retry RECOVERED the call "
+                    "(finish=%s, tokens_out=%d, tool_calls=%d).",
+                    getattr(response, "finish_reason", "?"),
+                    getattr(response.usage, "output_tokens", 0),
+                    len(getattr(response, "tool_calls", None) or []),
+                )
         while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(
                 "[gateway] Provider returned empty content (model=%s role=%s). "
@@ -5872,6 +5973,15 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             llm_dispatch.get("empty_content_retries", DEFAULT_EMPTY_CONTENT_RETRIES),
             name="llm_dispatch.empty_content_retries",
             default=DEFAULT_EMPTY_CONTENT_RETRIES, floor=0, ceiling=20,
+        ),
+        empty_truncation_suppress_retries=_clamp_positive_int(
+            llm_dispatch.get(
+                "empty_truncation_suppress_retries",
+                DEFAULT_EMPTY_TRUNCATION_SUPPRESS_RETRIES,
+            ),
+            name="llm_dispatch.empty_truncation_suppress_retries",
+            default=DEFAULT_EMPTY_TRUNCATION_SUPPRESS_RETRIES,
+            floor=0, ceiling=5,
         ),
         request_timeout_seconds=_clamp_positive_float(
             llm_dispatch.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS),

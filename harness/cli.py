@@ -1192,6 +1192,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # empty_content_retries = re-dispatches on empty provider content.
         "max_retries", "retry_base_delay_seconds", "retry_max_delay_seconds",
         "retry_max_total_seconds", "empty_content_retries",
+        # Re-dispatches with reasoning SUPPRESSED after a length truncation
+        # emitted no content — lumina 01a1de12 / 01a21907 both died there on
+        # the run's first call, and "fallback" is the role's own primary.
+        "empty_truncation_suppress_retries",
         # Per-call HTTP timeouts (generous; a slow reasoning model is not a
         # failure) + network-stall failover. request_timeout_per_role overrides
         # request_timeout_seconds per role (e.g. patching gets the largest read
@@ -1602,6 +1606,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "llm_dispatch.retry_max_delay_seconds": (int, float),
     "llm_dispatch.retry_max_total_seconds": (int, float),
     "llm_dispatch.empty_content_retries": (int,),
+    "llm_dispatch.empty_truncation_suppress_retries": (int,),
     "llm_dispatch.request_timeout_seconds": (int, float),
     "llm_dispatch.connect_timeout_seconds": (int, float),
     "llm_dispatch.request_timeout_per_role": (dict,),

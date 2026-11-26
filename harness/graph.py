@@ -15824,6 +15824,48 @@ def _recommendation_is_unactionable(recommendation: str) -> bool:
     return bool(_UNACTIONABLE_RECOMMENDATION_RE.match(recommendation or ""))
 
 
+#: The repair-reflection judge's verdict vocabulary. ONE definition, because
+#: it is stated in three places that have to agree: the judge's own
+#: ``output_spec``, this parser's acceptance check, and the schema hint the
+#: malformed-JSON repair re-prompts with. The hint drifted from the other two
+#: (no WORKING_HYPOTHESIS, wrong emptiness rule), so a repaired deferral came
+#: back as a different verdict entirely.
+_REFLECTION_VERDICTS: tuple[str, ...] = (
+    "PROGRESS", "DISTRACTION", "REGRESSION", "WORKING_HYPOTHESIS",
+)
+
+#: Verdicts allowed to omit ``real_blocker`` — the judge is signalling "trust
+#: the LLM's current direction". DISTRACTION / REGRESSION must name a blocker.
+_REFLECTION_VERDICTS_BLOCKER_OPTIONAL: tuple[str, ...] = (
+    "PROGRESS", "WORKING_HYPOTHESIS",
+)
+
+#: Optional keys the judge may add and the parser preserves. They are
+#: load-bearing: ``impl_file`` names the implementation module so a failing
+#: test is repaired in PRODUCTION rather than rewritten, and ``wrong_test``
+#: carries the proved contradiction. A repair prompt must never drop them.
+_REFLECTION_OPTIONAL_KEYS: tuple[str, ...] = ("impl_file", "wrong_test")
+
+
+def _reflection_verdict_schema_hint() -> str:
+    """The schema hint for the malformed-JSON repair, built from the same
+    constants the parser enforces so the two cannot drift apart."""
+    verdicts = ", ".join(f"'{v}'" for v in _REFLECTION_VERDICTS)
+    optional_blocker = " or ".join(
+        f"verdict='{v}'" for v in _REFLECTION_VERDICTS_BLOCKER_OPTIONAL
+    )
+    optional_keys = " and ".join(f"'{k}'" for k in _REFLECTION_OPTIONAL_KEYS)
+    return (
+        f"A JSON object with three required keys: 'verdict' (one of "
+        f"{verdicts}), 'real_blocker' (string — the underlying reason the "
+        f"repair loop is stuck; may be empty only when {optional_blocker}), "
+        f"and 'recommendation' (string). PRESERVE the optional keys "
+        f"{optional_keys} with their values whenever the text carries them — "
+        f"they route the round to production repair and must never be "
+        f"dropped. Add no keys that are not already present."
+    )
+
+
 def _parse_repair_reflection_verdict(
     raw: str,
 ) -> Optional[dict[str, str]]:
@@ -15857,11 +15899,11 @@ def _parse_repair_reflection_verdict(
     # (no consecutive-distraction tick, no HITL escalation) for at most
     # 2 rounds. See ``_maybe_promote_working_hypothesis_to_distraction``
     # for the third-round cap.
-    if verdict not in {"PROGRESS", "DISTRACTION", "REGRESSION", "WORKING_HYPOTHESIS"}:
+    if verdict not in _REFLECTION_VERDICTS:
         return None
     real_blocker = str(parsed.get("real_blocker", "")).strip()
     recommendation = str(parsed.get("recommendation", "")).strip()
-    if not real_blocker and verdict not in {"PROGRESS", "WORKING_HYPOTHESIS"}:
+    if not real_blocker and verdict not in _REFLECTION_VERDICTS_BLOCKER_OPTIONAL:
         # PROGRESS and WORKING_HYPOTHESIS verdicts can omit the blocker
         # (the judge is signalling "trust the LLM's current direction");
         # DISTRACTION / REGRESSION must name it.
@@ -18547,14 +18589,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                             cache_family='judgment:reflection_repair_dispatch',
                             budget_remaining_usd=bud,
                         )
-                    _reflection_schema = (
-                        "A JSON object with exactly three keys: "
-                        "'verdict' (one of 'PROGRESS', 'DISTRACTION', "
-                        "'REGRESSION'), 'real_blocker' (string — the "
-                        "underlying reason the repair loop is stuck; "
-                        "may be empty only when verdict='PROGRESS'), "
-                        "and 'recommendation' (string). No other keys."
-                    )
+                    # Built from the same constants the parser enforces —
+                    # this hint had drifted from both the judge's output_spec
+                    # and the parser. See _REFLECTION_VERDICTS.
+                    _reflection_schema = _reflection_verdict_schema_hint()
                     repaired_verdict, repaired_budget = await _repair_malformed_json(
                         raw_text=verdict_raw or "",
                         schema_hint=_reflection_schema,

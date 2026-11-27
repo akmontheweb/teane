@@ -315,17 +315,39 @@ class _TestFnScanner(ast.NodeVisitor):
         # function-local miss: a module constant is the same value in every
         # test, so a signature using one is still proven.
         self._module_bindings: dict[str, ast.expr] = {}
-        self._fn_bindings: dict[str, dict[str, ast.expr]] = {}
+        # One dict per enclosing FUNCTION, test or not, innermost last. A
+        # non-test function's locals must not reach module scope: ``_fn_stack``
+        # is deliberately test-only (so only test bodies get their signatures
+        # recorded), and keying binding scope off it leaked every helper's
+        # locals into the module table, where they then resolved names in
+        # unrelated tests.
+        self._scope_stack: list[dict[str, ast.expr]] = []
         # Each test function's own parameters. A fixture name needs no
         # resolution — the same fixture in two tests is the same input.
         self._fn_params: dict[str, frozenset[str]] = {}
 
     # --- binding scope -----------------------------------------------------
     def _bindings_for_current_fn(self) -> dict[str, ast.expr]:
-        if not self._fn_stack:
-            return dict(self._module_bindings)
-        merged = dict(self._module_bindings)
-        merged.update(self._fn_bindings.get(self._fn_stack[-1], {}))
+        """The substitution table for the call being recorded, resolved the
+        way Python resolves a name.
+
+        A PARAMETER of the enclosing test shadows any outer binding, so an
+        outer binding of that name is dropped — otherwise a helper's local
+        ``payload = make(0)`` gets substituted over a ``payload`` fixture and
+        two tests receiving DIFFERENT parametrized values are rendered
+        identical, which is the false-positive shape this module exists to
+        avoid. A name the test rebinds in its OWN body is not a parameter
+        reference any more, so that binding is kept.
+        """
+        own = self._scope_stack[-1] if self._scope_stack else {}
+        outer = dict(self._module_bindings)
+        for scope in self._scope_stack[:-1]:
+            outer.update(scope)
+        if self._fn_stack:
+            for param in self._fn_params.get(self._fn_stack[-1], ()):
+                outer.pop(param, None)
+        merged = outer
+        merged.update(own)
         return merged
 
     def _bind(self, name: str, value: ast.expr) -> None:
@@ -339,8 +361,8 @@ class _TestFnScanner(ast.NodeVisitor):
             for n in ast.walk(value)
         ):
             return
-        if self._fn_stack:
-            self._fn_bindings.setdefault(self._fn_stack[-1], {})[name] = value
+        if self._scope_stack:
+            self._scope_stack[-1][name] = value
         else:
             self._module_bindings[name] = value
 
@@ -358,8 +380,12 @@ class _TestFnScanner(ast.NodeVisitor):
             )
             if _has_ambient_fixture(node):
                 self.ambient_fns.add(node.name)
+        # Every function gets a binding scope, test or not, so a helper's
+        # locals die with it instead of reaching the module table.
+        self._scope_stack.append({})
         for child in node.body:
             self.visit(child)
+        self._scope_stack.pop()
         if is_test:
             self._fn_stack.pop()
 

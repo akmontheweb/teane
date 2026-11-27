@@ -1370,7 +1370,28 @@ def refresh_generated_contract_tests(
     retired: list[str] = []
     for test_rel, source_rel, tier in _generated_tier_files(workspace_path):
         test_abs = os.path.join(workspace_path, test_rel)
-        source = _read_text(os.path.join(workspace_path, source_rel))
+        source_abs = os.path.join(workspace_path, source_rel)
+        source = _read_text(source_abs)
+        source_gone = not os.path.isfile(source_abs)
+        # A source that does not PARSE tells us nothing about its models, and
+        # this sweep runs at the top of every build — including the builds
+        # where repair has just left the file half-edited. Retiring on an
+        # unparseable or empty read would delete the generated test on a
+        # transient syntax error and never bring it back, since the emitters
+        # only run once per batch. ``parse_pydantic_models`` swallows
+        # SyntaxError and returns ``[]``, which is indistinguishable from
+        # "no models here", so the parse has to be checked separately.
+        if not source_gone:
+            if not (source or "").strip():
+                continue
+            try:
+                ast.parse(source or "")
+            except SyntaxError:
+                logger.debug(
+                    "[contract-tests] staleness sweep: %s does not parse "
+                    "right now — leaving %s alone.", source_rel, test_rel,
+                )
+                continue
         body = None
         if source is not None:
             try:

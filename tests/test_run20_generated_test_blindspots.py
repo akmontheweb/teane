@@ -733,3 +733,57 @@ class TestTheConfigKeyIsWired:
             / "config" / "config_help.md"
         ).read_text()
         assert "max_related_evidence_files" in help_md
+
+
+class TestTheSweepNeverDeletesOnATransientError:
+    """Regression tests for a defect in the sweep itself, found reviewing
+    5adb3ac rather than in a run.
+
+    The sweep runs at the top of EVERY build — including the builds where
+    repair has just left a production file half-edited. ``parse_pydantic_models``
+    swallows ``SyntaxError`` and returns ``[]``, which is indistinguishable
+    from "no models here", so an unparseable source read as "nothing is
+    derivable" and the generated test was deleted. Permanently: the emitters
+    only run once per batch, so nothing would ever bring it back.
+    """
+
+    def test_a_syntax_error_in_the_source_leaves_the_test_alone(
+        self, tmp_path,
+    ):
+        src_rel = _workspace_with_generated_contract(
+            tmp_path, SCHEMA_AT_EMISSION,
+        )
+        (tmp_path / src_rel).write_text(
+            SCHEMA_AT_EMISSION + "\n    def oops(  # unclosed\n"
+        )
+        refreshed, retired = refresh_generated_contract_tests(str(tmp_path))
+        assert (refreshed, retired) == ([], [])
+        assert (tmp_path / CONTRACT).exists()
+
+    def test_an_empty_source_leaves_the_test_alone(self, tmp_path):
+        """A half-written file reads as empty."""
+        src_rel = _workspace_with_generated_contract(
+            tmp_path, SCHEMA_AT_EMISSION,
+        )
+        (tmp_path / src_rel).write_text("")
+        refreshed, retired = refresh_generated_contract_tests(str(tmp_path))
+        assert (refreshed, retired) == ([], [])
+        assert (tmp_path / CONTRACT).exists()
+
+    def test_a_genuinely_deleted_source_still_retires(self, tmp_path):
+        """The guard must not cost the case it was built for."""
+        src_rel = _workspace_with_generated_contract(
+            tmp_path, SCHEMA_AT_EMISSION,
+        )
+        (tmp_path / src_rel).unlink()
+        _, retired = refresh_generated_contract_tests(str(tmp_path))
+        assert retired == [CONTRACT]
+
+    def test_a_source_that_parses_to_nothing_still_retires(self, tmp_path):
+        """And nor the case where the models genuinely went away."""
+        src_rel = _workspace_with_generated_contract(
+            tmp_path, SCHEMA_AT_EMISSION,
+        )
+        (tmp_path / src_rel).write_text("X = 1\n")
+        _, retired = refresh_generated_contract_tests(str(tmp_path))
+        assert retired == [CONTRACT]

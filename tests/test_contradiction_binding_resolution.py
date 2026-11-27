@@ -348,3 +348,114 @@ class TestTheExistingGuardsStillHold:
                 with pytest.raises(ValueError):
                     ContactUpdate(first_name=None)
         ''') == []
+
+
+class TestScopeResolvesTheWayPythonDoes:
+    """Regression tests for two defects in the binding resolution itself,
+    found reviewing f8a3e87 rather than in a run.
+
+    Both are false-POSITIVE paths, which is the direction that costs a
+    correct test: the prover hands the author a proof and the author
+    complies.
+    """
+
+    def test_a_parameter_is_not_overridden_by_a_module_binding(self):
+        """``payload`` is a parameter of both tests AND a module-level name.
+        In Python the parameter shadows the module binding.
+
+        Substituting the module value renders two tests that receive
+        DIFFERENT parametrized payloads identical and reports a contradiction
+        between them. Uses a MODULE binding deliberately: a helper-local one
+        is already stopped by the scope fix below, so routing this through a
+        helper would test that fix twice and leave the parameter guard
+        unexercised.
+        """
+        got = _find('''
+            import pytest
+
+            payload = make(0)
+
+            @pytest.mark.parametrize("payload", [make(1)])
+            def test_a(payload):
+                r = Thing(payload)
+
+            @pytest.mark.parametrize("payload", [make(2)])
+            def test_b(payload):
+                with pytest.raises(E):
+                    Thing(payload)
+        ''')
+        assert [c.call for c in got] != ["Thing(make(0))"], (
+            "a module binding was substituted over a parameter that "
+            "shadows it"
+        )
+
+    def test_a_helper_functions_locals_do_not_reach_module_scope(self):
+        """``_fn_stack`` is deliberately test-only, so keying binding scope
+        off it put every non-test function's locals in the module table."""
+        got = _find('''
+            import pytest
+
+            def _helper():
+                thing = make(99)
+                return thing
+
+            def test_a():
+                r = Build(thing)
+
+            def test_b():
+                with pytest.raises(E):
+                    Build(thing)
+        ''')
+        assert got == [], (
+            "`thing` is not defined in either test — the signature is "
+            "unprovable and must be dropped, not resolved from a helper"
+        )
+
+    def test_a_test_rebinding_its_own_parameter_still_substitutes(self):
+        """The shadowing rule must not go too far: a name the test rebinds in
+        its OWN body is no longer a parameter reference."""
+        [c] = _find('''
+            import pytest
+            def test_a(payload):
+                payload = make(7)
+                r = Thing(payload)
+            def test_b(payload):
+                payload = make(7)
+                with pytest.raises(E):
+                    Thing(payload)
+        ''')
+        assert c.call == "Thing(make(7))", c.call
+
+    def test_a_nested_closure_does_not_leak_into_its_test(self):
+        got = _find('''
+            import pytest
+            def test_a():
+                def _inner():
+                    v = make(1)
+                    return v
+                r = Thing(v)
+            def test_b():
+                def _inner():
+                    v = make(2)
+                    return v
+                with pytest.raises(E):
+                    Thing(v)
+        ''')
+        assert got == []
+
+    def test_module_constants_still_resolve(self):
+        """The fix must not cost the module-scope case that worked before."""
+        [c] = _find('''
+            import pytest
+            PAYLOAD = dict(a=1)
+            def test_a():
+                r = Thing(PAYLOAD)
+            def test_b():
+                with pytest.raises(E):
+                    Thing(PAYLOAD)
+        ''')
+        assert c.call == "Thing(dict(a=1))"
+
+    def test_the_run20_pair_is_still_correctly_cleared(self):
+        """End-to-end guard: the original fix must survive the scope rework."""
+        assert _find(RUN20_PAIR) == []

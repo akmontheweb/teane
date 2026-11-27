@@ -35,7 +35,7 @@
         "restore_workspace_ownership": true
     },
     "token_budget": {
-        "hard_cap_usd": 5.0,
+        "hard_cap_usd": 12.0,
         "context_window_threshold_pct": 0.85,
         "stages": {},
         "default_hard_cap_usd": 2.0,
@@ -338,7 +338,8 @@
         "json_stderr": false,
         "langsmith": false,
         "retention_days": 90,
-        "max_session_logs": 500
+        "max_session_logs": 500,
+        "delete_session_logs_on_new_build": false
     },
     "retrieval_tools": {
         "enabled": true,

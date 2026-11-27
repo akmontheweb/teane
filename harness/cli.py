@@ -1043,6 +1043,10 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Session-log retention. Nothing pruned these before 2026-11-13.
         # 0 disables either axis; both apply together.
         "retention_days", "max_session_logs",
+        # Whether `teane build`'s --new-build reset also deletes the prior
+        # sessions' JSONL transcripts for that workspace. Default false:
+        # checkpoints are stale state, transcripts are evidence.
+        "delete_session_logs_on_new_build",
         # Console (stderr) verbosity, independent of the file handler.
         # "WARNING" keeps the terminal quiet while the file captures the
         # full stream; "OFF"/"NONE" silences the console entirely; null
@@ -1549,6 +1553,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.max_bytes": (int,),
     "logging.backup_count": (int,),
     "logging.retention_days": (int,),
+    "logging.delete_session_logs_on_new_build": (bool,),
     "logging.max_session_logs": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
@@ -7454,8 +7459,13 @@ def _perform_new_build_reset(
 async def _purge_workspace_checkpoints(
     workspace_path: str, config: dict[str, Any],
 ) -> None:
-    """Delete every checkpoint session (and per-session JSONL transcript)
-    whose stored ``workspace_path`` matches the workspace being reset.
+    """Delete every checkpoint session whose stored ``workspace_path``
+    matches the workspace being reset.
+
+    Per-session JSONL transcripts are KEPT unless
+    ``logging.delete_session_logs_on_new_build`` is true — they are run
+    evidence, not resumable state, so a fresh build has no reason to need
+    them gone.
 
     Used by ``--new-build true`` cleanup so that "starting fresh" includes
     the persistence layer, not just the working tree. Session ↔ workspace
@@ -7536,10 +7546,27 @@ async def _purge_workspace_checkpoints(
 
     # Per-session JSONL transcripts. Same path + glob shape that
     # cmd_purge --session-id already handles. Best-effort per file.
+    #
+    # Default is now to KEEP them. A checkpoint is stale state that a fresh
+    # build must not resume from; a transcript is evidence and has no effect
+    # on any build. Deleting it only destroys the previous run's post-mortem
+    # material at the exact moment the operator starts the run that will be
+    # compared against it — lumina run 01a21929's log was the sole record
+    # behind a root-cause analysis and this path removed it hours later when
+    # the follow-up build began. ``teane purge`` remains the explicit way to
+    # reclaim the disk.
     log_cfg = config.get("logging", {}) or {}
     log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
+    delete_logs = bool(log_cfg.get("delete_session_logs_on_new_build", False))
     removed_logs = 0
-    if os.path.isdir(log_dir):
+    if not delete_logs:
+        logger.info(
+            "[new_build] Keeping %d prior session log(s) in %s "
+            "(logging.delete_session_logs_on_new_build=false). Checkpoints "
+            "are purged; transcripts are preserved as run evidence.",
+            len(matches), log_dir,
+        )
+    elif os.path.isdir(log_dir):
         import glob as _glob
         for s in matches:
             sid = s.thread_id
@@ -7559,7 +7586,8 @@ async def _purge_workspace_checkpoints(
 
     logger.info(
         "[new_build] Purged %d checkpoint session(s) and %d JSONL log "
-        "file(s) for workspace %s.",
+        "file(s) for workspace %s (logs are kept by default; set "
+        "logging.delete_session_logs_on_new_build=true to remove them).",
         deleted_rows, removed_logs, workspace_path,
     )
 

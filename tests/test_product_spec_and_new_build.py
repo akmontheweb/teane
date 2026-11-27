@@ -405,6 +405,9 @@ class TestPurgeWorkspaceCheckpoints:
     async def test_jsonl_logs_removed_for_matching_sessions(
         self, tmp_path, monkeypatch,
     ):
+        """Opt-in deletion. Default is KEEP (see the two tests below) —
+        a checkpoint is resumable state a fresh build must not pick up,
+        while a transcript is evidence that has no effect on any build."""
         db_file = tmp_path / "checkpoints.db"
         db_file.write_text("")
         ws = str(tmp_path / "ws")
@@ -440,7 +443,10 @@ class TestPurgeWorkspaceCheckpoints:
             ws,
             {
                 "persistence": {"db_path": str(db_file)},
-                "logging": {"log_dir": str(log_dir)},
+                "logging": {
+                    "log_dir": str(log_dir),
+                    "delete_session_logs_on_new_build": True,
+                },
             },
         )
 
@@ -448,6 +454,86 @@ class TestPurgeWorkspaceCheckpoints:
         assert not (log_dir / "sess-match.jsonl").exists()
         assert not (log_dir / "sess-match.jsonl.1").exists()
         assert (log_dir / "sess-other.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_jsonl_logs_kept_by_default(self, tmp_path, monkeypatch):
+        """lumina 01a21929: that run's log was the sole record behind a
+        root-cause analysis, and the follow-up clean build deleted it
+        while the analysis was still in progress. Checkpoints must still
+        be purged — only the transcripts survive."""
+        db_file = tmp_path / "checkpoints.db"
+        db_file.write_text("")
+        ws = str(tmp_path / "ws")
+        os.makedirs(ws)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "sess-match.jsonl").write_text("entry1")
+        (log_dir / "sess-match.jsonl.1").write_text("entry0")
+
+        async def fake_list_all_sessions(db_path: str, limit: int = 50):
+            return [_make_summary("sess-match", ws)]
+
+        fake_checkpointer = _FakeCheckpointer()
+        async def fake_from_db_path(*, db_path: str, ttl_days: int):
+            return fake_checkpointer
+
+        from harness import storage
+        monkeypatch.setattr(storage, "list_all_sessions", fake_list_all_sessions)
+        monkeypatch.setattr(
+            storage.HarnessAsyncSqliteSaver, "from_db_path", fake_from_db_path,
+        )
+
+        from harness.cli import _purge_workspace_checkpoints
+        await _purge_workspace_checkpoints(
+            ws,
+            {
+                "persistence": {"db_path": str(db_file)},
+                "logging": {"log_dir": str(log_dir)},
+            },
+        )
+
+        # Transcript and its rotation survive ...
+        assert (log_dir / "sess-match.jsonl").exists()
+        assert (log_dir / "sess-match.jsonl.1").exists()
+        # ... while the checkpoint for the SAME session is still purged.
+        assert fake_checkpointer.deleted == ["sess-match"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_false_also_keeps_logs(self, tmp_path, monkeypatch):
+        """An operator who writes the key out as false gets the same
+        behaviour as omitting it."""
+        db_file = tmp_path / "checkpoints.db"
+        db_file.write_text("")
+        ws = str(tmp_path / "ws")
+        os.makedirs(ws)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "sess-match.jsonl").write_text("entry1")
+
+        async def fake_list_all_sessions(db_path: str, limit: int = 50):
+            return [_make_summary("sess-match", ws)]
+
+        async def fake_from_db_path(*, db_path: str, ttl_days: int):
+            return _FakeCheckpointer()
+
+        from harness import storage
+        monkeypatch.setattr(storage, "list_all_sessions", fake_list_all_sessions)
+        monkeypatch.setattr(
+            storage.HarnessAsyncSqliteSaver, "from_db_path", fake_from_db_path,
+        )
+
+        from harness.cli import _purge_workspace_checkpoints
+        await _purge_workspace_checkpoints(
+            ws,
+            {
+                "persistence": {"db_path": str(db_file)},
+                "logging": {
+                    "log_dir": str(log_dir),
+                    "delete_session_logs_on_new_build": False,
+                },
+            },
+        )
+        assert (log_dir / "sess-match.jsonl").exists()
 
     @pytest.mark.asyncio
     async def test_realpath_match_handles_symlinks(self, tmp_path, monkeypatch):

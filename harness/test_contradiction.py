@@ -32,6 +32,7 @@ unit-testable in isolation.
 from __future__ import annotations
 
 import ast
+import copy
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -141,17 +142,99 @@ def _call_name(node: ast.Call) -> Optional[str]:
     return None
 
 
-def _normalize_call(node: ast.Call) -> Optional[str]:
+class _BindingSubstituter(ast.NodeTransformer):
+    """Replace bare names with the expression they were bound to.
+
+    Exactly ONE pass: a node returned from ``visit_Name`` is inserted without
+    being traversed, so an inserted expression is never itself rewritten and
+    a self-referential binding cannot recurse.
+    """
+
+    def __init__(self, bindings: Mapping[str, ast.expr]) -> None:
+        self._bindings = bindings
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:  # noqa: N802
+        repl = self._bindings.get(node.id)
+        return repl if repl is not None else node
+
+
+def _arg_exprs(node: ast.Call) -> list[ast.expr]:
+    """The expressions that carry this call's INPUT: its arguments, its
+    keyword values, and the receiver of a method call.
+
+    The callable itself is excluded. ``_contact(2, 29)`` has ``_contact`` in a
+    ``Name`` position too, and a function name is not an input.
+    """
+    out: list[ast.expr] = [*node.args]
+    out += [kw.value for kw in node.keywords]
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        out.append(func.value)
+    return out
+
+
+def _normalize_call(
+    node: ast.Call,
+    bindings: Optional[Mapping[str, ast.expr]] = None,
+    known_names: frozenset[str] = frozenset(),
+) -> Optional[str]:
     """Canonical text of a *subject* call, or None if it should be ignored.
 
     Uses ``ast.unparse`` so ``X(first_name=None)`` normalizes identically
     regardless of source whitespace. Helper/assertion calls are dropped.
+
+    ``bindings`` maps a local/module name to the expression it was bound to,
+    and those are substituted into the signature before unparsing. Without
+    that, this function compares SYNTAX and calls it "identical input", which
+    is false the moment an argument arrives through a variable:
+
+        def test_feb29_leap_year(self):
+            contact = _contact(2, 29)
+            result = resolve_next_occurrence(contact, date(2024, 1, 1), 'UTC')
+
+        def test_invalid_date_raises(self):
+            contact = _contact(2, 31)
+            with pytest.raises(BirthdateValidationError):
+                resolve_next_occurrence(contact, date(2024, 1, 1), 'UTC')
+
+    Both unparse to ``resolve_next_occurrence(contact, date(2024, 1, 1),
+    'UTC')``. lumina 01a21929 (run 20) declared that pair "identical input,
+    opposite expected outcomes, so no production change can satisfy both" and
+    bounced it back to the test author twice. Feb 29 is a real leap day and
+    Feb 31 is not a date: the inputs differ, the expectations are consistent,
+    and the tests were correct. The author complying would have deleted a
+    correct requirement to satisfy a false proof.
+
+    Substituting makes the two signatures differ on their own, and leaves a
+    pair that really does bind the same value still provable — so this is a
+    precision fix in both directions, not a mute button.
+
+    Returns None when an input arrives through a name this module cannot
+    resolve (a ``for`` target, a ``with ... as`` target, tuple unpacking, an
+    augmented assignment). Such a signature does not capture its own input, so
+    per the module's stated bias it is dropped rather than guessed at.
+    ``known_names`` are the names that need no resolution: the enclosing test
+    function's own parameters, since the same fixture name in two tests is the
+    same input.
     """
     name = _call_name(node)
     if name is None or name in _HELPER_CALL_NAMES:
         return None
+    bindings = bindings or {}
+    for expr in _arg_exprs(node):
+        if (
+            isinstance(expr, ast.Name)
+            and expr.id not in bindings
+            and expr.id not in known_names
+        ):
+            return None
     try:
-        return ast.unparse(node)
+        subject: ast.AST = node
+        if bindings:
+            subject = _BindingSubstituter(bindings).visit(
+                copy.deepcopy(node),
+            )
+        return ast.unparse(subject)
     except Exception:  # noqa: BLE001 — unparse is best-effort
         return None
 
@@ -215,6 +298,39 @@ class _TestFnScanner(ast.NodeVisitor):
         self._fn_stack: list[str] = []
         self._in_raises = 0
         self._in_try = 0
+        # name -> bound expression, for the names a subject call's arguments
+        # can arrive through. Module/class scope is the fallback for a
+        # function-local miss: a module constant is the same value in every
+        # test, so a signature using one is still proven.
+        self._module_bindings: dict[str, ast.expr] = {}
+        self._fn_bindings: dict[str, dict[str, ast.expr]] = {}
+        # Each test function's own parameters. A fixture name needs no
+        # resolution — the same fixture in two tests is the same input.
+        self._fn_params: dict[str, frozenset[str]] = {}
+
+    # --- binding scope -----------------------------------------------------
+    def _bindings_for_current_fn(self) -> dict[str, ast.expr]:
+        if not self._fn_stack:
+            return dict(self._module_bindings)
+        merged = dict(self._module_bindings)
+        merged.update(self._fn_bindings.get(self._fn_stack[-1], {}))
+        return merged
+
+    def _bind(self, name: str, value: ast.expr) -> None:
+        """Record ``name = value`` in the current scope.
+
+        A self-referential binding (``x = x + 1``) is skipped: substituting it
+        would put the name back into the signature it was meant to resolve.
+        """
+        if any(
+            isinstance(n, ast.Name) and n.id == name
+            for n in ast.walk(value)
+        ):
+            return
+        if self._fn_stack:
+            self._fn_bindings.setdefault(self._fn_stack[-1], {})[name] = value
+        else:
+            self._module_bindings[name] = value
 
     # --- function boundary -------------------------------------------------
     def _visit_fn(self, node) -> None:
@@ -222,6 +338,12 @@ class _TestFnScanner(ast.NodeVisitor):
         if is_test:
             self._fn_stack.append(node.name)
             self.by_fn.setdefault(node.name, {"raise": set(), "success": set()})
+            args = node.args
+            self._fn_params[node.name] = frozenset(
+                a.arg for a in (
+                    *args.posonlyargs, *args.args, *args.kwonlyargs,
+                )
+            )
             if _has_ambient_fixture(node):
                 self.ambient_fns.add(node.name)
         for child in node.body:
@@ -268,12 +390,23 @@ class _TestFnScanner(ast.NodeVisitor):
     def _record(self, kind: str, call: ast.Call) -> None:
         if not self._fn_stack:
             return
-        sig = _normalize_call(call)
+        fn = self._fn_stack[-1]
+        sig = _normalize_call(
+            call,
+            self._bindings_for_current_fn(),
+            self._fn_params.get(fn, frozenset()),
+        )
         if sig is None:
             return
-        self.by_fn[self._fn_stack[-1]][kind].add(sig)
+        self.by_fn[fn][kind].add(sig)
 
     def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+        # Bind BEFORE classifying, so a later statement in this body sees it.
+        # Only a single bare-name target: tuple unpacking and subscript /
+        # attribute targets do not give a name a resolvable value, and
+        # ``_normalize_call`` drops any signature that still depends on one.
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            self._bind(node.targets[0].id, node.value)
         if isinstance(node.value, ast.Call) and not self._in_try:
             if self._in_raises:
                 self._record("raise", node.value)
@@ -285,6 +418,8 @@ class _TestFnScanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+        if isinstance(node.target, ast.Name) and node.value is not None:
+            self._bind(node.target.id, node.value)
         if isinstance(node.value, ast.Call) and not self._in_try:
             self._record("raise" if self._in_raises else "success", node.value)
         self.generic_visit(node)

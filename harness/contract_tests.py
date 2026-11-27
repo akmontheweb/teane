@@ -52,6 +52,8 @@ __all__ = [
     # Tier 3 — property-based structural invariants
     "render_property_test",
     "emit_property_tests",
+    # Staleness sweep — re-derive generated tests from the current models
+    "refresh_generated_contract_tests",
 ]
 
 # Pydantic base classes we recognise as "this is a validated model". Kept
@@ -72,7 +74,7 @@ class FieldSpec:
     """One model field's declaratively-checkable contract."""
     name: str
     type_str: str                       # normalised annotation, e.g. "str", "Optional[int]"
-    required: bool                       # non-Optional AND no default
+    required: bool                       # no default — see ``parse_pydantic_models``
     constraints: dict[str, object] = field(default_factory=dict)
     has_custom_validator: bool = False   # a @field_validator targets this field
     has_alias: bool = False              # Field(alias=...) — breaks field-name round-trip
@@ -269,7 +271,24 @@ def parse_pydantic_models(source: str, *, rel_path: str = "") -> list[ModelSpec]
                 constraints, has_default, has_alias = _extract_field_call_constraints(item.value)
             else:
                 constraints, has_default, has_alias = {}, False, False
-            required = not _is_optional(type_str) and not has_default
+            # Pydantic v2: ONLY a default makes a field optional. An
+            # ``X | None`` / ``Optional[X]`` annotation with no default is
+            # REQUIRED — it declares "this field may hold None", not "this
+            # field may be omitted". (Pydantic v1 inferred a ``None``
+            # default from Optional; v2 deliberately dropped that.)
+            #
+            # Treating Optional-without-default as optional made the
+            # happy-path test omit those fields, so the emitted test failed
+            # on first contact with "Field required" — a test the generator
+            # had proven correct and pydantic rejected. lumina 01a21929
+            # (run 20) emitted exactly that for ``BirthdayResponse``
+            # (last_name / birth_year / phone_number / email / notes, all
+            # ``X | None`` with no default): "5 validation errors ...
+            # Field required". The repair loop then spent rounds making the
+            # PRODUCTION model match the generator's wrong assumption,
+            # because the test file is tamper-guarded and the generator's
+            # claim was taken as ground truth.
+            required = not has_default
             fields.append(FieldSpec(
                 name=fname,
                 type_str=type_str,
@@ -382,6 +401,12 @@ _HEADER = (
     "from pydantic import ValidationError\n"
     "from {module} import {names}\n\n\n"
 )
+
+
+#: Signature of a Tier-1 file this emitter wrote. Checked before replacing or
+#: deleting one: a file the harness did not write is never touched. Mirrors
+#: ``_PROPERTY_MARKER``.
+_CONTRACT_MARKER = "Deterministic contract tests for"
 
 
 def render_contract_test(
@@ -537,44 +562,84 @@ def emit_contract_tests(
     mirroring ``test_generation._emit_nfr_stubs`` so the caller reuses the
     same marker-persistence path.
 
-    Python-only (Tier 1). Idempotent: an existing contract-test file is NOT
-    overwritten (respects operator edits). Best-effort — IO / parse errors on
-    one file skip it without failing the batch.
+    Python-only (Tier 1). Best-effort — IO / parse errors on one file skip it
+    without failing the batch.
+
+    A file the harness did not write is never touched. One it DID write is
+    re-derived from the current model and retired when the model is no longer
+    testable, exactly as :func:`emit_property_tests` does for Tier 3.
+
+    That parity is the fix for lumina 01a21929 (run 20). This emitter used to
+    be unconditionally non-clobbering ("respects operator edits"), which also
+    froze its own output: ``BirthdayResponse.created_at`` gained a
+    ``@field_validator`` mid-repair, :func:`_valid_kwargs` would now SKIP the
+    model for exactly that reason, and the happy-path test written before the
+    change stayed on disk asserting that ``created_at='aaa'`` constructs. No
+    production change could satisfy it — the validator it was fighting was
+    the one the API needed — and the loop oscillated for 11 verdicts and 30%
+    of the run's budget before dying.
     """
     if not _has_python_source(source_files):
         return [], {}
     source_roots = _source_roots_for(workspace_path)
     written: list[str] = []
+    retired: list[str] = []
+    refreshed: list[str] = []
     markers: dict[str, list[str]] = {}
     for rel in source_files:
         if not rel.endswith(".py") or _looks_like_test(rel):
             continue
-        abs_src = os.path.join(workspace_path, rel)
-        try:
-            with open(abs_src, "r", encoding="utf-8", errors="replace") as fh:
-                source = fh.read()
-        except OSError:
+        source = _read_text(os.path.join(workspace_path, rel))
+        if source is None:
             continue
         models = parse_pydantic_models(source, rel_path=rel)
         if not models:
             continue
         body = render_contract_test(models, source_rel=rel)
-        if not body:
-            continue
         out_rel = _contract_test_rel_path(rel, source_roots)
         out_abs = os.path.join(workspace_path, out_rel)
-        if os.path.exists(out_abs):
-            # Idempotent — record the marker edge but don't clobber.
-            markers[out_rel] = [rel]
+        existing = _read_text(out_abs) if os.path.exists(out_abs) else None
+        ours = existing is not None and _CONTRACT_MARKER in existing[:400]
+        if not body:
+            # Nothing is derivable from this model any more. A derived
+            # artefact must not outlive the shape it was derived from.
+            if ours:
+                try:
+                    os.remove(out_abs)
+                    retired.append(out_rel)
+                except OSError:
+                    pass
             continue
+        if existing is not None:
+            if not ours:
+                # Someone else owns this path; never clobber it.
+                markers[out_rel] = [rel]
+                continue
+            if existing == body:
+                markers[out_rel] = [rel]
+                continue
+            refreshed.append(out_rel)
         try:
             os.makedirs(os.path.dirname(out_abs), exist_ok=True)
             with open(out_abs, "w", encoding="utf-8") as fh:
                 fh.write(body)
         except OSError:
             continue
-        written.append(out_rel)
+        if out_rel not in refreshed:
+            written.append(out_rel)
         markers[out_rel] = [rel]
+    if retired:
+        logger.info(
+            "[contract-tests] retired %d stale contract test file(s) whose "
+            "models are no longer contract-testable: %s",
+            len(retired), ", ".join(retired),
+        )
+    if refreshed:
+        logger.info(
+            "[contract-tests] refreshed %d contract test file(s) after a "
+            "model's constraints changed: %s",
+            len(refreshed), ", ".join(refreshed),
+        )
     return written, markers
 
 
@@ -1169,3 +1234,173 @@ def emit_property_tests(
             len(refreshed), ", ".join(refreshed),
         )
     return written, markers
+
+
+# ===========================================================================
+# Staleness sweep — re-derive what is already on disk
+#
+# Both emitters above run in ``test_generation_node``: once per batch, over
+# the source files that batch touched. The repair loop then mutates those
+# same models for the rest of the batch and nothing re-checks the derived
+# tests, so a generated assertion can outlive the model shape it was derived
+# from for the whole remainder of the run.
+#
+# lumina 01a21929 (run 20) is the worked example and the reason this sweep
+# exists. ``server/app/schemas/birthday.py`` gained a ``@field_validator``
+# on ``created_at`` at 04:02:29, inside batch 103's repair loop — hours
+# after the batch's only generation pass at 00:16:18. ``_valid_kwargs``
+# skips a model whose required field carries a custom validator precisely
+# because its happy path is no longer derivable, but that check had been
+# evaluated once, at emission, and the file it had already written stayed on
+# disk asserting ``BirthdayResponse(created_at='aaa')`` constructs. The
+# judge named the schema as the blocker for 11 consecutive verdicts, repair
+# flipped the field between ``str`` and ``datetime`` four times, and the run
+# died with 30% of its budget spent on a test the harness itself had
+# invalidated and could not withdraw.
+#
+# A per-batch refresh would not have caught that; the sweep has to run
+# wherever the models can have changed. Its caller is the build.
+# ===========================================================================
+
+#: First line of every generated tier file: ``# @tests: <source rel path>``.
+_TESTS_HEADER_RE = re.compile(r"^#\s*@tests:\s*(\S+)\s*$")
+
+#: Directories never worth descending into when looking for generated tests.
+_SWEEP_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "dist", "build", "site-packages", ".next", "target", "coverage",
+})
+
+#: ``basename suffix → (renderer, marker)`` for each generated tier. Keyed on
+#: the suffix the tier's own path helper produces, so a renamed helper and a
+#: stale sweep cannot drift apart silently.
+_GENERATED_TIERS: tuple[tuple[str, str], ...] = (
+    ("_contract.py", "contract"),
+    ("_property.py", "property"),
+)
+
+
+def _render_for_tier(
+    tier: str, models: list[ModelSpec], *, source_rel: str,
+) -> Optional[str]:
+    if tier == "contract":
+        return render_contract_test(models, source_rel=source_rel)
+    if tier == "property":
+        return render_property_test(models, source_rel=source_rel)
+    return None
+
+
+def _marker_for_tier(tier: str) -> str:
+    return _CONTRACT_MARKER if tier == "contract" else _PROPERTY_MARKER
+
+
+def _generated_tier_files(
+    workspace_path: str,
+) -> list[tuple[str, str, str]]:
+    """``(test_rel, source_rel, tier)`` for every generated Tier-1 / Tier-3
+    file currently on disk that still bears this module's own banner.
+
+    Both path helpers place their output in ``<root>/tests/contract/``, so the
+    sweep only inspects directories of that shape. A file whose banner is
+    missing — hand-written, or adopted by an operator — is not listed, and so
+    is never rewritten or removed.
+    """
+    out: list[tuple[str, str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(workspace_path):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SWEEP_SKIP_DIRS and not d.startswith(".")
+        ]
+        parts = os.path.relpath(dirpath, workspace_path).replace(
+            "\\", "/",
+        ).split("/")
+        if len(parts) < 2 or parts[-1] != "contract" or parts[-2] != "tests":
+            continue
+        for name in filenames:
+            if not name.startswith("test_") or not name.endswith(".py"):
+                continue
+            tier = next(
+                (t for suffix, t in _GENERATED_TIERS if name.endswith(suffix)),
+                None,
+            )
+            if tier is None:
+                continue
+            test_rel = os.path.relpath(
+                os.path.join(dirpath, name), workspace_path,
+            )
+            text = _read_text(os.path.join(workspace_path, test_rel))
+            if not text or _marker_for_tier(tier) not in text[:400]:
+                continue
+            m = _TESTS_HEADER_RE.match(text.splitlines()[0] if text else "")
+            if not m:
+                continue
+            source_rel = m.group(1)
+            # The header is data read off disk, and the sweep uses it to open
+            # a file. Keep it inside the workspace: a ``../`` in a banner must
+            # not turn a staleness sweep into an arbitrary read.
+            if os.path.isabs(source_rel) or ".." in source_rel.replace(
+                "\\", "/",
+            ).split("/"):
+                continue
+            out.append((test_rel, source_rel, tier))
+    return out
+
+
+def refresh_generated_contract_tests(
+    workspace_path: str,
+) -> tuple[list[str], list[str]]:
+    """Re-derive every generated contract / property test on disk from the
+    CURRENT state of the model it was derived from.
+
+    Returns ``(refreshed, retired)`` as workspace-relative paths: ``refreshed``
+    were rewritten because the model changed shape, ``retired`` were deleted
+    because the model is no longer derivable at all (it grew a validator, or a
+    required field whose type cannot be synthesised).
+
+    Idempotent and best-effort: a file whose rendering is unchanged is left
+    alone, a source that has vanished retires its test, and any IO or parse
+    failure skips that one file rather than failing the caller.
+    """
+    refreshed: list[str] = []
+    retired: list[str] = []
+    for test_rel, source_rel, tier in _generated_tier_files(workspace_path):
+        test_abs = os.path.join(workspace_path, test_rel)
+        source = _read_text(os.path.join(workspace_path, source_rel))
+        body = None
+        if source is not None:
+            try:
+                models = parse_pydantic_models(source, rel_path=source_rel)
+            except Exception:  # noqa: BLE001 — a sweep never breaks the build
+                continue
+            if models:
+                body = _render_for_tier(tier, models, source_rel=source_rel)
+        if not body:
+            # The source is gone, holds no model any more, or holds one this
+            # tier can no longer derive anything from. Either way the file on
+            # disk is a claim about a shape that does not exist.
+            try:
+                os.remove(test_abs)
+                retired.append(test_rel)
+            except OSError:
+                pass
+            continue
+        existing = _read_text(test_abs)
+        if existing == body:
+            continue
+        try:
+            with open(test_abs, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError:
+            continue
+        refreshed.append(test_rel)
+    if retired or refreshed:
+        logger.info(
+            "[contract-tests] staleness sweep: refreshed %d, retired %d "
+            "generated test file(s) whose source model changed%s%s",
+            len(refreshed), len(retired),
+            (" — refreshed: " + ", ".join(sorted(refreshed))) if refreshed
+            else "",
+            (" — retired: " + ", ".join(sorted(retired))) if retired else "",
+        )
+    return refreshed, retired

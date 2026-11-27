@@ -2919,6 +2919,20 @@ class GatewayConfig:
     # Matches ``max_consecutive_distraction_rounds`` by default: the same
     # number of wasted rounds that trips the distraction breaker.
     max_unsat_offers_before_forcing: int = 3
+    # How many RELATED FILES the repair reflection prompt may name as
+    # grounded-but-undiagnosed (``graph._related_files_evidence``).
+    #
+    # The judge may only name files the diagnostics name plus these, so this
+    # is the width of the only window it has onto a defect that sits one hop
+    # away. Three sources now compete for the slots — the route the failure
+    # exercised, the failing files' imports, and the pytest fixture chain —
+    # where there used to be one, which is why the number is operator-
+    # visible rather than a literal in the call. Too small and the real file
+    # is crowded out (lumina 01a21929 named a schema for eleven verdicts
+    # while the defects sat in two files it could not see); too large and
+    # the judge is invited to shop around instead of localising.
+    # Clamped [1, 24].
+    max_related_evidence_files: int = 6
     # Bug B (2026-07-04) — low-signal-verdict circuit breaker. Ticked
     # whenever the reflection judge falls back to the "insufficient
     # data — no diagnostic locations available" sentinel, regardless of
@@ -5823,6 +5837,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_unsat_offers_before_forcing=_clamp_distraction_rounds(
             node_throttle.get("max_unsat_offers_before_forcing", 3)
+        ),
+        max_related_evidence_files=_clamp_positive_int(
+            node_throttle.get("max_related_evidence_files", 6),
+            name="node_throttle.max_related_evidence_files",
+            default=6, floor=1, ceiling=24,
         ),
         total_hard_cap_multiplier=_clamp_hard_cap_multiplier(
             node_throttle.get("total_hard_cap_multiplier", 4)

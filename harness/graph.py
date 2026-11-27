@@ -7903,6 +7903,14 @@ def _should_offer_unsatisfiable_escape(
     # carry an authoring smell and still be failing because production is
     # broken, but the application cannot produce a crash body or a
     # double-wrapped envelope because of anything the test got wrong.
+    #
+    # Pass evidence for the CANDIDATE files only. The caller partitions the
+    # guarded set with :func:`_production_fault_evidence_map` and offers the
+    # escape over the evidence-free remainder; handing this gate one file's
+    # evidence on behalf of a whole mixed set is what made the escape
+    # unreachable for lumina 01a21929's genuinely unsatisfiable generated
+    # test. When every candidate carries evidence the caller passes it here
+    # and the veto stands, exactly as before.
     if production_fault_evidence:
         return False
     if triage_test_bug:
@@ -8093,8 +8101,26 @@ def _workspace_imports_of(
     return out
 
 
+def _related_files_cap(default: int = 6) -> int:
+    """``node_throttle.max_related_evidence_files``, or ``default`` when the
+    gateway is not up yet (unit tests, pre-init paths)."""
+    try:
+        gw = get_gateway()
+        if gw is not None:
+            return int(getattr(
+                gw.config, "max_related_evidence_files", default,
+            ))
+    except Exception:  # noqa: BLE001 — evidence is best-effort, never fatal
+        pass
+    return default
+
+
 def _related_files_evidence(
-    workspace_path: str, diag_files: Iterable[str], *, cap: int = 6,
+    workspace_path: str,
+    diag_files: Iterable[str],
+    *,
+    cap: Optional[int] = None,
+    diagnostics: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[list[str], list[str]]:
     """``(imports, importers)`` for the diagnostic files.
 
@@ -8107,15 +8133,76 @@ def _related_files_evidence(
     Widening the EVIDENCE is the fix, not loosening the permission. There
     is precedent: the install-class carve-out already tells the judge it
     may name a manifest that appears in no diagnostic.
+
+    Three sources, in descending order of specificity, because they compete
+    for the same ``cap`` slots:
+
+    1. **The route the failure actually exercised.** A test that failed
+       asserting on ``GET /api/v1/birthdays/<id>`` is asserting on the module
+       that registers that path, whatever it imports.
+    2. **Static imports** of the failing files (the original widening).
+    3. **The pytest fixture chain** — the ``conftest.py`` files that supply
+       the test's fixtures, plus the modules they name in dotted *strings*.
+
+    (1) and (3) exist because a static import walk is the wrong instrument
+    for an integration test. An ADR-0006 acceptance test imports nothing but
+    ``pytest``: its app arrives through a fixture, and the generated conftest
+    declares the app module as a string. lumina 01a21929 (run 20) spent
+    eleven consecutive verdicts and 30% of its budget on
+    ``server/app/schemas/birthday.py`` — the only production file the import
+    walk could reach — while the two real defects sat in
+    ``server/app/api/birthdays.py`` and ``server/app/main.py``, both
+    unnameable under the grounding rule. Each source above independently
+    recovers one of them.
     """
-    imports = _workspace_imports_of(workspace_path, diag_files, cap=cap)
+    _cap = cap if cap is not None else _related_files_cap()
+    diag_list = [str(f) for f in diag_files if f]
+    skip = set(diag_list)
+    ordered: list[str] = []
+
+    def _add(items: Iterable[str]) -> None:
+        for f in items:
+            if not f or f in skip or f in ordered:
+                continue
+            ordered.append(f)
+
+    try:
+        from harness import route_index as _ri
+        _paths: list[str] = []
+        for d in (diagnostics or []):
+            if not isinstance(d, dict):
+                continue
+            _text = " ".join(
+                str(d.get(k, "") or "")
+                for k in ("message", "semantic_context", "context")
+            )
+            for p in _ri.request_paths_in_text(_text):
+                if p not in _paths:
+                    _paths.append(p)
+        if _paths:
+            _add(_ri.route_modules_for_paths(workspace_path, _paths))
+    except Exception:  # noqa: BLE001 — evidence is best-effort, never fatal
+        pass
+
+    _add(_workspace_imports_of(workspace_path, diag_list, cap=_cap))
+
+    try:
+        from harness import route_index as _ri2
+        _confs = _ri2.conftest_chain_for(workspace_path, diag_list)
+        if _confs:
+            _add(_ri2.module_refs_in(workspace_path, _confs))
+            _add(_workspace_imports_of(workspace_path, _confs, cap=_cap))
+    except Exception:  # noqa: BLE001
+        pass
+
+    imports = ordered[:_cap]
     importers: list[str] = []
     try:
         from harness.impact import DependencyGraph
         graph = DependencyGraph(workspace_path)
         importers = [
-            f for f in graph.immediate_callers_of(list(diag_files), top_k=cap)
-            if f not in set(diag_files)
+            f for f in graph.immediate_callers_of(diag_list, top_k=_cap)
+            if f not in skip and f not in set(imports)
         ]
     except Exception:  # noqa: BLE001 — evidence is best-effort, never fatal
         importers = []
@@ -8322,6 +8409,7 @@ def _apply_unsat_offer_floor(
     asserted_correct: bool = False,
     verdict_says_distraction: bool = False,
     production_fault_evidence: str = "",
+    production_fault_by_file: Optional[dict[str, str]] = None,
 ) -> Optional[tuple[str, str]]:
     """Count declined ``UNSATISFIABLE_TEST`` offers and, at the floor, take
     the escape on the model's behalf.
@@ -8384,7 +8472,21 @@ def _apply_unsat_offer_floor(
         return None
     if not offer_files:
         return None
-    if production_fault_evidence:
+    # Drop the files whose own failure proves production misbehaved, and
+    # clear their counts. Keeping the rest means one evidence-bearing file in
+    # a mixed set no longer shields a genuinely unsatisfiable sibling from
+    # the floor, which is the same per-file correction made at the offer
+    # sites (see :func:`_production_fault_evidence_map`).
+    if production_fault_by_file:
+        _evidenced = {
+            p for p in offer_files if production_fault_by_file.get(p)
+        }
+        for path in _evidenced:
+            declined.pop(path, None)
+        offer_files = {p for p in offer_files if p not in _evidenced}
+        if not offer_files:
+            return None
+    elif production_fault_evidence:
         for path in offer_files:
             declined.pop(path, None)
         return None
@@ -12763,6 +12865,42 @@ def _code_gap_evidence(state: AgentState, test_file: str) -> str:
     return ""
 
 
+def _production_fault_evidence_map(
+    state: AgentState, test_files: Any,
+) -> dict[str, str]:
+    """``{test_file: why}`` for EVERY one of ``test_files`` whose current
+    failure carries :func:`_code_gap_evidence`. Files with no evidence are
+    absent from the result.
+
+    Evidence is a property of one file's failure, and a failing set routinely
+    mixes kinds. ``_production_fault_evidence`` collapses the set to its first
+    hit, which is the right answer for a single-file question (the judge's
+    contradiction ruling asks about one named file) and the wrong one for a
+    set: one evidence-bearing file vetoed the UNSATISFIABLE_TEST escape for
+    every OTHER guarded test in the same round.
+
+    lumina 01a21929 (run 20) is the cost of that collapse.
+    ``tests/acceptance/test_story_006_acceptance.py`` legitimately carried
+    evidence — the app answered 200 where the criterion requires 404, an
+    owner-scoping defect in ``api/birthdays.py``. In the same failing set sat
+    ``server/tests/contract/test_birthday_contract.py``, a harness-generated
+    file that really WAS unsatisfiable. The set-wide veto fired on the
+    acceptance test's evidence 20+ times and withheld the escape from the
+    contract test on every one of them, so the one correct diagnosis
+    available to the loop was never reachable. Callers that ask about a set
+    must use this function and decide per file.
+    """
+    out: dict[str, str] = {}
+    for f in sorted({str(x) for x in (test_files or []) if x}):
+        try:
+            why = _code_gap_evidence(state, f)
+        except Exception:  # noqa: BLE001 — evidence must never break repair
+            why = ""
+        if why:
+            out[f] = why
+    return out
+
+
 def _production_fault_evidence(
     state: AgentState, test_files: Any,
 ) -> tuple[str, str]:
@@ -12773,20 +12911,36 @@ def _production_fault_evidence(
     UNSATISFIABLE_TEST offer, the declined-offer floor and the judge's
     contradiction ruling. Prose and streaks are inferences; this is a thing
     the application did, so it wins.
+
+    Single-file answer. A caller holding a SET wants
+    :func:`_production_fault_evidence_map` — see its docstring for why
+    collapsing a set to one hit is a defect, not a simplification.
     """
-    for f in sorted({str(x) for x in (test_files or []) if x}):
-        try:
-            why = _code_gap_evidence(state, f)
-        except Exception:  # noqa: BLE001 — evidence must never break repair
-            why = ""
-        if why:
-            return f, why
+    _map = _production_fault_evidence_map(state, test_files)
+    for f in sorted(_map):
+        return f, _map[f]
     return "", ""
 
 
-def _production_fault_banner(test_file: str, why: str) -> str:
+def _production_fault_banner(
+    test_file: str, why: str, more: Optional[dict[str, str]] = None,
+) -> str:
     """The repair directive that replaces the UNSATISFIABLE_TEST offer when
-    the failure evidence says production is at fault."""
+    the failure evidence says production is at fault.
+
+    ``more`` carries any FURTHER evidence-bearing files in the same round so
+    one banner speaks for all of them. Without it a round with two such files
+    named only the first, leaving the second looking like fair game for a
+    blame the evidence already rules out.
+    """
+    extra = ""
+    _rest = {k: v for k, v in (more or {}).items() if k != test_file}
+    if _rest:
+        extra = (
+            " The same applies to "
+            + "; ".join(f"{f} ({w})" for f, w in sorted(_rest.items()))
+            + "."
+        )
     return (
         f"PRODUCTION DEFECT EVIDENCE — the failure at {test_file} shows that "
         f"{why}. The test is asserting what the specification requires; the "
@@ -12794,6 +12948,7 @@ def _production_fault_banner(test_file: str, why: str) -> str:
         "produced this response. The UNSATISFIABLE_TEST escape is NOT "
         "available for this failure: no edit to the test can change what the "
         "application did."
+        + extra
     )
 
 
@@ -16671,6 +16826,40 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     """
     logger.info("[compiler_node] Running build command in sandbox...")
 
+    # Re-derive the harness's own generated contract / property tests from
+    # the models as they stand RIGHT NOW, before this build judges them.
+    #
+    # The emitters run once per batch, in test_generation_node. The repair
+    # loop keeps mutating those models for the rest of the batch, so without
+    # this sweep a generated assertion can outlive the model shape it was
+    # derived from — and because the file is tamper-guarded, repair cannot
+    # withdraw it and the judge reads it as ground truth. lumina 01a21929
+    # (run 20) died that way: see the sweep's own docstring.
+    #
+    # The build is the right caller because it is the single point every
+    # mutation path funnels through on its way to a verdict. Best-effort by
+    # construction — a sweep failure must never block a build.
+    try:
+        from harness.contract_tests import refresh_generated_contract_tests
+        _swept_refreshed, _swept_retired = refresh_generated_contract_tests(
+            str(state.get("workspace_path", "") or ""),
+        )
+        if _swept_refreshed or _swept_retired:
+            try:
+                from harness.observability import emit_event as _emit_sweep
+                _emit_sweep(
+                    "generated_tests_swept",
+                    refreshed=sorted(_swept_refreshed),
+                    retired=sorted(_swept_retired),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not block
+                pass
+    except Exception as _sweep_exc:  # noqa: BLE001
+        logger.debug(
+            "[compiler_node] generated-test staleness sweep failed: %s",
+            _sweep_exc,
+        )
+
     loop_counter = state.get("loop_counter", {})
     loop_counter = dict(loop_counter)
     loop_counter["compiler"] = loop_counter.get("compiler", 0) + 1
@@ -18492,6 +18681,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _related_imports, _related_importers = _related_files_evidence(
                     str(state.get("workspace_path", "") or ""),
                     _diag_files_for_ev,
+                    diagnostics=top_persisted_diagnostics,
                 )
             except Exception:  # noqa: BLE001 — never block the judge
                 _related_imports, _related_importers = [], []
@@ -20619,10 +20809,21 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _distraction_streak = int(
                     loop_counter.get("consecutive_distraction_rounds", 0) or 0
                 )
-                _pf_file, _pf_why = _production_fault_evidence(
-                    state,
-                    _guarded_line_files | set(_guarded_tests_dropped),
+                # Per file, not per round. ``_pf_map`` holds the guarded
+                # files whose own failure proves the application misbehaved;
+                # ``_pf_clean`` is the remainder, and only the remainder can
+                # be declared unsatisfiable. A mixed set used to veto the
+                # escape wholesale — see
+                # :func:`_production_fault_evidence_map`.
+                _guarded_all = _guarded_line_files | set(
+                    _guarded_tests_dropped
                 )
+                _pf_map = _production_fault_evidence_map(state, _guarded_all)
+                _pf_clean = {f for f in _guarded_all if f not in _pf_map}
+                _pf_file, _pf_why = ("", "")
+                for _f in sorted(_pf_map):
+                    _pf_file, _pf_why = _f, _pf_map[_f]
+                    break
                 # A protected-test blocker that survives repeated DISTRACTION
                 # verdicts means the prod targets aren't the fix — offer the
                 # UNSATISFIABLE_TEST escape instead of another futile prod
@@ -20642,12 +20843,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         _workspace_for_banner,
                         _guard_carveout_for_banner,
                     ),
-                    production_fault_evidence=_pf_why,
+                    # Only when NO guarded file is evidence-free does the
+                    # veto still speak for the round.
+                    production_fault_evidence="" if _pf_clean else _pf_why,
                 )
                 if _pf_why:
                     _log_production_fault_veto(_pf_file, _pf_why, "judge-driven")
                     reflection_banner_lines.append(
-                        _production_fault_banner(_pf_file, _pf_why)
+                        _production_fault_banner(_pf_file, _pf_why, _pf_map)
                     )
                 if _has_mandatable_target and _offer_unsat:
                     logger.warning(
@@ -20660,7 +20863,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # Production-fault evidence takes the no-offer branch even
                 # when no mandatable target remains: the ``else`` below is
                 # the offer, and "nothing mandatable" must not reopen it.
-                if (_has_mandatable_target or _pf_why) and not _offer_unsat:
+                if (
+                    (_has_mandatable_target or _pf_why)
+                    and not (_offer_unsat and _pf_clean)
+                ):
                     reflection_banner_lines.append(
                         "PROTECTED TEST LOCATION — the failing assertion "
                         f"lives at {_guarded_display}, which is a test "
@@ -20674,12 +20880,27 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     )
                 else:
                     _offered_unsat_marker = True
+                    # The offer covers the evidence-free files ONLY. A file
+                    # whose own failure proves production misbehaved keeps
+                    # its banner above and stays out of the offer set, so
+                    # neither the model nor the declined-offer floor can
+                    # declare it unsatisfiable.
                     _unsat_offer_files = {
                         _normalize_ws_path(f, _workspace_for_banner)
-                        for f in (
-                            _guarded_line_files | set(_guarded_tests_dropped)
-                        )
+                        for f in (_pf_clean or _guarded_all)
                     }
+                    _clean_display_parts = [
+                        f"{f}:{ln}" for f, ln in _guarded_test_lines[:5]
+                        if not _pf_clean or f in _pf_clean
+                    ]
+                    _clean_display_parts += [
+                        f for f in _guarded_tests_dropped[:5]
+                        if f not in _guarded_line_files
+                        and (not _pf_clean or f in _pf_clean)
+                    ]
+                    _guarded_display = (
+                        ", ".join(_clean_display_parts) or _guarded_display
+                    )
                     reflection_banner_lines.append(
                         "PROTECTED TEST LOCATION — the failing assertion "
                         f"lives at {_guarded_display}, inside a test file "
@@ -20974,9 +21195,18 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _floor_triage = _triage_flags_guarded_test_bug(
                     _errs_floor, _ws_floor, _carveout_floor,
                 )
-                _floor_pf_file, _floor_pf_why = _production_fault_evidence(
-                    state, {f for f, _ in _floor_lines},
+                # Per file, as in the judge-driven path above.
+                _floor_all = {f for f, _ in _floor_lines}
+                _floor_pf_map = _production_fault_evidence_map(
+                    state, _floor_all,
                 )
+                _floor_pf_clean = {
+                    f for f in _floor_all if f not in _floor_pf_map
+                }
+                _floor_pf_file, _floor_pf_why = ("", "")
+                for _ff in sorted(_floor_pf_map):
+                    _floor_pf_file, _floor_pf_why = _ff, _floor_pf_map[_ff]
+                    break
                 if _floor_pf_why:
                     _log_production_fault_veto(
                         _floor_pf_file, _floor_pf_why, "protected-test floor",
@@ -20984,11 +21214,13 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     messages.append(MessageDict(
                         role="system",
                         content=_production_fault_banner(
-                            _floor_pf_file, _floor_pf_why,
+                            _floor_pf_file, _floor_pf_why, _floor_pf_map,
                         ),
                     ))
                 _floor_offer = _should_offer_unsatisfiable_escape(
-                    production_fault_evidence=_floor_pf_why,
+                    production_fault_evidence=(
+                        "" if _floor_pf_clean else _floor_pf_why
+                    ),
                     has_guarded_blocker=True,
                     # Deliberately True. With the judge path dark we have no
                     # verdict to tell us whether a prod target exists, and
@@ -21016,13 +21248,17 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     ),
                     triage_test_bug=_floor_triage,
                 )
-                if _floor_offer:
+                if _floor_offer and _floor_pf_clean:
+                    # Evidence-free files only — a file whose failure proves
+                    # the application misbehaved got its banner above and is
+                    # not on offer here.
                     _floor_display = ", ".join(
                         f"{f}:{ln}" if ln else f
                         for f, ln in _floor_lines
+                        if f in _floor_pf_clean
                     )
                     _offered_unsat_marker = True
-                    _unsat_offer_files = {f for f, _ in _floor_lines}
+                    _unsat_offer_files = set(_floor_pf_clean)
                     logger.warning(
                         "[repair_node] Protected-test floor: failing "
                         "diagnostic(s) at %s live in tamper-guarded test "
@@ -22072,9 +22308,9 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 set() if _unparsed_this_round else _unsat_offer_files,
                 any_real_patch=_any_real_patch,
                 already_declared=_unsat_declared is not None,
-                production_fault_evidence=_production_fault_evidence(
+                production_fault_by_file=_production_fault_evidence_map(
                     state, _unsat_offer_files,
-                )[1],
+                ),
                 # The judge has already ruled on this round by here (the
                 # verdict block runs earlier in repair_node), so a round it
                 # called DISTRACTION/REGRESSION does not get to clear the

@@ -64,6 +64,7 @@
         "max_consecutive_distraction_rounds": 3,
         "max_consecutive_low_signal_rounds": 5,
         "max_unsat_offers_before_forcing": 3,
+        "max_related_evidence_files": 6,
         "total_hard_cap_multiplier": 4,
         "max_end_of_session_regression_cycles": 3,
         "end_of_session_repair_diagnostic_cap": 30,

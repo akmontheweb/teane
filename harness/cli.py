@@ -956,6 +956,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # never writes the line declines it forever (lumina-fresh-
         # 20260911-1107: 15 correct offers, 15 declines, build lost).
         "max_unsat_offers_before_forcing",
+        # How many grounded-but-undiagnosed files the repair reflection
+        # prompt may list as RELATED FILES. The judge may name only the
+        # diagnosed files plus these, so it bounds how far from the
+        # diagnostics a nameable defect can sit.
+        "max_related_evidence_files",
         # 2026-07-04 — router hard-ceiling multiplier for total repair
         # rounds per compile phase. Combined with
         # ``max_patch_repair_iterations`` to compute the absolute cap.
@@ -1474,6 +1479,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "node_throttle.max_consecutive_distraction_rounds": (int,),
     "node_throttle.max_consecutive_low_signal_rounds": (int,),
     "node_throttle.max_unsat_offers_before_forcing": (int,),
+    "node_throttle.max_related_evidence_files": (int,),
     "node_throttle.total_hard_cap_multiplier": (int,),
     "node_throttle.max_doc_review_cycles": (int,),
     "node_throttle.max_code_review_cycles": (int,),

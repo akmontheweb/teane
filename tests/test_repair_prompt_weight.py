@@ -301,3 +301,229 @@ class TestTheConfigIsWired:
         }
         gw = create_gateway_from_config(cfg)
         assert gw.config.repair_guarded_test_window_head_lines == expect
+
+
+class TestThePreflightBudgetIsSpentOnPatchableFiles:
+    """The budget decides WHICH DISPATCH the work lands in, not whether it
+    happens: an omitted file is named with an instruction to READ_FILE it.
+    Spending it on files the tamper guard forbids patching buys a round trip
+    for the one file that cannot use it — 197 times on lumina 01a21929.
+    """
+
+    def test_guarded_tests_go_to_the_tail(self):
+        got, n = g._order_preflight_by_patchability([
+            "server/tests/contract/test_a_contract.py",
+            "server/app/api/birthdays.py",
+            "tests/acceptance/test_story_006_acceptance.py",
+            "server/app/main.py",
+        ], "/w")
+        assert n == 2
+        assert got[:2] == [
+            "server/app/api/birthdays.py", "server/app/main.py",
+        ]
+        assert got[2:] == [
+            "server/tests/contract/test_a_contract.py",
+            "tests/acceptance/test_story_006_acceptance.py",
+        ]
+
+    def test_it_is_a_stable_partition_not_a_sort(self):
+        """Session 01a079dc lost ``main.py`` — the file the judge had just
+        directed it to patch — to a re-sort that disturbed the caller's
+        deliberate most-recent-first order. Relative order must survive
+        inside each class."""
+        order = [
+            "z/app/c.py", "a/app/a.py", "m/app/b.py",
+            "z/tests/test_z.py", "a/tests/test_a.py",
+        ]
+        got, n = g._order_preflight_by_patchability(order, "/w")
+        assert got == [
+            "z/app/c.py", "a/app/a.py", "m/app/b.py",
+            "z/tests/test_z.py", "a/tests/test_a.py",
+        ]
+        assert n == 2
+
+    def test_a_syntax_broken_test_counts_as_patchable(self):
+        """Repair IS allowed to fix a test file it cannot even collect, so
+        the carveout must not be demoted with the rest."""
+        broken = "server/tests/test_broken.py"
+        got, n = g._order_preflight_by_patchability(
+            [broken, "server/app/a.py"], "/w", carveout=frozenset({broken}),
+        )
+        assert n == 0 and got[0] == broken
+
+    def test_all_patchable_changes_nothing(self):
+        order = ["a/app/a.py", "b/app/b.py"]
+        got, n = g._order_preflight_by_patchability(order, "/w")
+        assert got == order and n == 0
+
+    def test_the_repair_node_uses_it(self):
+        src = pathlib.Path(g.__file__).read_text(encoding="utf-8")
+        call = src.index("preflight_pairs = _collect_workspace_file_content(")
+        head = src.rindex("_order_preflight_by_patchability(", 0, call)
+        assert call - head < 1200, "ordering is not applied before the collect"
+
+
+class TestThePreflightCapIsPriced:
+    def test_the_live_cap_comes_from_config(self, monkeypatch):
+        class _C:
+            preflight_section_char_cap = 12345
+
+        class _GW:
+            config = _C()
+
+        monkeypatch.setattr(g, "get_gateway", lambda: _GW())
+        assert g._preflight_section_char_cap() == 12345
+
+    def test_it_falls_back_without_a_gateway(self, monkeypatch):
+        monkeypatch.setattr(g, "get_gateway", lambda: None)
+        assert g._preflight_section_char_cap() == g._PREFLIGHT_SECTION_CHAR_CAP
+
+    def test_a_raising_gateway_does_not_break_prompt_sizing(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("no gateway")
+        monkeypatch.setattr(g, "get_gateway", _boom)
+        assert g._preflight_section_char_cap() == g._PREFLIGHT_SECTION_CHAR_CAP
+
+    def test_the_formatter_honours_the_live_cap(self, monkeypatch):
+        """Raising the cap has to actually show more files, or the config key
+        is decoration."""
+        files = [(f"app/f{i}.py", "x" * 5000) for i in range(10)]
+
+        def _cap(n):
+            class _C:
+                preflight_section_char_cap = n
+
+            class _GW:
+                config = _C()
+            monkeypatch.setattr(g, "get_gateway", lambda: _GW())
+            return g._format_preflight_file_content(files)
+
+        small, large = _cap(24000), _cap(48000)
+        assert small.count("### `app/f") < large.count("### `app/f")
+
+    def test_the_omission_notice_quotes_the_live_cap(self, monkeypatch):
+        class _C:
+            preflight_section_char_cap = 9000
+
+        class _GW:
+            config = _C()
+        monkeypatch.setattr(g, "get_gateway", lambda: _GW())
+        out = g._format_preflight_file_content(
+            [(f"app/f{i}.py", "x" * 5000) for i in range(5)],
+        )
+        assert "9k chars" in out and "READ_FILE" in out
+
+    def test_the_default_is_the_raised_value(self):
+        assert g._PREFLIGHT_SECTION_CHAR_CAP == 48000
+
+    def test_the_key_is_registered_typed_shipped_and_documented(self):
+        import json
+        from harness import cli
+        root = pathlib.Path(__file__).resolve().parents[1]
+        assert (
+            "preflight_section_char_cap"
+            in cli._KNOWN_NESTED_KEYS["node_throttle"]
+        )
+        assert (
+            cli._TYPE_SCHEMA["node_throttle.preflight_section_char_cap"]
+            == (int,)
+        )
+        cfg = json.loads((root / "config" / "config.json").read_text())
+        assert cfg["node_throttle"]["preflight_section_char_cap"] == 48000
+        help_md = (root / "config" / "config_help.md").read_text()
+        assert "preflight_section_char_cap" in help_md
+
+    @pytest.mark.parametrize("raw,expect", [
+        (48000, 48000), (1, 4000), (10 ** 9, 400000), ("nonsense", 48000),
+    ])
+    def test_the_cap_is_clamped(self, raw, expect):
+        from harness.gateway import create_gateway_from_config
+        gw = create_gateway_from_config({
+            "model_routing": {},
+            "node_throttle": {"preflight_section_char_cap": raw},
+        })
+        assert gw.config.preflight_section_char_cap == expect
+
+
+class TestTheCombinedEffectOnRun20:
+    """Replay of the real preflight set from run 20's final repair round."""
+
+    GUARDED = {
+        "server/tests/contract/test_birthday_contract.py": {114},
+        "server/tests/contract/test_birthday_property.py": {26},
+        "tests/acceptance/test_story_006_acceptance.py": {74},
+    }
+    PRODUCTION = (
+        "server/app/services/birthday_service.py",
+        "server/app/schemas/birthday.py",
+        "server/app/repositories/birthday_repository.py",
+        "server/app/models/birthday.py",
+        "server/app/api/deps.py",
+        "server/app/api/birthdays.py",
+        "server/app/api/router.py",
+        "server/app/main.py",
+        "server/app/config.py",
+        "server/app/errors.py",
+    )
+    LUMINA = pathlib.Path("/Users/akhila/Projects/lumina")
+
+    def _shown(self, order, windows, cap):
+        pairs = g._collect_workspace_file_content(
+            str(self.LUMINA), list(order), max_files=40,
+            window_paths=windows or None,
+            window_head_lines=40, window_radius=25,
+        )
+        acc, shown = 2000, []
+        for rel, content in pairs:
+            block = len(f"\n### `{rel}`\n```\n{content}\n```")
+            if acc + block > cap:
+                break
+            shown.append(rel)
+            acc += block
+        return shown
+
+    def test_production_files_survive_the_budget_now(self):
+        if not self.LUMINA.is_dir():
+            pytest.skip("lumina workspace not present")
+        before = self._shown(
+            list(self.GUARDED) + list(self.PRODUCTION), None, 24000,
+        )
+        after = self._shown(
+            *g._order_preflight_by_patchability(
+                list(self.GUARDED) + list(self.PRODUCTION), str(self.LUMINA),
+            )[:1],
+            self.GUARDED, 48000,
+        )
+        withheld_before = [p for p in self.PRODUCTION if p not in before]
+        withheld_after = [p for p in self.PRODUCTION if p not in after]
+        assert len(withheld_before) >= 8, (
+            "run 20's overflow no longer reproduces; re-measure before "
+            "trusting the after figure"
+        )
+        assert withheld_after == []
+
+    def test_order_is_what_saves_them_when_the_budget_still_binds(self):
+        """The raised cap happens to fit this whole set, so it alone would
+        have rescued run 20. The ordering is the part that holds when the
+        budget binds anyway — a bigger workspace, more diagnostics, a lower
+        configured cap. Pinned at the OLD cap so the two fixes are shown to
+        be independent rather than one masking the other.
+        """
+        if not self.LUMINA.is_dir():
+            pytest.skip("lumina workspace not present")
+        unordered = list(self.GUARDED) + list(self.PRODUCTION)
+        ordered, _ = g._order_preflight_by_patchability(
+            unordered, str(self.LUMINA),
+        )
+        withheld_unordered = [
+            p for p in self.PRODUCTION
+            if p not in self._shown(unordered, self.GUARDED, 24000)
+        ]
+        withheld_ordered = [
+            p for p in self.PRODUCTION
+            if p not in self._shown(ordered, self.GUARDED, 24000)
+        ]
+        assert len(withheld_ordered) < len(withheld_unordered), (
+            f"unordered withheld {len(withheld_unordered)}, "
+            f"ordered withheld {len(withheld_ordered)}"
+        )

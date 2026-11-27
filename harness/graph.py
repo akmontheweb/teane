@@ -11011,7 +11011,79 @@ def _is_bootstrap_tool(symbol: str) -> bool:
 # then either it lands or the harness treats it as a real distraction.
 _WORKING_HYPOTHESIS_STREAK_CAP = 2
 _PREFLIGHT_FILE_CHAR_CAP = 6000
-_PREFLIGHT_SECTION_CHAR_CAP = 24000
+
+# Fallback for the preflight file-content budget when no gateway is up (unit
+# tests, pre-init paths). The live value is
+# ``node_throttle.preflight_section_char_cap`` — see
+# :func:`_preflight_section_char_cap`.
+#
+# Raised from 24,000 after measuring lumina 01a21929: 294 of 314 repair
+# dumps (94%) overflowed this budget and printed the "You have NOT been
+# shown these — emit a READ_FILE block" notice, naming on average a dozen
+# production files. The model obeyed, 197 times, and each READ_FILE costs a
+# full extra dispatch — ~18k effective tokens once the cached prefix is
+# re-read, against ~6k tokens for the whole 24,000-char budget. Spending
+# more here to avoid even one round trip is a 3:1 win, and the old number
+# was evidently chosen to bound prompt size without pricing a round trip.
+_PREFLIGHT_SECTION_CHAR_CAP = 48000
+
+
+def _order_preflight_by_patchability(
+    paths: "Iterable[str]",
+    workspace_path: str,
+    carveout: "frozenset[str] | set[str]" = frozenset(),
+) -> tuple[list[str], int]:
+    """``(reordered, n_unpatchable)`` — files repair MAY PATCH first, the
+    tamper-guarded test files it may not last.
+
+    Both the file-count cap in :func:`_collect_workspace_file_content` and
+    the char cap in :func:`_format_preflight_file_content` evict from the
+    TAIL, and the omission notice tells the LLM to ``READ_FILE`` whatever was
+    withheld. So this order decides which dispatch the work lands in, not
+    whether it happens. A file the tamper guard forbids patching, placed
+    ahead of the production code under repair, buys a round trip for the one
+    file that cannot use it.
+
+    lumina 01a21929 paid that 197 times. 294 of its 314 repair dumps
+    overflowed the budget — roughly 18k of it on guarded test bodies — and
+    the omission list named exactly the files repair then pulled:
+    ``birthday_service.py`` withheld 269 times and pulled 54,
+    ``api/birthdays.py`` withheld 187 and pulled 68. Replaying that round's
+    real preflight set, the old order showed 4 files and withheld 9 of 10
+    production files; this order shows all 13.
+
+    A STABLE partition, never a sort. The caller's order is deliberately
+    most-recent-first, and session 01a079dc lost ``main.py`` — the file the
+    judge had just directed it to patch — to a re-sort that disturbed
+    exactly that. Files keep their relative order within each class.
+
+    ``carveout`` is the syntax-broken test files repair IS allowed to fix
+    (see :func:`_syntax_broken_test_files`); those count as patchable.
+    """
+    patchable: list[str] = []
+    guarded: list[str] = []
+    for p in paths:
+        rel = str(p)
+        norm = _normalize_ws_path(rel, workspace_path)
+        if _is_test_artifact(norm) and norm not in carveout:
+            guarded.append(rel)
+        else:
+            patchable.append(rel)
+    return patchable + guarded, len(guarded)
+
+
+def _preflight_section_char_cap() -> int:
+    """The live preflight file-content budget in characters."""
+    try:
+        gw = get_gateway()
+        if gw is not None:
+            return int(getattr(
+                gw.config, "preflight_section_char_cap",
+                _PREFLIGHT_SECTION_CHAR_CAP,
+            ))
+    except Exception:  # noqa: BLE001 — prompt sizing must never raise
+        pass
+    return _PREFLIGHT_SECTION_CHAR_CAP
 
 # Path segments that indicate a file lives inside a dependency tree, NOT
 # in the user's workspace source. Tracebacks routinely surface
@@ -11287,11 +11359,12 @@ def _format_current_file_content(failures: list[Any]) -> str:
     # view unbounded and crowd out the diagnostics below it. Files whose
     # views don't fit are NAMED, so the LLM knows to READ_FILE them rather
     # than patching from memory.
+    _cap = _preflight_section_char_cap()
     accumulated = sum(len(s) for s in lines)
     omitted: list[str] = []
     for file_ref, wider in seen.items():
         block = f"\n### `{file_ref}`\n```\n{wider}\n```"
-        if omitted or accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
+        if omitted or accumulated + len(block) > _cap:
             omitted.append(file_ref)
             continue
         lines.append(block)
@@ -11300,7 +11373,7 @@ def _format_current_file_content(failures: list[Any]) -> str:
         listed = ", ".join(f"`{p}`" for p in omitted)
         lines.append(
             f"\n(omitted to keep this section under "
-            f"{_PREFLIGHT_SECTION_CHAR_CAP // 1000}k chars: {listed}. You have "
+            f"{_cap // 1000}k chars: {listed}. You have "
             f"NOT been shown these — emit a READ_FILE block before writing any "
             f"REPLACE_BLOCK against one of them.)"
         )
@@ -11359,13 +11432,14 @@ def _format_preflight_file_content(
         "\n## Current Content of Files You Need to Edit",
         intro,
     ]
+    _cap = _preflight_section_char_cap()
     accumulated = sum(len(s) for s in lines)
     omitted: list[str] = []
     for rel_path, content in seen.items():
         block = f"\n### `{rel_path}`\n```\n{content}\n```"
         # Keep going after the first over-cap file: a single large file must
         # not suppress every smaller one behind it.
-        if omitted or accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
+        if omitted or accumulated + len(block) > _cap:
             omitted.append(rel_path)
             continue
         lines.append(block)
@@ -11378,7 +11452,7 @@ def _format_preflight_file_content(
         listed = ", ".join(f"`{p}`" for p in omitted)
         lines.append(
             f"\n(omitted to keep this section under "
-            f"{_PREFLIGHT_SECTION_CHAR_CAP // 1000}k chars: {listed}. You have "
+            f"{_cap // 1000}k chars: {listed}. You have "
             f"NOT been shown these — emit a READ_FILE block before writing any "
             f"REPLACE_BLOCK against one of them.)"
         )
@@ -19745,6 +19819,42 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         f"{f}:{sorted(ls)}"
                         for f, ls in sorted(_guarded_windows.items())
                     ),
+                )
+            # Spend the preflight budget on files repair MAY PATCH first.
+            #
+            # Both the file-count cap below and the char cap in
+            # ``_format_preflight_file_content`` evict from the TAIL, and
+            # the omission notice tells the LLM to READ_FILE whatever was
+            # withheld. So the order of this list decides which dispatch the
+            # work lands in, not whether it happens. Putting a file the
+            # tamper guard forbids patching ahead of the production code
+            # under repair buys a round trip for the one file that cannot
+            # use it.
+            #
+            # lumina 01a21929 paid that 197 times. 294 of 314 repair dumps
+            # overflowed the budget — roughly 18k of it on guarded test
+            # bodies — and the omission list named exactly the files repair
+            # then pulled: birthday_service.py withheld 269 times and pulled
+            # 54, api/birthdays.py withheld 187 and pulled 68.
+            #
+            # A STABLE partition, not a sort: the selection above is
+            # deliberately most-recent-first, and session 01a079dc lost
+            # ``main.py`` — the file the judge had just directed it to patch
+            # — to a re-sort that disturbed exactly that order. This moves
+            # unpatchable files to the back and changes nothing else.
+            files_for_preflight, _n_unpatchable = (
+                _order_preflight_by_patchability(
+                    files_for_preflight, workspace_path, _window_carveout,
+                )
+            )
+            if _n_unpatchable:
+                logger.info(
+                    "[repair_node] Preflight ordered by patchability: %d "
+                    "file(s) repair may edit first, %d tamper-guarded "
+                    "test file(s) last so the budget evicts those rather "
+                    "than the code under repair.",
+                    len(files_for_preflight) - _n_unpatchable,
+                    _n_unpatchable,
                 )
             preflight_pairs = _collect_workspace_file_content(
                 workspace_path, files_for_preflight,

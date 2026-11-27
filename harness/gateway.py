@@ -3207,6 +3207,22 @@ class GatewayConfig:
     # the ordinary preflight truncation. Clamped [0, 500] and [0, 500].
     repair_guarded_test_window_head_lines: int = 40
     repair_guarded_test_window_radius: int = 25
+    # Characters of file content the preflight "## Current Content of Files
+    # You Need to Edit" section may spend before it starts omitting files.
+    #
+    # Shared by patching_node, test_generation_node and repair_node. Omitted
+    # files are NAMED, with an instruction to emit READ_FILE before patching
+    # them — so this number does not bound work, it decides whether the work
+    # happens in this dispatch or the next one.
+    #
+    # That is why it was mispriced. lumina 01a21929 overflowed it in 294 of
+    # 314 repair dumps (94%), naming a dozen production files each time, and
+    # the model obeyed with 197 READ_FILE pulls across 74 rounds — 4.2
+    # dispatches per round. One pull costs a whole dispatch, ~18k effective
+    # tokens once the 80%-cached prefix is re-read, against ~6k tokens for
+    # the entire old 24,000-char budget. Spending more here to avoid even one
+    # round trip is roughly 3:1 in its favour. Clamped [4000, 400000].
+    preflight_section_char_cap: int = 48000
     # Sixth touchpoint (added alongside the saturation check): on each
     # discovery follow-up round, picks the 3-5 sectors most worth
     # re-auditing this round and splices them into the prompt's
@@ -5863,6 +5879,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             node_throttle.get("max_related_evidence_files", 6),
             name="node_throttle.max_related_evidence_files",
             default=6, floor=1, ceiling=24,
+        ),
+        preflight_section_char_cap=_clamp_positive_int(
+            node_throttle.get("preflight_section_char_cap", 48000),
+            name="node_throttle.preflight_section_char_cap",
+            default=48000, floor=4000, ceiling=400000,
         ),
         total_hard_cap_multiplier=_clamp_hard_cap_multiplier(
             node_throttle.get("total_hard_cap_multiplier", 4)

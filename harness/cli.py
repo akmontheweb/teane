@@ -961,6 +961,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # diagnosed files plus these, so it bounds how far from the
         # diagnostics a nameable defect can sit.
         "max_related_evidence_files",
+        # Characters of file content the preflight section may spend before
+        # it starts NAMING files it withheld and telling the LLM to
+        # READ_FILE them. Decides which dispatch the work lands in, not
+        # whether it happens (lumina 01a21929: 94% overflow, 197 pulls).
+        "preflight_section_char_cap",
         # 2026-07-04 — router hard-ceiling multiplier for total repair
         # rounds per compile phase. Combined with
         # ``max_patch_repair_iterations`` to compute the absolute cap.
@@ -1492,6 +1497,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "node_throttle.max_consecutive_low_signal_rounds": (int,),
     "node_throttle.max_unsat_offers_before_forcing": (int,),
     "node_throttle.max_related_evidence_files": (int,),
+    "node_throttle.preflight_section_char_cap": (int,),
     "node_throttle.total_hard_cap_multiplier": (int,),
     "node_throttle.max_doc_review_cycles": (int,),
     "node_throttle.max_code_review_cycles": (int,),

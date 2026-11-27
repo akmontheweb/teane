@@ -1416,6 +1416,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # Repair-node tuning read by the gateway factory.
     "repair": frozenset({
         "structured_diagnostic_payload",
+        # How much of a tamper-guarded test file the repair prompt embeds.
+        # Repair may not edit one, so it needs the failing assertion, not
+        # the body (lumina 01a21929: 18k chars of unedit-able test text on
+        # the billed path every round).
+        "guarded_test_window_head_lines",
+        "guarded_test_window_radius",
     }),
 }
 
@@ -1550,6 +1556,13 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "test_generation.spec_consistency_review": (bool,),
     "test_generation.max_spec_review_rounds": (int,),
     "test_generation.unexecutable_call_review": (bool,),
+    # Repair-prompt composition. Registered in _KNOWN_NESTED_KEYS since the
+    # flag was added but never typed here, so setting the documented value
+    # tripped the validator — the switch GatewayConfig advertises was
+    # unusable in practice.
+    "repair.structured_diagnostic_payload": (bool,),
+    "repair.guarded_test_window_head_lines": (int,),
+    "repair.guarded_test_window_radius": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.
     "llm_dispatch.deliberation_head_chars": (int,),
     "test_regeneration.enabled": (bool,),

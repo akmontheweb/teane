@@ -11169,6 +11169,80 @@ def _render_file_with_line_numbers_and_hash(
     return rendered, file_hash
 
 
+def _render_file_windows_with_line_numbers_and_hash(
+    path: str,
+    lines_of_interest: "Iterable[int]",
+    *,
+    head_lines: int,
+    radius: int,
+) -> tuple[Optional[str], Optional[str]]:
+    """A line-numbered view of ``path`` reduced to its head plus a window
+    around each line in ``lines_of_interest``, with the full file's sha256.
+
+    For a file the repair LLM may NOT edit, the whole body is cost without
+    purpose: it needs the failing assertion and enough around it to read the
+    assertion, which is the head (imports, module docstring, module-level
+    fixtures) plus a neighbourhood of each diagnostic. Elided stretches are
+    marked, so the model can see that lines are missing and READ_FILE if it
+    genuinely needs them — the one escape it must never be denied silently.
+
+    Line numbers are the file's OWN, never renumbered: a diagnostic says
+    ``:114`` and the view has to agree with it. Falls back to the ordinary
+    truncating renderer when ``lines_of_interest`` is empty or both bounds
+    are zero, so a misconfigured window degrades to today's behaviour rather
+    than to nothing.
+    """
+    wanted = sorted({int(n) for n in lines_of_interest if int(n or 0) > 0})
+    if not wanted or (head_lines <= 0 and radius <= 0):
+        return _render_file_with_line_numbers_and_hash(path)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, None
+    if not text:
+        return None, None
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        file_hash: Optional[str] = h.hexdigest()
+    except OSError:
+        file_hash = None
+    text_lines = text.splitlines()
+    total = len(text_lines)
+    if not total:
+        return None, file_hash
+    keep: set[int] = set(range(1, min(head_lines, total) + 1))
+    for n in wanted:
+        keep |= set(range(max(1, n - radius), min(total, n + radius) + 1))
+    if len(keep) >= total:
+        # Nothing would be elided — hand back the ordinary rendering so the
+        # output is byte-identical to the unwindowed path.
+        return _render_file_with_line_numbers_and_hash(path)
+    width = max(2, len(str(total)))
+    out: list[str] = []
+    prev = 0
+    for n in sorted(keep):
+        if n != prev + 1 and prev:
+            gap = n - prev - 1
+            out.append(
+                f"...({gap} line{'s' if gap != 1 else ''} elided — "
+                "READ_FILE this path if you need them)"
+            )
+        out.append(f"{n:>{width}}| {text_lines[n - 1]}")
+        prev = n
+    if prev < total:
+        gap = total - prev
+        out.append(
+            f"...({gap} line{'s' if gap != 1 else ''} elided — "
+            "READ_FILE this path if you need them)"
+        )
+    return "\n".join(out), file_hash
+
+
 def _format_current_file_content(failures: list[Any]) -> str:
     """Collect every wider-context file-content block from prior patch
     failures into a single top-of-prompt section.
@@ -11744,6 +11818,9 @@ def _collect_workspace_file_content(
     max_files: int = 12,
     record_hashes_into: Optional[dict[str, str]] = None,
     full_read_paths: Optional[set[str]] = None,
+    window_paths: Optional[dict[str, set[int]]] = None,
+    window_head_lines: int = 40,
+    window_radius: int = 25,
 ) -> list[tuple[str, str]]:
     """Read each ``rel_paths`` entry under ``workspace_path`` and return
     ``(rel_path, line_numbered_content)`` pairs. Silently skips files that
@@ -11765,16 +11842,35 @@ def _collect_workspace_file_content(
     composing a REPLACE_BLOCK that spans the failing line. Lifting the
     caps for exactly the stuck files keeps the token budget bounded to
     the actual failure surface.
+
+    ``window_paths`` maps a path to the lines worth seeing in it, and that
+    path is rendered as its head plus a window around each of those lines
+    instead of its body. Used for TAMPER-GUARDED test files: repair cannot
+    edit them, so it needs the failing assertion rather than the file, and
+    the full-read promotion above — written for production files it must
+    compose a REPLACE_BLOCK against — is pure cost when applied to one.
+    ``window_paths`` wins over ``full_read_paths`` for the same path, since
+    the two ask for opposite things and only one of them can be right about
+    a file nobody is allowed to patch.
     """
     out: list[tuple[str, str]] = []
     _full_set: set[str] = full_read_paths or set()
+    _windows: dict[str, set[int]] = window_paths or {}
     for rel in rel_paths:
         if len(out) >= max_files:
             break
         if not isinstance(rel, str) or not rel.strip():
             continue
         abs_path = os.path.join(workspace_path, rel)
-        if rel in _full_set:
+        if rel in _windows:
+            rendered, file_hash = (
+                _render_file_windows_with_line_numbers_and_hash(
+                    abs_path, _windows[rel],
+                    head_lines=window_head_lines,
+                    radius=window_radius,
+                )
+            )
+        elif rel in _full_set:
             rendered, file_hash = _render_file_with_line_numbers_and_hash(
                 abs_path,
                 max_lines=_PERSISTENT_BLOCKER_FILE_LINE_CAP,
@@ -19595,10 +19691,68 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             ) or []:
                 if isinstance(_f, str) and _f:
                     _persistent_files.add(_f)
+            # A tamper-guarded test gets a WINDOW, never a full read. The
+            # promotion above exists so the LLM can compose a REPLACE_BLOCK
+            # spanning the failing line; it may not patch a guarded test at
+            # all, so for those the promotion only buys tokens. And the
+            # judge names the guarded test on exactly the rounds where it IS
+            # the blocker, so the two rules collided every round of lumina
+            # 01a21929 and the expensive one won.
+            _errs_for_window = state.get("compiler_errors", []) or []
+            _window_carveout = _syntax_broken_test_files(
+                _errs_for_window, workspace_path,
+            )
+            _guarded_windows: dict[str, set[int]] = {}
+            for _d in _errs_for_window:
+                if not isinstance(_d, dict):
+                    continue
+                _raw = str(_d.get("file", "") or "")
+                if not _raw:
+                    continue
+                _norm_w = _normalize_ws_path(_raw, workspace_path)
+                if (
+                    not _is_test_artifact(_norm_w)
+                    or _norm_w in _window_carveout
+                ):
+                    continue
+                try:
+                    _ln = int(_d.get("line", 0) or 0)
+                except (TypeError, ValueError):
+                    _ln = 0
+                if _ln > 0:
+                    _guarded_windows.setdefault(_norm_w, set()).add(_ln)
+            # A guarded test with no line to anchor on keeps the ordinary
+            # truncation rather than an arbitrary window.
+            _persistent_files -= set(_guarded_windows)
+            _gw_cfg = get_gateway()
+            _w_head, _w_radius = 40, 25
+            if _gw_cfg is not None:
+                _w_head = int(getattr(
+                    _gw_cfg.config,
+                    "repair_guarded_test_window_head_lines", 40,
+                ))
+                _w_radius = int(getattr(
+                    _gw_cfg.config, "repair_guarded_test_window_radius", 25,
+                ))
+            if _guarded_windows:
+                logger.info(
+                    "[repair_node] Windowing %d tamper-guarded test file(s) "
+                    "to head+%d lines around the failing line(s) — repair "
+                    "cannot edit them, so the body is cost without purpose: "
+                    "%s",
+                    len(_guarded_windows), _w_radius,
+                    ", ".join(
+                        f"{f}:{sorted(ls)}"
+                        for f, ls in sorted(_guarded_windows.items())
+                    ),
+                )
             preflight_pairs = _collect_workspace_file_content(
                 workspace_path, files_for_preflight,
                 max_files=diag_cap,
                 record_hashes_into=files_seen_by_llm,
+                window_paths=_guarded_windows or None,
+                window_head_lines=_w_head,
+                window_radius=_w_radius,
                 full_read_paths=_persistent_files,
             )
             error_summary += _format_preflight_file_content(

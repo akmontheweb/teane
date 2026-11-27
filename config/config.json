@@ -55,6 +55,11 @@
             "fallback_output_tokens": 2000
         }
     },
+    "repair": {
+        "structured_diagnostic_payload": false,
+        "guarded_test_window_head_lines": 40,
+        "guarded_test_window_radius": 25
+    },
     "node_throttle": {
         "max_code_review_cycles": 1,
         "max_discovery_iterations": 1,

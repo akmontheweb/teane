@@ -3186,6 +3186,27 @@ class GatewayConfig:
     # cost. Off by setting repair_structured_diagnostic_payload=false in
     # config to fall back to markdown-only.
     repair_structured_diagnostic_payload: bool = True
+    # How much of a TAMPER-GUARDED test file the repair prompt embeds.
+    #
+    # Repair may not edit a guarded test, so the only thing it needs from one
+    # is the failing assertion and enough context to read it — not the file.
+    # lumina 01a21929 embedded 236 lines of ``test_birthday_contract.py``
+    # (11,509 chars) and 3,248 more of its property sibling on EVERY round,
+    # on the billed path, because the judge kept naming the failing line and
+    # a judge-named file is promoted to a full read. That promotion was
+    # written for production files the LLM must compose a REPLACE_BLOCK
+    # against; for a file it cannot touch it is pure cost. Across 314 repair
+    # dispatches the guarded-test bodies were ~18k chars of a ~45k billed
+    # message, while repair asked for a guarded test only 16 times in 197
+    # READ_FILE pulls — it wants the production code, not these.
+    #
+    # ``head_lines`` keeps the top of the file (imports, module docstring,
+    # module-level fixtures) so the assertion is readable in context;
+    # ``window_radius`` is the number of lines kept either side of each
+    # diagnostic line. Set head_lines=0 and window_radius=0 to fall back to
+    # the ordinary preflight truncation. Clamped [0, 500] and [0, 500].
+    repair_guarded_test_window_head_lines: int = 40
+    repair_guarded_test_window_radius: int = 25
     # Sixth touchpoint (added alongside the saturation check): on each
     # discovery follow-up round, picks the 3-5 sectors most worth
     # re-auditing this round and splices them into the prompt's
@@ -6140,6 +6161,20 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             (config_dict.get("repair", {}) or {}).get(
                 "structured_diagnostic_payload", True,
             )
+        ),
+        repair_guarded_test_window_head_lines=_clamp_positive_int(
+            (config_dict.get("repair", {}) or {}).get(
+                "guarded_test_window_head_lines", 40,
+            ),
+            name="repair.guarded_test_window_head_lines",
+            default=40, floor=0, ceiling=500,
+        ),
+        repair_guarded_test_window_radius=_clamp_positive_int(
+            (config_dict.get("repair", {}) or {}).get(
+                "guarded_test_window_radius", 25,
+            ),
+            name="repair.guarded_test_window_radius",
+            default=25, floor=0, ceiling=500,
         ),
         llm_judgment_discovery_followup_focus=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(

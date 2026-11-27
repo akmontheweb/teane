@@ -172,6 +172,36 @@ _AC_SECTION_RE = re.compile(
 )
 _AC_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]+(?P<text>.+?)[ \t]*$", re.M)
 
+# Markdown blockquote markers at line start, one or more deep (``>``, ``> >``,
+# ``>>``), with the single conventional space after each eaten.
+#
+# The generator renders Gherkin inside a blockquote:
+#
+#     **Acceptance Criteria:**
+#
+#     > Scenario: Birthday with known birth year
+#     >   Given today's local date is 2026-03-14
+#
+# Every AC pattern below anchors on ``^[ \t]*`` and then expects a bullet,
+# bold/heading marker or ``Scenario`` — none of them tolerate a ``>``. So the
+# scenario pass found nothing AND the ``Acceptance Criteria`` bullet fallback
+# found nothing, and ``_extract_acceptance_criteria`` returned [] for every
+# story. Because this reconciler is authoritative over the AC side table, those
+# empty lists then OVERWROTE the 52 ACs decomposition had just persisted
+# (lumina 01a21c72: 12 stories, 0 ACs, which left the acceptance tests with
+# nothing to anchor and turned them straight into protected-test blockers).
+# Normalising once here fixes all three patterns at the same time.
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)
+
+
+def _strip_blockquotes(body: str) -> str:
+    """Remove leading markdown blockquote markers from every line.
+
+    Returns ``body`` unchanged when it contains no blockquote, so a spec that
+    never used them parses exactly as before.
+    """
+    return _BLOCKQUOTE_PREFIX_RE.sub("", body)
+
 
 def _extract_acceptance_criteria(body: str) -> list[str]:
     """Acceptance-criteria titles from a story body, robust to the markup an
@@ -180,6 +210,9 @@ def _extract_acceptance_criteria(body: str) -> list[str]:
     the bullet items under an ``Acceptance Criteria`` label when a story lists
     plain criteria instead of named scenarios. Returns [] only when a story
     genuinely records none."""
+    # Blockquoted Gherkin is the generator's default rendering; strip the
+    # quote markers before any pattern runs so all three see bare lines.
+    body = _strip_blockquotes(body)
     acs: list[str] = []
     for m in _SCENARIO_TITLE_RE.finditer(body):
         title = m.group("title").strip().strip("*").strip()
@@ -522,7 +555,9 @@ def reconcile_workspace_from_spec(
 
     LLM's ``scope_files`` are carried over by ``story_key`` (exact) or
     fuzzy title match. Everything else in ``stories`` / ``features`` /
-    ``acceptance_criteria`` comes from the spec.
+    ``acceptance_criteria`` comes from the spec — EXCEPT that a story whose
+    spec body yields zero acceptance criteria keeps the ACs decomposition
+    persisted, rather than having them overwritten with an empty list.
 
     ``embed_constraint_nfrs`` (ADR-0004): when true, honor decomposition's
     constraint-NFR embed across the wipe. Decomposition folds a constraint NFR's
@@ -701,6 +736,30 @@ def reconcile_workspace_from_spec(
             # onto this functional story so the embedded constraint survives the
             # wipe (dedup against the spec's own ACs).
             acs_to_insert = list(spec["acceptance_criteria"])
+            # Defence in depth: this reconciler is authoritative over the AC
+            # side table, so a spec the parser cannot read ACs out of does not
+            # merely contribute nothing — it DELETES whatever decomposition
+            # persisted a moment earlier. ``scope_files`` above is already
+            # carried over from the LLM row for exactly this reason; ACs were
+            # not, so one unrecognised markup shape (lumina 01a21c72's
+            # blockquoted Gherkin) silently zeroed all 52 of them. Falling back
+            # keeps the next unknown format a degradation instead of a wipe.
+            if not acs_to_insert and llm_hit:
+                carried = [
+                    str(a).strip()
+                    for a in (llm_hit.get("acceptance_criteria") or [])
+                    if str(a).strip()
+                ]
+                if carried:
+                    logger.warning(
+                        "[spec_reconciler] %s: spec parsed 0 acceptance "
+                        "criteria — carrying forward %d from decomposition "
+                        "rather than overwriting them with nothing. The spec's "
+                        "AC markup is likely a shape the parser does not "
+                        "recognise; check docs/SPEC_REQUIREMENTS.md.",
+                        spec_key, len(carried),
+                    )
+                    acs_to_insert = carried
             if embed_constraint_nfrs and llm_hit:
                 _existing = set(acs_to_insert)
                 for _ac in folded_nfr_acs_by_llm_key.get(llm_hit["story_key"], []):

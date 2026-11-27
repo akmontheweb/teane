@@ -42,6 +42,7 @@ __all__ = [
     "Contradiction",
     "find_contradictions",
     "find_contradictions_across",
+    "is_raises_call",
     "unparseable_reason",
     "machine_unsatisfiable_reason",
 ]
@@ -129,6 +130,17 @@ def _is_raises_call(node: ast.expr) -> bool:
     if isinstance(func, ast.Name):
         return func.id in ("raises", "assertRaises", "assertRaisesRegex")
     return False
+
+
+def is_raises_call(node: ast.expr) -> bool:
+    """Public form of the pytest-raises predicate.
+
+    Shared with ``contract_tests.find_unexecutable_model_calls`` so the two
+    deterministic test gates cannot disagree about what opens a "must raise"
+    context. Omitting a required field inside one is the point of a
+    required-omission test; outside one it is a test that cannot run.
+    """
+    return _is_raises_call(node)
 
 
 def _call_name(node: ast.Call) -> Optional[str]:

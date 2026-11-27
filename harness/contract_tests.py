@@ -34,6 +34,7 @@ import ast
 import logging
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -54,6 +55,9 @@ __all__ = [
     "emit_property_tests",
     # Staleness sweep — re-derive generated tests from the current models
     "refresh_generated_contract_tests",
+    # Executability gate — a call that cannot match its model's signature
+    "UnexecutableCall",
+    "find_unexecutable_model_calls",
 ]
 
 # Pydantic base classes we recognise as "this is a validated model". Kept
@@ -1404,3 +1408,242 @@ def refresh_generated_contract_tests(
             (" — retired: " + ", ".join(sorted(retired))) if retired else "",
         )
     return refreshed, retired
+
+
+# ===========================================================================
+# Executability gate — will this test even run against the code it names?
+#
+# Every other test-quality gate asks whether a generated test agrees with the
+# SPEC. ``find_contradictions_across`` proves one test contradicts another,
+# and the spec-consistency reviewer asks which spec rule fixes a computed
+# expectation. Nothing asked the cheaper question first: does this call match
+# the signature of the model it is calling?
+#
+# lumina 01a21929 (run 20) shipped a test that could not execute, and both
+# gates passed it. The emitted happy path was
+# ``BirthdayResponse(id='aaa', first_name='aaa', birth_month=1, birth_day=1,
+# category='aaa', created_at='aaa', updated_at='aaa')`` against a model that
+# also declared ``last_name``, ``birth_year``, ``phone_number``, ``email``
+# and ``notes`` as required — so pydantic answered "5 validation errors ...
+# Field required" on the first build and every build after. The contradiction
+# prover proves a raise/success pair and this is neither side of one. The
+# spec reviewer had the test AND the model in front of it (it reads the
+# ``# @tests:`` marker to fetch the module) and returned "no false computed
+# expectations", because the failure is not a computed value at odds with a
+# spec rule — and because the reviewer is forbidden from flagging a test
+# "merely because today's production code does not satisfy it yet", which is
+# exactly the shape "this fails because last_name is required" presents. The
+# guard that stops the dangerous false positive is the guard that hid this.
+#
+# WHY THIS IS SAFE TO ACT ON, which is the whole question for a gate that
+# rewrites tests. A happy-path construction's job is to build a VALID
+# instance. Passing every declared-required field is correct whether or not
+# the model's requiredness is itself right: if a field ought to carry a
+# default, that is a change to the model, and the test supplying it in the
+# meantime asserts nothing false. So the remediation is unambiguous and never
+# deletes a requirement — unlike "this test outruns the code", where the test
+# is right and the build is supposed to stay red until production catches up.
+# That case is NOT in scope here and must never be: a missing module, a
+# missing symbol and a missing method are all legitimate red.
+#
+# Conservative to the point of uselessness before it is wrong once. Every
+# shape it cannot prove is skipped: see the guard list in
+# :func:`find_unexecutable_model_calls`.
+# ===========================================================================
+
+@dataclass(frozen=True)
+class UnexecutableCall:
+    """One construction that cannot succeed against its model as declared."""
+    file: str
+    line: int
+    test: str
+    model: str
+    missing: tuple[str, ...]
+
+    def describe(self) -> str:
+        fields = ", ".join(self.missing)
+        plural = "s" if len(self.missing) > 1 else ""
+        return (
+            f"{self.file}:{self.line} in `{self.test}`: "
+            f"`{self.model}(...)` omits required field{plural} {fields} — "
+            f"{self.model} declares {'them' if plural else 'it'} with no "
+            "default, so this construction raises ValidationError "
+            "'Field required' before any assertion runs. No production "
+            "change makes it succeed as written."
+        )
+
+
+def _module_rel_for(workspace_path: str, dotted: str) -> Optional[str]:
+    """``server.app.schemas.birthday`` → ``server/app/schemas/birthday.py``
+    when that file is in the workspace, else None (third-party or stdlib)."""
+    if not dotted or dotted.startswith("."):
+        return None
+    base = os.path.join(*dotted.split("."))
+    for candidate in (base + ".py", os.path.join(base, "__init__.py")):
+        if os.path.exists(os.path.join(workspace_path, candidate)):
+            return candidate.replace("\\", "/")
+    return None
+
+
+def _imported_models(
+    workspace_path: str, tree: ast.Module, cache: dict[str, list[ModelSpec]],
+) -> dict[str, ModelSpec]:
+    """``local name → ModelSpec`` for every Pydantic model this test file
+    imports from a WORKSPACE module.
+
+    Resolution is by import, so a same-named class from somewhere else is
+    never mistaken for the workspace's. A relative import (``level`` > 0) is
+    not resolved and its names are simply absent.
+    """
+    out: dict[str, ModelSpec] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
+            continue
+        rel = _module_rel_for(workspace_path, node.module)
+        if rel is None:
+            continue
+        if rel not in cache:
+            src = _read_text(os.path.join(workspace_path, rel))
+            try:
+                cache[rel] = parse_pydantic_models(src or "", rel_path=rel)
+            except Exception:  # noqa: BLE001 — a gate never breaks generation
+                cache[rel] = []
+        by_name = {m.name: m for m in cache[rel]}
+        for alias in node.names:
+            model = by_name.get(alias.name)
+            if model is not None:
+                out[alias.asname or alias.name] = model
+    return out
+
+
+class _ConstructionScanner(ast.NodeVisitor):
+    """Collect ``Model(...)`` calls in happy-path position.
+
+    Calls inside ``pytest.raises`` are skipped: omitting a required field
+    there is the POINT of a required-omission test, and the emitter writes
+    exactly those. Calls inside ``try`` are skipped too — the exception may
+    be caught deliberately, so success is not being claimed.
+    """
+
+    def __init__(self, models: dict[str, ModelSpec]) -> None:
+        self._models = models
+        self._fn_stack: list[str] = []
+        self._in_raises = 0
+        self._in_try = 0
+        self.found: list[tuple[str, ast.Call, ModelSpec]] = []
+
+    def _visit_fn(self, node) -> None:
+        is_test = node.name.startswith("test")
+        if is_test:
+            self._fn_stack.append(node.name)
+        self.generic_visit(node)
+        if is_test:
+            self._fn_stack.pop()
+
+    visit_FunctionDef = _visit_fn  # type: ignore[assignment]
+    visit_AsyncFunctionDef = _visit_fn  # type: ignore[assignment]
+
+    def visit_With(self, node: ast.With) -> None:  # noqa: N802
+        from harness.test_contradiction import is_raises_call
+        if any(is_raises_call(i.context_expr) for i in node.items):
+            self._in_raises += 1
+            self.generic_visit(node)
+            self._in_raises -= 1
+        else:
+            self.generic_visit(node)
+
+    visit_AsyncWith = visit_With  # type: ignore[assignment]
+
+    def visit_Try(self, node: ast.Try) -> None:  # noqa: N802
+        self._in_try += 1
+        for stmt in node.body:
+            self.visit(stmt)
+        self._in_try -= 1
+        for stmt in (*node.handlers, *node.orelse, *node.finalbody):
+            self.visit(stmt)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        from harness.test_contradiction import is_raises_call
+        if (
+            self._fn_stack
+            and not self._in_raises
+            and not self._in_try
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self._models
+        ):
+            self.found.append(
+                (self._fn_stack[-1], node, self._models[node.func.id]),
+            )
+        # The functional form ``pytest.raises(Exc, Model, ...)`` passes the
+        # callable rather than calling it, so nothing to do; but a subject
+        # call nested in the args of a raises() call must not count as a
+        # happy path.
+        if is_raises_call(node):
+            self._in_raises += 1
+            self.generic_visit(node)
+            self._in_raises -= 1
+        else:
+            self.generic_visit(node)
+
+
+def find_unexecutable_model_calls(
+    workspace_path: str, test_sources: "Mapping[str, str]",
+) -> list[UnexecutableCall]:
+    """Constructions in ``test_sources`` that cannot succeed against the
+    model they name, proven from the model's own declaration.
+
+    ``test_sources`` maps a workspace-relative test path to its source.
+    Deterministic, no LLM, and conservative by construction: a model or call
+    is SKIPPED rather than guessed at when
+
+    * the model is not imported from a resolvable workspace module, so a
+      same-named class from elsewhere cannot be confused for it;
+    * the model carries a ``@model_validator`` — a ``mode="before"``
+      validator can inject fields, so absence proves nothing;
+    * any of its fields carries a ``Field(alias=...)`` — then the accepted
+      keyword name is not the field name;
+    * the call passes ``**kwargs`` — the keys are not statically known;
+    * the call passes a positional argument — a model may define its own
+      ``__init__``, and we only know about the declarative one;
+    * the model declares no required field at all.
+
+    Returns findings sorted by file then line, so a re-prompt built from them
+    is stable across runs.
+    """
+    out: list[UnexecutableCall] = []
+    cache: dict[str, list[ModelSpec]] = {}
+    for rel in sorted(test_sources):
+        src = test_sources.get(rel)
+        if not src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue  # unparseable is a different, already-proven class
+        models = _imported_models(workspace_path, tree, cache)
+        if not models:
+            continue
+        scanner = _ConstructionScanner(models)
+        scanner.visit(tree)
+        for test_fn, call, model in scanner.found:
+            if model.has_model_validator:
+                continue
+            if any(f.has_alias for f in model.fields):
+                continue
+            if call.args:
+                continue
+            if any(kw.arg is None for kw in call.keywords):
+                continue
+            supplied = {kw.arg for kw in call.keywords if kw.arg}
+            missing = tuple(
+                f.name for f in model.fields
+                if f.required and f.name not in supplied
+            )
+            if not missing:
+                continue
+            out.append(UnexecutableCall(
+                file=rel, line=int(getattr(call, "lineno", 0) or 0),
+                test=test_fn, model=model.name, missing=missing,
+            ))
+    out.sort(key=lambda f: (f.file, f.line, f.model))
+    return out

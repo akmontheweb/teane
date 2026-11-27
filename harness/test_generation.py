@@ -2513,57 +2513,112 @@ async def _run_contradiction_gate(
         }
         _py_tests = {k: v for k, v in _py_tests.items() if v is not None}
         contradictions = find_contradictions_across(_py_tests)
-        if not contradictions:
+        # Second deterministic class: a call that cannot match the signature
+        # of the model it names. Same gate because the remedy is the same —
+        # re-prompt the AUTHOR while the test is still editable — and because
+        # a round that fixes one should re-check the other before spending
+        # another dispatch. See
+        # ``contract_tests.find_unexecutable_model_calls`` for why acting on
+        # it never deletes a requirement.
+        unexecutable: list[Any] = []
+        if cfg.get("unexecutable_call_review", True):
+            try:
+                from harness.contract_tests import (
+                    find_unexecutable_model_calls,
+                )
+                unexecutable = find_unexecutable_model_calls(
+                    workspace_path, _py_tests,
+                )
+            except Exception as _ux_exc:  # noqa: BLE001 — gate is best-effort
+                logger.debug(
+                    "[test_generation_node] executability check failed: %s",
+                    _ux_exc,
+                )
+        if not contradictions and not unexecutable:
             break
         try:
             from harness.observability import emit_event
             emit_event(
                 "test_generation_contradiction_detected",
                 count=len(contradictions),
+                unexecutable=len(unexecutable),
                 reprompt=contra_reprompts + 1,
                 files=sorted({
                     f for c in contradictions
                     for f in (c.expect_raise_file, c.expect_success_file) if f
-                }),
+                } | {u.file for u in unexecutable}),
             )
         except Exception:  # noqa: BLE001 — telemetry must not block
             pass
         if contra_reprompts >= contra_cap:
             logger.warning(
-                "[test_generation_node] Cross-file contradiction persists "
-                "after %d re-prompt(s); proceeding to the build (repair / "
-                "ADR-0001 regeneration will handle the residue). Pairs: %s",
-                contra_cap,
-                "; ".join(c.describe() for c in contradictions[:3]),
+                "[test_generation_node] Unsatisfiable generated test(s) "
+                "persist after %d re-prompt(s); proceeding to the build "
+                "(repair / ADR-0001 regeneration will handle the residue). "
+                "%d contradiction(s), %d unexecutable call(s): %s",
+                contra_cap, len(contradictions), len(unexecutable),
+                "; ".join(
+                    d.describe()
+                    for d in [*contradictions, *unexecutable][:3]
+                ),
             )
             break
         contra_reprompts += 1
         _pairs = "\n".join(f"- {c.describe()}" for c in contradictions)
+        _uncalls = "\n".join(f"- {u.describe()}" for u in unexecutable)
         logger.warning(
             "[test_generation_node] Detected %d cross-file test "
-            "contradiction(s); bouncing back to the author (re-prompt "
-            "%d/%d).\n%s",
-            len(contradictions), contra_reprompts, contra_cap, _pairs,
+            "contradiction(s) and %d unexecutable call(s); bouncing back to "
+            "the author (re-prompt %d/%d).\n%s",
+            len(contradictions), len(unexecutable),
+            contra_reprompts, contra_cap,
+            "\n".join(p for p in (_pairs, _uncalls) if p),
         )
-        messages.append({
-            "role": "system",
-            "content": (
-                "STOP — the tests you just generated are mutually "
-                "UNSATISFIABLE. The following call(s) are required to both "
-                "raise and succeed on identical input, across different "
-                "test files:\n" + _pairs + "\n\n"
-                "No production code can satisfy both, and the repair loop "
-                "may NOT edit test files to break the tie. Reconcile by "
-                "deciding which single layer OWNS the rejection (see RULE 6 "
-                "/ RULE 7): if the value is rejected at CONSTRUCTION, keep "
-                "the schema-level `pytest.raises(...)` assertion and REMOVE "
-                "the downstream test that constructs the same invalid value; "
-                "if the value is meant to construct and be rejected "
-                "downstream, loosen the schema test instead. Re-emit ONLY "
-                "the corrected test file(s) as REWRITE_FILE blocks, keeping "
-                "each file's `@tests` marker. Only patch blocks, no prose."
-            ),
-        })
+        if contradictions:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "STOP — the tests you just generated are mutually "
+                    "UNSATISFIABLE. The following call(s) are required to "
+                    "both raise and succeed on identical input, across "
+                    "different test files:\n" + _pairs + "\n\n"
+                    "No production code can satisfy both, and the repair "
+                    "loop may NOT edit test files to break the tie. "
+                    "Reconcile by deciding which single layer OWNS the "
+                    "rejection (see RULE 6 / RULE 7): if the value is "
+                    "rejected at CONSTRUCTION, keep the schema-level "
+                    "`pytest.raises(...)` assertion and REMOVE the "
+                    "downstream test that constructs the same invalid "
+                    "value; if the value is meant to construct and be "
+                    "rejected downstream, loosen the schema test instead. "
+                    "Re-emit ONLY the corrected test file(s) as "
+                    "REWRITE_FILE blocks, keeping each file's `@tests` "
+                    "marker. Only patch blocks, no prose."
+                ),
+            })
+        if unexecutable:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "STOP — the following construction(s) cannot execute "
+                    "against the model they name. Each omits a field the "
+                    "model declares with NO default, so pydantic raises "
+                    "ValidationError 'Field required' before your assertion "
+                    "runs:\n" + _uncalls + "\n\n"
+                    "This is not production lagging the test — the model "
+                    "already declares these fields, and no production "
+                    "change makes the call succeed as written. Fix it by "
+                    "PASSING each missing field a valid value. Do NOT "
+                    "delete the test, do NOT wrap it in "
+                    "`pytest.raises(...)`, and do NOT weaken any other "
+                    "assertion: a happy-path test must construct a VALID "
+                    "instance, so supplying every required field is correct "
+                    "regardless of whether the model's own requiredness is "
+                    "later changed. Re-emit ONLY the corrected test file(s) "
+                    "as REWRITE_FILE blocks, keeping each file's `@tests` "
+                    "marker. Only patch blocks, no prose."
+                ),
+            })
         try:
             response, new_budget = await _dispatch_test_author(
                 gateway=gateway,
@@ -2608,10 +2663,10 @@ async def _run_contradiction_gate(
             # the same bytes the patcher just rejected. Hand the residue to
             # the build, where repair and ADR-0001 regeneration can act.
             logger.warning(
-                "[test_generation_node] The contradiction re-prompt landed "
-                "no patch (re-emitted content, or every block rejected) — "
-                "proceeding to the build with the %d generated test file(s) "
-                "as they stand.",
+                "[test_generation_node] The unsatisfiable-test re-prompt "
+                "landed no patch (re-emitted content, or every block "
+                "rejected) — proceeding to the build with the %d generated "
+                "test file(s) as they stand.",
                 len(generated_tests),
             )
             break

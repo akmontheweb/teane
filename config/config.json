@@ -425,7 +425,8 @@
         "pre_repair_triage": true,
         "triage_gate_max_regens": 3,
         "spec_consistency_review": true,
-        "max_spec_review_rounds": 2
+        "max_spec_review_rounds": 2,
+        "unexecutable_call_review": true
     },
     "test_regeneration": {
         "enabled": true,

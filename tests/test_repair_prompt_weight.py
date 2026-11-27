@@ -445,6 +445,57 @@ class TestThePreflightCapIsPriced:
         assert gw.config.preflight_section_char_cap == expect
 
 
+# Run 20's real preflight set, as (lines, chars) measured from that run's
+# workspace. Recorded here rather than read off disk: this test used to point
+# at /Users/akhila/Projects/lumina directly, and the very next clean build
+# regenerated that workspace, so the overflow it pins stopped reproducing and
+# the test failed for a reason that had nothing to do with the code under
+# test. The preflight budget is pure char arithmetic over line-structured
+# files, so a synthesised file of the same shape exercises it identically.
+_RUN20_SHAPE: dict[str, tuple[int, int]] = {
+    "server/tests/contract/test_birthday_contract.py": (144, 10728),
+    "server/tests/contract/test_birthday_property.py": (28, 3077),
+    "tests/acceptance/test_story_006_acceptance.py": (78, 2620),
+    "server/app/services/birthday_service.py": (270, 9602),
+    "server/app/schemas/birthday.py": (111, 3565),
+    "server/app/repositories/birthday_repository.py": (155, 5378),
+    "server/app/models/birthday.py": (48, 1785),
+    "server/app/api/deps.py": (67, 2327),
+    "server/app/api/birthdays.py": (327, 11459),
+    "server/app/api/router.py": (10, 232),
+    "server/app/main.py": (50, 1448),
+    "server/app/config.py": (35, 1020),
+    "server/app/errors.py": (98, 2376),
+}
+
+
+def _synth_py(lines: int, chars: int) -> str:
+    """A Python file of exactly ``lines`` lines and ``chars`` characters.
+
+    Content is filler comments — the preflight formatter measures and windows
+    text, it does not interpret it.
+    """
+    body = max(chars - lines, lines)          # chars available excluding \n
+    base, extra = divmod(body, lines)
+    out = []
+    for i in range(lines):
+        width = max(base + (1 if i < extra else 0), 1)
+        out.append(("# " + "x" * max(width - 2, 0))[:width].ljust(width, "x"))
+    text = "\n".join(out) + "\n"
+    return text
+
+
+@pytest.fixture(scope="module")
+def run20_workspace(tmp_path_factory):
+    """Materialise run 20's preflight set at its recorded shape."""
+    root = tmp_path_factory.mktemp("run20_ws")
+    for rel, (lines, chars) in _RUN20_SHAPE.items():
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(_synth_py(lines, chars))
+    return root
+
+
 class TestTheCombinedEffectOnRun20:
     """Replay of the real preflight set from run 20's final repair round."""
 
@@ -465,11 +516,10 @@ class TestTheCombinedEffectOnRun20:
         "server/app/config.py",
         "server/app/errors.py",
     )
-    LUMINA = pathlib.Path("/Users/akhila/Projects/lumina")
 
-    def _shown(self, order, windows, cap):
+    def _shown(self, ws, order, windows, cap):
         pairs = g._collect_workspace_file_content(
-            str(self.LUMINA), list(order), max_files=40,
+            str(ws), list(order), max_files=40,
             window_paths=windows or None,
             window_head_lines=40, window_radius=25,
         )
@@ -482,15 +532,16 @@ class TestTheCombinedEffectOnRun20:
             acc += block
         return shown
 
-    def test_production_files_survive_the_budget_now(self):
-        if not self.LUMINA.is_dir():
-            pytest.skip("lumina workspace not present")
+    def test_production_files_survive_the_budget_now(self, run20_workspace):
         before = self._shown(
+            run20_workspace,
             list(self.GUARDED) + list(self.PRODUCTION), None, 24000,
         )
         after = self._shown(
+            run20_workspace,
             *g._order_preflight_by_patchability(
-                list(self.GUARDED) + list(self.PRODUCTION), str(self.LUMINA),
+                list(self.GUARDED) + list(self.PRODUCTION),
+                str(run20_workspace),
             )[:1],
             self.GUARDED, 48000,
         )
@@ -502,26 +553,28 @@ class TestTheCombinedEffectOnRun20:
         )
         assert withheld_after == []
 
-    def test_order_is_what_saves_them_when_the_budget_still_binds(self):
+    def test_order_is_what_saves_them_when_the_budget_still_binds(
+        self, run20_workspace,
+    ):
         """The raised cap happens to fit this whole set, so it alone would
         have rescued run 20. The ordering is the part that holds when the
         budget binds anyway — a bigger workspace, more diagnostics, a lower
         configured cap. Pinned at the OLD cap so the two fixes are shown to
         be independent rather than one masking the other.
         """
-        if not self.LUMINA.is_dir():
-            pytest.skip("lumina workspace not present")
         unordered = list(self.GUARDED) + list(self.PRODUCTION)
         ordered, _ = g._order_preflight_by_patchability(
-            unordered, str(self.LUMINA),
+            unordered, str(run20_workspace),
         )
         withheld_unordered = [
             p for p in self.PRODUCTION
-            if p not in self._shown(unordered, self.GUARDED, 24000)
+            if p not in self._shown(
+                run20_workspace, unordered, self.GUARDED, 24000)
         ]
         withheld_ordered = [
             p for p in self.PRODUCTION
-            if p not in self._shown(ordered, self.GUARDED, 24000)
+            if p not in self._shown(
+                run20_workspace, ordered, self.GUARDED, 24000)
         ]
         assert len(withheld_ordered) < len(withheld_unordered), (
             f"unordered withheld {len(withheld_unordered)}, "

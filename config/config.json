@@ -91,6 +91,9 @@
         "auto_resume_cap_per_blocker": 9,
         "auto_resume_class_cap_resets_on_progress": true,
         "auto_resume_class_charged_to_first_owner": true,
+        "park_blocker_on_cap": true,
+        "max_parked_blockers": 12,
+        "max_parked_tests_per_blocker": 12,
         "auto_resume_cap_per_trigger": 6,
         "auto_resume_cap": 18
     },

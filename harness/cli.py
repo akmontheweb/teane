@@ -1398,6 +1398,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # lumina 01a169ed at 6/6 after it resolved five blockers.
         "auto_resume_class_cap_resets_on_progress",
         "auto_resume_class_charged_to_first_owner",
+        # ADR-0010 Step 1: when a cap is spent and the blocker is a bounded
+        # set of failing tests, quarantine them and continue instead of
+        # ending the run. See harness/blocker_parking.py.
+        "park_blocker_on_cap", "max_parked_blockers",
+        "max_parked_tests_per_blocker",
     }),
     # Agile tuning knobs. batch_size = max stories per dependency batch;
     # commit_on_story = git-commit after each green story; repair_cap =
@@ -1473,6 +1478,9 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "hitl.auto_resume_cap_per_blocker": (int,),
     "hitl.auto_resume_class_cap_resets_on_progress": (bool,),
     "hitl.auto_resume_class_charged_to_first_owner": (bool,),
+    "hitl.park_blocker_on_cap": (bool,),
+    "hitl.max_parked_blockers": (int,),
+    "hitl.max_parked_tests_per_blocker": (int,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -4729,6 +4737,34 @@ def _build_outside_harness_actions(
     return actions
 
 
+def _park_blocker_at_cap(
+    state: dict[str, Any], *, trigger: str, cap_reason: str,
+    hitl_config: Optional[dict[str, Any]] = None,
+) -> Any:
+    """ADR-0010 Step 1 — try to park the blocker instead of ending the run.
+
+    Thin, fault-tolerant wrapper over
+    :func:`harness.blocker_parking.park_blocker`. Returns its outcome, or
+    ``None`` when the blocker cannot be parked — in which case the caller
+    terminates exactly as it did before parking existed. Parking is an
+    improvement on termination, never a precondition for it, so any fault in
+    here must degrade to the old behaviour rather than raise into the HITL
+    loop.
+    """
+    try:
+        from harness.blocker_parking import park_blocker
+        return park_blocker(
+            state, trigger=trigger, cap_reason=cap_reason,
+            hitl_config=hitl_config,
+        )
+    except Exception:  # noqa: BLE001 — parking must never break termination
+        logger.warning(
+            "[HITL] parking the blocker raised; terminating as before.",
+            exc_info=True,
+        )
+        return None
+
+
 def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     """
     Interactive stdin menu for the human_intervention_node.
@@ -5001,9 +5037,28 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 _blocked_file = str(
                     node_state.get("test_regen_unsupported") or ""
                 )
-                choice = "q"
-                auto_resumed_this_round = False
-                if _blocked_file:
+                # ADR-0010 Step 1 — "a test no node may author" is exactly
+                # the case parking exists for: nothing in the graph can fix
+                # it, so carry it as a recorded expected failure instead of
+                # ending the run. A successful park clears both flags, so
+                # they cannot condemn the next blocker on its first trip.
+                _parked_unauthorable = _park_blocker_at_cap(
+                    state, trigger=trigger,
+                    cap_reason=(
+                        "un-authorable test "
+                        f"{_blocked_file or '(regeneration stuck)'}"
+                    ),
+                    hitl_config=(
+                        (state.get("harness_config") or {}).get("hitl") or {}
+                    ),
+                )
+                choice = "r" if _parked_unauthorable is not None else "q"
+                auto_resumed_this_round = _parked_unauthorable is not None
+                if _parked_unauthorable is not None:
+                    # Parked: the build resumes, so the blocker marker that
+                    # makes the [q] path terminate must NOT be set below.
+                    _blocked_file = ""
+                elif _blocked_file:
                     logger.warning(
                         "[HITL] %s is a test file no node may author (repair "
                         "cannot edit tests; the regeneration node declined "
@@ -5024,9 +5079,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                         "%s`.",
                         str(state.get("session_id") or "<id>"),
                     )
-                node_state["unauthorable_test_blocker"] = (
-                    _blocked_file or "unknown"
-                )
+                if _parked_unauthorable is None:
+                    node_state["unauthorable_test_blocker"] = (
+                        _blocked_file or "unknown"
+                    )
                 state["node_state"] = node_state
             else:
                 # Per-session cap on consecutive headless auto-resumes.
@@ -5189,7 +5245,50 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 _blocker_cap_hit = bool(_blocker_sig) and (
                     _blocker_taken >= _cap_per_blocker
                 )
-                if _session_cap_hit or _trigger_cap_hit or _blocker_cap_hit:
+                _cap_hit = (
+                    _session_cap_hit or _trigger_cap_hit or _blocker_cap_hit
+                )
+                _cap_reason = ""
+                if _session_cap_hit:
+                    _cap_reason = f"session cap {_resumes_taken}/{_cap}"
+                elif _trigger_cap_hit:
+                    _cap_reason = (
+                        f"per-trigger cap {_trigger_taken}/"
+                        f"{_cap_per_trigger} for '{_charged_class}'"
+                        + (
+                            f" (fired as '{_trigger_class}')"
+                            if _charged_class != _trigger_class else ""
+                        )
+                    )
+                elif _blocker_cap_hit:
+                    _cap_reason = (
+                        f"per-blocker cap {_blocker_taken}/"
+                        f"{_cap_per_blocker} for '{_blocker_sig}' "
+                        "(same blocker across every trigger class)"
+                    )
+                # ADR-0010 Step 1 — a spent cap used to have exactly one
+                # outcome: end the run. lumina run 12 ended here with 13 of
+                # 17 criteria verified and zero stories sealed; run 01a21db1
+                # ended here on three acceptance tests that were correct.
+                # When what blocks the build is a bounded set of failing
+                # tests, carry them as recorded expected failures and go on.
+                # ``park_blocker`` returns None whenever that is not safe or
+                # not possible, and the termination below runs unchanged.
+                _parked = None
+                if _cap_hit:
+                    _parked = _park_blocker_at_cap(
+                        state, trigger=trigger, cap_reason=_cap_reason,
+                        hitl_config=_hitl_config,
+                    )
+                if _parked is not None:
+                    # Not counted as an auto-resume and no counter is reset:
+                    # the class budget is refunded by the progress rule once
+                    # this blocker is gone and a new one appears, and if the
+                    # park did not turn the build green the same caps are
+                    # still spent and the next trip finds nothing new to park.
+                    choice = "r"
+                    auto_resumed_this_round = True
+                elif _cap_hit:
                     # Direct-abandon: bypass the ``[q]`` handler's
                     # confirmation prompt. In headless mode the confirm
                     # channel returns False by default, so falling through
@@ -5198,23 +5297,6 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                     # ``while True:`` iteration — a tight loop that spams
                     # this WARNING millions of times per second (session
                     # cec4d124 hit 18M repetitions in ~10 minutes).
-                    if _session_cap_hit:
-                        _cap_reason = f"session cap {_resumes_taken}/{_cap}"
-                    elif _trigger_cap_hit:
-                        _cap_reason = (
-                            f"per-trigger cap {_trigger_taken}/"
-                            f"{_cap_per_trigger} for '{_charged_class}'"
-                            + (
-                                f" (fired as '{_trigger_class}')"
-                                if _charged_class != _trigger_class else ""
-                            )
-                        )
-                    else:
-                        _cap_reason = (
-                            f"per-blocker cap {_blocker_taken}/"
-                            f"{_cap_per_blocker} for '{_blocker_sig}' "
-                            "(same blocker across every trigger class)"
-                        )
                     logger.warning(
                         "[HITL] Auto-resume cap reached (%s) in headless "
                         "mode — terminating instead of looping. No "

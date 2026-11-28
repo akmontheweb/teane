@@ -3222,6 +3222,27 @@ class GatewayConfig:
     # the ordinary preflight truncation. Clamped [0, 500] and [0, 500].
     repair_guarded_test_window_head_lines: int = 40
     repair_guarded_test_window_radius: int = 25
+    # Remember per-file production-fault evidence for as long as the file
+    # keeps failing, instead of recomputing it from scratch every round
+    # (lumina run 01a21db1, 2026-11-27).
+    #
+    # ``_code_gap_evidence`` reads only the CURRENT round's diagnostics, so
+    # the proof that the application is at fault for a given test file
+    # evaporates whenever that round's diagnostic text happens to be less
+    # legible -- and ``_production_fault_evidence_map`` recomputes on every
+    # offer AND at force time. All three of run 01a21db1's declines on
+    # ``test_story_001_acceptance.py`` fell inside one such gap: vetoed at
+    # 21:48 on ``{"detail":"Not Found"}``, offered three times while the
+    # failing assertion was a bare ``AssertionError`` that matched no
+    # fingerprint, FORCED at 21:58, then vetoed again at 22:00 once
+    # ``assert 2xx == 4xx`` matched. Same test, same root cause, proof on
+    # both sides of the gap.
+    #
+    # Retirement is by the file passing -- evidence about a file that is no
+    # longer failing is moot -- which also handles batch transitions without
+    # a separate reset. Set repair.sticky_production_fault_evidence=false to
+    # restore strict per-round recomputation.
+    repair_sticky_production_fault_evidence: bool = True
     # Characters of file content the preflight "## Current Content of Files
     # You Need to Edit" section may spend before it starts omitting files.
     #
@@ -6248,6 +6269,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             ),
             name="repair.guarded_test_window_radius",
             default=25, floor=0, ceiling=500,
+        ),
+        repair_sticky_production_fault_evidence=bool(
+            (config_dict.get("repair", {}) or {}).get(
+                "sticky_production_fault_evidence", True,
+            )
         ),
         llm_judgment_discovery_followup_focus=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(

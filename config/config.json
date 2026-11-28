@@ -57,6 +57,7 @@
     },
     "repair": {
         "structured_diagnostic_payload": false,
+        "sticky_production_fault_evidence": true,
         "guarded_test_window_head_lines": 40,
         "guarded_test_window_radius": 25
     },

@@ -1432,6 +1432,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # the billed path every round).
         "guarded_test_window_head_lines",
         "guarded_test_window_radius",
+        # Remember per-file production-fault evidence while the file keeps
+        # failing, instead of recomputing it every round (lumina 01a21db1).
+        "sticky_production_fault_evidence",
     }),
 }
 
@@ -1574,6 +1577,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     # tripped the validator — the switch GatewayConfig advertises was
     # unusable in practice.
     "repair.structured_diagnostic_payload": (bool,),
+    "repair.sticky_production_fault_evidence": (bool,),
     "repair.guarded_test_window_head_lines": (int,),
     "repair.guarded_test_window_radius": (int,),
     # ADR-0001 test-author regeneration for unsatisfiable tests.

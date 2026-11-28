@@ -13037,6 +13037,7 @@ def _code_gap_evidence(state: AgentState, test_file: str) -> str:
 
 def _production_fault_evidence_map(
     state: AgentState, test_files: Any,
+    *, sticky: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """``{test_file: why}`` for EVERY one of ``test_files`` whose current
     failure carries :func:`_code_gap_evidence`. Files with no evidence are
@@ -13059,7 +13060,51 @@ def _production_fault_evidence_map(
     contract test on every one of them, so the one correct diagnosis
     available to the loop was never reachable. Callers that ask about a set
     must use this function and decide per file.
+
+    ``sticky`` makes the answer remembered rather than recomputed. Pass the
+    dict that lives in ``loop_counter`` and evidence observed in ANY earlier
+    round keeps vetoing for as long as the file is still failing, even on a
+    round whose diagnostic text for that file matches no fingerprint.
+
+    Without it the veto flickers, and the declined-offer floor can force the
+    escape inside the flicker. lumina run 01a21db1,
+    ``tests/acceptance/test_story_001_acceptance.py``::
+
+        21:48:25  vetoed   {"detail":"Not Found"} — the route does not exist
+        21:53:35  offered  (no fingerprint matched this round)
+        21:56:16  offered
+        21:57:41  offered  → declined count reaches the floor
+        21:58:19  FORCED   "taking the escape on the model's behalf"
+        22:00:29  vetoed   assert 2xx == 4xx — success where the criterion
+                           requires rejection
+
+    One test, one root cause, proof on both sides of the gap. The failing
+    assertion in between was a bare ``AssertionError`` from a rate-limit
+    test — precisely the shape ``has_mandatable_target=True``'s comment
+    warns about: a test innermost frame while production is at fault.
+
+    Retirement is by the file no longer failing. Evidence about a passing
+    file is moot, and reading that from the current failing set means a
+    batch transition retires the previous batch's entries with no separate
+    reset hook.
     """
+    ws = str(state.get("workspace_path", "") or "")
+    if sticky is not None:
+        _failing = {
+            _normalize_ws_path(str(d.get("file", "") or ""), ws)
+            for d in (state.get("compiler_errors") or [])
+            if isinstance(d, dict) and d.get("file")
+        }
+        for _stale in [
+            k for k in sticky
+            if _normalize_ws_path(str(k), ws) not in _failing
+        ]:
+            logger.info(
+                "[repair_node] Retiring remembered production-fault "
+                "evidence for %s — it is no longer in the failing set.",
+                _stale,
+            )
+            sticky.pop(_stale, None)
     out: dict[str, str] = {}
     for f in sorted({str(x) for x in (test_files or []) if x}):
         try:
@@ -13068,11 +13113,23 @@ def _production_fault_evidence_map(
             why = ""
         if why:
             out[f] = why
+            if sticky is not None:
+                sticky[f] = why
+        elif sticky is not None and sticky.get(f):
+            out[f] = sticky[f]
+            logger.info(
+                "[repair_node] Production-fault evidence for %s carried "
+                "forward from an earlier round (%s). This round's "
+                "diagnostic matched no fingerprint, but the file is still "
+                "failing and the proof has not been retired.",
+                f, sticky[f][:120],
+            )
     return out
 
 
 def _production_fault_evidence(
     state: AgentState, test_files: Any,
+    *, sticky: Optional[dict[str, str]] = None,
 ) -> tuple[str, str]:
     """``(test_file, why)`` for the first of ``test_files`` whose current
     failure carries :func:`_code_gap_evidence`, or ``("", "")``.
@@ -13086,10 +13143,47 @@ def _production_fault_evidence(
     :func:`_production_fault_evidence_map` — see its docstring for why
     collapsing a set to one hit is a defect, not a simplification.
     """
-    _map = _production_fault_evidence_map(state, test_files)
+    _map = _production_fault_evidence_map(state, test_files, sticky=sticky)
     for f in sorted(_map):
         return f, _map[f]
     return "", ""
+
+
+def _sticky_pf_evidence(
+    loop_counter: dict[str, Any],
+) -> Optional[dict[str, str]]:
+    """The remembered production-fault evidence map, or ``None`` when the
+    feature is switched off.
+
+    Returned dict is the live one inside ``loop_counter``, so
+    :func:`_production_fault_evidence_map` records and retires entries by
+    mutating it. ``None`` restores strict per-round recomputation, which is
+    the behaviour that let lumina run 01a21db1 force the escape inside an
+    evidence gap — see that function's docstring for the timeline.
+    """
+    try:
+        _enabled = bool(getattr(
+            getattr(get_gateway(), "config", None),
+            "repair_sticky_production_fault_evidence",
+            True,
+        ))
+    except Exception:  # noqa: BLE001 — a gateway fault must not break repair
+        _enabled = True
+    if not _enabled:
+        return None
+    raw = loop_counter.get("production_fault_evidence_sticky")
+    if not isinstance(raw, dict):
+        raw = {}
+        loop_counter["production_fault_evidence_sticky"] = raw
+        return raw
+    # A checkpoint round-trip can hand back anything; keep only str -> str
+    # and keep the SAME object so callers' mutations persist.
+    for k in [
+        k for k, v in raw.items()
+        if not isinstance(k, str) or not isinstance(v, str) or not v
+    ]:
+        raw.pop(k, None)
+    return cast("dict[str, str]", raw)
 
 
 def _production_fault_banner(
@@ -19632,6 +19726,16 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # baseline that measures whether the shift-left triage gate moves the
     # measured ~77% repair share. Pure measurement: changes no routing, and is
     # wrapped so a classifier fault can never break the repair loop.
+    #
+    # The asymmetry here is DELIBERATE and must stay: the classifier speaks
+    # only when a high-confidence test-AUTHORING fingerprint matches, and
+    # ``CODE_GAP`` is the residual bucket ("no test-authoring fingerprint
+    # matched — default to repair", confidence "n/a"). So a round of
+    # ``test_bug=0 code_gap=N`` is NOT a finding that production is at fault;
+    # it is the common case. Vetoing the UNSATISFIABLE_TEST escape on it was
+    # tried while fixing lumina run 01a21db1 and reverted: it would veto
+    # almost every round, and it re-blocked run 20's genuinely unsatisfiable
+    # ``test_birthday_contract.py``, which also classifies as CODE_GAP.
     try:
         from harness.test_triage import summarize_failures
         _triage = summarize_failures(errors)
@@ -21210,7 +21314,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _guarded_all = _guarded_line_files | set(
                     _guarded_tests_dropped
                 )
-                _pf_map = _production_fault_evidence_map(state, _guarded_all)
+                _pf_map = _production_fault_evidence_map(
+                    state, _guarded_all,
+                    sticky=_sticky_pf_evidence(loop_counter),
+                )
                 _pf_clean = {f for f in _guarded_all if f not in _pf_map}
                 _pf_file, _pf_why = ("", "")
                 for _f in sorted(_pf_map):
@@ -21591,6 +21698,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 _floor_all = {f for f, _ in _floor_lines}
                 _floor_pf_map = _production_fault_evidence_map(
                     state, _floor_all,
+                    sticky=_sticky_pf_evidence(loop_counter),
                 )
                 _floor_pf_clean = {
                     f for f in _floor_all if f not in _floor_pf_map
@@ -22702,6 +22810,7 @@ Generate your fix patches NOW. Only the blocks above. No other text.""")
                 already_declared=_unsat_declared is not None,
                 production_fault_by_file=_production_fault_evidence_map(
                     state, _unsat_offer_files,
+                    sticky=_sticky_pf_evidence(loop_counter),
                 ),
                 # The judge has already ruled on this round by here (the
                 # verdict block runs earlier in repair_node), so a round it
@@ -24538,7 +24647,9 @@ def _adjudicated_wrong_test(
     # rules out. Run 16's judge named test_story_001_acceptance.py "the wrong
     # side" while its own blocker text said the API returned
     # body['detail']['error'] — a double-wrapped envelope, i.e. production.
-    _pf_file, _pf_why = _production_fault_evidence(state, {named})
+    _pf_file, _pf_why = _production_fault_evidence(
+        state, {named}, sticky=_sticky_pf_evidence(loop_counter),
+    )
     if _pf_why:
         _log_production_fault_veto(_pf_file, _pf_why, "judge contradiction ruling")
         return None
@@ -32559,6 +32670,12 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
             # the stuck file, the ledger should not veto a future
             # recovery for the same path.
             new_lc["stuck_rewrite_recovery_attempted"] = []
+            # Remembered production-fault evidence is a claim about code the
+            # operator may have just rewritten by hand, so it is as stale as
+            # the miss counters above. Normal retirement (the file leaving
+            # the failing set) cannot catch this case: the file may still be
+            # failing, for a different reason.
+            new_lc["production_fault_evidence_sticky"] = {}
             values["loop_counter"] = new_lc
             logger.info(
                 "[run_graph] Resume rewind: auto-abandon path cleared "

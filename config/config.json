@@ -67,6 +67,7 @@
         "max_requirement_gap_fill_cycles": 2,
         "max_patch_repair_iterations": 5,
         "max_consecutive_distraction_rounds": 3,
+        "max_consecutive_patcher_blocked_rounds": 3,
         "max_consecutive_low_signal_rounds": 5,
         "max_unsat_offers_before_forcing": 3,
         "max_related_evidence_files": 6,

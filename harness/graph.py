@@ -13776,6 +13776,54 @@ def _summarize_round_patches(patch_results: list[Any]) -> list[dict[str, Any]]:
     return out[:12]
 
 
+def _prior_round_was_patcher_blocked(
+    prior_round_patches: Optional[list[dict[str, Any]]],
+) -> bool:
+    """True when the previous round tried to patch and the PATCHER refused it all.
+
+    Distinguishes a round that changed zero bytes because the *patcher*
+    rejected every block from one that changed zero bytes because the
+    repair LLM chose the wrong target. Both look identical in the
+    fingerprint delta the reflection judge sees, and the judge calls both
+    DISTRACTION -- lumina run 01a21db1 recorded the verdict stating "the
+    previous round landed no patches (the only patch was REJECTED)" and
+    ticking the distraction counter anyway, three times, which forced
+    UNSATISFIABLE_TEST onto two correct acceptance tests.
+
+    A rejection is a tooling failure. ``server/app/api/celebrations.py``
+    carried deliberate alias pairs::
+
+        @router.post("/celebrations", ...)
+        @router.post("/birthdays", ..., include_in_schema=False)
+        def create_celebration(...)
+
+    so every SEARCH anchor matched twice and the patcher -- correctly --
+    refused to guess. Four rounds were spent before one landed. None of
+    that is evidence about the repair direction, which was right the whole
+    time: the file genuinely had no ``@router.get`` at all.
+
+    Returns ``False`` for a round with no patch attempts at all (a genuine
+    zero-patch refusal) and for a round where anything applied, including
+    partially. ``no-op`` entries are ignored rather than counted as
+    attempts: a byte-identical re-emission is the ASSERTED-CORRECT signal,
+    which has its own handling and must not be masked by this one.
+    """
+    attempts = [
+        p for p in (prior_round_patches or [])
+        if isinstance(p, dict) and str(p.get("outcome") or "").strip()
+    ]
+    if not attempts:
+        return False
+    rejected = 0
+    for entry in attempts:
+        outcome = str(entry.get("outcome") or "")
+        if outcome.startswith("applied"):
+            return False
+        if outcome.startswith("REJECTED"):
+            rejected += 1
+    return rejected > 0
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -18988,6 +19036,39 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 # harness promoted it to.
                 _judge_issued_verdict = str(reflection_verdict.get("verdict") or "")
                 _low_signal = _reflection_verdict_is_low_signal(reflection_verdict)
+                # Was the PREVIOUS round's zero-byte outcome the patcher's
+                # doing rather than the LLM's? ``last_round_patches`` is
+                # the same fact the judge was shown; it is read here so
+                # the circuit breaker stops counting tooling failures as
+                # wrong-direction rounds. See
+                # ``_prior_round_was_patcher_blocked``.
+                _patcher_blocked = _prior_round_was_patcher_blocked(
+                    loop_counter.get("last_round_patches")
+                )
+                try:
+                    _gw_pb_cfg = getattr(get_gateway(), "config", None)
+                except Exception:  # noqa: BLE001
+                    _gw_pb_cfg = None
+                _max_patcher_blocked = int(getattr(
+                    _gw_pb_cfg,
+                    "max_consecutive_patcher_blocked_rounds",
+                    3,
+                ) or 3)
+                _patcher_blocked_streak = int(
+                    loop_counter.get("consecutive_patcher_blocked_rounds", 0)
+                    or 0
+                )
+                if not _patcher_blocked and _patcher_blocked_streak:
+                    # The patcher is landing patches again — this streak
+                    # must not leak into an unrelated later stall, or the
+                    # bound fires on a round that was never blocked.
+                    logger.info(
+                        "[repair_node] patcher landed a patch — resetting "
+                        "consecutive_patcher_blocked_rounds from %d to 0.",
+                        _patcher_blocked_streak,
+                    )
+                    loop_counter["consecutive_patcher_blocked_rounds"] = 0
+                    _patcher_blocked_streak = 0
                 # Fix B — WORKING_HYPOTHESIS: judge is deferring on a
                 # plausible upstream fix. Does NOT tick the distraction
                 # counter (that would race us to HITL against a bet the
@@ -19038,6 +19119,53 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                             _wh_streak, _WORKING_HYPOTHESIS_STREAK_CAP,
                             loop_counter.get("consecutive_distraction_rounds", 0),
                         )
+                elif (
+                    _v in {"DISTRACTION", "REGRESSION"}
+                    and not _low_signal
+                    and _patcher_blocked
+                    and _patcher_blocked_streak < _max_patcher_blocked
+                ):
+                    # The round changed zero bytes because the PATCHER
+                    # refused every block, not because the repair LLM
+                    # went off-target. Ticking the distraction counter
+                    # here is how lumina run 01a21db1 reached
+                    # UNSATISFIABLE_TEST on two correct tests: three
+                    # rejected patches on one file saturated the counter
+                    # and the forced escape overrode the production-fault
+                    # veto, triage and the model's own four declines.
+                    # Hold that counter; tick a bounded one instead so a
+                    # permanently unpatchable file still escalates.
+                    #
+                    # Note the harness ALREADY reasons this way about a
+                    # *model* zero-change round: the ASSERTED-CORRECT
+                    # branch reads byte-identical re-emission as "the file
+                    # is already correct, look elsewhere". Same
+                    # observable, opposite cause; only one was handled.
+                    loop_counter["consecutive_patcher_blocked_rounds"] = (
+                        _patcher_blocked_streak + 1
+                    )
+                    loop_counter["working_hypothesis_streak"] = 0
+                    logger.warning(
+                        "[repair_node] Reflection verdict %s, but every "
+                        "patch last round was REJECTED BY THE PATCHER "
+                        "(%s) — a tooling failure, not a wrong direction. "
+                        "Holding consecutive_distraction_rounds at %d; "
+                        "consecutive_patcher_blocked_rounds=%d/%d. The "
+                        "shared patch_feedback directive tells the model "
+                        "how to fix the anchor; blaming a test for an "
+                        "anchor it cannot match would be the wrong "
+                        "conclusion.",
+                        _v,
+                        ", ".join(
+                            f"{e.get('file')}: {e.get('outcome')}"
+                            for e in (
+                                loop_counter.get("last_round_patches") or []
+                            )[:3]
+                        ) or "no detail",
+                        loop_counter.get("consecutive_distraction_rounds", 0),
+                        loop_counter["consecutive_patcher_blocked_rounds"],
+                        _max_patcher_blocked,
+                    )
                 elif _v in {"DISTRACTION", "REGRESSION"} and not _low_signal:
                     loop_counter["consecutive_distraction_rounds"] = (
                         loop_counter.get("consecutive_distraction_rounds", 0) + 1

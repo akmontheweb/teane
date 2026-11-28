@@ -2943,6 +2943,21 @@ class GatewayConfig:
     # consecutive low-signal PROGRESS verdicts before external kill;
     # this cap catches the same pattern in ~5. Clamped [1, 20].
     max_consecutive_low_signal_rounds: int = 5
+    # Patcher-blocked circuit breaker (lumina run 01a21db1, 2026-11-27).
+    # Ticked when a repair round emitted patches and the PATCHER refused
+    # every one of them — an ambiguous SEARCH anchor, a search miss, a
+    # denied path. Such a round changed zero bytes for a reason that has
+    # nothing to do with the repair LLM's direction, so it must NOT tick
+    # ``max_consecutive_distraction_rounds``: in run 01a21db1 three
+    # rejected patches on one file (alias-pair @router decorators make
+    # every anchor ambiguous) drove the distraction counter to 3, which
+    # forced UNSATISFIABLE_TEST on two CORRECT acceptance tests over the
+    # production-fault veto's 7 refusals, the harness's own
+    # ``triage_test_bug=False`` and the model declining four times.
+    # This counter bounds the hold so a permanently unpatchable file
+    # cannot spin forever: once it saturates, normal distraction
+    # escalation resumes. Clamped [1, 20].
+    max_consecutive_patcher_blocked_rounds: int = 3
     # Multiplier for the router's hard total-iteration ceiling. Combined
     # with ``max_patch_repair_iterations``, sets the absolute cap on
     # total repair rounds per compile phase — the tripwire for
@@ -5670,6 +5685,38 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 20
         return value
 
+    def _clamp_patcher_blocked_rounds(raw: Any) -> int:
+        """Clamp ``node_throttle.max_consecutive_patcher_blocked_rounds``.
+
+        Range [1, 20]. A patcher-blocked round changed zero bytes because
+        the patcher refused the patch, not because the repair LLM chose
+        wrongly, so it is held out of the distraction circuit breaker --
+        but only for this many consecutive rounds, after which normal
+        escalation resumes so an unpatchable file cannot spin forever.
+        Floor of 1 keeps one round of grace (enough for the shared
+        patch_feedback directive to reach the model and land a corrected
+        anchor); ceiling of 20 keeps the bound meaningful.
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 3
+        if value < 1:
+            logger.warning(
+                "max_consecutive_patcher_blocked_rounds %d < 1; "
+                "clamping to 1.",
+                value,
+            )
+            return 1
+        if value > 20:
+            logger.warning(
+                "max_consecutive_patcher_blocked_rounds %d > 20; "
+                "clamping to 20.",
+                value,
+            )
+            return 20
+        return value
+
     def _clamp_hard_cap_multiplier(raw: Any) -> int:
         """Clamp ``node_throttle.total_hard_cap_multiplier`` to [1, 20].
 
@@ -5871,6 +5918,11 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_consecutive_low_signal_rounds=_clamp_low_signal_rounds(
             node_throttle.get("max_consecutive_low_signal_rounds", 5)
+        ),
+        max_consecutive_patcher_blocked_rounds=(
+            _clamp_patcher_blocked_rounds(
+                node_throttle.get("max_consecutive_patcher_blocked_rounds", 3)
+            )
         ),
         max_unsat_offers_before_forcing=_clamp_distraction_rounds(
             node_throttle.get("max_unsat_offers_before_forcing", 3)

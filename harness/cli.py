@@ -947,6 +947,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "max_patch_repair_iterations",
         # Consecutive-DISTRACTION circuit breaker for the repair loop.
         "max_consecutive_distraction_rounds",
+        "max_consecutive_patcher_blocked_rounds",
         # Bug B (2026-07-04) — consecutive-low-signal-verdict circuit
         # breaker for the repair loop.
         "max_consecutive_low_signal_rounds",
@@ -1498,6 +1499,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "token_budget.retry_charge": (dict,),
     "node_throttle.max_patch_repair_iterations": (int,),
     "node_throttle.max_consecutive_distraction_rounds": (int,),
+    "node_throttle.max_consecutive_patcher_blocked_rounds": (int,),
     "node_throttle.max_consecutive_low_signal_rounds": (int,),
     "node_throttle.max_unsat_offers_before_forcing": (int,),
     "node_throttle.max_related_evidence_files": (int,),
